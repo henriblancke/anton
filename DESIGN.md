@@ -127,7 +127,10 @@ solo board's only propagation path.
    fails: `bd dolt pull/push` executes *on the server*, and the `dolt-sql-server` image ships no ssh
    client and no keys, so a `git+ssh://` remote is unreachable from there by construction. Claim
    verification also skips its settle window, because a claim is visible to every other machine the
-   moment it commits.
+   moment it commits. The pass settles as its own terminal state — `shared-server`, with an empty
+   backlog — so the heartbeat never escalates a beat into a push pass looking for work that cannot
+   exist. The same rule reaches the *sessions* anton primes: the pickup protocol in `.beads/PRIME.md`
+   (and `skills/bd/SKILL.md`) runs its pull/publish/settle legs on an embedded board only.
 
 2. **A bd spawn's environment is scoped to the project it runs against** (`src/lib/beads/bd-env.ts`,
    anton-ffmw.1). Env is bd's highest-priority config source, so anton's own connection settings —
@@ -147,7 +150,10 @@ solo board's only propagation path.
    fresh clone, `bd bootstrap`. Server mode gets the CONNECTION instead: none of the refs/dolt/data
    knobs are imposed (`dolt.auto-commit` survives — a write still becomes a Dolt commit, which is the
    team's history), no remote is wired, and no clone is bootstrapped, since a shared-server board
-   keeps no local database to hydrate.
+   keeps no local database to hydrate. It also pins `backup.enabled false`: bd's auto-backup
+   registers its backup remote *on the server* as the project's own account, which is not privileged
+   for it, so left on it ends every single write in `Warning: auto-backup failed: register backup
+   remote` — the sync nudges' noise in another costume.
 
 **Configuring server mode.** One command, per project: `anton server-mode <repo> --host … --port …
 --user … --database …` (anton-yvjd, `src/lib/beads/server-mode.mjs`). It backs the board up

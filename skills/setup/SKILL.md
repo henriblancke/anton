@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 88feb83212f5
+version: 857383b9871d
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -162,9 +162,13 @@ server board is verified.
 
 One expected wart in server mode: `anton init` no longer wires a `refs/dolt/data` remote for a
 server-mode board, but one wired earlier (or by a bare `bd init`) stays in place and is simply inert
-— anton skips every sync pass for a server-mode board. A `bd dolt push/pull` run by hand still
-executes *on the server*, which has no git credentials, and fails with `command denied to user`.
-That is noise, not data risk (anton-0tul); `bd dolt remote remove origin` tidies it.
+— anton skips every sync pass for a server-mode board, and the pickup protocol it teaches sessions
+(`.beads/PRIME.md` §2) drops the pull/publish/settle steps on a shared server. A `bd dolt push/pull`
+run by hand still executes *on the server*, which has no git credentials, and fails with `command
+denied to user`. That is noise, not data risk (anton-0tul); `bd dolt remote remove origin` tidies it.
+The profile also pins `backup.enabled false` for the same reason — bd's auto-backup registers its
+remote on the server as this project's account, which is not privileged for it, so every write would
+otherwise end in `Warning: auto-backup failed: register backup remote`.
 
 ## 3. Detect the stack
 

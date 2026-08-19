@@ -117,8 +117,18 @@ describe("teamConfigKeys", () => {
     const keys = teamConfigKeys("server").map(([key]: string[]) => key);
     expect(keys).not.toContain("dolt.auto-push");
     expect(keys.filter((k: string) => k.startsWith("export."))).toEqual([]);
-    expect(teamConfigKeys("server")).toEqual([["dolt.auto-commit", "on"]]);
+    expect(teamConfigKeys("server")).toEqual([
+      ["backup.enabled", "false"],
+      ["dolt.auto-commit", "on"],
+    ]);
     expect(teamConfigKeys("server")).toBe(SERVER_CONFIG_KEYS);
+  });
+
+  // bd's auto-backup registers its backup remote ON the shared server as the project's account,
+  // which is not privileged for it — so left on it fails on every single write (anton-0tul).
+  it("pins bd's auto-backup off in server mode, first, and leaves embedded alone", () => {
+    expect(teamConfigKeys("server")[0]).toEqual(["backup.enabled", "false"]);
+    expect(teamConfigKeys("embedded").map(([key]: string[]) => key)).not.toContain("backup.enabled");
   });
 });
 

@@ -11,7 +11,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resetServerPreflight, runDoltSync } from "./bd";
+import { createDoltSync, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
 import { isServerMode, readBoardMode, resetBoardModeCache } from "./board-mode";
 
 /** Mirrors bd.ts's internal BdExec seam; kept local so the test does not widen that module's API. */
@@ -150,6 +150,40 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
     };
     await expect(runDoltSync(dir, exec, "pull")).resolves.toBe("synced");
     expect(calls.map((a) => a.join(" "))).toEqual(["dolt pull"]);
+  });
+});
+
+/**
+ * The seam every caller actually holds — `beads.sync`/`backstop`/`pull` all route through the
+ * coalescer, not through runDoltSync directly. What matters here is that a server-mode pass settles
+ * as its OWN terminal state rather than borrowing "synced": the backlog stays at zero and the repo
+ * counts as reconciled, so the heartbeat never escalates a beat into a full push pass looking for
+ * work that cannot exist (anton-0tul).
+ */
+describe("the sync coalescer in server mode (anton-0tul)", () => {
+  it("settles as shared-server with no backlog, and keeps the backstop cheap", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd: string, args: string[]) => {
+      calls.push(args);
+      return "";
+    });
+
+    await expect(sync(dir, "full")).resolves.toBe("shared-server");
+    expect(getSyncStatus(dir)).toMatchObject({ state: "shared-server", unpushedCount: 0, lastError: null });
+
+    // The backstop is the heartbeat's request; an unreconciled repo would force a full pull/commit/
+    // push pass. The preflight is cached by now, so this beat must spawn nothing at all.
+    calls.length = 0;
+    await expect(sync(dir, "backstop")).resolves.toBe("shared-server");
+    expect(calls).toEqual([]);
+  });
+
+  it("leaves an embedded repo's pass reporting synced", async () => {
+    const dir = repo({ dolt_mode: "embedded" });
+    const sync = createDoltSync(async () => "");
+    await expect(sync(dir, "full")).resolves.toBe("synced");
+    expect(getSyncStatus(dir).state).toBe("synced");
   });
 });
 

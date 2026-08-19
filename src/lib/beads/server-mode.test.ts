@@ -226,6 +226,9 @@ describe("configureServerMode", () => {
     expect(ran).toContainEqual("bd dolt set host dolt.example.dev --update-config");
     expect(ran).toContainEqual("bd dolt set database probe --update-config");
     expect(ran).toContainEqual("bd config set dolt.auto-commit on");
+    // bd's auto-backup would register its remote on the shared server as this project's account,
+    // which is not privileged for it — every write would warn (anton-0tul).
+    expect(ran).toContainEqual("bd config set backup.enabled false");
   });
 
   it("reverts metadata.json byte-for-byte when the server refuses the connection", () => {

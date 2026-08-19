@@ -683,10 +683,23 @@ export const EMBEDDED_CONFIG_KEYS = [
  * remote at all (DESIGN.md §3a). What survives is `dolt.auto-commit`: each write still becomes a
  * Dolt commit, which is what gives the team a history on the shared database.
  *
+ * `backup.enabled false` is the same class as those knobs (anton-0tul). bd's Dolt-native auto-backup
+ * registers a backup remote before each backup, and in server mode that registration runs ON THE
+ * SERVER as the project's database account — which is not privileged to do it, so every single bd
+ * write ends in `Warning: auto-backup failed: register backup remote: … command denied to user`.
+ * The warning is noise, not data risk (the write itself landed on the shared database), and noise on
+ * every write is how an operator learns to stop reading warnings. bd's own default is already false;
+ * pinning it is what keeps an inherited setting — or a future default flip — from re-creating that.
+ * It is enforced FIRST because each `bd config set` is itself a bd write, so a profile pass over a
+ * board that HAS auto-backup on would otherwise emit the very warning it exists to stop.
+ *
  * Enforcement only ever ADDS keys, so a board moved from embedded keeps the export knobs it already
  * carries — this is the profile for a project that has never been anything but server-mode.
  */
-export const SERVER_CONFIG_KEYS = [["dolt.auto-commit", "on"]];
+export const SERVER_CONFIG_KEYS = [
+  ["backup.enabled", "false"],
+  ["dolt.auto-commit", "on"],
+];
 
 /** The config.yaml keys enforced for `mode`. Embedded is the default and the fallback. */
 export function teamConfigKeys(mode) {
