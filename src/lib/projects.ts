@@ -293,6 +293,14 @@ export interface ProjectSettings {
    * state a pass proposes; that one is about whether approved epics execute at all.
    */
   proposalAutonomy?: ProposalAutonomyOverrides;
+  /**
+   * Bead labels this project nominates as value signals (anton-prng), highest tier first — the input
+   * to `jobValueScore`, which is what ranks governed work for admission. anton ships NO vocabulary:
+   * absent/empty means work ranks on its native fields alone (age), because a label anton guessed at
+   * would silently rank a board that never uses it. The order is the band order, so a project can
+   * nominate more than two tiers. Validated with {@link valueLabelsSchema} at the API boundary.
+   */
+  valueLabels?: string[];
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -508,7 +516,28 @@ export function resolveBudgetPolicy(settings: ProjectSettings): BudgetPolicy {
     utcOffsetMinutes: -new Date().getTimezoneOffset(),
     weeklyTargetPct: p.weeklyTargetPct,
     nightValueDiscount: p.preferNightForHeavy ? DEFAULT_BUDGET_POLICY.nightValueDiscount : 0,
+    // Board vocabulary, not a budget knob — carried on the policy because the value gate is what
+    // consumes it. Absent nominations rank on age alone rather than on labels anton assumed.
+    valueLabels: resolveValueLabels(settings),
   };
+}
+
+/**
+ * A project's nominated value labels (anton-prng). An ORDERED list, not a set, because the order IS
+ * the band order `jobValueScore` ranks by: the first entry is the top tier. Bounded like every other
+ * operator list, and duplicate-free — a label already nominated can never be reached a second time,
+ * so a repeat is a mistake, not a lower tier.
+ */
+export const valueLabelsSchema = z
+  .array(z.string().trim().min(1).max(120))
+  .max(8)
+  .refine((labels) => new Set(labels).size === labels.length, {
+    message: "each label may be nominated once",
+  });
+
+/** The project's nominations, in band order — empty when it has nominated none (the default). */
+export function resolveValueLabels(settings: ProjectSettings): string[] {
+  return settings.valueLabels ?? [];
 }
 
 /**

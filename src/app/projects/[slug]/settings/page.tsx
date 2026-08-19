@@ -1,6 +1,8 @@
 import { notFound } from "next/navigation";
 
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
+import { allIssues } from "@/lib/beads/issues";
+import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
@@ -37,10 +39,16 @@ export default async function ProjectSettingsPage({
   // .claude/agents (ids anton doesn't ship) are shown as always-active, never gated (anton-dvo.1
   // reversal). We partition by bundled-id membership, not by DiscoveredAgent.source — a user
   // override of a bundled name reports source "global"/"project" but still lives in anton's slot.
-  const [agents, bundledIds] = await Promise.all([
+  // Plus the label vocabulary the board actually uses (anton-prng), so value nominations are picked
+  // from this project's own namespaces rather than from labels anton assumed. Read alongside the
+  // agents (the snapshot is usually warm from the board) and fail-soft: a board anton can't read
+  // leaves the picker empty, where the editor still takes a typed label.
+  const [agents, bundledIds, beads] = await Promise.all([
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
+    allIssues(project.repoPath, { blockOnPendingWrite: false }).catch(() => []),
   ]);
+  const labelVocabulary = boardLabelVocabulary(beads);
 
   return (
     <SettingsView
@@ -51,6 +59,7 @@ export default async function ProjectSettingsPage({
       defaultCrons={defaultCrons}
       agents={agents}
       bundledIds={bundledIds}
+      labelVocabulary={labelVocabulary}
     />
   );
 }

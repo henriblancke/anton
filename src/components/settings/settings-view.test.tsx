@@ -39,6 +39,7 @@ function renderView(
   settings: Parameters<typeof SettingsView>[0]["settings"] = {},
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
   schedules: Parameters<typeof SettingsView>[0]["schedules"] = [],
+  labelVocabulary: Parameters<typeof SettingsView>[0]["labelVocabulary"] = [],
 ) {
   return render(
     <SettingsView
@@ -49,6 +50,7 @@ function renderView(
       defaultCrons={DEFAULT_CRONS}
       agents={agents}
       bundledIds={[]}
+      labelVocabulary={labelVocabulary}
     />,
   );
 }
@@ -386,6 +388,98 @@ describe("SettingsView pipeline variants (anton-aa3m)", () => {
 
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.formulaVariants).toEqual([]);
+  });
+});
+
+describe("SettingsView work value (anton-prng)", () => {
+  showing("value");
+
+  /** A board whose namespaces are its own — the picker must offer these, not labels anton assumed. */
+  const VOCABULARY = [
+    {
+      namespace: "severity",
+      labels: [
+        { label: "severity:sev1", count: 4 },
+        { label: "severity:sev2", count: 2 },
+      ],
+    },
+    { namespace: "", labels: [{ label: "approved", count: 9 }] },
+  ];
+
+  it("shows the zero-config state: nothing nominated, ranking by age alone", () => {
+    renderView({});
+    expect(screen.getByText(/Nothing nominated/)).toBeTruthy();
+  });
+
+  it("seeds the rows from the persisted nominations, in band order", () => {
+    renderView({ valueLabels: ["risk:high", "blocking-PR"] });
+    expect((screen.getByLabelText("Value label 1") as HTMLInputElement).value).toBe("risk:high");
+    expect((screen.getByLabelText("Value label 2") as HTMLInputElement).value).toBe("blocking-PR");
+  });
+
+  it("offers the board's OWN labels, grouped by namespace, and nominates one on click", () => {
+    const fetchMock = stubFetch();
+    renderView({}, [], [], VOCABULARY);
+
+    expect(screen.getByText("severity:")).toBeTruthy();
+    const chip = screen.getByRole("button", { name: /severity:sev1/ });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(
+      (screen.getByLabelText("Value label 1") as HTMLInputElement).value,
+    ).toBe("severity:sev1");
+    expect(
+      screen.getByRole("button", { name: /severity:sev1/ }).getAttribute("aria-pressed"),
+    ).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["severity:sev1"]);
+  });
+
+  it("PATCHes typed nominations on Save, dropping blank and repeat rows", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.change(screen.getByLabelText("Value label 1"), { target: { value: " risk:high " } });
+    // A repeat could never reach its tier (first match wins) and would 400 the whole save.
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.change(screen.getByLabelText("Value label 2"), { target: { value: "risk:high" } });
+    // An abandoned scaffolding row is not a nomination.
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["risk:high"]);
+  });
+
+  it("reorders a nomination — the list's order is the band order, so it must be editable", () => {
+    const fetchMock = stubFetch();
+    renderView({ valueLabels: ["risk:high", "blocking-PR"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Move value label 2 up" }));
+    expect((screen.getByLabelText("Value label 1") as HTMLInputElement).value).toBe("blocking-PR");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["blocking-PR", "risk:high"]);
+  });
+
+  it("removes a nomination, and an emptied list clears them", () => {
+    const fetchMock = stubFetch();
+    renderView({ valueLabels: ["risk:high"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove value label 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual([]);
+  });
+
+  it("says so when the board read came back empty, instead of offering nothing at all", () => {
+    renderView({});
+    expect(screen.getByText(/No labels read off this board yet/)).toBeTruthy();
   });
 });
 
