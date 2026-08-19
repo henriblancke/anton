@@ -125,16 +125,18 @@ describe("rankClaimableTargets — the order", () => {
     expect(ids(rankClaimableTargets(board, board))).toEqual(["f2", "f3", "f1"]);
   });
 
-  it("treats a bead with no priority as bd's lowest (4), not as unranked", () => {
+  it("sorts a bead with no priority last, behind even an explicit P4", () => {
+    // `.beads/PRIME.md`: "a bead with none sorts last" — unset is the absence of a decision, not a
+    // synonym for bd's lowest. The full property lives in rank.test.ts.
     const board = [
-      bead({ id: "f9", issue_type: "feature" }), // no priority — ties with an explicit 4
+      bead({ id: "f9", issue_type: "feature" }), // no priority
       bead({ id: "f2", issue_type: "feature", priority: 4 }),
       bead({ id: "f3", issue_type: "feature", priority: 3 }),
     ];
 
     const ranked = rankClaimableTargets(board, board);
     expect(ids(ranked)).toEqual(["f3", "f2", "f9"]);
-    expect(ranked.map((t) => t.priority)).toEqual([3, 4, 4]);
+    expect(ranked.map((t) => t.priority)).toEqual([3, 4, undefined]);
   });
 
   it("breaks a priority tie by how much open work the target unblocks, transitively", () => {
