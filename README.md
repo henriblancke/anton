@@ -308,7 +308,9 @@ Server mode is **opt-in, per project, and self-hosted** — the server is yours;
 
 The password goes in the environment anton runs in, scoped to that database user — `BEADS_DOLT_PASSWORD_BEADS` for the user above (`BEADS_DOLT_PASSWORD_<USER>`, uppercased, non-alphanumerics folded to `_`), or a bare `BEADS_DOLT_PASSWORD` if every project shares one account. Add `BEADS_DOLT_SERVER_TLS=true` when the server requires TLS. Set no other `BEADS_DOLT_*` variables in a shell you launch anton from: they outrank each project's own config, and a stray `BEADS_DOLT_SERVER_DATABASE` points *every* project at that one database.
 
-Check it with `bd dolt show` — it should name the host, port, user, and database you configured and report the server reachable — and with `bd dolt test`. Moving an existing embedded board onto a server isn't automated yet — export it with `bd export`, point the project at the server, `bd import`, and reconcile the counts before deleting the local copy.
+Check it with `bd dolt show` — it should name the host, port, user, and database you configured and report the server reachable — and with `bd dolt test`.
+
+**Moving an existing embedded board onto a server** is two jobs, and anton owns only the second. The board's history is a Dolt database directory, and it reaches the server's data volume by a copy you run by hand — follow [`docs/runbooks/embedded-board-to-shared-dolt-server.md`](./docs/runbooks/embedded-board-to-shared-dolt-server.md), validated end to end. Then `anton server-mode <repo> --host <host> --database <db>` does the config half: it writes the metadata above, verifies the board reads back whole, and puts the old file back if it doesn't. `bd export` → `bd import` is **not** a substitute — it moves the issues and drops the board's Dolt commit history. The embedded `.beads/embeddeddolt/<db>/` copy stays where it is throughout: it's the history backup and the way back.
 
 Full behaviour, including what each mode does when the network or the server goes down, is in [`DESIGN.md` §3a](./DESIGN.md#3a-board-modes--embedded-vs-shared-server).
 
