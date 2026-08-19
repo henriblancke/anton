@@ -403,7 +403,7 @@ async function settleProposal(
   const written = changed.map((s) => s.id);
   try {
     await beads.note(repo, proposal.id, appliedNote(plan, summary, actor));
-    await beads.close(repo, proposal.id, `applied: ${summary}`);
+    await beads.close(repo, proposal.id, appliedCloseReason(summary, actor));
   } catch (e) {
     throw await attachFailure(repo, proposal, unsettled(proposal.id, written, e));
   }
@@ -435,6 +435,28 @@ function unsettled(proposalId: string, changed: string[], e: unknown): ProposalA
       `approving it again settles it without writing anything`,
     changed,
   );
+}
+
+/** The one phrase that marks a close as an UNATTENDED apply. Written here, read by track-record.ts. */
+const POLICY_APPLY_PREFIX = "applied by policy: ";
+
+/**
+ * Why an applied proposal was closed — built here rather than inline, because the settled-proposal
+ * record has to tell the founder's verdicts from anton's own.
+ *
+ * An armed kind closes its proposals through this very function a founder-approved one does, so
+ * without the distinction every unattended write would count as evidence the founder accepted the
+ * ask. An armed kind would then ratchet its own record toward 100% applied and the earned floor
+ * (track-record.ts `settlementOf`) could never re-engage on a detector that regressed — the record
+ * would be measuring anton agreeing with itself.
+ */
+export function appliedCloseReason(summary: string, actor: ApplyActor): string {
+  return actor === "policy" ? `${POLICY_APPLY_PREFIX}${summary}` : `applied: ${summary}`;
+}
+
+/** Was this close an unattended apply — anton's own write, rather than a founder's verdict? */
+export function isPolicyApplyReason(reason: unknown): boolean {
+  return typeof reason === "string" && reason.trimStart().startsWith(POLICY_APPLY_PREFIX);
 }
 
 /**

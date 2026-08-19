@@ -920,6 +920,22 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
     expect(choice("container-orphan", "apply").disabled).toBe(false);
   });
 
+  it("locks apply on a verdict that carries NO reason — eligible is the gate, reason only the label", () => {
+    // `eligible` and `reason` are separate fields, and the server omits the reason whenever it has
+    // none to give (an unreadable board yields counts of zero and nothing to say). A gate derived
+    // from the reason would read that as "no lock" and leave apply CLICKABLE on a kind with no
+    // record at all — the one direction this floor may never fail in.
+    renderView({}, [], [], {
+      ...EARNED,
+      misfiled: { applied: 0, settled: 0, eligible: false },
+    });
+
+    expect(choice("misfiled", "apply").disabled).toBe(true);
+    // Still accountable: a disabled control that names no reason is the failure one surface over.
+    expect(screen.getByText(/apply locked · no record could be read/)).toBeTruthy();
+    expect(choice("misfiled", "shadow").disabled).toBe(false);
+  });
+
   it("locks every kind on the board as it stands — nothing has earned apply yet", () => {
     renderView({});
     for (const kind of KINDS) expect(choice(kind, "apply").disabled).toBe(true);

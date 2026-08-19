@@ -66,8 +66,11 @@ export interface ShadowInput {
   policy: ProposalAutonomyPolicy;
   /**
    * What this board's settled proposals say about each kind (anton-m29g) — read off the caller's own
-   * snapshot, alongside the policy, because a kind the record has not earned resolves to `propose`
-   * whatever the setting says and so is not shadowable either.
+   * snapshot, alongside the policy, and threaded through to `autonomyFor` so the shadow set is picked
+   * by the identical resolver the pass acts on rather than by a second reading of the policy.
+   *
+   * The earned floor gates `apply` alone: a kind set to `shadow` is unaffected by its record and
+   * reaches here unchanged — which is how an unearned kind builds one in the first place.
    */
   record: ProposalTrackRecord;
   /** The pass's own board snapshot stamp: what every premise check dates "since we asked" against. */

@@ -14,6 +14,14 @@ export interface Bead {
   acceptance_criteria?: string; // the field bd show/dep return
   context?: string;
   labels?: string[];
+  /**
+   * Why a closed bead was closed (`bd close --reason`). Declared rather than left to the index
+   * signature because it is read as a DISCRIMINATOR, not as prose: the settled-proposal record tells
+   * a founder's verdict from a fold or an unattended apply by this string alone (gardener's
+   * `isFoldReason` / `isPolicyApplyReason`), and a field typed `unknown` hides a bd that stops
+   * carrying it behind a check that just silently answers "no".
+   */
+  close_reason?: string;
   external_ref?: string;
   /**
    * bd custom metadata (`bd update --set-metadata k=v`, read back as an object). anton's PR pointer

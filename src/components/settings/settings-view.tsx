@@ -140,6 +140,18 @@ interface EarnedKind {
 /** A kind with no record at all — what an unreadable board, or a board with no proposals, yields. */
 const NO_RECORD: EarnedKind = { applied: 0, settled: 0, eligible: false };
 
+/**
+ * Why `apply` is locked, always sayable.
+ *
+ * `eligible` is the gate and `reason` only ever the label for it — the two are separate fields, so a
+ * verdict that is ineligible with no reason ({@link NO_RECORD}, what an unreadable board yields) must
+ * still read as locked. Deriving the lock from `reason` instead would leave that case naming no
+ * reason AND offering the level: the one direction this floor may never fail in.
+ */
+function lockedReason(earned: EarnedKind): string {
+  return earned.reason ?? "no record could be read for this kind — apply stays locked";
+}
+
 /** One detection kind as the founder meets it: what its move does, and whether it can be armed. */
 interface AutonomyKindSpec {
   /** A GardenerDetectionKind (src/lib/gardener/detections.ts). */
@@ -2012,7 +2024,7 @@ function AutonomyRow({
             record · {earned.applied}/{earned.settled} applied — clears the bar
           </span>
         ) : (
-          <span className="text-[11px] text-risk-med">apply locked · {earned.reason}</span>
+          <span className="text-[11px] text-risk-med">apply locked · {lockedReason(earned)}</span>
         )}
       </div>
       <span className="ml-auto shrink-0">
@@ -2047,7 +2059,7 @@ function AutonomyChoice({
   // only that one: `shadow` is how the record becomes readable in the first place and writes
   // nothing, so gating it would lock the door and pocket the key.
   const pinned = kind.blocked;
-  const unearned = kind.blocked ? undefined : earned.eligible ? undefined : earned.reason;
+  const unearned = kind.blocked || earned.eligible ? undefined : lockedReason(earned);
   return (
     <fieldset className="flex gap-0.5 rounded-[9px] border border-border bg-background/40 p-0.5">
       <legend className="sr-only">{kind.id} autonomy</legend>

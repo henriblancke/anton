@@ -16,6 +16,11 @@
  *     deliberately, so that folding does not poison the survivor's fingerprint. Counting those as
  *     applies would score every duplicate as a success — precision inflating exactly when a detector
  *     is at its noisiest. The fold's own close reason is the tell ({@link isFoldReason}).
+ *   • AN UNATTENDED APPLY IS NOT A VERDICT. An armed kind closes its own proposals through the same
+ *     `applyProposal` a founder-approved one does, so counting those would let a kind ratchet its own
+ *     record to 100% the moment it was armed — the floor could never re-engage on a detector that
+ *     regressed, because it would be reading anton agreeing with itself. The policy close carries its
+ *     own tell ({@link isPolicyApplyReason}).
  *   • THE WINDOW ROLLS. Only the last {@link EARNED_AUTONOMY_WINDOW} settled proposals per kind
  *     count, newest first, so a rewritten detector is not judged forever by the record of the one it
  *     replaced.
@@ -25,6 +30,7 @@
  * page two different answers to one question.
  */
 import { beads, type Bead } from "../beads/bd";
+import { isPolicyApplyReason } from "./apply";
 import {
   emptyTrackRecord,
   EARNED_AUTONOMY_WINDOW,
@@ -66,12 +72,15 @@ function settledAt(bead: Bead): number {
  *     writes, and it is tested FIRST because an abandoned bead is also closed.
  *   • A FOLD is neither. Nobody answered it; an overlapping patrol filed the same claim twice and
  *     this is the copy that was withdrawn.
- *   • Any other plain close is an apply — the move landed.
+ *   • AN UNATTENDED APPLY is neither. The kind was armed, so anton wrote it and nobody was asked —
+ *     a count of what the founder decided cannot include anton's own writes.
+ *   • Any other plain close is an apply — the move landed, and a human said so.
  */
 function settlementOf(bead: Bead): Settlement | undefined {
   if (beads.isAbandoned(bead)) return { applied: false, atMs: settledAt(bead) };
   if (bead.status !== "closed") return undefined;
   if (isFoldReason(bead.close_reason)) return undefined;
+  if (isPolicyApplyReason(bead.close_reason)) return undefined;
   return { applied: true, atMs: settledAt(bead) };
 }
 

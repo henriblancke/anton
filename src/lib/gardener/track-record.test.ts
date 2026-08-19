@@ -7,6 +7,8 @@
  *   • a FOLDED duplicate is NEITHER, because `reconcileDuplicateProposals` plainly closes twins on
  *     purpose. Counting a fold as an apply would score noise as success exactly when a detector is
  *     at its noisiest.
+ *   • an ARMED kind's own apply is neither — anton wrote it and nobody was asked, so counting it
+ *     would let an armed kind ratchet its own record to 100% and pin the floor open forever.
  * And the window ROLLS, so a rewritten detector is not judged by the record of the one it replaced.
  */
 import { describe, expect, it } from "vitest";
@@ -24,6 +26,7 @@ import {
   proposalFingerprint,
   type GardenerDetectionKind,
 } from "./detections";
+import { appliedCloseReason } from "./apply";
 import { foldReason } from "./emit";
 import { proposalTrackRecord } from "./track-record";
 
@@ -32,7 +35,7 @@ let seq = 0;
 /** A proposal bead of `kind`, carrying a real fingerprint label — the record's only kind signal. */
 function proposal(
   kind: GardenerDetectionKind,
-  settled: "applied" | "declined" | "folded" | "open",
+  settled: "applied" | "declined" | "folded" | "armed" | "open",
   atMs = Date.UTC(2026, 0, 1) + seq * 86_400_000,
 ): Bead {
   seq += 1;
@@ -53,7 +56,8 @@ function proposal(
   if (settled === "folded") {
     return { ...base, close_reason: foldReason("anton-keep", fingerprint) };
   }
-  return { ...base, close_reason: "applied: re-parented anton-a under anton-b" };
+  const summary = "re-parented anton-a under anton-b";
+  return { ...base, close_reason: appliedCloseReason(summary, settled === "armed" ? "policy" : "approval") };
 }
 
 const ALL_APPLY: ProposalAutonomyPolicy = Object.fromEntries(
@@ -82,6 +86,21 @@ describe("proposalTrackRecord", () => {
       proposal("parentless-cluster", "folded"),
     ]);
     expect(record["parentless-cluster"]).toEqual({ settled: 1, applied: 1 });
+  });
+
+  it("does NOT count an armed kind's own unattended apply as a founder verdict", () => {
+    // The ratchet: an armed kind closes its own proposals through the same `applyProposal` an
+    // approval calls, so counting those would let it drive its record to 100% applied with nobody
+    // asked — and the floor could never re-engage on a detector that regressed. Only the two the
+    // founder actually decided survive here.
+    const record = proposalTrackRecord([
+      proposal("implied-order", "applied"),
+      proposal("implied-order", "declined"),
+      ...Array.from({ length: EARNED_AUTONOMY_WINDOW }, () => proposal("implied-order", "armed")),
+    ]);
+    expect(record["implied-order"]).toEqual({ settled: 2, applied: 1 });
+    // And the ratchet is what that stops: 50% on two verdicts is below every bar.
+    expect(earnedAutonomyOfKind("implied-order", record).eligible).toBe(false);
   });
 
   it("ignores proposals still standing — an open ask is a question nobody has answered", () => {
