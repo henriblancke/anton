@@ -16,7 +16,10 @@ import { PoisonEpic } from "../errors";
 import type { StepContext } from "./context";
 import type { StepDefinition } from "./result";
 
-/** The registry a step is resolved against: `step:<name>` suffix → its definition. */
+/**
+ * The step registry: `step:<name>` suffix → its definition. What a step resolves against here, and
+ * what the formula floor validates a cooked formula against.
+ */
 export type StepRegistry = Readonly<Record<string, StepDefinition>>;
 
 /** The label prefix that names a step's handler: `step:<name>`. */

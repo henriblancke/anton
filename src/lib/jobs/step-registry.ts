@@ -56,7 +56,7 @@ export { claudeStep, implementStep, withDispatchNotes } from "./steps/agent";
 export { reviewStep, verifyStep } from "./steps/gates";
 export { commitStep, prStep } from "./steps/git";
 export { prBody, ticketPrompt, truncateField } from "./steps/prompts";
-export { stepName, STEP_LABEL_PREFIX } from "./steps/resolve";
+export { stepName, STEP_LABEL_PREFIX, type StepRegistry } from "./steps/resolve";
 
 /**
  * Every step anton knows how to execute, by label suffix. A project formula may name any of these;

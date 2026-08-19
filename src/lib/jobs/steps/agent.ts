@@ -61,8 +61,8 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
  */
 export async function claudeStep(ctx: StepContext): Promise<StepResult> {
   const stepId = ctx.step?.id ?? "claude";
-  const reasoning = await loadStepReasoning(ctx, stepId);
   ctx.assertLeaseHeld?.();
+  const reasoning = await loadStepReasoning(ctx, stepId);
   return dispatchClaude(ctx, {
     beadId: ctx.target.id,
     prompt: [reasoning, "", "---", "", stepTaskBlock(ctx, stepId)].join("\n"),
