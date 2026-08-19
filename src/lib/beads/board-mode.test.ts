@@ -1,6 +1,7 @@
 /**
- * Board-mode detection and the two behaviours that hang off it (anton-4gd2, anton-0tul,
- * anton-ffmw.1).
+ * Board-mode detection and the sync behaviour that hangs off it (anton-4gd2, anton-0tul). The
+ * other consumer — the per-project scoping of a bd spawn's environment — is covered by
+ * `bd-env.test.ts`; this file owns only what metadata.json is read to say.
  *
  * The embedded-mode assertions are not padding: every change here is gated on mode precisely so
  * that a board WITHOUT a shared server keeps its existing sync behaviour, and these are what hold
@@ -11,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { resetServerPreflight, runDoltSync } from "./bd";
-import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode, resetBoardModeCache } from "./board-mode";
+import { isServerMode, readBoardMode, resetBoardModeCache } from "./board-mode";
 
 /** Mirrors bd.ts's internal BdExec seam; kept local so the test does not widen that module's API. */
 type TestExec = (cwd: string, args: string[]) => Promise<string>;
@@ -43,6 +44,7 @@ describe("readBoardMode", () => {
       dolt_mode: "server",
       dolt_server_host: "dolt.example.dev",
       dolt_server_port: 3306,
+      dolt_server_user: "anton",
       dolt_database: "anton",
     });
     expect(readBoardMode(dir)).toEqual({
@@ -50,6 +52,7 @@ describe("readBoardMode", () => {
       host: "dolt.example.dev",
       port: 3306,
       database: "anton",
+      user: "anton",
     });
   });
 
@@ -147,19 +150,6 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
     };
     await expect(runDoltSync(dir, exec, "pull")).resolves.toBe("synced");
     expect(calls.map((a) => a.join(" "))).toEqual(["dolt pull"]);
-  });
-});
-
-describe("PROJECT_SCOPED_BD_ENV (anton-ffmw.1)", () => {
-  it("covers the vars that select a project's database", () => {
-    // These are the ones that routed anton's bd calls at the wrong database. Credentials are
-    // deliberately absent: they are shared across projects on a server, and stripping them would
-    // leave every spawned bd unable to authenticate.
-    expect(PROJECT_SCOPED_BD_ENV).toContain("BEADS_DOLT_SERVER_DATABASE");
-    expect(PROJECT_SCOPED_BD_ENV).toContain("BEADS_DOLT_SERVER_HOST");
-    expect(PROJECT_SCOPED_BD_ENV).toContain("BEADS_DOLT_SERVER_USER");
-    expect(PROJECT_SCOPED_BD_ENV).not.toContain("BEADS_DOLT_PASSWORD");
-    expect(PROJECT_SCOPED_BD_ENV).not.toContain("BEADS_DOLT_SERVER_TLS");
   });
 });
 

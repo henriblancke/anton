@@ -12,7 +12,9 @@
  *     remote is unreachable from there by construction.
  *
  *   - **Connection config is per-project, but the environment is per-process** (anton-ffmw.1).
- *     See `bd.ts`'s spawn path for why that has to be scoped away.
+ *     The mode, the connection target, and the database USER read here are what `bd-env.ts` uses to
+ *     scope a bd spawn's environment — see that module for why inheriting it corrupts across
+ *     projects.
  *
  * bd's own precedence is env > metadata.json > config.yaml. We deliberately read ONLY
  * `.beads/metadata.json` here: it is per-directory, so it describes *this* project no matter which
@@ -35,6 +37,10 @@ export interface BoardModeInfo {
   host?: string;
   port?: number;
   database?: string;
+  /** The configured database user. Also what scopes the password a bd spawn is given, so that a
+   * per-project account can authenticate without the environment leaking across projects
+   * (anton-ffmw.1 — see `bd-env.ts`). */
+  user?: string;
 }
 
 /**
@@ -80,6 +86,7 @@ export function readBoardMode(repoPath: string): BoardModeInfo {
         host: typeof meta.dolt_server_host === "string" ? meta.dolt_server_host : undefined,
         port: typeof meta.dolt_server_port === "number" ? meta.dolt_server_port : undefined,
         database: typeof meta.dolt_database === "string" ? meta.dolt_database : undefined,
+        user: typeof meta.dolt_server_user === "string" ? meta.dolt_server_user : undefined,
       };
     }
   } catch {
@@ -94,24 +101,3 @@ export function readBoardMode(repoPath: string): BoardModeInfo {
 export function isServerMode(repoPath: string): boolean {
   return readBoardMode(repoPath).mode === "server";
 }
-
-/**
- * Env vars that describe WHICH project/database to talk to. These must never be inherited by a bd
- * subprocess run against a different project (anton-ffmw.1): they are bd's highest-priority config
- * source, so an inherited value silently overrides the target project's own metadata.json and points
- * it at the wrong database.
- *
- * `BEADS_DOLT_PASSWORD` and `BEADS_DOLT_SERVER_TLS` are deliberately NOT listed: they are
- * credentials/transport, identical across projects on a given server, and stripping them would leave
- * every spawned bd unable to authenticate. Making credentials per-project is the follow-on that
- * retires the shared account — see anton-ffmw.1's acceptance.
- */
-export const PROJECT_SCOPED_BD_ENV = [
-  "BEADS_DOLT_SERVER_MODE",
-  "BEADS_DOLT_SERVER_HOST",
-  "BEADS_DOLT_SERVER_PORT",
-  "BEADS_DOLT_SERVER_USER",
-  "BEADS_DOLT_SERVER_DATABASE",
-  "BEADS_DOLT_SERVER_SOCKET",
-  "BEADS_DOLT_DATA_DIR",
-] as const;

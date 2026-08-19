@@ -122,11 +122,17 @@ solo board's only propagation path.
    verification also skips its settle window, because a claim is visible to every other machine the
    moment it commits.
 
-2. **Project-scoped `BEADS_DOLT_*` never survive a bd spawn** (`childEnv`). They are bd's
-   highest-priority config source, so anton's own connection settings — inherited from whatever
-   directory anton was launched in — would override the *target* project's `metadata.json` and point
-   it at the wrong database. Credentials (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are
-   deliberately not stripped: they are shared across projects on a given server.
+2. **A bd spawn's environment is scoped to the project it runs against** (`src/lib/beads/bd-env.ts`,
+   anton-ffmw.1). Env is bd's highest-priority config source, so anton's own connection settings —
+   inherited from whatever directory anton was launched in — would override the *target* project's
+   `metadata.json` and point it at the wrong database. Two rules:
+   - **Identity and routing are stripped** — every var that names *which* database to open, server
+     or embedded (`PROJECT_SCOPED_BD_ENV` is the list), leaving the target's own per-directory
+     `metadata.json` to decide.
+   - **The password is narrowed to the target's database user**: `BEADS_DOLT_PASSWORD_<USER>` wins
+     over the ambient `BEADS_DOLT_PASSWORD`, which is what makes per-project accounts work at all.
+   An explicit `env` override at the call site beats both. `BEADS_DOLT_SERVER_TLS` is transport, not
+   identity, and is left inherited.
 
 **Configuring server mode.** Put connection details in `.beads/metadata.json` — never in the
 environment, for the reason above, and never in `.beads/config.yaml` (it is the lowest-priority
@@ -143,9 +149,13 @@ do not match):
 }
 ```
 
-Credentials come from the environment (`BEADS_DOLT_PASSWORD`, plus `BEADS_DOLT_SERVER_TLS=true`
-when the server sets `require_secure_transport`). `dolt_server_port` must stay in `metadata.json`
-despite bd's deprecation warning — without it bd dials port 0 against a remote host.
+Credentials come from the environment, never from `metadata.json` — it is committed. Give each
+project's database user its own variable, `BEADS_DOLT_PASSWORD_<USER>` (uppercased, non-alphanumeric
+folded to `_`): the user above wants `BEADS_DOLT_PASSWORD_BEADS`. A bare `BEADS_DOLT_PASSWORD` is
+still honoured as the fallback for every project, which is the one-shared-account setup; per-user
+variables are what let that account be retired. Add `BEADS_DOLT_SERVER_TLS=true` when the server sets
+`require_secure_transport`. `dolt_server_port` must stay in `metadata.json` despite bd's deprecation
+warning — without it bd dials port 0 against a remote host.
 
 On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
 unreachable, records a failure naming the configured host/port and the ways out, rather than the

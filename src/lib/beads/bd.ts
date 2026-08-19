@@ -10,7 +10,8 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
-import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode } from "./board-mode";
+import { buildBdEnv, passwordVarHint } from "./bd-env";
+import { isServerMode, readBoardMode } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
@@ -337,32 +338,11 @@ function killGraceMs(): number {
 /** Per-invocation knobs for {@link bd}: extra env, and stdin for the commands that read it. */
 interface BdOpts {
   /** Merged over `process.env` (e.g. BEADS_ACTOR for an attributed write). An `undefined` value
-   * REMOVES the variable rather than inheriting the server's — see {@link childEnv}. */
+   * REMOVES the variable rather than inheriting the server's — see `bd-env.ts`'s `buildBdEnv`. */
   env?: Record<string, string | undefined>;
   /** Written to bd's stdin, which is then closed. Required by `bd batch`, which reads its
    * commands from stdin — without it bd would block on an open pipe until the step budget. */
   stdin?: string;
-}
-
-/**
- * The server's env with `overrides` applied, where an `undefined` override REMOVES the variable
- * rather than leaving whatever the server was launched with. That deletion is the point: a gate call
- * that can't derive a slug must not inherit an ambient `GH_REPO`, which would override `gh`'s repo
- * resolution and answer this project's gates with another repository's verdict.
- */
-function childEnv(overrides: Record<string, string | undefined>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides };
-  for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete env[key];
-  // Project-scoped BEADS_DOLT_* never survive the spawn (anton-ffmw.1). They are bd's
-  // HIGHEST-priority config source, so anton's own connection settings — inherited from whatever
-  // directory anton was launched in — would override the TARGET project's .beads/metadata.json and
-  // point it at the wrong database. Same failure shape as the ambient GH_REPO noted above, and it
-  // was caught in production only because bd refuses on a project-id mismatch:
-  //   PROJECT IDENTITY MISMATCH — refusing to connect
-  // Stripping them lets each project's own metadata.json decide, which is per-directory and so
-  // cannot leak. An explicit override still wins: callers that deliberately set one keep it.
-  for (const key of PROJECT_SCOPED_BD_ENV) if (!(key in overrides)) delete env[key];
-  return env;
 }
 
 /**
@@ -397,10 +377,10 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
       cwd,
       // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
       detached: process.platform !== "win32",
-      // Always built through childEnv, even with no overrides: it is what strips the
-      // project-scoped BEADS_DOLT_* that would otherwise route this call at another
-      // project's database (anton-ffmw.1).
-      env: childEnv(opts?.env ?? {}),
+      // Always built through buildBdEnv, even with no overrides: it is what strips the
+      // project-scoped BEADS_DOLT_* that would otherwise route this call at another project's
+      // database, and what narrows the password to THIS project's user (anton-ffmw.1).
+      env: buildBdEnv(cwd, opts?.env ?? {}),
     });
 
     if (opts?.stdin !== undefined) {
@@ -833,8 +813,9 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
     throw new Error(
       `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
         `Check the server is up and reachable, that .beads/metadata.json names the right ` +
-        `host/port, and that BEADS_DOLT_PASSWORD is set in this process — or set ` +
-        `dolt_mode back to "embedded" to work from the local copy. Underlying error: ${output}`,
+        `host/port/user, and that this project's password is set in this process — ` +
+        `${passwordVarHint(cwd)} — or set dolt_mode back to "embedded" to work from the local ` +
+        `copy. Underlying error: ${output}`,
       { cause: e },
     );
   }
