@@ -11,6 +11,11 @@
  * Only `shipped-orphan` is armed. Every other kind stays at `propose`, so whatever else this fixture
  * yields is filed and left alone — which is also the shape an operator arms in real life: one kind
  * they trust, not the whole policy.
+ *
+ * Arming it takes two things, not one (anton-m29g): the setting, and a record. The fixture seeds the
+ * kind's settled proposals on the real board below, because the earned floor is derived from the
+ * board the pass itself reads — an operator who flips the setting on a kind the founder has never
+ * accepted an ask from gets `propose`, and this suite would prove nothing about the armed walk.
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -30,7 +35,10 @@ import { beads, type Bead } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
-import { isProposalBead } from "../gardener/detections";
+import { appliedCloseReason } from "../gardener/apply";
+import { EARNED_AUTONOMY_BARS, earnedAutonomyOfKind } from "../gardener/autonomy";
+import { isProposalBead, proposalFingerprint } from "../gardener/detections";
+import { proposalTrackRecord } from "../gardener/track-record";
 import { makeGardenerHandler } from "./gardener";
 import type { Clock } from "./queue";
 
@@ -75,6 +83,42 @@ describeBd("gardener armed pass e2e (real handler · real bd)", () => {
       projectId,
     });
 
+  /**
+   * The record that has EARNED `shipped-orphan` its arming (anton-m29g): the founder's own accepted
+   * asks, on the real board, closed through the very builder `applyProposal` closes an approved
+   * proposal with.
+   *
+   * Real beads rather than a stub, because the floor reads the board this pass reads — a seed that
+   * only looked settled would leave the kind at `propose` and every assertion below chasing a
+   * missing apply. Each carries its own fingerprint, so none folds into another or into the ask the
+   * patrol is about to file; all are applied, clearing the `history` tier's percentage outright.
+   */
+  const earnShippedOrphan = async (): Promise<void> => {
+    const ids: string[] = [];
+    for (let i = 0; i < EARNED_AUTONOMY_BARS.history.minSettled; i++) {
+      ids.push(
+        await beads.create(repo, {
+          title: `a shipped-orphan ask the founder accepted (${i})`,
+          type: "task",
+          labels: [proposalFingerprint("shipped-orphan", `earned:${i}`)],
+        }),
+      );
+    }
+    await beads.batch(
+      repo,
+      ids.map((id) => ({
+        op: "close" as const,
+        id,
+        reason: appliedCloseReason(`retired ${id}`, "approval"),
+      })),
+    );
+
+    // Fail HERE if the seed stops earning the kind. Without it a broken record reads as an ordinary
+    // unarmed pass, and the suite reports a missing apply rather than the missing precondition.
+    const record = proposalTrackRecord(await beads.list(repo, ["--status", "all"]));
+    expect(earnedAutonomyOfKind("shipped-orphan", record).eligible).toBe(true);
+  };
+
   beforeAll(async () => {
     repoDir = makeBdRepo();
     repo = repoDir.repo;
@@ -103,6 +147,8 @@ describeBd("gardener armed pass e2e (real handler · real bd)", () => {
       defaultBranch: "main",
       settingsJson: JSON.stringify({ proposalAutonomy: { "shipped-orphan": "apply" } }),
     });
+
+    await earnShippedOrphan();
 
     // The subject was written a heartbeat ago, and this pass both files the ask and applies it: an
     // apply is only allowed when the subject's write can be ordered BEFORE the board read behind it
