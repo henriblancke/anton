@@ -31,6 +31,8 @@ import type { AntonDb, Clock } from "./jobs/queue";
  *   • `not-a-run-target` — not a feature, a parentless task/bug, or a childless epic, so nothing
  *     about it is a thing anton runs (`beads.isRunTarget`).
  *   • `not-open`         — closed, deferred, or already in flight.
+ *   • `abandoned`        — a won't-do. Usually closed with it, but a crashed cascade can leave the
+ *                          label on an OPEN bead, which nothing may pick up.
  *   • `claimed`          — carries an assignee. A target a human took is never taken back.
  *   • `blocked`          — an unmet blocker on the `blocks` graph.
  *   • `approval-gap`     — fails one of the approve gate's four promises (`approval-gate.ts`).
@@ -39,6 +41,7 @@ import type { AntonDb, Clock } from "./jobs/queue";
 export type PickerExclusionReason =
   | "not-a-run-target"
   | "not-open"
+  | "abandoned"
   | "claimed"
   | "blocked"
   | "approval-gap"
