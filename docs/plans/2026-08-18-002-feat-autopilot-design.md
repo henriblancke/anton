@@ -57,8 +57,11 @@ that is the protocol an external worker follows — anton's runtime never runs i
 
 **G2 — product-master can conclude but barely act.** `src/lib/jobs/product-master-steps.ts:132`
 already calls `applyArmedProposals`, so the armed path exists and is shared with the gardener. But the
-move vocabulary (`src/lib/gardener/detections.ts`) is `reprioritize`, `rehome`, `split`, `kill`,
-`unapprove`. There is no `approve`: product-master can **un**-approve your work and never start any.
+`GardenerMove` union (`src/lib/gardener/detections.ts:45-51`) is `reparent | link | retire |
+reprioritize | split | unapprove` — note there is no `rehome` (re-homing is `reparent`) and no
+`kill` (closing or deferring is `retire` with a `retireAs` of `close`/`defer`/`supersede`). There is
+no `approve`: through `degraded-approval → unapprove`, product-master can **un**-approve your work
+and never start any.
 
 **G3 — Failure has one outcome: stop.** A blocked run parks and escalates. `ANTON-RESULT: blocked —
 <reason>` (`src/lib/claude/anton-result.ts`) carries free prose, so anton cannot dispatch on *why*.
@@ -115,7 +118,7 @@ repair drafting (fires on a block), `execute-epic` (the work), and the review ga
  │    read-only tools)  │          │                      │
  └──────────┬───────────┘          └───────────┬──────────┘
             │ priority, ordering edges,        │ eligibility policy
-            │ split, kill, repair              │ + PRIME rank
+            │ split, retire, repair            │ + PRIME rank
             │                                  │ + WIP + quota share
             └────────►  T H E   B O A R D  ◄───┘
                               │
@@ -159,7 +162,13 @@ concept to reconcile and the correction propagates to every machine as ordinary 
 - **R1.4** Ranking is the PRIME order: priority (P0 first, unset last) → transitive unblocking value
   via `blocks` edges → age. Total and deterministic.
 - **R1.5** Starting a target writes `approved` **and** performs the auto-claim the approve route
-  already performs, then enqueues. A target claimed by a human is never taken.
+  already performs, then enqueues. A target claimed by a human is never taken. The label write and
+  the claim are ONE atomic operation under `withClaimLock`, reusing the approve route's sequence
+  rather than reimplementing it: that route already holds the lock across both, because the label is
+  what locks the reservation (`approve/route.ts:387-393`). A failed claim must leave no `approved`
+  label behind. The lock is keyed on `repoPath` and so serializes one machine only — cross-machine
+  the guard is the assignee CAS, which on an **embedded** board reads a possibly-stale mirror, so the
+  pass pulls before the CAS and fails closed when the pull does not land.
 - **R1.6** Idempotent: listing is a view of the board, never a queue of events. Two overlapping
   passes must enqueue exactly one run (`enqueueExecuteEpicIfAbsent`).
 - **R1.7** Every start writes a bead note recording the rule that matched and the rank, with actor
@@ -243,7 +252,12 @@ concept to reconcile and the correction propagates to every machine as ordinary 
   `ANTON-RESULT: blocked — <class> — <prose>`, classes `ref-stale`, `dep-missing`,
   `acceptance-missing`, `oversized`, `env`, `other`. Update `RESULT_LINE_RE` and the base system
   prompt (`src/prompts/system-base.md`).
-- **R5.2** Unparseable or unknown classes escalate exactly as today — fail closed, so an out-of-date
+- **R5.2** The class must be an **exact** member of the closed enum — never a prefix, substring, or
+  first-word match. A first token that is not an exact member is legacy prose, not an unknown class,
+  and the line parses as `other` with the whole original text preserved as the reason. Without this
+  rule a mid-rollout fleet emitting both formats would see `blocked — ref to the missing component`
+  parsed as class `ref`, and anton would run a confident repair on a bead nobody classified.
+- **R5.2a** Unparseable or unknown classes escalate exactly as today — fail closed, so an out-of-date
   agent prompt degrades to current behaviour rather than to guessing.
 - **R5.3** Each class becomes a **detection kind** with its own autonomy level, reusing `autonomyFor`
   and `applyArmedProposals` unchanged.
