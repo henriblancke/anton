@@ -59,7 +59,7 @@ export const SPAWN_KILL_SIGNAL = "SIGKILL";
  * an ops escape hatch). A cap rather than an override so production keeps the proportions above.
  * Read per call so a change lands without a module reload.
  */
-function budgetMs(kind) {
+export function budgetMs(kind) {
   const raw = Number(process.env.ANTON_BEADS_SPAWN_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? Math.min(SPAWN_BUDGETS_MS[kind], raw) : SPAWN_BUDGETS_MS[kind];
 }
@@ -74,7 +74,7 @@ function timedOut(r) {
  * output, which would otherwise surface as an opaque `exit ?` and send the reader hunting a cause
  * that isn't there (the anton-be1s misreport). `output` is the caller's own stdout/stderr pick.
  */
-function failureDetail(r, timeoutMs, output) {
+export function failureDetail(r, timeoutMs, output) {
   if (timedOut(r)) return `timed out after ${timeoutMs}ms (killed with ${r.signal ?? SPAWN_KILL_SIGNAL})`;
   return output.trim() || `exit ${r.status ?? "?"}`;
 }
@@ -446,15 +446,22 @@ export function configYamlHas(beadsDir, key, want) {
  * Idempotently ensure config.yaml carries `key: want`. `bd config set` patches config.yaml (appends a
  * single key line, never clobbering the rest); we skip the write when the file already matches so a
  * re-run is a true no-op. Returns "already" | "set" | "failed".
+ *
+ * `opts.exec` is the same seam `ensureDoltConnection` takes: a caller that must run bd under a
+ * project-scoped environment (server-mode.mjs) passes its own runner rather than inheriting the
+ * ambient one.
  */
-export function ensureBdConfig(dir, beadsDir, key, want) {
+export function ensureBdConfig(dir, beadsDir, key, want, opts = {}) {
   if (configYamlHas(beadsDir, key, want)) return "already";
-  const r = spawnSync("bd", ["config", "set", key, want], {
-    cwd: dir,
-    stdio: "ignore",
-    timeout: budgetMs("bd"),
-    killSignal: SPAWN_KILL_SIGNAL,
-  });
+  const ms = budgetMs("bd");
+  const r = opts.exec
+    ? opts.exec("bd", ["config", "set", key, want], ms)
+    : spawnSync("bd", ["config", "set", key, want], {
+        cwd: dir,
+        stdio: "ignore",
+        timeout: ms,
+        killSignal: SPAWN_KILL_SIGNAL,
+      });
   return (r.status ?? 1) === 0 ? "set" : "failed";
 }
 
@@ -491,6 +498,68 @@ export function readDoltMetadata(dir) {
   } catch {
     return { mode: "embedded" };
   }
+}
+
+/**
+ * Env vars that name WHICH project/database bd talks to. Never inherited by a bd spawned against a
+ * different project — an inherited value silently overrides that project's own metadata.json
+ * (anton-ffmw.1; `bd-env.ts` carries the field report).
+ *
+ * Credentials and transport (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are deliberately
+ * absent: they answer "may I connect", not "connect to what", and a blanket strip would leave every
+ * spawn unable to authenticate. The password is scoped by {@link scopedPasswordVar} instead.
+ *
+ * Defined here rather than in `bd-env.ts` so the pure-node CLI — which cannot import TypeScript —
+ * scopes its own bd spawns off the same list the server uses. `bd-env.ts` re-exports it.
+ */
+export const PROJECT_SCOPED_BD_ENV = [
+  // Whether to reach for a server at all, and which one.
+  "BEADS_DOLT_SERVER_MODE",
+  "BEADS_DOLT_SHARED_SERVER",
+  "BEADS_DOLT_PROXIED_SERVER",
+  "BEADS_DOLT_SERVER_HOST",
+  "BEADS_DOLT_SERVER_PORT",
+  "BEADS_DOLT_SERVER_USER",
+  "BEADS_DOLT_SERVER_DATABASE",
+  "BEADS_DOLT_SERVER_SOCKET",
+  // Embedded-mode routing: the data directory, and the ports of the per-project server bd starts
+  // over it. An inherited port dials another project's server exactly as a host/database would.
+  "BEADS_DOLT_DATA_DIR",
+  "BEADS_DOLT_PORT",
+  "BEADS_DOLT_REMOTESAPI_PORT",
+];
+
+/** The one credential var bd reads. Scoped per project rather than stripped — see the note above. */
+export const BD_PASSWORD_VAR = "BEADS_DOLT_PASSWORD";
+
+/**
+ * The env var holding `user`'s password: `BEADS_DOLT_PASSWORD_<USER>`, uppercased with every
+ * non-alphanumeric run folded to `_` so a user like `anton-bot` maps to a legal var name.
+ *
+ * Keyed by USER, not by database or project: the password belongs to the account, so two projects
+ * that legitimately share one account need one var, not two copies that can drift apart.
+ */
+export function scopedPasswordVar(user) {
+  return `${BD_PASSWORD_VAR}_${user.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+/**
+ * `parentEnv` with project identity stripped and the password narrowed to `user`'s account — the
+ * environment ONE bd invocation against one project gets.
+ *
+ * The ambient `BEADS_DOLT_PASSWORD` is left in place when the user has no scoped variable: a single
+ * shared account is still a valid deployment. `bd-env.ts` layers call-site overrides on top of this
+ * same rule for the server; the CLI uses it directly.
+ *
+ * @param {NodeJS.ProcessEnv} parentEnv
+ * @param {string|undefined} user the target project's configured database user, if any
+ */
+export function scopeBdEnv(parentEnv, user) {
+  const env = { ...parentEnv };
+  for (const key of PROJECT_SCOPED_BD_ENV) delete env[key];
+  const scoped = user ? parentEnv[scopedPasswordVar(user)] : undefined;
+  if (scoped !== undefined) env[BD_PASSWORD_VAR] = scoped;
+  return env;
 }
 
 /** The config.yaml keys anton's team-config enforces on an EMBEDDED board — the default profile,

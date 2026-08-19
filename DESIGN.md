@@ -149,10 +149,23 @@ solo board's only propagation path.
    team's history), no remote is wired, and no clone is bootstrapped, since a shared-server board
    keeps no local database to hydrate.
 
-**Configuring server mode.** Put connection details in `.beads/metadata.json` — never in the
-environment, for the reason above. The **mode** lives there and nowhere else: `bd config set
-dolt.mode` reports success but writes a nested block into a file of flat dotted keys, from bd's
-lowest-priority source, and has no effect. Add `dolt_mode` by hand:
+**Configuring server mode.** One command, per project: `anton server-mode <repo> --host … --port …
+--user … --database …` (anton-yvjd, `src/lib/beads/server-mode.mjs`). It backs the board up
+(`bd export --all` into a self-ignored `.beads/backups/`), writes the file below, verifies with
+`bd dolt test`, **reads the board back from the server** and compares the issue count with what the
+project had a moment earlier, then publishes the connection as the team default. Any failure after
+the write **reverts `metadata.json` byte-for-byte** — in server mode there is no local copy to fall
+back on, so a project left pointing at a server it cannot read is a board outage, and a half-applied
+switch is worse than none.
+
+The read-back is not belt-and-braces: `bd dolt test` proves the SERVER answers, not that this
+project can open its database there. bd's own project-identity guard refuses a database belonging to
+another project (`PROJECT IDENTITY MISMATCH — refusing to connect`) long after the connection test
+has passed, and a board that arrived empty — the copy never ran — connects perfectly.
+
+The connection is what that command writes; the **mode** lives in `.beads/metadata.json` and nowhere
+else, because `bd config set dolt.mode` reports success but writes a nested block into a file of flat
+dotted keys, from bd's lowest-priority source, and has no effect:
 
 ```json
 {
@@ -182,6 +195,15 @@ warning — without it bd dials port 0 against a remote host.
 On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
 unreachable, records a failure naming the configured host/port and the ways out, rather than the
 raw `unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce.
+
+**Moving an existing board onto a server** is two jobs, and anton owns only the second. The board's
+history is a Dolt database directory, and it reaches the server's data volume by a copy a human runs
+— `docs/runbooks/embedded-board-to-shared-dolt-server.md`, validated end to end. `bd dolt remote add`
++ `bd dolt push` cannot stand in for it: in server mode the push executes ON the server, whose image
+ships no ssh client and no keys. Neither can `bd export` → `bd import`, which moves issues and drops
+the commit history. `anton server-mode` is the second job, and it refuses (and reverts) when the
+first has not happened. The embedded `.beads/embeddeddolt/<db>/` is left in place throughout — it is
+the history backup and the escape hatch below.
 
 **Connectivity — what each mode does when things break.** The trade is *offline tolerance* against
 *propagation delay*, and each mode fails in the shape you'd expect from where its data lives:

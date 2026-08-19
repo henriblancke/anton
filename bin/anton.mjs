@@ -8,6 +8,9 @@
  *                  install required skills + selected agents into global ~/.claude (interactive;
  *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI) →
  *                  wire beads Dolt sync (git origin as Dolt remote + initial refs/dolt push)
+ *   anton server-mode  point ONE project's board at a shared Dolt server: back up → write
+ *                  .beads/metadata.json → bd dolt test → read the board back → publish the
+ *                  connection as the team default (reverts the write on any failure)
  *   anton doctor   prereq checks only (non-destructive)
  *   anton dev      next dev  (runner + scheduler auto-start via src/instrumentation.ts)
  *   anton start    next build (if stale) → next start
@@ -49,6 +52,7 @@ import {
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
+import { configureServerMode, SERVER_MIGRATION_RUNBOOK } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import { createInterface } from "node:readline/promises";
@@ -1493,6 +1497,112 @@ async function cmdInit(args = []) {
   return 0;
 }
 
+// ── Per-project server mode (anton server-mode — anton-yvjd) ─────────────────────────────────
+// Points ONE project's board at a shared `dolt sql-server` and proves the switch: back up, write
+// `.beads/metadata.json`, `bd dolt test`, confirm the board reads back whole, publish the connection
+// as the team default. The judgement lives in src/lib/beads/server-mode.mjs; this is its terminal.
+//
+// It configures the connection — it does NOT move the data. Copying an existing board's Dolt
+// history onto the server is docs/runbooks/embedded-board-to-shared-dolt-server.md, which a human
+// runs; this command is what makes that copy safe to point at (and refuses when it hasn't happened).
+
+/**
+ * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
+ * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs.
+ */
+function parseServerModeArgs(args) {
+  const VALUE_FLAGS = {
+    "--host": "host",
+    "--port": "port",
+    "--user": "user",
+    "--database": "database",
+    "--db": "database",
+  };
+  const out = { path: null, host: null, port: null, user: null, database: null, backup: true, force: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--no-backup") {
+      out.backup = false;
+      continue;
+    }
+    if (a === "--force") {
+      out.force = true;
+      continue;
+    }
+    const eq = a.match(/^(--[a-z-]+)=(.*)$/);
+    const flag = eq ? eq[1] : a;
+    const key = VALUE_FLAGS[flag];
+    if (key) {
+      out[key] = eq ? eq[2] : (args[++i] ?? null);
+      continue;
+    }
+    if (a.startsWith("-")) continue; // unknown flag — ignore
+    if (out.path === null) out.path = a;
+  }
+  return out;
+}
+
+/** Keep a multi-line tool message inside the report's left margin instead of breaking out of it. */
+const indent = (text) => String(text).split("\n").join("\n  ");
+
+/** How each step status prints. Anything unrecognised prints plainly rather than being swallowed. */
+const SERVER_MODE_MARKS = {
+  ok: () => c.green("✓"),
+  set: () => c.green("✓"),
+  written: () => c.green("✓"),
+  already: () => c.dim("·"),
+  unset: () => c.dim("·"),
+  skipped: () => c.dim("·"),
+  reverted: () => c.yellow("↩"),
+  failed: () => c.red("✗"),
+  missing: () => c.red("✗"),
+};
+
+async function cmdServerMode(args = []) {
+  const parsed = parseServerModeArgs(args);
+  const dir = resolve(parsed.path ?? process.cwd());
+  console.log(c.bold("anton server-mode") + c.dim(` ${dir}`));
+
+  // Steps print as they happen: an export plus two round trips to the server is long enough that a
+  // batched render reads as a hang. bd's own output is multi-line — its first line is the headline,
+  // the rest is repeated in full under the error below, where the reader is actually looking.
+  const renderStep = (s) => {
+    const mark = (SERVER_MODE_MARKS[s.status] ?? (() => c.dim("·")))();
+    const lines = String(s.detail ?? "").split("\n").filter(Boolean);
+    const detail = lines.length ? `${lines[0]}${lines.length > 1 ? " …" : ""}` : "";
+    console.log(`  ${mark} ${s.name}${detail ? c.dim(` — ${detail}`) : c.dim(` (${s.status})`)}`);
+  };
+
+  const result = configureServerMode(dir, parsed, {
+    log: (m) => console.log(c.dim(`    ${m}`)),
+    onStep: renderStep,
+  });
+
+  if (!result.ok) {
+    console.log(c.red("\n✗ this project was NOT switched to server mode."));
+    for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
+    for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
+    // The count guard is the one failure with a runbook behind it: the server is fine, the data
+    // simply is not on it yet.
+    if (result.counts?.after !== undefined && result.counts.after < (result.counts.before ?? 0)) {
+      console.log(c.dim("  → copy the board's Dolt history onto the server first:"));
+      console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
+    }
+    console.log("");
+    return 1;
+  }
+
+  const { host, port, user, database } = result.connection;
+  console.log(c.green("\n✓ server mode configured.") + c.dim(` ${user ? `${user}@` : ""}${host}:${port}/${database}`));
+  if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} issues from the server.`));
+  if (result.backup?.path) console.log(c.dim(`  pre-switch backup: ${result.backup.path}`));
+  console.log(
+    c.dim("  Next: run the same command on every other machine (the connection travels in config.yaml,\n" +
+      "        the password does not — set it in each shell), then `anton start`.\n"),
+  );
+  return 0;
+}
+
 function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
   return runLocal("next", nextArgs("dev", args));
@@ -1536,6 +1646,7 @@ ${c.bold("Usage:")} anton <command>
 
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
+  ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim("[path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]")}
   ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
@@ -1563,6 +1674,8 @@ function main(argv) {
       return cmdDoctor();
     case "board-check":
       return cmdBoardCheck(rest);
+    case "server-mode":
+      return cmdServerMode(rest);
     case "dev":
       return cmdDev(rest);
     case "start":
@@ -1604,6 +1717,7 @@ export {
   nextArgs,
   main,
   parseInitArgs,
+  parseServerModeArgs,
   ensureBeadsGitignore,
   registerProject,
   resolveAntonDb,

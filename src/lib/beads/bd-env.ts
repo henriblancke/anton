@@ -23,46 +23,15 @@
  *      password, which is why the shared `beads` account existed at all.
  */
 import { readBoardMode } from "./board-mode";
+import { BD_PASSWORD_VAR as PASSWORD_VAR, PROJECT_SCOPED_BD_ENV, scopedPasswordVar } from "./config.mjs";
 
 /**
- * Env vars that name WHICH project/database bd talks to. Never inherited by a bd spawned against a
- * different project — an inherited value silently overrides that project's own metadata.json.
- *
- * Credentials and transport (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are deliberately
- * absent: they answer "may I connect", not "connect to what", and a blanket strip would leave every
- * spawn unable to authenticate. The password is scoped by {@link resolvePassword} instead, which
- * narrows it per project without removing the shared-account fallback.
+ * The identity strip and the per-user password variable both live in `config.mjs`, so the pure-node
+ * CLI scopes a bd spawn exactly as the server does (`anton server-mode` verifies a project's
+ * connection with the same environment anton will later run bd with). Re-exported here because this
+ * module is where the rule is explained and where the app reads it from.
  */
-export const PROJECT_SCOPED_BD_ENV = [
-  // Whether to reach for a server at all, and which one.
-  "BEADS_DOLT_SERVER_MODE",
-  "BEADS_DOLT_SHARED_SERVER",
-  "BEADS_DOLT_PROXIED_SERVER",
-  "BEADS_DOLT_SERVER_HOST",
-  "BEADS_DOLT_SERVER_PORT",
-  "BEADS_DOLT_SERVER_USER",
-  "BEADS_DOLT_SERVER_DATABASE",
-  "BEADS_DOLT_SERVER_SOCKET",
-  // Embedded-mode routing: the data directory, and the ports of the per-project server bd starts
-  // over it. An inherited port dials another project's server exactly as a host/database would.
-  "BEADS_DOLT_DATA_DIR",
-  "BEADS_DOLT_PORT",
-  "BEADS_DOLT_REMOTESAPI_PORT",
-] as const;
-
-/** The one credential var bd reads. Scoped per project rather than stripped — see the module note. */
-const PASSWORD_VAR = "BEADS_DOLT_PASSWORD";
-
-/**
- * The env var holding `user`'s password: `BEADS_DOLT_PASSWORD_<USER>`, uppercased with every
- * non-alphanumeric run folded to `_` so a user like `anton-bot` maps to a legal var name.
- *
- * Keyed by USER, not by database or project: the password belongs to the account, so two projects
- * that legitimately share one account need one var, not two copies that can drift apart.
- */
-export function scopedPasswordVar(user: string): string {
-  return `${PASSWORD_VAR}_${user.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
-}
+export { PROJECT_SCOPED_BD_ENV, scopedPasswordVar };
 
 /**
  * The password for `repoPath`'s configured database user, or `undefined` to leave whatever the

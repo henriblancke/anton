@@ -187,6 +187,7 @@ The **job runner and cron scheduler start automatically** with the server (via `
 ```
 anton setup     check prereqs, migrate DB, install/refresh agents & skills  [--agents <a,b,c>|all] [--force-skills]
 anton init      configure beads in a target repo + register it       [path] [--prefix <p>] [--force-skills]
+anton server-mode  point one project's board at a shared Dolt server + verify it  [path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]
 anton doctor    check prereqs + anton.db + stale skills (non-destructive)
 anton board-check  report beads that break epic → feature → ticket   [path...] (default: cwd)
 anton dev       run the dev server (next dev)                         [--port <n>]

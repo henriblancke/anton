@@ -12,6 +12,7 @@
  *     bin/anton.mjs               the launcher (detects RELEASE_VERSION → bundle/daemon mode)
  *     src/lib/beads/config.mjs    shared Beads setup used by the CLI
  *     src/lib/beads/tiers.mjs     shared tier rules behind `anton board-check`
+ *     src/lib/beads/server-mode.mjs  shared server-mode config behind `anton server-mode`
  *     src/lib/claude/skill-stamp.mjs  shared skill version stamps (setup refresh + doctor drift)
  *     src/prompts/                system-base.md + agents/ (read at runtime, cwd-rooted)
  *     skills/                     vendored SKILL.md assets (read at runtime, cwd-rooted)
@@ -136,6 +137,9 @@ function main(argv) {
     // The tier rules `anton board-check` judges through (anton-i4al). Plain JS precisely so it can
     // ship here and be imported by the pure-Node launcher — the same seam config.mjs uses.
     join("src", "lib", "beads", "tiers.mjs"),
+    // `anton server-mode` — same pure-JS seam, and the command must work from an installed bundle
+    // (that is where a teammate moves their board onto the shared server, anton-yvjd).
+    join("src", "lib", "beads", "server-mode.mjs"),
     // The skill stamps `anton setup` refreshes and `anton doctor` warns on (anton-gsyh) — same
     // pure-JS seam, so the launcher can import it before any build exists.
     join("src", "lib", "claude", "skill-stamp.mjs"),
