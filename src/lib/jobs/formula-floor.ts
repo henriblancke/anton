@@ -26,10 +26,8 @@ import {
   STEP_LABEL_PREFIX,
   stepName,
   type StepDefinition,
+  type StepRegistry,
 } from "./step-registry";
-
-/** The step registry as the validator reads it: `step:<name>` suffix → its definition. */
-export type StepRegistry = Readonly<Record<string, StepDefinition>>;
 
 /**
  * The ordering invariants name specific steps rather than classes: git is the run's evidence of
