@@ -23,7 +23,12 @@
  *      password, which is why the shared `beads` account existed at all.
  */
 import { readBoardMode } from "./board-mode";
-import { BD_PASSWORD_VAR as PASSWORD_VAR, PROJECT_SCOPED_BD_ENV, scopedPasswordVar } from "./config.mjs";
+import {
+  BD_PASSWORD_VAR as PASSWORD_VAR,
+  PROJECT_SCOPED_BD_ENV,
+  passwordVarHint as passwordVarFor,
+  scopedPasswordVar,
+} from "./config.mjs";
 
 /**
  * The identity strip and the per-user password variable both live in `config.mjs`, so the pure-node
@@ -53,8 +58,7 @@ function resolvePassword(repoPath: string, parentEnv: NodeJS.ProcessEnv): string
  * message: naming the wrong variable is the difference between a one-line fix and an hour lost.
  */
 export function passwordVarHint(repoPath: string): string {
-  const user = readBoardMode(repoPath).user;
-  return user ? `${scopedPasswordVar(user)} (or ${PASSWORD_VAR})` : PASSWORD_VAR;
+  return passwordVarFor(readBoardMode(repoPath).user);
 }
 
 /**

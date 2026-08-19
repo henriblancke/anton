@@ -35,12 +35,13 @@ import {
   bdVersion,
   bdVersionAtLeast,
   budgetMs,
+  checkSharedServer,
   ensureBdConfig,
   ensureDoltConnection,
   failureDetail,
+  passwordVarHint,
   readDoltMetadata,
   scopeBdEnv,
-  scopedPasswordVar,
   teamConfigKeys,
 } from "./config.mjs";
 
@@ -240,19 +241,18 @@ export function backupBoard(dir, opts = {}) {
  * variable's name is per-USER (anton-ffmw.1), so guessing it is a wasted hour.
  */
 export function testDoltConnection(dir, connection, opts = {}) {
-  const exec = bdRunner(dir, connection.user, opts);
-  const ms = budgetMs("network");
-  const r = exec("bd", ["dolt", "test"], ms);
-  if ((r?.status ?? 1) === 0) return { ok: true };
+  // The probe itself is config.mjs's, shared with the `anton init`/`doctor` preflight (anton-eg46)
+  // so a connection this command accepts is one those will too. Only the hints are this command's:
+  // it is mid-flip, with the connection it just wrote in hand.
+  const probe = checkSharedServer(dir, connection, { ...opts, exec: bdRunner(dir, connection.user, opts) });
+  if (probe.ok) return { ok: true };
 
   const hints = [
-    connection.user
-      ? `set ${scopedPasswordVar(connection.user)} (or BEADS_DOLT_PASSWORD) for the "${connection.user}" account`
-      : "set BEADS_DOLT_PASSWORD for the database user",
+    `set ${passwordVarHint(connection.user)}${connection.user ? ` for the "${connection.user}" account` : " for the database user"}`,
     "add BEADS_DOLT_SERVER_TLS=true when the server sets require_secure_transport",
     `confirm the server is reachable at ${connection.host}:${connection.port} and serves the "${connection.database}" database`,
   ];
-  return { ok: false, detail: failureDetail(r, ms, output(r)), hints };
+  return { ok: false, detail: probe.detail, hints };
 }
 
 /** One step of the flow, in the `{ name, status, detail? }` shape configureBeadsForRepo reports. */

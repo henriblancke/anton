@@ -7,15 +7,20 @@
  * execs and temp directories: `bd dolt set` refuses to run in embedded mode and would otherwise
  * need a live server, and a unit test must not depend on either.
  */
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import {
   EMBEDDED_CONFIG_KEYS,
+  MIN_BD_VERSION,
   SERVER_CONFIG_KEYS,
+  beadsPrereqs,
+  checkSharedServer,
   configureBeadsDoltSync,
   ensureDoltConnection,
+  formatServerTarget,
   readDoltMetadata,
   teamConfigKeys,
 } from "./config.mjs";
@@ -207,5 +212,146 @@ describe("configureBeadsDoltSync in server mode", () => {
     };
 
     expect(configureBeadsDoltSync({ repoDir: dir, exec })).toMatchObject({ status: "configured", pushed: true });
+  });
+});
+
+/**
+ * The preflight (anton-eg46). Server mode is a hard dependency on a reachable server — there is no
+ * local copy to fall back on — so `beadsPrereqs` must refuse the bootstrap with the target named,
+ * rather than letting bd fail later with `unreachable at 127.0.0.1:0 … dolt is not installed`.
+ *
+ * Run against a real stub `bd` first on PATH over a real (origin-less) git repo, not an injected
+ * exec: what is under test includes WHICH bd command is spawned and whether one is spawned at all.
+ */
+describe("beadsPrereqs — the mode decides what must be reachable (anton-eg46)", () => {
+  let prevPath: string | undefined;
+
+  beforeEach(() => {
+    prevPath = process.env.PATH;
+  });
+
+  afterEach(() => {
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
+  });
+
+  /** A git repo (no `origin`) whose `.beads/metadata.json` declares `metadata`. */
+  function gitRepo(metadata?: Record<string, unknown>): string {
+    const dir = repo(metadata === undefined ? undefined : JSON.stringify(metadata));
+    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
+    return dir;
+  }
+
+  /**
+   * A stub `bd` first on PATH that answers the version gate, logs every invocation, and fails
+   * `dolt test` when `unreachable` — the one failure this preflight exists to catch.
+   */
+  function stubBd({ unreachable }: { unreachable: boolean }) {
+    const bin = mkdtempSync(join(tmpdir(), "anton-modes-bin-"));
+    dirs.push(bin);
+    const log = join(bin, "calls.log");
+    const script = [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      "const a = process.argv.slice(2);",
+      `fs.appendFileSync(${JSON.stringify(log)}, a.join(" ") + "\\n");`,
+      `if (a[0] === "--version" || a[0] === "--help") { console.log("bd version ${MIN_BD_VERSION} (stub)"); process.exit(0); }`,
+      ...(unreachable
+        ? ['if (a[0] === "dolt" && a[1] === "test") { console.error("dial tcp 10.0.0.9:3306: connect: connection refused"); process.exit(1); }']
+        : []),
+      "process.exit(0);",
+    ].join("\n");
+    writeFileSync(join(bin, "bd"), `${script}\n`);
+    chmodSync(join(bin, "bd"), 0o755);
+    process.env.PATH = `${bin}${delimiter}${prevPath ?? ""}`;
+    return {
+      calls: () => {
+        try {
+          return readFileSync(log, "utf8").split("\n").filter(Boolean);
+        } catch {
+          return [];
+        }
+      },
+    };
+  }
+
+  it("refuses a server-mode board whose server is unreachable, naming the target and both ways out", () => {
+    const dir = gitRepo(SERVER_METADATA);
+    stubBd({ unreachable: true });
+
+    const { ok, error } = beadsPrereqs(dir);
+
+    expect(ok).toBe(false);
+    // The target the project configured, and why it failed — the raw bd error names neither.
+    expect(error?.message).toContain("dolt.example.dev:3306/anton");
+    expect(error?.message).toContain("connection refused");
+    // Both ways out: reach the server (with the per-USER password variable, anton-ffmw.1), or fall
+    // back to this machine's local copy.
+    expect(error?.fix).toContain("BEADS_DOLT_PASSWORD_BEADS");
+    expect(error?.fix).toContain('"dolt_mode": "embedded"');
+    expect(error?.fix).toContain("metadata.json");
+  });
+
+  it("passes a server-mode board whose server answers — and never asks it for a git origin", () => {
+    const dir = gitRepo(SERVER_METADATA);
+    const bd = stubBd({ unreachable: false });
+
+    // No `origin` was added: refs/dolt/data is the embedded profile's channel, and demanding it
+    // here would fail a healthy server board for a channel it does not use.
+    expect(beadsPrereqs(dir)).toEqual({ ok: true });
+    expect(bd.calls()).toContain("dolt test");
+  });
+
+  it("leaves the embedded preflight exactly as it was: origin still required, server never probed", () => {
+    const dir = gitRepo({ dolt_mode: "embedded", dolt_database: "anton" });
+    const bd = stubBd({ unreachable: false });
+
+    const { ok, error } = beadsPrereqs(dir);
+
+    expect(ok).toBe(false);
+    expect(error?.message).toMatch(/no "origin" remote/);
+    expect(bd.calls()).not.toContain("dolt test");
+  });
+
+  it("passes an embedded board with an origin, still without probing any server", () => {
+    const dir = gitRepo({ dolt_mode: "embedded" });
+    spawnSync("git", ["-C", dir, "remote", "add", "origin", join(dir, "origin.git")], { stdio: "ignore" });
+    const bd = stubBd({ unreachable: false });
+
+    expect(beadsPrereqs(dir)).toEqual({ ok: true });
+    expect(bd.calls()).not.toContain("dolt test");
+  });
+});
+
+describe("formatServerTarget", () => {
+  it("renders host:port/database as an operator reads it", () => {
+    expect(formatServerTarget({ host: "dolt.example.dev", port: 3306, database: "anton" })).toBe(
+      "dolt.example.dev:3306/anton",
+    );
+  });
+
+  // An undeclared field is itself a cause (bd dials port 0 without one), so it is shown, not hidden.
+  it("marks what the project never declared instead of quietly dropping it", () => {
+    expect(formatServerTarget({ port: 3306 })).toBe("?:3306");
+    expect(formatServerTarget({})).toBe("?:?");
+  });
+});
+
+describe("checkSharedServer", () => {
+  it("probes with `bd dolt test` and reports the failure output an operator must act on", () => {
+    const dir = repo(JSON.stringify(SERVER_METADATA));
+    const { calls, exec } = recordingExec({ status: 1, stderr: "Access denied for user 'beads'" });
+
+    expect(checkSharedServer(dir, { user: "beads" }, { exec })).toEqual({
+      ok: false,
+      detail: "Access denied for user 'beads'",
+    });
+    expect(calls).toEqual([["bd", "dolt", "test"]]);
+  });
+
+  it("reports ok when the server answers", () => {
+    const dir = repo(JSON.stringify(SERVER_METADATA));
+    const { exec } = recordingExec();
+    expect(checkSharedServer(dir, {}, { exec })).toEqual({ ok: true });
   });
 });

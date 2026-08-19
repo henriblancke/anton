@@ -11,6 +11,7 @@ import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
 import { buildBdEnv, passwordVarHint } from "./bd-env";
+import { formatServerTarget } from "./config.mjs";
 import { isServerMode, readBoardMode } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
@@ -801,8 +802,7 @@ export function resetServerPreflight(): void {
 
 export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
   if (preflightedSet().has(cwd)) return;
-  const { host, port, database } = readBoardMode(cwd);
-  const target = `${host ?? "?"}:${port ?? "?"}${database ? `/${database}` : ""}`;
+  const target = formatServerTarget(readBoardMode(cwd));
   try {
     await exec(cwd, ["dolt", "test"]);
     // Recorded only on success, so a server that was down is retried on the next beat.

@@ -187,12 +187,23 @@ export function hasBeadsDir(dir) {
 }
 
 /**
- * Check the prereqs beads config needs (bd on PATH, an existing git repo with an origin remote).
+ * Check the prereqs beads config needs (bd on PATH, an existing git repo, and — per board mode —
+ * either an origin remote or a reachable shared server).
+ *
  * Returns { ok } or { ok:false, error:{ message, fix } } — the CLI renders the fix loudly; the
  * self-heal path (addProject) uses it to skip cleanly on a repo that can't be configured (e.g. a
  * plain directory with no git), never corrupting the projects row.
+ *
+ * The last check is the mode-dependent one, because the two profiles depend on different things
+ * (DESIGN.md §3a): an embedded board reconciles per-machine copies over `refs/dolt/data` and so
+ * needs `origin`, while a server board has no local copy at all and so needs the SERVER. Checking
+ * an embedded board's origin on a server board would fail it for a channel it does not use; not
+ * checking the server would let the bootstrap proceed and die later, mid-run, inside bd.
+ *
+ * @param {string} dir repo root
+ * @param {{ exec?: Function, env?: NodeJS.ProcessEnv }} [opts] the `checkSharedServer` seam
  */
-export function beadsPrereqs(dir) {
+export function beadsPrereqs(dir, opts = {}) {
   if (!onPath("bd")) {
     return {
       ok: false,
@@ -221,6 +232,25 @@ export function beadsPrereqs(dir) {
     return {
       ok: false,
       error: { message: `${dir} is not a git repository.`, fix: `git -C ${dir} init` },
+    };
+  }
+  const board = readDoltMetadata(dir);
+  if (board.mode === "server") {
+    const target = formatServerTarget(board);
+    const reachable = checkSharedServer(dir, board, opts);
+    if (reachable.ok) return { ok: true };
+    // Fail loud HERE rather than let bd fail later: in server mode there is no local copy, so an
+    // unreachable server is a board outage, and bd's own error names neither the configured target
+    // nor the way out ("unreachable at 127.0.0.1:0 … dolt is not installed").
+    return {
+      ok: false,
+      error: {
+        message: `this project's board is on a shared Dolt server at ${target}, which is unreachable — server mode keeps no local copy, so nothing here can read the board. (${reachable.detail})`,
+        fix:
+          `Start the server (or restore the route to ${target}), confirm ${join(dir, ".beads", "metadata.json")} ` +
+          `names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell — ` +
+          `or set "dolt_mode": "embedded" there to work from this machine's local copy until it's back.`,
+      },
     };
   }
   if (!hasOriginRemote(dir)) {
@@ -560,6 +590,60 @@ export function scopeBdEnv(parentEnv, user) {
   const scoped = user ? parentEnv[scopedPasswordVar(user)] : undefined;
   if (scoped !== undefined) env[BD_PASSWORD_VAR] = scoped;
   return env;
+}
+
+/**
+ * Which env var must hold `user`'s password — the per-user form when the project names a user, the
+ * shared fallback otherwise. Naming the wrong one is the difference between a one-line fix and a
+ * lost hour, so every "cannot reach the server" message routes through here (`bd-env.ts` wraps it
+ * for the server, which looks the user up from a repo path).
+ */
+export function passwordVarHint(user) {
+  return user ? `${scopedPasswordVar(user)} (or ${BD_PASSWORD_VAR})` : BD_PASSWORD_VAR;
+}
+
+/**
+ * The configured server as an operator reads it — `host:port/database`, with `?` standing in for a
+ * field the project never declared (an undeclared host is itself a cause, and hiding it sends the
+ * reader looking for a network fault that isn't there). Shared with the runtime preflight in
+ * `bd.ts` so both failures name the same target the same way.
+ *
+ * @param {{ host?: string, port?: number|string, database?: string }} [connection]
+ */
+export function formatServerTarget(connection = {}) {
+  const { host, port, database } = connection;
+  return `${host ?? "?"}:${port ?? "?"}${database ? `/${database}` : ""}`;
+}
+
+/**
+ * `bd dolt test` against the shared server `connection` names — the one probe that answers "can this
+ * machine reach this project's board at all". Returns `{ ok: true }` or `{ ok: false, detail }`;
+ * never throws, because callers gate a bootstrap on it.
+ *
+ * Spawned under the project-scoped environment, like every other bd call anton makes: an ambient
+ * `BEADS_DOLT_*` would otherwise have this verify some OTHER project's server (anton-ffmw.1).
+ *
+ * @param {string} dir repo root
+ * @param {{ host?: string, port?: number, user?: string, database?: string }} connection
+ * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
+ *   env?: NodeJS.ProcessEnv }} [opts]
+ */
+export function checkSharedServer(dir, connection = {}, opts = {}) {
+  const ms = budgetMs("network");
+  const exec =
+    opts.exec ??
+    ((cmd, args, timeoutMs = ms) =>
+      spawnSync(cmd, args, {
+        cwd: dir,
+        encoding: "utf8",
+        env: scopeBdEnv(opts.env ?? process.env, connection.user),
+        timeout: timeoutMs,
+        killSignal: SPAWN_KILL_SIGNAL,
+      }));
+
+  const r = exec("bd", ["dolt", "test"], ms);
+  if ((r?.status ?? 1) === 0) return { ok: true };
+  return { ok: false, detail: failureDetail(r, ms, `${r?.stdout ?? ""}${r?.stderr ?? ""}`) };
 }
 
 /** The config.yaml keys anton's team-config enforces on an EMBEDDED board — the default profile,

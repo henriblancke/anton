@@ -42,12 +42,16 @@ import {
   beadsPrereqs,
   bdVersion,
   bdVersionAtLeast,
+  checkSharedServer,
   configureBeadsDoltSync,
   configureBeadsForRepo,
   ensureBeadFormula,
   ensureBeadsGitignore,
   ensureRunFormula,
+  formatServerTarget,
   hasBeadsDir,
+  passwordVarHint,
+  readDoltMetadata,
   BEAD_FORMULA_FILENAME,
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
@@ -874,6 +878,37 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
+/**
+ * Is the board this command runs against actually readable? Reported alongside the tool prereqs, and
+ * only meaningful in SERVER mode: an embedded board is a local Dolt directory, so there is nothing
+ * to reach and nothing to say. A shared-server board keeps no local copy, which makes an unreachable
+ * server a board outage rather than stalled sync (DESIGN.md §3a) — so it is probed with `bd dolt
+ * test` and the failure names the configured target and both ways out.
+ *
+ * Returns true when the board is fine OR the question does not apply (no `.beads/`, embedded mode),
+ * so only a genuinely unreachable server fails the caller.
+ */
+function checkBoard(dir = process.cwd()) {
+  if (!hasBeadsDir(dir)) return true;
+  const board = readDoltMetadata(dir);
+  if (board.mode !== "server") return true;
+
+  const target = formatServerTarget(board);
+  const probe = checkSharedServer(dir, board);
+  if (probe.ok) {
+    console.log(`  ${c.green("✓")} ${"board".padEnd(9)} ${c.green(`shared Dolt server ${target} reachable`)}  ${c.dim("bd dolt test")}`);
+    return true;
+  }
+  console.log(`  ${c.red("✗")} ${"board".padEnd(9)} ${c.red(`shared Dolt server ${target} UNREACHABLE`)}  ${c.dim("bd dolt test")}`);
+  // bd's own failure is often several lines (its config warnings ride along); indent every one, so
+  // the cause reads as part of this report rather than as stray output.
+  for (const line of probe.detail.split("\n")) console.log(c.dim(`    ${line}`));
+  console.log(c.dim(`    Start the server (or restore the route to ${target}), check .beads/metadata.json`));
+  console.log(c.dim(`    names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell.`));
+  console.log(c.dim('    Or set "dolt_mode": "embedded" there to work from this machine\'s local copy meanwhile.'));
+  return false;
+}
+
 /** One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default). */
 function bdList(repo, extra) {
   return spawnSync("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], {
@@ -1060,8 +1095,15 @@ function cmdDoctor() {
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
-  console.log(ok ? c.green("\nAll required tools present.\n") : c.red("\nMissing required tools — install them, then re-run.\n"));
-  return ok ? 0 : 1;
+  // Last, because it is the only check that leaves the machine: a board on a shared server that
+  // nothing here can reach is as fatal as a missing tool, and doctor is where an operator looks first.
+  // Gated on the tool check: probing a board with no usable bd would report an "unreachable server"
+  // whose real cause is the missing tool named two lines above.
+  const boardOk = ok ? checkBoard() : true;
+  if (!ok) console.log(c.red("\nMissing required tools — install them, then re-run.\n"));
+  else if (!boardOk) console.log(c.red("\nThis repo's board is on a shared Dolt server this machine can't reach — see above.\n"));
+  else console.log(c.green("\nAll required tools present.\n"));
+  return ok && boardOk ? 0 : 1;
 }
 
 /**

@@ -194,7 +194,12 @@ warning — without it bd dials port 0 against a remote host.
 
 On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
 unreachable, records a failure naming the configured host/port and the ways out, rather than the
-raw `unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce.
+raw `unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce. The same
+probe gates the CLI: `anton init` (and the self-heal behind a UI-added project) refuses to configure
+a server-mode repo it cannot reach, and `anton doctor` reports the board alongside the tool prereqs
+and exits non-zero. Which prereq applies is decided by the mode — an embedded board needs `origin`
+(its `refs/dolt/data` channel), a server board needs the server — so neither is failed for the
+other's dependency.
 
 **Moving an existing board onto a server** is two jobs, and anton owns only the second. The board's
 history is a Dolt database directory, and it reaches the server's data volume by a copy a human runs

@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 import { agentsFromArgs, nextArgs, resolvePort } from "./anton.mjs";
 
@@ -267,5 +267,91 @@ describe("anton doctor — skill drift", () => {
   it("says nothing is drifted when no copy is installed at either scope", async () => {
     const r = runDoctor(await dirs.make("anton-home-"), await dirs.make("anton-cwd-"));
     expect(r.stdout).toContain("installed copies match the bundle");
+  });
+});
+
+/**
+ * `anton doctor` on a shared-server board (anton-eg46). Server mode keeps no local copy, so a server
+ * this machine cannot reach is a board outage, not slow sync — doctor probes it and fails, because
+ * doctor is where an operator looks first and bd's own error names neither the target nor the fix.
+ *
+ * Every required tool is stubbed on PATH: what is asserted is the exit code, so a CI box without
+ * `bd`/`claude` must not be what decides it.
+ */
+describe("anton doctor — shared-server board reachability", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const SERVER_METADATA = {
+    database: "dolt",
+    backend: "dolt",
+    dolt_mode: "server",
+    dolt_server_host: "dolt.example.dev",
+    dolt_server_port: 3306,
+    dolt_server_user: "beads",
+    dolt_database: "anton",
+  };
+
+  /** A bd stub that answers the version gate and fails `dolt test` when `unreachable`. */
+  function fakeBdServer(unreachable: boolean): string {
+    return [
+      "#!/usr/bin/env node",
+      "const a = process.argv.slice(2);",
+      'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.2 (fake)"); process.exit(0); }',
+      ...(unreachable
+        ? ['if (a[0] === "dolt" && a[1] === "test") { console.error("dial tcp 10.0.0.9:3306: connect: connection refused"); process.exit(1); }']
+        : []),
+      "process.exit(0);",
+    ].join("\n");
+  }
+
+  /** A repo with the given board metadata, and `doctor` run in it against stubbed tools. */
+  async function runDoctorIn(metadata: Record<string, unknown> | null, unreachable = false) {
+    const home = await dirs.make("anton-home-");
+    const cwd = await dirs.make("anton-board-");
+    if (metadata) {
+      mkdirSync(join(cwd, ".beads"), { recursive: true });
+      writeFileSync(join(cwd, ".beads", "metadata.json"), JSON.stringify(metadata, null, 2));
+    }
+    const bin = await dirs.make("anton-bin-");
+    writeFakeBd(bin, fakeBdServer(unreachable));
+    // The other required tools, so a missing `claude` in CI can't be what fails the check.
+    for (const tool of ["git", "claude"]) {
+      writeFileSync(join(bin, tool), `#!/usr/bin/env node\nprocess.exit(0);\n`);
+      chmodSync(join(bin, tool), 0o755);
+    }
+    return spawnSync(process.execPath, [CLI, "doctor"], {
+      encoding: "utf8",
+      cwd,
+      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HOME: home, ANTON_DB: join(home, "anton.db") },
+    });
+  }
+
+  it("fails with the configured host/port and both ways out when the server is unreachable", async () => {
+    const r = await runDoctorIn(SERVER_METADATA, true);
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("dolt.example.dev:3306/anton");
+    expect(r.stdout).toContain("UNREACHABLE");
+    expect(r.stdout).toContain("connection refused");
+    // The per-USER password variable, and the escape hatch back to the local copy.
+    expect(r.stdout).toContain("BEADS_DOLT_PASSWORD_BEADS");
+    expect(r.stdout).toContain('"dolt_mode": "embedded"');
+  });
+
+  it("passes and names the server when it answers", async () => {
+    const r = await runDoctorIn(SERVER_METADATA, false);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("dolt.example.dev:3306/anton reachable");
+  });
+
+  it("says nothing — and probes nothing — on an embedded board", async () => {
+    const r = await runDoctorIn({ dolt_mode: "embedded", dolt_database: "anton" });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toContain("shared Dolt server");
+    expect(r.stdout).toContain("All required tools present");
   });
 });
