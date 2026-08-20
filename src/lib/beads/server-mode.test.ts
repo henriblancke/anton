@@ -1104,21 +1104,15 @@ describe("configureServerMode", () => {
 
   /**
    * The flip is prepared before the last board read and written straight after it, so metadata.json
-   * is read and merged exactly once — well outside the window that matters. Proven by making the
-   * file unparseable DURING that read: the switch still lands the text prepared from the good file,
-   * because nothing re-reads it at write time (PR #174 review).
+   * is merged exactly once — outside the window that matters — and the write itself is a byte
+   * comparison plus a rename (PR #174 review).
    */
-  it("prepares the flip before the final read, so the write itself re-reads nothing", () => {
+  it("prepares the flip before the final read, and writes only once that read is in", () => {
     const dir = repo(EMBEDDED);
     const seen: string[] = [];
-    let reads = 0;
     const { exec } = fakeBd({ dir, before: BOARD });
     const wrapped = (cmd: string, args: string[]) => {
-      if (isRead(args)) {
-        seen.push(readFileSync(metadataPath(dir), "utf8"));
-        // Clobber the file while the drift read is in flight — after the prepare, before the write.
-        if (++reads === 2) writeFileSync(metadataPath(dir), "{ clobbered");
-      }
+      if (isRead(args)) seen.push(readFileSync(metadataPath(dir), "utf8"));
       return exec(cmd, args);
     };
 
@@ -1128,6 +1122,56 @@ describe("configureServerMode", () => {
     // Both source reads ran against the board as it was — the flip came after them.
     expect(seen.slice(0, 2).every((text) => JSON.parse(text).dolt_mode === "embedded")).toBe(true);
     expect(readMetadata(dir)).toMatchObject({ dolt_mode: "server", project_id: EMBEDDED.project_id });
+  });
+
+  /**
+   * Preparing the merge early buys a small window and opens another one: the text was computed from
+   * metadata.json as it read BEFORE a board export that may run for the whole network budget. An
+   * edit that lands in between — here a corrected project_id — would be replaced wholesale by a
+   * merge that never saw it, and a rename is not something the losing edit comes back from
+   * (PR #174 review). The bytes are compared against the prepare's snapshot and the switch refused.
+   */
+  it("refuses when metadata.json changes while the switch is being prepared", () => {
+    const dir = repo(EMBEDDED);
+    const corrected = { ...EMBEDDED, project_id: "8040cdee-corrected" };
+    let reads = 0;
+    const { calls, exec } = fakeBd({ dir, before: BOARD });
+    const wrapped = (cmd: string, args: string[]) => {
+      // While the drift read is in flight — after the prepare, before the write.
+      if (isRead(args) && ++reads === 2) writeFileSync(metadataPath(dir), `${JSON.stringify(corrected, null, 2)}\n`);
+      return exec(cmd, args);
+    };
+
+    const result = configureServerMode(dir, flags, { exec: wrapped });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join("\n")).toMatch(/metadata\.json changed while the switch was being prepared/);
+    expect(result.errors.join("\n")).toContain("Nothing was written");
+    // The concurrent edit is still there, and the board still reads the database it always did.
+    expect(readMetadata(dir)).toEqual(corrected);
+    // It never reached the flip, so it never reached the server either.
+    expect(cmdline(calls).some((c) => c.includes("dolt test"))).toBe(false);
+  });
+
+  /** The same guard, for a metadata.json that stops being READABLE in that window. */
+  it("refuses when metadata.json becomes unreadable while the switch is being prepared", () => {
+    const dir = repo(EMBEDDED);
+    let reads = 0;
+    const { calls, exec } = fakeBd({ dir, before: BOARD });
+    const wrapped = (cmd: string, args: string[]) => {
+      if (isRead(args) && ++reads === 2) {
+        rmSync(metadataPath(dir), { recursive: true, force: true });
+        mkdirSync(metadataPath(dir));
+      }
+      return exec(cmd, args);
+    };
+
+    const result = configureServerMode(dir, flags, { exec: wrapped });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join("\n")).toMatch(/could not read .*metadata\.json/);
+    expect(result.errors.join("\n")).toContain("nothing was written");
+    expect(cmdline(calls).some((c) => c.includes("dolt test"))).toBe(false);
   });
 
 

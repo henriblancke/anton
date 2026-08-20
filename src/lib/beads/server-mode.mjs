@@ -182,26 +182,35 @@ export function resolveServerConnection(raw, flags = {}) {
  * about to stop reading. bd offers no writer lock to hold across the two — there is no `bd lock`,
  * and its `--readonly` binds only the invocation it is passed to — so the window is made as small as
  * a window can be: reading `metadata.json`, merging it and serializing it all happen BEFORE that
- * read, leaving the flip itself a single `writeFileSync`. Stopping every writer first, which the
- * runbook demands and the drift check verifies, is what actually closes it.
+ * read, leaving the flip itself a byte comparison and a single `writeFileSync`. The comparison is
+ * what `before` is for on the caller's side too: preparing early means the merge can age against
+ * the file it was computed from, so the caller re-reads the bytes and refuses rather than writing
+ * over an edit that landed in between. Stopping every writer first, which the runbook demands and
+ * the drift check verifies, is what actually closes the window.
  */
+/**
+ * A file's exact bytes as `{ ok: true, text }`, with `text: null` for one that does not exist —
+ * `{ ok: false, detail }` for one that exists and cannot be read. Reads rather than
+ * tests-then-reads: a file that turned into a directory, or lost its read permission, since the
+ * caller last looked is a controlled refusal here, where a bare `readFileSync` would throw past
+ * every revert path and take the CLI out on an uncaught rejection (PR #174 review). No snapshot
+ * also means no restore, which is itself the reason to refuse rather than continue.
+ */
+function readFileSnapshot(path) {
+  try {
+    return { ok: true, text: readFileSync(path, "utf8") };
+  } catch (e) {
+    if (e?.code === "ENOENT") return { ok: true, text: null };
+    return { ok: false, detail: `could not read ${path}: ${String(e?.message ?? e)}` };
+  }
+}
+
 export function prepareServerModeMetadata(dir, connection) {
   const path = join(dir, ".beads", "metadata.json");
-  // The restore snapshot goes through the SAME guarded read as the parse below, and by reading
-  // rather than testing-then-reading. A file that turned into a directory, or lost its read
-  // permission, between the caller's validation and this call is a controlled refusal — a bare
-  // `readFileSync` here would instead throw past every revert path and take the CLI out on an
-  // uncaught rejection (PR #174 review). No snapshot also means no restore, which is itself the
-  // reason to refuse rather than continue.
-  let before = null;
-  try {
-    before = readFileSync(path, "utf8");
-  } catch (e) {
-    if (e?.code !== "ENOENT") {
-      const detail = `could not read ${path}: ${String(e?.message ?? e)}`;
-      return { status: "unreadable", changed: [], before: null, path, detail };
-    }
-  }
+  // The restore snapshot goes through the same guarded read as the parse below.
+  const snapshot = readFileSnapshot(path);
+  if (!snapshot.ok) return { status: "unreadable", changed: [], before: null, path, detail: snapshot.detail };
+  const before = snapshot.text;
   const meta = readMetadataFile(dir);
   if (meta.status === "unreadable") return { status: "unreadable", changed: [], before, path, detail: meta.detail };
   const raw = meta.raw;
@@ -694,8 +703,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //     exposes none (no `bd lock`; `--readonly` binds only the invocation it is passed to), and a
   //     lock anton invented would be honoured by nothing that writes this board (PR #174 review).
   //     So the window is made as small as one can be — reading, merging and serializing the file all
-  //     happen here, leaving step 6 a single `writeFileSync` — and the check below refuses on any
-  //     drift it did see. Stopping every writer first, which the runbook demands, is what closes it.
+  //     happen here, leaving step 6 a byte comparison and a single `writeFileSync` — and the checks
+  //     below refuse on any drift they did see, in the board (5b) and in the file itself (6a).
+  //     Stopping every writer first, which the runbook demands, is what closes it.
   //     Preparing here also moves the unreadable-metadata refusal ahead of the work it would waste.
   const prepared = prepareServerModeMetadata(dir, connection);
   // Step 2 read the same file; this catches the window between — and keeps a refusal from reading as
@@ -761,6 +771,30 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    failure, so there is nothing to roll back — config.yaml is not published until step 9 — and
   //    the flow returns the same structured refusal every other pre-flip check does.
   if (prepared.status === "prepared") {
+    // 6a. The merge in step 5a was computed over metadata.json as it read THEN, and the board
+    //     re-read since can run for the whole network budget. An edit that landed in that window —
+    //     a project_id correction, a TLS or connection fix, another clone's switch — is text this
+    //     write would replace with a merge that never saw it, and a rename is not something the
+    //     losing edit comes back from (PR #174 review). The board's own drift check refuses on the
+    //     same evidence; this is the file's. Bytes, not parsed keys: what a revert restores is
+    //     bytes, so anything that would not restore identically counts as drift.
+    const current = readFileSnapshot(prepared.path);
+    if (!current.ok) {
+      record("metadata.json", "failed", current.detail);
+      errors.push(`${current.detail} — nothing was written, so the board is untouched`);
+      return fail({ before, connection, counts, backup });
+    }
+    if (current.text !== prepared.before) {
+      const detail = "changed while the switch was being prepared";
+      record("metadata.json", "failed", detail);
+      errors.push(
+        `${prepared.path} ${detail} — something else edited it, and writing the switch computed ` +
+          "from its earlier contents would drop that edit. Nothing was written, so the board is " +
+          "untouched. Stop anton (`anton stop`) and any agent or shell writing here, then re-run " +
+          "to merge the switch over the current file.",
+      );
+      return fail({ before, connection, counts, backup });
+    }
     try {
       writeFileAtomic(prepared.path, prepared.text);
     } catch (e) {
