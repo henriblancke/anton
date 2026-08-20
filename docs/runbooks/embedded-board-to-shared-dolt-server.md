@@ -131,9 +131,12 @@ That command is the whole config half. It:
 3. writes `dolt_mode`/host/port/user/database into `.beads/metadata.json`, preserving every other
    key in that file;
 4. runs **`bd dolt test`**;
-5. **reads the board back from the server** and confirms every pre-switch issue id is present in
-   the server's copy — by identity, not cardinality, because a stale or divergent copy of the same
-   project can hold as many issues (or more) while missing the ones written here since it diverged;
+5. **reads the board back from the server** and confirms it is this board, whole and current — every
+   pre-switch issue id present, and every issue saying there what it says here (or something
+   *newer*, which is another machine that already switched). By identity and content, not
+   cardinality: a stale or divergent copy of the same project can hold as many issues (or more)
+   while missing the ones written here since it diverged, and a snapshot copied a week ago holds
+   every id while its titles, statuses and labels predate the board being moved;
 6. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
    team-wide default, so the next clone inherits the target.
 
@@ -150,12 +153,24 @@ most likely to see:
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
   from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
   the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
+- *"the server's … database holds all of this board's ids but N issues are older there than here
+  (…)"* — step 5, the other half of it. The copy on the server is a snapshot taken before those
+  beads were last written (an earlier Phase 1 attempt, or a stale export), so switching would strand
+  every one of those updates in the database being left behind. Re-run Phase 1 with a **current**
+  copy; `--force` accepts the gap deliberately, same as above. If it names *every* issue on the
+  board, that is not a stale copy — nothing edits a whole board at once — it is the two sides
+  printing the same rows differently; compare a `bd list --json` from each before forcing.
 - *"the board being moved changed while the switch was being prepared — N issues appeared,
   disappeared or were edited"* — step 2. Something is still writing this board (anton, an agent, a
   shell), so neither the backup nor the arrived-whole check covers what it wrote. The comparison is
   per-issue **content**, not just the id set, so a bead someone merely closed or relabelled trips it
   too — that update would otherwise be stranded in the embedded database the move is leaving behind.
   Phase 1 step 1 is the fix: `anton stop`, close the writers, re-run.
+- *"… metadata.json is not valid JSON …"* — `.beads/metadata.json` exists and cannot be parsed. The
+  switch writes that file by *merging* into it, so an unreadable one would be replaced outright,
+  losing `project_id`, `backend` and everything else bd keeps there. The command refuses and writes
+  nothing — **`--force` does not override this one**. Restore the file (from `.beads/backups/`, or
+  git) and re-run.
 - *"could not read the board being moved: …"* — step 1 failed, so step 5 has nothing to check the
   server's copy against. The command stops **before** backing up or writing anything. Fix the read
   (a stopped embedded server, a missing password variable) and re-run; `--force` switches anyway and

@@ -1643,6 +1643,7 @@ const SERVER_MODE_MARKS = {
   reverted: () => c.yellow("↩"),
   failed: () => c.red("✗"),
   missing: () => c.red("✗"),
+  unreadable: () => c.red("✗"),
 };
 
 async function cmdServerMode(args = []) {
@@ -1681,9 +1682,9 @@ async function cmdServerMode(args = []) {
     console.log(c.red("\n✗ this project was NOT switched to server mode."));
     for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
     for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
-    // The arrived-whole guard is the one failure with a runbook behind it: the server is fine, the
-    // data simply is not on it yet.
-    if (result.missing?.length) {
+    // The two arrived-whole guards are the failures with a runbook behind them: the server is fine,
+    // the data simply is not on it yet — or the copy that is on it predates this board.
+    if (result.missing?.length || result.stale?.length) {
       console.log(c.dim("  → copy the board's Dolt history onto the server first:"));
       console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
     }

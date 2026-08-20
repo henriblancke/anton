@@ -17,11 +17,13 @@
  *      Dolt directory is left exactly where it is — it is the real history backup, and the escape
  *      hatch if the server goes away.
  *   2. **Write the connection, then prove it.** `bd dolt test` must connect, or the flip is undone.
- *   3. **Prove the board arrived.** The issue IDs read before the flip are compared with the IDs
- *      read back from the server: every one of them must be there. A missing issue means the data
- *      copy has not happened, landed in another database, or left a stale copy of this project on
- *      the server — the one class of mistake that makes an otherwise-successful switch look fine
- *      while the team stares at a board with work missing from it. It reverts rather than reports.
+ *   3. **Prove the board arrived, whole and current.** The board read before the flip is compared
+ *      with the one read back from the server: every id must be there, and every issue must say on
+ *      the server what it says here — or say something NEWER, which is another machine that has
+ *      already switched. A missing issue means the data copy has not happened or landed in another
+ *      database; an issue the server holds an OLDER copy of means it landed from a stale snapshot.
+ *      Both are the class of mistake that makes an otherwise-successful switch look fine while the
+ *      team stares at a board with work missing from it. It reverts rather than reports.
  *   4. **Prove nobody wrote it meanwhile.** The board is read once to measure and once more
  *      immediately before the flip, and every issue's CONTENT is compared, not just the id set: an
  *      update the server's copy predates would otherwise sail through step 3 and be stranded in the
@@ -82,20 +84,41 @@ export const SERVER_METADATA_KEYS = {
 const BACKUP_DIR = "backups";
 
 /**
- * The RAW `.beads/metadata.json` object, or `{}` when it is absent or unparseable.
+ * The RAW `.beads/metadata.json` as `{ status, raw, detail? }` — `status` is `"absent"` (no file
+ * yet), `"read"` (parsed into `raw`), or `"unreadable"` (the file is there and cannot be used).
  *
  * `readDoltMetadata` is the MODE reader and deliberately drops everything about an embedded board;
  * this path needs the file as written — both to default the database name from the embedded board's
  * own `dolt_database`, and to merge rather than replace (bd keeps `project_id`, `backend` and
  * friends in there, and losing them would sever the workspace's identity).
+ *
+ * Which is exactly why "absent" and "unreadable" are told apart rather than both folded to `{}`:
+ * the write below MERGES over `raw`, so an unreadable file read as empty would silently REPLACE
+ * every key in it with the connection alone — losing `project_id` and `backend` to fix a mode (PR
+ * #174 review). An absent file has nothing to lose; an unparseable one has everything, so it is
+ * reported and the caller refuses.
  */
 export function readMetadataFile(dir) {
+  const path = join(dir, ".beads", "metadata.json");
+  let text;
   try {
-    const parsed = JSON.parse(readFileSync(join(dir, ".beads", "metadata.json"), "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
+    text = readFileSync(path, "utf8");
+  } catch (e) {
+    // ENOENT alone is "not written yet". Anything else — a permissions change, a path that is
+    // somehow a directory — is a file this cannot see, not a file that is not there.
+    if (e?.code === "ENOENT") return { status: "absent", raw: {} };
+    return { status: "unreadable", raw: {}, detail: `could not read ${path}: ${String(e?.message ?? e)}` };
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { status: "unreadable", raw: {}, detail: `${path} is not valid JSON: ${String(e?.message ?? e)}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { status: "unreadable", raw: {}, detail: `${path} is not a JSON object` };
+  }
+  return { status: "read", raw: parsed };
 }
 
 /**
@@ -108,7 +131,7 @@ export function readMetadataFile(dir) {
  * Returns `{ connection, errors }`. `errors` names the missing FLAG, not the metadata key — the
  * reader is at a prompt, not in an editor.
  *
- * @param {Record<string, unknown>} raw from {@link readMetadataFile}
+ * @param {Record<string, unknown>} raw the `raw` of {@link readMetadataFile}
  * @param {{ host?: string, port?: number|string, user?: string, database?: string, tls?: boolean }} flags
  */
 export function resolveServerConnection(raw, flags = {}) {
@@ -142,14 +165,17 @@ export function resolveServerConnection(raw, flags = {}) {
 /**
  * Write `connection` into `.beads/metadata.json` as server mode, preserving every other key.
  *
- * Returns `{ status: "already"|"written", changed, before }`, where `before` is the file's exact
- * prior text (or `null` when there was none) — what {@link restoreFile} puts back when the
- * verification below fails.
+ * Returns `{ status: "already"|"written"|"unreadable", changed, before }`, where `before` is the
+ * file's exact prior text (or `null` when there was none) — what {@link restoreFile} puts back when
+ * the verification below fails. `"unreadable"` writes NOTHING: merging over a file this cannot
+ * parse would replace it wholesale (see {@link readMetadataFile}).
  */
 export function writeServerModeMetadata(dir, connection) {
   const path = join(dir, ".beads", "metadata.json");
   const before = existsSync(path) ? readFileSync(path, "utf8") : null;
-  const raw = readMetadataFile(dir);
+  const meta = readMetadataFile(dir);
+  if (meta.status === "unreadable") return { status: "unreadable", changed: [], before, path, detail: meta.detail };
+  const raw = meta.raw;
 
   const next = { ...raw, dolt_mode: "server" };
   for (const [field, key] of Object.entries(SERVER_METADATA_KEYS)) {
@@ -257,17 +283,17 @@ function parseJsonPayload(text, accept) {
  * board arrived while a third of it was still at home. `--limit 0` because bd truncates at 50 by
  * default. Every flag exists in bd 1.1.0, anton's floor (MIN_BD_VERSION).
  *
- * `--skip-labels` is dropped for a CONTENT read only. Label hydration is the expensive half of the
- * query and the arrived-whole check compares ids alone — but the drift check compares what each
- * issue SAYS, and a label written mid-flip is a change like any other (PR #174 review).
+ * `--skip-labels` is NOT passed, on any read. Label hydration is the expensive half of the query,
+ * but every read here is compared against another one by content digest — the drift check against
+ * the source, the arrived-whole check against the server — and a label is content like any other
+ * (PR #174 review). One read that skipped them would report every issue on the board as changed.
  */
-const listAllArgs = (content) => [
+const listAllArgs = () => [
   "list",
   "--all",
   "--json",
   "--limit",
   "0",
-  ...(content ? [] : ["--skip-labels"]),
   "--include-gates",
   "--include-infra",
   "--include-templates",
@@ -296,6 +322,17 @@ function stableJson(value) {
 const issueDigest = (issue) => createHash("sha1").update(stableJson(issue)).digest("hex");
 
 /**
+ * bd's own last-write stamp for one issue as epoch ms, or `undefined` when it carries none this can
+ * order. It is what tells the two directions of a content difference apart across the migration
+ * boundary: a server copy AHEAD of this board is another machine that already switched, a server
+ * copy BEHIND it is a stale snapshot the flip would strand updates in (PR #174 review).
+ */
+const issueUpdatedAt = (issue) => {
+  const ms = typeof issue?.updated_at === "string" ? Date.parse(issue.updated_at) : Number.NaN;
+  return Number.isNaN(ms) ? undefined : ms;
+};
+
+/**
  * Every issue this project's board holds right now: its ids, and a content fingerprint per id.
  *
  * IDENTITY, not cardinality, is what answers "did the history actually arrive". A count proves only
@@ -305,17 +342,18 @@ const issueDigest = (issue) => createHash("sha1").update(stableJson(issue)).dige
  * that; comparing two numbers cannot. This runs once, on a one-time migration, so reading the ids
  * is worth what it costs over `bd count`.
  *
- * The `digests` answer the other question — "is this the same board it was a minute ago" — which
- * ids alone cannot: a writer that UPDATES an existing issue leaves the id set identical.
+ * The `digests` answer the other question — "is this the same board" — which ids alone cannot: a
+ * writer that UPDATES an existing issue leaves the id set identical, and so does a server snapshot
+ * copied before that update was made. `updated` orders two differing copies of one issue, so the
+ * second case can say WHICH side is behind.
  *
- * Returns `{ ok: true, ids, digests }` or `{ ok: false, detail }` — a board that cannot be read is
- * reported, never silently treated as empty.
+ * Returns `{ ok: true, ids, digests, updated }` or `{ ok: false, detail }` — a board that cannot be
+ * read is reported, never silently treated as empty.
  *
  * @param {string} dir repo root
- * @param {{ board?: object, content?: boolean, exec?: Function, env?: NodeJS.ProcessEnv }} [opts]
+ * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv }} [opts]
  *   `board` is the connection bd runs under (credentials + transport) — the board's own before the
- *   flip, the server's after it. `content: true` hydrates labels too, so the digests cover them;
- *   pass it for any read whose digests are compared.
+ *   flip, the server's after it.
  */
 export function readBoardIds(dir, opts = {}) {
   const exec = scopedBdRunner(dir, opts.board, opts);
@@ -324,7 +362,7 @@ export function readBoardIds(dir, opts = {}) {
   // 60s local budget times out — and a timeout here is not a warning, it is a refused flip before
   // it and a full revert after it (PR #174 review).
   const ms = budgetMs("network");
-  const r = exec("bd", listAllArgs(opts.content === true), ms);
+  const r = exec("bd", listAllArgs(), ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
 
   // stdout only — bd's warnings go to stderr, and the ones that don't are stepped over by the scan.
@@ -350,7 +388,12 @@ export function readBoardIds(dir, opts = {}) {
     return found.every((id) => typeof id === "string" && id !== "") ? issues : undefined;
   });
   if (!rows) return { ok: false, detail: "bd list printed no readable board" };
-  return { ok: true, ids: rows.map((i) => i.id), digests: new Map(rows.map((i) => [i.id, issueDigest(i)])) };
+  return {
+    ok: true,
+    ids: rows.map((i) => i.id),
+    digests: new Map(rows.map((i) => [i.id, issueDigest(i)])),
+    updated: new Map(rows.map((i) => [i.id, issueUpdatedAt(i)])),
+  };
 }
 
 /**
@@ -440,15 +483,18 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   backup?: boolean, force?: boolean }} flags
  *   `tls` declares the transport in this project's metadata.json (undefined leaves it undeclared,
  *   inheriting the ambient `BEADS_DOLT_SERVER_TLS`); `backup: false` skips the pre-flip export;
- *   `force: true` accepts a server board that is MISSING issues the board being moved has (starting
- *   a deliberately fresh board), and is the only way to switch when the board being moved cannot be
- *   read at all — with no source ids, nothing verifies what arrived.
+ *   `force: true` accepts a server board that is MISSING issues the board being moved has, or holds
+ *   an OLDER copy of them (starting a deliberately fresh board), and is the only way to switch when
+ *   the board being moved cannot be read at all — with no source read, nothing verifies what
+ *   arrived. It does NOT get past an unreadable `metadata.json`: that refusal is about not
+ *   destroying the file, which no amount of intent makes safe.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
- * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, drifted? }}
- *   `missing` is the ids this board holds that the server's copy does not — empty once the check
- *   has passed. `drifted` is the ids that appeared, disappeared or were EDITED on the board being
- *   moved while the switch was being prepared, i.e. a writer that was never stopped.
+ * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, stale?, drifted? }}
+ *   `missing` is the ids this board holds that the server's copy does not; `stale` the ids it does
+ *   hold but with content older than this board's — both empty once the checks have passed.
+ *   `drifted` is the ids that appeared, disappeared or were EDITED on the board being moved while
+ *   the switch was being prepared, i.e. a writer that was never stopped.
  */
 export function configureServerMode(dir, flags = {}, opts = {}) {
   const emit = typeof opts.log === "function" ? opts.log : () => {};
@@ -485,9 +531,24 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail();
   }
 
-  // 2. What the project is now, and what it should become.
+  // 2. What the project is now, and what it should become. A metadata.json that EXISTS and cannot
+  //    be parsed stops the command dead — and not even --force gets through, because the flip's own
+  //    write merges over that file: reading it as empty would replace bd's `project_id`, `backend`
+  //    and every key this module does not know about with the connection alone (PR #174 review).
+  //    An unreadable file is a board with a broken identity, which is not a thing to fix by
+  //    overwriting it.
+  const meta = readMetadataFile(dir);
+  if (meta.status === "unreadable") {
+    record("metadata.json", "failed", meta.detail);
+    errors.push(
+      `${meta.detail} — switching writes this file by MERGING into it, so an unreadable one would ` +
+        "be replaced outright, losing project_id, backend and anything else bd keeps there. " +
+        "Repair or restore it (`.beads/backups/`, or git) and re-run.",
+    );
+    return fail();
+  }
   const before = readDoltMetadata(dir);
-  const { connection, errors: invalid } = resolveServerConnection(readMetadataFile(dir), flags);
+  const { connection, errors: invalid } = resolveServerConnection(meta.raw, flags);
   if (invalid.length) {
     errors.push(...invalid);
     return fail({ before });
@@ -498,7 +559,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    one the export below also carries. Step 5b re-reads it against the flip, so the ageing this
   //    ordering costs is caught rather than trusted.
   const counts = {};
-  const idsBefore = readBoardIds(dir, { ...opts, board: before, content: true });
+  const idsBefore = readBoardIds(dir, { ...opts, board: before });
   if (idsBefore.ok) {
     counts.before = idsBefore.ids.length;
     record("board issues", "ok", `${idsBefore.ids.length} issues`);
@@ -565,13 +626,13 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //     contain it without the verification ever noticing. The runbook's first instruction is to
   //     stop every writer — this is what proves it happened (PR #174 review).
   //     CONTENT, not just ids: a writer that closes a bead, retitles it, moves a label or adds a
-  //     dependency leaves the id set identical, and step 8's arrived-whole check — ids again —
-  //     would wave the stale server copy through, stranding that update in a database this project
-  //     is about to stop reading. Comparing the per-issue digests catches every such write.
+  //     dependency leaves the id set identical, so a check on ids alone would pass here AND on the
+  //     server (step 8b compares content precisely because of this), stranding that update in a
+  //     database this project is about to stop reading. The per-issue digests catch every one.
   //     Skipped under --force, which already accepts the server's board unverified: the second read
   //     costs a full board listing and would only refine a check that flag has switched off.
   if (idsBefore.ok && !flags.force) {
-    const idsNow = readBoardIds(dir, { ...opts, board: before, content: true });
+    const idsNow = readBoardIds(dir, { ...opts, board: before });
     if (!idsNow.ok) {
       record("board unchanged", "failed", idsNow.detail);
       errors.push(
@@ -604,7 +665,13 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    set dolt.mode` reports success while writing a nested block into a file of flat dotted keys,
   //    from bd's lowest-priority source, and has no effect (anton-4gd2).
   const written = writeServerModeMetadata(dir, connection);
-  record("metadata.json", written.status, written.changed.join(", ") || undefined);
+  record("metadata.json", written.status, written.detail ?? (written.changed.join(", ") || undefined));
+  // Step 2 read the same file; this catches the window between — and, more usefully, keeps the
+  // write's own refusal from reading as a success to anything that calls it directly.
+  if (written.status === "unreadable") {
+    errors.push(`${written.detail} — nothing was written, so the board is untouched`);
+    return fail({ before, connection, counts, backup });
+  }
 
   /** Undo both writes and report why — the board keeps working exactly as it did. */
   const revert = (reason) => {
@@ -626,6 +693,11 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    identity: a stale or divergent copy of the same project can hold as many issues as the board
   //    being moved — more, even — while missing the ones written here since it diverged, and a
   //    count would wave it through onto an incomplete board every later write then compounds.
+  //    And by CONTENT, because id membership has the same blind spot on this side of the boundary
+  //    as it does on the other one (step 5b): a server snapshot copied from an older export holds
+  //    every id while its titles, statuses, labels, dependencies and assignees predate the board
+  //    being moved, and an ids-only check would flip onto it and strand every one of those updates
+  //    in the database this project is about to stop reading (PR #174 review).
   const idsAfter = readBoardIds(dir, { ...opts, board: connection });
   record("server board issues", idsAfter.ok ? "ok" : "failed", idsAfter.ok ? `${idsAfter.ids.length} issues` : idsAfter.detail);
   if (!idsAfter.ok) {
@@ -651,6 +723,42 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, missing });
   }
 
+  // 8b. Every id the server DOES hold, compared by content against the board being moved. A copy
+  //     whose digest matches is the same issue; one that differs is only acceptable in ONE
+  //     direction — the server's is NEWER (another machine already switched and has been writing
+  //     it, which the id check already accepts as "plus newer ones"). A server copy that is older,
+  //     or that carries no stamp to order it by, is a snapshot this board has moved on from, and
+  //     flipping onto it loses the difference. `updated_at` is what tells the two apart; without it
+  //     on both sides there is nothing to prove the server is ahead, so the conservative reading
+  //     wins and the switch is refused.
+  const stale = idsBefore.ok
+    ? idsBefore.ids.filter((id) => {
+        if (!onServer.has(id) || idsAfter.digests.get(id) === idsBefore.digests.get(id)) return false;
+        const here = idsBefore.updated.get(id);
+        const there = idsAfter.updated.get(id);
+        return !(here !== undefined && there !== undefined && there > here);
+      })
+    : [];
+  if (stale.length && !flags.force) {
+    errors.push(
+      `the server's "${connection.database}" database holds all of this board's ids but ${stale.length} ` +
+        `issue${stale.length === 1 ? " is" : "s are"} older there than here (${stale.slice(0, 5).join(", ")}` +
+        `${stale.length > 5 ? ", …" : ""}) — the copy on the server predates this board, so switching ` +
+        "would strand those updates in the database being left behind. Re-run Phase 1 of the runbook " +
+        "with a current copy." +
+        // EVERY issue differing is not a stale snapshot — nothing edits a whole board — it is the
+        // two sides describing the same rows differently. Named, because the fix is the opposite
+        // one (look at the listings, then --force) and an operator should not have to guess.
+        (stale.length === idsBefore.ids.length
+          ? " (That is EVERY issue on the board, which usually means the two sides print the same " +
+            "rows differently rather than that the server is a week behind — compare a `bd list " +
+            "--json` from each before reaching for --force.)"
+          : ""),
+    );
+    revert("server board is older than this one");
+    return fail({ before, connection, counts, backup, missing, stale });
+  }
+
   // 9. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
   //    the snapshot above, so a failed attempt leaves it exactly as it was rather than carrying
   //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
@@ -673,8 +781,8 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   // same answer: the project goes back to what it was rather than staying half-switched.
   if (errors.length) {
     revert("could not publish the team-wide connection defaults");
-    return fail({ before, connection, counts, backup, missing });
+    return fail({ before, connection, counts, backup, missing, stale });
   }
 
-  return { ok: true, steps, errors, before, connection, counts, backup, missing };
+  return { ok: true, steps, errors, before, connection, counts, backup, missing, stale };
 }

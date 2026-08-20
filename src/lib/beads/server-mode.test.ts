@@ -76,7 +76,7 @@ function fakeBd(
     calls.push([cmd, ...args]);
     if (args[0] === "--version") return { status: 0, stdout: `bd version ${opts.version ?? "1.1.2"} (fake)` };
     if (args[0] === "list") {
-      const onServer = opts.dir !== undefined && readMetadataFile(opts.dir).dolt_mode === "server";
+      const onServer = opts.dir !== undefined && readMetadataFile(opts.dir).raw.dolt_mode === "server";
       const board = onServer ? (opts.after ?? opts.before) : opts.before;
       return board === undefined ? { status: 1, stderr: "no board" } : { status: 0, stdout: listing(board) };
     }
@@ -176,10 +176,27 @@ describe("writeServerModeMetadata", () => {
     expect(existsSync(metadataPath(fresh))).toBe(false);
   });
 
-  it("reads unparseable metadata as empty rather than throwing", () => {
-    const dir = repo("{ not json");
-    expect(readMetadataFile(dir)).toEqual({});
-    expect(writeServerModeMetadata(dir, CONNECTION).status).toBe("written");
+  /**
+   * The write MERGES into metadata.json, so a file it cannot parse must not be read as `{}` — that
+   * turns the merge into a replace and drops `project_id`, `backend` and every key bd keeps there
+   * on a board whose only actual problem was its mode (PR #174 review).
+   */
+  it("tells an ABSENT metadata.json from an unreadable one, and refuses to overwrite the latter", () => {
+    expect(readMetadataFile(repo())).toEqual({ status: "absent", raw: {} });
+    expect(readMetadataFile(repo(EMBEDDED))).toEqual({ status: "read", raw: EMBEDDED });
+
+    for (const bad of ["{ not json", '["an", "array"]', "null"]) {
+      const dir = repo(bad);
+      const read = readMetadataFile(dir);
+      expect(read.status, `${bad} read as ${read.status}`).toBe("unreadable");
+      expect(read.raw).toEqual({});
+
+      const written = writeServerModeMetadata(dir, CONNECTION);
+      expect(written.status).toBe("unreadable");
+      expect(written.detail).toContain("metadata.json");
+      // Not one byte written — the refusal is the whole point.
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(bad);
+    }
   });
 });
 
@@ -203,9 +220,9 @@ describe("readBoardIds", () => {
     for (const flag of ["--all", "--limit 0", "--include-gates", "--include-infra", "--include-templates"]) {
       expect(ran).toContain(flag);
     }
-    // Ids-only by default: label hydration is the expensive half of the query, and the
-    // arrived-whole check against the server reads ids alone.
-    expect(ran).toContain("--skip-labels");
+    // Labels are hydrated on EVERY read: each one is compared against another by content digest,
+    // and a read that skipped them would report the whole board as changed.
+    expect(ran).not.toContain("--skip-labels");
   });
 
   /**
@@ -218,7 +235,6 @@ describe("readBoardIds", () => {
     /** `probe-1`'s fingerprint as bd printed it — throwing rather than comparing two undefineds. */
     const fingerprint = (issue: object): string => {
       const read = readBoardIds(repo(EMBEDDED), {
-        content: true,
         exec: (cmd: string, args: string[]) => {
           calls.push([cmd, ...args]);
           return { status: 0, stdout: JSON.stringify({ issues: [issue] }) };
@@ -425,7 +441,7 @@ describe("configureServerMode", () => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
       if (args[0] === "list") {
         // The pre-switch read succeeds; the post-switch one hits the identity guard.
-        return readMetadataFile(dir).dolt_mode === "server"
+        return readMetadataFile(dir).raw.dolt_mode === "server"
           ? { status: 1, stderr: "PROJECT IDENTITY MISMATCH — refusing to connect" }
           : { status: 0, stdout: listing(BOARD) };
       }
@@ -451,7 +467,7 @@ describe("configureServerMode", () => {
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
       if (args[0] === "list") {
-        return readMetadataFile(dir).dolt_mode === "server"
+        return readMetadataFile(dir).raw.dolt_mode === "server"
           ? { status: 0, stdout: listing(["other-1"]) }
           : { status: 1, stderr: "database is locked" };
       }
@@ -608,6 +624,113 @@ describe("configureServerMode", () => {
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
   });
 
+  /**
+   * The blind spot an id-set check has on the DESTINATION side, and the mirror of the drift check
+   * (PR #174 review): Phase 1 copies a snapshot taken before the last few edits, so every id is on
+   * the server while a title, status, label, dependency or assignee there predates the board being
+   * moved. Membership passes; flipping strands those updates in the database nobody reads again.
+   */
+  describe("the server's copy is checked by CONTENT, not just id membership", () => {
+    /** Source and server boards of the same seven ids, differing only in `probe-3`. */
+    const boards = (server: { status: string; updated_at: string }) => {
+      const rows = (issues: object[]) => ({ status: 0, stdout: JSON.stringify({ issues }) });
+      const here = BOARD.map((id) => ({ id, title: id, status: "open", updated_at: "2026-08-18T12:00:00Z" }));
+      const there = here.map((i) => (i.id === "probe-3" ? { ...i, ...server } : i));
+      return (dir: string) =>
+        (_cmd: string, args: string[]): Result => {
+          if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+          if (args[0] === "list") return rows(readMetadataFile(dir).raw.dolt_mode === "server" ? there : here);
+          return { status: 0 };
+        };
+    };
+
+    it("refuses and reverts when the server holds an OLDER copy of an issue it does hold", () => {
+      const dir = repo(EMBEDDED);
+      const original = readFileSync(metadataPath(dir), "utf8");
+      // Copied before probe-3 was closed here: same id, same count, stale content.
+      const exec = boards({ status: "open", updated_at: "2026-08-01T09:00:00Z" })(dir);
+
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(false);
+      expect(result.stale).toEqual(["probe-3"]);
+      expect(result.missing).toEqual([]);
+      expect(result.errors.join("\n")).toMatch(/1 issue is older there than here \(probe-3\)/);
+      // Reverted, not merely reported — the project keeps reading the board that is current.
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+      expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
+    });
+
+    // Content that differs with nothing to order it by proves nothing about which side is ahead —
+    // and "cannot tell" is not a reason to switch onto it.
+    it("refuses differing content that carries no stamp to order the two copies by", () => {
+      const dir = repo(EMBEDDED);
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (args[0] === "list") {
+          const onServer = readMetadataFile(dir).raw.dolt_mode === "server";
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              issues: BOARD.map((id) => ({ id, title: onServer && id === "probe-3" ? "an older title" : id })),
+            }),
+          };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, flags, { exec });
+      expect(result.ok).toBe(false);
+      expect(result.stale).toEqual(["probe-3"]);
+    });
+
+    // A whole board reading as stale is not a stale board — it is the two sides describing the same
+    // rows differently, and the message says so rather than sending the operator back to Phase 1.
+    it("says so when EVERY issue differs, which is a listing mismatch and not a stale snapshot", () => {
+      const dir = repo(EMBEDDED);
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (args[0] === "list") {
+          const onServer = readMetadataFile(dir).raw.dolt_mode === "server";
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              issues: BOARD.map((id) => (onServer ? { id, title: id, extra_column: null } : { id, title: id })),
+            }),
+          };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, flags, { exec });
+      expect(result.ok).toBe(false);
+      expect(result.stale).toEqual(BOARD);
+      expect(result.errors.join("\n")).toContain("EVERY issue on the board");
+    });
+
+    // The other direction is the documented healthy case: another machine switched first and has
+    // been writing the shared board. Its copy is ahead of this one, which is not a loss.
+    it("accepts a server copy that is NEWER than this board's", () => {
+      const dir = repo(EMBEDDED);
+      const exec = boards({ status: "closed", updated_at: "2026-08-19T09:00:00Z" })(dir);
+
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(result.stale).toEqual([]);
+      expect(readMetadata(dir).dolt_mode).toBe("server");
+    });
+
+    // --force already accepts a server board that is missing issues outright; a stale one is the
+    // same deliberate override, and the same flag.
+    it("switches anyway under --force", () => {
+      const dir = repo(EMBEDDED);
+      const exec = boards({ status: "open", updated_at: "2026-08-01T09:00:00Z" })(dir);
+      expect(configureServerMode(dir, { ...flags, force: true }, { exec }).ok).toBe(true);
+      expect(readMetadata(dir).dolt_mode).toBe("server");
+    });
+  });
+
   // A server that carries every issue AND has moved on (another machine already writing to it) is
   // not a failure — the board being moved is whole on the other side, which is the whole question.
   it("accepts a server board that holds every issue plus newer ones", () => {
@@ -691,6 +814,28 @@ describe("configureServerMode", () => {
     const dir = repo(EMBEDDED);
     expect(configureServerMode(dir, flags, { exec: fakeBd({ dir, before: BOARD }).exec }).ok).toBe(true);
     expect("dolt_server_tls" in readMetadata(dir)).toBe(false);
+  });
+
+  /**
+   * The flip writes metadata.json by MERGING into it, so a file it cannot parse is a file it would
+   * REPLACE — losing bd's `project_id` and `backend` on a board whose only problem was its mode (PR
+   * #174 review). Not even --force gets through: the refusal is about not destroying the file.
+   */
+  it("refuses an unreadable metadata.json rather than overwriting it, --force included", () => {
+    for (const force of [false, true]) {
+      const dir = repo('{ "project_id": "8040cdee-1234"');
+      const original = readFileSync(metadataPath(dir), "utf8");
+      const { calls, exec } = fakeBd({ dir, before: BOARD });
+
+      const result = configureServerMode(dir, { ...flags, force }, { exec });
+
+      expect(result.ok).toBe(false);
+      expect(result.errors.join("\n")).toMatch(/is not valid JSON/);
+      expect(result.errors.join("\n")).toContain("project_id");
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+      // It stops before the board is even read: nothing to back up, nothing to revert.
+      expect(cmdline(calls)).toEqual(["bd --version"]);
+    }
   });
 
   it("validates before touching anything — a missing flag writes no file and spawns no bd", () => {
