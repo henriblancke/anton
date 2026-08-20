@@ -17,6 +17,7 @@ import {
   type PickerExclusion,
   type PickerPlanEntry,
 } from "./board-picker-plan";
+import { eligibleTargets } from "./jobs/picker-targets";
 import type { Bead } from "./beads/types";
 import type { Clock } from "./jobs/queue";
 
@@ -43,6 +44,26 @@ function bead(o: Partial<Bead> = {}): Bead {
     labels: ["approved", "domain:eng"],
     ...o,
   };
+}
+
+/** A bead whose contract holds — the state the approve gate admits, so a gap opened in it is a real
+ *  flip from eligible to `approval-gap`. */
+const SHAPED_BODY = [
+  "## Goal",
+  "Ship the thing",
+  "",
+  "## Context",
+  "It lives in src/lib",
+  "",
+  "## Out of scope",
+  "Everything else",
+  "",
+  "## Verify",
+  "bun run test",
+].join("\n");
+
+function shaped(o: Partial<Bead> = {}): Bead {
+  return bead({ description: SHAPED_BODY, acceptance_criteria: "- [ ] it works", ...o });
 }
 
 function stamp(o: Partial<BoardStamp> = {}): BoardStamp {
@@ -94,6 +115,19 @@ describe("board stamp", () => {
     expect(stampBoard([bead(change)], OBSERVED).digest).not.toBe(before.digest);
   });
 
+  // The contract lives in prose, but eligibility reads it: the approve gate faults a cleared
+  // Acceptance as `approval-gap`, so a digest blind to the description would hold still across the
+  // one edit that flips rank 1 out of the plan entirely.
+  it.each([
+    ["its Acceptance criteria are cleared", { acceptance_criteria: undefined }],
+    ["its Acceptance heading is deleted from the description", { description: "## Goal\nShip the thing" }],
+    ["a section still holds the formula's prompt", { acceptance_criteria: "TODO — state the criteria" }],
+  ])("moves when %s", (_edit, change) => {
+    const before = stampBoard([shaped()], OBSERVED);
+
+    expect(stampBoard([shaped(change)], OBSERVED).digest).not.toBe(before.digest);
+  });
+
   it("moves when a bead joins or leaves the board", () => {
     const one = stampBoard([bead()], OBSERVED);
     const two = stampBoard([bead(), bead({ id: "anton-b" })], OBSERVED);
@@ -102,12 +136,20 @@ describe("board stamp", () => {
   });
 
   // Otherwise a typo fix marks every plan stale on a board the pass re-reads every ten minutes, and
-  // "the board moved" stops carrying any information.
-  it("holds still when only prose the decision never reads changes", () => {
-    const before = stampBoard([bead()], OBSERVED);
+  // "the board moved" stops carrying any information. The contract enters the digest as a verdict,
+  // not as its text, so reworded prose under intact headings reads as the same board.
+  it("holds still when prose moves but nothing the decision reads does", () => {
+    const before = stampBoard([shaped()], OBSERVED);
 
     const after = stampBoard(
-      [bead({ title: "a target, renamed", description: "rewritten", updated_at: "2026-08-19T09:00:00Z" })],
+      [
+        shaped({
+          title: "a target, renamed",
+          description: SHAPED_BODY.replace("Ship the thing", "Ship the thing, spelled right"),
+          acceptance_criteria: "- [ ] it works, restated",
+          updated_at: "2026-08-19T09:00:00Z",
+        }),
+      ],
       OBSERVED + 60_000,
     );
 
@@ -149,6 +191,23 @@ describe("staleness", () => {
     const moved = stampBoard([bead({ assignee: "henri" })], OBSERVED + 1);
 
     expect(isPlanStale(plan, moved)).toBe(true);
+  });
+
+  // The invariant the fence exists for, stated against the real eligibility predicate rather than
+  // against a field list: any edit that changes who may be started must read as a moved board, or a
+  // surface presents as rank 1 a target the gate now refuses.
+  it("catches an edit that flips a target out of the eligible set", () => {
+    const before = [shaped()];
+    const after = [shaped({ acceptance_criteria: undefined })];
+    expect(eligibleTargets(before).eligible).toHaveLength(1);
+    expect(eligibleTargets(after)).toMatchObject({
+      eligible: [],
+      exclusions: [{ beadId: "anton-a", reason: "approval-gap" }],
+    });
+
+    const shapedPlan = { ...plan, stamp: stampBoard(before, OBSERVED) };
+
+    expect(isPlanStale(shapedPlan, stampBoard(after, OBSERVED + 1))).toBe(true);
   });
 });
 

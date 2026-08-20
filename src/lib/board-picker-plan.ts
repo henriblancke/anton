@@ -12,7 +12,8 @@
  * claim protocol — not this record — is what stops two machines starting the same target.
  *
  * Reading the record costs no `bd` call by construction: every field a surface needs is on the row,
- * and the only runtime dependency here is anton.db. `Bead` is a type-only import.
+ * and the only runtime dependency here is anton.db and the contract reader the stamp judges through
+ * (`beads/contract.ts`, itself pure and spawn-free). `Bead` is a type-only import.
  *
  * db-injectable (like run-health) so the pass and its tests share one connection; the UI read path
  * goes through the shared anton.db.
@@ -20,6 +21,7 @@
 import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -100,13 +102,36 @@ export interface BoardPickerPlan {
 const DIGEST_LENGTH = 16;
 
 /**
- * The projection of a bead the digest covers: exactly the fields eligibility and the PRIME ranking
+ * The bead's contract standing, as the digest carries it: the VERDICT, never the prose it was read
+ * from.
+ *
+ * Eligibility reads the contract-bearing fields — `description`, `acceptance_criteria`,
+ * `acceptance` — through the approve gate (`makeApprovalGate` → `contractGaps`), so a deleted
+ * Acceptance section flips a target from eligible to `approval-gap` without touching any other
+ * field. A digest over the raw prose would catch that, but it would also mark every plan stale on a
+ * typo fix; a digest over the parsed verdict catches exactly the edits that can change the answer.
+ * `undefined` — exempt tier, or a bead no bd read produced — is its own state, distinct from
+ * "judged and clean", because those two are different answers about whether the gate applies.
+ */
+function contractDigest(bead: Bead): string {
+  const status = contractStatusOf(bead);
+  if (!status) return "unjudged";
+  return [...status.blocking, ...status.advisory]
+    .map((v) => `${v.severity}/${v.section}`)
+    .sort()
+    .join(",");
+}
+
+/**
+ * The projection of a bead the digest covers: exactly the inputs eligibility and the PRIME ranking
  * read, and nothing else.
  *
- * Deliberately NOT the bead's `updated_at` stamp. A digest over "was this bead written at all"
- * would mark every plan stale the moment somebody fixed a typo in a description, on a board where
- * the pass reruns every ten minutes anyway — so "the board moved" would stop meaning anything. What
- * the fence must catch is a move that could change the ANSWER, which is a change to one of these.
+ * Deliberately NOT the bead's raw prose or its `updated_at` stamp. A digest over "was this bead
+ * written at all" would mark every plan stale the moment somebody fixed a typo in a description, on
+ * a board where the pass reruns every ten minutes anyway — so "the board moved" would stop meaning
+ * anything. What the fence must catch is a move that could change the ANSWER: the fields below, plus
+ * whatever the description says about the contract, which enters as {@link contractDigest}'s verdict
+ * rather than as its text.
  *
  * Age is the one ranking input absent here, and necessarily: it is a function of wall-clock time,
  * so it changes every second and no digest can hold it. Age drift is handled by the pass's cadence,
@@ -128,6 +153,7 @@ function digestLine(bead: Bead): string {
     bead.created_at ?? "",
     labels,
     deps,
+    contractDigest(bead),
   ].join("\t");
 }
 
