@@ -70,13 +70,28 @@ export interface BdRepo {
  * friends already index-pack every push, so this makes the sandbox match production rather than
  * papering over a real failure.
  *
+ * Auto-gc is switched OFF for the same class of reason, and it is not a hypothetical: `git gc --auto`
+ * DETACHES, so a repack runs in the background while the suite keeps using the remote — and a repack
+ * deletes the packs it just rewrote out from under whatever is reading or writing them. That surfaces
+ * as an ENOENT on a temp file with every assertion green ("failed to copy file to
+ * .git/objects/pack/tmp_pack_…: No such file or directory" from a concurrent `git clone`; "unable to
+ * create temporary file" from a concurrent `bd dolt push`), which reddened two runs of PR #174. One
+ * `bd dolt push` lands ~4 packs, so a suite crosses `gc.autoPackLimit` (50) after about a dozen syncs
+ * — every e2e here does far more than that, making the race routine rather than rare. Nothing in a
+ * throwaway sandbox benefits from gc, so both the heuristic (`gc.auto`) and receive-pack's call into
+ * it (`receive.autogc`) are disabled.
+ *
  * `-b main` pins the bare HEAD to refs/heads/main so clones of this remote check out main;
  * otherwise hosts whose default branch is `master` leave a clone on an unborn `master` and
  * `git push origin main` fails with "src refspec main does not match any".
  */
 export function initBareRemote(path: string): void {
   execFileSync("git", ["init", "--bare", "-q", "-b", "main", path], { stdio: "ignore" });
-  execFileSync("git", ["-C", path, "config", "receive.unpackLimit", "0"], { stdio: "ignore" });
+  const config = (key: string, value: string) =>
+    execFileSync("git", ["-C", path, "config", key, value], { stdio: "ignore" });
+  config("receive.unpackLimit", "0");
+  config("gc.auto", "0");
+  config("receive.autogc", "false");
 }
 
 /**
