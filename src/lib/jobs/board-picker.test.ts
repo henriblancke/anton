@@ -114,6 +114,30 @@ describe("makeBoardPickerHandler", () => {
     );
   });
 
+  it("heartbeats after the board read, so a slow `bd` isn't killed as no progress", async () => {
+    board.current = [bead("t1")];
+    const beats: string[] = [];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(
+      fakeCtx({ heartbeat: async () => void beats.push("beat") }),
+    );
+
+    expect(beats).toEqual(["beat"]);
+  });
+
+  it("writes NOTHING once the pass is cancelled", async () => {
+    // The plan is replaced whole, so a cancelled pass that still wrote would overwrite the last good
+    // plan — and during project teardown resurrect a row the abort just deleted.
+    board.current = [bead("t1")];
+    const aborted = AbortSignal.abort();
+
+    await expect(
+      makeBoardPickerHandler({ db: t.db, clock })(fakeCtx({ signal: aborted })),
+    ).rejects.toThrow();
+
+    expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
+  });
+
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {
     const handler = makeBoardPickerHandler({ db: t.db, clock });
     await expect(handler(fakeCtx({ payload: { projectId: "ghost" } }))).rejects.toThrow(PoisonError);

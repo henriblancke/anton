@@ -204,6 +204,20 @@ describe("unblockCounter", () => {
     expect(unblockCounter(board)("f1")).toBe(1);
   });
 
+  it("skips a deferred dependent but counts a blocked or in-progress one", () => {
+    // `deferred` is a human's "not now", so releasing it is worth nothing this pass — while a
+    // dependent bd reports as `blocked` (or one somebody started anyway) is precisely the waiting
+    // work the target releases. Counting by `status === "open"` alone would invert both.
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "snoozed", status: "deferred", dependencies: [blocks("snoozed", "f1")] }),
+      bead({ id: "waiting", status: "blocked", dependencies: [blocks("waiting", "f1")] }),
+      bead({ id: "started", status: "in_progress", dependencies: [blocks("started", "f1")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(2);
+  });
+
   it("ignores every edge type but `blocks`", () => {
     const board = [
       bead({ id: "e1" }),

@@ -63,6 +63,18 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
       runtime: { observedAtMs },
     });
 
+    // The board read is the only slow step, and it doesn't heartbeat: two `bd list` calls behind the
+    // Dolt lock can outlast the per-attempt no-progress timeout on a big board, killing a pass that
+    // was making progress and burning a retry attempt.
+    await ctx.heartbeat();
+
+    // The plan is one row per project, replaced whole, so a cancelled pass that still wrote would
+    // overwrite the last good plan — and during `abortProject` teardown it would resurrect a row the
+    // abort just deleted. Nothing above notices a cancel (the board read isn't abortable and
+    // `heartbeat` doesn't inspect the signal), so the write is gated here explicitly, as the sibling
+    // read-then-upsert passes do.
+    ctx.signal.throwIfAborted();
+
     // The job id goes on the row: "which pass decided this?" is the first question asked of a plan
     // an operator disagrees with, and the job carries the logs that answer it.
     await saveBoardPickerPlan(db, clock, { projectId, jobId: ctx.jobId, ...decision });

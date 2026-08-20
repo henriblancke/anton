@@ -105,13 +105,15 @@ export function decideBoardPickerPlan(input: {
   }
 
   // Ranked against the FULL board, not the admitted set: a target's unblocking value comes from the
-  // work it releases, which is mostly work no policy would ever admit on its own. The rule lookup is
-  // total by construction — every bead ranked here was put in `admitted` beside its rule.
-  const entries = rankTargets(admitted, input.board).map((ranked, i) => ({
-    beadId: ranked.bead.id,
-    rank: i + 1,
-    rule: ruleFor.get(ranked.bead.id) as string,
-  }));
+  // work it releases, which is mostly work no policy would ever admit on its own.
+  const entries = rankTargets(admitted, input.board).map((ranked, i) => {
+    const rule = ruleFor.get(ranked.bead.id);
+    // Total by construction — every bead ranked here was put in `admitted` beside its rule. A miss
+    // would persist an entry that no rule admits, which is a start nobody can audit; fail the pass
+    // rather than record one.
+    if (!rule) throw new Error(`board-picker: no admitting rule for ${ranked.bead.id}`);
+    return { beadId: ranked.bead.id, rank: i + 1, rule };
+  });
 
   return {
     stamp: stampBoard(input.board, input.runtime.observedAtMs),

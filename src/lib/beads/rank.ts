@@ -25,7 +25,7 @@ export interface RankedTarget {
    * and unranked work must not tie with work somebody deliberately ranked lowest.
    */
   priority?: number;
-  /** How many open beads this target transitively unblocks via `blocks` edges. */
+  /** How many still-waiting beads this target transitively unblocks via `blocks` edges. */
   unblocks: number;
   /** The bead's `created_at`, the age tiebreak (oldest first); "" when bd reported none. */
   createdAt: string;
@@ -53,12 +53,16 @@ function dependentIndex(board: Bead[]): Map<string, string[]> {
 }
 
 /**
- * `id → how many open beads it transitively unblocks`, built once per board.
+ * `id → how many still-waiting beads it transitively unblocks`, built once per board.
  *
  * A `blocks` edge is (from = dependent, to = blocker), so the dependents of a target are what its
  * completion releases; the count is the transitive closure of that, restricted to beads that are
- * still open (a closed dependent was never waiting). A bead reached twice — the two arms of a
- * diamond meeting again — is counted once, because finishing the target releases it once.
+ * still WAITING. A closed dependent was never waiting, and a `deferred` one is work a human pushed
+ * away — counting it would let a target whose whole value is snoozed work outrank one that releases
+ * live work. `blocked` and `in_progress` DO count: a transitively blocked dependent is exactly the
+ * work being released, and bd reports it under those statuses, not `open`. A bead reached twice —
+ * the two arms of a diamond meeting again — is counted once, because finishing the target releases
+ * it once.
  *
  * `seen` is what makes the walk terminate: a `blocks` cycle is a malformed board, not an
  * impossible one, and a picker that hung on one would take the whole pass down with it. A
@@ -67,7 +71,9 @@ function dependentIndex(board: Bead[]): Map<string, string[]> {
  */
 export function unblockCounter(board: Bead[]): (id: string) => number {
   const dependents = dependentIndex(board);
-  const openIds = new Set(board.filter((b) => b.status !== "closed").map((b) => b.id));
+  const waitingIds = new Set(
+    board.filter((b) => b.status !== "closed" && b.status !== "deferred").map((b) => b.id),
+  );
 
   return (id: string): number => {
     const seen = new Set<string>([id]);
@@ -78,7 +84,7 @@ export function unblockCounter(board: Bead[]): (id: string) => number {
         if (seen.has(next)) continue;
         seen.add(next);
         queue.push(next);
-        if (openIds.has(next)) count++;
+        if (waitingIds.has(next)) count++;
       }
     }
     return count;
