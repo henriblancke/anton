@@ -12,6 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { configYamlValue } from "./config.mjs";
 import {
   DEFAULT_DOLT_PORT,
   backupBoard,
@@ -478,6 +479,56 @@ describe("configureServerMode", () => {
     expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
     // Nothing was published: a board that cannot connect must not leave a team default behind.
     expect(cmdline(calls).some((c) => c.includes("--update-config"))).toBe(false);
+  });
+
+  /**
+   * A switch to bd's DEFAULT account (no `dolt_server_user`) over a config.yaml that still carries
+   * an older `dolt.user` is a switch bd makes as that older account: metadata.json outranks
+   * config.yaml but does not erase it. Retracted with the rest of the publication it would come too
+   * late — the probe tests the stale identity, fails to authenticate, and rolls back a switch that
+   * was correct, leaving the move impossible without hand-editing config.yaml first (PR #174
+   * review). It is retracted first.
+   */
+  describe("a stale config.yaml user the switch stops declaring", () => {
+    const stale = "prefix: probe\ndolt.user: old-account\n";
+    const toDefaultUser = { ...flags, user: undefined };
+
+    it("is cleared BEFORE the connection is probed", () => {
+      const dir = repo(EMBEDDED);
+      const beadsDir = join(dir, ".beads");
+      writeFileSync(join(beadsDir, "config.yaml"), stale);
+      const base = fakeBd({ dir, before: BOARD });
+      // Read at the probe itself: the ordering claim is about what bd sees, not about call order.
+      let userAtProbe: string | undefined = "unprobed";
+      const exec = (cmd: string, args: string[]): Result => {
+        if (args[0] === "dolt" && args[1] === "test") userAtProbe = configYamlValue(beadsDir, "dolt.user");
+        return base.exec(cmd, args);
+      };
+
+      const result = configureServerMode(dir, toDefaultUser, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(userAtProbe).toBeUndefined();
+      const cleared = result.steps.filter((s: { name: string; status: string }) => s.name === "dolt.user");
+      expect(cleared[0]).toMatchObject({ status: "cleared" });
+      const ran = cmdline(base.calls);
+      expect(ran).toContainEqual("bd config unset dolt.user");
+      expect(ran.indexOf("bd config unset dolt.user")).toBeLessThan(ran.indexOf("bd dolt test"));
+    });
+
+    // Clearing it is a write like any other this run makes, so a failure downstream puts it back —
+    // a rolled-back switch leaves config.yaml exactly as it found it.
+    it("is put back when the switch is rolled back", () => {
+      const dir = repo(EMBEDDED);
+      const configPath = join(dir, ".beads", "config.yaml");
+      writeFileSync(configPath, stale);
+      const { exec } = fakeBd({ dir, before: BOARD, test: { status: 1, stderr: "Connection failed" } });
+
+      const result = configureServerMode(dir, toDefaultUser, { exec });
+
+      expect(result.ok).toBe(false);
+      expect(readFileSync(configPath, "utf8")).toBe(stale);
+    });
   });
 
   /**

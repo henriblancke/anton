@@ -87,7 +87,15 @@ describe("readDoltMetadata", () => {
   });
 
   it("drops connection fields of the wrong type rather than passing them through", () => {
-    const dir = repo(JSON.stringify({ dolt_mode: "server", dolt_server_host: 42, dolt_server_port: "3306" }));
+    const dir = repo(
+      JSON.stringify({
+        dolt_mode: "server",
+        dolt_server_host: 42,
+        dolt_server_port: true,
+        dolt_server_user: 7,
+        dolt_database: [],
+      }),
+    );
     expect(readDoltMetadata(dir)).toEqual({
       mode: "server",
       host: undefined,
@@ -96,6 +104,31 @@ describe("readDoltMetadata", () => {
       database: undefined,
       tls: undefined,
     });
+  });
+
+  /**
+   * bd writes metadata.json too, and `bd dolt set port <n> --update-config` re-serializes the port
+   * as a STRING (server-mode.test.ts models exactly that rewrite). A number-only parse would lose
+   * the port of every board bd has published: `anton init` reports it missing, preflight names the
+   * target `host:?`, and the per-server password variable is looked up under a port-less name
+   * nobody set (PR #174 review).
+   */
+  it("accepts bd's string-encoded port", () => {
+    const dir = repo(JSON.stringify({ ...SERVER_METADATA, dolt_server_port: "3306" }));
+    expect(readDoltMetadata(dir).port).toBe(3306);
+  });
+
+  // Forgiving the encoding must not forgive a value that is not a port: bd dialing a nonsense port
+  // is the same outage as bd dialing port 0, and "missing" at least names the fix.
+  it.each([
+    ["a non-numeric string", "3306x"],
+    ["an empty string", ""],
+    ["a float", 3306.5],
+    ["zero", 0],
+    ["out of range", 70000],
+  ])("drops %s as a port", (_label, written) => {
+    const dir = repo(JSON.stringify({ ...SERVER_METADATA, dolt_server_port: written }));
+    expect(readDoltMetadata(dir).port).toBeUndefined();
   });
 
   // Transport is per project (PR #174 review): declared either way it is read back, and left out it

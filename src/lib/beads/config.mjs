@@ -539,6 +539,26 @@ export function ensureBdConfig(dir, beadsDir, key, want, opts = {}) {
 }
 
 /**
+ * `dolt_server_port` as a number, whatever JSON type it arrives as.
+ *
+ * bd writes this file too, and `bd dolt set port <n> --update-config` re-serializes the port as a
+ * STRING — so a number-only parse loses the port of every board bd has already published, which is
+ * every board this command has successfully switched (PR #174 review). What follows is not a
+ * warning but three silent failures: `anton init` reports the required port missing, the preflight
+ * names the target as `host:?`, and the per-server password variable is looked up under a
+ * port-less name no operator was told to set, so the next bd call cannot authenticate.
+ *
+ * Only a whole port number is accepted, in either encoding. Anything else — a float, a blank, a
+ * `"3306x"`, a value out of range — is still dropped rather than passed through: bd dialing a
+ * nonsense port is the same outage as bd dialing port 0, and the "missing" verdict at least names
+ * the fix.
+ */
+function asPort(value) {
+  const n = typeof value === "string" && /^\s*\d+\s*$/.test(value) ? Number(value) : value;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 && n <= 65535 ? n : undefined;
+}
+
+/**
  * The board mode + connection a project declares in `.beads/metadata.json` — `embedded` (a Dolt
  * database under `.beads/`, one copy per machine, reconciled over refs/dolt/data) or `server` (one
  * shared `dolt sql-server` every machine reads and writes). See DESIGN.md §3a.
@@ -565,7 +585,7 @@ export function readDoltMetadata(dir) {
     return {
       mode: "server",
       host: typeof meta.dolt_server_host === "string" ? meta.dolt_server_host : undefined,
-      port: typeof meta.dolt_server_port === "number" ? meta.dolt_server_port : undefined,
+      port: asPort(meta.dolt_server_port),
       user: typeof meta.dolt_server_user === "string" ? meta.dolt_server_user : undefined,
       database: typeof meta.dolt_database === "string" ? meta.dolt_database : undefined,
       // bd's own key (`dolt_server_tls`), left undefined when the project declares nothing — which
@@ -906,7 +926,7 @@ const SERVER_CONNECTION_KEYS = [
  * The verdict is read back from the FILE for that reason: a value that outlives both is reported as
  * a failure naming the hand fix, never assumed gone.
  */
-function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutMs) {
+export function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutMs) {
   const path = `dolt.${key}`;
   const stale = configYamlValue(beadsDir, path);
   if (stale === undefined) return { name: path, status: "unset" };
@@ -923,6 +943,27 @@ function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutMs) {
         status: "failed",
         detail: `.beads/config.yaml still publishes ${path}: ${left} but ${declares} — remove that line by hand`,
       };
+}
+
+/**
+ * The OPTIONAL connection keys `.beads/config.yaml` still publishes that `info` no longer declares
+ * — exactly what {@link retractStaleConnectionKey} would clear, named before anything is written.
+ *
+ * Separated from the retraction itself so a caller that has to snapshot config.yaml for a rollback
+ * only pays for the snapshot when there is in fact a write coming, and so the retraction can be
+ * ordered ahead of a connection PROBE rather than behind it (`server-mode.mjs`): a stale
+ * `dolt.user` makes bd authenticate as the wrong account, so a probe run before the retraction
+ * tests the wrong identity and fails a switch that would have worked.
+ *
+ * @param {string} beadsDir `<dir>/.beads`
+ * @param {{ host?: string, port?: number, user?: string, database?: string }} info from readDoltMetadata
+ */
+export function staleConnectionKeys(beadsDir, info) {
+  return SERVER_CONNECTION_KEYS.filter(({ key, required }) => {
+    const raw = info?.[key];
+    const declared = !(raw === undefined || raw === null || raw === "");
+    return !required && !declared && configYamlValue(beadsDir, `dolt.${key}`) !== undefined;
+  });
 }
 
 /**

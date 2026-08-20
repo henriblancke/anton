@@ -54,8 +54,10 @@ import {
   hasLocalDoltDb,
   passwordVarHint,
   readDoltMetadata,
+  retractStaleConnectionKey,
   scopedBdRunner,
   serverScopedPasswordVar,
+  staleConnectionKeys,
   teamConfigKeys,
 } from "./config.mjs";
 
@@ -858,11 +860,35 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
 
   // What this invocation actually left in each file — a revert undoes THOSE bytes and nothing else.
-  // `configPublished` flips only once step 9 starts writing config.yaml; before that the file is
-  // untouched by this run, so there is nothing in it to put back.
+  // Two flags, because config.yaml is written at two different points for two different reasons:
+  // `configTouched` says a revert has bytes to put back (the retraction in 6b, or the publication in
+  // step 9), while `configPublished` says `bd dolt set --update-config` has started — which is the
+  // only thing that also rewrites metadata.json, and so the only thing whose rewrite the rollback
+  // may recognise as its own.
   const wroteMetadata = prepared.status === "prepared" ? prepared.text : null;
   let configSnapshot = configBefore;
+  let configTouched = false;
   let configPublished = false;
+
+  /**
+   * Snapshot config.yaml for the rollback, ONCE, immediately before this run first writes it —
+   * `{ ok }` / `{ ok: false, detail }`.
+   *
+   * Not reused from step 5 (PR #174 review): everything between the two — the flip, and on the
+   * publication path a connection test and a server export with a multi-minute budget — is a window
+   * in which someone edits config.yaml, and restoring step 5's text would silently drop that edit.
+   * And never re-taken: what a revert owes the operator is the file as this run FOUND it, so once
+   * the retraction below has written, its own pre-image is the snapshot the publication rolls back
+   * to as well.
+   */
+  const snapshotConfig = () => {
+    if (configTouched) return { ok: true };
+    const now = readFileSnapshot(configPath);
+    if (!now.ok) return now;
+    configSnapshot = now.text;
+    configTouched = true;
+    return { ok: true };
+  };
 
   /**
    * {@link restoreFile}, as `{ ok }` / `{ ok: false, detail }` rather than a throw.
@@ -896,8 +922,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
    * is recognized as this run's ({@link isPublicationRewrite}) — without that, every failed
    * publication would decline its own rollback and strand the project in server mode while reporting
    * it was not switched (PR #174 review).
-   * config.yaml is snapshotted immediately before publication instead, since bd's own writes make
-   * "did someone else change this?" unanswerable once step 9 has started.
+   * config.yaml is snapshotted immediately before this run first writes it instead
+   * ({@link snapshotConfig}), since bd's own writes make "did someone else change this?"
+   * unanswerable once publication has started.
    * Neither restore is allowed to throw ({@link tryRestore}).
    */
   const revert = (reason) => {
@@ -933,7 +960,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     } else {
       record("metadata.json", "unchanged", `${reason} — the file already said this, so nothing was written`);
     }
-    if (configPublished) {
+    if (configTouched) {
       const restored = tryRestore(configPath, configSnapshot);
       if (!restored.ok) {
         record("config.yaml", "failed", `${reason} — could not be put back: ${restored.detail}`);
@@ -946,6 +973,44 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       }
     }
   };
+
+  // Both the retraction below and the publication in step 9 take the project-scoped runner: on a
+  // server board `bd config unset` and `bd dolt set` talk to the database, so they need the same
+  // narrowed credentials the connection test proves.
+  const exec = scopedBdRunner(dir, connection, opts);
+
+  // 6b. Retract an optional connection key config.yaml still publishes and the switch just stopped
+  //     declaring — BEFORE the probe, not with the rest of the publication in step 9 (PR #174
+  //     review). metadata.json outranks config.yaml but does not erase it, so a project moving to
+  //     bd's default account (no `dolt_server_user`) while config.yaml still carries an older
+  //     `dolt.user` is a project bd connects as that older account: the probe below tests the wrong
+  //     identity, fails to authenticate, and rolls back a switch that was correct — leaving no way
+  //     to make the move at all without hand-editing config.yaml first. Clearing it first means the
+  //     probe tests the connection this project is actually declaring.
+  //     A key that will NOT come off is fatal here for the same reason it is in step 9: it decides
+  //     which account every later bd call uses, and the only fix is the operator's.
+  const stale = staleConnectionKeys(beadsDir, connection);
+  if (stale.length) {
+    const snapshot = snapshotConfig();
+    if (!snapshot.ok) {
+      record("config.yaml", "failed", snapshot.detail);
+      errors.push(
+        `${snapshot.detail} — a stale connection key cannot be cleared from a file whose earlier ` +
+          "contents could not be snapshotted, because a failed switch could not then be rolled back",
+      );
+      revert("could not snapshot config.yaml before clearing a stale connection key");
+      return fail({ before, connection, counts, backup });
+    }
+    for (const { key, metaKey } of stale) {
+      const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
+      record(retracted.name, retracted.status, retracted.detail);
+      if (retracted.status === "failed") errors.push(retracted.detail);
+    }
+    if (errors.length) {
+      revert("could not clear a stale connection key from config.yaml");
+      return fail({ before, connection, counts, backup });
+    }
+  }
 
   // 7. Prove the connection before anything else trusts it.
   const tested = testDoltConnection(dir, connection, opts);
@@ -1086,16 +1151,16 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    the snapshot below, so a failed attempt leaves it exactly as it was rather than carrying
   //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
   //    comes after the metadata write rather than before it.
-  //    The snapshot is re-read HERE, not reused from step 5 (PR #174 review): everything between
-  //    the two — the flip, the connection test, a server export with a multi-minute budget — is a
-  //    window in which someone edits config.yaml, and restoring step 5's text would silently drop
-  //    that edit. Re-reading narrows the window to the publication itself, which is the smallest it
-  //    can be: once bd starts patching the file, its writes and a concurrent edit are the same
-  //    bytes to anything looking from here.
+  //    {@link snapshotConfig} takes it as late as it can and only once (PR #174 review) — not
+  //    reused from step 5, since everything between the two (the flip, the connection test, a
+  //    server export with a multi-minute budget) is a window in which someone edits config.yaml,
+  //    and not re-taken if step 6b already wrote, since a revert owes the file as this run FOUND
+  //    it. Either way the window is the smallest available: once bd starts patching the file, its
+  //    writes and a concurrent edit are the same bytes to anything looking from here.
   //    An unreadable file refuses rather than publishes, for the same reason step 5 does: a
   //    snapshot that cannot be taken is a rollback that cannot happen, and the half-written
   //    config.yaml a failed publication leaves behind is exactly what a rollback is for.
-  const configNow = readFileSnapshot(configPath);
+  const configNow = snapshotConfig();
   if (!configNow.ok) {
     record("config.yaml", "failed", configNow.detail);
     errors.push(
@@ -1105,11 +1170,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     revert("could not snapshot config.yaml before publishing");
     return fail({ before, connection, counts, backup, missing, diverged, extra });
   }
-  configSnapshot = configNow.text;
   configPublished = true;
-  // Both take the project-scoped runner: on a server board `bd config set` and `bd dolt set` talk
-  // to the database, so they need the same narrowed credentials the test above proved.
-  const exec = scopedBdRunner(dir, connection, opts);
   for (const [key, want] of teamConfigKeys("server")) {
     const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
     record(`${key}=${want}`, status);
