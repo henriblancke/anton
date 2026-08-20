@@ -257,6 +257,49 @@ export function writeServerModeMetadata(dir, connection) {
   return { ...prepared, status: "written" };
 }
 
+/** The metadata.json keys `bd dolt set … --update-config` re-serializes as it publishes. */
+const PUBLISHED_METADATA_KEYS = new Set(Object.values(SERVER_METADATA_KEYS));
+
+/**
+ * True when `text` is metadata.json still holding the switch this run wrote, re-serialized by bd's
+ * own publication — as opposed to somebody else's edit.
+ *
+ * Publication runs `bd dolt set <key> <value> --update-config`, which writes BOTH files (see
+ * {@link ensureDoltConnection}). So the moment one of those succeeds, metadata.json no longer holds
+ * the exact bytes the flip wrote, even with nothing else on the machine touching it. Comparing bytes
+ * alone would then read bd's own rewrite as a concurrent editor and decline the rollback of a failed
+ * publication — leaving `dolt_mode: server` behind while the command reports the project was not
+ * switched (PR #174 review). Content is compared instead, and ONLY bd's re-encoding is forgiven:
+ * every key this run wrote must still carry the value it wrote — loosely for the connection keys bd
+ * rewrites, since it re-serializes a port as its own JSON type, and exactly for everything else,
+ * `project_id` and `backend` included — and the only keys allowed to have appeared are those same
+ * connection keys. Anything else is an edit a restore would discard, and is refused as before.
+ */
+function isPublicationRewrite(text, wrote) {
+  if (typeof text !== "string" || typeof wrote !== "string") return false;
+  let now;
+  let mine;
+  try {
+    now = JSON.parse(text);
+    mine = JSON.parse(wrote);
+  } catch {
+    return false;
+  }
+  const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  if (!isObject(now) || !isObject(mine)) return false;
+  for (const key of new Set([...Object.keys(mine), ...Object.keys(now)])) {
+    if (PUBLISHED_METADATA_KEYS.has(key)) {
+      // A key only the rewrite has is bd filling in a connection field; one only the flip has is bd
+      // dropping it. Both compare a value against `undefined` here, so only the first passes.
+      if (!(key in mine)) continue;
+      if (String(now[key]) !== String(mine[key])) return false;
+    } else if (stableJson(now[key]) !== stableJson(mine[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Put back a file this flow replaced — `before` is its exact prior text, `null` when it did not
  * exist (in which case the file is removed). Used for both `metadata.json` and `config.yaml`.
@@ -827,13 +870,20 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
    * which is the failure this whole command exists not to commit. So the current bytes are compared
    * with what the flip wrote: equal means the edit never happened and the restore is exact; anything
    * else means someone else owns the file now, and the run says so rather than overwriting them.
+   * Once publication has started, bd's OWN rewrite of metadata.json is the expected difference and
+   * is recognized as this run's ({@link isPublicationRewrite}) — without that, every failed
+   * publication would decline its own rollback and strand the project in server mode while reporting
+   * it was not switched (PR #174 review).
    * config.yaml is snapshotted immediately before publication instead, since bd's own writes make
    * "did someone else change this?" unanswerable once step 9 has started.
    */
   const revert = (reason) => {
     if (wroteMetadata !== null) {
       const current = readFileSnapshot(prepared.path);
-      if (current.ok && current.text === wroteMetadata) {
+      const ours =
+        current.ok &&
+        (current.text === wroteMetadata || (configPublished && isPublicationRewrite(current.text, wroteMetadata)));
+      if (ours) {
         restoreFile(prepared.path, prepared.before);
         record("metadata.json", "reverted", `${reason} — the board is untouched`);
       } else {

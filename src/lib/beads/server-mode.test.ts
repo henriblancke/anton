@@ -542,6 +542,67 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * `bd dolt set --update-config` writes metadata.json as well as config.yaml, so by the time a
+   * later publication step fails, the file no longer holds the exact bytes the flip wrote — with
+   * nobody else touching it. A byte-only comparison reads bd's own rewrite as a concurrent editor
+   * and declines the rollback, leaving `dolt_mode: server` behind under a report saying the project
+   * was not switched (PR #174 review). The rewrite is recognized as this run's, and rolled back.
+   */
+  it("rolls metadata.json back when bd's own --update-config rewrote it before publishing failed", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const original = readFileSync(metadataPath(dir), "utf8");
+    // bd as it really behaves: --update-config patches config.yaml AND re-serializes metadata.json
+    // in bd's own encoding — reordered keys, no trailing newline, the port as a string.
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        const meta = readMetadata(dir);
+        const rewritten = { dolt_mode: meta.dolt_mode, ...meta, dolt_server_port: String(meta.dolt_server_port) };
+        writeFileSync(metadataPath(dir), JSON.stringify(rewritten));
+        writeFileSync(configPath, `${readFileSync(configPath, "utf8")}dolt.${args[2]}: ${args[3]}\n`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
+    expect(result.steps.some((s: { status: string }) => s.status === "kept")).toBe(false);
+  });
+
+  /**
+   * Forgiving bd's rewrite must not forgive everyone else's. An edit that lands DURING publication
+   * and changes something bd does not write is still a file this run no longer owns.
+   */
+  it("still keeps metadata.json when a real edit lands during publication", () => {
+    const dir = repo(EMBEDDED);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        const meta = readMetadata(dir);
+        writeFileSync(metadataPath(dir), `${JSON.stringify({ ...meta, project_id: "corrected-9999" }, null, 2)}\n`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readMetadata(dir).project_id).toBe("corrected-9999");
+    expect(result.steps.some((s: { status: string }) => s.status === "kept")).toBe(true);
+    expect(result.warnings.some((w: string) => w.includes("edited after this command wrote the switch"))).toBe(true);
+  });
+
+  /**
    * A rollback must not become the thing that loses work (PR #174 review). Everything after the flip
    * — the connection test, the server's export, the publication — takes long enough for another
    * clone's switch or a person fixing the connection to edit metadata.json, and restoring the
