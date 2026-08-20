@@ -19,11 +19,13 @@
  *   2. **Write the connection, then prove it.** `bd dolt test` must connect, or the flip is undone.
  *   3. **Prove the board arrived, whole and current.** The board read before the flip is compared
  *      with the one read back from the server: every id must be there, and every issue must say on
- *      the server what it says here — or say something NEWER, which is another machine that has
- *      already switched. A missing issue means the data copy has not happened or landed in another
- *      database; an issue the server holds an OLDER copy of means it landed from a stale snapshot.
- *      Both are the class of mistake that makes an otherwise-successful switch look fine while the
- *      team stares at a board with work missing from it. It reverts rather than reports.
+ *      the server exactly what it says here. A missing issue means the data copy has not happened
+ *      or landed in another database; an issue whose content differs means the server's copy and
+ *      this board were edited apart — in EITHER direction, because a later `updated_at` on the
+ *      server orders two writes without merging them and so is no proof its row carries this
+ *      board's edit. Both are the class of mistake that makes an otherwise-successful switch look
+ *      fine while the team stares at a board with work missing from it. It reverts rather than
+ *      reports.
  *   4. **Prove nobody wrote it meanwhile.** The board is read once to measure and once more
  *      immediately before the flip, and every issue's CONTENT is compared, not just the id set: an
  *      update the server's copy predates would otherwise sail through step 3 and be stranded in the
@@ -323,9 +325,11 @@ const issueDigest = (issue) => createHash("sha1").update(stableJson(issue)).dige
 
 /**
  * bd's own last-write stamp for one issue as epoch ms, or `undefined` when it carries none this can
- * order. It is what tells the two directions of a content difference apart across the migration
- * boundary: a server copy AHEAD of this board is another machine that already switched, a server
- * copy BEHIND it is a stale snapshot the flip would strand updates in (PR #174 review).
+ * order. It names, but never excuses, a content difference across the migration boundary: a server
+ * copy BEHIND this board is a snapshot copied before the last edits, one AHEAD of it is a board
+ * someone kept writing after the copy. Both are divergence — ordering two writes is not merging
+ * them — so the stamp chooses which fix the message names, not whether the flip is allowed
+ * (PR #174 review).
  */
 const issueUpdatedAt = (issue) => {
   const ms = typeof issue?.updated_at === "string" ? Date.parse(issue.updated_at) : Number.NaN;
@@ -344,8 +348,8 @@ const issueUpdatedAt = (issue) => {
  *
  * The `digests` answer the other question — "is this the same board" — which ids alone cannot: a
  * writer that UPDATES an existing issue leaves the id set identical, and so does a server snapshot
- * copied before that update was made. `updated` orders two differing copies of one issue, so the
- * second case can say WHICH side is behind.
+ * copied before that update was made. `updated` orders two differing copies of one issue, which is
+ * how the second case can say which side was written last — not whether the difference is safe.
  *
  * Returns `{ ok: true, ids, digests, updated }` or `{ ok: false, detail }` — a board that cannot be
  * read is reported, never silently treated as empty.
@@ -483,16 +487,18 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   backup?: boolean, force?: boolean }} flags
  *   `tls` declares the transport in this project's metadata.json (undefined leaves it undeclared,
  *   inheriting the ambient `BEADS_DOLT_SERVER_TLS`); `backup: false` skips the pre-flip export;
- *   `force: true` accepts a server board that is MISSING issues the board being moved has, or holds
- *   an OLDER copy of them (starting a deliberately fresh board), and is the only way to switch when
+ *   `force: true` accepts a server board that is MISSING issues the board being moved has, or that
+ *   says something DIFFERENT about them in either direction (starting a deliberately fresh board,
+ *   or switching a machine whose local board is a leftover copy), and is the only way to switch when
  *   the board being moved cannot be read at all — with no source read, nothing verifies what
  *   arrived. It does NOT get past an unreadable `metadata.json`: that refusal is about not
  *   destroying the file, which no amount of intent makes safe.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
- * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, stale?, drifted? }}
- *   `missing` is the ids this board holds that the server's copy does not; `stale` the ids it does
- *   hold but with content older than this board's — both empty once the checks have passed.
+ * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, diverged?, drifted? }}
+ *   `missing` is the ids this board holds that the server's copy does not; `diverged` the ids it
+ *   does hold but says something different about, in either direction — both empty once the checks
+ *   have passed.
  *   `drifted` is the ids that appeared, disappeared or were EDITED on the board being moved while
  *   the switch was being prepared, i.e. a writer that was never stopped.
  */
@@ -724,39 +730,56 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   }
 
   // 8b. Every id the server DOES hold, compared by content against the board being moved. A copy
-  //     whose digest matches is the same issue; one that differs is only acceptable in ONE
-  //     direction — the server's is NEWER (another machine already switched and has been writing
-  //     it, which the id check already accepts as "plus newer ones"). A server copy that is older,
-  //     or that carries no stamp to order it by, is a snapshot this board has moved on from, and
-  //     flipping onto it loses the difference. `updated_at` is what tells the two apart; without it
-  //     on both sides there is nothing to prove the server is ahead, so the conservative reading
-  //     wins and the switch is refused.
-  const stale = idsBefore.ok
-    ? idsBefore.ids.filter((id) => {
-        if (!onServer.has(id) || idsAfter.digests.get(id) === idsBefore.digests.get(id)) return false;
-        const here = idsBefore.updated.get(id);
-        const there = idsAfter.updated.get(id);
-        return !(here !== undefined && there !== undefined && there > here);
-      })
+  //     whose digest matches is the same issue; ANY difference is divergence and refuses, in both
+  //     directions. A NEWER `updated_at` on the server is not the exception it looks like (PR #174
+  //     review): it says the server's row was written last, not that it carries this board's edit.
+  //     Close a bead here at t1 while the stale server copy is retitled at t2 and the server wins
+  //     on timestamp while missing the close — flipping onto it strands exactly the update the
+  //     check exists to protect. Nothing bd prints proves the server's row descends from this one,
+  //     so content equality is the only evidence accepted; `--force` remains the deliberate
+  //     override, and the id check still accepts ids the server holds and this board does not.
+  const diverged = idsBefore.ok
+    ? idsBefore.ids.filter((id) => onServer.has(id) && idsAfter.digests.get(id) !== idsBefore.digests.get(id))
     : [];
-  if (stale.length && !flags.force) {
+  // The stamp picks the fix to name, not the verdict: behind → the copy is old, re-run Phase 1;
+  // ahead → both sides were written after the copy, so the two boards have to be reconciled by a
+  // human (or forced, if this board is the leftover of a machine that already switched).
+  const ahead = diverged.filter((id) => {
+    const here = idsBefore.updated.get(id);
+    const there = idsAfter.updated.get(id);
+    return here !== undefined && there !== undefined && there > here;
+  });
+  if (diverged.length && !flags.force) {
+    const n = diverged.length;
     errors.push(
-      `the server's "${connection.database}" database holds all of this board's ids but ${stale.length} ` +
-        `issue${stale.length === 1 ? " is" : "s are"} older there than here (${stale.slice(0, 5).join(", ")}` +
-        `${stale.length > 5 ? ", …" : ""}) — the copy on the server predates this board, so switching ` +
-        "would strand those updates in the database being left behind. Re-run Phase 1 of the runbook " +
-        "with a current copy." +
+      `the server's "${connection.database}" database holds all of this board's ids but ${n} ` +
+        `issue${n === 1 ? "" : "s"} say${n === 1 ? "s" : ""} something different there ` +
+        `(${diverged.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}) — the copy on the server and this ` +
+        "board were edited apart, so switching would strand every one of those differences in the " +
+        "database being left behind. " +
+        (ahead.length === n
+          ? "Those rows were written LAST on the server, which does not mean they contain this " +
+            "board's edits — a later timestamp orders two writes, it does not merge them. Reconcile " +
+            "the two boards (compare a `bd list --json` from each); --force is right only when this " +
+            "machine's board is a leftover copy nobody has written since it was copied."
+          : ahead.length
+            ? `${ahead.length} of them (${ahead.slice(0, 5).join(", ")}${ahead.length > 5 ? ", …" : ""}) ` +
+              "were written last on the server, which orders the two writes without merging them; the " +
+              "rest are older there. Re-run Phase 1 of the runbook with a current copy, or reconcile " +
+              "the two boards before forcing."
+            : "The copy on the server predates this board. Re-run Phase 1 of the runbook with a " +
+              "current copy.") +
         // EVERY issue differing is not a stale snapshot — nothing edits a whole board — it is the
         // two sides describing the same rows differently. Named, because the fix is the opposite
         // one (look at the listings, then --force) and an operator should not have to guess.
-        (stale.length === idsBefore.ids.length
+        (n === idsBefore.ids.length
           ? " (That is EVERY issue on the board, which usually means the two sides print the same " +
-            "rows differently rather than that the server is a week behind — compare a `bd list " +
+            "rows differently rather than that the boards really diverged — compare a `bd list " +
             "--json` from each before reaching for --force.)"
           : ""),
     );
-    revert("server board is older than this one");
-    return fail({ before, connection, counts, backup, missing, stale });
+    revert("server board differs from this one");
+    return fail({ before, connection, counts, backup, missing, diverged });
   }
 
   // 9. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
@@ -781,8 +804,8 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   // same answer: the project goes back to what it was rather than staying half-switched.
   if (errors.length) {
     revert("could not publish the team-wide connection defaults");
-    return fail({ before, connection, counts, backup, missing, stale });
+    return fail({ before, connection, counts, backup, missing, diverged });
   }
 
-  return { ok: true, steps, errors, before, connection, counts, backup, missing, stale };
+  return { ok: true, steps, errors, before, connection, counts, backup, missing, diverged };
 }

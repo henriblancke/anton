@@ -113,7 +113,10 @@ The `dolt log` output is the point of this whole approach: it is the project's r
 
 ### Phase 2 — Point the project at the server
 
-From the project, on each machine:
+From the project, on each machine — starting with the one Phase 1 was copied from, whose board still
+matches the server's. A second machine carrying its own embedded copy is checked against the server
+the same way, so anything either side wrote after the copy is reported rather than silently dropped
+(see step 5 and the failure list below).
 
 ```bash
 export BEADS_DOLT_PASSWORD_<USER>='…'     # uppercased user, non-alphanumerics folded to _
@@ -132,11 +135,12 @@ That command is the whole config half. It:
    key in that file;
 4. runs **`bd dolt test`**;
 5. **reads the board back from the server** and confirms it is this board, whole and current — every
-   pre-switch issue id present, and every issue saying there what it says here (or something
-   *newer*, which is another machine that already switched). By identity and content, not
-   cardinality: a stale or divergent copy of the same project can hold as many issues (or more)
-   while missing the ones written here since it diverged, and a snapshot copied a week ago holds
-   every id while its titles, statuses and labels predate the board being moved;
+   pre-switch issue id present, and every issue saying there *exactly* what it says here. By
+   identity and content, not cardinality: a stale or divergent copy of the same project can hold as
+   many issues (or more) while missing the ones written here since it diverged, and a snapshot
+   copied a week ago holds every id while its titles, statuses and labels predate the board being
+   moved. A difference is refused in **both** directions — a newer `updated_at` on the server orders
+   the two writes without merging them, so it is no proof that row carries this board's edits;
 6. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
    team-wide default, so the next clone inherits the target.
 
@@ -153,13 +157,18 @@ most likely to see:
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
   from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
   the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
-- *"the server's … database holds all of this board's ids but N issues are older there than here
-  (…)"* — step 5, the other half of it. The copy on the server is a snapshot taken before those
-  beads were last written (an earlier Phase 1 attempt, or a stale export), so switching would strand
-  every one of those updates in the database being left behind. Re-run Phase 1 with a **current**
-  copy; `--force` accepts the gap deliberately, same as above. If it names *every* issue on the
-  board, that is not a stale copy — nothing edits a whole board at once — it is the two sides
-  printing the same rows differently; compare a `bd list --json` from each before forcing.
+- *"the server's … database holds all of this board's ids but N issues say something different there
+  (…)"* — step 5, the other half of it. The two copies were edited apart, so switching would strand
+  every one of those differences in the database being left behind. The message says which way round
+  it is. *The copy on the server predates this board* — a snapshot taken before those beads were
+  last written (an earlier Phase 1 attempt, or a stale export): re-run Phase 1 with a **current**
+  copy. *Written last on the server* — someone kept writing one of the two boards after the copy;
+  a later timestamp orders those writes, it does **not** merge them, so the server's row can be
+  newer and still be missing a bead you closed here. Reconcile the two boards (compare a `bd list
+  --json` from each); `--force` is right only when this machine's board is a leftover copy nobody
+  has written since it was copied. If it names *every* issue on the board, the boards did not really
+  diverge — nothing edits a whole board at once — it is the two sides printing the same rows
+  differently; compare those listings before forcing.
 - *"the board being moved changed while the switch was being prepared — N issues appeared,
   disappeared or were edited"* — step 2. Something is still writing this board (anton, an agent, a
   shell), so neither the backup nor the arrived-whole check covers what it wrote. The comparison is

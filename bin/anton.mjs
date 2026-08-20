@@ -1683,8 +1683,8 @@ async function cmdServerMode(args = []) {
     for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
     for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
     // The two arrived-whole guards are the failures with a runbook behind them: the server is fine,
-    // the data simply is not on it yet — or the copy that is on it predates this board.
-    if (result.missing?.length || result.stale?.length) {
+    // the data simply is not on it yet — or the copy that is on it and this board were edited apart.
+    if (result.missing?.length || result.diverged?.length) {
       console.log(c.dim("  → copy the board's Dolt history onto the server first:"));
       console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
     }

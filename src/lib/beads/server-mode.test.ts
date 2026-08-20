@@ -632,10 +632,11 @@ describe("configureServerMode", () => {
    */
   describe("the server's copy is checked by CONTENT, not just id membership", () => {
     /** Source and server boards of the same seven ids, differing only in `probe-3`. */
-    const boards = (server: { status: string; updated_at: string }) => {
+    const boards = (server: object, local: object = {}) => {
       const rows = (issues: object[]) => ({ status: 0, stdout: JSON.stringify({ issues }) });
-      const here = BOARD.map((id) => ({ id, title: id, status: "open", updated_at: "2026-08-18T12:00:00Z" }));
-      const there = here.map((i) => (i.id === "probe-3" ? { ...i, ...server } : i));
+      const base = BOARD.map((id) => ({ id, title: id, status: "open", updated_at: "2026-08-18T12:00:00Z" }));
+      const here = base.map((i) => (i.id === "probe-3" ? { ...i, ...local } : i));
+      const there = base.map((i) => (i.id === "probe-3" ? { ...i, ...server } : i));
       return (dir: string) =>
         (_cmd: string, args: string[]): Result => {
           if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
@@ -653,9 +654,10 @@ describe("configureServerMode", () => {
       const result = configureServerMode(dir, flags, { exec });
 
       expect(result.ok).toBe(false);
-      expect(result.stale).toEqual(["probe-3"]);
+      expect(result.diverged).toEqual(["probe-3"]);
       expect(result.missing).toEqual([]);
-      expect(result.errors.join("\n")).toMatch(/1 issue is older there than here \(probe-3\)/);
+      expect(result.errors.join("\n")).toMatch(/1 issue says something different there \(probe-3\)/);
+      expect(result.errors.join("\n")).toContain("The copy on the server predates this board");
       // Reverted, not merely reported — the project keeps reading the board that is current.
       expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
       expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
@@ -681,7 +683,7 @@ describe("configureServerMode", () => {
 
       const result = configureServerMode(dir, flags, { exec });
       expect(result.ok).toBe(false);
-      expect(result.stale).toEqual(["probe-3"]);
+      expect(result.diverged).toEqual(["probe-3"]);
     });
 
     // A whole board reading as stale is not a stale board — it is the two sides describing the same
@@ -704,25 +706,46 @@ describe("configureServerMode", () => {
 
       const result = configureServerMode(dir, flags, { exec });
       expect(result.ok).toBe(false);
-      expect(result.stale).toEqual(BOARD);
+      expect(result.diverged).toEqual(BOARD);
       expect(result.errors.join("\n")).toContain("EVERY issue on the board");
     });
 
-    // The other direction is the documented healthy case: another machine switched first and has
-    // been writing the shared board. Its copy is ahead of this one, which is not a loss.
-    it("accepts a server copy that is NEWER than this board's", () => {
+    /**
+     * The direction a timestamp check waves through, and the reason there is no timestamp check any
+     * more (PR #174 review). This board closed probe-3 at t1; the server's stale copy of the SAME
+     * bead was retitled at t2 > t1. The server's row is newer and still does not contain the close,
+     * so accepting it on the stamp alone strands exactly the update this check exists to protect.
+     */
+    it("refuses a server copy that is NEWER but was edited apart from this board's", () => {
       const dir = repo(EMBEDDED);
-      const exec = boards({ status: "closed", updated_at: "2026-08-19T09:00:00Z" })(dir);
+      const original = readFileSync(metadataPath(dir), "utf8");
+      const exec = boards(
+        { title: "retitled on the server", updated_at: "2026-08-19T09:00:00Z" },
+        { status: "closed", updated_at: "2026-08-18T12:00:00Z" },
+      )(dir);
 
       const result = configureServerMode(dir, flags, { exec });
 
+      expect(result.ok).toBe(false);
+      expect(result.diverged).toEqual(["probe-3"]);
+      // Named for what it is, so the operator reaches for the two listings rather than Phase 1.
+      expect(result.errors.join("\n")).toContain("written LAST on the server");
+      expect(result.errors.join("\n")).toContain("does not merge them");
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    });
+
+    // Identical content is the one thing that proves the copy arrived — the flip needs no stamp.
+    it("accepts a server copy that says exactly what this board says", () => {
+      const dir = repo(EMBEDDED);
+      const result = configureServerMode(dir, flags, { exec: boards({})(dir) });
+
       expect(result.ok).toBe(true);
-      expect(result.stale).toEqual([]);
+      expect(result.diverged).toEqual([]);
       expect(readMetadata(dir).dolt_mode).toBe("server");
     });
 
-    // --force already accepts a server board that is missing issues outright; a stale one is the
-    // same deliberate override, and the same flag.
+    // --force already accepts a server board that is missing issues outright; a divergent one is
+    // the same deliberate override, and the same flag.
     it("switches anyway under --force", () => {
       const dir = repo(EMBEDDED);
       const exec = boards({ status: "open", updated_at: "2026-08-01T09:00:00Z" })(dir);
