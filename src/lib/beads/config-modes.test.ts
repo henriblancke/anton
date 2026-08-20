@@ -19,6 +19,8 @@ import {
   SERVER_CONFIG_KEYS,
   beadsPrereqs,
   checkSharedServer,
+  configYamlHas,
+  configYamlValue,
   configureBeadsDoltSync,
   configureBeadsForRepo,
   ensureDoltConnection,
@@ -216,6 +218,77 @@ describe("ensureDoltConnection (server profile)", () => {
     const steps = ensureDoltConnection(dir, join(dir, ".beads"), info, { exec });
 
     expect(steps[0]).toMatchObject({ status: "failed", detail: "not supported in embedded mode" });
+  });
+
+  /**
+   * An optional field dropped from metadata.json must be dropped from config.yaml too (PR #174
+   * review). Left standing, bd falls back to that lower-priority value and connects as the old
+   * account, while anton — reading metadata.json — scopes the spawn's credentials as if no user
+   * were configured: the bd call authenticates as the wrong account, or not at all.
+   */
+  describe("an optional field metadata.json no longer declares", () => {
+    const noUser = JSON.stringify({ ...SERVER_METADATA, dolt_server_user: undefined });
+    const published = { host: "dolt.example.dev", port: 3306, database: "anton" };
+
+    it.each([
+      ["the flat encoding", "dolt.host: dolt.example.dev\ndolt.port: 3306\ndolt.database: anton\ndolt.user: beads\n"],
+      ["the nested map bd writes since 1.1.0", "dolt:\n    host: dolt.example.dev\n    port: 3306\n    database: anton\n    user: beads\n"],
+    ])("is retracted from config.yaml in %s", (_label, configYaml) => {
+      const dir = repo(noUser, configYaml);
+      const { calls, exec } = recordingExec();
+
+      const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec });
+
+      expect(calls).toEqual([["bd", "config", "unset", "dolt.user"]]);
+      const retracted = steps[steps.length - 1];
+      expect(retracted).toMatchObject({ name: "dolt.user", status: "cleared" });
+      expect(retracted.detail).toContain("beads");
+      // The stale line is struck out, not deleted, and the rest of the connection is untouched.
+      const text = readFileSync(join(dir, ".beads", "config.yaml"), "utf8");
+      expect(text).toContain("# ");
+      expect(text).not.toMatch(/^\s*(dolt\.)?user: beads/m);
+      expect(configYamlHas(join(dir, ".beads"), "dolt.host", "dolt.example.dev")).toBe(true);
+    });
+
+    // bd reports success even when it rewrote nothing, so the verdict comes from the file — which
+    // also means a bd that refuses outright still ends with config.yaml corrected.
+    it("is retracted even when bd's own unset fails", () => {
+      const dir = repo(noUser, "dolt:\n    user: beads\n");
+      const { exec } = recordingExec({ status: 1, stderr: "no such key" });
+
+      const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec });
+
+      expect(steps[steps.length - 1]).toMatchObject({ name: "dolt.user", status: "cleared" });
+      expect(configYamlValue(join(dir, ".beads"), "dolt.user")).toBeUndefined();
+    });
+
+    it("stays a silent no-op when config.yaml publishes nothing for it", () => {
+      const dir = repo(noUser, "dolt.host: dolt.example.dev\n");
+      const { calls, exec } = recordingExec();
+
+      const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec });
+
+      expect(calls).not.toContainEqual(["bd", "config", "unset", "dolt.user"]);
+      expect(steps[steps.length - 1]).toEqual({ name: "dolt.user", status: "unset" });
+    });
+
+    // Fail loud rather than leave a wrong account published: an unwritable config.yaml is reported
+    // with the line to remove by hand, and it fails the run like any other unpublishable key.
+    it("reports a value it cannot remove instead of claiming it is gone", () => {
+      const dir = repo(noUser, "dolt:\n    user: beads\n");
+      const configPath = join(dir, ".beads", "config.yaml");
+      chmodSync(configPath, 0o444);
+      try {
+        const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec: recordingExec().exec });
+
+        const left = steps[steps.length - 1];
+        expect(left).toMatchObject({ name: "dolt.user", status: "failed" });
+        expect(left.detail).toContain("dolt.user");
+        expect(left.detail).toContain("by hand");
+      } finally {
+        chmodSync(configPath, 0o644);
+      }
+    });
   });
 });
 

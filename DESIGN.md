@@ -195,7 +195,9 @@ The **connection** is mirrored into `.beads/config.yaml` as a team-wide default 
 which anton's team-config enforcement applies for you (`src/lib/beads/config.mjs`, anton-4gd2).
 metadata.json stays the truth anton reads; the mirror is what lets a clone that did not inherit one
 still find the server. It is enforcement, so a required field absent from metadata.json is reported
-as an error rather than defaulted.
+as an error rather than defaulted — and an optional one (`dolt.user`) that metadata.json no longer
+declares is retracted from the mirror rather than left standing, since bd would otherwise fall back
+to it and connect as an account anton no longer scopes credentials for.
 
 Credentials come from the environment, never from `metadata.json` — it is committed. Give each
 project's database user its own variable, `BEADS_DOLT_PASSWORD_<USER>` (uppercased, non-alphanumeric

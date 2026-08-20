@@ -421,19 +421,19 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
 }
 
 /**
- * Parse `.beads/config.yaml` into a flat `dotted.path → value` map (surrounding quotes stripped),
- * accepting BOTH encodings bd has shipped. bd 1.0.4 appends flat dotted lines (`export.auto: false`);
- * bd 1.1.0 writes `export.*` and `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping
- * `sync.remote` flat. Both must resolve to the same dotted path so team-config enforcement doesn't
- * keep re-setting keys it already set (anton-qhoz). Nesting is tracked purely by indentation; blank
- * and comment lines are ignored. A later line for the same path wins (bd appends, so this reflects the
- * effective value).
+ * Walk a `.beads/config.yaml`'s uncommented `key: value` lines, yielding `{ line, path, value }` for
+ * each — the ONE reader of both encodings bd has shipped, so nothing below can disagree about what a
+ * line means. bd 1.0.4 appends flat dotted lines (`export.auto: false`); bd 1.1.0 writes `export.*`
+ * and `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping `sync.remote` flat. Both
+ * must resolve to the same dotted path so team-config enforcement doesn't keep re-setting keys it
+ * already set (anton-qhoz). Nesting is tracked purely by indentation; blank and comment lines are
+ * ignored. `line` is the 0-based index into `text.split("\n")`, for callers that rewrite the file.
  */
-function parseConfigYaml(text) {
-  const map = {};
+function* configYamlEntries(text) {
   const stack = []; // parent map headers currently in scope, outermost first: { indent, key }
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(/\r$/, "");
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\r$/, "");
     if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
     const m = line.match(/^(\s*)([^:#]+):\s*(.*)$/);
     if (!m) continue;
@@ -447,9 +447,18 @@ function parseConfigYaml(text) {
       // A bare `key:` opens a nested map (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
       stack.push({ indent, key });
     } else {
-      map[path] = value.replace(/^["']|["']$/g, "");
+      yield { line: i, path, value: value.replace(/^["']|["']$/g, "") };
     }
   }
+}
+
+/**
+ * Parse `.beads/config.yaml` into a flat `dotted.path → value` map (surrounding quotes stripped).
+ * A later line for the same path wins (bd appends, so this reflects the effective value).
+ */
+function parseConfigYaml(text) {
+  const map = {};
+  for (const { path, value } of configYamlEntries(text)) map[path] = value;
   return map;
 }
 
@@ -463,13 +472,47 @@ function parseConfigYaml(text) {
  * on` lands it), which is not portable.
  */
 export function configYamlHas(beadsDir, key, want) {
-  let text = "";
+  return configYamlValue(beadsDir, key) === want;
+}
+
+/**
+ * The value `.beads/config.yaml` publishes for `key` (dotted path), or `undefined` when the file is
+ * missing, unreadable, or says nothing about it.
+ */
+export function configYamlValue(beadsDir, key) {
   try {
-    text = readFileSync(join(beadsDir, "config.yaml"), "utf8");
+    return parseConfigYaml(readFileSync(join(beadsDir, "config.yaml"), "utf8"))[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Comment out every line `.beads/config.yaml` devotes to `key`, returning whether the file changed.
+ * Commenting rather than deleting is `bd config unset`'s own strike-out style, and it leaves the old
+ * value readable as history instead of vanishing from a committed file.
+ */
+function retractConfigYamlKey(beadsDir, key) {
+  const path = join(beadsDir, "config.yaml");
+  let lines;
+  try {
+    lines = readFileSync(path, "utf8").split("\n");
   } catch {
     return false;
   }
-  return parseConfigYaml(text)[key] === want;
+  let changed = false;
+  for (const entry of configYamlEntries(lines.join("\n"))) {
+    if (entry.path !== key) continue;
+    lines[entry.line] = lines[entry.line].replace(/^(\s*)/, "$1# ");
+    changed = true;
+  }
+  if (!changed) return false;
+  try {
+    writeFileSync(path, lines.join("\n"));
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -570,7 +613,16 @@ export const BD_PASSWORD_VAR = "BEADS_DOLT_PASSWORD";
 /** bd's transport switch. Per project via `dolt_server_tls` — see {@link applyBoardTls}. */
 export const BD_TLS_VAR = "BEADS_DOLT_SERVER_TLS";
 
-/** A value as an env-var name fragment: uppercased, every non-alphanumeric run folded to `_`. */
+/**
+ * A value as an env-var name fragment: uppercased, every non-alphanumeric run folded to `_`.
+ *
+ * Deliberately lossy, not reversible: this is the name an OPERATOR types into their shell, and it is
+ * documented as derivable by hand (README, DESIGN.md §, the runbook, the /setup skill), which an
+ * escaped or hashed encoding would end. The cost is that identities differing only in WHICH
+ * non-alphanumerics they use (`db-a.example.com` vs `db.a-example.com`) fold to one token — two
+ * hosts one operator would have to own simultaneously, sharing an account name, with different
+ * passwords, before it could matter (PR #174 review).
+ */
 const envToken = (value) => String(value).toUpperCase().replace(/[^A-Z0-9]+/g, "_");
 
 /**
@@ -827,7 +879,9 @@ export function teamConfigKeys(mode) {
  * fall back on, it is a broken server config, and it is reported as an error rather than skipped.
  * `port` is required for the same reason DESIGN.md §3a insists it stay in metadata.json despite bd's
  * deprecation warning — absent it, bd dials port 0 against a remote host. `user` is optional: bd
- * defaults to `root`, which is a real (if unadvisable) single-account setup.
+ * defaults to `root`, which is a real (if unadvisable) single-account setup — but an optional field
+ * metadata.json drops is RETRACTED from config.yaml rather than left standing, see
+ * {@link retractStaleConnectionKey}.
  */
 const SERVER_CONNECTION_KEYS = [
   { key: "host", metaKey: "dolt_server_host", required: true },
@@ -835,6 +889,41 @@ const SERVER_CONNECTION_KEYS = [
   { key: "database", metaKey: "dolt_database", required: true },
   { key: "user", metaKey: "dolt_server_user", required: false },
 ];
+
+/**
+ * Retract a `dolt.<key>` config.yaml still publishes for an OPTIONAL field metadata.json no longer
+ * declares, reported as `{ name, status: "unset" | "cleared" | "failed", detail? }`.
+ *
+ * Skipping it is not enough. metadata.json outranks config.yaml but does not erase it, so a
+ * leftover `dolt.user: beads` keeps bd connecting as that account while anton — which reads the
+ * connection from metadata.json — scopes the spawn's credentials as if no user were configured. The
+ * bd call then authenticates as the wrong account, or fails outright (PR #174 review). Both files
+ * are committed, so the stale key travels to every clone until someone notices.
+ *
+ * `bd config unset` first, because config.yaml is bd's file — then our own strike-out, because bd
+ * only rewrites the FLAT encoding while reporting success either way, so a key under the nested
+ * `dolt:` map bd itself writes since 1.1.0 survives an exit-0 "Unset dolt.user (in config.yaml)".
+ * The verdict is read back from the FILE for that reason: a value that outlives both is reported as
+ * a failure naming the hand fix, never assumed gone.
+ */
+function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutMs) {
+  const path = `dolt.${key}`;
+  const stale = configYamlValue(beadsDir, path);
+  if (stale === undefined) return { name: path, status: "unset" };
+
+  exec("bd", ["config", "unset", path], timeoutMs);
+  if (configYamlValue(beadsDir, path) !== undefined) retractConfigYamlKey(beadsDir, path);
+
+  const left = configYamlValue(beadsDir, path);
+  const declares = `.beads/metadata.json declares no "${metaKey}"`;
+  return left === undefined
+    ? { name: path, status: "cleared", detail: `dropped stale ${path}: ${stale} — ${declares}` }
+    : {
+        name: path,
+        status: "failed",
+        detail: `.beads/config.yaml still publishes ${path}: ${left} but ${declares} — remove that line by hand`,
+      };
+}
 
 /**
  * Publish the server-mode connection from `.beads/metadata.json` to `.beads/config.yaml` as the
@@ -846,8 +935,9 @@ const SERVER_CONNECTION_KEYS = [
  * mode (no Dolt server)"), so calling it there would turn a healthy embedded board into a wall of
  * failed steps.
  *
- * Returns one `{ name, status, detail? }` step per field:
- * "already" | "set" | "failed" | "missing" (required, absent from metadata) | "unset" (optional).
+ * Returns one `{ name, status, detail? }` step per field: "already" | "set" | "failed" | "missing"
+ * (required, absent from metadata) | "unset" (optional, published nowhere) | "cleared" (optional,
+ * retracted from config.yaml — see {@link retractStaleConnectionKey}).
  *
  * @param {string} dir repo root
  * @param {string} beadsDir `<dir>/.beads`
@@ -867,7 +957,7 @@ export function ensureDoltConnection(dir, beadsDir, info, opts = {}) {
       // Named as the fix, not as the symptom: what to add, and where.
       return required
         ? { name: `dolt.${key}`, status: "missing", detail: `server mode declares no "${metaKey}" in .beads/metadata.json` }
-        : { name: `dolt.${key}`, status: "unset" };
+        : retractStaleConnectionKey(beadsDir, key, metaKey, exec, localMs);
     }
     const want = String(raw);
     const name = `dolt.${key}=${want}`;
