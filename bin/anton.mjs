@@ -39,7 +39,6 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
-  beadsPrereqs,
   bdVersion,
   bdVersionAtLeast,
   checkSharedServer,
@@ -1467,18 +1466,20 @@ async function cmdInit(args = []) {
   const dir = resolve(rawPath ?? process.cwd());
   console.log(c.bold("anton init") + c.dim(` ${dir}`));
 
-  // Prereqs — fail loud, each with the fix (shared with addProject's self-heal gate).
-  const pre = beadsPrereqs(dir);
-  if (!pre.ok) {
-    console.log(c.red(`\n✗ ${pre.error.message}`));
-    if (pre.error.fix) console.log(c.dim(`  ${pre.error.fix}`));
-    return 1;
-  }
-
   // Enforce beads team-config via the shared config path (bd init when absent → config.yaml → .gitignore).
+  // It runs the prereq preflight ITSELF, and no gate may run ahead of it: on a server board the
+  // config path first retracts a stale `dolt.user` published in config.yaml, and a preflight before
+  // that retraction probes as the very account being retracted — so `anton init` would refuse the
+  // project over the exact fault it came to repair (PR #174 review). Prereq failures come back as
+  // `skipped` with the same message + fix this used to print.
   const beads = configureBeadsForRepo(dir, { prefix, log: (m) => console.log(c.dim(`  ${m}`)) });
   if (!beads.configured) {
-    console.log(c.red("\n✗ beads config failed — see output above."));
+    if (beads.skipped) {
+      console.log(c.red(`\n✗ ${beads.reason}`));
+      if (beads.fix) console.log(c.dim(`  ${beads.fix}`));
+    } else {
+      console.log(c.red("\n✗ beads config failed — see output above."));
+    }
     return 1;
   }
   for (const e of beads.errors) console.log(c.yellow(`  ${e}`));

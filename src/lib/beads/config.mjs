@@ -187,23 +187,16 @@ export function hasBeadsDir(dir) {
 }
 
 /**
- * Check the prereqs beads config needs (bd on PATH, an existing git repo, and — per board mode —
- * either an origin remote or a reachable shared server).
+ * The half of the preflight that touches no board: bd is installed, new enough, and `dir` is a git
+ * repo. Split out from `beadsPrereqs` because it is the only half that is safe to run BEFORE the
+ * stale-connection retraction — it authenticates nothing, so it cannot be failed by the very stale
+ * `dolt.user` the retraction removes (PR #174 review).
  *
- * Returns { ok } or { ok:false, error:{ message, fix } } — the CLI renders the fix loudly; the
- * self-heal path (addProject) uses it to skip cleanly on a repo that can't be configured (e.g. a
- * plain directory with no git), never corrupting the projects row.
- *
- * The last check is the mode-dependent one, because the two profiles depend on different things
- * (DESIGN.md §3a): an embedded board reconciles per-machine copies over `refs/dolt/data` and so
- * needs `origin`, while a server board has no local copy at all and so needs the SERVER. Checking
- * an embedded board's origin on a server board would fail it for a channel it does not use; not
- * checking the server would let the bootstrap proceed and die later, mid-run, inside bd.
+ * Returns { ok } or { ok:false, error:{ message, fix } }.
  *
  * @param {string} dir repo root
- * @param {{ exec?: Function, env?: NodeJS.ProcessEnv }} [opts] the `checkSharedServer` seam
  */
-export function beadsPrereqs(dir, opts = {}) {
+export function beadsToolingPrereqs(dir) {
   if (!onPath("bd")) {
     return {
       ok: false,
@@ -234,6 +227,23 @@ export function beadsPrereqs(dir, opts = {}) {
       error: { message: `${dir} is not a git repository.`, fix: `git -C ${dir} init` },
     };
   }
+  return { ok: true };
+}
+
+/**
+ * The mode-dependent half of the preflight, because the two profiles depend on different things
+ * (DESIGN.md §3a): an embedded board reconciles per-machine copies over `refs/dolt/data` and so
+ * needs `origin`, while a server board has no local copy at all and so needs the SERVER. Checking
+ * an embedded board's origin on a server board would fail it for a channel it does not use; not
+ * checking the server would let the bootstrap proceed and die later, mid-run, inside bd.
+ *
+ * This half AUTHENTICATES (server mode probes with `bd dolt test`), so it must run after any
+ * stale-connection retraction — otherwise it probes as the account being retracted.
+ *
+ * @param {string} dir repo root
+ * @param {{ exec?: Function, env?: NodeJS.ProcessEnv }} [opts] the `checkSharedServer` seam
+ */
+export function beadsBoardPrereqs(dir, opts = {}) {
   const board = readDoltMetadata(dir);
   if (board.mode === "server") {
     const target = formatServerTarget(board);
@@ -263,6 +273,23 @@ export function beadsPrereqs(dir, opts = {}) {
     };
   }
   return { ok: true };
+}
+
+/**
+ * The full prereq check — tooling then board — for callers that configure nothing and so have no
+ * retraction to sequence around. `configureBeadsForRepo` deliberately calls the two halves itself,
+ * with step 0b's stale-key retraction between them.
+ *
+ * Returns { ok } or { ok:false, error:{ message, fix } } — the CLI renders the fix loudly; the
+ * self-heal path uses it to skip cleanly on a repo that can't be configured (e.g. a plain directory
+ * with no git), never corrupting the projects row.
+ *
+ * @param {string} dir repo root
+ * @param {{ exec?: Function, env?: NodeJS.ProcessEnv }} [opts] the `checkSharedServer` seam
+ */
+export function beadsPrereqs(dir, opts = {}) {
+  const tooling = beadsToolingPrereqs(dir);
+  return tooling.ok ? beadsBoardPrereqs(dir, opts) : tooling;
 }
 
 /** The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime state. */
@@ -1334,7 +1361,7 @@ export function detectHooksManager(dir, priorHooksPath = null) {
 
 /**
  * Run the full beads team-config path for `dir`, idempotently. Steps: stale-connection retraction
- * (server mode, ahead of the preflight probe) → workspace creation (`bd init` when `.beads/` is
+ * (server mode, between the tooling and board preflight halves) → workspace creation (`bd init` when `.beads/` is
  * absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else no-op) → config.yaml enforcement → `.beads/.gitignore` → formulas (bead skeleton + run pipeline) →
  * Dolt remote wiring. Every step is best-effort and its outcome is collected in `steps`/`errors`
  * rather than thrown — the caller decides how loud to be (the CLI prints each step; addProject logs
@@ -1347,11 +1374,12 @@ export function detectHooksManager(dir, priorHooksPath = null) {
  * that did not reach config.yaml leaves the next clone dialling nothing, or an older server.
  *
  * Returns:
- *   { configured, skipped, reason?, mode, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
+ *   { configured, skipped, reason?, fix?, mode, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
  *
- * When prereqs aren't met (no bd / not a git repo / no origin) it returns early with
- * `{ configured:false, skipped:true, reason, hasBeads }` and does nothing — so calling it on a plain
- * directory is a safe no-op.
+ * When prereqs aren't met (no bd / not a git repo / unreachable server / no origin) it returns early
+ * with `{ configured:false, skipped:true, reason, fix, hasBeads }` and does nothing — so calling it
+ * on a plain directory is a safe no-op. It owns that preflight: callers render `reason`/`fix` rather
+ * than gating on their own `beadsPrereqs`, which would run ahead of the stale-key retraction below.
  *
  * @param {string} dir absolute path to the target repo
  * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string, env?: NodeJS.ProcessEnv,
@@ -1381,18 +1409,23 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // init, bootstrap and the config writes all address the same database with the same credentials.
   const exec = scopedBdRunner(dir, connection, opts);
 
-  // 0b. Clear a stale optional connection key BEFORE the preflight, for the same reason
+  // 0a. The half of the preflight that authenticates nothing — bd installed, new enough, `dir` a git
+  //     repo — runs FIRST: step 0b spawns bd, so a missing or too-old bd must be named as such
+  //     rather than surfacing as a retraction that mysteriously failed.
+  const tooling = beadsToolingPrereqs(dir);
+
+  // 0b. Clear a stale optional connection key BEFORE the board preflight, for the same reason
   //     `server-mode.mjs` clears one before its own probe (PR #174 review): metadata.json outranks
   //     config.yaml but does not erase it, so a board that stopped declaring `dolt_server_user` —
   //     moving to bd's default account — while config.yaml still publishes an older `dolt.user` is
-  //     a board bd authenticates as that older account. The preflight's `bd dolt test` would then
-  //     probe the wrong identity and fail, and since the preflight returns early, step 2b's
+  //     a board bd authenticates as that older account. The board preflight's `bd dolt test` would
+  //     then probe the wrong identity and fail, and since that preflight returns early, step 2b's
   //     retraction below could never run: `anton init` would refuse the project on a fault it is
   //     carrying the fix for. Clearing it first means the probe tests the identity this project
   //     actually declares.
   //     Fatal if it will not come off, exactly as in step 2b: the key decides which account every
   //     later bd call uses, so a probe past it proves nothing and the only fix is the operator's.
-  if (mode === "server") {
+  if (tooling.ok && mode === "server") {
     for (const { key, metaKey } of staleConnectionKeys(beadsDir, connection)) {
       const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
       steps.push(retracted);
@@ -1405,16 +1438,25 @@ export function configureBeadsForRepo(dir, opts = {}) {
     }
   }
 
-  // The preflight runs through the SAME runner as everything below it. Its server-mode leg spawns a
-  // real `bd dolt test`, so left unscoped it would probe with `process.env` — reporting a board
-  // unreachable whenever the password lives only in `opts.env`, and reaching the host CLI even when
-  // the caller injected an executor precisely to avoid that.
-  const pre = beadsPrereqs(dir, { ...opts, exec });
+  // 0c. Now the board half, through the SAME runner as everything below it. Its server-mode leg
+  //     spawns a real `bd dolt test`, so left unscoped it would probe with `process.env` —
+  //     reporting a board unreachable whenever the password lives only in `opts.env`, and reaching
+  //     the host CLI even when the caller injected an executor precisely to avoid that.
+  //
+  //     These two halves are the ONLY preflight on the init path. A caller must not gate on its own
+  //     `beadsPrereqs` ahead of this call (PR #174 review): probing before step 0b authenticates as
+  //     the stale `dolt.user` this function exists to retract, so the repair would be refused by its
+  //     own gate. `fix` travels out with `reason` precisely so a CLI caller can render the same
+  //     guidance from here.
+  const pre = tooling.ok ? beadsBoardPrereqs(dir, { ...opts, exec }) : tooling;
   if (!pre.ok) {
     return {
       configured: false,
       skipped: true,
       reason: pre.error.message,
+      // The fix rides along with the reason so a CLI caller can print the same guidance it used to
+      // get from its own (now removed) preflight.
+      fix: pre.error.fix ?? null,
       mode,
       ranInit: false,
       steps,

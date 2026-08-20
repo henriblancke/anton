@@ -21,6 +21,7 @@ import {
   // (bin/anton.mjs) and `anton init` (via configureBeadsForRepo). normalizeRemoteUrl is its URL
   // equality helper.
   configureBeadsDoltSync,
+  configYamlValue,
   detectHooksManager,
   normalizeRemoteUrl,
   untrackBeadsExports,
@@ -28,6 +29,7 @@ import {
 
 import {
   CLI,
+  FAKE_BD,
   fakeBdVersion,
   gitInit,
   pathWith,
@@ -339,6 +341,52 @@ describe("anton init (end-to-end, bd stubbed on PATH)", () => {
     });
     expect(r.status).toBe(1);
     expect(r.stdout).toContain("need >= 1.1.0");
+  });
+
+  /**
+   * A server board that stopped declaring `dolt_server_user` (moving to bd's default account) while
+   * config.yaml still publishes an older `dolt.user` is a board bd authenticates as that older
+   * account — and `anton init` carries the retraction that repairs it. It only gets to run if NO
+   * gate authenticates ahead of it: `cmdInit` used to call `beadsPrereqs` itself, so the probe
+   * failed on the stale identity and init refused the project over the fault it came to fix
+   * (PR #174 review). Asserted end-to-end because what is under test is the CLI's gate ordering.
+   */
+  it("repairs a stale dolt.user on a server board instead of refusing over it (stale-user)", async () => {
+    // A stub bd whose `dolt test` authenticates as whoever config.yaml still names.
+    writeFakeBd(
+      fakeBin,
+      FAKE_BD.replace(
+        'if (a[0] === "dolt" && (a[1] === "pull"',
+        [
+          'if (a[0] === "dolt" && a[1] === "test") {',
+          '  let text = ""; try { text = fs.readFileSync(cfg, "utf8"); } catch {}',
+          '  if (/^\\s*user: retired-account/m.test(text)) { console.error("Access denied for user \'retired-account\'"); process.exit(1); }',
+          "  process.exit(0);",
+          "}",
+          'if (a[0] === "dolt" && (a[1] === "pull"',
+        ].join("\n"),
+      ),
+    );
+
+    const dir = await dirs.make("anton-init-");
+    gitInit(dir, true);
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    // No `dolt_server_user` — this board has moved to bd's default account…
+    writeFileSync(
+      join(dir, ".beads", "metadata.json"),
+      JSON.stringify({ dolt_mode: "server", dolt_server_host: "dolt.example.dev", dolt_server_port: 3306, dolt_database: "anton" }),
+    );
+    // …but config.yaml still publishes the retired one, in the nested encoding bd 1.1.0 writes.
+    writeFileSync(join(dir, ".beads", "config.yaml"), "prefix: ex\ndolt:\n  user: retired-account\n");
+
+    const r = runInit(dir);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("beads team-config enforced");
+    expect(r.stdout).toContain("shared Dolt server board");
+    // Struck (bd 1.1.0's `config unset` reports success without removing it, so the retraction
+    // comments the line out itself) — what matters is that bd no longer reads a user here.
+    expect(configYamlValue(join(dir, ".beads"), "dolt.user")).toBeUndefined();
   });
 
   it("configures beads team-config + registers the repo on a fresh repo (fresh-init)", async () => {
