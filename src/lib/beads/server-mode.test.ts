@@ -16,6 +16,7 @@ import {
   DEFAULT_DOLT_PORT,
   backupBoard,
   configureServerMode,
+  prepareServerModeMetadata,
   readBoardIds,
   readMetadataFile,
   resolveServerConnection,
@@ -131,6 +132,46 @@ describe("resolveServerConnection", () => {
   ])("reports %s as an error naming the flag", (_label, flags, expected) => {
     const { errors } = resolveServerConnection({}, flags);
     expect(errors.some((e: string) => expected.test(e))).toBe(true);
+  });
+});
+
+/**
+ * The flip is prepared BEFORE the board is read one last time and written straight after it, so the
+ * span between "nothing is writing this board" and "this project no longer reads it" is a single
+ * write rather than a re-read and re-merge of metadata.json. bd has no writer lock to hold across
+ * the two, so that span is the whole of the protection this side can offer (PR #174 review).
+ */
+describe("prepareServerModeMetadata", () => {
+  it("computes the flip without touching the file", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+
+    const prepared = prepareServerModeMetadata(dir, CONNECTION);
+
+    expect(prepared.status).toBe("prepared");
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    expect(prepared.before).toBe(original);
+    // The text is the whole merged file, ready to land in one write.
+    expect(JSON.parse(String(prepared.text))).toEqual({
+      ...EMBEDDED,
+      dolt_mode: "server",
+      dolt_server_host: CONNECTION.host,
+      dolt_server_port: CONNECTION.port,
+      dolt_server_user: CONNECTION.user,
+      dolt_database: CONNECTION.database,
+    });
+  });
+
+  it("reports a file that already says exactly this, and one it cannot parse", () => {
+    const dir = repo(EMBEDDED);
+    writeServerModeMetadata(dir, CONNECTION);
+    expect(prepareServerModeMetadata(dir, CONNECTION).status).toBe("already");
+
+    const broken = repo("{ not json");
+    const prepared = prepareServerModeMetadata(broken, CONNECTION);
+    expect(prepared.status).toBe("unreadable");
+    expect(prepared.text).toBeUndefined();
+    expect(readFileSync(metadataPath(broken), "utf8")).toBe("{ not json");
   });
 });
 
@@ -790,6 +831,68 @@ describe("configureServerMode", () => {
     expect(cmdline(calls).some((c) => c.startsWith("bd export"))).toBe(false);
     expect(readMetadata(dir).dolt_server_host).toBe("dolt.example.dev");
   });
+
+  /**
+   * metadata.json is TRACKED, so one machine's flip reaches every clone on `git pull` — and from
+   * then on that clone's own `anton server-mode` reads the server on BOTH sides of every check,
+   * passing while whatever it wrote embedded-side sits unmerged in .beads/ (PR #174 review). The
+   * run cannot tell that database from the leftover the runbook says to keep, so it must not report
+   * a verification it did not make: it names the local board it did not compare.
+   */
+  it("warns when a clone that already reads the server still holds a local embedded board", () => {
+    const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: "dolt.example.dev", dolt_server_port: 3306 });
+    mkdirSync(join(dir, ".beads", "embeddeddolt", "probe"), { recursive: true });
+
+    const result = configureServerMode(dir, flags, { exec: fakeBd({ dir, before: BOARD }).exec });
+
+    expect(result.ok).toBe(true);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toMatch(/local embedded Dolt database/);
+    expect(result.warnings[0]).toMatch(/tracked by git/);
+    // And it says so in the step list too, where an operator watching the run is looking.
+    expect(result.steps.find((s: { name: string }) => s.name === "local board")).toMatchObject({ status: "skipped" });
+  });
+
+  // The runbook's second machine — a clone that hydrates nothing — has no local board to strand, so
+  // the trivial pass is the honest answer there and warning about it would be noise.
+  it("does not warn when the clone has no local Dolt database at all", () => {
+    const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: "dolt.example.dev", dolt_server_port: 3306 });
+
+    const result = configureServerMode(dir, flags, { exec: fakeBd({ dir, before: BOARD }).exec });
+
+    expect(result.ok).toBe(true);
+    expect(result.warnings).toEqual([]);
+    expect(result.steps.find((s: { name: string }) => s.name === "local board")).toMatchObject({ status: "ok" });
+  });
+
+  /**
+   * The flip is prepared before the last board read and written straight after it, so metadata.json
+   * is read and merged exactly once — well outside the window that matters. Proven by making the
+   * file unparseable DURING that read: the switch still lands the text prepared from the good file,
+   * because nothing re-reads it at write time (PR #174 review).
+   */
+  it("prepares the flip before the final read, so the write itself re-reads nothing", () => {
+    const dir = repo(EMBEDDED);
+    const seen: string[] = [];
+    let reads = 0;
+    const { exec } = fakeBd({ dir, before: BOARD });
+    const wrapped = (cmd: string, args: string[]) => {
+      if (args[0] === "list") {
+        seen.push(readFileSync(metadataPath(dir), "utf8"));
+        // Clobber the file while the drift read is in flight — after the prepare, before the write.
+        if (++reads === 2) writeFileSync(metadataPath(dir), "{ clobbered");
+      }
+      return exec(cmd, args);
+    };
+
+    const result = configureServerMode(dir, flags, { exec: wrapped });
+
+    expect(result.ok).toBe(true);
+    // Both source reads ran against the board as it was — the flip came after them.
+    expect(seen.slice(0, 2).every((text) => JSON.parse(text).dolt_mode === "embedded")).toBe(true);
+    expect(readMetadata(dir)).toMatchObject({ dolt_mode: "server", project_id: EMBEDDED.project_id });
+  });
+
 
   /**
    * config.yaml is half of what a failed switch is rolled back from. Snapshotted AFTER the flip, an

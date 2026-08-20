@@ -1678,10 +1678,17 @@ async function cmdServerMode(args = []) {
     onStep: renderStep,
   });
 
+  // What the run could not verify, on either exit. Printed in full and never dimmed: a warning here
+  // is the only notice an operator gets that a board on this machine went unchecked (PR #174 review).
+  const renderWarnings = () => {
+    for (const w of result.warnings ?? []) console.log(c.yellow(`\n!  ${indent(w)}`));
+  };
+
   if (!result.ok) {
     console.log(c.red("\n✗ this project was NOT switched to server mode."));
     for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
     for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
+    renderWarnings();
     // The two arrived-whole guards are the failures with a runbook behind them: the server is fine,
     // the data simply is not on it yet — or the copy that is on it and this board were edited apart.
     if (result.missing?.length || result.diverged?.length) {
@@ -1700,6 +1707,7 @@ async function cmdServerMode(args = []) {
   );
   if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} issues from the server.`));
   if (result.backup?.path) console.log(c.dim(`  pre-switch backup: ${result.backup.path}`));
+  renderWarnings();
   console.log(
     c.dim("  Next: run the same command on every other machine (the connection travels in config.yaml,\n" +
       "        the password does not — set it in each shell), then `anton start`.\n"),

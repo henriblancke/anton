@@ -187,6 +187,18 @@ most likely to see:
   an empty listing that cannot be told apart from no listing at all — and `--force` is the right
   answer for it: there is nothing to lose track of.
 
+**A warning rather than a failure — *"… still holds a local embedded Dolt database"*.**
+`.beads/metadata.json` is **tracked**, so once the flip is committed and pushed every other clone
+switches to the server on its next `git pull` — before anyone has looked at that machine's board.
+From then on `anton server-mode` *on that clone* reads the server on both sides of every check: it
+passes, and it proves nothing about the embedded database still sitting in that clone's `.beads/`,
+so the command says so instead of reporting a verification it did not make. Usually that database is
+the leftover Phase 3 step 4 says to keep and there is nothing to do. If it might hold writes that
+never reached the server — the clone was in use while Phase 1 ran — check it before deleting it: put
+`dolt_mode` back to `"embedded"` in `.beads/metadata.json` (`git stash` the pulled change), run
+`bd list --status all --json`, compare it with the server's listing, then re-run the command. Landing
+the `metadata.json` commit only after every clone has been checked avoids the question entirely.
+
 Also worth knowing: the password variable is **per user** (`BEADS_DOLT_PASSWORD_BEADS` for user
 `beads`) and that mapping is anton's, applied when anton spawns bd. A `bd` you run **by hand** reads
 only the plain `BEADS_DOLT_PASSWORD` — set that too if you drive bd directly. If another project
@@ -208,7 +220,9 @@ inherits that variable, as before.
    run the same `anton server-mode …` command and confirm it reports the same issue count. That is
    the whole point of the move: the second machine hydrates nothing and syncs nothing. (On that
    machine the arrived-whole check compares the server against a board with nothing local in it, so
-   it passes trivially — the count it prints is the assertion worth reading.)
+   it passes trivially — the count it prints is the assertion worth reading. On a clone that *does*
+   still carry `.beads/embeddeddolt`, the command warns that it compared nothing local; see the
+   warning note above.)
 2. **Spot-check content**, not just cardinality: `bd list --status all | tail`, one `bd show <id>`
    with dependencies and labels.
 3. **Drop the stale `refs/dolt/data` remotes.** They came over from embedded mode and are now inert

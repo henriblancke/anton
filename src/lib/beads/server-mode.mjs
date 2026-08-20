@@ -48,6 +48,7 @@ import {
   ensureBdConfig,
   ensureDoltConnection,
   failureDetail,
+  hasLocalDoltDb,
   passwordVarHint,
   readDoltMetadata,
   scopedBdRunner,
@@ -165,14 +166,23 @@ export function resolveServerConnection(raw, flags = {}) {
 }
 
 /**
- * Write `connection` into `.beads/metadata.json` as server mode, preserving every other key.
+ * Everything the flip needs, computed without touching a thing: `{ status, changed, before, path,
+ * text, detail? }`. `status` is `"prepared"` (write `text` and the mode is server), `"already"` (the
+ * file says exactly this already) or `"unreadable"` — which prepares NOTHING, because merging over a
+ * file this cannot parse would replace it wholesale (see {@link readMetadataFile}). `before` is the
+ * file's exact prior text, or `null` when there was none — what {@link restoreFile} puts back when a
+ * verification fails.
  *
- * Returns `{ status: "already"|"written"|"unreadable", changed, before }`, where `before` is the
- * file's exact prior text (or `null` when there was none) — what {@link restoreFile} puts back when
- * the verification below fails. `"unreadable"` writes NOTHING: merging over a file this cannot
- * parse would replace it wholesale (see {@link readMetadataFile}).
+ * Split from the write because ORDER is the protection here (PR #174 review). The board is read one
+ * last time immediately before the flip to prove no writer is still going, and anything that runs
+ * between that read and the write is a window in which an edit lands in the database this project is
+ * about to stop reading. bd offers no writer lock to hold across the two — there is no `bd lock`,
+ * and its `--readonly` binds only the invocation it is passed to — so the window is made as small as
+ * a window can be: reading `metadata.json`, merging it and serializing it all happen BEFORE that
+ * read, leaving the flip itself a single `writeFileSync`. Stopping every writer first, which the
+ * runbook demands and the drift check verifies, is what actually closes it.
  */
-export function writeServerModeMetadata(dir, connection) {
+export function prepareServerModeMetadata(dir, connection) {
   const path = join(dir, ".beads", "metadata.json");
   const before = existsSync(path) ? readFileSync(path, "utf8") : null;
   const meta = readMetadataFile(dir);
@@ -186,10 +196,19 @@ export function writeServerModeMetadata(dir, connection) {
 
   const changed = Object.keys(next).filter((k) => raw[k] !== next[k]);
   const text = `${JSON.stringify(next, null, 2)}\n`;
-  if (before === text) return { status: "already", changed: [], before, path };
+  if (before === text) return { status: "already", changed: [], before, path, text };
+  return { status: "prepared", changed, before, path, text };
+}
 
-  writeFileSync(path, text);
-  return { status: "written", changed, before, path };
+/**
+ * {@link prepareServerModeMetadata} and then the write — `{ status: "already"|"written"|"unreadable",
+ * changed, before, path }`. The one-call form, for callers with no read to sequence against.
+ */
+export function writeServerModeMetadata(dir, connection) {
+  const prepared = prepareServerModeMetadata(dir, connection);
+  if (prepared.status !== "prepared") return prepared;
+  writeFileSync(prepared.path, prepared.text);
+  return { ...prepared, status: "written" };
 }
 
 /**
@@ -495,10 +514,14 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   destroying the file, which no amount of intent makes safe.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
- * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, diverged?, drifted? }}
+ * @returns {{ ok, steps, connection?, errors, warnings, before?, counts?, backup?, missing?,
+ *   diverged?, drifted? }}
  *   `missing` is the ids this board holds that the server's copy does not; `diverged` the ids it
  *   does hold but says something different about, in either direction — both empty once the checks
  *   have passed.
+ *   `warnings` is what the run could NOT verify, on a run that otherwise succeeded — a project
+ *   already reading the server verifies nothing about the embedded board still sitting next to it
+ *   (see step 3). Callers must show them: they are the only notice an operator gets.
  *   `drifted` is the ids that appeared, disappeared or were EDITED on the board being moved while
  *   the switch was being prepared, i.e. a writer that was never stopped.
  */
@@ -507,8 +530,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   const onStep = typeof opts.onStep === "function" ? opts.onStep : () => {};
   const steps = [];
   const errors = [];
+  const warnings = [];
   const beadsDir = join(dir, ".beads");
-  const fail = (extra = {}) => ({ ok: false, steps, errors, ...extra });
+  const fail = (extra = {}) => ({ ok: false, steps, errors, warnings, ...extra });
   /** Record a step AND hand it to the caller as it happens — this flow is slow enough (an export,
    * two round trips to the server) that a terminal batching its output reads as a hang. */
   const record = (name, status, detail) => {
@@ -564,11 +588,45 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    post-flip read is checked against, and it is taken BEFORE the backup so every id in it is
   //    one the export below also carries. Step 5b re-reads it against the flip, so the ageing this
   //    ordering costs is caught rather than trusted.
+  //    WHOSE board that is, is the question a clone has to answer for itself. In server mode it is
+  //    the SERVER's — so every check below compares the server with itself and proves nothing about
+  //    any board on this machine. On a clone that never held the board that is the ordinary case
+  //    (the runbook's second-machine step, which passes trivially by design). On a clone that DID,
+  //    it is a trap: `.beads/metadata.json` is TRACKED, so the flip reaches every clone on `git
+  //    pull` — before anyone checks that clone — and whatever it wrote embedded-side stays in
+  //    `.beads/`, absent from the server's copy (PR #174 review). Nothing here can tell a leftover
+  //    database deliberately abandoned after the move (the runbook keeps it, on every machine) from
+  //    one holding edits that never travelled: comparison shows divergence either way. So the run
+  //    reports what it did NOT verify instead of claiming a check it cannot make.
+  const sourceIsServer = before.mode === "server";
+  if (sourceIsServer) {
+    const local = hasLocalDoltDb(beadsDir);
+    record(
+      "local board",
+      local ? "skipped" : "ok",
+      local
+        ? "present and NOT compared — this project already reads the server"
+        : "none on this machine — nothing local to strand",
+    );
+    if (local) {
+      warnings.push(
+        "this project's metadata.json already says server mode, so the checks below read the server " +
+          `on both sides — and ${beadsDir} still holds a local embedded Dolt database that nothing ` +
+          "here has compared with it. metadata.json is tracked by git: the switch reaches every clone " +
+          "on `git pull`, ahead of anyone checking that clone, so anything written here before the " +
+          "pull is still in the local database and not on the server. To check it, put `dolt_mode` " +
+          'back to "embedded" in .beads/metadata.json (git stash / git checkout the pulled change), ' +
+          "run `bd list --status all --json`, compare it with the server's, then re-run this command. " +
+          "Nothing to do if that database is the leftover the runbook says to keep.",
+      );
+    }
+  }
+
   const counts = {};
   const idsBefore = readBoardIds(dir, { ...opts, board: before });
   if (idsBefore.ok) {
     counts.before = idsBefore.ids.length;
-    record("board issues", "ok", `${idsBefore.ids.length} issues`);
+    record("board issues", "ok", `${idsBefore.ids.length} issues${sourceIsServer ? ", read from the server" : ""}`);
   } else if (!flags.force) {
     // Fatal without --force. The arrived-whole check in step 7 is the only thing standing between
     // this project and a stale or unrelated copy on the server, and it needs these ids to run —
@@ -624,6 +682,25 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup });
   }
 
+  // 5a. Compute the flip — the merged metadata.json text, and the prior text a revert restores —
+  //     BEFORE the re-read below rather than after it. That read is what proves no writer is still
+  //     going, and everything between it and the write is a window in which an edit lands in the
+  //     database this project is about to stop reading. There is no lock to hold across the two: bd
+  //     exposes none (no `bd lock`; `--readonly` binds only the invocation it is passed to), and a
+  //     lock anton invented would be honoured by nothing that writes this board (PR #174 review).
+  //     So the window is made as small as one can be — reading, merging and serializing the file all
+  //     happen here, leaving step 6 a single `writeFileSync` — and the check below refuses on any
+  //     drift it did see. Stopping every writer first, which the runbook demands, is what closes it.
+  //     Preparing here also moves the unreadable-metadata refusal ahead of the work it would waste.
+  const prepared = prepareServerModeMetadata(dir, connection);
+  // Step 2 read the same file; this catches the window between — and keeps a refusal from reading as
+  // a success to anything that calls the write directly.
+  if (prepared.status === "unreadable") {
+    record("metadata.json", "unreadable", prepared.detail);
+    errors.push(`${prepared.detail} — nothing was written, so the board is untouched`);
+    return fail({ before, connection, counts, backup });
+  }
+
   // 5b. Re-read the board immediately before the flip and refuse if it moved. The reading in step 3
   //     ages across the backup — minutes of `bd export` on a big board — and nothing stops anton's
   //     scheduler or another shell from writing the embedded board in that window. An issue created
@@ -667,21 +744,16 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     record("board unchanged", "ok", `${idsNow.ids.length} issues, unchanged since the read`);
   }
 
-  // 6. Write the mode + connection. metadata.json is the ONLY place the mode can live: `bd config
-  //    set dolt.mode` reports success while writing a nested block into a file of flat dotted keys,
-  //    from bd's lowest-priority source, and has no effect (anton-4gd2).
-  const written = writeServerModeMetadata(dir, connection);
-  record("metadata.json", written.status, written.detail ?? (written.changed.join(", ") || undefined));
-  // Step 2 read the same file; this catches the window between — and, more usefully, keeps the
-  // write's own refusal from reading as a success to anything that calls it directly.
-  if (written.status === "unreadable") {
-    errors.push(`${written.detail} — nothing was written, so the board is untouched`);
-    return fail({ before, connection, counts, backup });
-  }
+  // 6. The flip: ONE write, immediately after the read that proved the board stood still — nothing
+  //    between them but the comparison itself (see 5a). metadata.json is the only place the mode can
+  //    live: `bd config set dolt.mode` reports success while writing a nested block into a file of
+  //    flat dotted keys, from bd's lowest-priority source, and has no effect (anton-4gd2).
+  if (prepared.status === "prepared") writeFileSync(prepared.path, prepared.text);
+  record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
 
   /** Undo both writes and report why — the board keeps working exactly as it did. */
   const revert = (reason) => {
-    restoreFile(written.path, written.before);
+    restoreFile(prepared.path, prepared.before);
     restoreFile(configPath, configBefore);
     record("metadata.json", "reverted", `${reason} — the board is untouched`);
   };
@@ -807,5 +879,5 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, missing, diverged });
   }
 
-  return { ok: true, steps, errors, before, connection, counts, backup, missing, diverged };
+  return { ok: true, steps, errors, warnings, before, connection, counts, backup, missing, diverged };
 }
