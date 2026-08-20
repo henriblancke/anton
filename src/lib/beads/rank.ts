@@ -64,6 +64,13 @@ function dependentIndex(board: Bead[]): Map<string, string[]> {
  * the two arms of a diamond meeting again — is counted once, because finishing the target releases
  * it once.
  *
+ * The walk STOPS at a closed or deferred dependent rather than merely declining to count it, so
+ * the chain only propagates through beads the target actually holds. Finishing the target cannot
+ * release whatever a deferred bead blocks — the deferral still does — and whatever a closed bead
+ * blocked, it stopped blocking when it closed. Crediting either downstream would let a target
+ * whose reach dead-ends outrank one that releases live work, which is the very thing excluding
+ * them from the count is for.
+ *
  * `seen` is what makes the walk terminate: a `blocks` cycle is a malformed board, not an
  * impossible one, and a picker that hung on one would take the whole pass down with it. A
  * dependent that isn't on the board is traversed but not counted — it is evidence of an edge, not
@@ -71,9 +78,12 @@ function dependentIndex(board: Bead[]): Map<string, string[]> {
  */
 export function unblockCounter(board: Bead[]): (id: string) => number {
   const dependents = dependentIndex(board);
-  const waitingIds = new Set(
-    board.filter((b) => b.status !== "closed" && b.status !== "deferred").map((b) => b.id),
-  );
+  const waitingIds = new Set<string>();
+  const haltIds = new Set<string>();
+  for (const b of board) {
+    if (b.status === "closed" || b.status === "deferred") haltIds.add(b.id);
+    else waitingIds.add(b.id);
+  }
 
   return (id: string): number => {
     const seen = new Set<string>([id]);
@@ -83,6 +93,7 @@ export function unblockCounter(board: Bead[]): (id: string) => number {
       for (const next of dependents.get(queue.shift() as string) ?? []) {
         if (seen.has(next)) continue;
         seen.add(next);
+        if (haltIds.has(next)) continue;
         queue.push(next);
         if (waitingIds.has(next)) count++;
       }

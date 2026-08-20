@@ -189,10 +189,18 @@ export function isPlanStale(plan: BoardPickerPlan, current: BoardStamp): boolean
  * order IS the ranking's output and is preserved verbatim — exclusions have no inherent order, and
  * two passes over unchanged state must serialize byte-identically for the record to be idempotent
  * rather than merely recomputed.
+ *
+ * Compares by code unit, never `localeCompare` — the same reason the rank order does: a
+ * locale-sensitive order is not the same order twice.
  */
+function byCodeUnit(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
 export function sortExclusions(exclusions: PickerExclusion[]): PickerExclusion[] {
   return [...exclusions].sort(
-    (a, b) => a.beadId.localeCompare(b.beadId) || a.reason.localeCompare(b.reason),
+    (a, b) => byCodeUnit(a.beadId, b.beadId) || byCodeUnit(a.reason, b.reason),
   );
 }
 

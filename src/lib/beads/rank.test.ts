@@ -241,6 +241,41 @@ describe("unblockCounter", () => {
     expect(ids(rankTargets(board, board))).toEqual(["a", "b", "c"]);
   });
 
+  it("stops at a deferred dependent instead of crediting the target for what it blocks", () => {
+    // f1 → snoozed → downstream. Completing f1 cannot release `downstream`; the deferral still
+    // holds it. Counting past `snoozed` would let f1 outrank a target that frees live work.
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "snoozed", status: "deferred", dependencies: [blocks("snoozed", "f1")] }),
+      bead({ id: "downstream", status: "blocked", dependencies: [blocks("downstream", "snoozed")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(0);
+  });
+
+  it("stops at a closed dependent — whatever it blocked, it stopped blocking when it closed", () => {
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "done", status: "closed", dependencies: [blocks("done", "f1")] }),
+      bead({ id: "downstream", dependencies: [blocks("downstream", "done")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(0);
+  });
+
+  it("still reaches a bead a deferred arm shares with a live one", () => {
+    // Only the path through `snoozed` is dead — `live` still releases `tail`, so the diamond's
+    // shared tail must not be lost with it.
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "snoozed", status: "deferred", dependencies: [blocks("snoozed", "f1")] }),
+      bead({ id: "live", dependencies: [blocks("live", "f1")] }),
+      bead({ id: "tail", dependencies: [blocks("tail", "snoozed"), blocks("tail", "live")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(2);
+  });
+
   it("traverses a dependent that is not on the board without counting it", () => {
     // `ghost` is off this snapshot but its edge is on f1, and it in turn blocks a bead that IS
     // here: the walk must reach `beyond` while counting only the open work it can see.
