@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PREFLIGHT_TTL_MS, createDoltSync, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
 import { isServerMode, pinBoardMode, readBoardMode, resetBoardModeCache } from "./board-mode";
+import { BOARD_READ_PROBE } from "./config.mjs";
 
 /** Mirrors bd.ts's internal BdExec seam; kept local so the test does not widen that module's API. */
 type TestExec = (cwd: string, args: string[]) => Promise<string>;
@@ -234,6 +235,33 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
     expect(probed).toEqual(["old.example.dev", "new-server.example.dev"]);
   });
 
+  /**
+   * The second half of the health probe (PR #174 review). `bd dolt test` proves the SERVER answered
+   * and nothing about this project's database, so a preflight that stopped there would keep the pass
+   * resolving `shared-server` — and the sync status healthy — while every board operation is refused
+   * by bd's identity guard. The read is what makes that an outage the operator sees.
+   */
+  it("fails the pass when the server answers but will not serve this project's board", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const calls: string[][] = [];
+    const exec: TestExec = async (_cwd: string, args: string[]) => {
+      calls.push(args);
+      if (args.join(" ") === BOARD_READ_PROBE.join(" ")) {
+        throw new Error("PROJECT IDENTITY MISMATCH — refusing to connect");
+      }
+      return "";
+    };
+
+    // Worded for the board, not the server: "unreachable" would send the reader after a network
+    // fault that isn't there.
+    await expect(runDoltSync(dir, exec, "full")).rejects.toThrow(/will not serve the board/);
+    expect(calls.map((a) => a.join(" "))).toEqual(["dolt test", BOARD_READ_PROBE.join(" ")]);
+
+    // Nothing was cached, so the next pass re-probes rather than waiting out a TTL it never earned.
+    await expect(runDoltSync(dir, exec, "full")).rejects.toThrow(/will not serve the board/);
+    expect(calls).toHaveLength(4);
+  });
+
   it("still runs the full pull/commit/push in embedded mode", async () => {
     const dir = repo({ dolt_mode: "embedded" });
     const calls: string[][] = [];
@@ -277,12 +305,12 @@ describe("the sync coalescer in server mode (anton-0tul)", () => {
     expect(getSyncStatus(dir)).toMatchObject({ state: "shared-server", unpushedCount: 0, lastError: null });
 
     // The backstop is the heartbeat's request; an unreconciled repo would force a full pull/commit/
-    // push pass. Here it costs the health probe and nothing else — never pull/commit/push.
+    // push pass. Here it costs the health probes and nothing else — never pull/commit/push.
     calls.length = 0;
     await expect(sync(dir, "backstop")).resolves.toBe("shared-server");
-    expect(calls.map((a) => a.join(" "))).toEqual(["dolt test"]);
+    expect(calls.map((a) => a.join(" "))).toEqual(["dolt test", BOARD_READ_PROBE.join(" ")]);
 
-    // ...and the probe's TTL keeps the next beat free, so the ~10s heartbeat is not a `bd dolt
+    // ...and the probes' TTL keeps the next beat free, so the ~10s heartbeat is not a `bd dolt
     // test` every ~10s.
     calls.length = 0;
     await expect(sync(dir, "backstop")).resolves.toBe("shared-server");

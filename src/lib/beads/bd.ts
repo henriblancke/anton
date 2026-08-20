@@ -11,7 +11,7 @@ import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
 import { buildBdEnv, passwordVarHint } from "./bd-env";
-import { formatServerTarget } from "./config.mjs";
+import { BOARD_READ_PROBE, formatServerTarget } from "./config.mjs";
 import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
@@ -768,9 +768,10 @@ export type SyncRequest = SyncMode | "backstop" | "push";
 export type SyncOutcome = "synced" | "not-wired" | "shared-server";
 
 /**
- * Server-mode preflight (anton-eg46). Runs `bd dolt test` at most once per {@link PREFLIGHT_TTL_MS}
- * per repo, on the sync pass that would otherwise have run, and throws an actionable error when the
- * shared server is unreachable. Carried only by passes with no board write of their own behind them
+ * Server-mode preflight (anton-eg46). Runs {@link PREFLIGHT_PROBES} — the connection test AND a board
+ * read — at most once per {@link PREFLIGHT_TTL_MS} per repo, on the sync pass that would otherwise
+ * have run, and throws an actionable error when this machine cannot use the board. Carried only by
+ * passes with no board write of their own behind them
  * — the heartbeat and the read-freshness pulls; see `probeServer` on {@link runDoltSync} for why a
  * post-write pass must not add this second failure boundary.
  *
@@ -794,7 +795,7 @@ const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
  * preflight is the only thing the heartbeat does, so a permanently-cached pass means an outage
  * after startup never reaches the sync-status registry — the UI keeps reporting a healthy shared
  * board until some unrelated board operation happens to fail. Five minutes bounds that blind spot
- * while keeping the probe off the ~10s beat (one `bd dolt test` per repo per five minutes).
+ * while keeping the probes off the ~10s beat (one round per repo per five minutes).
  */
 export const PREFLIGHT_TTL_MS = 5 * 60_000;
 
@@ -833,29 +834,52 @@ export function resetServerPreflight(): void {
   preflightedAt().clear();
 }
 
+/**
+ * The two probes, in order, with the message each failure needs. `bd dolt test` answers only "the
+ * server accepted a connection" — it names no database and reads nothing — so a preflight that
+ * stopped there would keep the sync status at `shared-server` while every board operation fails on a
+ * `dolt_database` that is missing, unmigrated, or another project's (bd's identity guard: `PROJECT
+ * IDENTITY MISMATCH — refusing to connect`). The board read is what closes that (PR #174 review),
+ * and it is the same one the CLI's gate uses ({@link checkSharedServer}), so the heartbeat and
+ * `anton doctor` cannot disagree about whether this board works.
+ */
+const PREFLIGHT_PROBES = [
+  {
+    args: ["dolt", "test"],
+    message: (cwd: string, target: string) =>
+      `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
+      `Check the server is up and reachable, that .beads/metadata.json names the right ` +
+      `host/port/user, and that this project's password is set in this process — ` +
+      `${passwordVarHint(cwd)} — or set dolt_mode back to "embedded" to work from the local copy.`,
+  },
+  {
+    args: BOARD_READ_PROBE,
+    message: (cwd: string, target: string) =>
+      `shared Dolt server ${target} accepted the connection but will not serve the board for ${cwd}. ` +
+      `Check that .beads/metadata.json names the database this project's board actually lives in, ` +
+      `that its database account may read it, and that the board has been copied onto the server — ` +
+      `or set dolt_mode back to "embedded" to work from the local copy.`,
+  },
+] as const;
+
 export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
   const board = readBoardMode(cwd);
   const server = serverIdentity(board);
   const last = preflightedAt().get(cwd);
   if (last !== undefined && last.server === server && Date.now() - last.at < PREFLIGHT_TTL_MS) return;
   const target = formatServerTarget(board);
-  try {
-    await exec(cwd, ["dolt", "test"]);
-    // Stamped only on success, so a server that was down is retried on the next beat rather than
-    // waiting out a TTL it never earned.
-    preflightedAt().set(cwd, { at: Date.now(), server });
-  } catch (e) {
-    const err = e as Error & { stdout?: string; stderr?: string };
-    const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
-    throw new Error(
-      `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
-        `Check the server is up and reachable, that .beads/metadata.json names the right ` +
-        `host/port/user, and that this project's password is set in this process — ` +
-        `${passwordVarHint(cwd)} — or set dolt_mode back to "embedded" to work from the local ` +
-        `copy. Underlying error: ${output}`,
-      { cause: e },
-    );
+  for (const probe of PREFLIGHT_PROBES) {
+    try {
+      await exec(cwd, [...probe.args]);
+    } catch (e) {
+      const err = e as Error & { stdout?: string; stderr?: string };
+      const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
+      throw new Error(`${probe.message(cwd, target)} Underlying error: ${output}`, { cause: e });
+    }
   }
+  // Stamped only after BOTH probes pass, so a server that was down — or a board it would not serve —
+  // is retried on the next beat rather than waiting out a TTL it never earned.
+  preflightedAt().set(cwd, { at: Date.now(), server });
 }
 
 /**

@@ -21,7 +21,7 @@ The move has two halves:
 | Half | Who does it | What |
 |---|---|---|
 | **Data** | you, by hand (this runbook) | stream the project's Dolt database directory into the server's data volume |
-| **Config** | `anton server-mode` | write `.beads/metadata.json`, verify with `bd dolt test`, prove the board reads back whole, publish the connection as the team default |
+| **Config** | `anton server-mode` | write `.beads/metadata.json`, verify the connection (`bd dolt test` **and** a board read), prove the board reads back whole, publish the connection as the team default |
 
 They are deliberately separate. anton does not move your data, and the command refuses to finish if
 the data has not arrived — see [Why not `bd dolt push`](#why-not-bd-dolt-push).
@@ -134,7 +134,8 @@ That command is the whole config half. It:
    server's board unverified anyway);
 3. writes `dolt_mode`/host/port/user/database into `.beads/metadata.json`, preserving every other
    key in that file;
-4. runs **`bd dolt test`**;
+4. verifies the connection — **`bd dolt test`**, then a board read against the configured database,
+   because the first proves only that the server answered;
 5. **reads the board back from the server** and confirms it is this board, whole and current — every
    pre-switch record present, and each saying there *exactly* what it says here (a record only the
    *server* holds is reported, not refused — see the warning below). By
@@ -150,11 +151,11 @@ That command is the whole config half. It:
 keeps working exactly as it did (1–3 fail before anything is written at all). The failures you are
 most likely to see:
 
-- *"the server accepted the connection but this project cannot read its board … PROJECT IDENTITY
-  MISMATCH"* — the database on the server belongs to a different project (`project_id` in
-  `metadata.json` vs. the database's). You pointed at the wrong database, or Phase 1 has not
-  happened. **`bd dolt test` passes in this state** — connecting is not the same as being able to
-  read, which is why the command checks both.
+- *"the server accepted the connection but will not serve the … database … PROJECT IDENTITY
+  MISMATCH"* (or, from step 5, *"… but this project cannot read its board …"*) — the database on the
+  server belongs to a different project (`project_id` in `metadata.json` vs. the database's). You
+  pointed at the wrong database, or Phase 1 has not happened. **`bd dolt test` passes in this
+  state** — connecting is not the same as being able to read, which is why the command checks both.
 - *"the server's … database is missing N of this board's M records (…)"* — the server is reachable
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
   from an earlier attempt. The named records are the ones to look for. Re-run Phase 1. `--force` accepts

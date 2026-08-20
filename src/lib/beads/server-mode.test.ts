@@ -436,9 +436,30 @@ describe("testDoltConnection", () => {
     const { exec } = fakeBd({ test: { status: 1, stderr: "Connection failed" } });
     const result = testDoltConnection(repo(EMBEDDED), CONNECTION, { exec });
     expect(result.ok).toBe(false);
+    expect(result.stage).toBe("connect");
     const hints = (result.hints ?? []).join("\n");
     expect(hints).toContain("BEADS_DOLT_PASSWORD_BEADS");
     expect(hints).toContain("dolt.example.dev:3306");
+  });
+
+  /**
+   * A board that refused the READ has already proven host, port, account and transport work, so
+   * repeating the credential and TLS hints sends the operator to check what the probe just cleared.
+   * What is left is the database: named wrongly, never copied across, or another project's.
+   */
+  it("drops the credential hints when the connection worked and the BOARD refused", () => {
+    const { exec } = fakeBd({});
+    const readRefused = (cmd: string, args: string[]) =>
+      args[0] === "count" ? { status: 1, stderr: "PROJECT IDENTITY MISMATCH" } : exec(cmd, args);
+
+    const result = testDoltConnection(repo(EMBEDDED), CONNECTION, { exec: readRefused });
+
+    expect(result.ok).toBe(false);
+    expect(result.stage).toBe("read");
+    const hints = (result.hints ?? []).join("\n");
+    expect(hints).toContain('confirm "probe" is the database');
+    expect(hints).toContain("embedded-board-to-shared-dolt-server.md");
+    expect(hints).not.toContain("BEADS_DOLT_PASSWORD_BEADS");
   });
 });
 

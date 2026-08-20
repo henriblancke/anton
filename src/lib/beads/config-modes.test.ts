@@ -13,6 +13,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
+  BOARD_READ_PROBE,
   EMBEDDED_CONFIG_KEYS,
   MIN_BD_VERSION,
   PROJECT_SCOPED_BD_ENV,
@@ -457,10 +458,13 @@ describe("beadsPrereqs — the mode decides what must be reachable (anton-eg46)"
   }
 
   /**
-   * A stub `bd` first on PATH that answers the version gate, logs every invocation, and fails
-   * `dolt test` when `unreachable` — the one failure this preflight exists to catch.
+   * A stub `bd` first on PATH that answers the version gate, logs every invocation, and fails one of
+   * the two health probes: `unreachable` refuses the connection, `unreadable` accepts it and then
+   * refuses the board the way bd's project-identity guard does. Both are failures this preflight
+   * exists to catch — the second one only since PR #174's review, because `bd dolt test` passes in
+   * that state.
    */
-  function stubBd({ unreachable }: { unreachable: boolean }) {
+  function stubBd({ unreachable, unreadable = false }: { unreachable: boolean; unreadable?: boolean }) {
     const bin = mkdtempSync(join(tmpdir(), "anton-modes-bin-"));
     dirs.push(bin);
     const log = join(bin, "calls.log");
@@ -472,6 +476,9 @@ describe("beadsPrereqs — the mode decides what must be reachable (anton-eg46)"
       `if (a[0] === "--version" || a[0] === "--help") { console.log("bd version ${MIN_BD_VERSION} (stub)"); process.exit(0); }`,
       ...(unreachable
         ? ['if (a[0] === "dolt" && a[1] === "test") { console.error("dial tcp 10.0.0.9:3306: connect: connection refused"); process.exit(1); }']
+        : []),
+      ...(unreadable
+        ? [`if (a[0] === ${JSON.stringify(BOARD_READ_PROBE[0])}) { console.error("PROJECT IDENTITY MISMATCH — refusing to connect"); process.exit(1); }`]
         : []),
       "process.exit(0);",
     ].join("\n");
@@ -506,14 +513,38 @@ describe("beadsPrereqs — the mode decides what must be reachable (anton-eg46)"
     expect(error?.fix).toContain("metadata.json");
   });
 
-  it("passes a server-mode board whose server answers — and never asks it for a git origin", () => {
+  /**
+   * `bd dolt test` names no database and reads nothing, so it passes over a `dolt_database` that is
+   * missing, unmigrated, or another project's — and server mode keeps no local copy behind it. A
+   * preflight that stopped there would configure a repo on which no board operation works (PR #174
+   * review).
+   */
+  it("refuses a server-mode board the server will not serve, and says so as a database problem", () => {
+    const dir = gitRepo(SERVER_METADATA);
+    const bd = stubBd({ unreachable: false, unreadable: true });
+
+    const { ok, error } = beadsPrereqs(dir);
+
+    expect(ok).toBe(false);
+    expect(bd.calls()).toEqual(expect.arrayContaining(["dolt test", BOARD_READ_PROBE.join(" ")]));
+    expect(error?.message).toContain('will not serve the "anton" database');
+    expect(error?.message).toContain("PROJECT IDENTITY MISMATCH");
+    // Host, port, account and transport were just proven to work, so the fix names the database and
+    // the copy that populates it — not the password variable the connection test already cleared.
+    expect(error?.fix).toContain("names the database this project's board actually lives in");
+    expect(error?.fix).toContain("embedded-board-to-shared-dolt-server.md");
+    expect(error?.fix).not.toContain("BEADS_DOLT_PASSWORD_BEADS");
+    expect(error?.fix).toContain('"dolt_mode": "embedded"');
+  });
+
+  it("passes a server-mode board whose server serves it — and never asks it for a git origin", () => {
     const dir = gitRepo(SERVER_METADATA);
     const bd = stubBd({ unreachable: false });
 
     // No `origin` was added: refs/dolt/data is the embedded profile's channel, and demanding it
     // here would fail a healthy server board for a channel it does not use.
     expect(beadsPrereqs(dir)).toEqual({ ok: true });
-    expect(bd.calls()).toContain("dolt test");
+    expect(bd.calls()).toEqual(expect.arrayContaining(["dolt test", BOARD_READ_PROBE.join(" ")]));
   });
 
   it("leaves the embedded preflight exactly as it was: origin still required, server never probed", () => {
@@ -623,15 +654,48 @@ describe("checkSharedServer", () => {
 
     expect(checkSharedServer(dir, { user: "beads" }, { exec })).toEqual({
       ok: false,
+      stage: "connect",
       detail: "Access denied for user 'beads'",
     });
+    // The board read never runs: there is no connection to read over.
     expect(calls).toEqual([["bd", "dolt", "test"]]);
   });
 
-  it("reports ok when the server answers", () => {
+  it("reports ok only once the connection AND a board read succeed", () => {
     const dir = repo(JSON.stringify(SERVER_METADATA));
-    const { exec } = recordingExec();
+    const { calls, exec } = recordingExec();
     expect(checkSharedServer(dir, {}, { exec })).toEqual({ ok: true });
+    expect(calls).toEqual([
+      ["bd", "dolt", "test"],
+      ["bd", ...BOARD_READ_PROBE],
+    ]);
+  });
+
+  /**
+   * The gap this second probe closes (PR #174 review). `bd dolt test` names no database and reads
+   * nothing, so bd's identity guard — which refuses a database belonging to another project — fires
+   * only on a real board operation. Without the read, `anton init`/`doctor` exit clean and the
+   * heartbeat keeps reporting `shared-server` over a board on which nothing works.
+   */
+  it("fails at the READ stage when the server answers but refuses this project's database", () => {
+    const dir = repo(JSON.stringify(SERVER_METADATA));
+    const calls: string[][] = [];
+    const exec = (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+      return args[0] === "dolt"
+        ? { status: 0, stdout: "✓ Connection successful" }
+        : { status: 1, stderr: "PROJECT IDENTITY MISMATCH — refusing to connect" };
+    };
+
+    expect(checkSharedServer(dir, { user: "beads", database: "someone-else" }, { exec })).toEqual({
+      ok: false,
+      stage: "read",
+      detail: "PROJECT IDENTITY MISMATCH — refusing to connect",
+    });
+    expect(calls).toEqual([
+      ["bd", "dolt", "test"],
+      ["bd", ...BOARD_READ_PROBE],
+    ]);
   });
 });
 

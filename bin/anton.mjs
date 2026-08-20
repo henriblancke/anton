@@ -41,6 +41,7 @@ import { createRequire } from "node:module";
 import {
   bdVersion,
   bdVersionAtLeast,
+  budgetMs,
   checkSharedServer,
   configureBeadsDoltSync,
   configureBeadsForRepo,
@@ -51,11 +52,13 @@ import {
   hasBeadsDir,
   passwordVarHint,
   readDoltMetadata,
+  scopedBdRunner,
+  SERVER_MIGRATION_RUNBOOK,
   BEAD_FORMULA_FILENAME,
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
-import { configureServerMode, SERVER_MIGRATION_RUNBOOK } from "../src/lib/beads/server-mode.mjs";
+import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import { createInterface } from "node:readline/promises";
@@ -878,14 +881,18 @@ function checkPrereqs() {
 }
 
 /**
- * Is the board this command runs against actually readable? Reported alongside the tool prereqs, and
+ * Is the board this command runs against actually usable? Reported alongside the tool prereqs, and
  * only meaningful in SERVER mode: an embedded board is a local Dolt directory, so there is nothing
- * to reach and nothing to say. A shared-server board keeps no local copy, which makes an unreachable
- * server a board outage rather than stalled sync (DESIGN.md §3a) — so it is probed with `bd dolt
- * test` and the failure names the configured target and both ways out.
+ * to reach and nothing to say. A shared-server board keeps no local copy, which makes a board this
+ * machine cannot read an outage rather than stalled sync (DESIGN.md §3a) — so it is probed with
+ * `bd dolt test` AND a board read, and the failure names the configured target and the ways out.
+ *
+ * The read is not belt-and-braces: a connection test passes over a database that does not exist on
+ * the server and over one belonging to another project, so stopping there would exit this command
+ * clean on a board where nothing works (PR #174 review, {@link checkSharedServer}).
  *
  * Returns true when the board is fine OR the question does not apply (no `.beads/`, embedded mode),
- * so only a genuinely unreachable server fails the caller.
+ * so only a genuinely unusable board fails the caller.
  */
 function checkBoard(dir = process.cwd()) {
   if (!hasBeadsDir(dir)) return true;
@@ -894,26 +901,48 @@ function checkBoard(dir = process.cwd()) {
 
   const target = formatServerTarget(board);
   const probe = checkSharedServer(dir, board);
+  const probes = c.dim("bd dolt test + board read");
   if (probe.ok) {
-    console.log(`  ${c.green("✓")} ${"board".padEnd(9)} ${c.green(`shared Dolt server ${target} reachable`)}  ${c.dim("bd dolt test")}`);
+    console.log(`  ${c.green("✓")} ${"board".padEnd(9)} ${c.green(`shared Dolt server ${target} serving this board`)}  ${probes}`);
     return true;
   }
-  console.log(`  ${c.red("✗")} ${"board".padEnd(9)} ${c.red(`shared Dolt server ${target} UNREACHABLE`)}  ${c.dim("bd dolt test")}`);
+  const headline =
+    probe.stage === "read"
+      ? `shared Dolt server ${target} answered but WILL NOT SERVE this board`
+      : `shared Dolt server ${target} UNREACHABLE`;
+  console.log(`  ${c.red("✗")} ${"board".padEnd(9)} ${c.red(headline)}  ${probes}`);
   // bd's own failure is often several lines (its config warnings ride along); indent every one, so
   // the cause reads as part of this report rather than as stray output.
   for (const line of probe.detail.split("\n")) console.log(c.dim(`    ${line}`));
-  console.log(c.dim(`    Start the server (or restore the route to ${target}), check .beads/metadata.json`));
-  console.log(c.dim(`    names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell.`));
+  if (probe.stage === "read") {
+    // Host, port, account and transport are already proven by the probe that passed — pointing the
+    // reader back at them is what wastes the hour. What is left is the database itself.
+    console.log(c.dim(`    Check .beads/metadata.json names the database this board lives in (now "${board.database ?? "?"}"),`));
+    console.log(c.dim(`    that the "${board.user ?? "configured"}" account may read it, and that the board was copied onto the server:`));
+    console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
+  } else {
+    console.log(c.dim(`    Start the server (or restore the route to ${target}), check .beads/metadata.json`));
+    console.log(c.dim(`    names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell.`));
+  }
   console.log(c.dim('    Or set "dolt_mode": "embedded" there to work from this machine\'s local copy meanwhile.'));
   return false;
 }
 
-/** One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default). */
+/**
+ * One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default).
+ *
+ * Spawned through the project-scoped runner, not a bare `spawnSync` (anton-ffmw.1): `board-check`
+ * takes MANY repos in one invocation, so an ambient `BEADS_DOLT_*` inherited from the launch
+ * directory would have every one of them listed out of whichever database that names, and a project
+ * whose account has its own `BEADS_DOLT_PASSWORD_<USER>` would never receive it and fail to
+ * authenticate. The runner resolves both from the target repo's own metadata.json.
+ *
+ * The network budget, because in server mode this read crosses the wire — and an unbounded spawn is
+ * how a hung server turns a board audit into a hang.
+ */
 function bdList(repo, extra) {
-  return spawnSync("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  const exec = scopedBdRunner(repo, readDoltMetadata(repo));
+  return exec("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], budgetMs("network"));
 }
 
 /** bd's listing as an array, or null when this build's output can't be parsed. */

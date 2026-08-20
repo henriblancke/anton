@@ -46,6 +46,7 @@ import { join } from "node:path";
 
 import {
   MIN_BD_VERSION,
+  SERVER_MIGRATION_RUNBOOK,
   bdVersion,
   bdVersionAtLeast,
   budgetMs,
@@ -75,11 +76,10 @@ export const DEFAULT_DOLT_PORT = 3306;
 
 /**
  * Absolute URL to the embedded → server migration runbook — the data half this command refuses to
- * do for you. A URL, not a repo-relative path, so it resolves from a bundle install that ships no
- * `docs/` (same reason as config.mjs's BD_MIGRATION_RUNBOOK).
+ * do for you. Defined in `config.mjs` (which the server-mode preflight also names it from) and
+ * re-exported here, where this command's callers look for it.
  */
-export const SERVER_MIGRATION_RUNBOOK =
-  "https://github.com/henriblancke/anton/blob/main/docs/runbooks/embedded-board-to-shared-dolt-server.md";
+export { SERVER_MIGRATION_RUNBOOK };
 
 /**
  * The `metadata.json` key each connection field lands in — bd's names, and what `readDoltMetadata`
@@ -526,9 +526,12 @@ export function backupBoard(dir, opts = {}) {
 }
 
 /**
- * `bd dolt test` against the configured server, with the hints an operator needs when it fails:
+ * The health probe against the configured server, with the hints an operator needs when it fails:
  * a connection this project cannot make is almost always a missing password variable, and the
  * variable's name is per-USER (anton-ffmw.1), so guessing it is a wasted hour.
+ *
+ * Returns `{ ok: true }` or `{ ok: false, stage, detail, hints }` — `stage` is
+ * {@link checkSharedServer}'s, so the caller can say whether the SERVER refused or the board did.
  */
 export function testDoltConnection(dir, connection, opts = {}) {
   // The probe itself is config.mjs's, shared with the `anton init`/`doctor` preflight (anton-eg46)
@@ -536,6 +539,22 @@ export function testDoltConnection(dir, connection, opts = {}) {
   // it is mid-flip, with the connection it just wrote in hand.
   const probe = checkSharedServer(dir, connection, { ...opts, exec: scopedBdRunner(dir, connection, opts) });
   if (probe.ok) return { ok: true };
+
+  // A board that refused the READ has already proven host, port, account and transport work, so the
+  // credential and TLS hints would only send the operator to check what the probe just verified.
+  // What is left is the database itself: named wrongly, not copied across, or another project's.
+  if (probe.stage === "read") {
+    return {
+      ok: false,
+      stage: probe.stage,
+      detail: probe.detail,
+      hints: [
+        `confirm "${connection.database}" is the database THIS project's board lives in, and that the ` +
+          `"${connection.user ?? "configured"}" account may read it`,
+        `copy the board onto the server first if it is not there yet — ${SERVER_MIGRATION_RUNBOOK}`,
+      ],
+    };
+  }
 
   const perServer = serverScopedPasswordVar(connection);
   const hints = [
@@ -548,7 +567,7 @@ export function testDoltConnection(dir, connection, opts = {}) {
       "THIS project's transport, where a process-wide BEADS_DOLT_SERVER_TLS is one value for every project",
     `confirm the server is reachable at ${connection.host}:${connection.port} and serves the "${connection.database}" database`,
   ];
-  return { ok: false, detail: probe.detail, hints };
+  return { ok: false, stage: probe.stage, detail: probe.detail, hints };
 }
 
 /** One step of the flow, in the `{ name, status, detail? }` shape configureBeadsForRepo reports. */
@@ -1062,12 +1081,18 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     }
   }
 
-  // 7. Prove the connection before anything else trusts it.
+  // 7. Prove the connection — and that the database on the other end serves THIS board — before
+  //    anything else trusts it. The second half is why the step is named for what it proves rather
+  //    than for `bd dolt test` alone: that command answers only "the server accepted a connection".
   const tested = testDoltConnection(dir, connection, opts);
-  record("bd dolt test", tested.ok ? "ok" : "failed", tested.detail);
+  record("server connection", tested.ok ? "ok" : "failed", tested.detail);
   if (!tested.ok) {
-    errors.push(`bd dolt test could not connect: ${tested.detail}`);
-    revert("could not connect");
+    errors.push(
+      tested.stage === "read"
+        ? `the server accepted the connection but will not serve the "${connection.database}" database: ${tested.detail}`
+        : `bd dolt test could not connect: ${tested.detail}`,
+    );
+    revert(tested.stage === "read" ? "board unreadable on the server" : "could not connect");
     return fail({ before, connection, counts, backup, hints: tested.hints });
   }
 

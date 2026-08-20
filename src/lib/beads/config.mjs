@@ -118,6 +118,16 @@ export const BD_MIGRATION_RUNBOOK =
   "https://github.com/henriblancke/anton/blob/main/docs/runbooks/bd-1.0.4-to-1.1.0-migration.md";
 
 /**
+ * Absolute URL to the embedded → server migration runbook — the data half `anton server-mode`
+ * refuses to do for you. A URL for the same reason as above. It lives HERE rather than in
+ * `server-mode.mjs` (which re-exports it) because the preflight below names it too: a server that
+ * answers but will not serve the board is most often a database that was never copied across, and
+ * `server-mode.mjs` imports this module, not the other way around.
+ */
+export const SERVER_MIGRATION_RUNBOOK =
+  "https://github.com/henriblancke/anton/blob/main/docs/runbooks/embedded-board-to-shared-dolt-server.md";
+
+/**
  * Parse a `bd --version` line (`bd version 1.1.0 (hash)`) into `{ major, minor, patch, raw }`, or
  * null when no dotted version is present. `run` is injectable for tests; the default spawns bd.
  *
@@ -237,7 +247,7 @@ export function beadsToolingPrereqs(dir) {
  * an embedded board's origin on a server board would fail it for a channel it does not use; not
  * checking the server would let the bootstrap proceed and die later, mid-run, inside bd.
  *
- * This half AUTHENTICATES (server mode probes with `bd dolt test`), so it must run after any
+ * This half AUTHENTICATES and READS (see {@link checkSharedServer}), so it must run after any
  * stale-connection retraction — otherwise it probes as the account being retracted.
  *
  * @param {string} dir repo root
@@ -247,19 +257,29 @@ export function beadsBoardPrereqs(dir, opts = {}) {
   const board = readDoltMetadata(dir);
   if (board.mode === "server") {
     const target = formatServerTarget(board);
-    const reachable = checkSharedServer(dir, board, opts);
-    if (reachable.ok) return { ok: true };
-    // Fail loud HERE rather than let bd fail later: in server mode there is no local copy, so an
-    // unreachable server is a board outage, and bd's own error names neither the configured target
-    // nor the way out ("unreachable at 127.0.0.1:0 … dolt is not installed").
+    const usable = checkSharedServer(dir, board, opts);
+    if (usable.ok) return { ok: true };
+    // Fail loud HERE rather than let bd fail later: in server mode there is no local copy, so a
+    // board this machine cannot read is an outage, and bd's own error names neither the configured
+    // target nor the way out ("unreachable at 127.0.0.1:0 … dolt is not installed").
+    // The two stages get different words because they have different fixes: an unreachable server is
+    // the server's problem, while a server that answers and then refuses the board is this project's
+    // connection naming the wrong (or an unmigrated) database.
     return {
       ok: false,
       error: {
-        message: `this project's board is on a shared Dolt server at ${target}, which is unreachable — server mode keeps no local copy, so nothing here can read the board. (${reachable.detail})`,
+        message:
+          usable.stage === "read"
+            ? `this project's board is on a shared Dolt server at ${target}, which accepted the connection but will not serve the "${board.database ?? "?"}" database — server mode keeps no local copy, so nothing here can read the board. (${usable.detail})`
+            : `this project's board is on a shared Dolt server at ${target}, which is unreachable — server mode keeps no local copy, so nothing here can read the board. (${usable.detail})`,
         fix:
-          `Start the server (or restore the route to ${target}), confirm ${join(dir, ".beads", "metadata.json")} ` +
-          `names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell — ` +
-          `or set "dolt_mode": "embedded" there to work from this machine's local copy until it's back.`,
+          usable.stage === "read"
+            ? `Confirm ${join(dir, ".beads", "metadata.json")} names the database this project's board actually lives in, ` +
+              `that the "${board.user ?? "configured"}" account may read it, and that the board has been copied onto the ` +
+              `server (${SERVER_MIGRATION_RUNBOOK}) — or set "dolt_mode": "embedded" there to work from this machine's local copy.`
+            : `Start the server (or restore the route to ${target}), confirm ${join(dir, ".beads", "metadata.json")} ` +
+              `names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell — ` +
+              `or set "dolt_mode": "embedded" there to work from this machine's local copy until it's back.`,
       },
     };
   }
@@ -866,9 +886,29 @@ export function formatServerTarget(connection = {}) {
 }
 
 /**
- * `bd dolt test` against the shared server `connection` names — the one probe that answers "can this
- * machine reach this project's board at all". Returns `{ ok: true }` or `{ ok: false, detail }`;
- * never throws, because callers gate a bootstrap on it.
+ * The cheapest board READ bd offers — one `COUNT` against the configured database, not an export.
+ * Shared with the runtime preflight in `bd.ts` so the health gate a heartbeat applies is the same
+ * one `anton init`/`doctor` applied.
+ */
+export const BOARD_READ_PROBE = ["count", "--json"];
+
+/**
+ * Can this machine actually USE this project's board on the shared server `connection` names — the
+ * question every server-mode health gate asks. Two probes, because it takes both:
+ *
+ *   1. `bd dolt test` — is the server reachable and does it accept a connection. That is ALL it
+ *      verifies (bd's own help says so); it names no database and reads nothing.
+ *   2. `bd count` — can THIS project read ITS database there. A `dolt_database` that does not exist
+ *      on the server passes probe 1, and so does one belonging to ANOTHER project, where bd's
+ *      identity guard then refuses every board operation ("PROJECT IDENTITY MISMATCH — refusing to
+ *      connect"). Server mode keeps no local copy behind either, so a gate that stopped at probe 1
+ *      would let `anton init` and `anton doctor` exit clean — and the heartbeat keep reporting
+ *      `shared-server` — over a board on which nothing works (PR #174 review).
+ *
+ * Returns `{ ok: true }` or `{ ok: false, stage: "connect"|"read", detail }`; never throws, because
+ * callers gate a bootstrap on it. `stage` is what lets each caller name the right fix: an
+ * unreachable server and a server that answers but refuses this project's database are not the same
+ * problem.
  *
  * Spawned under the project-scoped environment, like every other bd call anton makes: an ambient
  * `BEADS_DOLT_*` would otherwise have this verify some OTHER project's server (anton-ffmw.1).
@@ -882,9 +922,16 @@ export function checkSharedServer(dir, connection = {}, opts = {}) {
   const ms = budgetMs("network");
   const exec = scopedBdRunner(dir, connection, opts);
 
-  const r = exec("bd", ["dolt", "test"], ms);
-  if ((r?.status ?? 1) === 0) return { ok: true };
-  return { ok: false, detail: failureDetail(r, ms, `${r?.stdout ?? ""}${r?.stderr ?? ""}`) };
+  const test = exec("bd", ["dolt", "test"], ms);
+  if ((test?.status ?? 1) !== 0) {
+    return { ok: false, stage: "connect", detail: failureDetail(test, ms, `${test?.stdout ?? ""}${test?.stderr ?? ""}`) };
+  }
+
+  const read = exec("bd", BOARD_READ_PROBE, ms);
+  if ((read?.status ?? 1) !== 0) {
+    return { ok: false, stage: "read", detail: failureDetail(read, ms, `${read?.stdout ?? ""}${read?.stderr ?? ""}`) };
+  }
+  return { ok: true };
 }
 
 /** The config.yaml keys anton's team-config enforces on an EMBEDDED board — the default profile,
