@@ -187,7 +187,21 @@ export function resolveServerConnection(raw, flags = {}) {
  */
 export function prepareServerModeMetadata(dir, connection) {
   const path = join(dir, ".beads", "metadata.json");
-  const before = existsSync(path) ? readFileSync(path, "utf8") : null;
+  // The restore snapshot goes through the SAME guarded read as the parse below, and by reading
+  // rather than testing-then-reading. A file that turned into a directory, or lost its read
+  // permission, between the caller's validation and this call is a controlled refusal — a bare
+  // `readFileSync` here would instead throw past every revert path and take the CLI out on an
+  // uncaught rejection (PR #174 review). No snapshot also means no restore, which is itself the
+  // reason to refuse rather than continue.
+  let before = null;
+  try {
+    before = readFileSync(path, "utf8");
+  } catch (e) {
+    if (e?.code !== "ENOENT") {
+      const detail = `could not read ${path}: ${String(e?.message ?? e)}`;
+      return { status: "unreadable", changed: [], before: null, path, detail };
+    }
+  }
   const meta = readMetadataFile(dir);
   if (meta.status === "unreadable") return { status: "unreadable", changed: [], before, path, detail: meta.detail };
   const raw = meta.raw;
@@ -576,6 +590,20 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    one holding edits that never travelled: comparison shows divergence either way. So the run
   //    reports what it did NOT verify instead of claiming a check it cannot make.
   const sourceIsServer = before.mode === "server";
+  // Whether both reads come from the SAME board — which `sourceIsServer` alone does NOT say. A
+  // re-run that repoints an existing server board at another host or database reads one server
+  // before the flip and a different one after, so the copy-arrived question is live again and the
+  // comparisons below must all apply (PR #174 review). Compared on what selects a board — host,
+  // port, database — and conservatively: anything undeclared or unequal counts as a different
+  // target, so doubt costs a warning rather than silence.
+  const sameServerTarget =
+    sourceIsServer &&
+    typeof before.host === "string" &&
+    typeof connection.host === "string" &&
+    before.host.trim().toLowerCase() === connection.host.trim().toLowerCase() &&
+    (before.port ?? DEFAULT_DOLT_PORT) === connection.port &&
+    before.database !== undefined &&
+    before.database === connection.database;
   if (sourceIsServer) {
     const local = hasLocalDoltDb(beadsDir);
     record(
@@ -587,9 +615,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     );
     if (local) {
       warnings.push(
-        "this project's metadata.json already says server mode, so the checks below read the server " +
-          `on both sides — and ${beadsDir} still holds a local embedded Dolt database that nothing ` +
-          "here has compared with it. metadata.json is tracked by git: the switch reaches every clone " +
+        "this project's metadata.json already says server mode, so the checks below read a server on " +
+          `both sides — and ${beadsDir} still holds a local embedded Dolt database that nothing ` +
+          "here has compared with either. metadata.json is tracked by git: the switch reaches every clone " +
           "on `git pull`, ahead of anyone checking that clone, so anything written here before the " +
           "pull is still in the local database and not on the server. To check it, put `dolt_mode` " +
           'back to "embedded" in .beads/metadata.json (git stash / git checkout the pulled change), ' +
@@ -867,11 +895,14 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //     either way, and a resurrected bead is deleted again in one command. Refusing would also push
   //     the runbook's second machine onto --force, which switches off the checks above that guard
   //     the unrecoverable half. So the keys are named and the operator decides.
-  //     Only when the board being moved is a LOCAL one: on a project already reading the server
-  //     both reads come from it, so a key in one and not the other is a teammate writing between
-  //     two reads — nothing to do with a copy, and the warning would be pure noise.
+  //     Suppressed only when both reads hit the SAME server database: there a key in one and not
+  //     the other is a teammate writing between two reads — nothing to do with a copy, and the
+  //     warning would be pure noise. Being in server mode is not enough to claim that (PR #174
+  //     review): repointing a server board at another host or database compares two different
+  //     boards, where a destination-only key is once again either new work or work deleted on the
+  //     board being left — exactly what this warning is for.
   const here = new Set(recordsBefore.ok ? recordsBefore.keys : []);
-  const extra = recordsBefore.ok && !sourceIsServer ? recordsAfter.keys.filter((key) => !here.has(key)) : [];
+  const extra = recordsBefore.ok && !sameServerTarget ? recordsAfter.keys.filter((key) => !here.has(key)) : [];
   if (extra.length) {
     const n = extra.length;
     const named = `${extra.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`;

@@ -187,6 +187,26 @@ describe("prepareServerModeMetadata", () => {
     expect(prepared.text).toBeUndefined();
     expect(readFileSync(metadataPath(broken), "utf8")).toBe("{ not json");
   });
+
+  /**
+   * The rollback snapshot is taken with the SAME guarded read as the parse (PR #174 review). A
+   * metadata.json that exists and cannot be read — a permissions change, a path that is somehow a
+   * directory — used to throw out of the bare `readFileSync` taking the snapshot, past every revert
+   * path, so the CLI died on an uncaught rejection instead of refusing.
+   */
+  it("reports a file it cannot READ rather than throwing out of the snapshot", () => {
+    const dir = repo(EMBEDDED);
+    rmSync(metadataPath(dir));
+    mkdirSync(metadataPath(dir));
+
+    const prepared = prepareServerModeMetadata(dir, CONNECTION);
+    expect(prepared.status).toBe("unreadable");
+    expect(prepared.detail).toMatch(/could not read .*metadata\.json/);
+    // No snapshot means no restore — which is itself the reason to refuse rather than continue.
+    expect(prepared.before).toBeNull();
+    expect(prepared.text).toBeUndefined();
+    expect(() => writeServerModeMetadata(dir, CONNECTION)).not.toThrow();
+  });
 });
 
 describe("writeServerModeMetadata", () => {
@@ -993,6 +1013,34 @@ describe("configureServerMode", () => {
       expect(result.extra).toEqual([]);
       expect(result.warnings).toEqual([]);
     });
+
+    /**
+     * Being in server mode is NOT the same as reading the same board twice (PR #174 review).
+     * Repointing an existing server board at another database compares two different boards, so a
+     * destination-only key is once again either work created there or work deleted on the board
+     * being left behind — the very thing this warning exists to surface.
+     */
+    it("warns when the flags repoint an existing server board at a different database", () => {
+      const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: CONNECTION.host, dolt_server_port: 3306, dolt_database: "probe-old" });
+      let reads = 0;
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (isRead(args)) {
+          // Reads 1 and 2 are the drift check against the OLD database; the third is the read-back
+          // from the new one, which carries a record the old board never had.
+          reads += 1;
+          return { status: 0, stdout: listing(reads < 3 ? BOARD : [...BOARD, "probe-8"]) };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(result.extra).toEqual(["probe-8"]);
+      expect(result.warnings.join("\n")).toMatch(/holds 1 record this board does not \(probe-8\)/);
+      expect(readMetadata(dir).dolt_database).toBe("probe");
+    });
   });
 
   it("refuses to flip when the pre-switch backup fails, and skips it only on request", () => {
@@ -1102,6 +1150,34 @@ describe("configureServerMode", () => {
     expect(result.errors.join("\n")).toMatch(/could not read .*config\.yaml/);
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
     expect(readMetadata(dir).dolt_mode).toBe("embedded");
+  });
+
+  /**
+   * The other half of the same rollback snapshot. metadata.json passes step 2's validation and then
+   * stops being readable — a permissions change, a path replaced by a directory — before step 5a
+   * takes its prior bytes. That read goes through the guarded parser too, so the run refuses
+   * loudly instead of exiting on an uncaught rejection (PR #174 review).
+   */
+  it("refuses before the flip when the rollback snapshot of metadata.json cannot be read", () => {
+    const dir = repo(EMBEDDED);
+    const { calls, exec } = fakeBd({ dir, before: BOARD });
+    const breaking = (cmd: string, args: string[]): Result => {
+      const result = exec(cmd, args);
+      // Right after the board read of step 3, i.e. inside the window step 2 cannot cover.
+      if (isRead(args) && existsSync(metadataPath(dir))) {
+        rmSync(metadataPath(dir), { recursive: true, force: true });
+        mkdirSync(metadataPath(dir));
+      }
+      return result;
+    };
+
+    const result = configureServerMode(dir, flags, { exec: breaking });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join("\n")).toMatch(/could not read .*metadata\.json/);
+    expect(result.errors.join("\n")).toContain("nothing was written");
+    // It never reached the flip, so it never reached the server either.
+    expect(cmdline(calls).some((c) => c.includes("dolt test"))).toBe(false);
   });
 
   /**
