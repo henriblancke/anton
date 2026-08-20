@@ -174,6 +174,11 @@ const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
  * How many candidate openers {@link parseJsonPayload} will parse before giving up. One attempt per
  * opener, never per close: a budget spent enumerating the closes behind a single opener is a budget
  * a warning's stray `{` can exhaust before the real payload is ever reached (PR #174 review).
+ *
+ * 100 is chosen well above the bracket-bearing preamble any bd version has been seen to print
+ * (single digits — one or two deprecation lines), and the cost of being wrong is bounded either
+ * way: exceed it and the symptom is a refused flip with "no readable board", never a wrong board
+ * accepted. Safe to raise if some future bd gets chattier.
  */
 const MAX_JSON_CANDIDATES = 100;
 
@@ -298,6 +303,13 @@ export function readBoardIds(dir, opts = {}) {
     // An EMPTY bare array is the one span that proves nothing about itself — it would match a stray
     // `[]` anywhere in the output. Taken only when it is the whole of stdout; the `{ issues: [] }`
     // form names itself and needs no such guard.
+    //
+    // Known cost, deliberately paid (PR #174 review): an EMPTY board that bd wraps in a stdout
+    // warning ("some warning\n[]\n") falls through to `{ ok: false }` and reads as unreadable. The
+    // alternative — accepting a bare `[]` from anywhere in the output — would let a warning's own
+    // brackets pass as "the board is empty", and an empty source set makes the arrived-whole check
+    // in configureServerMode pass over ANY server board. A misleading message on an empty board is
+    // recoverable (--force, which that step names); a silently unverified flip is not.
     if (issues.length === 0 && !wrapped && span.trim() !== stdout.trim()) return undefined;
     const found = issues.map((i) => (i && typeof i === "object" ? i.id : undefined));
     return found.every((id) => typeof id === "string" && id !== "") ? found : undefined;
@@ -397,8 +409,10 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   read at all — with no source ids, nothing verifies what arrived.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
- * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing? }} `missing` is
- *   the ids this board holds that the server's copy does not — empty once the check has passed.
+ * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, drifted? }}
+ *   `missing` is the ids this board holds that the server's copy does not — empty once the check
+ *   has passed. `drifted` is the ids that appeared or disappeared on the board being moved while
+ *   the switch was being prepared, i.e. a writer that was never stopped.
  */
 export function configureServerMode(dir, flags = {}, opts = {}) {
   const emit = typeof opts.log === "function" ? opts.log : () => {};
@@ -444,8 +458,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   }
 
   // 3. Read the board's issue IDs while it is still pointed where it is now. This is the set the
-  //    post-flip read is checked against — take it BEFORE the backup so a slow export can't sit
-  //    between the measurement and the switch.
+  //    post-flip read is checked against, and it is taken BEFORE the backup so every id in it is
+  //    one the export below also carries. Step 5b re-reads it against the flip, so the ageing this
+  //    ordering costs is caught rather than trusted.
   const counts = {};
   const idsBefore = readBoardIds(dir, { ...opts, board: before });
   if (idsBefore.ok) {
@@ -460,7 +475,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     errors.push(
       `could not read the board being moved: ${idsBefore.detail} — without its issue ids the ` +
         "server's copy cannot be checked for what this board holds. Fix the read, or re-run with " +
-        "--force to accept the server's board unverified.",
+        "--force to accept the server's board unverified — which is also the answer for a board " +
+        "that is genuinely EMPTY, since an empty listing bd prints warnings around is not " +
+        "distinguishable from no listing at all (readBoardIds).",
     );
     return fail({ before, connection, counts });
   } else {
@@ -502,6 +519,43 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         "switch is rolled back from, so the flip is refused rather than made unrevertable",
     );
     return fail({ before, connection, counts, backup });
+  }
+
+  // 5b. Re-read the board immediately before the flip and refuse if it moved. The ids in step 3 age
+  //     across the backup — minutes of `bd export` on a big board — and nothing stops anton's
+  //     scheduler or another shell from writing the embedded board in that window. An issue created
+  //     there is missing from the server AND missing from the set step 8 checks, so the command
+  //     would report a clean arrival over a bead nobody sees again; the later backup can even
+  //     contain it without the verification ever noticing. The runbook's first instruction is to
+  //     stop every writer — this is what proves it happened (PR #174 review).
+  //     Skipped under --force, which already accepts the server's board unverified: the second read
+  //     costs a full board listing and would only refine a check that flag has switched off.
+  if (idsBefore.ok && !flags.force) {
+    const idsNow = readBoardIds(dir, { ...opts, board: before });
+    if (!idsNow.ok) {
+      record("board unchanged", "failed", idsNow.detail);
+      errors.push(
+        `the board being moved became unreadable while the switch was being prepared: ${idsNow.detail} ` +
+          "— nothing has been changed. Fix the read and re-run, or re-run with --force to accept the " +
+          "server's board unverified.",
+      );
+      return fail({ before, connection, counts, backup });
+    }
+    const wasThere = new Set(idsBefore.ids);
+    const isThere = new Set(idsNow.ids);
+    const drifted = [...idsNow.ids.filter((id) => !wasThere.has(id)), ...idsBefore.ids.filter((id) => !isThere.has(id))];
+    if (drifted.length) {
+      record("board unchanged", "failed", `${drifted.length} issue${drifted.length === 1 ? "" : "s"} changed`);
+      errors.push(
+        `the board being moved changed while the switch was being prepared — ${drifted.length} issue` +
+          `${drifted.length === 1 ? "" : "s"} appeared or disappeared (${drifted.slice(0, 5).join(", ")}` +
+          `${drifted.length > 5 ? ", …" : ""}). Something is still writing this board, so neither the ` +
+          "backup nor the arrived-whole check covers it. Stop anton (`anton stop`) and any agent or " +
+          "shell writing here, then re-run.",
+      );
+      return fail({ before, connection, counts, backup, drifted });
+    }
+    record("board unchanged", "ok", `${idsNow.ids.length} issues, unchanged since the read`);
   }
 
   // 6. Write the mode + connection. metadata.json is the ONLY place the mode can live: `bd config

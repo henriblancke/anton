@@ -124,17 +124,22 @@ That command is the whole config half. It:
 
 1. reads the board's issue ids as it stands, and **backs it up** (`bd export --all` into
    `.beads/backups/`, skip with `--no-backup`);
-2. writes `dolt_mode`/host/port/user/database into `.beads/metadata.json`, preserving every other
+2. re-reads those ids immediately before the switch and **refuses if the board moved** — the export
+   above takes minutes on a big board, and an issue written in that window would be missing from
+   the server without the check in 5 ever seeing it (skipped under `--force`, which accepts the
+   server's board unverified anyway);
+3. writes `dolt_mode`/host/port/user/database into `.beads/metadata.json`, preserving every other
    key in that file;
-3. runs **`bd dolt test`**;
-4. **reads the board back from the server** and confirms every pre-switch issue id is present in
+4. runs **`bd dolt test`**;
+5. **reads the board back from the server** and confirms every pre-switch issue id is present in
    the server's copy — by identity, not cardinality, because a stale or divergent copy of the same
    project can hold as many issues (or more) while missing the ones written here since it diverged;
-5. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
+6. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
    team-wide default, so the next clone inherits the target.
 
-**Any failure in 3–5 reverts `.beads/metadata.json` byte-for-byte** and exits non-zero — the project
-keeps working exactly as it did. The two failures you are most likely to see:
+**Any failure in 4–6 reverts `.beads/metadata.json` byte-for-byte** and exits non-zero — the project
+keeps working exactly as it did (1–3 fail before anything is written at all). The failures you are
+most likely to see:
 
 - *"the server accepted the connection but this project cannot read its board … PROJECT IDENTITY
   MISMATCH"* — the database on the server belongs to a different project (`project_id` in
@@ -145,10 +150,16 @@ keeps working exactly as it did. The two failures you are most likely to see:
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
   from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
   the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
-- *"could not read the board being moved: …"* — step 1 failed, so step 4 has nothing to check the
+- *"the board being moved changed while the switch was being prepared — N issues appeared or
+  disappeared"* — step 2. Something is still writing this board (anton, an agent, a shell), so
+  neither the backup nor the arrived-whole check covers what it wrote. Phase 1 step 1 is the fix:
+  `anton stop`, close the writers, re-run.
+- *"could not read the board being moved: …"* — step 1 failed, so step 5 has nothing to check the
   server's copy against. The command stops **before** backing up or writing anything. Fix the read
   (a stopped embedded server, a missing password variable) and re-run; `--force` switches anyway and
-  accepts the server's board unverified.
+  accepts the server's board unverified. A genuinely **empty** board reads this way too — bd prints
+  an empty listing that cannot be told apart from no listing at all — and `--force` is the right
+  answer for it: there is nothing to lose track of.
 
 Also worth knowing: the password variable is **per user** (`BEADS_DOLT_PASSWORD_BEADS` for user
 `beads`) and that mapping is anton's, applied when anton spawns bd. A `bd` you run **by hand** reads

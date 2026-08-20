@@ -219,6 +219,77 @@ describe("ensureDoltConnection (server profile)", () => {
   });
 });
 
+/**
+ * Publishing the connection is FATAL, not advisory (PR #174 review). config.yaml is what a teammate's
+ * clone inherits: unpublished, it either names no server or still names an earlier one, so reporting
+ * `configured: true` is `anton init` exiting 0 — printing that team config was enforced — over a
+ * board the next clone cannot reach, or reaches in the wrong place.
+ */
+describe("configureBeadsForRepo — a server connection that cannot be published fails the run", () => {
+  let savedPath: string | undefined;
+
+  beforeEach(() => {
+    savedPath = process.env.PATH;
+  });
+
+  afterEach(() => {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+  });
+
+  /** A stub `bd` first on PATH: answers the version gate and the server probe, `dolt set` per `publish`. */
+  function stubBd(publish: { status: number; stderr?: string }) {
+    const bin = mkdtempSync(join(tmpdir(), "anton-publish-bin-"));
+    dirs.push(bin);
+    const script = [
+      "#!/usr/bin/env node",
+      "const a = process.argv.slice(2);",
+      `if (a[0] === "--version" || a[0] === "--help") { console.log("bd version ${MIN_BD_VERSION} (stub)"); process.exit(0); }`,
+      `if (a[0] === "dolt" && a[1] === "set") { console.error(${JSON.stringify(publish.stderr ?? "")}); process.exit(${publish.status}); }`,
+      "process.exit(0);",
+    ].join("\n");
+    writeFileSync(join(bin, "bd"), `${script}\n`);
+    chmodSync(join(bin, "bd"), 0o755);
+    process.env.PATH = `${bin}${delimiter}${savedPath ?? ""}`;
+  }
+
+  /** A git repo whose board is already declared to live on a shared server. */
+  function serverRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "anton-publish-"));
+    dirs.push(dir);
+    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    writeFileSync(join(dir, ".beads", "metadata.json"), JSON.stringify(SERVER_METADATA));
+    writeFileSync(join(dir, ".beads", "config.yaml"), "# empty\n");
+    return dir;
+  }
+
+  it("reports configured: false, naming what bd said", () => {
+    const dir = serverRepo();
+    stubBd({ status: 1, stderr: "Access denied for user 'beads'" });
+
+    const result = configureBeadsForRepo(dir, { log: () => {} });
+
+    expect(result.configured).toBe(false);
+    expect(result.skipped).toBe(false);
+    expect(result.mode).toBe("server");
+    expect(result.errors.join("\n")).toContain("Access denied");
+    // It stops there: everything after this point drives bd against a database this project has
+    // just proved it cannot address.
+    expect(result.steps.map((s: { name: string }) => s.name)).not.toContain(".beads/.gitignore");
+  });
+
+  it("still reports configured: true when the connection lands", () => {
+    const dir = serverRepo();
+    stubBd({ status: 0 });
+
+    const result = configureBeadsForRepo(dir, { log: () => {} });
+
+    expect(result.configured).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+});
+
 describe("configureBeadsDoltSync in server mode", () => {
   it("wires no refs/dolt/data remote — there is nothing to reconcile on a shared server", () => {
     const dir = repo(JSON.stringify(SERVER_METADATA));

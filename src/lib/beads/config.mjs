@@ -1139,6 +1139,8 @@ export function detectHooksManager(dir, priorHooksPath = null) {
  * The steps that describe refs/dolt/data — hydrating a fresh clone, the enforced sync knobs, the
  * remote wiring — are the EMBEDDED profile. A server-mode board (DESIGN.md §3a) gets its connection
  * published as the team default instead; see `teamConfigKeys` / `ensureDoltConnection` (anton-4gd2).
+ * That publication is one of the three FATAL steps (with `bd init` and `bd bootstrap`): a connection
+ * that did not reach config.yaml leaves the next clone dialling nothing, or an older server.
  *
  * Returns:
  *   { configured, skipped, reason?, mode, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
@@ -1272,15 +1274,26 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // 2b. Server mode only: publish the connection as the team-wide default so a teammate's clone
   //     inherits the target instead of being told to type it. A required field missing from
   //     metadata.json is an ERROR, not a silence — the board cannot reach its server without it.
+  //     And it FAILS the run, unlike the portable keys above: an unpublished connection is not a
+  //     degraded config, it is the wrong one. config.yaml is either missing the target or still
+  //     carrying an earlier server's, so the next clone connects somewhere else or not at all —
+  //     reported as `configured: true`, that is `anton init` exiting 0 over a board nobody can
+  //     reach (PR #174 review). Return here rather than collecting: everything below runs bd
+  //     against a database this project has just proved it cannot address.
   if (mode === "server") {
+    let published = true;
     for (const step of ensureDoltConnection(dir, beadsDir, connection, { exec })) {
       steps.push(step);
       if (step.status === "missing" || step.status === "failed") {
         emit(`${step.name} — ${step.detail}`);
         errors.push(step.detail);
+        published = false;
       } else {
         emit(`${step.name} (${step.status})`);
       }
+    }
+    if (!published) {
+      return { configured: false, skipped: false, mode, ranInit, ranBootstrap, steps, errors, hasBeads: existsSync(beadsDir) };
     }
   }
 
