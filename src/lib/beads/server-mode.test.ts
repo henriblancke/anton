@@ -509,6 +509,42 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The rollback itself runs on the failure path, where a full disk or a read-only `.beads/` is
+   * often the very thing being rolled back. A throw from the restore would escape the flow and take
+   * the CLI out on a stack trace — no structured report, and metadata.json left pointing at the
+   * server that was just rejected with nothing saying so (PR #174 review). Skipped as root, which
+   * ignores the permission bits this fails the restore with.
+   */
+  it.skipIf(process.getuid?.() === 0)("reports the mode it is left in when the rollback's own write fails", () => {
+    const dir = repo(EMBEDDED);
+    const beadsDir = join(dir, ".beads");
+    const base = fakeBd({ dir, before: BOARD });
+    // `.beads/` goes read-only at the connection test: the flip has landed, and the restore that
+    // answers the refused connection is the write that fails.
+    const exec = (cmd: string, args: string[]): Result => {
+      if (args[0] === "dolt" && args[1] === "test") {
+        chmodSync(beadsDir, 0o555);
+        return { status: 1, stderr: "Connection failed" };
+      }
+      return base.exec(cmd, args);
+    };
+
+    let result;
+    try {
+      result = configureServerMode(dir, { ...flags, backup: false }, { exec });
+    } finally {
+      chmodSync(beadsDir, 0o755);
+    }
+
+    expect(result.ok).toBe(false);
+    // The switch is still in the file — so the report has to name it, not claim a clean revert.
+    expect(readMetadata(dir).dolt_mode).toBe("server");
+    expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(false);
+    expect(result.errors.some((e: string) => e.includes("could not be put back"))).toBe(true);
+    expect(result.errors.some((e: string) => e.includes("dolt.example.dev:3306"))).toBe(true);
+  });
+
+  /**
    * Publication writes config.yaml one key at a time, so a failure part-way through leaves the file
    * carrying half a server connection — and the command reports the board as untouched. Both files
    * roll back together, or the report is a lie the next clone inherits.

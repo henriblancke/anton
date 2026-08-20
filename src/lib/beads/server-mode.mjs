@@ -865,6 +865,24 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   let configPublished = false;
 
   /**
+   * {@link restoreFile}, as `{ ok }` / `{ ok: false, detail }` rather than a throw.
+   *
+   * A rollback runs on the failure path, where the disk is often the reason for the failure being
+   * rolled back in the first place: an ENOSPC or EROFS in the restore would escape {@link revert},
+   * take the CLI out on a stack trace instead of its structured report, and leave the operator with
+   * no statement at all of which mode the project ended up in — while metadata.json still points at
+   * the server that was just rejected (PR #174 review). Caught, so the mode can be said out loud.
+   */
+  const tryRestore = (path, before) => {
+    try {
+      restoreFile(path, before);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, detail: String(e?.message ?? e) };
+    }
+  };
+
+  /**
    * Undo this run's writes and report why — the board keeps working exactly as it did.
    *
    * Restores only what it can still prove it wrote (PR #174 review). Everything after the flip —
@@ -880,6 +898,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
    * it was not switched (PR #174 review).
    * config.yaml is snapshotted immediately before publication instead, since bd's own writes make
    * "did someone else change this?" unanswerable once step 9 has started.
+   * Neither restore is allowed to throw ({@link tryRestore}).
    */
   const revert = (reason) => {
     if (wroteMetadata !== null) {
@@ -888,8 +907,19 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         current.ok &&
         (current.text === wroteMetadata || (configPublished && isPublicationRewrite(current.text, wroteMetadata)));
       if (ours) {
-        restoreFile(prepared.path, prepared.before);
-        record("metadata.json", "reverted", `${reason} — the board is untouched`);
+        const restored = tryRestore(prepared.path, prepared.before);
+        if (restored.ok) {
+          record("metadata.json", "reverted", `${reason} — the board is untouched`);
+        } else {
+          record("metadata.json", "failed", `${reason} — could not be put back: ${restored.detail}`);
+          errors.push(
+            `${prepared.path} could not be put back after the switch ${reason}: ${restored.detail}. ` +
+              `This project is therefore STILL pointed at ${connection.host}:${connection.port}, and ` +
+              "the board it was reading before is not being read by anything. Free up space or fix " +
+              'the permissions on `.beads/`, then put `dolt_mode` back to "embedded" in ' +
+              `${prepared.path} by hand (which restores the local board) and re-run.`,
+          );
+        }
       } else {
         record("metadata.json", "kept", `${reason} — edited since the switch was written, so NOT restored`);
         warnings.push(
@@ -903,7 +933,18 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     } else {
       record("metadata.json", "unchanged", `${reason} — the file already said this, so nothing was written`);
     }
-    if (configPublished) restoreFile(configPath, configSnapshot);
+    if (configPublished) {
+      const restored = tryRestore(configPath, configSnapshot);
+      if (!restored.ok) {
+        record("config.yaml", "failed", `${reason} — could not be put back: ${restored.detail}`);
+        errors.push(
+          `${configPath} could not be put back after the switch ${reason}: ${restored.detail}. It may ` +
+            "hold half of the team-wide connection defaults, which every bd command in this project " +
+            "reads. Free up space or fix the permissions on `.beads/`, then check the file against " +
+            "git (`git diff -- .beads/config.yaml`) before re-running.",
+        );
+      }
+    }
   };
 
   // 7. Prove the connection before anything else trusts it.
