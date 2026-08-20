@@ -86,6 +86,7 @@ describe("parseServerModeArgs", () => {
       database: null,
       backup: true,
       force: false,
+      unknown: [],
     });
   });
 
@@ -98,6 +99,7 @@ describe("parseServerModeArgs", () => {
       database: "d",
       backup: true,
       force: false,
+      unknown: [],
     });
     // A flag VALUE is never mistaken for the path, whichever form it takes.
     expect(parseServerModeArgs(["--host=h", "--database=d", "/repos/foo"])).toMatchObject({
@@ -110,6 +112,18 @@ describe("parseServerModeArgs", () => {
 
   it("parses the two escape hatches", () => {
     expect(parseServerModeArgs(["--no-backup", "--force"])).toMatchObject({ backup: false, force: true });
+  });
+
+  // A typo must not read as "use what the repo already has" — that is how a verified switch lands
+  // on the wrong server (PR #174 review).
+  it("collects unknown flags instead of ignoring them", () => {
+    expect(parseServerModeArgs(["/repos/foo", "--hots", "new-host", "--database", "d"])).toMatchObject({
+      unknown: ["--hots"],
+      host: null,
+      database: "d",
+    });
+    expect(parseServerModeArgs(["--hots=new-host"])).toMatchObject({ unknown: ["--hots"] });
+    expect(parseServerModeArgs(["-h"])).toMatchObject({ unknown: ["-h"] });
   });
 });
 
@@ -134,6 +148,17 @@ describe("anton server-mode (end to end over a stub bd)", () => {
       project_id: "abc-123",
     });
     expect(r.stdout).toContain("server mode configured");
+  });
+
+  it("refuses a misspelled flag rather than falling back on the repo's existing connection", async () => {
+    const p = await project();
+    const before = p.raw();
+
+    const r = p.run(["--hots", "dolt.example.dev", "--database", "probe"]);
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("unknown flag --hots");
+    expect(p.raw()).toBe(before);
   });
 
   it("exits non-zero and leaves the board alone when the server is unreachable", async () => {

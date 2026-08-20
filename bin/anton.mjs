@@ -1548,9 +1548,13 @@ async function cmdInit(args = []) {
 // history onto the server is docs/runbooks/embedded-board-to-shared-dolt-server.md, which a human
 // runs; this command is what makes that copy safe to point at (and refuses when it hasn't happened).
 
+/** The flags `server-mode` accepts — one source for `--help` and for the unknown-flag refusal. */
+const SERVER_MODE_FLAGS = "[path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]";
+
 /**
  * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
- * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs.
+ * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs. Anything
+ * else lands in `unknown`, which the command refuses on rather than running a half-read connection.
  */
 function parseServerModeArgs(args) {
   const VALUE_FLAGS = {
@@ -1560,7 +1564,7 @@ function parseServerModeArgs(args) {
     "--database": "database",
     "--db": "database",
   };
-  const out = { path: null, host: null, port: null, user: null, database: null, backup: true, force: false };
+  const out = { path: null, host: null, port: null, user: null, database: null, backup: true, force: false, unknown: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--no-backup") {
@@ -1578,7 +1582,12 @@ function parseServerModeArgs(args) {
       out[key] = eq ? eq[2] : (args[++i] ?? null);
       continue;
     }
-    if (a.startsWith("-")) continue; // unknown flag — ignore
+    // A typo is collected, never ignored: on a repo that already carries a connection, ignoring
+    // `--hots new-host` would verify and publish the OLD host and still exit 0 (PR #174 review).
+    if (a.startsWith("-")) {
+      out.unknown.push(flag);
+      continue;
+    }
     if (out.path === null) out.path = a;
   }
   return out;
@@ -1602,6 +1611,11 @@ const SERVER_MODE_MARKS = {
 
 async function cmdServerMode(args = []) {
   const parsed = parseServerModeArgs(args);
+  if (parsed.unknown.length) {
+    console.log(c.red(`anton server-mode: unknown flag${parsed.unknown.length === 1 ? "" : "s"} ${parsed.unknown.join(", ")}`));
+    console.log(c.dim(`  usage: anton server-mode ${SERVER_MODE_FLAGS}\n`));
+    return 1;
+  }
   const dir = resolve(parsed.path ?? process.cwd());
   console.log(c.bold("anton server-mode") + c.dim(` ${dir}`));
 
@@ -1688,7 +1702,7 @@ ${c.bold("Usage:")} anton <command>
 
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
-  ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim("[path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]")}
+  ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim(SERVER_MODE_FLAGS)}
   ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}

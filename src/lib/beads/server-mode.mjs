@@ -337,7 +337,9 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  * @param {string} dir repo root
  * @param {{ host?: string, port?: number|string, user?: string, database?: string, backup?: boolean, force?: boolean }} flags
  *   `backup: false` skips the pre-flip export; `force: true` accepts a server board that is MISSING
- *   issues the board being moved has (starting a deliberately fresh board).
+ *   issues the board being moved has (starting a deliberately fresh board), and is the only way to
+ *   switch when the board being moved cannot be read at all — with no source ids, nothing verifies
+ *   what arrived.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
  * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing? }} `missing` is
@@ -394,12 +396,21 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   if (idsBefore.ok) {
     counts.before = idsBefore.ids.length;
     record("board issues", "ok", `${idsBefore.ids.length} issues`);
+  } else if (!flags.force) {
+    // Fatal without --force. The arrived-whole check in step 7 is the only thing standing between
+    // this project and a stale or unrelated copy on the server, and it needs these ids to run —
+    // with no source set to compare, a successful switch says nothing about what arrived. Treating
+    // that as "nothing missing" is how an unverified board gets reported as a clean move.
+    record("board issues", "failed", idsBefore.detail);
+    errors.push(
+      `could not read the board being moved: ${idsBefore.detail} — without its issue ids the ` +
+        "server's copy cannot be checked for what this board holds. Fix the read, or re-run with " +
+        "--force to accept the server's board unverified.",
+    );
+    return fail({ before, connection, counts });
   } else {
-    // Not fatal: a board that cannot be read (a stopped embedded server, say) can still be pointed
-    // at a server. It costs the arrived-whole check, which is said out loud rather than quietly
-    // skipped.
-    record("board issues", "skipped", idsBefore.detail);
-    emit(`could not read the current board (${idsBefore.detail}) — skipping the arrived-whole check.`);
+    record("board issues", "skipped", `${idsBefore.detail} — --force`);
+    emit(`could not read the current board (${idsBefore.detail}) — --force: skipping the arrived-whole check.`);
   }
 
   // 4. Back up before the flip. Only meaningful on an embedded board: a server board's data is not

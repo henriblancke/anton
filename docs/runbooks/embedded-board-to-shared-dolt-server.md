@@ -145,6 +145,10 @@ keeps working exactly as it did. The two failures you are most likely to see:
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
   from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
   the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
+- *"could not read the board being moved: …"* — step 1 failed, so step 4 has nothing to check the
+  server's copy against. The command stops **before** backing up or writing anything. Fix the read
+  (a stopped embedded server, a missing password variable) and re-run; `--force` switches anyway and
+  accepts the server's board unverified.
 
 Also worth knowing: the password variable is **per user** (`BEADS_DOLT_PASSWORD_BEADS` for user
 `beads`) and that mapping is anton's, applied when anton spawns bd. A `bd` you run **by hand** reads

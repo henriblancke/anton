@@ -345,6 +345,38 @@ describe("configureServerMode", () => {
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
   });
 
+  /**
+   * A source board that cannot be read leaves NOTHING to check the server's copy against, so the
+   * arrived-whole guard silently passes on an empty set (PR #174 review). Refusing keeps `ok: true`
+   * meaning "this board arrived"; --force is the deliberate way to switch anyway.
+   */
+  it("refuses to switch when the board being moved cannot be read — unless forced", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    // The local board is unreadable; the server answers with a board that is not this one.
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (args[0] === "list") {
+        return readMetadataFile(dir).dolt_mode === "server"
+          ? { status: 0, stdout: listing(["other-1"]) }
+          : { status: 1, stderr: "database is locked" };
+      }
+      return { status: 0 };
+    };
+
+    const refused = configureServerMode(dir, flags, { exec });
+    expect(refused.ok).toBe(false);
+    expect(refused.errors.join("\n")).toMatch(/could not read the board being moved: .*database is locked/);
+    expect(refused.errors.join("\n")).toContain("--force");
+    // It refuses BEFORE touching anything — no backup, no metadata write to revert.
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+
+    const forced = configureServerMode(dir, { ...flags, force: true }, { exec });
+    expect(forced.ok).toBe(true);
+    expect(readMetadata(dir).dolt_mode).toBe("server");
+    expect(forced.counts).toEqual({ after: 1 });
+  });
+
   it("refuses a server board missing issues the board being moved has — unless forced", () => {
     const dir = repo(EMBEDDED);
     const original = readFileSync(metadataPath(dir), "utf8");
