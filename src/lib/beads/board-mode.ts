@@ -12,9 +12,9 @@
  *     remote is unreachable from there by construction.
  *
  *   - **Connection config is per-project, but the environment is per-process** (anton-ffmw.1).
- *     The mode, the connection target, and the database USER read here are what `bd-env.ts` uses to
- *     scope a bd spawn's environment — see that module for why inheriting it corrupts across
- *     projects.
+ *     The mode, the connection target, the database USER and the TLS setting read here are what
+ *     `bd-env.ts` uses to scope a bd spawn's environment — see that module for why inheriting them
+ *     corrupts across projects.
  *
  * bd's own precedence is env > metadata.json > config.yaml. We deliberately read ONLY
  * `.beads/metadata.json`: it is per-directory, so it describes *this* project no matter which
@@ -44,6 +44,10 @@ export interface BoardModeInfo {
    * per-project account can authenticate without the environment leaking across projects
    * (anton-ffmw.1 — see `bd-env.ts`). */
   user?: string;
+  /** Whether this project's server requires TLS (`dolt_server_tls`), when it says so at all.
+   * Undefined means "not declared" — the ambient `BEADS_DOLT_SERVER_TLS` is inherited then, and
+   * only then (`bd-env.ts`). */
+  tls?: boolean;
 }
 
 /**
@@ -79,10 +83,10 @@ export function readBoardMode(repoPath: string): BoardModeInfo {
   const hit = cache().get(repoPath);
   if (hit) return hit;
 
-  const { mode, host, port, database, user } = readDoltMetadata(repoPath);
+  const { mode, host, port, database, user, tls } = readDoltMetadata(repoPath);
   // Connection fields are dropped on an embedded board: they describe a server there is none of,
   // and callers read their presence as "this is where the board lives".
-  const info: BoardModeInfo = mode === "server" ? { mode, host, port, database, user } : { mode: "embedded" };
+  const info: BoardModeInfo = mode === "server" ? { mode, host, port, database, user, tls } : { mode: "embedded" };
 
   cache().set(repoPath, info);
   return info;

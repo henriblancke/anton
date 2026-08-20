@@ -41,6 +41,7 @@ import {
   passwordVarHint,
   readDoltMetadata,
   scopedBdRunner,
+  serverScopedPasswordVar,
   teamConfigKeys,
 } from "./config.mjs";
 
@@ -65,6 +66,10 @@ export const SERVER_METADATA_KEYS = {
   port: "dolt_server_port",
   user: "dolt_server_user",
   database: "dolt_database",
+  // Transport, and the reason it is written HERE: bd reads `dolt_server_tls` per directory, while
+  // `BEADS_DOLT_SERVER_TLS` is one process-wide value that outranks it — so one anton driving a TLS
+  // server and a plaintext one needs each project to declare its own (PR #174 review, `bd-env.ts`).
+  tls: "dolt_server_tls",
 };
 
 /** Where a pre-flip export lands. Self-ignoring, so a backup never becomes a commit. */
@@ -98,7 +103,7 @@ export function readMetadataFile(dir) {
  * reader is at a prompt, not in an editor.
  *
  * @param {Record<string, unknown>} raw from {@link readMetadataFile}
- * @param {{ host?: string, port?: number|string, user?: string, database?: string }} flags
+ * @param {{ host?: string, port?: number|string, user?: string, database?: string, tls?: boolean }} flags
  */
 export function resolveServerConnection(raw, flags = {}) {
   const errors = [];
@@ -114,13 +119,18 @@ export function resolveServerConnection(raw, flags = {}) {
   const rawPort = flags.port ?? raw[SERVER_METADATA_KEYS.port] ?? DEFAULT_DOLT_PORT;
   const port = Number(rawPort);
 
+  // Left undefined unless something declares it: an unasked-for `false` would strip the ambient
+  // BEADS_DOLT_SERVER_TLS that a single-server deployment is documented to rely on.
+  const rawTls = flags.tls ?? raw[SERVER_METADATA_KEYS.tls];
+  const tls = typeof rawTls === "boolean" ? rawTls : undefined;
+
   if (!host) errors.push("no server host — pass --host <host>");
   if (!database) errors.push("no database — pass --database <name> (the database this project's board lives in)");
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     errors.push(`invalid port "${rawPort}" — pass --port <1-65535>`);
   }
 
-  return { connection: { host, port, user, database }, errors };
+  return { connection: { host, port, user, database, tls }, errors };
 }
 
 /**
@@ -261,9 +271,14 @@ const LIST_ALL_IDS_ARGS = [
  *
  * Returns `{ ok: true, ids }` or `{ ok: false, detail }` — a board that cannot be read is reported,
  * never silently treated as empty.
+ *
+ * @param {string} dir repo root
+ * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv }} [opts] `board` is the
+ *   connection bd runs under (credentials + transport) — the board's own before the flip, the
+ *   server's after it.
  */
 export function readBoardIds(dir, opts = {}) {
-  const exec = scopedBdRunner(dir, opts.user, opts);
+  const exec = scopedBdRunner(dir, opts.board, opts);
   // The network budget, not the local `bd` one: in server mode this listing crosses the wire to the
   // Dolt server, exactly like the export in `backupBoard`. On a large board over a slow link the
   // 60s local budget times out — and a timeout here is not a warning, it is a refused flip before
@@ -302,9 +317,13 @@ export function readBoardIds(dir, opts = {}) {
  * why the runbook also says to keep that copy.
  *
  * Returns `{ status: "written"|"failed", path?, detail? }`.
+ *
+ * @param {string} dir repo root
+ * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date }} [opts]
+ *   `board` is the connection bd runs under — see {@link readBoardIds}.
  */
 export function backupBoard(dir, opts = {}) {
-  const exec = scopedBdRunner(dir, opts.user, opts);
+  const exec = scopedBdRunner(dir, opts.board, opts);
   const beadsDir = join(dir, ".beads");
   const dest = join(beadsDir, BACKUP_DIR);
   const stamp = (opts.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, "-");
@@ -340,12 +359,18 @@ export function testDoltConnection(dir, connection, opts = {}) {
   // The probe itself is config.mjs's, shared with the `anton init`/`doctor` preflight (anton-eg46)
   // so a connection this command accepts is one those will too. Only the hints are this command's:
   // it is mid-flip, with the connection it just wrote in hand.
-  const probe = checkSharedServer(dir, connection, { ...opts, exec: scopedBdRunner(dir, connection.user, opts) });
+  const probe = checkSharedServer(dir, connection, { ...opts, exec: scopedBdRunner(dir, connection, opts) });
   if (probe.ok) return { ok: true };
 
+  const perServer = serverScopedPasswordVar(connection);
   const hints = [
     `set ${passwordVarHint(connection.user)}${connection.user ? ` for the "${connection.user}" account` : " for the database user"}`,
-    "add BEADS_DOLT_SERVER_TLS=true when the server sets require_secure_transport",
+    // The rung above, named only here: it exists for the operator who drives two servers whose
+    // accounts happen to share a name, and that operator is the one standing in front of this
+    // failure (PR #174 review).
+    ...(perServer ? [`or ${perServer}, when another project uses the same "${connection.user}" account on a different server`] : []),
+    "pass --tls when the server sets require_secure_transport (--no-tls when it does not) — that is " +
+      "THIS project's transport, where a process-wide BEADS_DOLT_SERVER_TLS is one value for every project",
     `confirm the server is reachable at ${connection.host}:${connection.port} and serves the "${connection.database}" database`,
   ];
   return { ok: false, detail: probe.detail, hints };
@@ -363,11 +388,13 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  * to fall back on — an unreachable server is a board outage, DESIGN.md §3a).
  *
  * @param {string} dir repo root
- * @param {{ host?: string, port?: number|string, user?: string, database?: string, backup?: boolean, force?: boolean }} flags
- *   `backup: false` skips the pre-flip export; `force: true` accepts a server board that is MISSING
- *   issues the board being moved has (starting a deliberately fresh board), and is the only way to
- *   switch when the board being moved cannot be read at all — with no source ids, nothing verifies
- *   what arrived.
+ * @param {{ host?: string, port?: number|string, user?: string, database?: string, tls?: boolean,
+ *   backup?: boolean, force?: boolean }} flags
+ *   `tls` declares the transport in this project's metadata.json (undefined leaves it undeclared,
+ *   inheriting the ambient `BEADS_DOLT_SERVER_TLS`); `backup: false` skips the pre-flip export;
+ *   `force: true` accepts a server board that is MISSING issues the board being moved has (starting
+ *   a deliberately fresh board), and is the only way to switch when the board being moved cannot be
+ *   read at all — with no source ids, nothing verifies what arrived.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
  * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing? }} `missing` is
@@ -420,7 +447,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    post-flip read is checked against — take it BEFORE the backup so a slow export can't sit
   //    between the measurement and the switch.
   const counts = {};
-  const idsBefore = readBoardIds(dir, { ...opts, user: before.user });
+  const idsBefore = readBoardIds(dir, { ...opts, board: before });
   if (idsBefore.ok) {
     counts.before = idsBefore.ids.length;
     record("board issues", "ok", `${idsBefore.ids.length} issues`);
@@ -449,7 +476,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   } else if (flags.backup === false) {
     record("backup", "skipped", "--no-backup");
   } else {
-    backup = backupBoard(dir, { ...opts, user: before.user });
+    backup = backupBoard(dir, { ...opts, board: before });
     record("backup", backup.status === "written" ? "ok" : "failed", backup.detail ?? backup.path);
     if (backup.status !== "written") {
       // Refusing here is the point of the flag: an unbacked flip is exactly what --no-backup opts
@@ -459,17 +486,29 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     }
   }
 
-  // 5. Write the mode + connection. metadata.json is the ONLY place the mode can live: `bd config
+  // 5. Take the config.yaml snapshot FIRST — before the flip, not just before step 9 publishes into
+  //    it. It is half of what `revert` puts back, and a snapshot that cannot be read (a permissions
+  //    change, a path that is somehow a directory) is a rollback that cannot happen: taken after the
+  //    metadata write, that read throws with the project already switched to an unverified server
+  //    and no revert on the way out (PR #174 review). Read it while there is still nothing to undo.
+  const configPath = join(beadsDir, "config.yaml");
+  let configBefore = null;
+  try {
+    configBefore = existsSync(configPath) ? readFileSync(configPath, "utf8") : null;
+  } catch (e) {
+    record("config.yaml", "failed", String(e?.message ?? e));
+    errors.push(
+      `could not read ${configPath}: ${String(e?.message ?? e)} — it is half of what a failed ` +
+        "switch is rolled back from, so the flip is refused rather than made unrevertable",
+    );
+    return fail({ before, connection, counts, backup });
+  }
+
+  // 6. Write the mode + connection. metadata.json is the ONLY place the mode can live: `bd config
   //    set dolt.mode` reports success while writing a nested block into a file of flat dotted keys,
   //    from bd's lowest-priority source, and has no effect (anton-4gd2).
   const written = writeServerModeMetadata(dir, connection);
   record("metadata.json", written.status, written.changed.join(", ") || undefined);
-
-  // Snapshot config.yaml too, BEFORE step 8 starts publishing into it: `bd config set` and `bd dolt
-  // set --update-config` write one key at a time, so a failure part-way through would otherwise
-  // leave a half-published server default behind a report that says the board is untouched.
-  const configPath = join(beadsDir, "config.yaml");
-  const configBefore = existsSync(configPath) ? readFileSync(configPath, "utf8") : null;
 
   /** Undo both writes and report why — the board keeps working exactly as it did. */
   const revert = (reason) => {
@@ -478,7 +517,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     record("metadata.json", "reverted", `${reason} — the board is untouched`);
   };
 
-  // 6. Prove the connection before anything else trusts it.
+  // 7. Prove the connection before anything else trusts it.
   const tested = testDoltConnection(dir, connection, opts);
   record("bd dolt test", tested.ok ? "ok" : "failed", tested.detail);
   if (!tested.ok) {
@@ -487,11 +526,11 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, hints: tested.hints });
   }
 
-  // 7. Prove THIS board arrived, not just that some board answers. The server's copy is checked by
+  // 8. Prove THIS board arrived, not just that some board answers. The server's copy is checked by
   //    identity: a stale or divergent copy of the same project can hold as many issues as the board
   //    being moved — more, even — while missing the ones written here since it diverged, and a
   //    count would wave it through onto an incomplete board every later write then compounds.
-  const idsAfter = readBoardIds(dir, { ...opts, user: connection.user });
+  const idsAfter = readBoardIds(dir, { ...opts, board: connection });
   record("server board issues", idsAfter.ok ? "ok" : "failed", idsAfter.ok ? `${idsAfter.ids.length} issues` : idsAfter.detail);
   if (!idsAfter.ok) {
     // Fatal, unlike the pre-flip read: reading the board back IS the verification, and `bd dolt
@@ -516,13 +555,13 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, missing });
   }
 
-  // 8. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
+  // 9. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
   //    the snapshot above, so a failed attempt leaves it exactly as it was rather than carrying
   //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
   //    comes after the metadata write rather than before it.
   // Both take the project-scoped runner: on a server board `bd config set` and `bd dolt set` talk
   // to the database, so they need the same narrowed credentials the test above proved.
-  const exec = scopedBdRunner(dir, connection.user, opts);
+  const exec = scopedBdRunner(dir, connection, opts);
   for (const [key, want] of teamConfigKeys("server")) {
     const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
     record(`${key}=${want}`, status);

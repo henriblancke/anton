@@ -152,10 +152,18 @@ keeps working exactly as it did. The two failures you are most likely to see:
 
 Also worth knowing: the password variable is **per user** (`BEADS_DOLT_PASSWORD_BEADS` for user
 `beads`) and that mapping is anton's, applied when anton spawns bd. A `bd` you run **by hand** reads
-only the plain `BEADS_DOLT_PASSWORD` — set that too if you drive bd directly. Add
-`BEADS_DOLT_SERVER_TLS=true` when the server sets `require_secure_transport` (and make sure it is
-**not** set for a server without TLS — a stray one fails with "TLS requested but server does not
-support TLS").
+only the plain `BEADS_DOLT_PASSWORD` — set that too if you drive bd directly. If another project
+already uses an account of the same name on a *different* server, scope this one's password by
+server as well — `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` (e.g.
+`BEADS_DOLT_PASSWORD_DOLT_EXAMPLE_DEV_3306_BEADS`) — which anton prefers over the per-user variable;
+without it both projects resolve to the same secret and one of them cannot authenticate.
+
+Transport is per project too: pass **`--tls`** when the server sets `require_secure_transport`, and
+`--no-tls` when it does not. Either writes `dolt_server_tls` into this project's `metadata.json`,
+which is what lets one anton drive a TLS server and a plaintext one — the ambient
+`BEADS_DOLT_SERVER_TLS` is a single value for every project, and the wrong one fails with "TLS
+requested but server does not support TLS" (or its inverse). A project that declares neither
+inherits that variable, as before.
 
 ### Phase 3 — Verify, then let go
 

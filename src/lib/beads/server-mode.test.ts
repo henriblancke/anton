@@ -107,6 +107,16 @@ describe("resolveServerConnection", () => {
     expect(connection).toEqual({ host: "dolt.example.dev", port: DEFAULT_DOLT_PORT, user: undefined, database: "probe" });
   });
 
+  // Transport is per project (PR #174 review), and silence is not a declaration: a board configured
+  // before --tls existed must keep inheriting the ambient BEADS_DOLT_SERVER_TLS.
+  it("carries the declared transport, and none when neither the flags nor the file names one", () => {
+    expect(resolveServerConnection(EMBEDDED, { host: "h", database: "d", tls: true }).connection.tls).toBe(true);
+    expect(resolveServerConnection({ ...EMBEDDED, dolt_server_tls: true }, { host: "h", database: "d" }).connection.tls).toBe(true);
+    // A flag beats the file in both directions.
+    expect(resolveServerConnection({ ...EMBEDDED, dolt_server_tls: true }, { host: "h", database: "d", tls: false }).connection.tls).toBe(false);
+    expect(resolveServerConnection(EMBEDDED, { host: "h", database: "d" }).connection.tls).toBeUndefined();
+  });
+
   it.each([
     ["no host", {}, /--host/],
     ["no database", { host: "dolt.example.dev" }, /--database/],
@@ -465,6 +475,54 @@ describe("configureServerMode", () => {
     expect(result.ok).toBe(true);
     expect(cmdline(calls).some((c) => c.startsWith("bd export"))).toBe(false);
     expect(readMetadata(dir).dolt_server_host).toBe("dolt.example.dev");
+  });
+
+  /**
+   * config.yaml is half of what a failed switch is rolled back from. Snapshotted AFTER the flip, an
+   * unreadable one threw with the project already pointed at an unverified server and no revert on
+   * the way out (PR #174 review) — so the read happens while there is still nothing to undo.
+   */
+  it("refuses before the flip when the rollback snapshot of config.yaml cannot be read", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    // A config.yaml that exists and cannot be read: readFileSync throws EISDIR on a directory.
+    const configPath = join(dir, ".beads", "config.yaml");
+    rmSync(configPath);
+    mkdirSync(configPath);
+
+    const result = configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD] }).exec });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.join("\n")).toMatch(/could not read .*config\.yaml/);
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    expect(readMetadata(dir).dolt_mode).toBe("embedded");
+  });
+
+  /**
+   * One anton drives many boards, and `BEADS_DOLT_SERVER_TLS` is one value for every one of them —
+   * so the transport has to be the project's own (PR #174 review). `bd-env.ts` applies what lands
+   * here; this is where it gets written.
+   */
+  it("writes the transport --tls/--no-tls declares, and leaves an undeclared one alone", () => {
+    const dir = repo(EMBEDDED);
+
+    expect(configureServerMode(dir, { ...flags, tls: true }, { exec: fakeBd({ boards: [BOARD] }).exec }).ok).toBe(true);
+    expect(readMetadata(dir).dolt_server_tls).toBe(true);
+
+    // A re-run that says nothing about the transport keeps what the project already declared.
+    expect(configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD] }).exec }).ok).toBe(true);
+    expect(readMetadata(dir).dolt_server_tls).toBe(true);
+
+    expect(configureServerMode(dir, { ...flags, tls: false }, { exec: fakeBd({ boards: [BOARD] }).exec }).ok).toBe(true);
+    expect(readMetadata(dir).dolt_server_tls).toBe(false);
+  });
+
+  // A board written before the key existed declares nothing, and inherits the ambient variable —
+  // which is what keeps the documented single-server deployment working.
+  it("adds no transport key when neither the flags nor the file names one", () => {
+    const dir = repo(EMBEDDED);
+    expect(configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD] }).exec }).ok).toBe(true);
+    expect("dolt_server_tls" in readMetadata(dir)).toBe(false);
   });
 
   it("validates before touching anything — a missing flag writes no file and spawns no bd", () => {

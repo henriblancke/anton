@@ -92,7 +92,23 @@ describe("readDoltMetadata", () => {
       port: undefined,
       user: undefined,
       database: undefined,
+      tls: undefined,
     });
+  });
+
+  // Transport is per project (PR #174 review): declared either way it is read back, and left out it
+  // stays undefined — which is what `bd-env.ts` reads as "inherit the ambient BEADS_DOLT_SERVER_TLS".
+  it.each([
+    ["true", true, true],
+    ["false", false, false],
+    ["a non-boolean", "yes", undefined],
+  ])("reads dolt_server_tls: %s as %s", (_label, written, expected) => {
+    const dir = repo(JSON.stringify({ ...SERVER_METADATA, dolt_server_tls: written }));
+    expect(readDoltMetadata(dir).tls).toBe(expected);
+  });
+
+  it("leaves tls undefined when the project declares none", () => {
+    expect(readDoltMetadata(repo(JSON.stringify(SERVER_METADATA))).tls).toBeUndefined();
   });
 });
 

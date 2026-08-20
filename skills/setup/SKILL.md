@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 57e80578f880
+version: 42f201ff1652
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -141,8 +141,13 @@ warns it is deprecated — without it bd dials port 0 against a remote host.
 `BEADS_DOLT_PASSWORD_<USER>`, uppercased with non-alphanumeric runs folded to `_` (a user `beads`
 wants `BEADS_DOLT_PASSWORD_BEADS`). A bare `BEADS_DOLT_PASSWORD` still works as the fallback for
 every project — the one-shared-account setup — but a per-user variable is what lets each project
-have its own account. Add `BEADS_DOLT_SERVER_TLS=true` when the server sets
-`require_secure_transport`.
+have its own account. When the same account name exists on two different servers, scope it by server
+as well: `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` wins over the per-user variable.
+
+**TLS is per project, in `metadata.json`** — `"dolt_server_tls": true` when the server sets
+`require_secure_transport` (`anton server-mode --tls` / `--no-tls` writes it). The ambient
+`BEADS_DOLT_SERVER_TLS` is one value for every project this anton drives, so it cannot describe a
+TLS server and a plaintext one; a project that declares nothing still inherits it.
 
 Set **nothing else** `BEADS_DOLT_*` in a shell anton runs from. Env is bd's highest-priority config
 source, so a stray `BEADS_DOLT_SERVER_DATABASE` in an `.envrc` points *every* project's bd at that

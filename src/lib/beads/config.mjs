@@ -512,7 +512,8 @@ export function ensureBdConfig(dir, beadsDir, key, want, opts = {}) {
  * The typed accessor `board-mode.ts` delegates here, so there is ONE parser of this file.
  *
  * @param {string} dir repo root (the directory containing `.beads/`)
- * @returns {{ mode: "embedded"|"server", host?: string, port?: number, user?: string, database?: string }}
+ * @returns {{ mode: "embedded"|"server", host?: string, port?: number, user?: string, database?: string,
+ *   tls?: boolean }}
  */
 export function readDoltMetadata(dir) {
   try {
@@ -524,6 +525,9 @@ export function readDoltMetadata(dir) {
       port: typeof meta.dolt_server_port === "number" ? meta.dolt_server_port : undefined,
       user: typeof meta.dolt_server_user === "string" ? meta.dolt_server_user : undefined,
       database: typeof meta.dolt_database === "string" ? meta.dolt_database : undefined,
+      // bd's own key (`dolt_server_tls`), left undefined when the project declares nothing — which
+      // is what {@link applyBoardTls} reads as "inherit the ambient setting".
+      tls: typeof meta.dolt_server_tls === "boolean" ? meta.dolt_server_tls : undefined,
     };
   } catch {
     return { mode: "embedded" };
@@ -537,7 +541,8 @@ export function readDoltMetadata(dir) {
  *
  * Credentials and transport (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are deliberately
  * absent: they answer "may I connect", not "connect to what", and a blanket strip would leave every
- * spawn unable to authenticate. The password is scoped by {@link scopedPasswordVar} instead.
+ * spawn unable to authenticate. They are resolved per project instead — the password by
+ * {@link resolveBdPassword}, the transport by {@link applyBoardTls}.
  *
  * Defined here rather than in `bd-env.ts` so the pure-node CLI — which cannot import TypeScript —
  * scopes its own bd spawns off the same list the server uses. `bd-env.ts` re-exports it.
@@ -562,41 +567,116 @@ export const PROJECT_SCOPED_BD_ENV = [
 /** The one credential var bd reads. Scoped per project rather than stripped — see the note above. */
 export const BD_PASSWORD_VAR = "BEADS_DOLT_PASSWORD";
 
+/** bd's transport switch. Per project via `dolt_server_tls` — see {@link applyBoardTls}. */
+export const BD_TLS_VAR = "BEADS_DOLT_SERVER_TLS";
+
+/** A value as an env-var name fragment: uppercased, every non-alphanumeric run folded to `_`. */
+const envToken = (value) => String(value).toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+
+/**
+ * The board a bd spawn is being pointed at, as the env scoper needs it. A bare string is the
+ * user-only form kept for the many call sites that know nothing else about the target.
+ *
+ * @param {string|{ user?: string, host?: string, port?: number|string, tls?: boolean }|undefined} board
+ */
+function asBoard(board) {
+  return typeof board === "string" ? { user: board } : (board ?? {});
+}
+
 /**
  * The env var holding `user`'s password: `BEADS_DOLT_PASSWORD_<USER>`, uppercased with every
  * non-alphanumeric run folded to `_` so a user like `anton-bot` maps to a legal var name.
  *
- * Keyed by USER, not by database or project: the password belongs to the account, so two projects
- * that legitimately share one account need one var, not two copies that can drift apart.
+ * Keyed by USER alone: the password belongs to the account, so two projects that legitimately share
+ * one account need one var, not two copies that can drift apart. When an account name is reused on
+ * DIFFERENT servers with different passwords, {@link serverScopedPasswordVar} is the rung above.
  */
 export function scopedPasswordVar(user) {
-  return `${BD_PASSWORD_VAR}_${user.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+  return `${BD_PASSWORD_VAR}_${envToken(user)}`;
 }
 
 /**
- * `parentEnv` with project identity stripped and the password narrowed to `user`'s account — the
- * environment ONE bd invocation against one project gets.
+ * The env var holding `user`'s password *on this server*:
+ * `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` — or `undefined` when the board names no host/user.
  *
- * The ambient `BEADS_DOLT_PASSWORD` is left in place when the user has no scoped variable: a single
- * shared account is still a valid deployment. `bd-env.ts` layers call-site overrides on top of this
- * same rule for the server; the CLI uses it directly.
+ * A credential belongs to an account ON a server, and a common account name (`beads`) is exactly
+ * what two teams' servers both tend to have. Scoped by user alone, those two passwords collide on
+ * one variable and one anton cannot hold both, so every bd call for one project authenticates with
+ * the other server's secret (PR #174 review). The port is part of the identity for the same reason
+ * the host is: two servers on one box are two servers.
+ *
+ * @param {string|{ user?: string, host?: string, port?: number|string }} board
+ */
+export function serverScopedPasswordVar(board) {
+  const { user, host, port } = asBoard(board);
+  if (!user || !host) return undefined;
+  return `${BD_PASSWORD_VAR}_${envToken(host)}${port === undefined ? "" : `_${envToken(port)}`}_${envToken(user)}`;
+}
+
+/**
+ * The password to hand a bd spawn against `board`, or `undefined` to leave whatever the parent
+ * holds — most specific first: this account on THIS server, then the account anywhere, then the
+ * ambient `BEADS_DOLT_PASSWORD` (a single shared account is still a valid deployment, and only an
+ * operator who has actually created per-project users should see any change).
  *
  * @param {NodeJS.ProcessEnv} parentEnv
- * @param {string|undefined} user the target project's configured database user, if any
+ * @param {string|{ user?: string, host?: string, port?: number|string }} board
  */
-export function scopeBdEnv(parentEnv, user) {
-  const env = { ...parentEnv };
-  for (const key of PROJECT_SCOPED_BD_ENV) delete env[key];
-  const scoped = user ? parentEnv[scopedPasswordVar(user)] : undefined;
-  if (scoped !== undefined) env[BD_PASSWORD_VAR] = scoped;
+export function resolveBdPassword(parentEnv, board) {
+  const { user } = asBoard(board);
+  if (!user) return undefined;
+  const perServer = serverScopedPasswordVar(board);
+  return (perServer !== undefined ? parentEnv[perServer] : undefined) ?? parentEnv[scopedPasswordVar(user)];
+}
+
+/**
+ * Apply `board`'s declared transport to `env`, in place.
+ *
+ * TLS is per project — bd reads `dolt_server_tls` from the target's own `.beads/metadata.json` —
+ * but `BEADS_DOLT_SERVER_TLS` outranks that file in bd's precedence, so one anton driving a TLS
+ * server and a plaintext one breaks whichever project the ambient value does not describe: TLS
+ * requested but server does not support TLS, or its inverse (PR #174 review).
+ *
+ * So a project that declares a transport gets it, and only a project that declares NONE inherits
+ * the ambient setting — which is what keeps the documented single-server `BEADS_DOLT_SERVER_TLS=true`
+ * working for boards written before the key existed.
+ *
+ * @param {NodeJS.ProcessEnv} env mutated
+ * @param {string|{ tls?: boolean }} board
+ */
+export function applyBoardTls(env, board) {
+  const { tls } = asBoard(board);
+  if (tls === true) env[BD_TLS_VAR] = "true";
+  else if (tls === false) delete env[BD_TLS_VAR];
   return env;
 }
 
 /**
- * A bd/git runner bound to `dir` and to `user`'s credentials — the ONE way anton spawns bd against a
- * project it is configuring. The environment carries no project identity of its own, so the target's
- * `.beads/metadata.json` decides which database is opened, and the password is narrowed to that
- * project's account (anton-ffmw.1; `bd-env.ts` carries the field report).
+ * `parentEnv` with project identity stripped, the password narrowed to the target's account, and the
+ * transport set from what the target declares — the environment ONE bd invocation against one
+ * project gets.
+ *
+ * `bd-env.ts` layers call-site overrides on top of these same rules for the server; the CLI uses it
+ * directly.
+ *
+ * @param {NodeJS.ProcessEnv} parentEnv
+ * @param {string|{ user?: string, host?: string, port?: number|string, tls?: boolean }|undefined} board
+ *   the target project's connection (a bare string is its database user)
+ */
+export function scopeBdEnv(parentEnv, board) {
+  const env = { ...parentEnv };
+  for (const key of PROJECT_SCOPED_BD_ENV) delete env[key];
+  const password = resolveBdPassword(parentEnv, board);
+  if (password !== undefined) env[BD_PASSWORD_VAR] = password;
+  return applyBoardTls(env, board);
+}
+
+/**
+ * A bd/git runner bound to `dir` and to `board`'s credentials — the ONE way anton spawns bd against
+ * a project it is configuring. The environment carries no project identity of its own, so the
+ * target's `.beads/metadata.json` decides which database is opened, while the password and the
+ * transport are narrowed to that project's connection (anton-ffmw.1; `bd-env.ts` carries the field
+ * report).
  *
  * `opts.exec` short-circuits it, so every caller keeps the injectable seam its tests use.
  *
@@ -605,16 +685,17 @@ export function scopeBdEnv(parentEnv, user) {
  * to a payload that no longer parses — a board read as unreadable because it is BIG.
  *
  * @param {string} dir cwd for the spawn (the target repo)
- * @param {string|undefined} user the project's configured database user, if any
+ * @param {string|{ user?: string, host?: string, port?: number|string, tls?: boolean }|undefined} board
+ *   the project's connection (a bare string is its database user)
  * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
  *   env?: NodeJS.ProcessEnv }} [opts]
  */
 /** Per-stream output ceiling for a spawned bd, matching the 64 MiB the TypeScript wrappers use. */
 const BD_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
-export function scopedBdRunner(dir, user, opts = {}) {
+export function scopedBdRunner(dir, board, opts = {}) {
   if (opts.exec) return opts.exec;
-  const env = scopeBdEnv(opts.env ?? process.env, user);
+  const env = scopeBdEnv(opts.env ?? process.env, board);
   return (cmd, args, timeoutMs = budgetMs("bd")) =>
     spawnSync(cmd, args, {
       cwd: dir,
@@ -631,6 +712,11 @@ export function scopedBdRunner(dir, user, opts = {}) {
  * shared fallback otherwise. Naming the wrong one is the difference between a one-line fix and a
  * lost hour, so every "cannot reach the server" message routes through here (`bd-env.ts` wraps it
  * for the server, which looks the user up from a repo path).
+ *
+ * The per-SERVER rung ({@link serverScopedPasswordVar}) is deliberately not listed here: it only
+ * matters when one account name is reused across servers, and naming three variables in every
+ * connection failure buries the one an ordinary deployment needs. `anton server-mode` names it
+ * where that case actually shows up.
  */
 export function passwordVarHint(user) {
   return user ? `${scopedPasswordVar(user)} (or ${BD_PASSWORD_VAR})` : BD_PASSWORD_VAR;
@@ -658,13 +744,13 @@ export function formatServerTarget(connection = {}) {
  * `BEADS_DOLT_*` would otherwise have this verify some OTHER project's server (anton-ffmw.1).
  *
  * @param {string} dir repo root
- * @param {{ host?: string, port?: number, user?: string, database?: string }} connection
+ * @param {{ host?: string, port?: number, user?: string, database?: string, tls?: boolean }} connection
  * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
  *   env?: NodeJS.ProcessEnv }} [opts]
  */
 export function checkSharedServer(dir, connection = {}, opts = {}) {
   const ms = budgetMs("network");
-  const exec = scopedBdRunner(dir, connection.user, opts);
+  const exec = scopedBdRunner(dir, connection, opts);
 
   const r = exec("bd", ["dolt", "test"], ms);
   if ((r?.status ?? 1) === 0) return { ok: true };
@@ -1087,7 +1173,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // is whatever board the launch directory's .envrc last exported, and outranks the target's own
   // metadata.json in bd's precedence (anton-ffmw.1). Built once, from the connection just read, so
   // init, bootstrap and the config writes all address the same database with the same credentials.
-  const exec = scopedBdRunner(dir, connection.user, opts);
+  const exec = scopedBdRunner(dir, connection, opts);
 
   const pre = beadsPrereqs(dir);
   if (!pre.ok) {

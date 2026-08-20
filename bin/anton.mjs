@@ -1549,7 +1549,8 @@ async function cmdInit(args = []) {
 // runs; this command is what makes that copy safe to point at (and refuses when it hasn't happened).
 
 /** The flags `server-mode` accepts — one source for `--help` and for the unknown-flag refusal. */
-const SERVER_MODE_FLAGS = "[path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]";
+const SERVER_MODE_FLAGS =
+  "[path] --host <h> [--port <n>] [--user <u>] --database <db> [--tls|--no-tls] [--no-backup] [--force]";
 
 /**
  * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
@@ -1571,6 +1572,9 @@ function parseServerModeArgs(args) {
     port: null,
     user: null,
     database: null,
+    // Undefined, not false: only a project that DECLARES a transport gets one written, so a repo
+    // configured before `--tls` existed keeps inheriting the ambient BEADS_DOLT_SERVER_TLS.
+    tls: undefined,
     backup: true,
     force: false,
     unknown: [],
@@ -1584,6 +1588,10 @@ function parseServerModeArgs(args) {
     }
     if (a === "--force") {
       out.force = true;
+      continue;
+    }
+    if (a === "--tls" || a === "--no-tls") {
+      out.tls = a === "--tls";
       continue;
     }
     const eq = a.match(/^(--[a-z-]+)=(.*)$/);
@@ -1674,8 +1682,12 @@ async function cmdServerMode(args = []) {
     return 1;
   }
 
-  const { host, port, user, database } = result.connection;
-  console.log(c.green("\n✓ server mode configured.") + c.dim(` ${user ? `${user}@` : ""}${host}:${port}/${database}`));
+  const { host, port, user, database, tls } = result.connection;
+  const transport = tls === undefined ? "" : tls ? " over TLS" : " without TLS";
+  console.log(
+    c.green("\n✓ server mode configured.") +
+      c.dim(` ${user ? `${user}@` : ""}${host}:${port}/${database}${transport}`),
+  );
   if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} issues from the server.`));
   if (result.backup?.path) console.log(c.dim(`  pre-switch backup: ${result.backup.path}`));
   console.log(

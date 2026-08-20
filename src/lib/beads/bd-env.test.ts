@@ -10,7 +10,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { PROJECT_SCOPED_BD_ENV, buildBdEnv, passwordVarHint, scopedPasswordVar } from "./bd-env";
+import {
+  PROJECT_SCOPED_BD_ENV,
+  buildBdEnv,
+  passwordVarHint,
+  scopedPasswordVar,
+  serverScopedPasswordVar,
+} from "./bd-env";
 import { resetBoardModeCache } from "./board-mode";
 
 const dirs: string[] = [];
@@ -27,13 +33,18 @@ function repo(metadata: Record<string, unknown> | null): string {
 }
 
 /** A server-mode board, named the way a real `.beads/metadata.json` names one. */
-function serverRepo(database: string, user?: string): string {
+function serverRepo(
+  database: string,
+  user?: string,
+  extra: Record<string, unknown> = {},
+): string {
   return repo({
     dolt_mode: "server",
     dolt_server_host: "dolt.example.dev",
     dolt_server_port: 3306,
     dolt_database: database,
     ...(user ? { dolt_server_user: user } : {}),
+    ...extra,
   });
 }
 
@@ -123,6 +134,65 @@ describe("buildBdEnv — credentials are per project", () => {
   it("names a user's password var legally even when the account has punctuation", () => {
     expect(scopedPasswordVar("anton-bot")).toBe("BEADS_DOLT_PASSWORD_ANTON_BOT");
     expect(scopedPasswordVar("beads")).toBe("BEADS_DOLT_PASSWORD_BEADS");
+  });
+
+  // Two servers, one account name, two secrets: scoped by user alone both projects resolve to
+  // BEADS_DOLT_PASSWORD_BEADS, so one of them authenticates against the wrong server (PR #174
+  // review). The per-server rung is what lets one anton hold both.
+  it("prefers this server's password for an account name two servers share", () => {
+    const env: NodeJS.ProcessEnv = {
+      ...PROJECT_A_ENV,
+      BEADS_DOLT_PASSWORD_BEADS: "server-a-secret",
+      BEADS_DOLT_PASSWORD_DOLT_EXAMPLE_DEV_3306_BEADS: "server-a-secret",
+      BEADS_DOLT_PASSWORD_OTHER_EXAMPLE_DEV_3306_BEADS: "server-b-secret",
+    };
+    const onB = serverRepo("planar", "beads", { dolt_server_host: "other.example.dev" });
+    expect(buildBdEnv(onB, {}, env).BEADS_DOLT_PASSWORD).toBe("server-b-secret");
+    expect(buildBdEnv(serverRepo("anton", "beads"), {}, env).BEADS_DOLT_PASSWORD).toBe("server-a-secret");
+  });
+
+  it("falls back to the per-user password when this server has no variable of its own", () => {
+    const env = { ...PROJECT_A_ENV, BEADS_DOLT_PASSWORD_TRAMMEL: "trammel-secret" };
+    expect(buildBdEnv(serverRepo("planar", "trammel"), {}, env).BEADS_DOLT_PASSWORD).toBe("trammel-secret");
+  });
+
+  it("names the per-server var from host, port and account — and nothing without a host or user", () => {
+    expect(serverScopedPasswordVar({ host: "dolt.example.dev", port: 3306, user: "anton-bot" })).toBe(
+      "BEADS_DOLT_PASSWORD_DOLT_EXAMPLE_DEV_3306_ANTON_BOT",
+    );
+    expect(serverScopedPasswordVar({ host: "dolt.example.dev", user: "beads" })).toBe(
+      "BEADS_DOLT_PASSWORD_DOLT_EXAMPLE_DEV_BEADS",
+    );
+    expect(serverScopedPasswordVar({ user: "beads" })).toBeUndefined();
+    expect(serverScopedPasswordVar({ host: "dolt.example.dev" })).toBeUndefined();
+  });
+});
+
+// Transport is per project for the same reason the database is: `BEADS_DOLT_SERVER_TLS` is one
+// process-wide value, and a TLS server and a plaintext one cannot both be described by it (PR #174
+// review). bd reads `dolt_server_tls` per directory — the env just has to stop overriding it.
+describe("buildBdEnv — transport follows the target project", () => {
+  it("strips an inherited TLS flag for a project that declares plaintext", () => {
+    const env = buildBdEnv(serverRepo("planar", "trammel", { dolt_server_tls: false }), {}, PROJECT_A_ENV);
+    expect("BEADS_DOLT_SERVER_TLS" in env).toBe(false);
+  });
+
+  it("sets it for a project that declares TLS, whatever anton was launched with", () => {
+    const parent = { ...PROJECT_A_ENV, BEADS_DOLT_SERVER_TLS: undefined };
+    const env = buildBdEnv(serverRepo("planar", "trammel", { dolt_server_tls: true }), {}, parent);
+    expect(env.BEADS_DOLT_SERVER_TLS).toBe("true");
+  });
+
+  // The documented single-server setup: one exported variable, no per-project key, unchanged.
+  it("inherits the ambient flag when the project declares no transport", () => {
+    const env = buildBdEnv(serverRepo("planar", "trammel"), {}, PROJECT_A_ENV);
+    expect(env.BEADS_DOLT_SERVER_TLS).toBe("true");
+  });
+
+  it("lets an explicit override win over the project's own declaration", () => {
+    const repoPath = serverRepo("planar", "trammel", { dolt_server_tls: false });
+    const env = buildBdEnv(repoPath, { BEADS_DOLT_SERVER_TLS: "true" }, PROJECT_A_ENV);
+    expect(env.BEADS_DOLT_SERVER_TLS).toBe("true");
   });
 });
 

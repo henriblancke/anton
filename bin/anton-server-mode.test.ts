@@ -116,6 +116,16 @@ describe("parseServerModeArgs", () => {
     expect(parseServerModeArgs(["--no-backup", "--force"])).toMatchObject({ backup: false, force: true });
   });
 
+  // Undeclared is its own answer, distinct from --no-tls: it means "inherit the ambient
+  // BEADS_DOLT_SERVER_TLS", which is what a board configured before this flag existed relies on.
+  it("parses the transport as declared, not-declared, or explicitly plaintext", () => {
+    expect(parseServerModeArgs(["--tls"]).tls).toBe(true);
+    expect(parseServerModeArgs(["--no-tls"]).tls).toBe(false);
+    expect(parseServerModeArgs([]).tls).toBeUndefined();
+    // Neither form is mistaken for the repo path or an unknown flag.
+    expect(parseServerModeArgs(["/repos/foo", "--no-tls"])).toMatchObject({ path: "/repos/foo", tls: false, unknown: [] });
+  });
+
   // A typo must not read as "use what the repo already has" — that is how a verified switch lands
   // on the wrong server (PR #174 review).
   it("collects unknown flags instead of ignoring them", () => {
@@ -168,6 +178,17 @@ describe("anton server-mode (end to end over a stub bd)", () => {
       project_id: "abc-123",
     });
     expect(r.stdout).toContain("server mode configured");
+  });
+
+  // The transport has to travel in the project's own metadata: `BEADS_DOLT_SERVER_TLS` is one value
+  // for every board this anton drives (PR #174 review).
+  it("writes the transport --tls declares into this project's metadata", async () => {
+    const p = await project();
+    const r = p.run([...CONNECT, "--tls"]);
+
+    expect(r.status).toBe(0);
+    expect(p.metadata().dolt_server_tls).toBe(true);
+    expect(r.stdout).toContain("over TLS");
   });
 
   it("refuses a misspelled flag rather than falling back on the repo's existing connection", async () => {

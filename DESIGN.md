@@ -140,9 +140,13 @@ solo board's only propagation path.
      or embedded (`PROJECT_SCOPED_BD_ENV` is the list), leaving the target's own per-directory
      `metadata.json` to decide.
    - **The password is narrowed to the target's database user**: `BEADS_DOLT_PASSWORD_<USER>` wins
-     over the ambient `BEADS_DOLT_PASSWORD`, which is what makes per-project accounts work at all.
-   An explicit `env` override at the call site beats both. `BEADS_DOLT_SERVER_TLS` is transport, not
-   identity, and is left inherited.
+     over the ambient `BEADS_DOLT_PASSWORD`, which is what makes per-project accounts work at all,
+     and `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` wins over that — a credential belongs to an
+     account ON a server, and `beads` is exactly the account name two teams' servers both have.
+   - **The transport follows the target's own `dolt_server_tls`**: declared, it is applied; absent,
+     the ambient `BEADS_DOLT_SERVER_TLS` is inherited as before. Transport is not identity, but it is
+     still per project — one process-wide value cannot describe a TLS server and a plaintext one.
+   An explicit `env` override at the call site beats all of them.
 
 3. **Setup enforces the profile the mode calls for** (`configureBeadsForRepo`, anton-4gd2). Embedded
    gets the Dolt-first sync knobs it always had — `export.auto`/`export.git-add` false,
@@ -156,7 +160,7 @@ solo board's only propagation path.
    remote` — the sync nudges' noise in another costume.
 
 **Configuring server mode.** One command, per project: `anton server-mode <repo> --host … --port …
---user … --database …` (anton-yvjd, `src/lib/beads/server-mode.mjs`). It backs the board up
+--user … --database … [--tls|--no-tls]` (anton-yvjd, `src/lib/beads/server-mode.mjs`). It backs the board up
 (`bd export --all` into a self-ignored `.beads/backups/`), writes the file below, verifies with
 `bd dolt test`, **reads the board back from the server** and confirms every issue id the project
 held a moment earlier is present there, then publishes the connection as the team default. Any failure after
@@ -179,7 +183,8 @@ dotted keys, from bd's lowest-priority source, and has no effect:
   "dolt_server_host": "dolt.example.dev",
   "dolt_server_port": 3306,
   "dolt_server_user": "beads",
-  "dolt_database": "anton"
+  "dolt_database": "anton",
+  "dolt_server_tls": true
 }
 ```
 
@@ -194,9 +199,16 @@ Credentials come from the environment, never from `metadata.json` — it is comm
 project's database user its own variable, `BEADS_DOLT_PASSWORD_<USER>` (uppercased, non-alphanumeric
 folded to `_`): the user above wants `BEADS_DOLT_PASSWORD_BEADS`. A bare `BEADS_DOLT_PASSWORD` is
 still honoured as the fallback for every project, which is the one-shared-account setup; per-user
-variables are what let that account be retired. Add `BEADS_DOLT_SERVER_TLS=true` when the server sets
-`require_secure_transport`. `dolt_server_port` must stay in `metadata.json` despite bd's deprecation
-warning — without it bd dials port 0 against a remote host.
+variables are what let that account be retired. When one account name is reused on DIFFERENT servers
+with different passwords, scope it further — `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>`, which wins
+over the per-user variable and is the only way one anton can hold both secrets.
+
+`dolt_server_tls` is the transport, and it belongs in `metadata.json` for the same reason the host
+does: `BEADS_DOLT_SERVER_TLS` is one process-wide value, so a TLS server and a plaintext one driven
+by one anton cannot both be right about it (`--tls` / `--no-tls` write the key). A project that
+declares nothing inherits the ambient variable, which is what keeps single-server deployments
+working. `dolt_server_port` must stay in `metadata.json` despite bd's deprecation warning — without
+it bd dials port 0 against a remote host.
 
 On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
 unreachable, records a failure naming the configured host/port and the ways out, rather than the
