@@ -8,7 +8,7 @@
  * injected `exec` — the real one needs a live server, and a unit test must not.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +22,7 @@ import {
   resolveServerConnection,
   restoreFile,
   testDoltConnection,
+  writeFileAtomic,
   writeServerModeMetadata,
 } from "./server-mode.mjs";
 
@@ -241,6 +242,28 @@ describe("writeServerModeMetadata", () => {
   });
 });
 
+/**
+ * A plain `writeFileSync` truncates before it can fail, so a full disk or a read-only mount would
+ * leave metadata.json empty — connection details a workspace can no longer read, lost by the one
+ * command that exists not to lose boards (PR #174 review). Root ignores the permission bits this
+ * simulates the failure with, so the case is skipped there rather than asserted falsely.
+ */
+describe.skipIf(process.getuid?.() === 0)("writeFileAtomic", () => {
+  it("leaves the previous contents intact when the write fails, and drops its temp file", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    const beadsDir = join(dir, ".beads");
+    chmodSync(beadsDir, 0o555);
+    try {
+      expect(() => writeFileAtomic(metadataPath(dir), "replacement\n")).toThrow();
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    } finally {
+      chmodSync(beadsDir, 0o755);
+    }
+    expect(readdirSync(beadsDir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+});
+
 describe("readBoardIds", () => {
   /** The parse, without the digests — those are asserted on their own below. */
   const ids = (stdout: string) => {
@@ -435,6 +458,34 @@ describe("configureServerMode", () => {
     expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
     // Nothing was published: a board that cannot connect must not leave a team default behind.
     expect(cmdline(calls).some((c) => c.includes("--update-config"))).toBe(false);
+  });
+
+  /**
+   * The flip is the one write that happens before `revert` exists. A plain write that fails part-way
+   * — a full disk, a read-only `.beads/` — would truncate metadata.json AND take the command out
+   * through a stack trace, leaving a workspace whose connection details no longer parse (PR #174
+   * review). Skipped as root, which ignores the permission bits this fails the write with.
+   */
+  it.skipIf(process.getuid?.() === 0)("refuses cleanly when the flip's own write fails, leaving metadata.json intact", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    const beadsDir = join(dir, ".beads");
+    const { calls, exec } = fakeBd({ dir, before: BOARD });
+
+    chmodSync(beadsDir, 0o555);
+    let result;
+    try {
+      result = configureServerMode(dir, { ...flags, backup: false }, { exec });
+    } finally {
+      chmodSync(beadsDir, 0o755);
+    }
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e: string) => e.includes("could not write"))).toBe(true);
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    // The board never moved, so nothing downstream of the flip ran — and there is nothing to revert.
+    expect(cmdline(calls)).not.toContainEqual("bd dolt test");
+    expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(false);
   });
 
   /**

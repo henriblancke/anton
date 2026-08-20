@@ -36,7 +36,7 @@
  * failed attempt leaves a working board rather than a project pointed at a server it cannot read.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -201,13 +201,33 @@ export function prepareServerModeMetadata(dir, connection) {
 }
 
 /**
+ * Replace a file's contents so that a failure leaves the previous ones intact: the new text goes to
+ * a sibling temp file, which is renamed over the target only once it is fully written. A plain
+ * `writeFileSync` truncates its target before it can fail, so a full disk, a read-only mount or an
+ * I/O error part-way through leaves `metadata.json` empty or half-written — a workspace whose
+ * connection details no longer parse, from a command whose whole point is not to lose boards
+ * (PR #174 review). `rename` is atomic within a filesystem, and the temp file is kept in the same
+ * directory to stay on one. The error still propagates; only the damage does not.
+ */
+export function writeFileAtomic(path, text) {
+  const tmp = `${path}.anton-${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, text);
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
+/**
  * {@link prepareServerModeMetadata} and then the write — `{ status: "already"|"written"|"unreadable",
  * changed, before, path }`. The one-call form, for callers with no read to sequence against.
  */
 export function writeServerModeMetadata(dir, connection) {
   const prepared = prepareServerModeMetadata(dir, connection);
   if (prepared.status !== "prepared") return prepared;
-  writeFileSync(prepared.path, prepared.text);
+  writeFileAtomic(prepared.path, prepared.text);
   return { ...prepared, status: "written" };
 }
 
@@ -217,7 +237,7 @@ export function writeServerModeMetadata(dir, connection) {
  */
 export function restoreFile(path, before) {
   if (before === null) rmSync(path, { force: true });
-  else writeFileSync(path, before);
+  else writeFileAtomic(path, before);
 }
 
 /** Everything a bd invocation printed, both streams — bd puts its config warnings on stderr. */
@@ -751,7 +771,25 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    between them but the comparison itself (see 5a). metadata.json is the only place the mode can
   //    live: `bd config set dolt.mode` reports success while writing a nested block into a file of
   //    flat dotted keys, from bd's lowest-priority source, and has no effect (anton-4gd2).
-  if (prepared.status === "prepared") writeFileSync(prepared.path, prepared.text);
+  //    Written atomically, and a failure reported rather than thrown: this is the one write that
+  //    happens before `revert` exists, so an unhandled ENOSPC/EROFS/EIO here would leave the CLI
+  //    exiting on a stack trace over a metadata.json a plain write had already truncated
+  //    (PR #174 review). {@link writeFileAtomic} keeps the previous file intact through the
+  //    failure, so there is nothing to roll back — config.yaml is not published until step 9 — and
+  //    the flow returns the same structured refusal every other pre-flip check does.
+  if (prepared.status === "prepared") {
+    try {
+      writeFileAtomic(prepared.path, prepared.text);
+    } catch (e) {
+      const detail = String(e?.message ?? e);
+      record("metadata.json", "failed", detail);
+      errors.push(
+        `could not write ${prepared.path}: ${detail} — the file still holds its previous contents ` +
+          "and the board is untouched. Free up space or fix the permissions on `.beads/`, then re-run.",
+      );
+      return fail({ before, connection, counts, backup });
+    }
+  }
   record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
 
   /** Undo both writes and report why — the board keeps working exactly as it did. */
