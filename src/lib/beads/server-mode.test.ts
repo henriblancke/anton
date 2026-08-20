@@ -184,7 +184,11 @@ describe("writeServerModeMetadata", () => {
 });
 
 describe("readBoardIds", () => {
-  const ids = (stdout: string) => readBoardIds(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
+  /** The parse, without the digests — those are asserted on their own below. */
+  const ids = (stdout: string) => {
+    const read = readBoardIds(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
+    return read.ok ? { ok: read.ok, ids: read.ids } : read;
+  };
 
   // Closed issues, gates, infra beads and templates are board state too: a check that skipped them
   // would call a board arrived while a third of it was still at home.
@@ -194,11 +198,48 @@ describe("readBoardIds", () => {
       calls.push([cmd, ...args]);
       return { status: 0, stdout: listing(["probe-1"]) };
     };
-    expect(readBoardIds(repo(EMBEDDED), { exec })).toEqual({ ok: true, ids: ["probe-1"] });
+    expect(readBoardIds(repo(EMBEDDED), { exec }).ids).toEqual(["probe-1"]);
     const ran = calls[0].join(" ");
     for (const flag of ["--all", "--limit 0", "--include-gates", "--include-infra", "--include-templates"]) {
       expect(ran).toContain(flag);
     }
+    // Ids-only by default: label hydration is the expensive half of the query, and the
+    // arrived-whole check against the server reads ids alone.
+    expect(ran).toContain("--skip-labels");
+  });
+
+  /**
+   * The digests are what the drift check compares, and ids alone cannot answer it: a writer that
+   * updates an existing issue leaves the id set identical (PR #174 review). Labels are part of that
+   * content, so a content read hydrates them.
+   */
+  it("fingerprints each issue's content, labels included, for the drift check", () => {
+    const calls: string[][] = [];
+    /** `probe-1`'s fingerprint as bd printed it — throwing rather than comparing two undefineds. */
+    const fingerprint = (issue: object): string => {
+      const read = readBoardIds(repo(EMBEDDED), {
+        content: true,
+        exec: (cmd: string, args: string[]) => {
+          calls.push([cmd, ...args]);
+          return { status: 0, stdout: JSON.stringify({ issues: [issue] }) };
+        },
+      });
+      const fp = read.digests?.get("probe-1");
+      if (!fp) throw new Error(`no digest for probe-1: ${read.detail ?? "board read as empty"}`);
+      return fp;
+    };
+
+    const open = fingerprint({ id: "probe-1", title: "t", status: "open", labels: ["approved"] });
+    expect(fingerprint({ id: "probe-1", title: "t", status: "closed", labels: ["approved"] })).not.toBe(open);
+    expect(fingerprint({ id: "probe-1", title: "T", status: "open", labels: ["approved"] })).not.toBe(open);
+    expect(fingerprint({ id: "probe-1", title: "t", status: "open", labels: ["approved", "risk:low"] })).not.toBe(open);
+
+    // Unchanged content fingerprints the same, whatever order bd prints the fields and labels in —
+    // a reordered listing must not read as a mid-flip edit and refuse the switch.
+    expect(fingerprint({ id: "probe-1", title: "t", status: "open", labels: ["approved"] })).toBe(open);
+    expect(fingerprint({ labels: ["approved"], status: "open", title: "t", id: "probe-1" })).toBe(open);
+
+    for (const call of calls) expect(call.join(" ")).not.toContain("--skip-labels");
   });
 
   it("reads both shapes bd answers with — a bare array and the { issues } wrapper", () => {
@@ -476,6 +517,37 @@ describe("configureServerMode", () => {
     // Refused BEFORE the flip: metadata.json was never written, so there is nothing to revert.
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
     expect(result.steps.some((s: { name: string; status: string }) => s.name === "board unchanged" && s.status === "failed")).toBe(true);
+  });
+
+  /**
+   * The half an id-set comparison cannot see (PR #174 review): a writer that UPDATES an existing
+   * bead — closes it, retitles it, moves a label, takes the assignment — leaves the ids identical,
+   * so the drift check passed, the arrived-whole check (ids again) passed, and the switch reported
+   * a clean move while that update stayed behind in the embedded database nobody reads any more.
+   * The per-issue content digests are what catch it.
+   */
+  it("refuses when an existing issue is EDITED while the switch is being prepared", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    // Same board, same ids, both reads — an agent just closed probe-3 between them.
+    let reads = 0;
+    const rows = (closed: boolean) =>
+      JSON.stringify({
+        issues: BOARD.map((id) => ({ id, title: id, status: closed && id === "probe-3" ? "closed" : "open" })),
+      });
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (args[0] === "list") return { status: 0, stdout: rows(++reads > 1) };
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(result.drifted).toEqual(["probe-3"]);
+    expect(result.errors.join("\n")).toMatch(/appeared, disappeared or were edited/);
+    // Refused BEFORE the flip, like every other drift: the board keeps working as it did.
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
   });
 
   // A source that becomes unreadable between the two reads is the same refusal, not a shrug: the

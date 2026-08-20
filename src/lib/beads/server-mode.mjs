@@ -22,10 +22,16 @@
  *      copy has not happened, landed in another database, or left a stale copy of this project on
  *      the server — the one class of mistake that makes an otherwise-successful switch look fine
  *      while the team stares at a board with work missing from it. It reverts rather than reports.
+ *   4. **Prove nobody wrote it meanwhile.** The board is read once to measure and once more
+ *      immediately before the flip, and every issue's CONTENT is compared, not just the id set: an
+ *      update the server's copy predates would otherwise sail through step 3 and be stranded in the
+ *      database this project is about to stop reading. What remains is the flip itself — a single
+ *      `metadata.json` write, milliseconds rather than the minutes an export takes.
  *
  * On any of those failures `metadata.json` AND `.beads/config.yaml` are restored byte-for-byte, so a
  * failed attempt leaves a working board rather than a project pointed at a server it cannot read.
  */
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -249,23 +255,48 @@ function parseJsonPayload(text, accept) {
  * `--all` plus the three `--include-*` flags mirror the backup's `bd export --all`: closed issues,
  * gates, infra beads and templates are board state too, and a check that skipped them would call a
  * board arrived while a third of it was still at home. `--limit 0` because bd truncates at 50 by
- * default, and `--skip-labels` because only the ids are read — label hydration is the expensive
- * half of the query. Every flag exists in bd 1.1.0, anton's floor (MIN_BD_VERSION).
+ * default. Every flag exists in bd 1.1.0, anton's floor (MIN_BD_VERSION).
+ *
+ * `--skip-labels` is dropped for a CONTENT read only. Label hydration is the expensive half of the
+ * query and the arrived-whole check compares ids alone — but the drift check compares what each
+ * issue SAYS, and a label written mid-flip is a change like any other (PR #174 review).
  */
-const LIST_ALL_IDS_ARGS = [
+const listAllArgs = (content) => [
   "list",
   "--all",
   "--json",
   "--limit",
   "0",
-  "--skip-labels",
+  ...(content ? [] : ["--skip-labels"]),
   "--include-gates",
   "--include-infra",
   "--include-templates",
 ];
 
+/** JSON with object keys sorted at every depth, and every array ordered by its own serialization:
+ * bd's field order and its row order are presentation, not board content, so neither may read as a
+ * mid-flip edit. */
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).sort().join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 /**
- * Every issue ID this project's board holds right now.
+ * A fingerprint of one issue as bd printed it — EVERY field, not a chosen few, so a status, title,
+ * assignee, label or dependency written while the switch is being prepared cannot slip past the
+ * drift check by leaving the id set intact (PR #174 review). Hashed rather than kept, so a
+ * fingerprint per issue costs 40 bytes on a board of any size.
+ */
+const issueDigest = (issue) => createHash("sha1").update(stableJson(issue)).digest("hex");
+
+/**
+ * Every issue this project's board holds right now: its ids, and a content fingerprint per id.
  *
  * IDENTITY, not cardinality, is what answers "did the history actually arrive". A count proves only
  * that SOME board is on the other end: a server holding a stale or divergent copy of the same
@@ -274,13 +305,17 @@ const LIST_ALL_IDS_ARGS = [
  * that; comparing two numbers cannot. This runs once, on a one-time migration, so reading the ids
  * is worth what it costs over `bd count`.
  *
- * Returns `{ ok: true, ids }` or `{ ok: false, detail }` — a board that cannot be read is reported,
- * never silently treated as empty.
+ * The `digests` answer the other question — "is this the same board it was a minute ago" — which
+ * ids alone cannot: a writer that UPDATES an existing issue leaves the id set identical.
+ *
+ * Returns `{ ok: true, ids, digests }` or `{ ok: false, detail }` — a board that cannot be read is
+ * reported, never silently treated as empty.
  *
  * @param {string} dir repo root
- * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv }} [opts] `board` is the
- *   connection bd runs under (credentials + transport) — the board's own before the flip, the
- *   server's after it.
+ * @param {{ board?: object, content?: boolean, exec?: Function, env?: NodeJS.ProcessEnv }} [opts]
+ *   `board` is the connection bd runs under (credentials + transport) — the board's own before the
+ *   flip, the server's after it. `content: true` hydrates labels too, so the digests cover them;
+ *   pass it for any read whose digests are compared.
  */
 export function readBoardIds(dir, opts = {}) {
   const exec = scopedBdRunner(dir, opts.board, opts);
@@ -289,14 +324,14 @@ export function readBoardIds(dir, opts = {}) {
   // 60s local budget times out — and a timeout here is not a warning, it is a refused flip before
   // it and a full revert after it (PR #174 review).
   const ms = budgetMs("network");
-  const r = exec("bd", LIST_ALL_IDS_ARGS, ms);
+  const r = exec("bd", listAllArgs(opts.content === true), ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
 
   // stdout only — bd's warnings go to stderr, and the ones that don't are stepped over by the scan.
   // bd answers with a bare array on some boards and `{ issues: [...] }` on others; both are the
   // payload, and anything else (a nested array of dependency ids, say) is not.
   const stdout = r?.stdout ?? "";
-  const ids = parseJsonPayload(stdout, (parsed, span) => {
+  const rows = parseJsonPayload(stdout, (parsed, span) => {
     const wrapped = !Array.isArray(parsed) && Array.isArray(parsed?.issues);
     const issues = Array.isArray(parsed) ? parsed : wrapped ? parsed.issues : undefined;
     if (!issues) return undefined;
@@ -312,9 +347,10 @@ export function readBoardIds(dir, opts = {}) {
     // recoverable (--force, which that step names); a silently unverified flip is not.
     if (issues.length === 0 && !wrapped && span.trim() !== stdout.trim()) return undefined;
     const found = issues.map((i) => (i && typeof i === "object" ? i.id : undefined));
-    return found.every((id) => typeof id === "string" && id !== "") ? found : undefined;
+    return found.every((id) => typeof id === "string" && id !== "") ? issues : undefined;
   });
-  return ids ? { ok: true, ids } : { ok: false, detail: "bd list printed no readable board" };
+  if (!rows) return { ok: false, detail: "bd list printed no readable board" };
+  return { ok: true, ids: rows.map((i) => i.id), digests: new Map(rows.map((i) => [i.id, issueDigest(i)])) };
 }
 
 /**
@@ -411,8 +447,8 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
  * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing?, drifted? }}
  *   `missing` is the ids this board holds that the server's copy does not — empty once the check
- *   has passed. `drifted` is the ids that appeared or disappeared on the board being moved while
- *   the switch was being prepared, i.e. a writer that was never stopped.
+ *   has passed. `drifted` is the ids that appeared, disappeared or were EDITED on the board being
+ *   moved while the switch was being prepared, i.e. a writer that was never stopped.
  */
 export function configureServerMode(dir, flags = {}, opts = {}) {
   const emit = typeof opts.log === "function" ? opts.log : () => {};
@@ -462,7 +498,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    one the export below also carries. Step 5b re-reads it against the flip, so the ageing this
   //    ordering costs is caught rather than trusted.
   const counts = {};
-  const idsBefore = readBoardIds(dir, { ...opts, board: before });
+  const idsBefore = readBoardIds(dir, { ...opts, board: before, content: true });
   if (idsBefore.ok) {
     counts.before = idsBefore.ids.length;
     record("board issues", "ok", `${idsBefore.ids.length} issues`);
@@ -521,17 +557,21 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup });
   }
 
-  // 5b. Re-read the board immediately before the flip and refuse if it moved. The ids in step 3 age
-  //     across the backup — minutes of `bd export` on a big board — and nothing stops anton's
+  // 5b. Re-read the board immediately before the flip and refuse if it moved. The reading in step 3
+  //     ages across the backup — minutes of `bd export` on a big board — and nothing stops anton's
   //     scheduler or another shell from writing the embedded board in that window. An issue created
   //     there is missing from the server AND missing from the set step 8 checks, so the command
   //     would report a clean arrival over a bead nobody sees again; the later backup can even
   //     contain it without the verification ever noticing. The runbook's first instruction is to
   //     stop every writer — this is what proves it happened (PR #174 review).
+  //     CONTENT, not just ids: a writer that closes a bead, retitles it, moves a label or adds a
+  //     dependency leaves the id set identical, and step 8's arrived-whole check — ids again —
+  //     would wave the stale server copy through, stranding that update in a database this project
+  //     is about to stop reading. Comparing the per-issue digests catches every such write.
   //     Skipped under --force, which already accepts the server's board unverified: the second read
   //     costs a full board listing and would only refine a check that flag has switched off.
   if (idsBefore.ok && !flags.force) {
-    const idsNow = readBoardIds(dir, { ...opts, board: before });
+    const idsNow = readBoardIds(dir, { ...opts, board: before, content: true });
     if (!idsNow.ok) {
       record("board unchanged", "failed", idsNow.detail);
       errors.push(
@@ -541,14 +581,16 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       );
       return fail({ before, connection, counts, backup });
     }
-    const wasThere = new Set(idsBefore.ids);
-    const isThere = new Set(idsNow.ids);
-    const drifted = [...idsNow.ids.filter((id) => !wasThere.has(id)), ...idsBefore.ids.filter((id) => !isThere.has(id))];
+    // One comparison covers all three shapes of drift: an id only the later read has (created), one
+    // only the earlier read has (deleted), and one both hold under different digests (updated).
+    const drifted = [...new Set([...idsBefore.ids, ...idsNow.ids])].filter(
+      (id) => idsBefore.digests.get(id) !== idsNow.digests.get(id),
+    );
     if (drifted.length) {
       record("board unchanged", "failed", `${drifted.length} issue${drifted.length === 1 ? "" : "s"} changed`);
       errors.push(
         `the board being moved changed while the switch was being prepared — ${drifted.length} issue` +
-          `${drifted.length === 1 ? "" : "s"} appeared or disappeared (${drifted.slice(0, 5).join(", ")}` +
+          `${drifted.length === 1 ? "" : "s"} appeared, disappeared or were edited (${drifted.slice(0, 5).join(", ")}` +
           `${drifted.length > 5 ? ", …" : ""}). Something is still writing this board, so neither the ` +
           "backup nor the arrived-whole check covers it. Stop anton (`anton stop`) and any agent or " +
           "shell writing here, then re-run.",

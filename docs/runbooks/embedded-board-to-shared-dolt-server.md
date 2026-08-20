@@ -150,10 +150,12 @@ most likely to see:
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
   from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
   the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
-- *"the board being moved changed while the switch was being prepared — N issues appeared or
-  disappeared"* — step 2. Something is still writing this board (anton, an agent, a shell), so
-  neither the backup nor the arrived-whole check covers what it wrote. Phase 1 step 1 is the fix:
-  `anton stop`, close the writers, re-run.
+- *"the board being moved changed while the switch was being prepared — N issues appeared,
+  disappeared or were edited"* — step 2. Something is still writing this board (anton, an agent, a
+  shell), so neither the backup nor the arrived-whole check covers what it wrote. The comparison is
+  per-issue **content**, not just the id set, so a bead someone merely closed or relabelled trips it
+  too — that update would otherwise be stranded in the embedded database the move is leaving behind.
+  Phase 1 step 1 is the fix: `anton stop`, close the writers, re-run.
 - *"could not read the board being moved: …"* — step 1 failed, so step 5 has nothing to check the
   server's copy against. The command stops **before** backing up or writing anything. Fix the read
   (a stopped embedded server, a missing password variable) and re-run; `--force` switches anyway and

@@ -207,6 +207,33 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
     }
   });
 
+  /**
+   * The other half of what that cache may not outlive (PR #174 review). Keyed on the repo path
+   * alone, a pass recorded for one server vouches for whatever metadata.json names next — so an
+   * operator correcting a wrong host, database, account or transport gets "healthy shared board"
+   * for up to five minutes from a target nothing has probed. The probe follows the connection.
+   */
+  it("re-probes within the TTL when metadata.json is pointed at a different server", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "old.example.dev", dolt_server_port: 3306 });
+    const probed: string[] = [];
+    const exec: TestExec = async (cwd: string, args: string[]) => {
+      if (args.join(" ") === "dolt test") probed.push(readBoardMode(cwd).host ?? "?");
+      return "";
+    };
+
+    await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    expect(probed).toEqual(["old.example.dev"]);
+
+    // The correction an operator makes when the host was wrong. Well inside the TTL.
+    writeFileSync(
+      join(dir, ".beads", "metadata.json"),
+      JSON.stringify({ dolt_mode: "server", dolt_server_host: "new-server.example.dev", dolt_server_port: 3306 }),
+    );
+    await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+    expect(probed).toEqual(["old.example.dev", "new-server.example.dev"]);
+  });
+
   it("still runs the full pull/commit/push in embedded mode", async () => {
     const dir = repo({ dolt_mode: "embedded" });
     const calls: string[][] = [];

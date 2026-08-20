@@ -12,7 +12,7 @@ import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
 import { buildBdEnv, passwordVarHint } from "./bd-env";
 import { formatServerTarget } from "./config.mjs";
-import { isServerMode, readBoardMode } from "./board-mode";
+import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
@@ -796,17 +796,34 @@ const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
  */
 export const PREFLIGHT_TTL_MS = 5 * 60_000;
 
+/** A successful probe: when it landed (epoch ms) and which server it proved reachable. */
+type Preflighted = { at: number; server: string };
+
 /**
- * When each repo's last SUCCESSFUL probe landed, in epoch ms.
+ * Each repo's last SUCCESSFUL probe.
  *
  * Anchored on `globalThis` for the same cross-bundle reason as the status registry above: a route
  * handler bundle and the instrumentation-started sync engine each load their own compiled copy of
  * this module, and a plain module-level Map would give each one its own — turning "once per TTL"
  * into "once per TTL per bundle" and re-running `bd dolt test` for every one of them.
  */
-function preflightedAt(): Map<string, number> {
-  const g = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
+function preflightedAt(): Map<string, Preflighted> {
+  const g = globalThis as unknown as Record<symbol, Map<string, Preflighted> | undefined>;
   return (g[PREFLIGHTED_KEY] ??= new Map());
+}
+
+/**
+ * Everything about the configured target a probe's result is only valid for — host, port, database,
+ * account and transport, which is exactly what `bd dolt test` exercises (`bd-env.ts` scopes the
+ * spawn by the same fields).
+ *
+ * The repo path alone is NOT that key (PR #174 review): correcting metadata.json from one server to
+ * another is how an operator recovers from a bad connection, and a cache keyed on the path would
+ * keep reporting the OLD server's pass for up to a TTL — vouching for a target nothing has probed
+ * while `readBoardMode` has already picked the correction up.
+ */
+function serverIdentity(board: BoardModeInfo): string {
+  return JSON.stringify([board.host, board.port, board.user, board.database, board.tls]);
 }
 
 /** Tests only — production expires probes on the TTL by design. */
@@ -815,14 +832,16 @@ export function resetServerPreflight(): void {
 }
 
 export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
+  const board = readBoardMode(cwd);
+  const server = serverIdentity(board);
   const last = preflightedAt().get(cwd);
-  if (last !== undefined && Date.now() - last < PREFLIGHT_TTL_MS) return;
-  const target = formatServerTarget(readBoardMode(cwd));
+  if (last !== undefined && last.server === server && Date.now() - last.at < PREFLIGHT_TTL_MS) return;
+  const target = formatServerTarget(board);
   try {
     await exec(cwd, ["dolt", "test"]);
     // Stamped only on success, so a server that was down is retried on the next beat rather than
     // waiting out a TTL it never earned.
-    preflightedAt().set(cwd, Date.now());
+    preflightedAt().set(cwd, { at: Date.now(), server });
   } catch (e) {
     const err = e as Error & { stdout?: string; stderr?: string };
     const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
