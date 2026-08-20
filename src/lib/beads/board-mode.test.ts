@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PREFLIGHT_TTL_MS, createDoltSync, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
-import { isServerMode, readBoardMode, resetBoardModeCache } from "./board-mode";
+import { isServerMode, pinBoardMode, readBoardMode, resetBoardModeCache } from "./board-mode";
 
 /** Mirrors bd.ts's internal BdExec seam; kept local so the test does not widen that module's API. */
 type TestExec = (cwd: string, args: string[]) => Promise<string>;
@@ -68,6 +68,47 @@ describe("readBoardMode", () => {
     ["an unrecognised mode", { dolt_mode: "sideways" } as Record<string, unknown>],
   ])("falls back to embedded given %s", (_label, meta) => {
     expect(readBoardMode(repo(meta)).mode).toBe("embedded");
+  });
+
+  // The cache may not outlive the file it caches: these fields choose a bd spawn's password and its
+  // transport, so an operator correcting a wrong user/host/TLS in metadata.json must not need a
+  // restart nobody documented to be believed (PR #174 review).
+  it("picks up an edited metadata.json on the next read", () => {
+    const dir = repo({ dolt_mode: "embedded" });
+    expect(readBoardMode(dir).mode).toBe("embedded");
+
+    writeFileSync(
+      join(dir, ".beads", "metadata.json"),
+      JSON.stringify({ dolt_mode: "server", dolt_server_host: "fixed.example.dev", dolt_server_user: "anton", dolt_server_tls: true }),
+    );
+
+    expect(readBoardMode(dir)).toMatchObject({ mode: "server", host: "fixed.example.dev", user: "anton", tls: true });
+  });
+
+  // Creating the file counts as a change too — a repo read before `bd init` must not be stuck
+  // reporting embedded once it has a real connection.
+  it("picks up a metadata.json that did not exist at the first read", () => {
+    const dir = repo(null);
+    expect(readBoardMode(dir).mode).toBe("embedded");
+
+    mkdirSync(join(dir, ".beads"), { recursive: true });
+    writeFileSync(join(dir, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "server", dolt_server_host: "h" }));
+
+    expect(readBoardMode(dir).mode).toBe("server");
+  });
+
+  // The one deliberate exception, and it belongs to tests alone: pinning survives the file so a
+  // suite can make anton believe in a server bd is not talking to.
+  it("holds a pinned mode against the file until the cache is reset", () => {
+    const dir = repo({ dolt_mode: "embedded" });
+    pinBoardMode(dir, { mode: "server", host: "pinned.example.dev" });
+
+    expect(readBoardMode(dir)).toEqual({ mode: "server", host: "pinned.example.dev" });
+    writeFileSync(join(dir, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded", note: "touched" }));
+    expect(readBoardMode(dir).mode).toBe("server");
+
+    resetBoardModeCache();
+    expect(readBoardMode(dir).mode).toBe("embedded");
   });
 
   it("falls back to embedded on malformed JSON rather than throwing", () => {

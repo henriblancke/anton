@@ -7,12 +7,13 @@
  *
  * **How server mode is simulated, and why it has to be.** A real shared board needs a live
  * `dolt sql-server`, which neither this machine nor CI has — bd's embedded engine is in-process and
- * refuses `bd dolt start`/`test` outright. So the mode is simulated at ANTON's seam, using the two
- * caches the runtime already treats as fixed-for-the-process:
+ * refuses `bd dolt start`/`test` outright. So the mode is simulated at ANTON's seam, through the two
+ * caches that decide how the runtime treats this board:
  *
- *   1. `.beads/metadata.json` is flipped to `dolt_mode: "server"` just long enough for
- *      `readBoardMode` to cache that verdict, then restored — so anton reads "server" for the whole
- *      file while bd keeps talking to the embedded board it actually has.
+ *   1. `readBoardMode` is PINNED to a server connection for this repo, so anton reads "server" for
+ *      the whole file while bd keeps talking to the embedded board it actually has. (Flipping
+ *      metadata.json and restoring it would not do: the mode cache now expires off that file's
+ *      stamp, so the restore would take the verdict with it — PR #174 review.)
  *   2. `preflightSharedServer` is recorded through its injectable exec, standing in for the
  *      `bd dolt test` a reachable server would have answered.
  *
@@ -23,10 +24,8 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { beads, getSyncStatus, preflightSharedServer, resetServerPreflight } from "../beads/bd";
-import { readBoardMode, resetBoardModeCache } from "../beads/board-mode";
+import { pinBoardMode, readBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import * as schema from "../db/schema";
 import { getJob } from "./queue";
 import { resetOperatorCache } from "../operator";
@@ -56,21 +55,8 @@ describeBd("execute-epic e2e — simulated server mode (real handler · real bd/
     bare = ctx.bare!;
 
     // Teach anton (only) that this board lives on a shared server — see the file header.
-    const metadata = join(repo, ".beads", "metadata.json");
-    const embedded = readFileSync(metadata, "utf8");
-    writeFileSync(
-      metadata,
-      JSON.stringify({
-        ...JSON.parse(embedded),
-        dolt_mode: "server",
-        dolt_server_host: "dolt.test.invalid",
-        dolt_server_port: 3306,
-        dolt_server_user: "beads",
-      }),
-    );
-    resetBoardModeCache();
-    expect(readBoardMode(repo).mode).toBe("server"); // the read that pins it for this process
-    writeFileSync(metadata, embedded);
+    pinBoardMode(repo, { mode: "server", host: "dolt.test.invalid", port: 3306, user: "beads" });
+    expect(readBoardMode(repo).mode).toBe("server");
 
     // Stand in for the `bd dolt test` a reachable server answers, so the first pass doesn't reject.
     await preflightSharedServer(repo, async () => "");

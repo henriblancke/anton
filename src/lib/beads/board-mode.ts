@@ -27,8 +27,11 @@
  *
  * The parse itself lives in `config.mjs` — the same mode decides which team-config profile setup
  * enforces, and one reader means the CLI and the server can never disagree about what a project is.
- * This module owns the typed accessor and the per-process cache on top of it.
+ * This module owns the typed accessor and the metadata-stamped cache on top of it.
  */
+import { statSync } from "node:fs";
+import { join } from "node:path";
+
 import { readDoltMetadata } from "./config.mjs";
 
 export type BoardMode = "embedded" | "server";
@@ -51,25 +54,65 @@ export interface BoardModeInfo {
 }
 
 /**
- * Cache keyed by repo path. Mode is fixed for a process: switching it means editing
- * `.beads/metadata.json`, which is a deliberate act followed by a restart. Caching keeps the
- * read off the hot path — `readBoardMode` is consulted on every bd spawn and every sync pass.
+ * Cache keyed by repo path, invalidated by the identity of `.beads/metadata.json` itself.
+ *
+ * Caching keeps the read off the hot path — `readBoardMode` is consulted on every bd spawn and
+ * every sync pass. It may NOT outlive the file: these fields decide which password a bd spawn is
+ * given and whether it speaks TLS (`bd-env.ts`), and correcting a wrong host, user or transport in
+ * metadata.json is exactly how an operator recovers from a bad connection. A cache pinned for the
+ * life of the process would keep authenticating for the old account against the old transport while
+ * bd itself reads the corrected file — a mismatch curable only by a restart nobody documented
+ * (PR #174 review). Stamping instead means the very next read picks the correction up.
  *
  * Held on `globalThis` for the same reason as the sync-status registry: the instrumentation-started
  * sync engine and Next.js route handlers can load different compiled instances of this module, and
  * a plain module-level Map would leave one of them re-reading the file forever.
  */
 const CACHE = Symbol.for("anton.beads.boardMode");
-type CacheHolder = { [CACHE]?: Map<string, BoardModeInfo> };
+type CacheEntry = { info: BoardModeInfo; stamp: string };
+type CacheHolder = { [CACHE]?: Map<string, CacheEntry> };
 
-function cache(): Map<string, BoardModeInfo> {
+function cache(): Map<string, CacheEntry> {
   const holder = globalThis as CacheHolder;
   return (holder[CACHE] ??= new Map());
 }
 
-/** Drop cached modes. Tests only — production mode is fixed for the life of the process. */
+/** A stamp no real file can produce, so a pinned entry survives every edit (see {@link pinBoardMode}). */
+const PINNED = "pinned";
+
+/**
+ * Identity of `<repoPath>/.beads/metadata.json` as one comparable string: inode, size and
+ * nanosecond mtime, so a rewrite that preserves any one of them still reads as a change. A stat is
+ * far cheaper than the read-and-parse it guards, which is what keeps this affordable per bd spawn.
+ *
+ * An absent or unreadable file stamps as `absent` rather than throwing — creating one later is a
+ * change like any other, and the read that follows resolves to `embedded` on its own terms.
+ */
+function metadataStamp(repoPath: string): string {
+  try {
+    const s = statSync(join(repoPath, ".beads", "metadata.json"), { bigint: true });
+    return `${s.ino}:${s.size}:${s.mtimeNs}`;
+  } catch {
+    return "absent";
+  }
+}
+
+/** Drop cached modes, pins included. Tests only — production entries expire off the file's stamp. */
 export function resetBoardModeCache(): void {
   cache().clear();
+}
+
+/**
+ * Pin what `readBoardMode` answers for `repoPath`, ignoring metadata.json until
+ * {@link resetBoardModeCache}.
+ *
+ * Tests only, and only for the one thing the file cannot express: a board anton must believe lives
+ * on a shared server while the bd it spawns keeps talking to the embedded board CI actually has
+ * (`execute-epic.server-mode.integration.test.ts`). Simulating that by flipping the file relied on
+ * the cache never noticing the flip back — the exact staleness this module now refuses to have.
+ */
+export function pinBoardMode(repoPath: string, info: BoardModeInfo): void {
+  cache().set(repoPath, { info, stamp: PINNED });
 }
 
 /**
@@ -81,14 +124,16 @@ export function resetBoardModeCache(): void {
  */
 export function readBoardMode(repoPath: string): BoardModeInfo {
   const hit = cache().get(repoPath);
-  if (hit) return hit;
+  if (hit?.stamp === PINNED) return hit.info;
+  const stamp = metadataStamp(repoPath);
+  if (hit && hit.stamp === stamp) return hit.info;
 
   const { mode, host, port, database, user, tls } = readDoltMetadata(repoPath);
   // Connection fields are dropped on an embedded board: they describe a server there is none of,
   // and callers read their presence as "this is where the board lives".
   const info: BoardModeInfo = mode === "server" ? { mode, host, port, database, user, tls } : { mode: "embedded" };
 
-  cache().set(repoPath, info);
+  cache().set(repoPath, { info, stamp });
   return info;
 }
 

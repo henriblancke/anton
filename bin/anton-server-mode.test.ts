@@ -88,6 +88,7 @@ describe("parseServerModeArgs", () => {
       force: false,
       unknown: [],
       missing: [],
+      extra: [],
     });
   });
 
@@ -102,6 +103,7 @@ describe("parseServerModeArgs", () => {
       force: false,
       unknown: [],
       missing: [],
+      extra: [],
     });
     // A flag VALUE is never mistaken for the path, whichever form it takes.
     expect(parseServerModeArgs(["--host=h", "--database=d", "/repos/foo"])).toMatchObject({
@@ -124,6 +126,18 @@ describe("parseServerModeArgs", () => {
     expect(parseServerModeArgs([]).tls).toBeUndefined();
     // Neither form is mistaken for the repo path or an unknown flag.
     expect(parseServerModeArgs(["/repos/foo", "--no-tls"])).toMatchObject({ path: "/repos/foo", tls: false, unknown: [] });
+  });
+
+  // Two repo paths is an ambiguous target: silently taking the first would rewrite and verify one
+  // board's connection while the operator named two (PR #174 review).
+  it("collects extra positional paths instead of discarding them", () => {
+    expect(parseServerModeArgs(["/repos/a", "/repos/b", "--host", "h"])).toMatchObject({
+      path: "/repos/a",
+      extra: ["/repos/b"],
+    });
+    expect(parseServerModeArgs(["/repos/a", "--host", "h", "/repos/b", "/repos/c"]).extra).toEqual(["/repos/b", "/repos/c"]);
+    // A flag's own value is still its value, never an extra path.
+    expect(parseServerModeArgs(["/repos/a", "--host", "h", "--db", "d"]).extra).toEqual([]);
   });
 
   // A typo must not read as "use what the repo already has" — that is how a verified switch lands
@@ -210,6 +224,18 @@ describe("anton server-mode (end to end over a stub bd)", () => {
 
     expect(r.status).toBe(1);
     expect(r.stdout).toContain("missing value for --database");
+    expect(p.raw()).toBe(before);
+  });
+
+  it("refuses a second repo path rather than configuring the first of two", async () => {
+    const p = await project();
+    const before = p.raw();
+
+    // `p.run` already passes the repo dir, so this adds a second bare token.
+    const r = p.run(["/repos/elsewhere", ...CONNECT]);
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("unexpected argument /repos/elsewhere");
     expect(p.raw()).toBe(before);
   });
 

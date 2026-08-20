@@ -1555,8 +1555,9 @@ const SERVER_MODE_FLAGS =
 /**
  * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
  * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs. Anything
- * else lands in `unknown`, and a value flag left without a value lands in `missing` — the command
- * refuses on either rather than running a half-read connection.
+ * else lands in `unknown`, a value flag left without a value lands in `missing`, and a second bare
+ * token lands in `extra` — the command refuses on any of the three rather than running a half-read
+ * connection or an ambiguous target.
  */
 function parseServerModeArgs(args) {
   const VALUE_FLAGS = {
@@ -1579,6 +1580,7 @@ function parseServerModeArgs(args) {
     force: false,
     unknown: [],
     missing: [],
+    extra: [],
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1618,7 +1620,11 @@ function parseServerModeArgs(args) {
       out.unknown.push(flag);
       continue;
     }
+    // A second bare token is an ambiguous target, not a spare word. Keeping the first would rewrite
+    // and verify ONE repo's board connection while the operator named two, and still exit 0
+    // (PR #174 review) — so every extra positional is collected and the command refuses.
     if (out.path === null) out.path = a;
+    else out.extra.push(a);
   }
   return out;
 }
@@ -1644,6 +1650,9 @@ async function cmdServerMode(args = []) {
   const malformed = [
     parsed.unknown.length ? `unknown flag${parsed.unknown.length === 1 ? "" : "s"} ${parsed.unknown.join(", ")}` : null,
     parsed.missing.length ? `missing value for ${parsed.missing.join(", ")}` : null,
+    parsed.extra.length
+      ? `unexpected argument${parsed.extra.length === 1 ? "" : "s"} ${parsed.extra.join(", ")} (one repo path at a time)`
+      : null,
   ].filter(Boolean);
   if (malformed.length) {
     for (const m of malformed) console.log(c.red(`anton server-mode: ${m}`));
