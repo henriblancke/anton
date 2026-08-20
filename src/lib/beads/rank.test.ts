@@ -263,9 +263,47 @@ describe("unblockCounter", () => {
     expect(unblockCounter(board)("f1")).toBe(0);
   });
 
-  it("still reaches a bead a deferred arm shares with a live one", () => {
-    // Only the path through `snoozed` is dead — `live` still releases `tail`, so the diamond's
-    // shared tail must not be lost with it.
+  it("does not credit a target for a dependent another open bead still blocks", () => {
+    // `shared` is held by f1 AND by g1, which f1 does not touch. Closing f1 leaves it blocked, so
+    // f1 is worth exactly the one bead it frees — otherwise it outranks a target that frees work.
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "g1" }),
+      bead({ id: "own", dependencies: [blocks("own", "f1")] }),
+      bead({ id: "shared", dependencies: [blocks("shared", "f1"), blocks("shared", "g1")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(1);
+  });
+
+  it("credits a dependent whose every remaining blocker is inside the target's closure", () => {
+    // f1 → mid, and `tail` is held by f1 and mid: finishing f1 releases mid, and mid's release is
+    // what frees tail. Both are f1's to claim, unlike the independent blocker above.
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "mid", dependencies: [blocks("mid", "f1")] }),
+      bead({ id: "tail", dependencies: [blocks("tail", "f1"), blocks("tail", "mid")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(2);
+  });
+
+  it("ignores a closed blocker when deciding a dependent is released", () => {
+    // `done` let go of `tail` when it closed, so the live arm alone releases it: the diamond's
+    // shared tail must not be lost to an edge that no longer holds anything.
+    const board = [
+      bead({ id: "f1" }),
+      bead({ id: "done", status: "closed" }),
+      bead({ id: "live", dependencies: [blocks("live", "f1")] }),
+      bead({ id: "tail", dependencies: [blocks("tail", "done"), blocks("tail", "live")] }),
+    ];
+
+    expect(unblockCounter(board)("f1")).toBe(2);
+  });
+
+  it("leaves a bead a deferred blocker still holds to the deferral", () => {
+    // `live` frees its arm of the diamond, but `snoozed` keeps holding `tail` — a deferral is not
+    // lifted by finishing f1, so f1 is worth one bead here, not two.
     const board = [
       bead({ id: "f1" }),
       bead({ id: "snoozed", status: "deferred", dependencies: [blocks("snoozed", "f1")] }),
@@ -273,7 +311,7 @@ describe("unblockCounter", () => {
       bead({ id: "tail", dependencies: [blocks("tail", "snoozed"), blocks("tail", "live")] }),
     ];
 
-    expect(unblockCounter(board)("f1")).toBe(2);
+    expect(unblockCounter(board)("f1")).toBe(1);
   });
 
   it("traverses a dependent that is not on the board without counting it", () => {

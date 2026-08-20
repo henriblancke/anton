@@ -37,7 +37,7 @@ is total and deterministic, so two machines agree on what is next:
 
 1. **priority**, P0 first (a bead with none sorts last);
 2. then **unblocking value** — how many open beads it transitively unblocks via `blocks` edges, most
-   first;
+   first (a bead another open blocker still holds is not unblocked by this one, so it does not count);
 3. then **age**, oldest `created_at` first;
 4. then **id**, which is what makes the order total.
 

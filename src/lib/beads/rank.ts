@@ -38,31 +38,49 @@ const UNPRIORITIZED = Number.MAX_SAFE_INTEGER;
  *  the queue ahead of work that has genuinely been waiting. */
 const UNDATED = "\uffff";
 
-/** `blocker id → the ids it blocks`, from the `blocks` edges bd inlines on each bead. */
-function dependentIndex(board: Bead[]): Map<string, string[]> {
-  const dependents = new Map<string, string[]>();
+/**
+ * The `blocks` edges bd inlines on each bead, indexed both ways in one pass: `blocks` maps a
+ * blocker to what it holds (the walk's direction), `heldBy` maps a dependent to everything holding
+ * it (what the walk must have released before it may credit that dependent).
+ */
+function blocksGraph(board: Bead[]): { blocks: Map<string, string[]>; heldBy: Map<string, string[]> } {
+  const blocks = new Map<string, string[]>();
+  const heldBy = new Map<string, string[]>();
+  const push = (index: Map<string, string[]>, key: string, value: string) => {
+    const list = index.get(key);
+    if (list) list.push(value);
+    else index.set(key, [value]);
+  };
   for (const bead of board) {
     for (const dep of bead.dependencies ?? []) {
       if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
-      const list = dependents.get(dep.depends_on_id);
-      if (list) list.push(dep.issue_id);
-      else dependents.set(dep.depends_on_id, [dep.issue_id]);
+      push(blocks, dep.depends_on_id, dep.issue_id);
+      push(heldBy, dep.issue_id, dep.depends_on_id);
     }
   }
-  return dependents;
+  return { blocks, heldBy };
 }
 
 /**
  * `id → how many still-waiting beads it transitively unblocks`, built once per board.
  *
  * A `blocks` edge is (from = dependent, to = blocker), so the dependents of a target are what its
- * completion releases; the count is the transitive closure of that, restricted to beads that are
- * still WAITING. A closed dependent was never waiting, and a `deferred` one is work a human pushed
- * away — counting it would let a target whose whole value is snoozed work outrank one that releases
- * live work. `blocked` and `in_progress` DO count: a transitively blocked dependent is exactly the
- * work being released, and bd reports it under those statuses, not `open`. A bead reached twice —
- * the two arms of a diamond meeting again — is counted once, because finishing the target releases
- * it once.
+ * completion could release. "Could" is the whole difficulty: reachability is not release. A bead
+ * held by two blockers is freed by neither alone, so the walk credits a dependent only once EVERY
+ * blocker still holding it is inside the target's own closure — the target plus what finishing the
+ * target releases. Counting on reachability instead inflates a target that shares a dependent with
+ * unrelated open work, and the inflated number outranks a target that genuinely frees something.
+ *
+ * A blocker that is closed, or absent from this `--status all` snapshot, holds nothing and is
+ * dropped from that check. A `deferred` blocker still holds: the deferral is a human's "not now",
+ * and finishing the target does not lift it.
+ *
+ * The count is restricted to dependents that are still WAITING. A closed dependent was never
+ * waiting, and a `deferred` one is work a human pushed away — counting it would let a target whose
+ * whole value is snoozed work outrank one that releases live work. `blocked` and `in_progress` DO
+ * count: a transitively blocked dependent is exactly the work being released, and bd reports it
+ * under those statuses, not `open`. A bead reached twice — the two arms of a diamond meeting again
+ * — is counted once, because finishing the target releases it once.
  *
  * The walk STOPS at a closed or deferred dependent rather than merely declining to count it, so
  * the chain only propagates through beads the target actually holds. Finishing the target cannot
@@ -71,29 +89,42 @@ function dependentIndex(board: Bead[]): Map<string, string[]> {
  * whose reach dead-ends outrank one that releases live work, which is the very thing excluding
  * them from the count is for.
  *
- * `seen` is what makes the walk terminate: a `blocks` cycle is a malformed board, not an
- * impossible one, and a picker that hung on one would take the whole pass down with it. A
- * dependent that isn't on the board is traversed but not counted — it is evidence of an edge, not
- * of open work.
+ * `released` is what makes the walk terminate: a `blocks` cycle is a malformed board, not an
+ * impossible one, and a picker that hung on one would take the whole pass down with it. Each bead
+ * enters it at most once, so each is enqueued at most once. A dependent whose blockers are not all
+ * released yet is simply left for the pass that follows the last of them — every released blocker
+ * is itself enqueued, so the check runs again after each. A dependent that isn't on the board is
+ * traversed but not counted — it is evidence of an edge, not of open work.
  */
 export function unblockCounter(board: Bead[]): (id: string) => number {
-  const dependents = dependentIndex(board);
+  const { blocks, heldBy } = blocksGraph(board);
   const waitingIds = new Set<string>();
   const haltIds = new Set<string>();
+  const deferredIds = new Set<string>();
   for (const b of board) {
+    if (b.status === "deferred") deferredIds.add(b.id);
     if (b.status === "closed" || b.status === "deferred") haltIds.add(b.id);
     else waitingIds.add(b.id);
   }
 
+  // Only the blockers that still hold: a closed one let go when it closed, and one absent from a
+  // `--status all` read does not exist to hold. A deferred one keeps its grip.
+  const stillHeldBy = new Map<string, string[]>();
+  for (const [dependent, blockers] of heldBy) {
+    const holding = blockers.filter((b) => waitingIds.has(b) || deferredIds.has(b));
+    if (holding.length) stillHeldBy.set(dependent, holding);
+  }
+
   return (id: string): number => {
-    const seen = new Set<string>([id]);
+    const released = new Set<string>([id]);
     const queue = [id];
     let count = 0;
     while (queue.length) {
-      for (const next of dependents.get(queue.shift() as string) ?? []) {
-        if (seen.has(next)) continue;
-        seen.add(next);
-        if (haltIds.has(next)) continue;
+      for (const next of blocks.get(queue.shift() as string) ?? []) {
+        if (released.has(next) || haltIds.has(next)) continue;
+        const holders = stillHeldBy.get(next);
+        if (holders && !holders.every((holder) => released.has(holder))) continue;
+        released.add(next);
         queue.push(next);
         if (waitingIds.has(next)) count++;
       }

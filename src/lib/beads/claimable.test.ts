@@ -163,13 +163,15 @@ describe("rankClaimableTargets — the order", () => {
     const board = [
       bead({ id: "f1", issue_type: "feature" }),
       bead({ id: "f2", issue_type: "feature", status: "closed", dependencies: [blocks("f2", "f1")] }),
-      // A malformed cycle f3 → f4 → f3 must not hang the traversal.
-      bead({ id: "f3", issue_type: "feature", dependencies: [blocks("f3", "f1"), blocks("f3", "f4")] }),
-      bead({ id: "f4", issue_type: "feature", dependencies: [blocks("f4", "f3")] }),
+      bead({ id: "f3", issue_type: "feature", dependencies: [blocks("f3", "f1")] }),
+      // A malformed cycle f4 → f5 → f4 must not hang the traversal — or credit f1 for work that
+      // holds itself no matter what f1 does.
+      bead({ id: "f4", issue_type: "feature", dependencies: [blocks("f4", "f3"), blocks("f4", "f5")] }),
+      bead({ id: "f5", issue_type: "feature", dependencies: [blocks("f5", "f4")] }),
     ];
 
     const byId = new Map(rankClaimableTargets(board, board).map((t) => [t.bead.id, t.unblocks]));
-    expect(byId.get("f1")).toBe(2); // f3 and f4; the closed f2 was never waiting
+    expect(byId.get("f1")).toBe(1); // f3 alone: the closed f2 was never waiting, the cycle never frees
   });
 
   it("falls back to age, then id, so two machines agree exactly", () => {
