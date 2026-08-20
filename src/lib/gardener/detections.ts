@@ -347,6 +347,21 @@ export function fingerprintLabelOf(bead: { labels?: string[] }): string | undefi
 }
 
 /**
+ * The kind a fingerprint label names, or undefined when it names none anton knows.
+ *
+ * The label is the one record of a proposal's kind that survives everything: a hand-edited metadata
+ * blob, a plan from an older anton, a bead whose description someone rewrote. That is why the
+ * settled-proposal record reads the kind from HERE rather than from the plan (track-record.ts) — the
+ * record is a count of what the founder decided, and a proposal whose metadata rotted was still
+ * decided about.
+ */
+export function kindOfFingerprint(label: string): GardenerDetectionKind | undefined {
+  if (!FINGERPRINT_LABEL.test(label)) return undefined;
+  const kind = label.split(":")[1] as GardenerDetectionKind;
+  return GARDENER_DETECTION_KINDS.includes(kind) ? kind : undefined;
+}
+
+/**
  * Is this bead one of the gardener's own proposals (anton-9qwq)? Both tiers need the question and
  * for opposite reasons: emission asks it to dedup, and detection asks it to EXCLUDE — a proposal is
  * a bead about the board, not part of its shape, so left in the snapshot every parentless proposal

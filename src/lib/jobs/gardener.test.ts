@@ -33,9 +33,11 @@ import type {
 import { LABELS } from "../beads/bd";
 import type { ApplyDecision, ApplyMoment } from "../gardener/apply";
 import { MAX_APPLIES_PER_PASS } from "../gardener/emit";
+import { EARNED_AUTONOMY_BARS } from "../gardener/autonomy";
 import {
   GARDENER_OBSERVED_AT_KEY,
   parseGardenerPlan,
+  proposalFingerprint,
   type GardenerPlan,
 } from "../gardener/detections";
 import { passRecordCounts, readPassRecords } from "../gardener/record";
@@ -871,9 +873,28 @@ describe("gardener patrol · armed", () => {
       }),
     );
 
+  /**
+   * The settled-proposal record that has EARNED `shipped-orphan` (anton-m29g): the founder's own
+   * accepted asks, plainly closed and still carrying their fingerprints.
+   *
+   * Every board in this suite carries it, because these cases are about the armed WALK and the
+   * earned floor would otherwise decide all of them before the walk ran. The floor itself is
+   * exercised where it lives (gardener/autonomy.test.ts, gardener/track-record.test.ts) and against
+   * this handler by the one case below that reads a board without it.
+   */
+  const earned = (): Bead[] =>
+    Array.from({ length: EARNED_AUTONOMY_BARS.history.minSettled }, (_, i) =>
+      bead(`rec-${i}`, {
+        status: "closed",
+        labels: [proposalFingerprint("shipped-orphan", `earned:${i}`)],
+        close_reason: "applied: closed a shipped orphan",
+        closed_at: "2024-01-01T00:00:00Z",
+      }),
+    );
+
   /** Every read answers with these subjects plus whatever the patrol has filed about them. */
-  function boardIs(subjects: () => Bead[]): void {
-    const board = () => [...subjects(), ...filed()];
+  function boardIs(subjects: () => Bead[], record: () => Bead[] = earned): void {
+    const board = () => [...record(), ...subjects(), ...filed()];
     listMock.mockImplementation(async () => board());
     showMock.mockImplementation(async (_cwd, id) => {
       const found = board().find((b) => b.id === id);
@@ -925,6 +946,21 @@ describe("gardener patrol · armed", () => {
     );
     // An unattended write no other machine can see is half a write.
     expect(nudge).toHaveBeenCalledWith({ id: projectId, repoPath: REPO });
+  });
+
+  it("applies nothing for an armed kind the board's own record has not earned (anton-m29g)", async () => {
+    // The setting says `apply` and the patrol still writes nothing: the founder has never accepted a
+    // `shipped-orphan` ask, so there is no evidence the detector's judgment is right — the gate
+    // shadow mode cannot supply, since a wrong-but-clean proposal shadows as `apply` too.
+    orphansMock.mockResolvedValue([orphan("t-4")]);
+    boardIs(() => [cold("t-4")], () => []);
+
+    await expectJobStatus(t.db, await runPatrol(), "done");
+
+    // The ask is filed and stands open as an ordinary proposal — nothing was applied or closed.
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(closedIds()).toEqual([]);
+    expect(await applyLines()).toEqual([]);
   });
 
   it("buys the write before it makes it — the spend is recorded ahead of the board", async () => {

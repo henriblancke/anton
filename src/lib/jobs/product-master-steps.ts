@@ -20,6 +20,7 @@ import {
   type EmissionResult,
 } from "../gardener/emit";
 import { shadowProposals } from "../gardener/shadow";
+import { proposalTrackRecord } from "../gardener/track-record";
 import {
   buildProductMasterPrompt,
   detectionsFor,
@@ -105,6 +106,10 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
   const file = async (detections: GardenerDetection[]): Promise<void> => {
     scope.ctx.signal.throwIfAborted();
     const { board, observedAtMs } = snapshot;
+    // Derived from the SNAPSHOT, so it moves with it: an armed apply settles the proposals it
+    // applies, which is the very record the next tier is judged against (anton-m29g). Re-reading the
+    // board re-reads the record with it.
+    const record = proposalTrackRecord(board);
     try {
       const emission = await emitProposals(repo, {
         board,
@@ -120,6 +125,7 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
         repo,
         created: emission.created,
         policy: scope.policy,
+        record,
         observedAtMs,
         nowMs: scope.clock.now(),
         producer: "[product-master]",
@@ -133,6 +139,7 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
         repo,
         created: emission.created,
         policy: scope.policy,
+        record,
         producer: "[product-master]",
         log: scope.log,
         nudge: () => scope.nudge(scope.project),

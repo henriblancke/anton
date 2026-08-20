@@ -26,6 +26,7 @@ import {
   ANTON_SEVERITY_KEY,
   formatScanSeverityPolicy,
 } from "../scan-severity";
+import { describeCouplingFilter } from "../scan-coupling";
 import {
   buildBoardContext,
   formatBoardContext,
@@ -271,6 +272,12 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
           console.warn(`[nightly-stringer] ${project.slug}: ${untrackedLine}`);
         }
       }
+
+      // 1d. Coupling signals whose edges only the type system can see (anton-yvx9). Said out loud
+      // for the same reason: a dropped architecture finding must read as a filtered scan, and the
+      // log is the only place the drop and its proof still exist.
+      const couplingLine = describeCouplingFilter(result.coupling);
+      if (couplingLine) await appendSessionLog(logPath, `[stringer] ${couplingLine}\n`);
 
       // 2. No new signals → nothing to triage. That's a success, not an error — and a real data
       // point: a clean pass is what a falling trend is made of, so it is recorded like any other.

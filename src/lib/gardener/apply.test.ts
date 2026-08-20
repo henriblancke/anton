@@ -160,12 +160,16 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     // The board move is identical to the approved one above, which is exactly why the note has to
     // differ: it is the only place the board records that nobody approved this, and which setting
     // did — the first thing a founder who finds a bead moved overnight goes looking for.
+    //
+    // The CLOSE REASON differs for a second reader: the settled-proposal record counts founder
+    // verdicts, and an unattended write it could not tell apart would let an armed kind ratchet its
+    // own record to 100% applied (track-record.ts `settlementOf`).
     expect(result.changed).toEqual(["anton-a"]);
     expect(calls).toEqual([
       "reparent anton-a anton-card",
       `note ${proposal.id} gardener: applied by POLICY — re-parented anton-a under anton-card. ` +
         "Nobody approved this: this project's proposal autonomy for `container-orphan` is set to apply.",
-      `close ${proposal.id} applied: re-parented anton-a under anton-card`,
+      `close ${proposal.id} applied by policy: re-parented anton-a under anton-card`,
     ]);
   });
 
@@ -360,7 +364,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     expect(result.changed).toEqual(["anton-a", "anton-b"]);
     expect(calls).toContain(
-      `close ${proposal.id} applied: re-parented anton-a, anton-b under anton-card`,
+      `close ${proposal.id} applied by policy: re-parented anton-a, anton-b under anton-card`,
     );
   });
 
