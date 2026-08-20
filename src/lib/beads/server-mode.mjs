@@ -515,13 +515,16 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
  * @returns {{ ok, steps, connection?, errors, warnings, before?, counts?, backup?, missing?,
- *   diverged?, drifted? }}
+ *   diverged?, extra?, drifted? }}
  *   `missing` is the ids this board holds that the server's copy does not; `diverged` the ids it
  *   does hold but says something different about, in either direction — both empty once the checks
- *   have passed.
+ *   have passed. `extra` is the other direction — ids only the SERVER has, which pass (they strand
+ *   nothing) and are warned about, since they are either work created there or work deleted here
+ *   that the flip brings back, and nothing bd prints tells those apart (see step 8c).
  *   `warnings` is what the run could NOT verify, on a run that otherwise succeeded — a project
  *   already reading the server verifies nothing about the embedded board still sitting next to it
- *   (see step 3). Callers must show them: they are the only notice an operator gets.
+ *   (see step 3), and an id only the server holds is not decidable from either listing (step 8c).
+ *   Callers must show them: they are the only notice an operator gets.
  *   `drifted` is the ids that appeared, disappeared or were EDITED on the board being moved while
  *   the switch was being prepared, i.e. a writer that was never stopped.
  */
@@ -854,6 +857,37 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, missing, diverged });
   }
 
+  // 8c. Ids the SERVER holds and this board does not. Two different things wear that shape and
+  //     nothing bd prints tells them apart (PR #174 review): a teammate's issue created on the
+  //     server after Phase 1 copied it — the ordinary case for a machine joining a board others
+  //     already moved onto — or an issue deleted HERE after that copy (`bd delete`, an epic removed
+  //     with --cascade), which the server still carries and the flip would bring back. Deciding
+  //     would need ancestry or a tombstone; bd exposes neither, so the run does not decide.
+  //     Reported rather than refused, because the two directions are not the same failure: a
+  //     missing or divergent id is this board's work stranded in a database about to be abandoned,
+  //     which nothing recovers — an id only the server has is work that survives the flip either
+  //     way, and a resurrected bead is deleted again in one command. Refusing would also push the
+  //     runbook's second machine onto --force, which switches off the checks above that guard the
+  //     unrecoverable half. So the ids are named and the operator decides.
+  //     Only when the board being moved is a LOCAL one: on a project already reading the server
+  //     both listings come from it, so an id in one and not the other is a teammate writing between
+  //     two reads — nothing to do with a copy, and the warning would be pure noise.
+  const here = new Set(idsBefore.ok ? idsBefore.ids : []);
+  const extra = idsBefore.ok && !sourceIsServer ? idsAfter.ids.filter((id) => !here.has(id)) : [];
+  if (extra.length) {
+    const n = extra.length;
+    const named = `${extra.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`;
+    record("server-only issues", "skipped", `${n} not compared — present there, absent here`);
+    warnings.push(
+      `the server's "${connection.database}" database holds ${n} issue${n === 1 ? "" : "s"} this ` +
+        `board does not (${named}). Everything this board holds arrived intact — these are the other ` +
+        "direction, and nothing here can say which of two things they are: issues created on the " +
+        `server since it was copied (normal — the board moved on without this machine), or issue${n === 1 ? "" : "s"} ` +
+        `deleted HERE after the copy, which the server still carries and this switch has just brought ` +
+        "back. Check them (`bd show <id>`): keep them, or delete them again on the now-shared board.",
+    );
+  }
+
   // 9. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
   //    the snapshot above, so a failed attempt leaves it exactly as it was rather than carrying
   //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
@@ -876,8 +910,8 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   // same answer: the project goes back to what it was rather than staying half-switched.
   if (errors.length) {
     revert("could not publish the team-wide connection defaults");
-    return fail({ before, connection, counts, backup, missing, diverged });
+    return fail({ before, connection, counts, backup, missing, diverged, extra });
   }
 
-  return { ok: true, steps, errors, warnings, before, connection, counts, backup, missing, diverged };
+  return { ok: true, steps, errors, warnings, before, connection, counts, backup, missing, diverged, extra };
 }

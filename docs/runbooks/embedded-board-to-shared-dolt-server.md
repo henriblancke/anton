@@ -135,7 +135,8 @@ That command is the whole config half. It:
    key in that file;
 4. runs **`bd dolt test`**;
 5. **reads the board back from the server** and confirms it is this board, whole and current — every
-   pre-switch issue id present, and every issue saying there *exactly* what it says here. By
+   pre-switch issue id present, and every issue saying there *exactly* what it says here (an id only
+   the *server* holds is reported, not refused — see the warning below). By
    identity and content, not cardinality: a stale or divergent copy of the same project can hold as
    many issues (or more) while missing the ones written here since it diverged, and a snapshot
    copied a week ago holds every id while its titles, statuses and labels predate the board being
@@ -186,6 +187,15 @@ most likely to see:
   accepts the server's board unverified. A genuinely **empty** board reads this way too — bd prints
   an empty listing that cannot be told apart from no listing at all — and `--force` is the right
   answer for it: there is nothing to lose track of.
+
+**A warning rather than a failure — *"… holds N issues this board does not"*.** Step 5 checks that
+everything on *this* board reached the server; ids only the **server** has are the other direction,
+and they strand nothing, so they do not stop the switch. They are still worth a look, because two
+different things wear that shape and nothing bd prints tells them apart: issues created on the
+server after Phase 1 copied it (normal — you are joining a board that moved on without this
+machine), or issues **deleted here** after that copy, which the server still carries and the switch
+has just brought back. `bd show <id>` the named ids: keep them, or delete them again on the now-
+shared board.
 
 **A warning rather than a failure — *"… still holds a local embedded Dolt database"*.**
 `.beads/metadata.json` is **tracked**, so once the flip is committed and pushed every other clone

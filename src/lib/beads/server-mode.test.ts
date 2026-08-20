@@ -795,15 +795,73 @@ describe("configureServerMode", () => {
     });
   });
 
-  // A server that carries every issue AND has moved on (another machine already writing to it) is
-  // not a failure — the board being moved is whole on the other side, which is the whole question.
-  it("accepts a server board that holds every issue plus newer ones", () => {
-    const dir = repo(EMBEDDED);
-    const result = configureServerMode(dir, flags, { exec: fakeBd({ dir, before: BOARD, after: [...BOARD, "probe-8"] }).exec });
+  /**
+   * The DESTINATION-only direction (PR #174 review). A server that carries every issue AND has moved
+   * on is not a failure — the board being moved is whole on the other side, which is the question
+   * this check asks — but those extra ids are not self-explanatory either: they are a teammate's new
+   * work, OR an issue deleted here after Phase 1 copied the database, which the flip resurrects.
+   * bd prints no ancestry and no tombstone, so the run reports them instead of guessing, and does
+   * not refuse: unlike a missing or divergent id, nothing of this board's is stranded by them, and
+   * refusing would send the runbook's second machine to --force, which switches off the checks that
+   * guard the half that IS unrecoverable.
+   */
+  describe("ids only the SERVER holds", () => {
+    it("accepts a server board that holds every issue plus newer ones, and names the extras", () => {
+      const dir = repo(EMBEDDED);
+      const exec = fakeBd({ dir, before: BOARD, after: [...BOARD, "probe-8", "probe-9"] }).exec;
 
-    expect(result.ok).toBe(true);
-    expect(result.missing).toEqual([]);
-    expect(result.counts).toEqual({ before: 7, after: 8 });
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(result.missing).toEqual([]);
+      expect(result.diverged).toEqual([]);
+      expect(result.extra).toEqual(["probe-8", "probe-9"]);
+      expect(result.counts).toEqual({ before: 7, after: 9 });
+      // Named, with BOTH readings — an operator who deleted an epic here has to be able to tell.
+      expect(result.warnings.join("\n")).toMatch(/holds 2 issues this board does not \(probe-8, probe-9\)/);
+      expect(result.warnings.join("\n")).toMatch(/deleted HERE after the copy/);
+      expect(result.steps.find((s: { name: string }) => s.name === "server-only issues")).toMatchObject({
+        status: "skipped",
+      });
+      // Reported, not refused: the switch stands.
+      expect(readMetadata(dir).dolt_mode).toBe("server");
+    });
+
+    it("says nothing when the server holds exactly this board", () => {
+      const dir = repo(EMBEDDED);
+      const result = configureServerMode(dir, flags, { exec: fakeBd({ dir, before: BOARD, after: BOARD }).exec });
+
+      expect(result.ok).toBe(true);
+      expect(result.extra).toEqual([]);
+      expect(result.warnings).toEqual([]);
+      expect(result.steps.some((s: { name: string }) => s.name === "server-only issues")).toBe(false);
+    });
+
+    /**
+     * On a project already reading the server both listings come from it, so an id in one and not
+     * the other is a teammate writing between two reads — nothing to do with a copy that may or may
+     * not have resurrected something, and warning about it would train operators to ignore this.
+     */
+    it("does not warn when both listings come from the server anyway", () => {
+      const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: "dolt.example.dev", dolt_server_port: 3306 });
+      let reads = 0;
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (args[0] === "list") {
+          // Reads 1 and 2 are the drift check and must agree; the third is the read-back, where a
+          // teammate's issue has landed in between.
+          reads += 1;
+          return { status: 0, stdout: listing(reads < 3 ? BOARD : [...BOARD, "probe-8"]) };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(result.extra).toEqual([]);
+      expect(result.warnings).toEqual([]);
+    });
   });
 
   it("refuses to flip when the pre-switch backup fails, and skips it only on request", () => {
