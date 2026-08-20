@@ -175,8 +175,8 @@ export interface RunningJobInfo extends LiveJobInfo {
 }
 
 /**
- * Bead-label source for the per-job value gate (anton-k05r): the labels of a job's target bead
- * (e.g. `risk:high`, `blocking-PR`), read at lease time so `jobValueScore` can rank governed work.
+ * Bead-label source for the per-job value gate (anton-k05r): the labels of a job's target bead, read
+ * at lease time so `jobValueScore` can rank governed work against the project's own nominations.
  * Returns `null` when the bead can't be resolved — the gate fails open on null (admits the job)
  * rather than starving work on a guess.
  */
@@ -869,8 +869,8 @@ export class JobRunner {
   /**
    * Per-job value/cost admission gate (anton-k05r), run when the coarse `budgetGate` ADMITS a
    * budget-aware project: of that project's due queued governed jobs, hold the ones `admitJob`
-   * says aren't worth the remaining budget — scarce headroom admits only high-value work
-   * (risk:high / blocking-PR), abundant budget drains down to cleanup, and a job whose per-type
+   * says aren't worth the remaining budget — scarce headroom admits only work the project's own
+   * value nominations rank highly, abundant budget drains down to cleanup, and a job whose per-type
    * burn average can't fit the remaining session is held regardless of value. Holds are per-tick
    * only (queued holds feed leaseDue's `exclude`; reclaim holds feed capOf — see tickOnce):
    * nothing is deferred or written, so the next tick re-evaluates against fresh usage/pace state

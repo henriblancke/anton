@@ -73,15 +73,22 @@ export interface BudgetPolicy {
   // admitting *now*. Pace-state (plus session headroom) sets a minimum value threshold; a job's
   // value comes from its bead labels. Scarce budget → only high-value; abundant → down to cleanup.
 
+  /**
+   * The bead labels this project NOMINATED as value signals, highest tier first (anton-prng). anton
+   * ships none: an empty list means work ranks on its native fields alone (age, here), which is the
+   * honest default on a board whose vocabulary anton has never seen. Order is the band order — see
+   * {@link jobValueScore}.
+   */
+  valueLabels: readonly string[];
   /** Age window backing {@link jobValueScore}'s tie-break: a job this old scores the full age band. */
   valueAgeWindowMs: number;
   /** Session headroom% at/below which budget is "scarce" (high-value only), even absent an ahead-of-pace read. */
   scarceHeadroomPct: number;
   /** Session headroom% at/above which budget is "abundant" (admit down to cleanup), absent a behind-pace read. */
   abundantHeadroomPct: number;
-  /** Value threshold when scarce/ahead-of-pace — matches the risk:high band, so only high-value admits. */
+  /** Value threshold when scarce/ahead-of-pace — the TOP nominated band's floor, so only it admits. */
   valueThresholdScarce: number;
-  /** Value threshold on-pace — matches the blocking-PR band, so cleanup waits but urgent work runs. */
+  /** Value threshold on-pace — the lowest nominated band's floor: unnominated cleanup waits, nominated work runs. */
   valueThresholdNormal: number;
   /** Value threshold when abundant/behind-pace — admit everything, including low-value cleanup. */
   valueThresholdAbundant: number;
@@ -113,6 +120,7 @@ export const DEFAULT_BUDGET_POLICY: BudgetPolicy = {
   paceSlackPct: 5,
   weekMs: 7 * DAY_MS,
   sessionWindowMs: 5 * HOUR_MS,
+  valueLabels: [],
   valueAgeWindowMs: 7 * DAY_MS,
   scarceHeadroomPct: 20,
   abundantHeadroomPct: 60,
@@ -289,41 +297,71 @@ export function budgetGate(
 
 // ── Pace-modulated prioritization (anton-k05r) ──────────────────────────────────────────────────
 // Once budgetGate says work MAY run, this finer gate decides which jobs are worth admitting *now*.
-// A job's value comes from its bead labels; pace-state (plus session headroom) sets a minimum value
-// threshold. Scarce budget → high-value only; abundant → drain low-value cleanup; night lowers the
+// A job's value comes from the labels its project nominated; pace-state (plus session headroom) sets
+// a minimum value threshold. Scarce budget → high-value only; abundant → drain low-value cleanup; night lowers the
 // bar for heavy jobs. This governs anton's own admission order only — it never forks beads' board.
-
-/** Bead label marking the highest-value work — a risky change that must land before it rots. */
-export const VALUE_LABEL_RISK_HIGH = "risk:high";
-/** Bead label marking work that unblocks an open PR — high value, below risk:high. */
-export const VALUE_LABEL_BLOCKING_PR = "blocking-PR";
 
 /** The inputs to {@link jobValueScore}: a bead's labels and how long the work has waited. */
 export interface JobValueInput {
-  /** The bead's labels (e.g. `risk:high`, `blocking-PR`, `size:M`). */
+  /** The bead's labels, exactly as the board carries them (e.g. `risk:high`, `size:M`). */
   labels: readonly string[];
   /** How long the job has been waiting, in ms. Older work scores higher within its band. */
   ageMs?: number;
 }
 
+/** Top of the unnominated band: work carrying no nominated label scores on age alone, in [0, this]. */
+const UNNOMINATED_BAND_TOP = 0.4;
 /**
- * Score a job's value in [0,1] from its bead labels, with age as a within-band tie-break. The bands
- * are disjoint so the ordering `risk:high > blocking-PR > age` is total: any risk:high job outranks
- * any blocking-PR job, which outranks any unlabeled job however old. Age only breaks ties among
- * peers — a week-old cleanup job never overtakes a fresh blocking-PR one.
+ * Where the TOP and BOTTOM nominated bands floor, whatever the tier count. They mirror
+ * {@link DEFAULT_BUDGET_POLICY}'s `valueThresholdScarce` / `valueThresholdNormal` — the bars
+ * {@link admitJob} was tuned on — so "scarce admits the top tier only" and "on-pace admits anything
+ * nominated" stay true for one nomination or five, instead of holding only at the two anton's own
+ * board happens to use. A budget test asserts they stay in step.
+ */
+const TOP_BAND_FLOOR = 0.8;
+const BOTTOM_BAND_FLOOR = 0.5;
+/** How tall a band's age range may get — the top band's height, so the oldest top-tier work hits 1. */
+const MAX_BAND_AGE_SPAN = 0.2;
+/**
+ * How much of the gap between adjacent band floors a band's age range may fill when tiers are packed
+ * tighter than {@link MAX_BAND_AGE_SPAN}. Below 1 so the bands never touch: the oldest bead in a tier
+ * still scores under the freshest bead one tier up.
+ */
+const AGE_FILL = 2 / 3;
+
+/**
+ * Score a job's value in [0,1] from the labels its project NOMINATED (`policy.valueLabels`, highest
+ * tier first), with age as a within-band tie-break. anton ships no vocabulary of its own: a project
+ * that nominates nothing ranks purely on age, and a project's nominations are just strings its own
+ * board uses.
  *
- *   • risk:high    → [0.8, 1.0]
- *   • blocking-PR  → [0.5, 0.7]
- *   • otherwise    → [0.0, 0.4]  (pure age; this is the "low-value cleanup" band)
+ * The tiers floor at evenly spaced points from 0.8 (top) down to 0.5 (lowest nominated), each band's
+ * age range filling two thirds of the gap below the next tier up; unnominated work fills [0, 0.4].
+ * Every band is therefore disjoint and the ordering is total: any tier-1 job outranks any tier-2
+ * job, which outranks any unnominated job however old. Age only breaks ties among peers — a week-old
+ * cleanup job never overtakes a fresh nominated one.
+ *
+ * With the two-tier nomination anton's own board uses (`risk:high`, `blocking-PR`) that is exactly
+ * the shipped arithmetic: [0.8, 1.0], [0.5, 0.7], [0, 0.4].
  */
 export function jobValueScore(input: JobValueInput, policy: BudgetPolicy): number {
   const ageFrac =
     policy.valueAgeWindowMs > 0
       ? Math.min(1, Math.max(0, (input.ageMs ?? 0) / policy.valueAgeWindowMs))
       : 0;
-  if (input.labels.includes(VALUE_LABEL_RISK_HIGH)) return 0.8 + 0.2 * ageFrac;
-  if (input.labels.includes(VALUE_LABEL_BLOCKING_PR)) return 0.5 + 0.2 * ageFrac;
-  return 0.4 * ageFrac;
+  const tiers = policy.valueLabels;
+  // First match wins: the nomination order IS the tier order, so a bead carrying two nominated
+  // labels scores in the higher one.
+  const tier = tiers.findIndex((label) => input.labels.includes(label));
+  if (tier < 0) return UNNOMINATED_BAND_TOP * ageFrac;
+  // A sole nomination floors at the top and keeps the shipped [0.8, 1.0] band — there is no tier
+  // below it to make room for. Interpolated rather than stepped down by `spacing` so the top and
+  // bottom floors land on their thresholds exactly, without float drift through the middle tiers.
+  const depth = tiers.length > 1 ? tier / (tiers.length - 1) : 0;
+  const floor = TOP_BAND_FLOOR * (1 - depth) + BOTTOM_BAND_FLOOR * depth;
+  const spacing = tiers.length > 1 ? (TOP_BAND_FLOOR - BOTTOM_BAND_FLOOR) / (tiers.length - 1) : 0;
+  const ageSpan = spacing > 0 ? Math.min(MAX_BAND_AGE_SPAN, spacing * AGE_FILL) : MAX_BAND_AGE_SPAN;
+  return floor + ageSpan * ageFrac;
 }
 
 /** A job as the admission gate sees it: its value score and its projected session%-cost to run. */

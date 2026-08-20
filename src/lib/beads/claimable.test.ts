@@ -125,16 +125,18 @@ describe("rankClaimableTargets — the order", () => {
     expect(ids(rankClaimableTargets(board, board))).toEqual(["f2", "f3", "f1"]);
   });
 
-  it("treats a bead with no priority as bd's lowest (4), not as unranked", () => {
+  it("sorts a bead with no priority last, behind even an explicit P4", () => {
+    // `.beads/PRIME.md`: "a bead with none sorts last" — unset is the absence of a decision, not a
+    // synonym for bd's lowest. The full property lives in rank.test.ts.
     const board = [
-      bead({ id: "f9", issue_type: "feature" }), // no priority — ties with an explicit 4
+      bead({ id: "f9", issue_type: "feature" }), // no priority
       bead({ id: "f2", issue_type: "feature", priority: 4 }),
       bead({ id: "f3", issue_type: "feature", priority: 3 }),
     ];
 
     const ranked = rankClaimableTargets(board, board);
     expect(ids(ranked)).toEqual(["f3", "f2", "f9"]);
-    expect(ranked.map((t) => t.priority)).toEqual([3, 4, 4]);
+    expect(ranked.map((t) => t.priority)).toEqual([3, 4, undefined]);
   });
 
   it("breaks a priority tie by how much open work the target unblocks, transitively", () => {
@@ -161,13 +163,15 @@ describe("rankClaimableTargets — the order", () => {
     const board = [
       bead({ id: "f1", issue_type: "feature" }),
       bead({ id: "f2", issue_type: "feature", status: "closed", dependencies: [blocks("f2", "f1")] }),
-      // A malformed cycle f3 → f4 → f3 must not hang the traversal.
-      bead({ id: "f3", issue_type: "feature", dependencies: [blocks("f3", "f1"), blocks("f3", "f4")] }),
-      bead({ id: "f4", issue_type: "feature", dependencies: [blocks("f4", "f3")] }),
+      bead({ id: "f3", issue_type: "feature", dependencies: [blocks("f3", "f1")] }),
+      // A malformed cycle f4 → f5 → f4 must not hang the traversal — or credit f1 for work that
+      // holds itself no matter what f1 does.
+      bead({ id: "f4", issue_type: "feature", dependencies: [blocks("f4", "f3"), blocks("f4", "f5")] }),
+      bead({ id: "f5", issue_type: "feature", dependencies: [blocks("f5", "f4")] }),
     ];
 
     const byId = new Map(rankClaimableTargets(board, board).map((t) => [t.bead.id, t.unblocks]));
-    expect(byId.get("f1")).toBe(2); // f3 and f4; the closed f2 was never waiting
+    expect(byId.get("f1")).toBe(1); // f3 alone: the closed f2 was never waiting, the cycle never frees
   });
 
   it("falls back to age, then id, so two machines agree exactly", () => {

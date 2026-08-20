@@ -16,6 +16,7 @@ import {
   proposalAutonomySchema,
   runHealthThresholdsSchema,
   scanSeverityPolicySchema,
+  valueLabelsSchema,
   getProjectSettingsBySlug,
   updateProjectSettings,
   type ProjectSettings,
@@ -393,6 +394,24 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         );
       }
       patch.proposalAutonomy = parsed.data;
+    }
+  }
+
+  if ("valueLabels" in body) {
+    const raw = (body as Record<string, unknown>).valueLabels;
+    // "" / null / [] → clear: nominating nothing IS the default (rank on native fields alone), so
+    // it is stored as absent rather than as an empty array. Otherwise validate strictly — a
+    // duplicate or over-long nomination 400s rather than persisting a tier that can never be
+    // reached. Replaced wholesale, not merged: the array's ORDER is the band order an operator tunes.
+    if (raw == null || raw === "" || (Array.isArray(raw) && raw.length === 0)) {
+      patch.valueLabels = undefined;
+    } else {
+      const parsed = valueLabelsSchema.safeParse(raw);
+      if (!parsed.success) {
+        const detail = parsed.error.issues[0]?.message ?? "invalid label";
+        return NextResponse.json({ error: `Invalid valueLabels: ${detail}` }, { status: 400 });
+      }
+      patch.valueLabels = parsed.data;
     }
   }
 

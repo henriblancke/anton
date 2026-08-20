@@ -617,6 +617,72 @@ describe("settings route — per-label pipeline variants (anton-aa3m)", () => {
 });
 
 /**
+ * Nominated value labels (anton-prng): the nominations round-trip IN ORDER (the order is the value
+ * band order), nominating none is stored as absent, and a repeat 400s rather than persisting a tier
+ * that can never be reached.
+ */
+describe("settings route — nominated value labels (anton-prng)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists no key for a zero-config project — anton nominates nothing", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.valueLabels).toBeUndefined();
+    expect("valueLabels" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists the nominations IN ORDER, and GET restores them", async () => {
+    const valueLabels = ["risk:high", "blocking-PR"];
+    const res = await PATCH(patchReq({ valueLabels }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.valueLabels).toEqual(valueLabels);
+    expect(persisted().valueLabels).toEqual(valueLabels);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.valueLabels).toEqual(valueLabels);
+  });
+
+  it("replaces rather than merges — re-ranking must be able to drop a nomination", async () => {
+    await PATCH(patchReq({ valueLabels: ["risk:high", "blocking-PR"] }), ctx("tmp"));
+    await PATCH(patchReq({ valueLabels: ["blocking-PR"] }), ctx("tmp"));
+    expect(persisted().valueLabels).toEqual(["blocking-PR"]);
+  });
+
+  it("clears on [] / null — back to ranking on native fields alone", async () => {
+    await PATCH(patchReq({ valueLabels: ["risk:high"] }), ctx("tmp"));
+    await PATCH(patchReq({ valueLabels: [] }), ctx("tmp"));
+    expect("valueLabels" in persisted()).toBe(false);
+
+    await PATCH(patchReq({ valueLabels: ["risk:high"] }), ctx("tmp"));
+    await PATCH(patchReq({ valueLabels: null }), ctx("tmp"));
+    expect("valueLabels" in persisted()).toBe(false);
+  });
+
+  it("rejects a repeat or malformed nomination without disturbing what is stored", async () => {
+    await PATCH(patchReq({ valueLabels: ["risk:high"] }), ctx("tmp"));
+    for (const value of [
+      ["risk:high", "risk:high"],
+      ["  "],
+      [42],
+      "risk:high",
+      Array.from({ length: 9 }, (_, i) => `l${i}`),
+    ]) {
+      const res = await PATCH(patchReq({ valueLabels: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/valueLabels/);
+    }
+    expect(persisted().valueLabels).toEqual(["risk:high"]);
+  });
+});
+
+/**
  * Per-kind proposal autonomy (anton-nbyy): the policy round-trips, merges per kind, and a submission
  * naming a kind or a level anton doesn't know 400s rather than persisting an entry that would
  * silently resolve back to `propose`.

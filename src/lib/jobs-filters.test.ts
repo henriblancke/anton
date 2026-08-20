@@ -132,6 +132,7 @@ describe("option lists", () => {
       "gate-check",
       "gardener",
       "product-master",
+      "board-picker",
     ]);
     expect(JOB_TYPE_FILTER_OPTIONS.map((o) => o.value)).toEqual(["", ...JOB_TYPES]);
   });

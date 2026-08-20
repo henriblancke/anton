@@ -80,9 +80,10 @@ describe("schedules route", () => {
     const res = await GET(new Request("http://t/"), ctx("tmp"));
     expect(res.status).toBe(200);
     const { schedules } = await res.json();
-    expect(schedules).toHaveLength(8);
+    expect(schedules).toHaveLength(9);
     const types = schedules.map((s: { type: string }) => s.type).sort();
     expect(types).toEqual([
+      "board-picker",
       "gardener",
       "gate-check",
       "nightly-stringer",
@@ -112,6 +113,9 @@ describe("schedules route", () => {
       // product-master (anton-d2sx) likewise: it spends a claude session and a founder's attention
       // on every proposal it files.
       "product-master": false,
+      // board-picker (anton-albm) is the sharpest opt-in of the three: it is the only automation
+      // that starts work, so arming it is the operator giving anton a standing approval.
+      "board-picker": false,
     });
   });
 

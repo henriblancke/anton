@@ -120,6 +120,20 @@
       "when": 1786995892686,
       "tag": "0016_exotic_kabuki",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1787104815953,
+      "tag": "0017_rare_slapstick",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1787110055236,
+      "tag": "0018_backfill_value_labels",
+      "breakpoints": true
     }
   ]
 }
