@@ -768,8 +768,9 @@ export type SyncRequest = SyncMode | "backstop" | "push";
 export type SyncOutcome = "synced" | "not-wired" | "shared-server";
 
 /**
- * Server-mode preflight (anton-eg46). Runs `bd dolt test` ONCE per repo per process, the first time
- * a sync pass would have run, and throws an actionable error when the shared server is unreachable.
+ * Server-mode preflight (anton-eg46). Runs `bd dolt test` at most once per {@link PREFLIGHT_TTL_MS}
+ * per repo, on the sync pass that would otherwise have run, and throws an actionable error when the
+ * shared server is unreachable.
  *
  * Why it belongs here rather than at boot: it piggybacks on the heartbeat, so the failure lands in
  * the sync-status registry the operator is already watching, and a server that comes back up is
@@ -785,28 +786,43 @@ export type SyncOutcome = "synced" | "not-wired" | "shared-server";
 const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
 
 /**
+ * How long a successful probe stands in for the server being up.
+ *
+ * A success EXPIRES rather than being remembered forever (PR #174 review): in server mode the
+ * preflight is the only thing the heartbeat does, so a permanently-cached pass means an outage
+ * after startup never reaches the sync-status registry — the UI keeps reporting a healthy shared
+ * board until some unrelated board operation happens to fail. Five minutes bounds that blind spot
+ * while keeping the probe off the ~10s beat (one `bd dolt test` per repo per five minutes).
+ */
+export const PREFLIGHT_TTL_MS = 5 * 60_000;
+
+/**
+ * When each repo's last SUCCESSFUL probe landed, in epoch ms.
+ *
  * Anchored on `globalThis` for the same cross-bundle reason as the status registry above: a route
  * handler bundle and the instrumentation-started sync engine each load their own compiled copy of
- * this module, and a plain module-level Set would give each one its own — turning "once per
- * process" into "once per bundle" and re-running `bd dolt test` for every one of them.
+ * this module, and a plain module-level Map would give each one its own — turning "once per TTL"
+ * into "once per TTL per bundle" and re-running `bd dolt test` for every one of them.
  */
-function preflightedSet(): Set<string> {
-  const g = globalThis as unknown as Record<symbol, Set<string> | undefined>;
-  return (g[PREFLIGHTED_KEY] ??= new Set());
+function preflightedAt(): Map<string, number> {
+  const g = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
+  return (g[PREFLIGHTED_KEY] ??= new Map());
 }
 
-/** Tests only — production preflights once per process by design. */
+/** Tests only — production expires probes on the TTL by design. */
 export function resetServerPreflight(): void {
-  preflightedSet().clear();
+  preflightedAt().clear();
 }
 
 export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
-  if (preflightedSet().has(cwd)) return;
+  const last = preflightedAt().get(cwd);
+  if (last !== undefined && Date.now() - last < PREFLIGHT_TTL_MS) return;
   const target = formatServerTarget(readBoardMode(cwd));
   try {
     await exec(cwd, ["dolt", "test"]);
-    // Recorded only on success, so a server that was down is retried on the next beat.
-    preflightedSet().add(cwd);
+    // Stamped only on success, so a server that was down is retried on the next beat rather than
+    // waiting out a TTL it never earned.
+    preflightedAt().set(cwd, Date.now());
   } catch (e) {
     const err = e as Error & { stdout?: string; stderr?: string };
     const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;

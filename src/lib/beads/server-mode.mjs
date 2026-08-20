@@ -17,10 +17,11 @@
  *      Dolt directory is left exactly where it is — it is the real history backup, and the escape
  *      hatch if the server goes away.
  *   2. **Write the connection, then prove it.** `bd dolt test` must connect, or the flip is undone.
- *   3. **Prove the board arrived.** The issue count before the flip is compared with the count read
- *      back from the server. Fewer issues means the data copy has not happened (or landed in
- *      another database) — the one mistake that makes an otherwise-successful switch look fine
- *      while the team stares at an empty board. It reverts rather than reports.
+ *   3. **Prove the board arrived.** The issue IDs read before the flip are compared with the IDs
+ *      read back from the server: every one of them must be there. A missing issue means the data
+ *      copy has not happened, landed in another database, or left a stale copy of this project on
+ *      the server — the one class of mistake that makes an otherwise-successful switch look fine
+ *      while the team stares at a board with work missing from it. It reverts rather than reports.
  *
  * On any of those failures `metadata.json` AND `.beads/config.yaml` are restored byte-for-byte, so a
  * failed attempt leaves a working board rather than a project pointed at a server it cannot read.
@@ -160,48 +161,105 @@ export function restoreFile(path, before) {
 const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
 
 /**
- * The JSON object in `text`, found by trying every `{`…`}` span right-to-left (the same
- * keep-scanning idea as bd.ts's `parseJsonTail`, widened to a closing brace it must also find).
- *
- * NOT the widest span: bd brackets its `--json` output with deprecation warnings, and a warning is
- * free to contain braces of its own (`use {dolt.auto-commit} instead`) — first `{` to last `}` would
- * swallow one and read a healthy board as unparseable. Returns `undefined` when nothing parses.
+ * How many candidate spans {@link parseJsonPayload} will parse before giving up. Each attempt
+ * parses a slice that is megabytes on a large board, so an stdout that holds no payload at all must
+ * fail fast rather than square its own length.
  */
-function parseJsonObject(text) {
-  // Both `i > 0` guards are load-bearing: `lastIndexOf(c, -1)` clamps its start to 0 rather than
-  // giving up, so a leading brace that fails to parse would be handed back forever.
-  for (let i = text.lastIndexOf("{"); i >= 0; i = i > 0 ? text.lastIndexOf("{", i - 1) : -1) {
-    for (let e = text.lastIndexOf("}"); e > i; e = e > 0 ? text.lastIndexOf("}", e - 1) : -1) {
+const MAX_JSON_SPANS = 100;
+
+/**
+ * The JSON payload in `text` that `accept` recognises, or `undefined`.
+ *
+ * Neither "first `{` to last `}`" nor "the last span that parses" is safe on its own: bd brackets
+ * its `--json` output with deprecation warnings free to contain brackets of their own (`use
+ * {dolt.auto-commit} instead`), so the first would swallow a warning, while the second would hand
+ * back an issue's OWN nested object or array. Every `{`/`[` start is tried left-to-right against
+ * every matching close right-to-left (widest span first) — and `accept` alone decides that a span
+ * is the payload, because "it parsed" plainly is not enough to know that it is.
+ *
+ * `accept` is handed the parsed value and its raw span, and returns the value to hand back, or
+ * `undefined` to keep scanning.
+ */
+function parseJsonPayload(text, accept) {
+  let attempts = 0;
+  for (let i = 0; i < text.length; i++) {
+    const open = text[i];
+    if (open !== "{" && open !== "[") continue;
+    const close = open === "{" ? "}" : "]";
+    // `e > i` also guards the walk: `lastIndexOf(close, -1)` clamps its start to 0 rather than
+    // giving up, so a close at index 0 would otherwise be handed back forever.
+    for (let e = text.lastIndexOf(close); e > i; e = text.lastIndexOf(close, e - 1)) {
+      if (++attempts > MAX_JSON_SPANS) return undefined;
+      const span = text.slice(i, e + 1);
+      let parsed;
       try {
-        const parsed = JSON.parse(text.slice(i, e + 1));
-        if (parsed && typeof parsed === "object") return parsed;
+        parsed = JSON.parse(span);
       } catch {
-        // not the object's span — narrow the end, then keep walking the start left
+        continue; // not this span — narrow the close, then keep walking the start right
       }
+      const taken = accept(parsed, span);
+      if (taken !== undefined) return taken;
     }
   }
   return undefined;
 }
 
 /**
- * How many issues this project's board holds right now, via `bd count --status all`.
+ * The arguments that list EVERY issue on this project's board, ids and all.
  *
- * The one number that answers "did the history actually arrive": cheap on a large board (unlike a
- * full `bd list`), and identical either side of the flip, so before/after compare like for like.
- *
- * Returns `{ ok: true, count }` or `{ ok: false, detail }` — a board that cannot be counted is
- * reported, never silently treated as zero.
+ * `--all` plus the three `--include-*` flags mirror the backup's `bd export --all`: closed issues,
+ * gates, infra beads and templates are board state too, and a check that skipped them would call a
+ * board arrived while a third of it was still at home. `--limit 0` because bd truncates at 50 by
+ * default, and `--skip-labels` because only the ids are read — label hydration is the expensive
+ * half of the query. Every flag exists in bd 1.1.0, anton's floor (MIN_BD_VERSION).
  */
-export function countBoard(dir, opts = {}) {
+const LIST_ALL_IDS_ARGS = [
+  "list",
+  "--all",
+  "--json",
+  "--limit",
+  "0",
+  "--skip-labels",
+  "--include-gates",
+  "--include-infra",
+  "--include-templates",
+];
+
+/**
+ * Every issue ID this project's board holds right now.
+ *
+ * IDENTITY, not cardinality, is what answers "did the history actually arrive". A count proves only
+ * that SOME board is on the other end: a server holding a stale or divergent copy of the same
+ * project can match — or beat — the local count while missing issues the board being moved has, and
+ * the flip would accept it and keep writing into the divergent copy. Comparing the id sets catches
+ * that; comparing two numbers cannot. This runs once, on a one-time migration, so reading the ids
+ * is worth what it costs over `bd count`.
+ *
+ * Returns `{ ok: true, ids }` or `{ ok: false, detail }` — a board that cannot be read is reported,
+ * never silently treated as empty.
+ */
+export function readBoardIds(dir, opts = {}) {
   const exec = scopedBdRunner(dir, opts.user, opts);
   const ms = budgetMs("bd");
-  const r = exec("bd", ["count", "--status", "all", "--json"], ms);
+  const r = exec("bd", LIST_ALL_IDS_ARGS, ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
 
   // stdout only — bd's warnings go to stderr, and the ones that don't are stepped over by the scan.
-  const parsed = parseJsonObject(r?.stdout ?? "");
-  if (!parsed) return { ok: false, detail: "bd count printed no JSON" };
-  return Number.isInteger(parsed.count) ? { ok: true, count: parsed.count } : { ok: false, detail: "bd count reported no count" };
+  // bd answers with a bare array on some boards and `{ issues: [...] }` on others; both are the
+  // payload, and anything else (a nested array of dependency ids, say) is not.
+  const stdout = r?.stdout ?? "";
+  const ids = parseJsonPayload(stdout, (parsed, span) => {
+    const wrapped = !Array.isArray(parsed) && Array.isArray(parsed?.issues);
+    const issues = Array.isArray(parsed) ? parsed : wrapped ? parsed.issues : undefined;
+    if (!issues) return undefined;
+    // An EMPTY bare array is the one span that proves nothing about itself — it would match a stray
+    // `[]` anywhere in the output. Taken only when it is the whole of stdout; the `{ issues: [] }`
+    // form names itself and needs no such guard.
+    if (issues.length === 0 && !wrapped && span.trim() !== stdout.trim()) return undefined;
+    const found = issues.map((i) => (i && typeof i === "object" ? i.id : undefined));
+    return found.every((id) => typeof id === "string" && id !== "") ? found : undefined;
+  });
+  return ids ? { ok: true, ids } : { ok: false, detail: "bd list printed no readable board" };
 }
 
 /**
@@ -278,11 +336,12 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *
  * @param {string} dir repo root
  * @param {{ host?: string, port?: number|string, user?: string, database?: string, backup?: boolean, force?: boolean }} flags
- *   `backup: false` skips the pre-flip export; `force: true` accepts a server board that holds
- *   FEWER issues than the board being moved (starting a deliberately fresh board).
+ *   `backup: false` skips the pre-flip export; `force: true` accepts a server board that is MISSING
+ *   issues the board being moved has (starting a deliberately fresh board).
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
- * @returns {{ ok, steps, connection?, errors, before?, counts?, backup? }}
+ * @returns {{ ok, steps, connection?, errors, before?, counts?, backup?, missing? }} `missing` is
+ *   the ids this board holds that the server's copy does not — empty once the check has passed.
  */
 export function configureServerMode(dir, flags = {}, opts = {}) {
   const emit = typeof opts.log === "function" ? opts.log : () => {};
@@ -327,20 +386,20 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before });
   }
 
-  // 3. Count the board while it is still pointed where it is now. This is the number the post-flip
-  //    read is checked against — take it BEFORE the backup so a slow export can't sit between the
-  //    measurement and the switch.
+  // 3. Read the board's issue IDs while it is still pointed where it is now. This is the set the
+  //    post-flip read is checked against — take it BEFORE the backup so a slow export can't sit
+  //    between the measurement and the switch.
   const counts = {};
-  const countedBefore = countBoard(dir, { ...opts, user: before.user });
-  if (countedBefore.ok) {
-    counts.before = countedBefore.count;
-    record("board count", "ok", `${countedBefore.count} issues`);
+  const idsBefore = readBoardIds(dir, { ...opts, user: before.user });
+  if (idsBefore.ok) {
+    counts.before = idsBefore.ids.length;
+    record("board issues", "ok", `${idsBefore.ids.length} issues`);
   } else {
-    // Not fatal: a board that cannot be counted (a stopped embedded server, say) can still be
-    // pointed at a server. It costs the arrived-whole check, which is said out loud rather than
-    // quietly skipped.
-    record("board count", "skipped", countedBefore.detail);
-    emit(`could not count the current board (${countedBefore.detail}) — skipping the arrived-whole check.`);
+    // Not fatal: a board that cannot be read (a stopped embedded server, say) can still be pointed
+    // at a server. It costs the arrived-whole check, which is said out loud rather than quietly
+    // skipped.
+    record("board issues", "skipped", idsBefore.detail);
+    emit(`could not read the current board (${idsBefore.detail}) — skipping the arrived-whole check.`);
   }
 
   // 4. Back up before the flip. Only meaningful on an embedded board: a server board's data is not
@@ -389,28 +448,33 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, hints: tested.hints });
   }
 
-  // 7. Prove the BOARD arrived, not just the server. A reachable server holding fewer issues than
-  //    the board being moved means the Dolt directory was never copied (or went to another
-  //    database) — the failure that otherwise looks like a clean switch onto an empty board.
-  const countedAfter = countBoard(dir, { ...opts, user: connection.user });
-  record("server board count", countedAfter.ok ? "ok" : "failed", countedAfter.ok ? `${countedAfter.count} issues` : countedAfter.detail);
-  if (!countedAfter.ok) {
-    // Fatal, unlike the pre-flip count: reading the board back IS the verification, and `bd dolt
+  // 7. Prove THIS board arrived, not just that some board answers. The server's copy is checked by
+  //    identity: a stale or divergent copy of the same project can hold as many issues as the board
+  //    being moved — more, even — while missing the ones written here since it diverged, and a
+  //    count would wave it through onto an incomplete board every later write then compounds.
+  const idsAfter = readBoardIds(dir, { ...opts, user: connection.user });
+  record("server board issues", idsAfter.ok ? "ok" : "failed", idsAfter.ok ? `${idsAfter.ids.length} issues` : idsAfter.detail);
+  if (!idsAfter.ok) {
+    // Fatal, unlike the pre-flip read: reading the board back IS the verification, and `bd dolt
     // test` does not stand in for it. A server can answer the connection test and still refuse the
     // database — bd's own project-identity guard does exactly that when the connection names a
     // database belonging to another project ("PROJECT IDENTITY MISMATCH — refusing to connect").
-    errors.push(`the server accepted the connection but this project cannot read its board: ${countedAfter.detail}`);
+    errors.push(`the server accepted the connection but this project cannot read its board: ${idsAfter.detail}`);
     revert("board unreadable on the server");
     return fail({ before, connection, counts, backup });
   }
-  counts.after = countedAfter.count;
-  if (counts.before !== undefined && counts.after < counts.before && !flags.force) {
+  counts.after = idsAfter.ids.length;
+
+  const onServer = new Set(idsAfter.ids);
+  const missing = idsBefore.ok ? idsBefore.ids.filter((id) => !onServer.has(id)) : [];
+  if (missing.length && !flags.force) {
     errors.push(
-      `the server's "${connection.database}" database holds ${counts.after} issues but this board has ${counts.before} — ` +
+      `the server's "${connection.database}" database is missing ${missing.length} of this board's ` +
+        `${counts.before} issues (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}) — ` +
         "its history has not been copied onto the server yet",
     );
     revert("server board is missing issues");
-    return fail({ before, connection, counts, backup });
+    return fail({ before, connection, counts, backup, missing });
   }
 
   // 8. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
@@ -435,8 +499,8 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   // same answer: the project goes back to what it was rather than staying half-switched.
   if (errors.length) {
     revert("could not publish the team-wide connection defaults");
-    return fail({ before, connection, counts, backup });
+    return fail({ before, connection, counts, backup, missing });
   }
 
-  return { ok: true, steps, errors, before, connection, counts, backup };
+  return { ok: true, steps, errors, before, connection, counts, backup, missing };
 }

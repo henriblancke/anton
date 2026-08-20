@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 857383b9871d
+version: 57e80578f880
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -113,7 +113,8 @@ anton server-mode . --host <host> --port <port> --user <user> --database <this p
 ```
 
 It writes `.beads/metadata.json`, verifies the connection with `bd dolt test`, **reads the board
-back from the server** and compares the issue count with what the project had before, then publishes
+back from the server** and confirms every issue the project held a moment earlier is there (by id,
+not by count — a stale copy of the same project can match on size), then publishes
 the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the team-wide default
 so the next clone inherits the target. **Any failure after the write reverts `metadata.json`
 byte-for-byte** and exits non-zero — a project is never left pointed at a server it cannot read.

@@ -22,9 +22,10 @@ afterEach(() => dirs.cleanup());
 const EMBEDDED = { database: "dolt", backend: "dolt", dolt_mode: "embedded", dolt_database: "probe", project_id: "abc-123" };
 
 /**
- * A stub `bd` for the server-mode flow. `bd count` answers with the contents of `.beads/.fake-count`
- * so a case can make the server's board differ from the local one, and `bd dolt test` fails when
- * `.beads/.fake-unreachable` exists — the two failures the command is built to catch.
+ * A stub `bd` for the server-mode flow. `bd list` answers with the ids in `.beads/.fake-board`
+ * (local ids, then the server's, separated by `|`) so a case can make the server's board differ
+ * from the local one, and `bd dolt test` fails when `.beads/.fake-unreachable` exists — the two
+ * failures the command is built to catch.
  */
 const FAKE_BD_SERVER = [
   "#!/usr/bin/env node",
@@ -34,10 +35,11 @@ const FAKE_BD_SERVER = [
   'const beads = path.join(process.cwd(), ".beads");',
   'const read = (f, d) => { try { return fs.readFileSync(path.join(beads, f), "utf8").trim(); } catch { return d; } };',
   'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.2 (fake)"); process.exit(0); }',
-  'if (a[0] === "count") {',
+  'if (a[0] === "list") {',
   '  const mode = JSON.parse(read("metadata.json", "{}")).dolt_mode;',
-  '  const counts = read(".fake-count", "3|3").split("|");',
-  '  console.log(JSON.stringify({ count: Number(mode === "server" ? counts[1] : counts[0]) }));',
+  '  const boards = read(".fake-board", "probe-1,probe-2,probe-3|probe-1,probe-2,probe-3").split("|");',
+  '  const ids = (mode === "server" ? boards[1] : boards[0]).split(",").filter(Boolean);',
+  '  console.log(JSON.stringify({ issues: ids.map((id) => ({ id })) }));',
   "  process.exit(0);",
   "}",
   'if (a[0] === "export") { fs.writeFileSync(a[a.indexOf("-o") + 1], ""); process.exit(0); }',
@@ -146,7 +148,7 @@ describe("anton server-mode (end to end over a stub bd)", () => {
   });
 
   it("exits non-zero and points at the runbook when the server's board is missing issues", async () => {
-    const p = await project({ ".fake-count": "12|0" });
+    const p = await project({ ".fake-board": "probe-1,probe-2,probe-3|probe-4,probe-5,probe-6" });
     const before = p.raw();
 
     const r = p.run(CONNECT);

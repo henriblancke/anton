@@ -600,16 +600,30 @@ export function scopeBdEnv(parentEnv, user) {
  *
  * `opts.exec` short-circuits it, so every caller keeps the injectable seam its tests use.
  *
+ * Output is capped at {@link BD_MAX_OUTPUT_BYTES} rather than spawnSync's 1 MiB default: a full
+ * `bd list --json` of a few hundred issues already clears 1 MiB, and the default silently truncates
+ * to a payload that no longer parses — a board read as unreadable because it is BIG.
+ *
  * @param {string} dir cwd for the spawn (the target repo)
  * @param {string|undefined} user the project's configured database user, if any
  * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
  *   env?: NodeJS.ProcessEnv }} [opts]
  */
+/** Per-stream output ceiling for a spawned bd, matching the 64 MiB the TypeScript wrappers use. */
+const BD_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
 export function scopedBdRunner(dir, user, opts = {}) {
   if (opts.exec) return opts.exec;
   const env = scopeBdEnv(opts.env ?? process.env, user);
   return (cmd, args, timeoutMs = budgetMs("bd")) =>
-    spawnSync(cmd, args, { cwd: dir, encoding: "utf8", env, timeout: timeoutMs, killSignal: SPAWN_KILL_SIGNAL });
+    spawnSync(cmd, args, {
+      cwd: dir,
+      encoding: "utf8",
+      env,
+      timeout: timeoutMs,
+      killSignal: SPAWN_KILL_SIGNAL,
+      maxBuffer: BD_MAX_OUTPUT_BYTES,
+    });
 }
 
 /**

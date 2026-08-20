@@ -16,7 +16,7 @@ import {
   DEFAULT_DOLT_PORT,
   backupBoard,
   configureServerMode,
-  countBoard,
+  readBoardIds,
   readMetadataFile,
   resolveServerConnection,
   restoreFile,
@@ -33,6 +33,9 @@ const EMBEDDED = {
 };
 
 const CONNECTION = { host: "dolt.example.dev", port: 3306, user: "beads", database: "probe" };
+
+/** The board being moved, as ids — what the server's copy is checked against. */
+const BOARD = ["probe-1", "probe-2", "probe-3", "probe-4", "probe-5", "probe-6", "probe-7"];
 
 const dirs: string[] = [];
 
@@ -53,21 +56,23 @@ const readMetadata = (dir: string) => JSON.parse(readFileSync(metadataPath(dir),
 
 type Result = { status: number | null; stdout?: string; stderr?: string };
 
+/** `bd list --json` as bd prints it: the ids wrapped in the object form, warnings and all. */
+const listing = (ids: string[]) =>
+  `Warning: deprecated\n${JSON.stringify({ issues: ids.map((id) => ({ id, title: id })) }, null, 2)}\n`;
+
 /**
- * A stub `bd` that records every invocation and answers by subcommand. `counts` is consumed in
- * order, so a case can hand back one number before the switch and another after it.
+ * A stub `bd` that records every invocation and answers by subcommand. `boards` is consumed in
+ * order, so a case can hand back one set of issue ids before the switch and another after it.
  */
-function fakeBd(opts: { counts?: number[]; test?: Result; export?: Result; version?: string } = {}) {
+function fakeBd(opts: { boards?: string[][]; test?: Result; export?: Result; version?: string } = {}) {
   const calls: string[][] = [];
-  const counts = [...(opts.counts ?? [])];
+  const boards = [...(opts.boards ?? [])];
   const exec = (cmd: string, args: string[]): Result => {
     calls.push([cmd, ...args]);
     if (args[0] === "--version") return { status: 0, stdout: `bd version ${opts.version ?? "1.1.2"} (fake)` };
-    if (args[0] === "count") {
-      const next = counts.length > 1 ? counts.shift() : counts[0];
-      return next === undefined
-        ? { status: 1, stderr: "no board" }
-        : { status: 0, stdout: `{\n  "count": ${next},\n  "schema_version": 1\n}\n` };
+    if (args[0] === "list") {
+      const next = boards.length > 1 ? boards.shift() : boards[0];
+      return next === undefined ? { status: 1, stderr: "no board" } : { status: 0, stdout: listing(next) };
     }
     if (args[0] === "export") return opts.export ?? { status: 0 };
     if (args[0] === "dolt" && args[1] === "test") return opts.test ?? { status: 0, stdout: "✓ Connection successful" };
@@ -162,26 +167,53 @@ describe("writeServerModeMetadata", () => {
   });
 });
 
-describe("countBoard", () => {
-  it("parses the count out of stdout even when bd prefixes it with warnings", () => {
-    const exec = () => ({ status: 0, stdout: 'Warning: deprecated\n{\n  "count": 42\n}\n', stderr: "Warning: also deprecated" });
-    expect(countBoard(repo(EMBEDDED), { exec })).toEqual({ ok: true, count: 42 });
+describe("readBoardIds", () => {
+  const ids = (stdout: string) => readBoardIds(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
+
+  // Closed issues, gates, infra beads and templates are board state too: a check that skipped them
+  // would call a board arrived while a third of it was still at home.
+  it("asks bd for EVERY issue — closed, gates, infra and templates included, unlimited", () => {
+    const calls: string[][] = [];
+    const exec = (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+      return { status: 0, stdout: listing(["probe-1"]) };
+    };
+    expect(readBoardIds(repo(EMBEDDED), { exec })).toEqual({ ok: true, ids: ["probe-1"] });
+    const ran = calls[0].join(" ");
+    for (const flag of ["--all", "--limit 0", "--include-gates", "--include-infra", "--include-templates"]) {
+      expect(ran).toContain(flag);
+    }
   });
 
-  // The pre-flip count is the ONLY input to the arrived-whole check — a warning bd decides to print
-  // with braces in it must not turn a healthy board into "printed no JSON" and skip that check.
-  it("steps over a warning that contains braces of its own, on either side of the JSON", () => {
-    const around = (stdout: string) => countBoard(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
-    expect(around('warning: use {dolt.auto-commit} instead\n{"count": 42}\n')).toEqual({ ok: true, count: 42 });
-    expect(around('{"count": 42}\nwarning: use {dolt.auto-commit} instead\n')).toEqual({ ok: true, count: 42 });
+  it("reads both shapes bd answers with — a bare array and the { issues } wrapper", () => {
+    expect(ids('[{"id": "probe-1"}, {"id": "probe-2"}]')).toEqual({ ok: true, ids: ["probe-1", "probe-2"] });
+    expect(ids('{"issues": [{"id": "probe-1"}]}')).toEqual({ ok: true, ids: ["probe-1"] });
+    expect(ids("[]")).toEqual({ ok: true, ids: [] });
   });
 
-  it("reports a failed or unreadable count rather than calling it zero", () => {
-    expect(countBoard(repo(EMBEDDED), { exec: () => ({ status: 1, stderr: "connection refused" }) })).toEqual({
+  // The pre-flip read is the ONLY input to the arrived-whole check — a warning bd decides to print
+  // with brackets in it must not turn a healthy board into "no readable board" and skip that check.
+  it("steps over a warning that contains brackets of its own, on either side of the JSON", () => {
+    const payload = '{"issues": [{"id": "probe-1"}]}';
+    expect(ids(`warning: use {dolt.auto-commit} instead\n${payload}\n`)).toEqual({ ok: true, ids: ["probe-1"] });
+    expect(ids(`${payload}\nwarning: use {dolt.auto-commit} instead\n`)).toEqual({ ok: true, ids: ["probe-1"] });
+    expect(ids(`warning: pass [--all] instead\n${payload}\n`)).toEqual({ ok: true, ids: ["probe-1"] });
+  });
+
+  // An issue's own nested arrays parse perfectly well and are not the board — "it parsed" is not
+  // enough, or a board would be read as its first issue's dependency list.
+  it("does not mistake an issue's nested array for the board", () => {
+    expect(ids('{"issues": [{"id": "probe-1", "dependencies": []}]}')).toEqual({ ok: true, ids: ["probe-1"] });
+  });
+
+  it("reports a failed or unreadable board rather than calling it empty", () => {
+    expect(readBoardIds(repo(EMBEDDED), { exec: () => ({ status: 1, stderr: "connection refused" }) })).toEqual({
       ok: false,
       detail: "connection refused",
     });
-    expect(countBoard(repo(EMBEDDED), { exec: () => ({ status: 0, stdout: "no json here" }) }).ok).toBe(false);
+    expect(ids("no json here").ok).toBe(false);
+    // Issues without ids are not a board this can compare — reported, never silently empty.
+    expect(ids('{"issues": [{"title": "no id"}]}').ok).toBe(false);
   });
 });
 
@@ -220,12 +252,13 @@ describe("configureServerMode", () => {
 
   it("backs up, writes the connection, verifies it, and publishes the team defaults", () => {
     const dir = repo(EMBEDDED);
-    const { calls, exec } = fakeBd({ counts: [7] });
+    const { calls, exec } = fakeBd({ boards: [BOARD] });
 
     const result = configureServerMode(dir, flags, { exec });
 
     expect(result.ok).toBe(true);
     expect(result.counts).toEqual({ before: 7, after: 7 });
+    expect(result.missing).toEqual([]);
     expect(readMetadata(dir).dolt_mode).toBe("server");
     const ran = cmdline(calls);
     expect(ran.some((c) => c.startsWith("bd export --all"))).toBe(true);
@@ -242,7 +275,7 @@ describe("configureServerMode", () => {
   it("reverts metadata.json byte-for-byte when the server refuses the connection", () => {
     const dir = repo(EMBEDDED);
     const original = readFileSync(metadataPath(dir), "utf8");
-    const { calls, exec } = fakeBd({ counts: [7], test: { status: 1, stderr: "Connection failed" } });
+    const { calls, exec } = fakeBd({ boards: [BOARD], test: { status: 1, stderr: "Connection failed" } });
 
     const result = configureServerMode(dir, flags, { exec });
 
@@ -266,7 +299,7 @@ describe("configureServerMode", () => {
     // A bd that patches config.yaml for real (as the live one does) and then refuses one key.
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "count") return { status: 0, stdout: '{"count": 7}' };
+      if (args[0] === "list") return { status: 0, stdout: listing(BOARD) };
       if (args[0] === "config" && args[1] === "set") {
         writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${args[2]}: ${args[3]}\n`);
         return { status: 0 };
@@ -296,11 +329,11 @@ describe("configureServerMode", () => {
     const original = readFileSync(metadataPath(dir), "utf8");
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "count") {
+      if (args[0] === "list") {
         // The pre-switch read succeeds; the post-switch one hits the identity guard.
         return readMetadataFile(dir).dolt_mode === "server"
           ? { status: 1, stderr: "PROJECT IDENTITY MISMATCH — refusing to connect" }
-          : { status: 0, stdout: '{"count": 7}' };
+          : { status: 0, stdout: listing(BOARD) };
       }
       return { status: 0 };
     };
@@ -312,38 +345,71 @@ describe("configureServerMode", () => {
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
   });
 
-  it("refuses a server board holding fewer issues than the board being moved — unless forced", () => {
+  it("refuses a server board missing issues the board being moved has — unless forced", () => {
     const dir = repo(EMBEDDED);
     const original = readFileSync(metadataPath(dir), "utf8");
 
-    const refused = configureServerMode(dir, flags, { exec: fakeBd({ counts: [7, 0] }).exec });
+    const refused = configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD, []] }).exec });
     expect(refused.ok).toBe(false);
-    expect(refused.errors.join("\n")).toMatch(/holds 0 issues but this board has 7/);
+    expect(refused.errors.join("\n")).toMatch(/missing 7 of this board's 7 issues/);
+    expect(refused.missing).toEqual(BOARD);
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
 
-    const forced = configureServerMode(dir, { ...flags, force: true }, { exec: fakeBd({ counts: [7, 0] }).exec });
+    const forced = configureServerMode(dir, { ...flags, force: true }, { exec: fakeBd({ boards: [BOARD, []] }).exec });
     expect(forced.ok).toBe(true);
     expect(readMetadata(dir).dolt_mode).toBe("server");
+  });
+
+  /**
+   * The reason cardinality is not the check (PR #174 review). A stale or divergent copy of the SAME
+   * project on the server — same size, or bigger — passes a count comparison while missing work
+   * this board holds, and every write after the flip compounds onto that incomplete copy.
+   */
+  it("refuses a divergent server board that matches on count but not on identity", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    // Same seven ids minus the two newest, plus three the server picked up on its own: MORE issues
+    // than the board being moved, and still not this board.
+    const divergent = [...BOARD.slice(0, 5), "probe-8", "probe-9", "probe-10"];
+
+    const result = configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD, divergent] }).exec });
+
+    expect(result.ok).toBe(false);
+    expect(result.counts).toEqual({ before: 7, after: 8 });
+    expect(result.missing).toEqual(["probe-6", "probe-7"]);
+    expect(result.errors.join("\n")).toMatch(/missing 2 of this board's 7 issues \(probe-6, probe-7\)/);
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+  });
+
+  // A server that carries every issue AND has moved on (another machine already writing to it) is
+  // not a failure — the board being moved is whole on the other side, which is the whole question.
+  it("accepts a server board that holds every issue plus newer ones", () => {
+    const dir = repo(EMBEDDED);
+    const result = configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD, [...BOARD, "probe-8"]] }).exec });
+
+    expect(result.ok).toBe(true);
+    expect(result.missing).toEqual([]);
+    expect(result.counts).toEqual({ before: 7, after: 8 });
   });
 
   it("refuses to flip when the pre-switch backup fails, and skips it only on request", () => {
     const dir = repo(EMBEDDED);
     const original = readFileSync(metadataPath(dir), "utf8");
 
-    const failed = configureServerMode(dir, flags, { exec: fakeBd({ counts: [7], export: { status: 1, stderr: "disk full" } }).exec });
+    const failed = configureServerMode(dir, flags, { exec: fakeBd({ boards: [BOARD], export: { status: 1, stderr: "disk full" } }).exec });
     expect(failed.ok).toBe(false);
     expect(failed.errors.join("\n")).toContain("disk full");
     // The flip never happened, so there is nothing to revert — the file was never touched.
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
 
-    const skipped = fakeBd({ counts: [7] });
+    const skipped = fakeBd({ boards: [BOARD] });
     expect(configureServerMode(dir, { ...flags, backup: false }, { exec: skipped.exec }).ok).toBe(true);
     expect(cmdline(skipped.calls).some((c) => c.startsWith("bd export"))).toBe(false);
   });
 
   it("skips the backup for a board already on a server — its data is not local to export", () => {
     const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: "old.example.dev", dolt_server_port: 3306 });
-    const { calls, exec } = fakeBd({ counts: [7] });
+    const { calls, exec } = fakeBd({ boards: [BOARD] });
 
     const result = configureServerMode(dir, flags, { exec });
 
@@ -355,7 +421,7 @@ describe("configureServerMode", () => {
   it("validates before touching anything — a missing flag writes no file and spawns no bd", () => {
     const dir = repo(EMBEDDED);
     const original = readFileSync(metadataPath(dir), "utf8");
-    const { calls, exec } = fakeBd({ counts: [7] });
+    const { calls, exec } = fakeBd({ boards: [BOARD] });
 
     const result = configureServerMode(dir, { port: 3306 }, { exec });
 

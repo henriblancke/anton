@@ -10,8 +10,8 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { createDoltSync, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { PREFLIGHT_TTL_MS, createDoltSync, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
 import { isServerMode, readBoardMode, resetBoardModeCache } from "./board-mode";
 
 /** Mirrors bd.ts's internal BdExec seam; kept local so the test does not widen that module's API. */
@@ -117,7 +117,8 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
     expect(attempts).toBe(2);
   });
 
-  // The other half of that contract: a SUCCESSFUL preflight is not repeated for the same repo.
+  // The other half of that contract: a SUCCESSFUL preflight is not repeated for the same repo
+  // while it is still fresh — the ~10s beat must not become a `bd dolt test` every ~10s.
   it("preflights once per repo across passes once the server answers", async () => {
     const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
     let attempts = 0;
@@ -128,6 +129,41 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
     await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
     await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
     expect(attempts).toBe(1);
+  });
+
+  /**
+   * The reason that cache EXPIRES (PR #174 review). A server that passed the probe at startup and
+   * then went down would otherwise be reported healthy forever: server mode does nothing else on
+   * the beat, so nothing would ever contradict the cached pass. After the TTL the probe runs again
+   * and the outage rejects the pass, which is what puts it in the sync-status registry.
+   */
+  it("re-probes after the TTL, so a server that dies post-startup surfaces", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    let up = true;
+    let attempts = 0;
+    const exec: TestExec = async (_cwd: string, args: string[]) => {
+      if (args.join(" ") === "dolt test") {
+        attempts++;
+        if (!up) throw new Error("dial tcp 127.0.0.1:3306: connection refused");
+      }
+      return "";
+    };
+
+    vi.useFakeTimers();
+    try {
+      await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+      up = false;
+      // Still inside the TTL: the cached pass holds and the dead server goes unnoticed.
+      vi.advanceTimersByTime(PREFLIGHT_TTL_MS - 1);
+      await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+      expect(attempts).toBe(1);
+
+      vi.advanceTimersByTime(1);
+      await expect(runDoltSync(dir, exec, "full")).rejects.toThrow(/unreachable/);
+      expect(attempts).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("still runs the full pull/commit/push in embedded mode", async () => {

@@ -158,8 +158,8 @@ solo board's only propagation path.
 **Configuring server mode.** One command, per project: `anton server-mode <repo> --host … --port …
 --user … --database …` (anton-yvjd, `src/lib/beads/server-mode.mjs`). It backs the board up
 (`bd export --all` into a self-ignored `.beads/backups/`), writes the file below, verifies with
-`bd dolt test`, **reads the board back from the server** and compares the issue count with what the
-project had a moment earlier, then publishes the connection as the team default. Any failure after
+`bd dolt test`, **reads the board back from the server** and confirms every issue id the project
+held a moment earlier is present there, then publishes the connection as the team default. Any failure after
 the write **reverts `metadata.json` byte-for-byte** — in server mode there is no local copy to fall
 back on, so a project left pointing at a server it cannot read is a board outage, and a half-applied
 switch is worse than none.

@@ -122,12 +122,14 @@ anton server-mode PROJECT --host HOST --port PORT --user USER --database DB
 
 That command is the whole config half. It:
 
-1. counts the board as it stands, and **backs it up** (`bd export --all` into `.beads/backups/`,
-   skip with `--no-backup`);
+1. reads the board's issue ids as it stands, and **backs it up** (`bd export --all` into
+   `.beads/backups/`, skip with `--no-backup`);
 2. writes `dolt_mode`/host/port/user/database into `.beads/metadata.json`, preserving every other
    key in that file;
 3. runs **`bd dolt test`**;
-4. **reads the board back from the server** and compares the issue count with the pre-switch count;
+4. **reads the board back from the server** and confirms every pre-switch issue id is present in
+   the server's copy — by identity, not cardinality, because a stale or divergent copy of the same
+   project can hold as many issues (or more) while missing the ones written here since it diverged;
 5. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
    team-wide default, so the next clone inherits the target.
 
@@ -139,10 +141,10 @@ keeps working exactly as it did. The two failures you are most likely to see:
   `metadata.json` vs. the database's). You pointed at the wrong database, or Phase 1 has not
   happened. **`bd dolt test` passes in this state** — connecting is not the same as being able to
   read, which is why the command checks both.
-- *"the server's … database holds N issues but this board has M"* — the server is reachable and is
-  this project's, but the copy did not land (or landed in another database). Re-run Phase 1.
-  `--force` accepts the mismatch deliberately; it is for starting a fresh board, not for finishing
-  this runbook.
+- *"the server's … database is missing N of this board's M issues (…)"* — the server is reachable
+  and is this project's, but the copy did not land, landed in another database, or is a stale copy
+  from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
+  the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
 
 Also worth knowing: the password variable is **per user** (`BEADS_DOLT_PASSWORD_BEADS` for user
 `beads`) and that mapping is anton's, applied when anton spawns bd. A `bd` you run **by hand** reads
@@ -155,7 +157,9 @@ support TLS").
 
 1. **The same board, from a second machine.** On another clone — one with no local Dolt DB at all —
    run the same `anton server-mode …` command and confirm it reports the same issue count. That is
-   the whole point of the move: the second machine hydrates nothing and syncs nothing.
+   the whole point of the move: the second machine hydrates nothing and syncs nothing. (On that
+   machine the arrived-whole check compares the server against a board with nothing local in it, so
+   it passes trivially — the count it prints is the assertion worth reading.)
 2. **Spot-check content**, not just cardinality: `bd list --status all | tail`, one `bd show <id>`
    with dependencies and labels.
 3. **Drop the stale `refs/dolt/data` remotes.** They came over from embedded mode and are now inert
