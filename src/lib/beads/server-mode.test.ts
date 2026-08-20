@@ -200,6 +200,23 @@ describe("readBoardIds", () => {
     expect(ids(`warning: pass [--all] instead\n${payload}\n`)).toEqual({ ok: true, ids: ["probe-1"] });
   });
 
+  // The scan budget belongs to the payload, not to the warning in front of it: a bounded search
+  // that spends every attempt on the closes behind a warning's stray `{` reports "no readable
+  // board" on exactly the large boards this migration exists for (PR #174 review).
+  it("still finds the board behind a brace-bearing warning when the board is large", () => {
+    const many = Array.from({ length: 250 }, (_, n) => ({ id: `probe-${n + 1}` }));
+    const stdout = `warning: use {dolt.auto-commit} instead\n${JSON.stringify({ issues: many })}\n`;
+    expect(ids(stdout)).toEqual({ ok: true, ids: many.map((i) => i.id) });
+  });
+
+  // A `}` inside an issue's own text is not the end of the payload.
+  it("reads a board whose issue text carries brackets of its own", () => {
+    expect(ids('{"issues": [{"id": "probe-1", "title": "use {dolt.auto-commit} [now]"}]}')).toEqual({
+      ok: true,
+      ids: ["probe-1"],
+    });
+  });
+
   // An issue's own nested arrays parse perfectly well and are not the board — "it parsed" is not
   // enough, or a board would be read as its first issue's dependency list.
   it("does not mistake an issue's nested array for the board", () => {

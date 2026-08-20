@@ -87,6 +87,7 @@ describe("parseServerModeArgs", () => {
       backup: true,
       force: false,
       unknown: [],
+      missing: [],
     });
   });
 
@@ -100,6 +101,7 @@ describe("parseServerModeArgs", () => {
       backup: true,
       force: false,
       unknown: [],
+      missing: [],
     });
     // A flag VALUE is never mistaken for the path, whichever form it takes.
     expect(parseServerModeArgs(["--host=h", "--database=d", "/repos/foo"])).toMatchObject({
@@ -124,6 +126,24 @@ describe("parseServerModeArgs", () => {
     });
     expect(parseServerModeArgs(["--hots=new-host"])).toMatchObject({ unknown: ["--hots"] });
     expect(parseServerModeArgs(["-h"])).toMatchObject({ unknown: ["-h"] });
+  });
+
+  // Same failure as a typo, by a different route: a value flag left empty reads as "omitted", and
+  // an omitted field falls back to the repo's existing metadata — a verified switch to the wrong
+  // target (PR #174 review).
+  it("collects a value flag left without a value instead of reading it as omitted", () => {
+    expect(parseServerModeArgs(["/repos/foo", "--database"])).toMatchObject({
+      missing: ["--database"],
+      database: null,
+      path: "/repos/foo",
+    });
+    expect(parseServerModeArgs(["--host="])).toMatchObject({ missing: ["--host"], host: null });
+    // The token behind it is a flag, not its value: both are read on their own terms.
+    expect(parseServerModeArgs(["--host", "--port", "3307"])).toMatchObject({
+      missing: ["--host"],
+      host: null,
+      port: "3307",
+    });
   });
 });
 
@@ -158,6 +178,17 @@ describe("anton server-mode (end to end over a stub bd)", () => {
 
     expect(r.status).toBe(1);
     expect(r.stdout).toContain("unknown flag --hots");
+    expect(p.raw()).toBe(before);
+  });
+
+  it("refuses a value flag with no value rather than silently reusing the repo's own connection", async () => {
+    const p = await project();
+    const before = p.raw();
+
+    const r = p.run(["--host", "dolt.example.dev", "--database"]);
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("missing value for --database");
     expect(p.raw()).toBe(before);
   });
 

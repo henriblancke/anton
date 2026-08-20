@@ -161,11 +161,35 @@ export function restoreFile(path, before) {
 const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
 
 /**
- * How many candidate spans {@link parseJsonPayload} will parse before giving up. Each attempt
- * parses a slice that is megabytes on a large board, so an stdout that holds no payload at all must
- * fail fast rather than square its own length.
+ * How many candidate openers {@link parseJsonPayload} will parse before giving up. One attempt per
+ * opener, never per close: a budget spent enumerating the closes behind a single opener is a budget
+ * a warning's stray `{` can exhaust before the real payload is ever reached (PR #174 review).
  */
-const MAX_JSON_SPANS = 100;
+const MAX_JSON_CANDIDATES = 100;
+
+/**
+ * Index of the bracket that closes the one at `start`, or -1 when nothing does.
+ *
+ * String-aware, because an issue's own text is free to contain a `}`. The walk starts fresh at
+ * `start` rather than tracking quotes across the whole of stdout, so an odd quote in a warning
+ * printed BEFORE the payload cannot desynchronise the payload's own scan.
+ */
+function matchingClose(text, start) {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === "\\") i++;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") depth++;
+    else if ((ch === "}" || ch === "]") && --depth === 0) return i;
+  }
+  return -1;
+}
 
 /**
  * The JSON payload in `text` that `accept` recognises, or `undefined`.
@@ -173,9 +197,12 @@ const MAX_JSON_SPANS = 100;
  * Neither "first `{` to last `}`" nor "the last span that parses" is safe on its own: bd brackets
  * its `--json` output with deprecation warnings free to contain brackets of their own (`use
  * {dolt.auto-commit} instead`), so the first would swallow a warning, while the second would hand
- * back an issue's OWN nested object or array. Every `{`/`[` start is tried left-to-right against
- * every matching close right-to-left (widest span first) — and `accept` alone decides that a span
- * is the payload, because "it parsed" plainly is not enough to know that it is.
+ * back an issue's OWN nested object or array. So each `{`/`[` is tried left-to-right against the
+ * ONE close that balances it — and `accept` alone decides that a span is the payload, because "it
+ * parsed" plainly is not enough to know that it is.
+ *
+ * Balancing rather than guessing the close is also what keeps the budget honest: a warning's stray
+ * bracket costs one attempt, however many issues follow it.
  *
  * `accept` is handed the parsed value and its raw span, and returns the value to hand back, or
  * `undefined` to keep scanning.
@@ -185,21 +212,18 @@ function parseJsonPayload(text, accept) {
   for (let i = 0; i < text.length; i++) {
     const open = text[i];
     if (open !== "{" && open !== "[") continue;
-    const close = open === "{" ? "}" : "]";
-    // `e > i` also guards the walk: `lastIndexOf(close, -1)` clamps its start to 0 rather than
-    // giving up, so a close at index 0 would otherwise be handed back forever.
-    for (let e = text.lastIndexOf(close); e > i; e = text.lastIndexOf(close, e - 1)) {
-      if (++attempts > MAX_JSON_SPANS) return undefined;
-      const span = text.slice(i, e + 1);
-      let parsed;
-      try {
-        parsed = JSON.parse(span);
-      } catch {
-        continue; // not this span — narrow the close, then keep walking the start right
-      }
-      const taken = accept(parsed, span);
-      if (taken !== undefined) return taken;
+    if (++attempts > MAX_JSON_CANDIDATES) return undefined;
+    const end = matchingClose(text, i);
+    if (end < 0) continue; // an unbalanced bracket — a warning's, never a payload's
+    const span = text.slice(i, end + 1);
+    let parsed;
+    try {
+      parsed = JSON.parse(span);
+    } catch {
+      continue; // balanced but not JSON — keep walking the openers right
     }
+    const taken = accept(parsed, span);
+    if (taken !== undefined) return taken;
   }
   return undefined;
 }
@@ -240,7 +264,11 @@ const LIST_ALL_IDS_ARGS = [
  */
 export function readBoardIds(dir, opts = {}) {
   const exec = scopedBdRunner(dir, opts.user, opts);
-  const ms = budgetMs("bd");
+  // The network budget, not the local `bd` one: in server mode this listing crosses the wire to the
+  // Dolt server, exactly like the export in `backupBoard`. On a large board over a slow link the
+  // 60s local budget times out — and a timeout here is not a warning, it is a refused flip before
+  // it and a full revert after it (PR #174 review).
+  const ms = budgetMs("network");
   const r = exec("bd", LIST_ALL_IDS_ARGS, ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
 

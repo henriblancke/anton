@@ -1554,7 +1554,8 @@ const SERVER_MODE_FLAGS = "[path] --host <h> [--port <n>] [--user <u>] --databas
 /**
  * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
  * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs. Anything
- * else lands in `unknown`, which the command refuses on rather than running a half-read connection.
+ * else lands in `unknown`, and a value flag left without a value lands in `missing` — the command
+ * refuses on either rather than running a half-read connection.
  */
 function parseServerModeArgs(args) {
   const VALUE_FLAGS = {
@@ -1564,7 +1565,17 @@ function parseServerModeArgs(args) {
     "--database": "database",
     "--db": "database",
   };
-  const out = { path: null, host: null, port: null, user: null, database: null, backup: true, force: false, unknown: [] };
+  const out = {
+    path: null,
+    host: null,
+    port: null,
+    user: null,
+    database: null,
+    backup: true,
+    force: false,
+    unknown: [],
+    missing: [],
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--no-backup") {
@@ -1579,7 +1590,18 @@ function parseServerModeArgs(args) {
     const flag = eq ? eq[1] : a;
     const key = VALUE_FLAGS[flag];
     if (key) {
-      out[key] = eq ? eq[2] : (args[++i] ?? null);
+      const value = eq ? eq[2] : args[i + 1];
+      // A value flag with nothing usable behind it is a typo, not an omission — and it must not read
+      // as one: resolveServerConnection falls back to the repo's existing metadata for every field
+      // left null, so a trailing `--database` would verify and publish the OLD database and still
+      // exit 0 (PR #174 review). The next token is left unconsumed when it is itself a flag, so it
+      // still gets parsed on its own terms.
+      if (value === undefined || value === "" || (!eq && value.startsWith("-"))) {
+        out.missing.push(flag);
+        continue;
+      }
+      out[key] = value;
+      if (!eq) i++;
       continue;
     }
     // A typo is collected, never ignored: on a repo that already carries a connection, ignoring
@@ -1611,8 +1633,12 @@ const SERVER_MODE_MARKS = {
 
 async function cmdServerMode(args = []) {
   const parsed = parseServerModeArgs(args);
-  if (parsed.unknown.length) {
-    console.log(c.red(`anton server-mode: unknown flag${parsed.unknown.length === 1 ? "" : "s"} ${parsed.unknown.join(", ")}`));
+  const malformed = [
+    parsed.unknown.length ? `unknown flag${parsed.unknown.length === 1 ? "" : "s"} ${parsed.unknown.join(", ")}` : null,
+    parsed.missing.length ? `missing value for ${parsed.missing.join(", ")}` : null,
+  ].filter(Boolean);
+  if (malformed.length) {
+    for (const m of malformed) console.log(c.red(`anton server-mode: ${m}`));
     console.log(c.dim(`  usage: anton server-mode ${SERVER_MODE_FLAGS}\n`));
     return 1;
   }
