@@ -1023,9 +1023,10 @@ export function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutM
  *
  * Separated from the retraction itself so a caller that has to snapshot config.yaml for a rollback
  * only pays for the snapshot when there is in fact a write coming, and so the retraction can be
- * ordered ahead of a connection PROBE rather than behind it (`server-mode.mjs`): a stale
- * `dolt.user` makes bd authenticate as the wrong account, so a probe run before the retraction
- * tests the wrong identity and fails a switch that would have worked.
+ * ordered ahead of a connection PROBE rather than behind it — by `server-mode.mjs` before its own
+ * `bd dolt test`, and by `configureBeadsForRepo` before the preflight's: a stale `dolt.user` makes
+ * bd authenticate as the wrong account, so a probe run before the retraction tests the wrong
+ * identity and fails a board that would have connected.
  *
  * @param {string} beadsDir `<dir>/.beads`
  * @param {{ host?: string, port?: number, user?: string, database?: string }} info from readDoltMetadata
@@ -1332,9 +1333,9 @@ export function detectHooksManager(dir, priorHooksPath = null) {
 }
 
 /**
- * Run the full beads team-config path for `dir`, idempotently. Steps: workspace creation
- * (`bd init` when `.beads/` is absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else
- * no-op) → config.yaml enforcement → `.beads/.gitignore` → formulas (bead skeleton + run pipeline) →
+ * Run the full beads team-config path for `dir`, idempotently. Steps: stale-connection retraction
+ * (server mode, ahead of the preflight probe) → workspace creation (`bd init` when `.beads/` is
+ * absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else no-op) → config.yaml enforcement → `.beads/.gitignore` → formulas (bead skeleton + run pipeline) →
  * Dolt remote wiring. Every step is best-effort and its outcome is collected in `steps`/`errors`
  * rather than thrown — the caller decides how loud to be (the CLI prints each step; addProject logs
  * a summary) and a step failure never aborts the caller.
@@ -1379,6 +1380,30 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // metadata.json in bd's precedence (anton-ffmw.1). Built once, from the connection just read, so
   // init, bootstrap and the config writes all address the same database with the same credentials.
   const exec = scopedBdRunner(dir, connection, opts);
+
+  // 0b. Clear a stale optional connection key BEFORE the preflight, for the same reason
+  //     `server-mode.mjs` clears one before its own probe (PR #174 review): metadata.json outranks
+  //     config.yaml but does not erase it, so a board that stopped declaring `dolt_server_user` —
+  //     moving to bd's default account — while config.yaml still publishes an older `dolt.user` is
+  //     a board bd authenticates as that older account. The preflight's `bd dolt test` would then
+  //     probe the wrong identity and fail, and since the preflight returns early, step 2b's
+  //     retraction below could never run: `anton init` would refuse the project on a fault it is
+  //     carrying the fix for. Clearing it first means the probe tests the identity this project
+  //     actually declares.
+  //     Fatal if it will not come off, exactly as in step 2b: the key decides which account every
+  //     later bd call uses, so a probe past it proves nothing and the only fix is the operator's.
+  if (mode === "server") {
+    for (const { key, metaKey } of staleConnectionKeys(beadsDir, connection)) {
+      const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
+      steps.push(retracted);
+      if (retracted.status === "failed") {
+        emit(`${retracted.name} — ${retracted.detail}`);
+        errors.push(retracted.detail);
+        return { configured: false, skipped: false, mode, ranInit: false, steps, errors, hasBeads: true };
+      }
+      emit(`${retracted.name} (${retracted.status})`);
+    }
+  }
 
   // The preflight runs through the SAME runner as everything below it. Its server-mode leg spawns a
   // real `bd dolt test`, so left unscoped it would probe with `process.env` — reporting a board

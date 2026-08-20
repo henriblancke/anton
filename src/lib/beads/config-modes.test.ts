@@ -552,6 +552,54 @@ describe("beadsPrereqs — the mode decides what must be reachable (anton-eg46)"
     expect(calls).toContainEqual(["bd", "dolt", "test"]);
     expect(bd.calls()).not.toContain("dolt test");
   });
+
+  /**
+   * A board that stops declaring `dolt_server_user` (moving to bd's default account) while
+   * config.yaml still publishes an older `dolt.user` is a board bd authenticates as that older
+   * account. The preflight probe must not be the thing that decides it: it would fail on the stale
+   * identity and return early, so the retraction that repairs it — downstream of the preflight —
+   * could never run, and no re-run would ever get past it (PR #174 review).
+   *
+   * Run against a real stub bd whose `dolt test` answers from config.yaml, because what is under
+   * test is the ORDER of a real write and a real probe.
+   */
+  it("clears a stale dolt.user before probing, so the switch to bd's default account can happen", () => {
+    // No `dolt_server_user`: this board has moved to bd's default account.
+    const dir = gitRepo({ ...SERVER_METADATA, dolt_server_user: undefined });
+    // The nested encoding bd 1.1.0 writes — the one `bd config unset` reports success on without
+    // actually striking, which is why the retraction re-reads the file and strikes it itself.
+    writeFileSync(join(dir, ".beads", "config.yaml"), "dolt:\n  user: retired-account\n");
+
+    const bin = mkdtempSync(join(tmpdir(), "anton-modes-bin-"));
+    dirs.push(bin);
+    const cfg = join(dir, ".beads", "config.yaml");
+    writeFileSync(
+      join(bin, "bd"),
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        "const a = process.argv.slice(2);",
+        `if (a[0] === "--version" || a[0] === "--help") { console.log("bd version ${MIN_BD_VERSION} (stub)"); process.exit(0); }`,
+        // Authenticating as whoever config.yaml still names: the retired account is refused.
+        'if (a[0] === "dolt" && a[1] === "test") {',
+        `  const text = fs.readFileSync(${JSON.stringify(cfg)}, "utf8");`,
+        '  if (/^\\s*user: retired-account/m.test(text)) { console.error("Access denied for user \'retired-account\'"); process.exit(1); }',
+        "}",
+        "process.exit(0);",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(join(bin, "bd"), 0o755);
+    process.env.PATH = `${bin}${delimiter}${prevPath ?? ""}`;
+
+    const result = configureBeadsForRepo(dir, { log: () => {} });
+
+    expect(configYamlValue(join(dir, ".beads"), "dolt.user")).toBeUndefined();
+    expect(result.steps).toContainEqual(expect.objectContaining({ name: "dolt.user", status: "cleared" }));
+    // Past the preflight — the probe tested the identity this project actually declares.
+    expect(result.skipped).toBe(false);
+    expect(result.errors).toEqual([]);
+  });
 });
 
 describe("formatServerTarget", () => {
