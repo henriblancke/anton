@@ -272,8 +272,12 @@ const PUBLISHED_METADATA_KEYS = new Set(Object.values(SERVER_METADATA_KEYS));
  * switched (PR #174 review). Content is compared instead, and ONLY bd's re-encoding is forgiven:
  * every key this run wrote must still carry the value it wrote — loosely for the connection keys bd
  * rewrites, since it re-serializes a port as its own JSON type, and exactly for everything else,
- * `project_id` and `backend` included — and the only keys allowed to have appeared are those same
- * connection keys. Anything else is an edit a restore would discard, and is refused as before.
+ * `project_id` and `backend` included. A key that was NOT in what this run wrote is nobody's
+ * re-encoding: publication only ever re-serializes keys metadata.json already declared (the flip
+ * merges over them, so every one of them is in `wrote`), while an optional field this run left out —
+ * `dolt_server_tls`, an absent `dolt_server_user` — can only have APPEARED because somebody else
+ * added it, and forgiving that would let the restore silently drop their edit (PR #174 review).
+ * Anything this run did not write, whatever its key, is refused as before.
  */
 function isPublicationRewrite(text, wrote) {
   if (typeof text !== "string" || typeof wrote !== "string") return false;
@@ -288,10 +292,10 @@ function isPublicationRewrite(text, wrote) {
   const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
   if (!isObject(now) || !isObject(mine)) return false;
   for (const key of new Set([...Object.keys(mine), ...Object.keys(now)])) {
-    if (PUBLISHED_METADATA_KEYS.has(key)) {
-      // A key only the rewrite has is bd filling in a connection field; one only the flip has is bd
-      // dropping it. Both compare a value against `undefined` here, so only the first passes.
-      if (!(key in mine)) continue;
+    if (PUBLISHED_METADATA_KEYS.has(key) && key in mine) {
+      // Loose only for a connection key this run actually wrote: bd re-serializes a port as its own
+      // JSON type. A key only the rewrite has falls through to the exact compare below — against
+      // `undefined` — and so is refused.
       if (String(now[key]) !== String(mine[key])) return false;
     } else if (stableJson(now[key]) !== stableJson(mine[key])) {
       return false;

@@ -603,6 +603,35 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The forgiveness covers bd re-encoding the keys this run WROTE — not a key appearing out of
+   * nowhere. An optional field the flip left out (`dolt_server_tls` here) can only have been added
+   * by somebody else, and restoring the pre-flip text over it would discard that edit silently
+   * (PR #174 review).
+   */
+  it("keeps metadata.json when an optional connection key it never wrote appears during publication", () => {
+    const dir = repo(EMBEDDED);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        const meta = readMetadata(dir);
+        writeFileSync(metadataPath(dir), `${JSON.stringify({ ...meta, dolt_server_tls: true }, null, 2)}\n`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readMetadata(dir).dolt_server_tls).toBe(true);
+    expect(result.steps.some((s: { status: string }) => s.status === "kept")).toBe(true);
+    expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(false);
+    expect(result.warnings.some((w: string) => w.includes("edited after this command wrote the switch"))).toBe(true);
+  });
+
+  /**
    * A rollback must not become the thing that loses work (PR #174 review). Everything after the flip
    * — the connection test, the server's export, the publication — takes long enough for another
    * clone's switch or a person fixing the connection to edit metadata.json, and restoring the
