@@ -384,6 +384,32 @@ export interface ReconcileResult {
   failed: string[];
 }
 
+/** The one phrase that marks a close as a fold. Written by {@link foldReason}, read by nothing else. */
+const FOLD_REASON_PREFIX = "duplicate of ";
+
+/**
+ * Why a folded duplicate was closed — built here rather than inline, because TWO readers depend on
+ * telling this close from an apply's.
+ *
+ * A fold is a PLAIN close on purpose (see {@link reconcileDuplicateProposals}), so nothing about the
+ * bead's status distinguishes "the founder accepted this ask" from "overlapping patrols filed it
+ * twice and we kept the other one". The settled-proposal record (track-record.ts) counts the first as
+ * evidence a kind can be armed on, and counting the second would score every fold as a success —
+ * inflating precision exactly when a detector is at its noisiest, which is the failure mode
+ * inverted. One builder, one predicate, so the writer and the reader cannot drift.
+ */
+export function foldReason(keep: string, fingerprint: string): string {
+  return (
+    `${FOLD_REASON_PREFIX}${keep}: overlapping patrols filed the same claim ` +
+    `(${fingerprint}) twice — ${keep} carries the ask`
+  );
+}
+
+/** Was this close a {@link foldReason} — a duplicate withdrawn — rather than an apply or a decline? */
+export function isFoldReason(reason: unknown): boolean {
+  return typeof reason === "string" && reason.trimStart().startsWith(FOLD_REASON_PREFIX);
+}
+
 export interface ReconcileOptions {
   /** The patrol's cancel signal, checked between closes. */
   signal?: AbortSignal;
@@ -436,12 +462,7 @@ export async function reconcileDuplicateProposals(
             !isOpenWork(live) ||
             !unclaimedTwin(live);
           if (stale) return false;
-          await beads.close(
-            repo,
-            id,
-            `duplicate of ${duplicate.keep}: overlapping patrols filed the same claim ` +
-              `(${duplicate.fingerprint}) twice — ${duplicate.keep} carries the ask`,
-          );
+          await beads.close(repo, id, foldReason(duplicate.keep, duplicate.fingerprint));
           return true;
         });
         if (folded) result.folded.push({ id, into: duplicate.keep });

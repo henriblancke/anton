@@ -20,7 +20,11 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { planApply, toBdStampGrid, type ApplyMoment } from "./apply";
-import { autonomyFor, type ProposalAutonomyPolicy } from "./autonomy";
+import {
+  autonomyFor,
+  type ProposalAutonomyPolicy,
+  type ProposalTrackRecord,
+} from "./autonomy";
 import {
   planOf,
   type GardenerDetectionKind,
@@ -60,6 +64,15 @@ export interface ShadowInput {
   /** What the pass just filed — shadowed in the order it was filed. */
   created: EmittedProposal[];
   policy: ProposalAutonomyPolicy;
+  /**
+   * What this board's settled proposals say about each kind (anton-m29g) — read off the caller's own
+   * snapshot, alongside the policy, and threaded through to `autonomyFor` so the shadow set is picked
+   * by the identical resolver the pass acts on rather than by a second reading of the policy.
+   *
+   * The earned floor gates `apply` alone: a kind set to `shadow` is unaffected by its record and
+   * reaches here unchanged — which is how an unearned kind builds one in the first place.
+   */
+  record: ProposalTrackRecord;
   /** The pass's own board snapshot stamp: what every premise check dates "since we asked" against. */
   observedAtMs?: number;
   nowMs: number;
@@ -81,10 +94,11 @@ export interface ShadowInput {
 function shadowable(
   created: EmittedProposal[],
   policy: ProposalAutonomyPolicy,
+  record: ProposalTrackRecord,
 ): Array<{ proposal: EmittedProposal; plan: GardenerPlan }> {
   return created.flatMap((proposal) => {
     const plan = planOf(proposal.detection);
-    return autonomyFor(plan.kind, plan, policy) === "shadow" ? [{ proposal, plan }] : [];
+    return autonomyFor(plan.kind, plan, policy, record) === "shadow" ? [{ proposal, plan }] : [];
   });
 }
 
@@ -97,7 +111,7 @@ function shadowable(
  * would report a verdict the armed pass would not have reached.
  */
 export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[]> {
-  const targets = shadowable(input.created, input.policy);
+  const targets = shadowable(input.created, input.policy, input.record);
   if (targets.length === 0 || input.signal?.aborted) return [];
 
   let board: Bead[];
