@@ -36,7 +36,9 @@
  *      `metadata.json` write, milliseconds rather than the minutes an export takes.
  *
  * On any of those failures `metadata.json` AND `.beads/config.yaml` are restored byte-for-byte, so a
- * failed attempt leaves a working board rather than a project pointed at a server it cannot read.
+ * failed attempt leaves a working board rather than a project pointed at a server it cannot read —
+ * unless something else has edited one of them since, which is reported and left alone rather than
+ * overwritten.
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -52,7 +54,9 @@ import {
   ensureDoltConnection,
   failureDetail,
   hasLocalDoltDb,
+  parseConfigYaml,
   passwordVarHint,
+  publishedConfigKeys,
   readDoltMetadata,
   retractStaleConnectionKey,
   scopedBdRunner,
@@ -304,6 +308,30 @@ function isPublicationRewrite(text, wrote) {
     }
   }
   return true;
+}
+
+/** Every config.yaml key a switch to server mode may publish or retract — see `publishedConfigKeys`. */
+const PUBLISHED_CONFIG_KEYS = new Set(publishedConfigKeys("server"));
+
+/**
+ * The config.yaml keys on which `current` disagrees with `before` and which this run cannot claim —
+ * i.e. somebody else's edit, sorted. Empty means every difference is one of this run's own writes.
+ *
+ * config.yaml's counterpart to {@link isPublicationRewrite}, and there for the same reason
+ * (PR #174 review): between the snapshot and a failed publication there is a window in which an
+ * agent or a person edits the file, and restoring the snapshot over that edit would discard it
+ * silently. Bytes cannot answer who wrote what here — bd's own patches change them too — but keys
+ * can: this run only ever asks bd for {@link PUBLISHED_CONFIG_KEYS}, and bd patches config.yaml one
+ * key at a time, so a value that moved under any other key moved under somebody else's hand.
+ * Compared through bd's own parser, so both encodings (flat dotted lines and bd 1.1.0's nested maps)
+ * read the same, a struck-out key reads as absent, and formatting is not mistaken for an edit.
+ */
+function foreignConfigEdits(before, current, owned = PUBLISHED_CONFIG_KEYS) {
+  const was = parseConfigYaml(before ?? "");
+  const now = parseConfigYaml(current ?? "");
+  return [...new Set([...Object.keys(was), ...Object.keys(now)])]
+    .filter((key) => !owned.has(key) && was[key] !== now[key])
+    .sort();
 }
 
 /**
@@ -880,6 +908,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
    * And never re-taken: what a revert owes the operator is the file as this run FOUND it, so once
    * the retraction below has written, its own pre-image is the snapshot the publication rolls back
    * to as well.
+   * Taking it late narrows the window but cannot close it — an edit can still land while bd is
+   * patching the file — which is why the restore also checks WHICH keys moved before putting these
+   * bytes back ({@link foreignConfigEdits}).
    */
   const snapshotConfig = () => {
     if (configTouched) return { ok: true };
@@ -922,9 +953,12 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
    * is recognized as this run's ({@link isPublicationRewrite}) — without that, every failed
    * publication would decline its own rollback and strand the project in server mode while reporting
    * it was not switched (PR #174 review).
-   * config.yaml is snapshotted immediately before this run first writes it instead
-   * ({@link snapshotConfig}), since bd's own writes make "did someone else change this?"
-   * unanswerable once publication has started.
+   * config.yaml gets the same treatment by KEY rather than by bytes ({@link foreignConfigEdits}),
+   * because bd's own patches change its bytes too: it is snapshotted as late as this run can take it
+   * ({@link snapshotConfig}), and restored only when every key that has moved since is one of the
+   * keys this run asked bd to write. A value that moved under any other key is an edit that landed
+   * in the window the snapshot cannot close — between it and a failed publication — and it is left
+   * standing rather than overwritten (PR #174 review).
    * Neither restore is allowed to throw ({@link tryRestore}).
    */
   const revert = (reason) => {
@@ -961,14 +995,33 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       record("metadata.json", "unchanged", `${reason} — the file already said this, so nothing was written`);
     }
     if (configTouched) {
-      const restored = tryRestore(configPath, configSnapshot);
-      if (!restored.ok) {
-        record("config.yaml", "failed", `${reason} — could not be put back: ${restored.detail}`);
-        errors.push(
-          `${configPath} could not be put back after the switch ${reason}: ${restored.detail}. It may ` +
-            "hold half of the team-wide connection defaults, which every bd command in this project " +
-            "reads. Free up space or fix the permissions on `.beads/`, then check the file against " +
-            "git (`git diff -- .beads/config.yaml`) before re-running.",
+      const current = readFileSnapshot(configPath);
+      const foreign = current.ok ? foreignConfigEdits(configSnapshot, current.text) : null;
+      if (current.ok && current.text === configSnapshot) {
+        record("config.yaml", "unchanged", `${reason} — nothing of this run's ever reached the file`);
+      } else if (foreign && !foreign.length) {
+        const restored = tryRestore(configPath, configSnapshot);
+        if (restored.ok) {
+          record("config.yaml", "reverted", `${reason} — the team-wide defaults are back as they were`);
+        } else {
+          record("config.yaml", "failed", `${reason} — could not be put back: ${restored.detail}`);
+          errors.push(
+            `${configPath} could not be put back after the switch ${reason}: ${restored.detail}. It may ` +
+              "hold half of the team-wide connection defaults, which every bd command in this project " +
+              "reads. Free up space or fix the permissions on `.beads/`, then check the file against " +
+              "git (`git diff -- .beads/config.yaml`) before re-running.",
+          );
+        }
+      } else {
+        const named = foreign?.length ? ` (${foreign.slice(0, 5).join(", ")}${foreign.length > 5 ? ", …" : ""})` : "";
+        record("config.yaml", "kept", `${reason} — edited since the snapshot, so NOT restored`);
+        warnings.push(
+          `${configPath} carries a change this command did not make${named}` +
+            `${current.ok ? "" : ` (${current.detail})`}, so putting the earlier text back would ` +
+            "discard it — the file has been left exactly as it is. It may therefore still hold half " +
+            "of the team-wide connection defaults, which every bd command in this project reads. " +
+            "Check it against git (`git diff -- .beads/config.yaml`) and reconcile it by hand before " +
+            "re-running.",
         );
       }
     }
@@ -1047,8 +1100,22 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   }
   counts.after = recordsAfter.keys.length;
 
+  // Every comparison below (8a missing, 8b diverged, 8c server-only) answers ONE question — did this
+  // board's history arrive on the server — and that question only exists across a COPY boundary.
+  // When both reads hit the same server database there is none: a re-run that changes only the
+  // account or the TLS setting reads one database twice, so a record a teammate edits or deletes
+  // between the two reads comes back divergent or missing from the very database that holds it, and
+  // the run would report a failed migration and roll back a switch that was correct (PR #174
+  // review). Being in server mode is NOT enough to claim that — repointing at another host or
+  // database is a copy boundary again, and every check has to apply — which is what
+  // `sameServerTarget` decides, conservatively.
+  const compareCopy = recordsBefore.ok && !sameServerTarget;
+  if (recordsBefore.ok && sameServerTarget) {
+    record("arrived-whole check", "skipped", "both reads hit the same server database — nothing was copied");
+  }
+
   const onServer = new Set(recordsAfter.keys);
-  const missing = recordsBefore.ok ? recordsBefore.keys.filter((key) => !onServer.has(key)) : [];
+  const missing = compareCopy ? recordsBefore.keys.filter((key) => !onServer.has(key)) : [];
   if (missing.length && !flags.force) {
     errors.push(
       `the server's "${connection.database}" database is missing ${missing.length} of this board's ` +
@@ -1068,7 +1135,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //     check exists to protect. Nothing bd prints proves the server's row descends from this one,
   //     so content equality is the only evidence accepted; `--force` remains the deliberate
   //     override, and the key check still accepts keys the server holds and this board does not.
-  const diverged = recordsBefore.ok
+  const diverged = compareCopy
     ? recordsBefore.keys.filter((key) => onServer.has(key) && recordsAfter.digests.get(key) !== recordsBefore.digests.get(key))
     : [];
   // The stamp picks the fix to name, not the verdict: behind → the copy is old, re-run Phase 1;
@@ -1125,14 +1192,11 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //     either way, and a resurrected bead is deleted again in one command. Refusing would also push
   //     the runbook's second machine onto --force, which switches off the checks above that guard
   //     the unrecoverable half. So the keys are named and the operator decides.
-  //     Suppressed only when both reads hit the SAME server database: there a key in one and not
-  //     the other is a teammate writing between two reads — nothing to do with a copy, and the
-  //     warning would be pure noise. Being in server mode is not enough to claim that (PR #174
-  //     review): repointing a server board at another host or database compares two different
-  //     boards, where a destination-only key is once again either new work or work deleted on the
-  //     board being left — exactly what this warning is for.
+  //     Suppressed with the rest of the copy checks when both reads hit the SAME server database
+  //     (`compareCopy`): there a key in one and not the other is a teammate writing between two
+  //     reads — nothing to do with a copy, and the warning would be pure noise.
   const here = new Set(recordsBefore.ok ? recordsBefore.keys : []);
-  const extra = recordsBefore.ok && !sameServerTarget ? recordsAfter.keys.filter((key) => !here.has(key)) : [];
+  const extra = compareCopy ? recordsAfter.keys.filter((key) => !here.has(key)) : [];
   if (extra.length) {
     const n = extra.length;
     const named = `${extra.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`;

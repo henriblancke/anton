@@ -455,8 +455,11 @@ function* configYamlEntries(text) {
 /**
  * Parse `.beads/config.yaml` into a flat `dotted.path → value` map (surrounding quotes stripped).
  * A later line for the same path wins (bd appends, so this reflects the effective value).
+ *
+ * Exported because a rollback has to compare two TEXTS — the file as a run found it against the file
+ * as it stands — rather than the file on disk against one key (PR #174 review).
  */
-function parseConfigYaml(text) {
+export function parseConfigYaml(text) {
   const map = {};
   for (const { path, value } of configYamlEntries(text)) map[path] = value;
   return map;
@@ -909,6 +912,21 @@ const SERVER_CONNECTION_KEYS = [
   { key: "database", metaKey: "dolt_database", required: true },
   { key: "user", metaKey: "dolt_server_user", required: false },
 ];
+
+/**
+ * Every dotted `config.yaml` key a switch INTO `mode` may write — the team-config knobs plus, in
+ * server mode, the `dolt.*` connection fields (published on the way in, retracted when
+ * metadata.json stops declaring one).
+ *
+ * This is what lets a rollback tell its own writes from somebody else's edit (PR #174 review). bd
+ * patches config.yaml key by key — `bd config set` appends one line, `bd dolt set --update-config`
+ * one per field, `bd config unset` strikes one out — so a difference under any OTHER key was made
+ * by something that is not this run, and is not a difference a revert may quietly overwrite.
+ */
+export function publishedConfigKeys(mode) {
+  const team = teamConfigKeys(mode).map(([key]) => key);
+  return mode === "server" ? [...team, ...SERVER_CONNECTION_KEYS.map(({ key }) => `dolt.${key}`)] : team;
+}
 
 /**
  * Retract a `dolt.<key>` config.yaml still publishes for an OPTIONAL field metadata.json no longer

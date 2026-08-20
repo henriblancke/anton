@@ -805,6 +805,46 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * Taking the snapshot late narrows that window; it does not close it. An edit landing WHILE bd is
+   * patching config.yaml is not in the snapshot, and restoring the snapshot over it would discard it
+   * silently (PR #174 review). Bytes cannot tell bd's own patches from somebody else's edit — keys
+   * can, because this run only ever asks bd for the team-config and `dolt.*` connection keys.
+   */
+  it("keeps config.yaml when an edit under a key this run never writes lands during publication", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        // A teammate's edit lands between two of bd's own patches — after the snapshot was taken.
+        append("some.other.key: set-by-someone-else");
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    // Left exactly as it stands — half a published connection and all — rather than rolled back
+    // over an edit nothing here could put back.
+    expect(readFileSync(configPath, "utf8")).toContain("some.other.key: set-by-someone-else");
+    expect(configYamlValue(join(dir, ".beads"), "backup.enabled")).toBe("false");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(some\.other\.key\)/);
+    // Named as the thing to reconcile, with the command that shows it.
+    expect(result.warnings.join("\n")).toMatch(/git diff -- \.beads\/config\.yaml/);
+  });
+
+  /**
    * The failure this command exists to catch. `bd dolt test` connects to the SERVER; it says nothing
    * about whether this project can open its database there — bd's own project-identity guard refuses
    * a database belonging to another project long after the connection test has passed.
@@ -1303,6 +1343,65 @@ describe("configureServerMode", () => {
       expect(result.extra).toEqual(["probe-8"]);
       expect(result.warnings.join("\n")).toMatch(/holds 1 record this board does not \(probe-8\)/);
       expect(readMetadata(dir).dolt_database).toBe("probe");
+    });
+  });
+
+  /**
+   * A re-run that keeps the same host, port and database — changing only the account or the
+   * transport — reads ONE database twice, so there is no copy to check for arrival. A teammate
+   * closing a bead or deleting one between the two reads is ordinary traffic on a shared board, and
+   * comparing anyway reports records as missing or divergent from the very database that holds them,
+   * then rolls back a switch that was correct (PR #174 review).
+   */
+  describe("a re-run that keeps the same server database", () => {
+    const serverRepo = () =>
+      repo({
+        ...EMBEDDED,
+        dolt_mode: "server",
+        dolt_server_host: CONNECTION.host,
+        dolt_server_port: 3306,
+        dolt_database: "probe",
+        dolt_server_user: "old-account",
+      });
+
+    /** Reads 1 and 2 are the drift check and must agree; the third is the read-back. */
+    const readsThen = (later: string) => {
+      let reads = 0;
+      return (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (isRead(args)) {
+          reads += 1;
+          return { status: 0, stdout: reads < 3 ? listing(BOARD) : later };
+        }
+        return { status: 0 };
+      };
+    };
+
+    it("does not report a teammate's deletion as a board that never arrived", () => {
+      const dir = serverRepo();
+
+      const result = configureServerMode(dir, flags, { exec: readsThen(listing(BOARD.slice(1))) });
+
+      expect(result.ok).toBe(true);
+      expect(result.missing).toEqual([]);
+      expect(result.counts).toEqual({ before: 7, after: 6 });
+      expect(result.steps.find((s: { name: string }) => s.name === "arrived-whole check")).toMatchObject({
+        status: "skipped",
+      });
+      // The switch stands — this run only ever changed the account it connects as.
+      expect(readMetadata(dir).dolt_server_user).toBe("beads");
+    });
+
+    it("does not report a teammate's edit as divergence", () => {
+      const dir = serverRepo();
+      const retitled = exported(BOARD.map((id) => ({ _type: "issue", id, title: id === "probe-2" ? "retitled there" : id })));
+
+      const result = configureServerMode(dir, flags, { exec: readsThen(retitled) });
+
+      expect(result.ok).toBe(true);
+      expect(result.diverged).toEqual([]);
+      expect(result.errors).toEqual([]);
+      expect(readMetadata(dir).dolt_server_user).toBe("beads");
     });
   });
 
