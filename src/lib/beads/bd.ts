@@ -770,7 +770,9 @@ export type SyncOutcome = "synced" | "not-wired" | "shared-server";
 /**
  * Server-mode preflight (anton-eg46). Runs `bd dolt test` at most once per {@link PREFLIGHT_TTL_MS}
  * per repo, on the sync pass that would otherwise have run, and throws an actionable error when the
- * shared server is unreachable.
+ * shared server is unreachable. Carried only by passes with no board write of their own behind them
+ * — the heartbeat and the read-freshness pulls; see `probeServer` on {@link runDoltSync} for why a
+ * post-write pass must not add this second failure boundary.
  *
  * Why it belongs here rather than at boot: it piggybacks on the heartbeat, so the failure lands in
  * the sync-status registry the operator is already watching, and a server that comes back up is
@@ -872,11 +874,22 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
  * flag on the hot sync path. The unconditional repair (`bd recompute-blocked`) is reserved for the
  * places that gap can't reach — a freshly bootstrapped clone that never ran a local merge (see
  * configureBeadsForRepo in config.mjs) — rather than paid on every heartbeat pull.
+ *
+ * `probeServer` gates the server-mode health probe, and must be FALSE for a pass that follows this
+ * caller's own board write (PR #174 review). On a shared server the write IS the publication — it
+ * landed on the one database the moment bd committed it — so callers like `publishLease` and the
+ * step-3c claim publish await this pass only to confirm delivery that already happened. Probing
+ * there adds a SECOND, independent failure boundary after a successful write: a blip between the
+ * write and `bd dolt test` rejects the pass, and the caller reads that as "the lease/claim never
+ * published" and fails the run closed over a mutation every other machine can already see. The
+ * probe belongs on the passes with no write to vouch for them — the heartbeat and the read-
+ * freshness pulls — which is where anton-eg46's fail-loud lands anyway.
  */
 export async function runDoltSync(
   cwd: string,
   exec: BdExec = bd,
   mode: SyncMode = "full",
+  probeServer = true,
 ): Promise<SyncOutcome> {
   // Server mode: there is nothing to reconcile, so this resolves without spawning bd at all
   // (anton-0tul). Every writer is already on the one database, and the pull/push would run ON THE
@@ -886,7 +899,7 @@ export async function runDoltSync(
   // Distinct from "not-wired": that means a board with no propagation path and is worth surfacing;
   // this means propagation is inherent and there is nothing to report.
   if (isServerMode(cwd)) {
-    await preflightSharedServer(cwd, exec);
+    if (probeServer) await preflightSharedServer(cwd, exec);
     return "shared-server";
   }
 
@@ -947,6 +960,7 @@ export function createDoltSync(
   const trailing = new Map<string, { promise: Promise<SyncOutcome>; mode: SyncMode }>();
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
   const trailingNewWork = new Map<string, boolean>(); // did any queued request carry new local work?
+  const trailingProbe = new Map<string, boolean>(); // may the queued pass still run the server probe?
 
   // Repos whose backlog this process has reconciled against the remote — a full pass has pushed
   // (or resolved not-wired) at least once. `unpushedCount` lives only in memory, so after a restart
@@ -958,7 +972,12 @@ export function createDoltSync(
   // commit. A backstop retry (newWork=false) re-attempts already-counted work and commits nothing
   // new, so it must never grow the backlog — otherwise a flaky remote turns one stranded change into
   // "N unpushed" after N failed retries (anton-rn88 review).
-  const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<SyncOutcome> => {
+  const start = (
+    cwd: string,
+    mode: SyncMode,
+    newWork: boolean,
+    probeServer: boolean,
+  ): Promise<SyncOutcome> => {
     recordStatus(cwd, { state: "syncing" });
     // Never start a pass on top of this process's OWN background board read (anton-3dpp). An
     // embedded board is single-holder: `bd dolt pull` takes the repo's exclusive Dolt lock, and a
@@ -997,7 +1016,7 @@ export function createDoltSync(
     };
     const p = Promise.resolve(issueSnapshotRefreshInFlight(cwd))
       .catch(() => {}) // a failed read is the reader's business; it still released the lock
-      .then(() => runDoltSync(cwd, exec, mode))
+      .then(() => runDoltSync(cwd, exec, mode, probeServer))
       .then(record);
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
@@ -1033,25 +1052,37 @@ export function createDoltSync(
     // Only a write-nudge introduces new local work; a backstop or durable "push" retry re-attempts
     // already-counted commits and must never inflate the backlog (anton-rn88).
     const newWork = request === "full";
+    // Only a pass with NO write of its own behind it may run the server-mode health probe — the
+    // heartbeat ("backstop") and the read-freshness pulls. A write-nudge ("full") and the durable
+    // push retry ("push") both follow a board write that, on a shared server, already published
+    // itself; probing after it can only invent a failure the write disproves (see runDoltSync).
+    const probeServer = request === "backstop" || request === "pull";
     const queued = trailing.get(cwd);
     if (queued) {
       if (mode === "full") trailingMode.set(cwd, "full");
       if (newWork) trailingNewWork.set(cwd, true); // a coalesced write carries new work into the pass
+      // Suppression is sticky and one-way: a coalesced pass resolves for EVERY request riding it,
+      // so one post-write caller is enough to disqualify the probe for the whole pass. The
+      // heartbeat that shares it loses nothing — it re-probes on the next beat.
+      if (!probeServer) trailingProbe.set(cwd, false);
       return queued.promise;
     }
     const current = running.get(cwd);
-    if (!current) return start(cwd, mode, newWork);
+    if (!current) return start(cwd, mode, newWork, probeServer);
     trailingMode.set(cwd, mode);
     trailingNewWork.set(cwd, newWork);
+    trailingProbe.set(cwd, probeServer);
     const next = current
       .catch(() => {}) // the current run's failure belongs to its own callers
       .then(() => {
         trailing.delete(cwd);
         const m = trailingMode.get(cwd) ?? "full";
         const nw = trailingNewWork.get(cwd) ?? false;
+        const probe = trailingProbe.get(cwd) ?? false;
         trailingMode.delete(cwd);
         trailingNewWork.delete(cwd);
-        return start(cwd, m, nw);
+        trailingProbe.delete(cwd);
+        return start(cwd, m, nw, probe);
       });
     trailing.set(cwd, { promise: next, mode });
     return next;

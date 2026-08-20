@@ -277,10 +277,87 @@ describe("the sync coalescer in server mode (anton-0tul)", () => {
     expect(getSyncStatus(dir)).toMatchObject({ state: "shared-server", unpushedCount: 0, lastError: null });
 
     // The backstop is the heartbeat's request; an unreconciled repo would force a full pull/commit/
-    // push pass. The preflight is cached by now, so this beat must spawn nothing at all.
+    // push pass. Here it costs the health probe and nothing else — never pull/commit/push.
+    calls.length = 0;
+    await expect(sync(dir, "backstop")).resolves.toBe("shared-server");
+    expect(calls.map((a) => a.join(" "))).toEqual(["dolt test"]);
+
+    // ...and the probe's TTL keeps the next beat free, so the ~10s heartbeat is not a `bd dolt
+    // test` every ~10s.
     calls.length = 0;
     await expect(sync(dir, "backstop")).resolves.toBe("shared-server");
     expect(calls).toEqual([]);
+  });
+
+  /**
+   * The false-failure this suppression exists to prevent (PR #174 review). `publishLease` writes the
+   * lease and then awaits `beads.sync` purely to confirm delivery; on a shared server that write
+   * already published itself. A probe here is a second, independent failure boundary AFTER a
+   * successful write — a blip on it rejects the pass, and the caller reads that as "the lease never
+   * published" and fails the run closed over a lease every other machine can already see.
+   */
+  it("runs no health probe on a post-write pass, so a blip cannot fail a published write", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const calls: string[][] = [];
+    const sync = createDoltSync(async (_cwd: string, args: string[]) => {
+      calls.push(args);
+      if (args.join(" ") === "dolt test") throw new Error("dial tcp 127.0.0.1:3306: connection refused");
+      return "";
+    });
+
+    // The write-nudge (`beads.sync`) and the durable push job both follow a board write.
+    await expect(sync(dir, "full")).resolves.toBe("shared-server");
+    await expect(sync(dir, "push")).resolves.toBe("shared-server");
+    expect(calls).toEqual([]);
+  });
+
+  // The other half: anton-eg46's fail-loud is untouched on the passes that have no write vouching
+  // for them — the heartbeat and the read-freshness pull still surface an unreachable server.
+  it("still fails loud on the heartbeat and on a read-freshness pull", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const sync = createDoltSync(async (_cwd: string, args: string[]) => {
+      if (args.join(" ") === "dolt test") throw new Error("dial tcp 127.0.0.1:3306: connection refused");
+      return "";
+    });
+
+    await expect(sync(dir, "backstop")).rejects.toThrow(/unreachable/);
+    await expect(sync(dir, "pull")).rejects.toThrow(/unreachable/);
+    expect(getSyncStatus(dir).state).toBe("failing");
+  });
+
+  /**
+   * Suppression has to survive coalescing, because a coalesced pass resolves for EVERY request
+   * riding it: a write-nudge that lands on a queued heartbeat pass would otherwise inherit that
+   * pass's probe and the exact false failure above. One post-write caller disqualifies the probe
+   * for the whole pass; the heartbeat re-probes on the next beat.
+   */
+  it("suppresses the probe for a whole pass when a write-nudge coalesces into a heartbeat", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const calls: string[][] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let first = true;
+    const sync = createDoltSync(async (_cwd: string, args: string[]) => {
+      calls.push(args);
+      if (first) {
+        first = false;
+        await gate; // hold the in-flight pass open so the next requests must queue behind it
+      }
+      if (args.join(" ") === "dolt test") throw new Error("dial tcp 127.0.0.1:3306: connection refused");
+      return "";
+    });
+
+    // The in-flight heartbeat probes and FAILS, so nothing is cached — without that, the probe's
+    // TTL alone would keep the trailing pass quiet and this would prove nothing about suppression.
+    const running = sync(dir, "backstop");
+    const queued = sync(dir, "backstop"); // queues a trailing pass that would probe
+    const nudge = sync(dir, "full"); // ...the write-nudge rides it, so it must not
+    release();
+
+    await expect(running).rejects.toThrow(/unreachable/);
+    await expect(queued).resolves.toBe("shared-server");
+    await expect(nudge).resolves.toBe("shared-server");
+    expect(calls.map((a) => a.join(" "))).toEqual(["dolt test"]); // the trailing pass probed nothing
   });
 
   it("leaves an embedded repo's pass reporting synced", async () => {
