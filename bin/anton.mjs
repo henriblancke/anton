@@ -1641,6 +1641,10 @@ const SERVER_MODE_MARKS = {
   unset: () => c.dim("·"),
   skipped: () => c.dim("·"),
   reverted: () => c.yellow("↩"),
+  // A revert that declined to overwrite an edit someone else made after the flip — the file is
+  // theirs now, and the warning below says what is left pointing where.
+  kept: () => c.yellow("⚠"),
+  unchanged: () => c.dim("·"),
   failed: () => c.red("✗"),
   missing: () => c.red("✗"),
   unreadable: () => c.red("✗"),

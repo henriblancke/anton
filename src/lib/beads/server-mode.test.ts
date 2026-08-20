@@ -542,6 +542,92 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * A rollback must not become the thing that loses work (PR #174 review). Everything after the flip
+   * — the connection test, the server's export, the publication — takes long enough for another
+   * clone's switch or a person fixing the connection to edit metadata.json, and restoring the
+   * pre-flip text over that edit would discard it with no way back. The run keeps the file and says
+   * the project is still pointed at the server instead.
+   */
+  it("does NOT roll metadata.json back over an edit that landed after the flip", () => {
+    const dir = repo(EMBEDDED);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "dolt" && args[1] === "test") {
+        const meta = JSON.parse(readFileSync(metadataPath(dir), "utf8"));
+        writeFileSync(metadataPath(dir), `${JSON.stringify({ ...meta, project_id: "corrected-9999" }, null, 2)}\n`);
+        return { status: 1, stderr: "Connection failed" };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    // The concurrent edit is still there, mode and all — nothing overwrote it.
+    expect(readMetadata(dir).project_id).toBe("corrected-9999");
+    expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(false);
+    expect(result.steps.some((s: { status: string }) => s.status === "kept")).toBe(true);
+    expect(result.warnings.some((w: string) => w.includes("edited after this command wrote the switch"))).toBe(true);
+  });
+
+  /** Nothing has written config.yaml before step 9, so a revert before it has nothing to put back. */
+  it("leaves config.yaml alone when it reverts before publishing", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const edited = "prefix: probe\nsome.other.key: set-by-someone-else\n";
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "dolt" && args[1] === "test") {
+        writeFileSync(configPath, edited);
+        return { status: 1, stderr: "Connection failed" };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toBe(edited);
+  });
+
+  /**
+   * The config.yaml rollback snapshot is taken immediately before publication, not before the flip:
+   * an edit that landed in the window between them is part of the file the publication is undone
+   * back to, rather than something the undo throws away (PR #174 review).
+   */
+  it("rolls config.yaml back to what it held when publishing STARTED, keeping a concurrent edit", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const edited = "prefix: probe\nsome.other.key: set-by-someone-else\n";
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "dolt" && args[1] === "test") {
+        // Lands after the flip, before a single team default is published.
+        writeFileSync(configPath, edited);
+        return { status: 0, stdout: "✓ Connection successful" };
+      }
+      if (args[0] === "config" && args[1] === "set") {
+        writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${args[2]}: ${args[3]}\n`);
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        writeFileSync(configPath, `${readFileSync(configPath, "utf8")}dolt.${args[2]}: ${args[3]}\n`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toBe(edited);
+  });
+
+  /**
    * The failure this command exists to catch. `bd dolt test` connects to the SERVER; it says nothing
    * about whether this project can open its database there — bd's own project-identity guard refuses
    * a database belonging to another project long after the connection test has passed.

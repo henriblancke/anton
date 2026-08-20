@@ -209,8 +209,12 @@ so the command says so instead of reporting a verification it did not make. Usua
 the leftover Phase 3 step 4 says to keep and there is nothing to do. If it might hold writes that
 never reached the server — the clone was in use while Phase 1 ran — check it before deleting it: put
 `dolt_mode` back to `"embedded"` in `.beads/metadata.json` (`git stash` the pulled change), run
-`bd list --status all --json`, compare it with the server's listing, then re-run the command. Landing
-the `metadata.json` commit only after every clone has been checked avoids the question entirely.
+`bd export --all`, compare it with a `bd export --all` from the server, then re-run the command.
+`bd export --all` and **not** a `bd list` listing, for the same reason the command's own checks use it:
+a listing prints issue projections, so a leftover board that differs only by a comment, an edited
+comment or a `bd remember` entry reads as identical to the server's — and the one copy of that write
+gets deleted on the strength of a comparison that could not see it. Landing the `metadata.json`
+commit only after every clone has been checked avoids the question entirely.
 
 Also worth knowing: the password variable is **per user** (`BEADS_DOLT_PASSWORD_BEADS` for user
 `beads`) and that mapping is anton's, applied when anton spawns bd. A `bd` you run **by hand** reads

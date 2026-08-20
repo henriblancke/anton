@@ -678,11 +678,12 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     }
   }
 
-  // 5. Take the config.yaml snapshot FIRST — before the flip, not just before step 9 publishes into
-  //    it. It is half of what `revert` puts back, and a snapshot that cannot be read (a permissions
-  //    change, a path that is somehow a directory) is a rollback that cannot happen: taken after the
-  //    metadata write, that read throws with the project already switched to an unverified server
-  //    and no revert on the way out (PR #174 review). Read it while there is still nothing to undo.
+  // 5. Prove config.yaml is readable BEFORE the flip. A file that cannot be read (a permissions
+  //    change, a path that is somehow a directory) is a rollback that cannot happen, and finding
+  //    that out after the metadata write means the project is already switched to an unverified
+  //    server with no revert on the way out (PR #174 review). Ask while there is nothing to undo.
+  //    The bytes `revert` actually restores are re-read immediately before publication (step 9);
+  //    this text only proves the read works and is refused on if it does not.
   const configPath = join(beadsDir, "config.yaml");
   let configBefore = null;
   try {
@@ -809,11 +810,46 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   }
   record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
 
-  /** Undo both writes and report why — the board keeps working exactly as it did. */
+  // What this invocation actually left in each file — a revert undoes THOSE bytes and nothing else.
+  // `configPublished` flips only once step 9 starts writing config.yaml; before that the file is
+  // untouched by this run, so there is nothing in it to put back.
+  const wroteMetadata = prepared.status === "prepared" ? prepared.text : null;
+  let configSnapshot = configBefore;
+  let configPublished = false;
+
+  /**
+   * Undo this run's writes and report why — the board keeps working exactly as it did.
+   *
+   * Restores only what it can still prove it wrote (PR #174 review). Everything after the flip —
+   * the connection test, the board export the server answers with a multi-minute budget, the
+   * publication — is a window in which another clone's switch, an agent or a person edits
+   * metadata.json, and putting the pre-flip text back over that edit would discard it silently,
+   * which is the failure this whole command exists not to commit. So the current bytes are compared
+   * with what the flip wrote: equal means the edit never happened and the restore is exact; anything
+   * else means someone else owns the file now, and the run says so rather than overwriting them.
+   * config.yaml is snapshotted immediately before publication instead, since bd's own writes make
+   * "did someone else change this?" unanswerable once step 9 has started.
+   */
   const revert = (reason) => {
-    restoreFile(prepared.path, prepared.before);
-    restoreFile(configPath, configBefore);
-    record("metadata.json", "reverted", `${reason} — the board is untouched`);
+    if (wroteMetadata !== null) {
+      const current = readFileSnapshot(prepared.path);
+      if (current.ok && current.text === wroteMetadata) {
+        restoreFile(prepared.path, prepared.before);
+        record("metadata.json", "reverted", `${reason} — the board is untouched`);
+      } else {
+        record("metadata.json", "kept", `${reason} — edited since the switch was written, so NOT restored`);
+        warnings.push(
+          `${prepared.path} was edited after this command wrote the switch into it` +
+            `${current.ok ? "" : ` (${current.detail})`}, so putting the earlier text back would ` +
+            "discard that edit — it has been left exactly as it is. This project therefore still " +
+            `points at ${connection.host}:${connection.port}, which ${reason}. Reconcile the file by ` +
+            'hand (`dolt_mode` back to "embedded" restores the local board) and re-run.',
+        );
+      }
+    } else {
+      record("metadata.json", "unchanged", `${reason} — the file already said this, so nothing was written`);
+    }
+    if (configPublished) restoreFile(configPath, configSnapshot);
   };
 
   // 7. Prove the connection before anything else trusts it.
@@ -952,9 +988,30 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   }
 
   // 9. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
-  //    the snapshot above, so a failed attempt leaves it exactly as it was rather than carrying
+  //    the snapshot below, so a failed attempt leaves it exactly as it was rather than carrying
   //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
   //    comes after the metadata write rather than before it.
+  //    The snapshot is re-read HERE, not reused from step 5 (PR #174 review): everything between
+  //    the two — the flip, the connection test, a server export with a multi-minute budget — is a
+  //    window in which someone edits config.yaml, and restoring step 5's text would silently drop
+  //    that edit. Re-reading narrows the window to the publication itself, which is the smallest it
+  //    can be: once bd starts patching the file, its writes and a concurrent edit are the same
+  //    bytes to anything looking from here.
+  //    An unreadable file refuses rather than publishes, for the same reason step 5 does: a
+  //    snapshot that cannot be taken is a rollback that cannot happen, and the half-written
+  //    config.yaml a failed publication leaves behind is exactly what a rollback is for.
+  const configNow = readFileSnapshot(configPath);
+  if (!configNow.ok) {
+    record("config.yaml", "failed", configNow.detail);
+    errors.push(
+      `${configNow.detail} — the team-wide defaults are not published, because a half-written ` +
+        "config.yaml could not be rolled back from a snapshot this cannot read",
+    );
+    revert("could not snapshot config.yaml before publishing");
+    return fail({ before, connection, counts, backup, missing, diverged, extra });
+  }
+  configSnapshot = configNow.text;
+  configPublished = true;
   // Both take the project-scoped runner: on a server board `bd config set` and `bd dolt set` talk
   // to the database, so they need the same narrowed credentials the test above proved.
   const exec = scopedBdRunner(dir, connection, opts);
