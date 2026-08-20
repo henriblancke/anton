@@ -205,7 +205,11 @@ folded to `_`): the user above wants `BEADS_DOLT_PASSWORD_BEADS`. A bare `BEADS_
 still honoured as the fallback for every project, which is the one-shared-account setup; per-user
 variables are what let that account be retired. When one account name is reused on DIFFERENT servers
 with different passwords, scope it further — `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>`, which wins
-over the per-user variable and is the only way one anton can hold both secrets.
+over the per-user variable and is the only way one anton can hold both secrets. That name is derived
+by hand, so the fold is lossy on purpose: two hosts differing only in *which* non-alphanumerics they
+use (`db-a.example.com`, `db.a-example.com`) collapse to one variable. A pair like that sharing one
+account name is the single case the per-server rung cannot separate — give those accounts different
+names, and the per-user rung keeps them apart.
 
 `dolt_server_tls` is the transport, and it belongs in `metadata.json` for the same reason the host
 does: `BEADS_DOLT_SERVER_TLS` is one process-wide value, so a TLS server and a plaintext one driven

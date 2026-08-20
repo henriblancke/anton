@@ -215,7 +215,11 @@ only the plain `BEADS_DOLT_PASSWORD` — set that too if you drive bd directly. 
 already uses an account of the same name on a *different* server, scope this one's password by
 server as well — `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` (e.g.
 `BEADS_DOLT_PASSWORD_DOLT_EXAMPLE_DEV_3306_BEADS`) — which anton prefers over the per-user variable;
-without it both projects resolve to the same secret and one of them cannot authenticate.
+without it both projects resolve to the same secret and one of them cannot authenticate. The name is
+derived, not escaped: every run of non-alphanumerics folds to a single `_`, so two hosts that differ
+only in *which* punctuation they use (`db-a.example.com` and `db.a-example.com`) fold to one
+variable. If you own such a pair, name their accounts differently — the per-user variable then keeps
+the two secrets apart.
 
 Transport is per project too: pass **`--tls`** when the server sets `require_secure_transport`, and
 `--no-tls` when it does not. Either writes `dolt_server_tls` into this project's `metadata.json`,

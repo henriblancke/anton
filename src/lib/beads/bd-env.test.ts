@@ -166,6 +166,20 @@ describe("buildBdEnv — credentials are per project", () => {
     expect(serverScopedPasswordVar({ user: "beads" })).toBeUndefined();
     expect(serverScopedPasswordVar({ host: "dolt.example.dev" })).toBeUndefined();
   });
+
+  // The name is what an operator types into their shell, and every doc that teaches it says to
+  // derive it by hand — so the fold is lossy rather than escaped or hashed, and hosts differing only
+  // in WHICH punctuation they use share a variable (PR #174 review). Pinned, not tolerated silently:
+  // the docs name the way out (different account names), and a change to the fold has to come here.
+  it("folds punctuation lossily — two hosts can share one variable, which the docs make the operator's call", () => {
+    expect(serverScopedPasswordVar({ host: "db-a.example.com", port: 3306, user: "beads" })).toBe(
+      serverScopedPasswordVar({ host: "db.a-example.com", port: 3306, user: "beads" }),
+    );
+    // Different accounts on that same pair stay apart — the documented way out of the collision.
+    expect(serverScopedPasswordVar({ host: "db-a.example.com", port: 3306, user: "beads-a" })).not.toBe(
+      serverScopedPasswordVar({ host: "db.a-example.com", port: 3306, user: "beads-b" }),
+    );
+  });
 });
 
 // Transport is per project for the same reason the database is: `BEADS_DOLT_SERVER_TLS` is one
