@@ -164,8 +164,10 @@ solo board's only propagation path.
 (`bd export --all` into a self-ignored `.beads/backups/`), re-reads the source board immediately
 before the switch and refuses if it moved under the export (a writer that was never stopped writes
 beads the arrived-whole check below would never look for), writes the file below, verifies with
-`bd dolt test`, **reads the board back from the server** and confirms every issue id the project
-held a moment earlier is present there, then publishes the connection as the team default. Any failure after
+`bd dolt test`, **reads the board back from the server** and confirms every record the project held
+a moment earlier is present there and says the same thing — a record being a `bd export --all` line,
+so an issue's comment thread and a `bd remember` memory are compared too, not just the issue
+projections a listing would show — then publishes the connection as the team default. Any failure after
 the write **reverts `metadata.json` byte-for-byte** — in server mode there is no local copy to fall
 back on, so a project left pointing at a server it cannot read is a board outage, and a half-applied
 switch is worse than none.

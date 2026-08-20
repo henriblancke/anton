@@ -125,22 +125,23 @@ anton server-mode PROJECT --host HOST --port PORT --user USER --database DB
 
 That command is the whole config half. It:
 
-1. reads the board's issue ids as it stands, and **backs it up** (`bd export --all` into
-   `.beads/backups/`, skip with `--no-backup`);
-2. re-reads those ids immediately before the switch and **refuses if the board moved** — the export
-   above takes minutes on a big board, and an issue written in that window would be missing from
-   the server without the check in 5 ever seeing it (skipped under `--force`, which accepts the
+1. reads the board as it stands — `bd export --all`, so every issue *with its comment thread* and
+   every persistent memory (`bd remember`), not the issue projections a `bd list` would print — and
+   **backs it up** (the same export, into `.beads/backups/`; skip with `--no-backup`);
+2. re-reads it immediately before the switch and **refuses if the board moved** — the export above
+   takes minutes on a big board, and anything written in that window would be missing from the
+   server without the check in 5 ever seeing it (skipped under `--force`, which accepts the
    server's board unverified anyway);
 3. writes `dolt_mode`/host/port/user/database into `.beads/metadata.json`, preserving every other
    key in that file;
 4. runs **`bd dolt test`**;
 5. **reads the board back from the server** and confirms it is this board, whole and current — every
-   pre-switch issue id present, and every issue saying there *exactly* what it says here (an id only
-   the *server* holds is reported, not refused — see the warning below). By
+   pre-switch record present, and each saying there *exactly* what it says here (a record only the
+   *server* holds is reported, not refused — see the warning below). By
    identity and content, not cardinality: a stale or divergent copy of the same project can hold as
    many issues (or more) while missing the ones written here since it diverged, and a snapshot
-   copied a week ago holds every id while its titles, statuses and labels predate the board being
-   moved. A difference is refused in **both** directions — a newer `updated_at` on the server orders
+   copied a week ago holds every id while its titles, statuses, labels and comment threads predate
+   the board being moved. A difference is refused in **both** directions — a newer `updated_at` on the server orders
    the two writes without merging them, so it is no proof that row carries this board's edits;
 6. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
    team-wide default, so the next clone inherits the target.
@@ -154,27 +155,28 @@ most likely to see:
   `metadata.json` vs. the database's). You pointed at the wrong database, or Phase 1 has not
   happened. **`bd dolt test` passes in this state** — connecting is not the same as being able to
   read, which is why the command checks both.
-- *"the server's … database is missing N of this board's M issues (…)"* — the server is reachable
+- *"the server's … database is missing N of this board's M records (…)"* — the server is reachable
   and is this project's, but the copy did not land, landed in another database, or is a stale copy
-  from an earlier attempt. The named ids are the ones to look for. Re-run Phase 1. `--force` accepts
+  from an earlier attempt. The named records are the ones to look for. Re-run Phase 1. `--force` accepts
   the gap deliberately; it is for starting a fresh board, not for finishing this runbook.
-- *"the server's … database holds all of this board's ids but N issues say something different there
-  (…)"* — step 5, the other half of it. The two copies were edited apart, so switching would strand
+- *"the server's … database holds all of this board's records but N of them say something different
+  there (…)"* — step 5, the other half of it. The two copies were edited apart, so switching would strand
   every one of those differences in the database being left behind. The message says which way round
   it is. *The copy on the server predates this board* — a snapshot taken before those beads were
   last written (an earlier Phase 1 attempt, or a stale export): re-run Phase 1 with a **current**
   copy. *Written last on the server* — someone kept writing one of the two boards after the copy;
   a later timestamp orders those writes, it does **not** merge them, so the server's row can be
-  newer and still be missing a bead you closed here. Reconcile the two boards (compare a `bd list
-  --json` from each); `--force` is right only when this machine's board is a leftover copy nobody
-  has written since it was copied. If it names *every* issue on the board, the boards did not really
+  newer and still be missing a bead you closed here. Reconcile the two boards (compare a `bd export
+  --all` from each); `--force` is right only when this machine's board is a leftover copy nobody
+  has written since it was copied. If it names *every* record on the board, the boards did not really
   diverge — nothing edits a whole board at once — it is the two sides printing the same rows
-  differently; compare those listings before forcing.
-- *"the board being moved changed while the switch was being prepared — N issues appeared,
+  differently; compare those exports before forcing.
+- *"the board being moved changed while the switch was being prepared — N records appeared,
   disappeared or were edited"* — step 2. Something is still writing this board (anton, an agent, a
   shell), so neither the backup nor the arrived-whole check covers what it wrote. The comparison is
-  per-issue **content**, not just the id set, so a bead someone merely closed or relabelled trips it
-  too — that update would otherwise be stranded in the embedded database the move is leaving behind.
+  per-record **content**, not just the key set, so a bead someone merely closed or relabelled — or a
+  comment edited in place, or a `bd remember` — trips it too; that write would otherwise be stranded
+  in the embedded database the move is leaving behind.
   Phase 1 step 1 is the fix: `anton stop`, close the writers, re-run.
 - *"… metadata.json is not valid JSON …"* — `.beads/metadata.json` exists and cannot be parsed. The
   switch writes that file by *merging* into it, so an unreadable one would be replaced outright,
@@ -184,12 +186,13 @@ most likely to see:
 - *"could not read the board being moved: …"* — step 1 failed, so step 5 has nothing to check the
   server's copy against. The command stops **before** backing up or writing anything. Fix the read
   (a stopped embedded server, a missing password variable) and re-run; `--force` switches anyway and
-  accepts the server's board unverified. A genuinely **empty** board reads this way too — bd prints
-  an empty listing that cannot be told apart from no listing at all — and `--force` is the right
-  answer for it: there is nothing to lose track of.
+  accepts the server's board unverified. A genuinely **empty** board only reads this way when bd
+  prints warnings on stdout around the empty export — zero records with nothing else printed is
+  taken as the empty board it is — and `--force` is the right answer if it does: there is nothing to
+  lose track of.
 
-**A warning rather than a failure — *"… holds N issues this board does not"*.** Step 5 checks that
-everything on *this* board reached the server; ids only the **server** has are the other direction,
+**A warning rather than a failure — *"… holds N records this board does not"*.** Step 5 checks that
+everything on *this* board reached the server; records only the **server** has are the other direction,
 and they strand nothing, so they do not stop the switch. They are still worth a look, because two
 different things wear that shape and nothing bd prints tells them apart: issues created on the
 server after Phase 1 copied it (normal — you are joining a board that moved on without this
@@ -231,7 +234,7 @@ inherits that variable, as before.
 ### Phase 3 — Verify, then let go
 
 1. **The same board, from a second machine.** On another clone — one with no local Dolt DB at all —
-   run the same `anton server-mode …` command and confirm it reports the same issue count. That is
+   run the same `anton server-mode …` command and confirm it reports the same record count. That is
    the whole point of the move: the second machine hydrates nothing and syncs nothing. (On that
    machine the arrived-whole check compares the server against a board with nothing local in it, so
    it passes trivially — the count it prints is the assertion worth reading. On a clone that *does*

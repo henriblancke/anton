@@ -1705,7 +1705,9 @@ async function cmdServerMode(args = []) {
     c.green("\n✓ server mode configured.") +
       c.dim(` ${user ? `${user}@` : ""}${host}:${port}/${database}${transport}`),
   );
-  if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} issues from the server.`));
+  // Records, not issues: the check reads `bd export --all`, so the count covers comment threads and
+  // persistent memories as well as beads (readBoardRecords).
+  if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} records from the server.`));
   if (result.backup?.path) console.log(c.dim(`  pre-switch backup: ${result.backup.path}`));
   renderWarnings();
   console.log(

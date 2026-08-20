@@ -17,7 +17,7 @@ import {
   backupBoard,
   configureServerMode,
   prepareServerModeMetadata,
-  readBoardIds,
+  readBoardRecords,
   readMetadataFile,
   resolveServerConnection,
   restoreFile,
@@ -58,13 +58,26 @@ const readMetadata = (dir: string) => JSON.parse(readFileSync(metadataPath(dir),
 
 type Result = { status: number | null; stdout?: string; stderr?: string };
 
-/** `bd list --json` as bd prints it: the ids wrapped in the object form, warnings and all. */
-const listing = (ids: string[]) =>
-  `Warning: deprecated\n${JSON.stringify({ issues: ids.map((id) => ({ id, title: id })) }, null, 2)}\n`;
+/**
+ * `bd export --all` as bd prints it: one JSON record per line, with a warning on stdout in front of
+ * them (some bd versions put their deprecation notices there). An EMPTY board exports nothing at
+ * all, which is what an empty `records` models.
+ */
+const exported = (records: object[]) =>
+  records.length ? `Warning: deprecated\n${records.map((r) => JSON.stringify(r)).join("\n")}\n` : "";
+
+/** The export of a board holding exactly these issue ids and nothing else. */
+const listing = (ids: string[]) => exported(ids.map((id) => ({ _type: "issue", id, title: id })));
 
 /**
- * A stub `bd` that records every invocation and answers by subcommand. `bd list` answers from the
- * board the project is CURRENTLY pointed at — `after` once metadata.json says server, `before`
+ * The verification read, told apart from the backup: both are `bd export --all`, and only the
+ * backup redirects to a file with `-o`.
+ */
+const isRead = (args: string[]) => args[0] === "export" && !args.includes("-o");
+
+/**
+ * A stub `bd` that records every invocation and answers by subcommand. The board read answers from
+ * the board the project is CURRENTLY pointed at — `after` once metadata.json says server, `before`
  * until then — rather than from a call counter, so a case stays correct however many times the flow
  * reads either side (it reads the source twice: once to measure, once again right before the flip
  * to catch a concurrent write). `dir` is what makes that readable; without it every read is
@@ -77,7 +90,7 @@ function fakeBd(
   const exec = (cmd: string, args: string[]): Result => {
     calls.push([cmd, ...args]);
     if (args[0] === "--version") return { status: 0, stdout: `bd version ${opts.version ?? "1.1.2"} (fake)` };
-    if (args[0] === "list") {
+    if (isRead(args)) {
       const onServer = opts.dir !== undefined && readMetadataFile(opts.dir).raw.dolt_mode === "server";
       const board = onServer ? (opts.after ?? opts.before) : opts.before;
       return board === undefined ? { status: 1, stderr: "no board" } : { status: 0, stdout: listing(board) };
@@ -264,130 +277,117 @@ describe.skipIf(process.getuid?.() === 0)("writeFileAtomic", () => {
   });
 });
 
-describe("readBoardIds", () => {
+describe("readBoardRecords", () => {
   /** The parse, without the digests — those are asserted on their own below. */
-  const ids = (stdout: string) => {
-    const read = readBoardIds(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
-    return read.ok ? { ok: read.ok, ids: read.ids } : read;
+  const keys = (stdout: string) => {
+    const read = readBoardRecords(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
+    return read.ok ? { ok: read.ok, keys: read.keys } : read;
   };
 
-  // Closed issues, gates, infra beads and templates are board state too: a check that skipped them
-  // would call a board arrived while a third of it was still at home.
-  it("asks bd for EVERY issue — closed, gates, infra and templates included, unlimited", () => {
+  /**
+   * The read is `bd export --all`, NOT `bd list --json`, and that is the finding it answers (PR
+   * #174 review): a listing prints issue projections, so an edited comment and a persistent memory
+   * are invisible to it — durable state a flip would strand while every check stayed green.
+   * `--all` is also what carries closed issues, gates, infra beads and templates.
+   */
+  it("reads the board with `bd export --all`, the one read that carries comments and memories", () => {
     const calls: string[][] = [];
     const exec = (cmd: string, args: string[]) => {
       calls.push([cmd, ...args]);
       return { status: 0, stdout: listing(["probe-1"]) };
     };
-    expect(readBoardIds(repo(EMBEDDED), { exec }).ids).toEqual(["probe-1"]);
-    const ran = calls[0].join(" ");
-    for (const flag of ["--all", "--limit 0", "--include-gates", "--include-infra", "--include-templates"]) {
-      expect(ran).toContain(flag);
-    }
-    // Labels are hydrated on EVERY read: each one is compared against another by content digest,
-    // and a read that skipped them would report the whole board as changed.
-    expect(ran).not.toContain("--skip-labels");
+    expect(readBoardRecords(repo(EMBEDDED), { exec }).keys).toEqual(["probe-1"]);
+    expect(calls[0].join(" ")).toBe("bd export --all");
+  });
+
+  // Memories are board state with no bead to hang off, so they are keyed under their own type —
+  // a memory named like a bead must not pass for it.
+  it("keys issues by their bd id and every other record by type", () => {
+    const stdout = exported([
+      { _type: "issue", id: "probe-1", title: "t" },
+      { _type: "memory", key: "probe-1", value: "a fact" },
+    ]);
+    expect(keys(stdout)).toEqual({ ok: true, keys: ["probe-1", "memory:probe-1"] });
   });
 
   /**
-   * The digests are what the drift check compares, and ids alone cannot answer it: a writer that
-   * updates an existing issue leaves the id set identical (PR #174 review). Labels are part of that
-   * content, so a content read hydrates them.
+   * The digests are what the drift and arrived-whole checks compare, and keys alone cannot answer
+   * either: a writer that updates an existing issue leaves the key set identical (PR #174 review).
+   * Labels, dependencies, the comment THREAD and a memory's value are all content, and the export
+   * carries every one of them.
    */
-  it("fingerprints each issue's content, labels included, for the drift check", () => {
-    const calls: string[][] = [];
+  it("fingerprints each record's content — labels, comments and memory values included", () => {
     /** `probe-1`'s fingerprint as bd printed it — throwing rather than comparing two undefineds. */
-    const fingerprint = (issue: object): string => {
-      const read = readBoardIds(repo(EMBEDDED), {
-        exec: (cmd: string, args: string[]) => {
-          calls.push([cmd, ...args]);
-          return { status: 0, stdout: JSON.stringify({ issues: [issue] }) };
-        },
-      });
-      const fp = read.digests?.get("probe-1");
-      if (!fp) throw new Error(`no digest for probe-1: ${read.detail ?? "board read as empty"}`);
+    const fingerprint = (record: object, key = "probe-1"): string => {
+      const read = readBoardRecords(repo(EMBEDDED), { exec: () => ({ status: 0, stdout: exported([record]) }) });
+      const fp = read.digests?.get(key);
+      if (!fp) throw new Error(`no digest for ${key}: ${read.detail ?? "board read as empty"}`);
       return fp;
     };
-
-    const open = fingerprint({ id: "probe-1", title: "t", status: "open", labels: ["approved"] });
-    expect(fingerprint({ id: "probe-1", title: "t", status: "closed", labels: ["approved"] })).not.toBe(open);
-    expect(fingerprint({ id: "probe-1", title: "T", status: "open", labels: ["approved"] })).not.toBe(open);
-    expect(fingerprint({ id: "probe-1", title: "t", status: "open", labels: ["approved", "risk:low"] })).not.toBe(open);
-
-    // Unchanged content fingerprints the same, whatever order bd prints the fields and labels in —
-    // a reordered listing must not read as a mid-flip edit and refuse the switch.
-    expect(fingerprint({ id: "probe-1", title: "t", status: "open", labels: ["approved"] })).toBe(open);
-    expect(fingerprint({ labels: ["approved"], status: "open", title: "t", id: "probe-1" })).toBe(open);
-
-    for (const call of calls) expect(call.join(" ")).not.toContain("--skip-labels");
-  });
-
-  it("reads both shapes bd answers with — a bare array and the { issues } wrapper", () => {
-    expect(ids('[{"id": "probe-1"}, {"id": "probe-2"}]')).toEqual({ ok: true, ids: ["probe-1", "probe-2"] });
-    expect(ids('{"issues": [{"id": "probe-1"}]}')).toEqual({ ok: true, ids: ["probe-1"] });
-    expect(ids("[]")).toEqual({ ok: true, ids: [] });
-  });
-
-  // The pre-flip read is the ONLY input to the arrived-whole check — a warning bd decides to print
-  // with brackets in it must not turn a healthy board into "no readable board" and skip that check.
-  it("steps over a warning that contains brackets of its own, on either side of the JSON", () => {
-    const payload = '{"issues": [{"id": "probe-1"}]}';
-    expect(ids(`warning: use {dolt.auto-commit} instead\n${payload}\n`)).toEqual({ ok: true, ids: ["probe-1"] });
-    expect(ids(`${payload}\nwarning: use {dolt.auto-commit} instead\n`)).toEqual({ ok: true, ids: ["probe-1"] });
-    expect(ids(`warning: pass [--all] instead\n${payload}\n`)).toEqual({ ok: true, ids: ["probe-1"] });
-  });
-
-  // The scan budget belongs to the payload, not to the warning in front of it: a bounded search
-  // that spends every attempt on the closes behind a warning's stray `{` reports "no readable
-  // board" on exactly the large boards this migration exists for (PR #174 review).
-  it("still finds the board behind a brace-bearing warning when the board is large", () => {
-    const many = Array.from({ length: 250 }, (_, n) => ({ id: `probe-${n + 1}` }));
-    const stdout = `warning: use {dolt.auto-commit} instead\n${JSON.stringify({ issues: many })}\n`;
-    expect(ids(stdout)).toEqual({ ok: true, ids: many.map((i) => i.id) });
-  });
-
-  /**
-   * The budget is finite, so where it runs out is pinned here rather than discovered in the field
-   * (PR #174 review). 100 openers is far past the one or two bracket-bearing lines any bd has been
-   * seen to print, and the failure beyond it is the safe one: a board that reads as UNREADABLE — a
-   * refused flip — never a different board accepted as this one.
-   */
-  it("reads past a warning preamble up to the scan budget, and fails loud beyond it", () => {
-    const payload = '{"issues": [{"id": "probe-1"}]}';
-    const noise = (n: number) => Array.from({ length: n }, (_, i) => `warning: {opt-${i}} is deprecated`).join("\n");
-
-    expect(ids(`${noise(99)}\n${payload}\n`)).toEqual({ ok: true, ids: ["probe-1"] });
-    expect(ids(`${noise(200)}\n${payload}\n`)).toEqual({ ok: false, detail: "bd list printed no readable board" });
-  });
-
-  // A `}` inside an issue's own text is not the end of the payload.
-  it("reads a board whose issue text carries brackets of its own", () => {
-    expect(ids('{"issues": [{"id": "probe-1", "title": "use {dolt.auto-commit} [now]"}]}')).toEqual({
-      ok: true,
-      ids: ["probe-1"],
+    const issue = (over: object = {}) => ({
+      _type: "issue",
+      id: "probe-1",
+      title: "t",
+      status: "open",
+      labels: ["approved"],
+      comments: [{ id: "c1", text: "a durable review note" }],
+      ...over,
     });
+
+    const open = fingerprint(issue());
+    expect(fingerprint(issue({ status: "closed" }))).not.toBe(open);
+    expect(fingerprint(issue({ title: "T" }))).not.toBe(open);
+    expect(fingerprint(issue({ labels: ["approved", "risk:low"] }))).not.toBe(open);
+    // The comment thread: an EDITED comment leaves bd's own comment_count identical, which is the
+    // whole reason a listing cannot stand in for the export here.
+    expect(fingerprint(issue({ comments: [{ id: "c1", text: "an edited note" }] }))).not.toBe(open);
+    expect(fingerprint(issue({ comments: [] }))).not.toBe(open);
+    // And a memory is content like any other.
+    const remembered = fingerprint({ _type: "memory", key: "k", value: "a fact" }, "memory:k");
+    expect(fingerprint({ _type: "memory", key: "k", value: "another fact" }, "memory:k")).not.toBe(remembered);
+
+    // Unchanged content fingerprints the same, whatever order bd prints the fields and comments in
+    // — a reordered export must not read as a mid-flip edit and refuse the switch.
+    expect(fingerprint(issue())).toBe(open);
+    expect(fingerprint({ comments: [{ text: "a durable review note", id: "c1" }], labels: ["approved"], status: "open", title: "t", id: "probe-1", _type: "issue" })).toBe(open);
   });
 
-  // An issue's own nested arrays parse perfectly well and are not the board — "it parsed" is not
-  // enough, or a board would be read as its first issue's dependency list.
-  it("does not mistake an issue's nested array for the board", () => {
-    expect(ids('{"issues": [{"id": "probe-1", "dependencies": []}]}')).toEqual({ ok: true, ids: ["probe-1"] });
+  // bd's own deprecation warnings land on stdout on some versions, and JSONL makes them a line that
+  // simply does not parse — never brackets a scan has to tell apart from a record's own.
+  it("steps over a warning bd printed on stdout, on either side of the records", () => {
+    const payload = JSON.stringify({ _type: "issue", id: "probe-1" });
+    expect(keys(`warning: use {dolt.auto-commit} instead\n${payload}\n`)).toEqual({ ok: true, keys: ["probe-1"] });
+    expect(keys(`${payload}\nwarning: use {dolt.auto-commit} instead\n`)).toEqual({ ok: true, keys: ["probe-1"] });
+  });
+
+  // An issue's own text is free to carry brackets and quotes; one record per line means none of it
+  // needs interpreting.
+  it("reads a board whose issue text carries brackets of its own", () => {
+    const stdout = exported([{ _type: "issue", id: "probe-1", title: "use {dolt.auto-commit} [now]" }]);
+    expect(keys(stdout)).toEqual({ ok: true, keys: ["probe-1"] });
   });
 
   it("reports a failed or unreadable board rather than calling it empty", () => {
-    expect(readBoardIds(repo(EMBEDDED), { exec: () => ({ status: 1, stderr: "connection refused" }) })).toEqual({
+    expect(readBoardRecords(repo(EMBEDDED), { exec: () => ({ status: 1, stderr: "connection refused" }) })).toEqual({
       ok: false,
       detail: "connection refused",
     });
-    expect(ids("no json here").ok).toBe(false);
-    // Issues without ids are not a board this can compare — reported, never silently empty.
-    expect(ids('{"issues": [{"title": "no id"}]}').ok).toBe(false);
-    // The documented cost of that (PR #174 review): a bare `[]` with anything printed around it is
-    // indistinguishable from a warning's own brackets, so an EMPTY board bd wraps in a stdout
-    // warning reads as unreadable. Deliberate — an empty source set would make the arrived-whole
-    // check pass over ANY server board, and configureServerMode names --force as the way through.
-    expect(ids("warning: deprecated\n[]\n").ok).toBe(false);
-    expect(ids('warning: deprecated\n{"issues": []}\n')).toEqual({ ok: true, ids: [] });
+    expect(keys("no json here").ok).toBe(false);
+    // A record with nothing to key it by cannot be compared, and dropping it quietly is how state
+    // gets stranded — the whole read is reported as unusable instead.
+    expect(keys(JSON.stringify({ _type: "issue", title: "no id" })).ok).toBe(false);
+    expect(keys(JSON.stringify({ _type: "memory", value: "no key" })).ok).toBe(false);
+  });
+
+  /**
+   * An empty board really does export nothing, and that is a usable answer — but only when stdout
+   * held nothing else. Zero records alongside output this could not parse is a read that went
+   * wrong, and calling it "empty" would make the arrived-whole check pass over ANY server board.
+   */
+  it("accepts a genuinely empty export, and refuses one that is only warnings", () => {
+    expect(keys("")).toEqual({ ok: true, keys: [] });
+    expect(keys("\n\n")).toEqual({ ok: true, keys: [] });
+    expect(keys("warning: deprecated\n")).toEqual({ ok: false, detail: "bd export printed no readable board" });
   });
 });
 
@@ -435,7 +435,7 @@ describe("configureServerMode", () => {
     expect(result.missing).toEqual([]);
     expect(readMetadata(dir).dolt_mode).toBe("server");
     const ran = cmdline(calls);
-    expect(ran.some((c) => c.startsWith("bd export --all"))).toBe(true);
+    expect(ran.some((c) => c.includes("bd export --all -o"))).toBe(true);
     expect(ran).toContainEqual("bd dolt test");
     // The connection reaches config.yaml as the team-wide default so the next clone inherits it.
     expect(ran).toContainEqual("bd dolt set host dolt.example.dev --update-config");
@@ -501,7 +501,7 @@ describe("configureServerMode", () => {
     // A bd that patches config.yaml for real (as the live one does) and then refuses one key.
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "list") return { status: 0, stdout: listing(BOARD) };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
       if (args[0] === "config" && args[1] === "set") {
         writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${args[2]}: ${args[3]}\n`);
         return { status: 0 };
@@ -531,7 +531,7 @@ describe("configureServerMode", () => {
     const original = readFileSync(metadataPath(dir), "utf8");
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "list") {
+      if (isRead(args)) {
         // The pre-switch read succeeds; the post-switch one hits the identity guard.
         return readMetadataFile(dir).raw.dolt_mode === "server"
           ? { status: 1, stderr: "PROJECT IDENTITY MISMATCH — refusing to connect" }
@@ -558,7 +558,7 @@ describe("configureServerMode", () => {
     // The local board is unreadable; the server answers with a board that is not this one.
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "list") {
+      if (isRead(args)) {
         return readMetadataFile(dir).raw.dolt_mode === "server"
           ? { status: 0, stdout: listing(["other-1"]) }
           : { status: 1, stderr: "database is locked" };
@@ -585,7 +585,7 @@ describe("configureServerMode", () => {
 
     const refused = configureServerMode(dir, flags, { exec: fakeBd({ dir, before: BOARD, after: [] }).exec });
     expect(refused.ok).toBe(false);
-    expect(refused.errors.join("\n")).toMatch(/missing 7 of this board's 7 issues/);
+    expect(refused.errors.join("\n")).toMatch(/missing 7 of this board's 7 records/);
     expect(refused.missing).toEqual(BOARD);
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
 
@@ -608,7 +608,7 @@ describe("configureServerMode", () => {
     let reads = 0;
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "list") {
+      if (isRead(args)) {
         reads += 1;
         return { status: 0, stdout: listing(reads === 1 ? BOARD : [...BOARD, "probe-8"]) };
       }
@@ -628,11 +628,11 @@ describe("configureServerMode", () => {
   });
 
   /**
-   * The half an id-set comparison cannot see (PR #174 review): a writer that UPDATES an existing
-   * bead — closes it, retitles it, moves a label, takes the assignment — leaves the ids identical,
-   * so the drift check passed, the arrived-whole check (ids again) passed, and the switch reported
+   * The half a key-set comparison cannot see (PR #174 review): a writer that UPDATES an existing
+   * bead — closes it, retitles it, moves a label, takes the assignment — leaves the keys identical,
+   * so the drift check passed, the arrived-whole check (keys again) passed, and the switch reported
    * a clean move while that update stayed behind in the embedded database nobody reads any more.
-   * The per-issue content digests are what catch it.
+   * The per-record content digests are what catch it.
    */
   it("refuses when an existing issue is EDITED while the switch is being prepared", () => {
     const dir = repo(EMBEDDED);
@@ -640,12 +640,10 @@ describe("configureServerMode", () => {
     // Same board, same ids, both reads — an agent just closed probe-3 between them.
     let reads = 0;
     const rows = (closed: boolean) =>
-      JSON.stringify({
-        issues: BOARD.map((id) => ({ id, title: id, status: closed && id === "probe-3" ? "closed" : "open" })),
-      });
+      exported(BOARD.map((id) => ({ _type: "issue", id, title: id, status: closed && id === "probe-3" ? "closed" : "open" })));
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "list") return { status: 0, stdout: rows(++reads > 1) };
+      if (isRead(args)) return { status: 0, stdout: rows(++reads > 1) };
       return { status: 0 };
     };
 
@@ -658,6 +656,45 @@ describe("configureServerMode", () => {
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
   });
 
+  /**
+   * The state a LISTING cannot see at all, and the finding this read exists to answer (PR #174
+   * review). `bd list --json` prints an issue's comment COUNT, so a comment edited in place reads
+   * as identical, and it never prints persistent memories. Both are durable board state; both would
+   * be stranded in the database this project is about to stop reading. The export catches them.
+   */
+  it.each([
+    [
+      "a comment edited in place",
+      (edited: boolean) => [
+        { _type: "issue", id: "probe-1", title: "probe-1", comments: [{ id: "c1", text: edited ? "an edited note" : "a note" }] },
+      ],
+      "probe-1",
+    ],
+    [
+      "a memory written by `bd remember`",
+      (edited: boolean) => [
+        { _type: "issue", id: "probe-1", title: "probe-1" },
+        ...(edited ? [{ _type: "memory", key: "a-fact", value: "remembered mid-flip" }] : []),
+      ],
+      "memory:a-fact",
+    ],
+  ])("refuses when %s lands while the switch is being prepared", (_label, board, key) => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    let reads = 0;
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: exported(board(++reads > 1)) };
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(result.drifted).toEqual([key]);
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+  });
+
   // A source that becomes unreadable between the two reads is the same refusal, not a shrug: the
   // arrived-whole check would be running against a set nothing can confirm any more.
   it("refuses when the board being moved becomes unreadable before the flip", () => {
@@ -666,7 +703,7 @@ describe("configureServerMode", () => {
     let reads = 0;
     const exec = (_cmd: string, args: string[]): Result => {
       if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-      if (args[0] === "list") {
+      if (isRead(args)) {
         reads += 1;
         return reads === 1 ? { status: 0, stdout: listing(BOARD) } : { status: 1, stderr: "database is locked" };
       }
@@ -687,12 +724,12 @@ describe("configureServerMode", () => {
     const checked = fakeBd({ dir, before: BOARD });
     expect(configureServerMode(dir, flags, { exec: checked.exec }).ok).toBe(true);
     // Source (measure) → source (re-check) → server (arrived-whole).
-    expect(cmdline(checked.calls).filter((c) => c.startsWith("bd list")).length).toBe(3);
+    expect(cmdline(checked.calls).filter((c) => c === "bd export --all").length).toBe(3);
 
     const forcedDir = repo(EMBEDDED);
     const forced = fakeBd({ dir: forcedDir, before: BOARD });
     expect(configureServerMode(forcedDir, { ...flags, force: true }, { exec: forced.exec }).ok).toBe(true);
-    expect(cmdline(forced.calls).filter((c) => c.startsWith("bd list")).length).toBe(2);
+    expect(cmdline(forced.calls).filter((c) => c === "bd export --all").length).toBe(2);
   });
 
   /**
@@ -712,27 +749,28 @@ describe("configureServerMode", () => {
     expect(result.ok).toBe(false);
     expect(result.counts).toEqual({ before: 7, after: 8 });
     expect(result.missing).toEqual(["probe-6", "probe-7"]);
-    expect(result.errors.join("\n")).toMatch(/missing 2 of this board's 7 issues \(probe-6, probe-7\)/);
+    expect(result.errors.join("\n")).toMatch(/missing 2 of this board's 7 records \(probe-6, probe-7\)/);
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
   });
 
   /**
-   * The blind spot an id-set check has on the DESTINATION side, and the mirror of the drift check
-   * (PR #174 review): Phase 1 copies a snapshot taken before the last few edits, so every id is on
-   * the server while a title, status, label, dependency or assignee there predates the board being
-   * moved. Membership passes; flipping strands those updates in the database nobody reads again.
+   * The blind spot a key-set check has on the DESTINATION side, and the mirror of the drift check
+   * (PR #174 review): Phase 1 copies a snapshot taken before the last few edits, so every key is on
+   * the server while a title, status, label, dependency, assignee or comment there predates the
+   * board being moved. Membership passes; flipping strands those updates in the database nobody
+   * reads again.
    */
-  describe("the server's copy is checked by CONTENT, not just id membership", () => {
+  describe("the server's copy is checked by CONTENT, not just key membership", () => {
     /** Source and server boards of the same seven ids, differing only in `probe-3`. */
     const boards = (server: object, local: object = {}) => {
-      const rows = (issues: object[]) => ({ status: 0, stdout: JSON.stringify({ issues }) });
-      const base = BOARD.map((id) => ({ id, title: id, status: "open", updated_at: "2026-08-18T12:00:00Z" }));
+      const rows = (issues: object[]) => ({ status: 0, stdout: exported(issues) });
+      const base = BOARD.map((id) => ({ _type: "issue", id, title: id, status: "open", updated_at: "2026-08-18T12:00:00Z" }));
       const here = base.map((i) => (i.id === "probe-3" ? { ...i, ...local } : i));
       const there = base.map((i) => (i.id === "probe-3" ? { ...i, ...server } : i));
       return (dir: string) =>
         (_cmd: string, args: string[]): Result => {
           if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-          if (args[0] === "list") return rows(readMetadataFile(dir).raw.dolt_mode === "server" ? there : here);
+          if (isRead(args)) return rows(readMetadataFile(dir).raw.dolt_mode === "server" ? there : here);
           return { status: 0 };
         };
     };
@@ -748,7 +786,7 @@ describe("configureServerMode", () => {
       expect(result.ok).toBe(false);
       expect(result.diverged).toEqual(["probe-3"]);
       expect(result.missing).toEqual([]);
-      expect(result.errors.join("\n")).toMatch(/1 issue says something different there \(probe-3\)/);
+      expect(result.errors.join("\n")).toMatch(/1 of them says something different there \(probe-3\)/);
       expect(result.errors.join("\n")).toContain("The copy on the server predates this board");
       // Reverted, not merely reported — the project keeps reading the board that is current.
       expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
@@ -761,13 +799,11 @@ describe("configureServerMode", () => {
       const dir = repo(EMBEDDED);
       const exec = (_cmd: string, args: string[]): Result => {
         if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-        if (args[0] === "list") {
+        if (isRead(args)) {
           const onServer = readMetadataFile(dir).raw.dolt_mode === "server";
           return {
             status: 0,
-            stdout: JSON.stringify({
-              issues: BOARD.map((id) => ({ id, title: onServer && id === "probe-3" ? "an older title" : id })),
-            }),
+            stdout: exported(BOARD.map((id) => ({ _type: "issue", id, title: onServer && id === "probe-3" ? "an older title" : id }))),
           };
         }
         return { status: 0 };
@@ -780,17 +816,17 @@ describe("configureServerMode", () => {
 
     // A whole board reading as stale is not a stale board — it is the two sides describing the same
     // rows differently, and the message says so rather than sending the operator back to Phase 1.
-    it("says so when EVERY issue differs, which is a listing mismatch and not a stale snapshot", () => {
+    it("says so when EVERY record differs, which is an export mismatch and not a stale snapshot", () => {
       const dir = repo(EMBEDDED);
       const exec = (_cmd: string, args: string[]): Result => {
         if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-        if (args[0] === "list") {
+        if (isRead(args)) {
           const onServer = readMetadataFile(dir).raw.dolt_mode === "server";
           return {
             status: 0,
-            stdout: JSON.stringify({
-              issues: BOARD.map((id) => (onServer ? { id, title: id, extra_column: null } : { id, title: id })),
-            }),
+            stdout: exported(
+              BOARD.map((id) => (onServer ? { _type: "issue", id, title: id, extra_column: null } : { _type: "issue", id, title: id })),
+            ),
           };
         }
         return { status: 0 };
@@ -799,7 +835,7 @@ describe("configureServerMode", () => {
       const result = configureServerMode(dir, flags, { exec });
       expect(result.ok).toBe(false);
       expect(result.diverged).toEqual(BOARD);
-      expect(result.errors.join("\n")).toContain("EVERY issue on the board");
+      expect(result.errors.join("\n")).toContain("EVERY record on the board");
     });
 
     /**
@@ -820,10 +856,54 @@ describe("configureServerMode", () => {
 
       expect(result.ok).toBe(false);
       expect(result.diverged).toEqual(["probe-3"]);
-      // Named for what it is, so the operator reaches for the two listings rather than Phase 1.
+      // Named for what it is, so the operator reaches for the two exports rather than Phase 1.
       expect(result.errors.join("\n")).toContain("written LAST on the server");
       expect(result.errors.join("\n")).toContain("does not merge them");
       expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+    });
+
+    /**
+     * The auxiliary board state a listing would have waved through, and the finding this answers
+     * (PR #174 review). A `bd comment` or `bd remember` written after Phase 1 copied the database
+     * lives ONLY in the embedded board: every issue row can still match — `bd list` prints a
+     * comment COUNT and no memories at all — so a projection-based check would flip and strand the
+     * review history and the persistent knowledge in the database being left behind.
+     */
+    it.each([
+      [
+        "a comment thread only the embedded board carries",
+        [{ _type: "issue", id: "probe-1", comments: [{ id: "c1", text: "why we chose this" }] }],
+        [{ _type: "issue", id: "probe-1", comments: [] }],
+        { diverged: ["probe-1"], missing: [] },
+      ],
+      [
+        "a memory only the embedded board carries",
+        [{ _type: "issue", id: "probe-1" }, { _type: "memory", key: "a-fact", value: "learned the hard way" }],
+        [{ _type: "issue", id: "probe-1" }],
+        // An absent record fails the membership check, which returns before content is compared at
+        // all — hence no `diverged` list on this one.
+        { diverged: undefined, missing: ["memory:a-fact"] },
+      ],
+    ])("refuses and reverts when the server's copy is missing %s", (_label, here, there, expected) => {
+      const dir = repo(EMBEDDED);
+      const original = readFileSync(metadataPath(dir), "utf8");
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (isRead(args)) {
+          return { status: 0, stdout: exported(readMetadataFile(dir).raw.dolt_mode === "server" ? there : here) };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(false);
+      expect(result.diverged).toEqual(expected.diverged);
+      expect(result.missing).toEqual(expected.missing);
+      // Reverted, not merely reported — that state is unrecoverable once the project stops reading
+      // the database holding it.
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+      expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
     });
 
     // Identical content is the one thing that proves the copy arrived — the flip needs no stamp.
@@ -856,7 +936,7 @@ describe("configureServerMode", () => {
    * refusing would send the runbook's second machine to --force, which switches off the checks that
    * guard the half that IS unrecoverable.
    */
-  describe("ids only the SERVER holds", () => {
+  describe("keys only the SERVER holds", () => {
     it("accepts a server board that holds every issue plus newer ones, and names the extras", () => {
       const dir = repo(EMBEDDED);
       const exec = fakeBd({ dir, before: BOARD, after: [...BOARD, "probe-8", "probe-9"] }).exec;
@@ -869,9 +949,9 @@ describe("configureServerMode", () => {
       expect(result.extra).toEqual(["probe-8", "probe-9"]);
       expect(result.counts).toEqual({ before: 7, after: 9 });
       // Named, with BOTH readings — an operator who deleted an epic here has to be able to tell.
-      expect(result.warnings.join("\n")).toMatch(/holds 2 issues this board does not \(probe-8, probe-9\)/);
+      expect(result.warnings.join("\n")).toMatch(/holds 2 records this board does not \(probe-8, probe-9\)/);
       expect(result.warnings.join("\n")).toMatch(/deleted HERE after the copy/);
-      expect(result.steps.find((s: { name: string }) => s.name === "server-only issues")).toMatchObject({
+      expect(result.steps.find((s: { name: string }) => s.name === "server-only records")).toMatchObject({
         status: "skipped",
       });
       // Reported, not refused: the switch stands.
@@ -885,7 +965,7 @@ describe("configureServerMode", () => {
       expect(result.ok).toBe(true);
       expect(result.extra).toEqual([]);
       expect(result.warnings).toEqual([]);
-      expect(result.steps.some((s: { name: string }) => s.name === "server-only issues")).toBe(false);
+      expect(result.steps.some((s: { name: string }) => s.name === "server-only records")).toBe(false);
     });
 
     /**
@@ -898,7 +978,7 @@ describe("configureServerMode", () => {
       let reads = 0;
       const exec = (_cmd: string, args: string[]): Result => {
         if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
-        if (args[0] === "list") {
+        if (isRead(args)) {
           // Reads 1 and 2 are the drift check and must agree; the third is the read-back, where a
           // teammate's issue has landed in between.
           reads += 1;
@@ -927,7 +1007,7 @@ describe("configureServerMode", () => {
 
     const skipped = fakeBd({ dir, before: BOARD });
     expect(configureServerMode(dir, { ...flags, backup: false }, { exec: skipped.exec }).ok).toBe(true);
-    expect(cmdline(skipped.calls).some((c) => c.startsWith("bd export"))).toBe(false);
+    expect(cmdline(skipped.calls).some((c) => c.includes("bd export --all -o"))).toBe(false);
   });
 
   it("skips the backup for a board already on a server — its data is not local to export", () => {
@@ -937,7 +1017,7 @@ describe("configureServerMode", () => {
     const result = configureServerMode(dir, flags, { exec });
 
     expect(result.ok).toBe(true);
-    expect(cmdline(calls).some((c) => c.startsWith("bd export"))).toBe(false);
+    expect(cmdline(calls).some((c) => c.includes("bd export --all -o"))).toBe(false);
     expect(readMetadata(dir).dolt_server_host).toBe("dolt.example.dev");
   });
 
@@ -986,7 +1066,7 @@ describe("configureServerMode", () => {
     let reads = 0;
     const { exec } = fakeBd({ dir, before: BOARD });
     const wrapped = (cmd: string, args: string[]) => {
-      if (args[0] === "list") {
+      if (isRead(args)) {
         seen.push(readFileSync(metadataPath(dir), "utf8"));
         // Clobber the file while the drift read is in flight — after the prepare, before the write.
         if (++reads === 2) writeFileSync(metadataPath(dir), "{ clobbered");

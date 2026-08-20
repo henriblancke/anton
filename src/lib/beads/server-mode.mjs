@@ -18,16 +18,19 @@
  *      hatch if the server goes away.
  *   2. **Write the connection, then prove it.** `bd dolt test` must connect, or the flip is undone.
  *   3. **Prove the board arrived, whole and current.** The board read before the flip is compared
- *      with the one read back from the server: every id must be there, and every issue must say on
- *      the server exactly what it says here. A missing issue means the data copy has not happened
- *      or landed in another database; an issue whose content differs means the server's copy and
+ *      with the one read back from the server: every record must be there, and must say on the
+ *      server exactly what it says here. A record is a `bd export` line — an issue with its labels,
+ *      dependencies and full comment thread, or a persistent memory — because a comment and a
+ *      `bd remember` are durable board state a listing never shows, and stranding them is as
+ *      permanent as stranding a bead (PR #174 review). A missing record means the data copy has not
+ *      happened or landed in another database; one whose content differs means the server's copy and
  *      this board were edited apart — in EITHER direction, because a later `updated_at` on the
  *      server orders two writes without merging them and so is no proof its row carries this
  *      board's edit. Both are the class of mistake that makes an otherwise-successful switch look
  *      fine while the team stares at a board with work missing from it. It reverts rather than
  *      reports.
  *   4. **Prove nobody wrote it meanwhile.** The board is read once to measure and once more
- *      immediately before the flip, and every issue's CONTENT is compared, not just the id set: an
+ *      immediately before the flip, and every record's CONTENT is compared, not just the key set: an
  *      update the server's copy predates would otherwise sail through step 3 and be stranded in the
  *      database this project is about to stop reading. What remains is the flip itself — a single
  *      `metadata.json` write, milliseconds rather than the minutes an export takes.
@@ -244,105 +247,44 @@ export function restoreFile(path, before) {
 const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
 
 /**
- * How many candidate openers {@link parseJsonPayload} will parse before giving up. One attempt per
- * opener, never per close: a budget spent enumerating the closes behind a single opener is a budget
- * a warning's stray `{` can exhaust before the real payload is ever reached (PR #174 review).
+ * The arguments that read EVERY durable thing this project's board holds, as JSONL on stdout.
  *
- * 100 is chosen well above the bracket-bearing preamble any bd version has been seen to print
- * (single digits — one or two deprecation lines), and the cost of being wrong is bounded either
- * way: exceed it and the symptom is a refused flip with "no readable board", never a wrong board
- * accepted. Safe to raise if some future bd gets chattier.
+ * `bd export`, NOT `bd list --json`, and that is the whole of the point (PR #174 review). A listing
+ * carries issue projections: it counts an issue's comments without printing them, and it does not
+ * print persistent memories (`bd remember`) at all. Both are durable board state — a review thread
+ * is the reasoning behind a decision, a memory is what the next session inherits — so a comment
+ * EDITED in place, or a memory written on either side of the copy, is a difference every check
+ * below would score as "identical" before flipping the project onto a database that does not hold
+ * it. `bd export` is the one read that carries all of it: one line per record, an issue with its
+ * labels, dependencies and full comment thread, or a `{"_type":"memory"}` row.
+ *
+ * `--all` is what widens it past regular issues to infra beads, templates, gates AND memories
+ * (memories are excluded by default because they can carry agent context); closed issues come as
+ * standard. It is also exactly what {@link backupBoard} writes, so what is verified and what is
+ * backed up are the same board. `bd export --all` exists in bd 1.1.0, anton's floor
+ * (MIN_BD_VERSION).
  */
-const MAX_JSON_CANDIDATES = 100;
+const exportAllArgs = () => ["export", "--all"];
 
 /**
- * Index of the bracket that closes the one at `start`, or -1 when nothing does.
- *
- * String-aware, because an issue's own text is free to contain a `}`. The walk starts fresh at
- * `start` rather than tracking quotes across the whole of stdout, so an odd quote in a warning
- * printed BEFORE the payload cannot desynchronise the payload's own scan.
+ * The key one exported record is compared under, or `undefined` when it carries nothing to compare
+ * it by. An issue keeps its own bd id — the thing an operator pastes into `bd show` when a message
+ * names it — and every other record type is namespaced by its `_type`, so a memory keyed `probe-3`
+ * cannot pass for the bead of that name.
  */
-function matchingClose(text, start) {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === "\\") i++;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === "{" || ch === "[") depth++;
-    else if ((ch === "}" || ch === "]") && --depth === 0) return i;
-  }
-  return -1;
+function recordKey(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return undefined;
+  const id = typeof record.id === "string" && record.id !== "" ? record.id : undefined;
+  const type = typeof record._type === "string" && record._type !== "" ? record._type : undefined;
+  // No `_type` is bd's older export shape, which wrote issues alone.
+  if (type === undefined || type === "issue") return id;
+  const own = typeof record.key === "string" && record.key !== "" ? record.key : id;
+  return own === undefined ? undefined : `${type}:${own}`;
 }
-
-/**
- * The JSON payload in `text` that `accept` recognises, or `undefined`.
- *
- * Neither "first `{` to last `}`" nor "the last span that parses" is safe on its own: bd brackets
- * its `--json` output with deprecation warnings free to contain brackets of their own (`use
- * {dolt.auto-commit} instead`), so the first would swallow a warning, while the second would hand
- * back an issue's OWN nested object or array. So each `{`/`[` is tried left-to-right against the
- * ONE close that balances it — and `accept` alone decides that a span is the payload, because "it
- * parsed" plainly is not enough to know that it is.
- *
- * Balancing rather than guessing the close is also what keeps the budget honest: a warning's stray
- * bracket costs one attempt, however many issues follow it.
- *
- * `accept` is handed the parsed value and its raw span, and returns the value to hand back, or
- * `undefined` to keep scanning.
- */
-function parseJsonPayload(text, accept) {
-  let attempts = 0;
-  for (let i = 0; i < text.length; i++) {
-    const open = text[i];
-    if (open !== "{" && open !== "[") continue;
-    if (++attempts > MAX_JSON_CANDIDATES) return undefined;
-    const end = matchingClose(text, i);
-    if (end < 0) continue; // an unbalanced bracket — a warning's, never a payload's
-    const span = text.slice(i, end + 1);
-    let parsed;
-    try {
-      parsed = JSON.parse(span);
-    } catch {
-      continue; // balanced but not JSON — keep walking the openers right
-    }
-    const taken = accept(parsed, span);
-    if (taken !== undefined) return taken;
-  }
-  return undefined;
-}
-
-/**
- * The arguments that list EVERY issue on this project's board, ids and all.
- *
- * `--all` plus the three `--include-*` flags mirror the backup's `bd export --all`: closed issues,
- * gates, infra beads and templates are board state too, and a check that skipped them would call a
- * board arrived while a third of it was still at home. `--limit 0` because bd truncates at 50 by
- * default. Every flag exists in bd 1.1.0, anton's floor (MIN_BD_VERSION).
- *
- * `--skip-labels` is NOT passed, on any read. Label hydration is the expensive half of the query,
- * but every read here is compared against another one by content digest — the drift check against
- * the source, the arrived-whole check against the server — and a label is content like any other
- * (PR #174 review). One read that skipped them would report every issue on the board as changed.
- */
-const listAllArgs = () => [
-  "list",
-  "--all",
-  "--json",
-  "--limit",
-  "0",
-  "--include-gates",
-  "--include-infra",
-  "--include-templates",
-];
 
 /** JSON with object keys sorted at every depth, and every array ordered by its own serialization:
- * bd's field order and its row order are presentation, not board content, so neither may read as a
- * mid-flip edit. */
+ * bd's field order and its row order — including the order it prints an issue's comments in — are
+ * presentation, not board content, so none of them may read as a mid-flip edit. */
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).sort().join(",")}]`;
   if (value && typeof value === "object") {
@@ -355,42 +297,45 @@ function stableJson(value) {
 }
 
 /**
- * A fingerprint of one issue as bd printed it — EVERY field, not a chosen few, so a status, title,
- * assignee, label or dependency written while the switch is being prepared cannot slip past the
- * drift check by leaving the id set intact (PR #174 review). Hashed rather than kept, so a
- * fingerprint per issue costs 40 bytes on a board of any size.
+ * A fingerprint of one exported record as bd printed it — EVERY field, not a chosen few, so a
+ * status, title, assignee, label, dependency, COMMENT or memory value written while the switch is
+ * being prepared cannot slip past the drift check by leaving the key set intact (PR #174 review).
+ * Hashed rather than kept, so a fingerprint per record costs 40 bytes on a board of any size.
  */
-const issueDigest = (issue) => createHash("sha1").update(stableJson(issue)).digest("hex");
+const recordDigest = (record) => createHash("sha1").update(stableJson(record)).digest("hex");
 
 /**
- * bd's own last-write stamp for one issue as epoch ms, or `undefined` when it carries none this can
- * order. It names, but never excuses, a content difference across the migration boundary: a server
- * copy BEHIND this board is a snapshot copied before the last edits, one AHEAD of it is a board
- * someone kept writing after the copy. Both are divergence — ordering two writes is not merging
- * them — so the stamp chooses which fix the message names, not whether the flip is allowed
- * (PR #174 review).
+ * bd's own last-write stamp for one record as epoch ms, or `undefined` when it carries none this can
+ * order (a memory carries none). It names, but never excuses, a content difference across the
+ * migration boundary: a server copy BEHIND this board is a snapshot copied before the last edits,
+ * one AHEAD of it is a board someone kept writing after the copy. Both are divergence — ordering two
+ * writes is not merging them — so the stamp chooses which fix the message names, not whether the
+ * flip is allowed (PR #174 review).
  */
-const issueUpdatedAt = (issue) => {
-  const ms = typeof issue?.updated_at === "string" ? Date.parse(issue.updated_at) : Number.NaN;
+const recordUpdatedAt = (record) => {
+  const ms = typeof record?.updated_at === "string" ? Date.parse(record.updated_at) : Number.NaN;
   return Number.isNaN(ms) ? undefined : ms;
 };
 
 /**
- * Every issue this project's board holds right now: its ids, and a content fingerprint per id.
+ * Everything this project's board holds right now: one key per record, and a content fingerprint
+ * per key. A record is an issue (with its labels, dependencies and comment thread) or a persistent
+ * memory — see {@link exportAllArgs} for why the read is an export rather than a listing.
  *
  * IDENTITY, not cardinality, is what answers "did the history actually arrive". A count proves only
  * that SOME board is on the other end: a server holding a stale or divergent copy of the same
  * project can match — or beat — the local count while missing issues the board being moved has, and
- * the flip would accept it and keep writing into the divergent copy. Comparing the id sets catches
- * that; comparing two numbers cannot. This runs once, on a one-time migration, so reading the ids
- * is worth what it costs over `bd count`.
+ * the flip would accept it and keep writing into the divergent copy. Comparing the key sets catches
+ * that; comparing two numbers cannot. This runs once, on a one-time migration, so reading the whole
+ * board is worth what it costs over `bd count`.
  *
- * The `digests` answer the other question — "is this the same board" — which ids alone cannot: a
- * writer that UPDATES an existing issue leaves the id set identical, and so does a server snapshot
- * copied before that update was made. `updated` orders two differing copies of one issue, which is
- * how the second case can say which side was written last — not whether the difference is safe.
+ * The `digests` answer the other question — "is this the same board" — which keys alone cannot: a
+ * writer that UPDATES an existing issue, or edits a comment on one, leaves the key set identical,
+ * and so does a server snapshot copied before that update was made. `updated` orders two differing
+ * copies of one record, which is how the second case can say which side was written last — not
+ * whether the difference is safe.
  *
- * Returns `{ ok: true, ids, digests, updated }` or `{ ok: false, detail }` — a board that cannot be
+ * Returns `{ ok: true, keys, digests, updated }` or `{ ok: false, detail }` — a board that cannot be
  * read is reported, never silently treated as empty.
  *
  * @param {string} dir repo root
@@ -398,45 +343,51 @@ const issueUpdatedAt = (issue) => {
  *   `board` is the connection bd runs under (credentials + transport) — the board's own before the
  *   flip, the server's after it.
  */
-export function readBoardIds(dir, opts = {}) {
+export function readBoardRecords(dir, opts = {}) {
   const exec = scopedBdRunner(dir, opts.board, opts);
-  // The network budget, not the local `bd` one: in server mode this listing crosses the wire to the
+  // The network budget, not the local `bd` one: in server mode this read crosses the wire to the
   // Dolt server, exactly like the export in `backupBoard`. On a large board over a slow link the
   // 60s local budget times out — and a timeout here is not a warning, it is a refused flip before
   // it and a full revert after it (PR #174 review).
   const ms = budgetMs("network");
-  const r = exec("bd", listAllArgs(), ms);
+  const r = exec("bd", exportAllArgs(), ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
 
-  // stdout only — bd's warnings go to stderr, and the ones that don't are stepped over by the scan.
-  // bd answers with a bare array on some boards and `{ issues: [...] }` on others; both are the
-  // payload, and anything else (a nested array of dependency ids, say) is not.
-  const stdout = r?.stdout ?? "";
-  const rows = parseJsonPayload(stdout, (parsed, span) => {
-    const wrapped = !Array.isArray(parsed) && Array.isArray(parsed?.issues);
-    const issues = Array.isArray(parsed) ? parsed : wrapped ? parsed.issues : undefined;
-    if (!issues) return undefined;
-    // An EMPTY bare array is the one span that proves nothing about itself — it would match a stray
-    // `[]` anywhere in the output. Taken only when it is the whole of stdout; the `{ issues: [] }`
-    // form names itself and needs no such guard.
-    //
-    // Known cost, deliberately paid (PR #174 review): an EMPTY board that bd wraps in a stdout
-    // warning ("some warning\n[]\n") falls through to `{ ok: false }` and reads as unreadable. The
-    // alternative — accepting a bare `[]` from anywhere in the output — would let a warning's own
-    // brackets pass as "the board is empty", and an empty source set makes the arrived-whole check
-    // in configureServerMode pass over ANY server board. A misleading message on an empty board is
-    // recoverable (--force, which that step names); a silently unverified flip is not.
-    if (issues.length === 0 && !wrapped && span.trim() !== stdout.trim()) return undefined;
-    const found = issues.map((i) => (i && typeof i === "object" ? i.id : undefined));
-    return found.every((id) => typeof id === "string" && id !== "") ? issues : undefined;
-  });
-  if (!rows) return { ok: false, detail: "bd list printed no readable board" };
-  return {
-    ok: true,
-    ids: rows.map((i) => i.id),
-    digests: new Map(rows.map((i) => [i.id, issueDigest(i)])),
-    updated: new Map(rows.map((i) => [i.id, issueUpdatedAt(i)])),
-  };
+  // stdout only — bd's warnings go to stderr, and JSONL turns the ones that don't into a line that
+  // simply does not parse, rather than brackets a scan has to tell apart from the payload's.
+  const digests = new Map();
+  const updated = new Map();
+  let noise = false;
+  for (const line of (r?.stdout ?? "").split("\n")) {
+    if (line.trim() === "") continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      noise = true; // a warning bd printed on stdout, not a record
+      continue;
+    }
+    const key = recordKey(record);
+    if (key === undefined) {
+      // A record with nothing to compare it under cannot be verified, and dropping it quietly is
+      // precisely how state gets stranded — so the whole read is reported as unusable instead.
+      if (record && typeof record === "object" && !Array.isArray(record)) {
+        return { ok: false, detail: "bd export printed a record with no id or key to compare it under" };
+      }
+      noise = true; // a bare string or number: bd talking, not exporting
+      continue;
+    }
+    digests.set(key, recordDigest(record));
+    updated.set(key, recordUpdatedAt(record));
+  }
+
+  // No records is a real answer — an empty board exports nothing — but ONLY when stdout held
+  // nothing else either. Zero records alongside output this could not parse is a read that went
+  // wrong, and calling that "the board is empty" would make the arrived-whole check in
+  // configureServerMode pass over ANY server board. --force is the deliberate way through, and the
+  // step that needs it names it.
+  if (digests.size === 0 && noise) return { ok: false, detail: "bd export printed no readable board" };
+  return { ok: true, keys: [...digests.keys()], digests, updated };
 }
 
 /**
@@ -454,7 +405,7 @@ export function readBoardIds(dir, opts = {}) {
  *
  * @param {string} dir repo root
  * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date }} [opts]
- *   `board` is the connection bd runs under — see {@link readBoardIds}.
+ *   `board` is the connection bd runs under — see {@link readBoardRecords}.
  */
 export function backupBoard(dir, opts = {}) {
   const exec = scopedBdRunner(dir, opts.board, opts);
@@ -477,7 +428,7 @@ export function backupBoard(dir, opts = {}) {
     return { status: "failed", detail: `could not write ${ignore}: ${String(e?.message ?? e)}` };
   }
 
-  // A large board's export reads every issue — the network budget, same as bd init/bootstrap.
+  // A large board's export reads every record — the network budget, same as bd init/bootstrap.
   const ms = budgetMs("network");
   const r = exec("bd", ["export", "--all", "-o", path], ms);
   if ((r?.status ?? 1) !== 0) return { status: "failed", detail: failureDetail(r, ms, output(r)) };
@@ -526,7 +477,7 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   backup?: boolean, force?: boolean }} flags
  *   `tls` declares the transport in this project's metadata.json (undefined leaves it undeclared,
  *   inheriting the ambient `BEADS_DOLT_SERVER_TLS`); `backup: false` skips the pre-flip export;
- *   `force: true` accepts a server board that is MISSING issues the board being moved has, or that
+ *   `force: true` accepts a server board that is MISSING records the board being moved has, or that
  *   says something DIFFERENT about them in either direction (starting a deliberately fresh board,
  *   or switching a machine whose local board is a leftover copy), and is the only way to switch when
  *   the board being moved cannot be read at all — with no source read, nothing verifies what
@@ -536,16 +487,18 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
  * @returns {{ ok, steps, connection?, errors, warnings, before?, counts?, backup?, missing?,
  *   diverged?, extra?, drifted? }}
- *   `missing` is the ids this board holds that the server's copy does not; `diverged` the ids it
+ *   Every key list below is {@link readBoardRecords}'s: a bead id for an issue (comment thread
+ *   included), `memory:<key>` for a persistent memory.
+ *   `missing` is the keys this board holds that the server's copy does not; `diverged` the keys it
  *   does hold but says something different about, in either direction — both empty once the checks
- *   have passed. `extra` is the other direction — ids only the SERVER has, which pass (they strand
+ *   have passed. `extra` is the other direction — keys only the SERVER has, which pass (they strand
  *   nothing) and are warned about, since they are either work created there or work deleted here
  *   that the flip brings back, and nothing bd prints tells those apart (see step 8c).
  *   `warnings` is what the run could NOT verify, on a run that otherwise succeeded — a project
  *   already reading the server verifies nothing about the embedded board still sitting next to it
- *   (see step 3), and an id only the server holds is not decidable from either listing (step 8c).
+ *   (see step 3), and a key only the server holds is not decidable from either read (step 8c).
  *   Callers must show them: they are the only notice an operator gets.
- *   `drifted` is the ids that appeared, disappeared or were EDITED on the board being moved while
+ *   `drifted` is the keys that appeared, disappeared or were EDITED on the board being moved while
  *   the switch was being prepared, i.e. a writer that was never stopped.
  */
 export function configureServerMode(dir, flags = {}, opts = {}) {
@@ -607,10 +560,11 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before });
   }
 
-  // 3. Read the board's issue IDs while it is still pointed where it is now. This is the set the
-  //    post-flip read is checked against, and it is taken BEFORE the backup so every id in it is
-  //    one the export below also carries. Step 5b re-reads it against the flip, so the ageing this
-  //    ordering costs is caught rather than trusted.
+  // 3. Read the board — every issue, comment thread and memory — while it is still pointed where it
+  //    is now. This is the set the post-flip read is checked against, and it is taken BEFORE the
+  //    backup so everything in it is something the export below also carries (both are `bd export
+  //    --all`, so that is exact). Step 5b re-reads it against the flip, so the ageing this ordering
+  //    costs is caught rather than trusted.
   //    WHOSE board that is, is the question a clone has to answer for itself. In server mode it is
   //    the SERVER's — so every check below compares the server with itself and proves nothing about
   //    any board on this machine. On a clone that never held the board that is the ordinary case
@@ -639,34 +593,34 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
           "on `git pull`, ahead of anyone checking that clone, so anything written here before the " +
           "pull is still in the local database and not on the server. To check it, put `dolt_mode` " +
           'back to "embedded" in .beads/metadata.json (git stash / git checkout the pulled change), ' +
-          "run `bd list --status all --json`, compare it with the server's, then re-run this command. " +
+          "run `bd export --all`, compare it with the server's, then re-run this command. " +
           "Nothing to do if that database is the leftover the runbook says to keep.",
       );
     }
   }
 
   const counts = {};
-  const idsBefore = readBoardIds(dir, { ...opts, board: before });
-  if (idsBefore.ok) {
-    counts.before = idsBefore.ids.length;
-    record("board issues", "ok", `${idsBefore.ids.length} issues${sourceIsServer ? ", read from the server" : ""}`);
+  const recordsBefore = readBoardRecords(dir, { ...opts, board: before });
+  if (recordsBefore.ok) {
+    counts.before = recordsBefore.keys.length;
+    record("board records", "ok", `${recordsBefore.keys.length} records${sourceIsServer ? ", read from the server" : ""}`);
   } else if (!flags.force) {
-    // Fatal without --force. The arrived-whole check in step 7 is the only thing standing between
-    // this project and a stale or unrelated copy on the server, and it needs these ids to run —
+    // Fatal without --force. The arrived-whole check in step 8 is the only thing standing between
+    // this project and a stale or unrelated copy on the server, and it needs this read to run —
     // with no source set to compare, a successful switch says nothing about what arrived. Treating
     // that as "nothing missing" is how an unverified board gets reported as a clean move.
-    record("board issues", "failed", idsBefore.detail);
+    record("board records", "failed", recordsBefore.detail);
     errors.push(
-      `could not read the board being moved: ${idsBefore.detail} — without its issue ids the ` +
-        "server's copy cannot be checked for what this board holds. Fix the read, or re-run with " +
-        "--force to accept the server's board unverified — which is also the answer for a board " +
-        "that is genuinely EMPTY, since an empty listing bd prints warnings around is not " +
-        "distinguishable from no listing at all (readBoardIds).",
+      `could not read the board being moved: ${recordsBefore.detail} — without it the server's copy ` +
+        "cannot be checked for what this board holds. Fix the read, or re-run with --force to accept " +
+        "the server's board unverified — which is also the answer for a board that is genuinely " +
+        "EMPTY, since an export bd printed warnings on stdout around is not distinguishable from no " +
+        "export at all (readBoardRecords).",
     );
     return fail({ before, connection, counts });
   } else {
-    record("board issues", "skipped", `${idsBefore.detail} — --force`);
-    emit(`could not read the current board (${idsBefore.detail}) — --force: skipping the arrived-whole check.`);
+    record("board records", "skipped", `${recordsBefore.detail} — --force`);
+    emit(`could not read the current board (${recordsBefore.detail}) — --force: skipping the arrived-whole check.`);
   }
 
   // 4. Back up before the flip. Only meaningful on an embedded board: a server board's data is not
@@ -731,32 +685,33 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //     would report a clean arrival over a bead nobody sees again; the later backup can even
   //     contain it without the verification ever noticing. The runbook's first instruction is to
   //     stop every writer — this is what proves it happened (PR #174 review).
-  //     CONTENT, not just ids: a writer that closes a bead, retitles it, moves a label or adds a
-  //     dependency leaves the id set identical, so a check on ids alone would pass here AND on the
-  //     server (step 8b compares content precisely because of this), stranding that update in a
-  //     database this project is about to stop reading. The per-issue digests catch every one.
+  //     CONTENT, not just keys: a writer that closes a bead, retitles it, moves a label, adds a
+  //     dependency, files a COMMENT or writes a memory leaves the key set identical or nearly so, so
+  //     a check on keys alone would pass here AND on the server (step 8b compares content precisely
+  //     because of this), stranding that write in a database this project is about to stop reading.
+  //     The per-record digests catch every one.
   //     Skipped under --force, which already accepts the server's board unverified: the second read
-  //     costs a full board listing and would only refine a check that flag has switched off.
-  if (idsBefore.ok && !flags.force) {
-    const idsNow = readBoardIds(dir, { ...opts, board: before });
-    if (!idsNow.ok) {
-      record("board unchanged", "failed", idsNow.detail);
+  //     costs a full board export and would only refine a check that flag has switched off.
+  if (recordsBefore.ok && !flags.force) {
+    const recordsNow = readBoardRecords(dir, { ...opts, board: before });
+    if (!recordsNow.ok) {
+      record("board unchanged", "failed", recordsNow.detail);
       errors.push(
-        `the board being moved became unreadable while the switch was being prepared: ${idsNow.detail} ` +
+        `the board being moved became unreadable while the switch was being prepared: ${recordsNow.detail} ` +
           "— nothing has been changed. Fix the read and re-run, or re-run with --force to accept the " +
           "server's board unverified.",
       );
       return fail({ before, connection, counts, backup });
     }
-    // One comparison covers all three shapes of drift: an id only the later read has (created), one
+    // One comparison covers all three shapes of drift: a key only the later read has (created), one
     // only the earlier read has (deleted), and one both hold under different digests (updated).
-    const drifted = [...new Set([...idsBefore.ids, ...idsNow.ids])].filter(
-      (id) => idsBefore.digests.get(id) !== idsNow.digests.get(id),
+    const drifted = [...new Set([...recordsBefore.keys, ...recordsNow.keys])].filter(
+      (key) => recordsBefore.digests.get(key) !== recordsNow.digests.get(key),
     );
     if (drifted.length) {
-      record("board unchanged", "failed", `${drifted.length} issue${drifted.length === 1 ? "" : "s"} changed`);
+      record("board unchanged", "failed", `${drifted.length} record${drifted.length === 1 ? "" : "s"} changed`);
       errors.push(
-        `the board being moved changed while the switch was being prepared — ${drifted.length} issue` +
+        `the board being moved changed while the switch was being prepared — ${drifted.length} record` +
           `${drifted.length === 1 ? "" : "s"} appeared, disappeared or were edited (${drifted.slice(0, 5).join(", ")}` +
           `${drifted.length > 5 ? ", …" : ""}). Something is still writing this board, so neither the ` +
           "backup nor the arrived-whole check covers it. Stop anton (`anton stop`) and any agent or " +
@@ -764,7 +719,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       );
       return fail({ before, connection, counts, backup, drifted });
     }
-    record("board unchanged", "ok", `${idsNow.ids.length} issues, unchanged since the read`);
+    record("board unchanged", "ok", `${recordsNow.keys.length} records, unchanged since the read`);
   }
 
   // 6. The flip: ONE write, immediately after the read that proved the board stood still — nothing
@@ -809,71 +764,76 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   }
 
   // 8. Prove THIS board arrived, not just that some board answers. The server's copy is checked by
-  //    identity: a stale or divergent copy of the same project can hold as many issues as the board
+  //    identity: a stale or divergent copy of the same project can hold as many records as the board
   //    being moved — more, even — while missing the ones written here since it diverged, and a
   //    count would wave it through onto an incomplete board every later write then compounds.
-  //    And by CONTENT, because id membership has the same blind spot on this side of the boundary
+  //    And by CONTENT, because key membership has the same blind spot on this side of the boundary
   //    as it does on the other one (step 5b): a server snapshot copied from an older export holds
-  //    every id while its titles, statuses, labels, dependencies and assignees predate the board
-  //    being moved, and an ids-only check would flip onto it and strand every one of those updates
-  //    in the database this project is about to stop reading (PR #174 review).
-  const idsAfter = readBoardIds(dir, { ...opts, board: connection });
-  record("server board issues", idsAfter.ok ? "ok" : "failed", idsAfter.ok ? `${idsAfter.ids.length} issues` : idsAfter.detail);
-  if (!idsAfter.ok) {
+  //    every key while its titles, statuses, labels, dependencies, assignees and comment threads
+  //    predate the board being moved, and a keys-only check would flip onto it and strand every one
+  //    of those updates in the database this project is about to stop reading (PR #174 review).
+  const recordsAfter = readBoardRecords(dir, { ...opts, board: connection });
+  record(
+    "server board records",
+    recordsAfter.ok ? "ok" : "failed",
+    recordsAfter.ok ? `${recordsAfter.keys.length} records` : recordsAfter.detail,
+  );
+  if (!recordsAfter.ok) {
     // Fatal, unlike the pre-flip read: reading the board back IS the verification, and `bd dolt
     // test` does not stand in for it. A server can answer the connection test and still refuse the
     // database — bd's own project-identity guard does exactly that when the connection names a
     // database belonging to another project ("PROJECT IDENTITY MISMATCH — refusing to connect").
-    errors.push(`the server accepted the connection but this project cannot read its board: ${idsAfter.detail}`);
+    errors.push(`the server accepted the connection but this project cannot read its board: ${recordsAfter.detail}`);
     revert("board unreadable on the server");
     return fail({ before, connection, counts, backup });
   }
-  counts.after = idsAfter.ids.length;
+  counts.after = recordsAfter.keys.length;
 
-  const onServer = new Set(idsAfter.ids);
-  const missing = idsBefore.ok ? idsBefore.ids.filter((id) => !onServer.has(id)) : [];
+  const onServer = new Set(recordsAfter.keys);
+  const missing = recordsBefore.ok ? recordsBefore.keys.filter((key) => !onServer.has(key)) : [];
   if (missing.length && !flags.force) {
     errors.push(
       `the server's "${connection.database}" database is missing ${missing.length} of this board's ` +
-        `${counts.before} issues (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}) — ` +
+        `${counts.before} records (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}) — ` +
         "its history has not been copied onto the server yet",
     );
-    revert("server board is missing issues");
+    revert("server board is missing records");
     return fail({ before, connection, counts, backup, missing });
   }
 
-  // 8b. Every id the server DOES hold, compared by content against the board being moved. A copy
-  //     whose digest matches is the same issue; ANY difference is divergence and refuses, in both
+  // 8b. Every key the server DOES hold, compared by content against the board being moved. A copy
+  //     whose digest matches is the same record; ANY difference is divergence and refuses, in both
   //     directions. A NEWER `updated_at` on the server is not the exception it looks like (PR #174
   //     review): it says the server's row was written last, not that it carries this board's edit.
   //     Close a bead here at t1 while the stale server copy is retitled at t2 and the server wins
   //     on timestamp while missing the close — flipping onto it strands exactly the update the
   //     check exists to protect. Nothing bd prints proves the server's row descends from this one,
   //     so content equality is the only evidence accepted; `--force` remains the deliberate
-  //     override, and the id check still accepts ids the server holds and this board does not.
-  const diverged = idsBefore.ok
-    ? idsBefore.ids.filter((id) => onServer.has(id) && idsAfter.digests.get(id) !== idsBefore.digests.get(id))
+  //     override, and the key check still accepts keys the server holds and this board does not.
+  const diverged = recordsBefore.ok
+    ? recordsBefore.keys.filter((key) => onServer.has(key) && recordsAfter.digests.get(key) !== recordsBefore.digests.get(key))
     : [];
   // The stamp picks the fix to name, not the verdict: behind → the copy is old, re-run Phase 1;
   // ahead → both sides were written after the copy, so the two boards have to be reconciled by a
   // human (or forced, if this board is the leftover of a machine that already switched).
-  const ahead = diverged.filter((id) => {
-    const here = idsBefore.updated.get(id);
-    const there = idsAfter.updated.get(id);
+  const ahead = diverged.filter((key) => {
+    const here = recordsBefore.updated.get(key);
+    const there = recordsAfter.updated.get(key);
     return here !== undefined && there !== undefined && there > here;
   });
   if (diverged.length && !flags.force) {
     const n = diverged.length;
     errors.push(
-      `the server's "${connection.database}" database holds all of this board's ids but ${n} ` +
-        `issue${n === 1 ? "" : "s"} say${n === 1 ? "s" : ""} something different there ` +
-        `(${diverged.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}) — the copy on the server and this ` +
+      `the server's "${connection.database}" database holds all of this board's records but ${n} ` +
+        `of them say${n === 1 ? "s" : ""} something different there ` +
+        `(${diverged.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}) — a title, a status, a label, a ` +
+        "dependency, a comment or a memory value. The copy on the server and this " +
         "board were edited apart, so switching would strand every one of those differences in the " +
         "database being left behind. " +
         (ahead.length === n
           ? "Those rows were written LAST on the server, which does not mean they contain this " +
             "board's edits — a later timestamp orders two writes, it does not merge them. Reconcile " +
-            "the two boards (compare a `bd list --json` from each); --force is right only when this " +
+            "the two boards (compare a `bd export --all` from each); --force is right only when this " +
             "machine's board is a leftover copy nobody has written since it was copied."
           : ahead.length
             ? `${ahead.length} of them (${ahead.slice(0, 5).join(", ")}${ahead.length > 5 ? ", …" : ""}) ` +
@@ -882,45 +842,45 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
               "the two boards before forcing."
             : "The copy on the server predates this board. Re-run Phase 1 of the runbook with a " +
               "current copy.") +
-        // EVERY issue differing is not a stale snapshot — nothing edits a whole board — it is the
+        // EVERY record differing is not a stale snapshot — nothing edits a whole board — it is the
         // two sides describing the same rows differently. Named, because the fix is the opposite
-        // one (look at the listings, then --force) and an operator should not have to guess.
-        (n === idsBefore.ids.length
-          ? " (That is EVERY issue on the board, which usually means the two sides print the same " +
-            "rows differently rather than that the boards really diverged — compare a `bd list " +
-            "--json` from each before reaching for --force.)"
+        // one (look at the exports, then --force) and an operator should not have to guess.
+        (n === recordsBefore.keys.length
+          ? " (That is EVERY record on the board, which usually means the two sides print the same " +
+            "rows differently rather than that the boards really diverged — compare a `bd export " +
+            "--all` from each before reaching for --force.)"
           : ""),
     );
     revert("server board differs from this one");
     return fail({ before, connection, counts, backup, missing, diverged });
   }
 
-  // 8c. Ids the SERVER holds and this board does not. Two different things wear that shape and
+  // 8c. Keys the SERVER holds and this board does not. Two different things wear that shape and
   //     nothing bd prints tells them apart (PR #174 review): a teammate's issue created on the
   //     server after Phase 1 copied it — the ordinary case for a machine joining a board others
   //     already moved onto — or an issue deleted HERE after that copy (`bd delete`, an epic removed
   //     with --cascade), which the server still carries and the flip would bring back. Deciding
   //     would need ancestry or a tombstone; bd exposes neither, so the run does not decide.
   //     Reported rather than refused, because the two directions are not the same failure: a
-  //     missing or divergent id is this board's work stranded in a database about to be abandoned,
-  //     which nothing recovers — an id only the server has is work that survives the flip either
-  //     way, and a resurrected bead is deleted again in one command. Refusing would also push the
-  //     runbook's second machine onto --force, which switches off the checks above that guard the
-  //     unrecoverable half. So the ids are named and the operator decides.
+  //     missing or divergent record is this board's work stranded in a database about to be
+  //     abandoned, which nothing recovers — one only the server has is work that survives the flip
+  //     either way, and a resurrected bead is deleted again in one command. Refusing would also push
+  //     the runbook's second machine onto --force, which switches off the checks above that guard
+  //     the unrecoverable half. So the keys are named and the operator decides.
   //     Only when the board being moved is a LOCAL one: on a project already reading the server
-  //     both listings come from it, so an id in one and not the other is a teammate writing between
+  //     both reads come from it, so a key in one and not the other is a teammate writing between
   //     two reads — nothing to do with a copy, and the warning would be pure noise.
-  const here = new Set(idsBefore.ok ? idsBefore.ids : []);
-  const extra = idsBefore.ok && !sourceIsServer ? idsAfter.ids.filter((id) => !here.has(id)) : [];
+  const here = new Set(recordsBefore.ok ? recordsBefore.keys : []);
+  const extra = recordsBefore.ok && !sourceIsServer ? recordsAfter.keys.filter((key) => !here.has(key)) : [];
   if (extra.length) {
     const n = extra.length;
     const named = `${extra.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`;
-    record("server-only issues", "skipped", `${n} not compared — present there, absent here`);
+    record("server-only records", "skipped", `${n} not compared — present there, absent here`);
     warnings.push(
-      `the server's "${connection.database}" database holds ${n} issue${n === 1 ? "" : "s"} this ` +
+      `the server's "${connection.database}" database holds ${n} record${n === 1 ? "" : "s"} this ` +
         `board does not (${named}). Everything this board holds arrived intact — these are the other ` +
-        "direction, and nothing here can say which of two things they are: issues created on the " +
-        `server since it was copied (normal — the board moved on without this machine), or issue${n === 1 ? "" : "s"} ` +
+        "direction, and nothing here can say which of two things they are: work created on the " +
+        `server since it was copied (normal — the board moved on without this machine), or work ` +
         `deleted HERE after the copy, which the server still carries and this switch has just brought ` +
         "back. Check them (`bd show <id>`): keep them, or delete them again on the now-shared board.",
     );

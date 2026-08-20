@@ -22,10 +22,11 @@ afterEach(() => dirs.cleanup());
 const EMBEDDED = { database: "dolt", backend: "dolt", dolt_mode: "embedded", dolt_database: "probe", project_id: "abc-123" };
 
 /**
- * A stub `bd` for the server-mode flow. `bd list` answers with the ids in `.beads/.fake-board`
+ * A stub `bd` for the server-mode flow. The verification read is `bd export --all` on stdout (the
+ * one read that carries comments and memories); it answers with the ids in `.beads/.fake-board`
  * (local ids, then the server's, separated by `|`) so a case can make the server's board differ
- * from the local one, and `bd dolt test` fails when `.beads/.fake-unreachable` exists — the two
- * failures the command is built to catch.
+ * from the local one. `bd export --all -o <file>` is the backup, and `bd dolt test` fails when
+ * `.beads/.fake-unreachable` exists — the two failures the command is built to catch.
  */
 const FAKE_BD_SERVER = [
   "#!/usr/bin/env node",
@@ -35,14 +36,14 @@ const FAKE_BD_SERVER = [
   'const beads = path.join(process.cwd(), ".beads");',
   'const read = (f, d) => { try { return fs.readFileSync(path.join(beads, f), "utf8").trim(); } catch { return d; } };',
   'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.2 (fake)"); process.exit(0); }',
-  'if (a[0] === "list") {',
+  'if (a[0] === "export" && a.includes("-o")) { fs.writeFileSync(a[a.indexOf("-o") + 1], ""); process.exit(0); }',
+  'if (a[0] === "export") {',
   '  const mode = JSON.parse(read("metadata.json", "{}")).dolt_mode;',
   '  const boards = read(".fake-board", "probe-1,probe-2,probe-3|probe-1,probe-2,probe-3").split("|");',
   '  const ids = (mode === "server" ? boards[1] : boards[0]).split(",").filter(Boolean);',
-  '  console.log(JSON.stringify({ issues: ids.map((id) => ({ id })) }));',
+  '  for (const id of ids) console.log(JSON.stringify({ _type: "issue", id }));',
   "  process.exit(0);",
   "}",
-  'if (a[0] === "export") { fs.writeFileSync(a[a.indexOf("-o") + 1], ""); process.exit(0); }',
   'if (a[0] === "dolt" && a[1] === "test") {',
   '  if (fs.existsSync(path.join(beads, ".fake-unreachable"))) { console.error("Connection failed"); process.exit(1); }',
   "  process.exit(0);",
