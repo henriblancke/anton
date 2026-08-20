@@ -493,6 +493,23 @@ describe("beadsPrereqs — the mode decides what must be reachable (anton-eg46)"
     expect(beadsPrereqs(dir)).toEqual({ ok: true });
     expect(bd.calls()).not.toContain("dolt test");
   });
+
+  /**
+   * The preflight is part of the run, not a step in front of it: `configureBeadsForRepo` documents
+   * `opts.exec` as replacing every bd spawn, so a probe that reached the host CLI anyway would fail
+   * an injected-executor caller before its executor was ever used (PR #174 review).
+   */
+  it("routes configureBeadsForRepo's preflight through the caller's injected exec, not the host bd", () => {
+    const dir = gitRepo(SERVER_METADATA);
+    const bd = stubBd({ unreachable: true });
+    const { calls, exec } = recordingExec();
+
+    const result = configureBeadsForRepo(dir, { exec, log: () => {} });
+
+    expect(result.skipped).toBe(false);
+    expect(calls).toContainEqual(["bd", "dolt", "test"]);
+    expect(bd.calls()).not.toContain("dolt test");
+  });
 });
 
 describe("formatServerTarget", () => {
@@ -649,5 +666,20 @@ describe("configureBeadsForRepo scopes every bd spawn to the target project (ant
       expect(call.env.BEADS_DOLT_SERVER_DATABASE).toBeUndefined();
       expect(call.env.BEADS_DOLT_SERVER_HOST).toBeUndefined();
     }
+  });
+
+  // A caller that supplies `opts.env` supplies it for the WHOLE run. When the board's password lives
+  // only there, a preflight probing under `process.env` would report a healthy server unreachable.
+  it("scopes the preflight probe from opts.env too, not from the ambient process environment", () => {
+    const dir = gitRepo({ metadata: SERVER_METADATA });
+    const bd = stubBd();
+
+    configureBeadsForRepo(dir, {
+      log: () => {},
+      env: { ...process.env, BEADS_DOLT_PASSWORD_BEADS: "from-opts-env" },
+    });
+
+    const probe = boardCalls(bd.calls()).find((c) => c.args[0] === "dolt" && c.args[1] === "test");
+    expect(probe?.env.BEADS_DOLT_PASSWORD).toBe("from-opts-env");
   });
 });

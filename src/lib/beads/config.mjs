@@ -1267,7 +1267,11 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // init, bootstrap and the config writes all address the same database with the same credentials.
   const exec = scopedBdRunner(dir, connection, opts);
 
-  const pre = beadsPrereqs(dir);
+  // The preflight runs through the SAME runner as everything below it. Its server-mode leg spawns a
+  // real `bd dolt test`, so left unscoped it would probe with `process.env` — reporting a board
+  // unreachable whenever the password lives only in `opts.env`, and reaching the host CLI even when
+  // the caller injected an executor precisely to avoid that.
+  const pre = beadsPrereqs(dir, { ...opts, exec });
   if (!pre.ok) {
     return {
       configured: false,
