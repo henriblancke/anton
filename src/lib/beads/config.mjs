@@ -593,6 +593,26 @@ export function scopeBdEnv(parentEnv, user) {
 }
 
 /**
+ * A bd/git runner bound to `dir` and to `user`'s credentials — the ONE way anton spawns bd against a
+ * project it is configuring. The environment carries no project identity of its own, so the target's
+ * `.beads/metadata.json` decides which database is opened, and the password is narrowed to that
+ * project's account (anton-ffmw.1; `bd-env.ts` carries the field report).
+ *
+ * `opts.exec` short-circuits it, so every caller keeps the injectable seam its tests use.
+ *
+ * @param {string} dir cwd for the spawn (the target repo)
+ * @param {string|undefined} user the project's configured database user, if any
+ * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
+ *   env?: NodeJS.ProcessEnv }} [opts]
+ */
+export function scopedBdRunner(dir, user, opts = {}) {
+  if (opts.exec) return opts.exec;
+  const env = scopeBdEnv(opts.env ?? process.env, user);
+  return (cmd, args, timeoutMs = budgetMs("bd")) =>
+    spawnSync(cmd, args, { cwd: dir, encoding: "utf8", env, timeout: timeoutMs, killSignal: SPAWN_KILL_SIGNAL });
+}
+
+/**
  * Which env var must hold `user`'s password — the per-user form when the project names a user, the
  * shared fallback otherwise. Naming the wrong one is the difference between a one-line fix and a
  * lost hour, so every "cannot reach the server" message routes through here (`bd-env.ts` wraps it
@@ -630,16 +650,7 @@ export function formatServerTarget(connection = {}) {
  */
 export function checkSharedServer(dir, connection = {}, opts = {}) {
   const ms = budgetMs("network");
-  const exec =
-    opts.exec ??
-    ((cmd, args, timeoutMs = ms) =>
-      spawnSync(cmd, args, {
-        cwd: dir,
-        encoding: "utf8",
-        env: scopeBdEnv(opts.env ?? process.env, connection.user),
-        timeout: timeoutMs,
-        killSignal: SPAWN_KILL_SIGNAL,
-      }));
+  const exec = scopedBdRunner(dir, connection.user, opts);
 
   const r = exec("bd", ["dolt", "test"], ms);
   if ((r?.status ?? 1) === 0) return { ok: true };
@@ -1037,7 +1048,10 @@ export function detectHooksManager(dir, priorHooksPath = null) {
  * directory is a safe no-op.
  *
  * @param {string} dir absolute path to the target repo
- * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string }} [opts]
+ * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string, env?: NodeJS.ProcessEnv,
+ *   exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} [opts]
+ *   `env` is the parent environment every bd spawn is scoped from (default `process.env`); `exec`
+ *   replaces the spawn entirely, the seam the unit tests drive.
  *   `appRoot` anchors the bundled formula assets. Default: this module's package root — right
  *   for the CLI, which runs from anywhere. A caller inside the Next server bundle MUST pass its
  *   own anchor (`process.cwd()`): there `import.meta.url` points at a build chunk, so the default
@@ -1054,6 +1068,12 @@ export function configureBeadsForRepo(dir, opts = {}) {
   // repo with no `.beads/` yet reads as embedded — which is right, since `bd init` creates exactly
   // that (server mode is opt-in, entered by editing metadata.json).
   const { mode, ...connection } = readDoltMetadata(dir);
+
+  // Every bd below runs under THIS project's identity, never anton's ambient `BEADS_DOLT_*` — which
+  // is whatever board the launch directory's .envrc last exported, and outranks the target's own
+  // metadata.json in bd's precedence (anton-ffmw.1). Built once, from the connection just read, so
+  // init, bootstrap and the config writes all address the same database with the same credentials.
+  const exec = scopedBdRunner(dir, connection.user, opts);
 
   const pre = beadsPrereqs(dir);
   if (!pre.ok) {
@@ -1096,12 +1116,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
     emit(`bd ${initArgs.join(" ")}`);
     // The long budget: init creates the Dolt workspace and can reach the remote.
     const initMs = budgetMs("network");
-    const r = spawnSync("bd", initArgs, {
-      cwd: dir,
-      encoding: "utf8",
-      timeout: initMs,
-      killSignal: SPAWN_KILL_SIGNAL,
-    });
+    const r = exec("bd", initArgs, initMs);
     if ((r.status ?? 1) !== 0) {
       const detail = failureDetail(r, initMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd init", status: "failed", detail });
@@ -1120,12 +1135,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
     emit("bd bootstrap --non-interactive (fresh clone — hydrating the Dolt DB from origin)");
     // Hydrating a fresh clone pulls the whole board over refs/dolt/data — the long budget.
     const bootstrapMs = budgetMs("network");
-    const r = spawnSync("bd", ["bootstrap", "--non-interactive"], {
-      cwd: dir,
-      encoding: "utf8",
-      timeout: bootstrapMs,
-      killSignal: SPAWN_KILL_SIGNAL,
-    });
+    const r = exec("bd", ["bootstrap", "--non-interactive"], bootstrapMs);
     if ((r.status ?? 1) !== 0) {
       const detail = failureDetail(r, bootstrapMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd bootstrap", status: "failed", detail });
@@ -1140,12 +1150,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
     // right after bootstrap. Best-effort: idempotent on a consistent DB, and a failure here must
     // never abort an otherwise-good clone setup. timeout: a hung recompute (e.g. a Dolt DB lock)
     // must not stall the configure flow — the kill surfaces as rc.error/non-zero, i.e. "skipped".
-    const rc = spawnSync("bd", ["recompute-blocked"], {
-      cwd: dir,
-      encoding: "utf8",
-      timeout: budgetMs("bd"),
-      killSignal: SPAWN_KILL_SIGNAL,
-    });
+    const rc = exec("bd", ["recompute-blocked"], budgetMs("bd"));
     steps.push({ name: "bd recompute-blocked", status: (rc.status ?? 1) === 0 ? "ok" : "skipped" });
   } else {
     emit(".beads/ present with a local Dolt DB — enforcing team-config only (no re-init).");
@@ -1154,7 +1159,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
 
   // 2. Patch config.yaml idempotently (never clobber), with the profile this board's mode calls for.
   for (const [key, want] of teamConfigKeys(mode)) {
-    const status = ensureBdConfig(dir, beadsDir, key, want);
+    const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
     steps.push({ name: `${key}=${want}`, status });
     if (status === "failed") {
       emit(`could not set ${key}=${want}`);
@@ -1168,7 +1173,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
   //     inherits the target instead of being told to type it. A required field missing from
   //     metadata.json is an ERROR, not a silence — the board cannot reach its server without it.
   if (mode === "server") {
-    for (const step of ensureDoltConnection(dir, beadsDir, connection)) {
+    for (const step of ensureDoltConnection(dir, beadsDir, connection, { exec })) {
       steps.push(step);
       if (step.status === "missing" || step.status === "failed") {
         emit(`${step.name} — ${step.detail}`);
@@ -1226,7 +1231,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so
   //    both `anton init` and addProject inherit it (anton-43b). A failure is collected, not thrown.
-  const doltSync = configureBeadsDoltSync({ repoDir: dir, log: emit });
+  const doltSync = configureBeadsDoltSync({ repoDir: dir, log: emit, exec });
   steps.push({ name: "dolt remote sync", status: doltSync.status, detail: doltSync.detail });
   if (doltSync.status === "error") {
     errors.push(`dolt remote sync failed: ${doltSync.detail}`);

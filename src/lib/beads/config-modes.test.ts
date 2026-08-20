@@ -15,10 +15,12 @@ import { delimiter, join } from "node:path";
 import {
   EMBEDDED_CONFIG_KEYS,
   MIN_BD_VERSION,
+  PROJECT_SCOPED_BD_ENV,
   SERVER_CONFIG_KEYS,
   beadsPrereqs,
   checkSharedServer,
   configureBeadsDoltSync,
+  configureBeadsForRepo,
   ensureDoltConnection,
   formatServerTarget,
   readDoltMetadata,
@@ -363,5 +365,129 @@ describe("checkSharedServer", () => {
     const dir = repo(JSON.stringify(SERVER_METADATA));
     const { exec } = recordingExec();
     expect(checkSharedServer(dir, {}, { exec })).toEqual({ ok: true });
+  });
+});
+
+/**
+ * The environment half of anton-ffmw.1. anton is one process configuring many projects' boards, and
+ * bd reads `env > metadata.json > config.yaml` — so an ambient `BEADS_DOLT_*` (a launch directory's
+ * .envrc, exported for project A) silently outranks the target project's own metadata.json. Every bd
+ * `configureBeadsForRepo` spawns must therefore run with project identity stripped and the password
+ * narrowed to THIS project's account.
+ *
+ * Run against a real stub `bd` first on PATH, because what is under test is the environment a real
+ * spawn receives — an injected exec would prove nothing about it.
+ */
+describe("configureBeadsForRepo scopes every bd spawn to the target project (anton-ffmw.1)", () => {
+  const AMBIENT = {
+    // Project A's identity, as an .envrc would export it — none of it may reach project B's bd.
+    BEADS_DOLT_SERVER_MODE: "1",
+    BEADS_DOLT_SERVER_HOST: "a.example.dev",
+    BEADS_DOLT_SERVER_DATABASE: "project_a",
+    BEADS_DOLT_PASSWORD: "project-a-secret",
+  };
+  const TOUCHED = [...Object.keys(AMBIENT), "BEADS_DOLT_PASSWORD_BEADS", "PATH"];
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = Object.fromEntries(TOUCHED.map((k) => [k, process.env[k]]));
+    Object.assign(process.env, AMBIENT);
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  type Call = { args: string[]; env: Record<string, string> };
+
+  /**
+   * A stub `bd` first on PATH that records every invocation's argv AND its `BEADS_DOLT_*` environment,
+   * answers the version gate and the server probe, and creates the `.beads/` workspace on `init` the
+   * way real bd does (the steps after init write into it).
+   */
+  function stubBd() {
+    const bin = mkdtempSync(join(tmpdir(), "anton-scope-bin-"));
+    dirs.push(bin);
+    const log = join(bin, "calls.jsonl");
+    const script = [
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      "const a = process.argv.slice(2);",
+      'const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith("BEADS_DOLT_")));',
+      `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args: a, env }) + "\\n");`,
+      `if (a[0] === "--version" || a[0] === "--help") { console.log("bd version ${MIN_BD_VERSION} (stub)"); process.exit(0); }`,
+      'if (a[0] === "init") { fs.mkdirSync(path.join(process.cwd(), ".beads"), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), ".beads", "config.yaml"), "# stub\\n"); }',
+      "process.exit(0);",
+    ].join("\n");
+    writeFileSync(join(bin, "bd"), `${script}\n`);
+    chmodSync(join(bin, "bd"), 0o755);
+    process.env.PATH = `${bin}${delimiter}${saved.PATH ?? ""}`;
+    return {
+      calls: (): Call[] => {
+        try {
+          return readFileSync(log, "utf8")
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line) as Call);
+        } catch {
+          return [];
+        }
+      },
+    };
+  }
+
+  /** A git repo at `dir`, optionally with `.beads/metadata.json` and an `origin`. */
+  function gitRepo({ metadata, origin }: { metadata?: Record<string, unknown>; origin?: boolean } = {}): string {
+    const dir = mkdtempSync(join(tmpdir(), "anton-scope-"));
+    dirs.push(dir);
+    spawnSync("git", ["-C", dir, "init"], { stdio: "ignore" });
+    if (metadata) {
+      mkdirSync(join(dir, ".beads"), { recursive: true });
+      writeFileSync(join(dir, ".beads", "metadata.json"), JSON.stringify(metadata));
+      writeFileSync(join(dir, ".beads", "config.yaml"), "# empty\n");
+    }
+    if (origin) spawnSync("git", ["-C", dir, "remote", "add", "origin", join(dir, "origin.git")], { stdio: "ignore" });
+    return dir;
+  }
+
+  /** `bd --version` opens no database, so the prereq probe is the one spawn identity cannot reach. */
+  const boardCalls = (calls: Call[]) => calls.filter((c) => c.args[0] !== "--version");
+
+  it("strips project identity from bd init — a new board is created where metadata.json says, not where the shell does", () => {
+    const dir = gitRepo({ origin: true });
+    const bd = stubBd();
+
+    configureBeadsForRepo(dir, { log: () => {} });
+
+    const calls = boardCalls(bd.calls());
+    expect(calls.map((c) => c.args[0])).toContain("init");
+    for (const call of calls) {
+      expect(Object.keys(call.env).filter((k) => PROJECT_SCOPED_BD_ENV.includes(k))).toEqual([]);
+      // Credentials are NOT stripped: a single shared account is still a valid deployment, and a bd
+      // that cannot authenticate is a different (and worse) failure than one pointed at project A.
+      expect(call.env.BEADS_DOLT_PASSWORD).toBe("project-a-secret");
+    }
+  });
+
+  it("hands a server-mode board its own account's password, not the ambient one", () => {
+    const dir = gitRepo({ metadata: SERVER_METADATA });
+    process.env.BEADS_DOLT_PASSWORD_BEADS = "project-b-secret";
+    const bd = stubBd();
+
+    configureBeadsForRepo(dir, { log: () => {} });
+
+    const calls = boardCalls(bd.calls());
+    // The connection publish is the call that must authenticate as this project's user.
+    expect(calls.some((c) => c.args[0] === "dolt" && c.args[1] === "set")).toBe(true);
+    expect(calls.some((c) => c.args[0] === "config" && c.args[1] === "set")).toBe(true);
+    for (const call of calls) {
+      expect(call.env.BEADS_DOLT_PASSWORD).toBe("project-b-secret");
+      expect(call.env.BEADS_DOLT_SERVER_DATABASE).toBeUndefined();
+      expect(call.env.BEADS_DOLT_SERVER_HOST).toBeUndefined();
+    }
   });
 });

@@ -25,13 +25,11 @@
  * On any of those failures `metadata.json` is restored byte-for-byte, so a failed attempt leaves a
  * working board rather than a project pointed at a server it cannot read.
  */
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
   MIN_BD_VERSION,
-  SPAWN_KILL_SIGNAL,
   bdVersion,
   bdVersionAtLeast,
   budgetMs,
@@ -41,7 +39,7 @@ import {
   failureDetail,
   passwordVarHint,
   readDoltMetadata,
-  scopeBdEnv,
+  scopedBdRunner,
   teamConfigKeys,
 } from "./config.mjs";
 
@@ -155,19 +153,6 @@ export function restoreMetadata(path, before) {
   else writeFileSync(path, before);
 }
 
-/**
- * A bd runner bound to `dir` and to `user`'s credentials: project identity stripped from the
- * environment and the password narrowed to that account, exactly as anton's own bd spawns are
- * scoped (`bd-env.ts`, anton-ffmw.1). Without it a `bd dolt test` here would verify whatever
- * `BEADS_DOLT_*` the operator's shell happens to export — i.e. verify nothing about this project.
- */
-function bdRunner(dir, user, opts = {}) {
-  if (opts.exec) return opts.exec;
-  const env = scopeBdEnv(opts.env ?? process.env, user);
-  return (cmd, args, timeoutMs = budgetMs("bd")) =>
-    spawnSync(cmd, args, { cwd: dir, encoding: "utf8", env, timeout: timeoutMs, killSignal: SPAWN_KILL_SIGNAL });
-}
-
 /** Everything a bd invocation printed, both streams — bd puts its config warnings on stderr. */
 const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
 
@@ -182,7 +167,7 @@ const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
  * reported, never silently treated as zero.
  */
 export function countBoard(dir, opts = {}) {
-  const exec = bdRunner(dir, opts.user, opts);
+  const exec = scopedBdRunner(dir, opts.user, opts);
   const ms = budgetMs("bd");
   const r = exec("bd", ["count", "--status", "all", "--json"], ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
@@ -215,7 +200,7 @@ export function countBoard(dir, opts = {}) {
  * Returns `{ status: "written"|"failed", path?, detail? }`.
  */
 export function backupBoard(dir, opts = {}) {
-  const exec = bdRunner(dir, opts.user, opts);
+  const exec = scopedBdRunner(dir, opts.user, opts);
   const beadsDir = join(dir, ".beads");
   const dest = join(beadsDir, BACKUP_DIR);
   const stamp = (opts.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, "-");
@@ -244,7 +229,7 @@ export function testDoltConnection(dir, connection, opts = {}) {
   // The probe itself is config.mjs's, shared with the `anton init`/`doctor` preflight (anton-eg46)
   // so a connection this command accepts is one those will too. Only the hints are this command's:
   // it is mid-flip, with the connection it just wrote in hand.
-  const probe = checkSharedServer(dir, connection, { ...opts, exec: bdRunner(dir, connection.user, opts) });
+  const probe = checkSharedServer(dir, connection, { ...opts, exec: scopedBdRunner(dir, connection.user, opts) });
   if (probe.ok) return { ok: true };
 
   const hints = [
@@ -294,7 +279,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    refs/dolt/data channel a server-mode board does not use. What it does need is bd and an
   //    initialized workspace to point at. The version probe goes through the project-scoped runner
   //    like every other bd call here, so an injected `exec` controls the whole flow.
-  const probe = bdRunner(dir, undefined, opts);
+  const probe = scopedBdRunner(dir, undefined, opts);
   const version = bdVersion(() => probe("bd", ["--version"], budgetMs("probe")));
   if (!bdVersionAtLeast(version)) {
     errors.push(
@@ -401,7 +386,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    comes after the metadata write rather than before it.
   // Both take the project-scoped runner: on a server board `bd config set` and `bd dolt set` talk
   // to the database, so they need the same narrowed credentials the test above proved.
-  const exec = bdRunner(dir, connection.user, opts);
+  const exec = scopedBdRunner(dir, connection.user, opts);
   for (const [key, want] of teamConfigKeys("server")) {
     const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
     record(`${key}=${want}`, status);
