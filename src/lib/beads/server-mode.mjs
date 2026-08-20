@@ -22,8 +22,8 @@
  *      another database) — the one mistake that makes an otherwise-successful switch look fine
  *      while the team stares at an empty board. It reverts rather than reports.
  *
- * On any of those failures `metadata.json` is restored byte-for-byte, so a failed attempt leaves a
- * working board rather than a project pointed at a server it cannot read.
+ * On any of those failures `metadata.json` AND `.beads/config.yaml` are restored byte-for-byte, so a
+ * failed attempt leaves a working board rather than a project pointed at a server it cannot read.
  */
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -126,7 +126,7 @@ export function resolveServerConnection(raw, flags = {}) {
  * Write `connection` into `.beads/metadata.json` as server mode, preserving every other key.
  *
  * Returns `{ status: "already"|"written", changed, before }`, where `before` is the file's exact
- * prior text (or `null` when there was none) — what {@link restoreMetadata} puts back when the
+ * prior text (or `null` when there was none) — what {@link restoreFile} puts back when the
  * verification below fails.
  */
 export function writeServerModeMetadata(dir, connection) {
@@ -147,8 +147,11 @@ export function writeServerModeMetadata(dir, connection) {
   return { status: "written", changed, before, path };
 }
 
-/** Put back what {@link writeServerModeMetadata} replaced — `null` means the file did not exist. */
-export function restoreMetadata(path, before) {
+/**
+ * Put back a file this flow replaced — `before` is its exact prior text, `null` when it did not
+ * exist (in which case the file is removed). Used for both `metadata.json` and `config.yaml`.
+ */
+export function restoreFile(path, before) {
   if (before === null) rmSync(path, { force: true });
   else writeFileSync(path, before);
 }
@@ -157,11 +160,34 @@ export function restoreMetadata(path, before) {
 const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
 
 /**
+ * The JSON object in `text`, found by trying every `{`…`}` span right-to-left (the same
+ * keep-scanning idea as bd.ts's `parseJsonTail`, widened to a closing brace it must also find).
+ *
+ * NOT the widest span: bd brackets its `--json` output with deprecation warnings, and a warning is
+ * free to contain braces of its own (`use {dolt.auto-commit} instead`) — first `{` to last `}` would
+ * swallow one and read a healthy board as unparseable. Returns `undefined` when nothing parses.
+ */
+function parseJsonObject(text) {
+  // Both `i > 0` guards are load-bearing: `lastIndexOf(c, -1)` clamps its start to 0 rather than
+  // giving up, so a leading brace that fails to parse would be handed back forever.
+  for (let i = text.lastIndexOf("{"); i >= 0; i = i > 0 ? text.lastIndexOf("{", i - 1) : -1) {
+    for (let e = text.lastIndexOf("}"); e > i; e = e > 0 ? text.lastIndexOf("}", e - 1) : -1) {
+      try {
+        const parsed = JSON.parse(text.slice(i, e + 1));
+        if (parsed && typeof parsed === "object") return parsed;
+      } catch {
+        // not the object's span — narrow the end, then keep walking the start left
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
  * How many issues this project's board holds right now, via `bd count --status all`.
  *
  * The one number that answers "did the history actually arrive": cheap on a large board (unlike a
  * full `bd list`), and identical either side of the flip, so before/after compare like for like.
- * Parsed from the first `{` because bd prefixes its JSON with deprecation warnings on some configs.
  *
  * Returns `{ ok: true, count }` or `{ ok: false, detail }` — a board that cannot be counted is
  * reported, never silently treated as zero.
@@ -172,18 +198,10 @@ export function countBoard(dir, opts = {}) {
   const r = exec("bd", ["count", "--status", "all", "--json"], ms);
   if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
 
-  // stdout only, and only the outermost object in it: bd prefixes (and on some configs follows) its
-  // JSON with deprecation warnings, so anything less careful reads a healthy board as unparseable.
-  const text = r?.stdout ?? "";
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end < start) return { ok: false, detail: "bd count printed no JSON" };
-  try {
-    const count = JSON.parse(text.slice(start, end + 1)).count;
-    return Number.isInteger(count) ? { ok: true, count } : { ok: false, detail: "bd count reported no count" };
-  } catch {
-    return { ok: false, detail: "bd count printed output this build can't parse" };
-  }
+  // stdout only — bd's warnings go to stderr, and the ones that don't are stepped over by the scan.
+  const parsed = parseJsonObject(r?.stdout ?? "");
+  if (!parsed) return { ok: false, detail: "bd count printed no JSON" };
+  return Number.isInteger(parsed.count) ? { ok: true, count: parsed.count } : { ok: false, detail: "bd count reported no count" };
 }
 
 /**
@@ -206,11 +224,18 @@ export function backupBoard(dir, opts = {}) {
   const stamp = (opts.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, "-");
   const path = join(dest, `board-${stamp}.jsonl`);
 
+  // Separate catches so the detail names the thing that actually failed — an unwritable .gitignore
+  // in a directory that was created fine is a different fix from a directory that cannot be made.
   try {
     mkdirSync(dest, { recursive: true });
-    writeFileSync(join(dest, ".gitignore"), "*\n");
   } catch (e) {
     return { status: "failed", detail: `could not create ${dest}: ${String(e?.message ?? e)}` };
+  }
+  const ignore = join(dest, ".gitignore");
+  try {
+    writeFileSync(ignore, "*\n");
+  } catch (e) {
+    return { status: "failed", detail: `could not write ${ignore}: ${String(e?.message ?? e)}` };
   }
 
   // A large board's export reads every issue — the network budget, same as bd init/bootstrap.
@@ -342,9 +367,16 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   const written = writeServerModeMetadata(dir, connection);
   record("metadata.json", written.status, written.changed.join(", ") || undefined);
 
-  /** Undo the write and report why — the board keeps working exactly as it did. */
+  // Snapshot config.yaml too, BEFORE step 8 starts publishing into it: `bd config set` and `bd dolt
+  // set --update-config` write one key at a time, so a failure part-way through would otherwise
+  // leave a half-published server default behind a report that says the board is untouched.
+  const configPath = join(beadsDir, "config.yaml");
+  const configBefore = existsSync(configPath) ? readFileSync(configPath, "utf8") : null;
+
+  /** Undo both writes and report why — the board keeps working exactly as it did. */
   const revert = (reason) => {
-    restoreMetadata(written.path, written.before);
+    restoreFile(written.path, written.before);
+    restoreFile(configPath, configBefore);
     record("metadata.json", "reverted", `${reason} — the board is untouched`);
   };
 
@@ -381,8 +413,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup });
   }
 
-  // 8. Only now publish the team-wide defaults into config.yaml, so a reverted attempt leaves that
-  //    file untouched too. `bd dolt set --update-config` refuses in embedded mode, which is why it
+  // 8. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
+  //    the snapshot above, so a failed attempt leaves it exactly as it was rather than carrying
+  //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
   //    comes after the metadata write rather than before it.
   // Both take the project-scoped runner: on a server board `bd config set` and `bd dolt set` talk
   // to the database, so they need the same narrowed credentials the test above proved.

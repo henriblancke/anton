@@ -19,7 +19,7 @@ import {
   countBoard,
   readMetadataFile,
   resolveServerConnection,
-  restoreMetadata,
+  restoreFile,
   testDoltConnection,
   writeServerModeMetadata,
 } from "./server-mode.mjs";
@@ -146,12 +146,12 @@ describe("writeServerModeMetadata", () => {
     const dir = repo("{\n  \"dolt_mode\": \"embedded\"\n}");
     const original = readFileSync(metadataPath(dir), "utf8");
     const written = writeServerModeMetadata(dir, CONNECTION);
-    restoreMetadata(written.path, written.before);
+    restoreFile(written.path, written.before);
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
 
     const fresh = repo();
     const created = writeServerModeMetadata(fresh, CONNECTION);
-    restoreMetadata(created.path, created.before);
+    restoreFile(created.path, created.before);
     expect(existsSync(metadataPath(fresh))).toBe(false);
   });
 
@@ -166,6 +166,14 @@ describe("countBoard", () => {
   it("parses the count out of stdout even when bd prefixes it with warnings", () => {
     const exec = () => ({ status: 0, stdout: 'Warning: deprecated\n{\n  "count": 42\n}\n', stderr: "Warning: also deprecated" });
     expect(countBoard(repo(EMBEDDED), { exec })).toEqual({ ok: true, count: 42 });
+  });
+
+  // The pre-flip count is the ONLY input to the arrived-whole check — a warning bd decides to print
+  // with braces in it must not turn a healthy board into "printed no JSON" and skip that check.
+  it("steps over a warning that contains braces of its own, on either side of the JSON", () => {
+    const around = (stdout: string) => countBoard(repo(EMBEDDED), { exec: () => ({ status: 0, stdout }) });
+    expect(around('warning: use {dolt.auto-commit} instead\n{"count": 42}\n')).toEqual({ ok: true, count: 42 });
+    expect(around('{"count": 42}\nwarning: use {dolt.auto-commit} instead\n')).toEqual({ ok: true, count: 42 });
   });
 
   it("reports a failed or unreadable count rather than calling it zero", () => {
@@ -243,6 +251,39 @@ describe("configureServerMode", () => {
     expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
     // Nothing was published: a board that cannot connect must not leave a team default behind.
     expect(cmdline(calls).some((c) => c.includes("--update-config"))).toBe(false);
+  });
+
+  /**
+   * Publication writes config.yaml one key at a time, so a failure part-way through leaves the file
+   * carrying half a server connection — and the command reports the board as untouched. Both files
+   * roll back together, or the report is a lie the next clone inherits.
+   */
+  it("restores config.yaml too when publishing the team defaults fails half-way", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const original = readFileSync(configPath, "utf8");
+    const metadataOriginal = readFileSync(metadataPath(dir), "utf8");
+    // A bd that patches config.yaml for real (as the live one does) and then refuses one key.
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (args[0] === "count") return { status: 0, stdout: '{"count": 7}' };
+      if (args[0] === "config" && args[1] === "set") {
+        writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${args[2]}: ${args[3]}\n`);
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        writeFileSync(configPath, `${readFileSync(configPath, "utf8")}dolt.${args[2]}: ${args[3]}\n`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(metadataOriginal);
   });
 
   /**
