@@ -41,7 +41,7 @@
  * overwritten.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -56,14 +56,19 @@ import {
   hasLocalDoltDb,
   parseConfigYaml,
   passwordVarHint,
-  publishedConfigKeys,
+  publishedConfigWrites,
   readDoltMetadata,
   retractStaleConnectionKey,
   scopedBdRunner,
   serverScopedPasswordVar,
   staleConnectionKeys,
   teamConfigKeys,
+  writeFileAtomic,
 } from "./config.mjs";
+
+// One atomic writer for everything under `.beads/`; it lives in config.mjs (which needs it for
+// config.yaml) and is re-exported here, where metadata.json's callers look for it.
+export { writeFileAtomic };
 
 /** bd's own default MySQL port. Written explicitly — see `SERVER_METADATA_KEYS.port`. */
 export const DEFAULT_DOLT_PORT = 3306;
@@ -233,26 +238,6 @@ export function prepareServerModeMetadata(dir, connection) {
 }
 
 /**
- * Replace a file's contents so that a failure leaves the previous ones intact: the new text goes to
- * a sibling temp file, which is renamed over the target only once it is fully written. A plain
- * `writeFileSync` truncates its target before it can fail, so a full disk, a read-only mount or an
- * I/O error part-way through leaves `metadata.json` empty or half-written — a workspace whose
- * connection details no longer parse, from a command whose whole point is not to lose boards
- * (PR #174 review). `rename` is atomic within a filesystem, and the temp file is kept in the same
- * directory to stay on one. The error still propagates; only the damage does not.
- */
-export function writeFileAtomic(path, text) {
-  const tmp = `${path}.anton-${process.pid}.tmp`;
-  try {
-    writeFileSync(tmp, text);
-    renameSync(tmp, path);
-  } catch (e) {
-    rmSync(tmp, { force: true });
-    throw e;
-  }
-}
-
-/**
  * {@link prepareServerModeMetadata} and then the write — `{ status: "already"|"written"|"unreadable",
  * changed, before, path }`. The one-call form, for callers with no read to sequence against.
  */
@@ -310,9 +295,6 @@ function isPublicationRewrite(text, wrote) {
   return true;
 }
 
-/** Every config.yaml key a switch to server mode may publish or retract — see `publishedConfigKeys`. */
-const PUBLISHED_CONFIG_KEYS = new Set(publishedConfigKeys("server"));
-
 /**
  * The config.yaml keys on which `current` disagrees with `before` and which this run cannot claim —
  * i.e. somebody else's edit, sorted. Empty means every difference is one of this run's own writes.
@@ -320,17 +302,25 @@ const PUBLISHED_CONFIG_KEYS = new Set(publishedConfigKeys("server"));
  * config.yaml's counterpart to {@link isPublicationRewrite}, and there for the same reason
  * (PR #174 review): between the snapshot and a failed publication there is a window in which an
  * agent or a person edits the file, and restoring the snapshot over that edit would discard it
- * silently. Bytes cannot answer who wrote what here — bd's own patches change them too — but keys
- * can: this run only ever asks bd for {@link PUBLISHED_CONFIG_KEYS}, and bd patches config.yaml one
- * key at a time, so a value that moved under any other key moved under somebody else's hand.
+ * silently. Bytes cannot answer who wrote what here — bd's own patches change them too — but the
+ * writes this invocation ASKED FOR can: `wrote` maps each key this run handed bd to the value it
+ * handed over (`undefined` for a key it retracted), and bd patches config.yaml one key at a time.
+ * So a difference is this run's only where the file now holds exactly what this run asked for.
+ *
+ * Matching by key alone is not enough (PR #174 review): a key this run owns can be changed by
+ * another process in the same window — `dolt.user` repointed at a different account while a later
+ * publication step fails — and an allowlist would call that difference Anton's and let the restore
+ * discard it. What this run wrote is the evidence; the key set only bounds where to look.
+ *
  * Compared through bd's own parser, so both encodings (flat dotted lines and bd 1.1.0's nested maps)
  * read the same, a struck-out key reads as absent, and formatting is not mistaken for an edit.
  */
-function foreignConfigEdits(before, current, owned = PUBLISHED_CONFIG_KEYS) {
+function foreignConfigEdits(before, current, wrote) {
   const was = parseConfigYaml(before ?? "");
   const now = parseConfigYaml(current ?? "");
   return [...new Set([...Object.keys(was), ...Object.keys(now)])]
-    .filter((key) => !owned.has(key) && was[key] !== now[key])
+    .filter((key) => was[key] !== now[key])
+    .filter((key) => !(wrote.has(key) && now[key] === wrote.get(key)))
     .sort();
 }
 
@@ -897,6 +887,11 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   let configSnapshot = configBefore;
   let configTouched = false;
   let configPublished = false;
+  // Each config.yaml key this run has handed bd, mapped to the value it handed over (`undefined`
+  // where it asked for a retraction) — the evidence `foreignConfigEdits` weighs a difference against.
+  // Recorded at the ATTEMPT, not on success: a bd that patched the file and then failed still wrote
+  // that value, and a revert has to recognise it as its own.
+  const wroteConfig = new Map();
 
   /**
    * Snapshot config.yaml for the rollback, ONCE, immediately before this run first writes it —
@@ -953,12 +948,13 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
    * is recognized as this run's ({@link isPublicationRewrite}) — without that, every failed
    * publication would decline its own rollback and strand the project in server mode while reporting
    * it was not switched (PR #174 review).
-   * config.yaml gets the same treatment by KEY rather than by bytes ({@link foreignConfigEdits}),
-   * because bd's own patches change its bytes too: it is snapshotted as late as this run can take it
-   * ({@link snapshotConfig}), and restored only when every key that has moved since is one of the
-   * keys this run asked bd to write. A value that moved under any other key is an edit that landed
-   * in the window the snapshot cannot close — between it and a failed publication — and it is left
-   * standing rather than overwritten (PR #174 review).
+   * config.yaml gets the same treatment by KEY AND VALUE rather than by bytes
+   * ({@link foreignConfigEdits}), because bd's own patches change its bytes too: it is snapshotted as
+   * late as this run can take it ({@link snapshotConfig}), and restored only when every key that has
+   * moved since now holds exactly what this run handed bd for it. Anything else — a key this run
+   * never writes, or one it does write now carrying a value it never asked for — is an edit that
+   * landed in the window the snapshot cannot close, and it is left standing rather than overwritten
+   * (PR #174 review).
    * Neither restore is allowed to throw ({@link tryRestore}).
    */
   const revert = (reason) => {
@@ -996,7 +992,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     }
     if (configTouched) {
       const current = readFileSnapshot(configPath);
-      const foreign = current.ok ? foreignConfigEdits(configSnapshot, current.text) : null;
+      const foreign = current.ok ? foreignConfigEdits(configSnapshot, current.text, wroteConfig) : null;
       if (current.ok && current.text === configSnapshot) {
         record("config.yaml", "unchanged", `${reason} — nothing of this run's ever reached the file`);
       } else if (foreign && !foreign.length) {
@@ -1055,6 +1051,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       return fail({ before, connection, counts, backup });
     }
     for (const { key, metaKey } of stale) {
+      wroteConfig.set(`dolt.${key}`, undefined);
       const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
       record(retracted.name, retracted.status, retracted.detail);
       if (retracted.status === "failed") errors.push(retracted.detail);
@@ -1235,6 +1232,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, missing, diverged, extra });
   }
   configPublished = true;
+  // Declared before the first patch lands, so a revert recognises anything bd wrote below — including
+  // a key whose command then failed part-way through the publication.
+  for (const [key, want] of publishedConfigWrites("server", connection)) wroteConfig.set(key, want);
   for (const [key, want] of teamConfigKeys("server")) {
     const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
     record(`${key}=${want}`, status);

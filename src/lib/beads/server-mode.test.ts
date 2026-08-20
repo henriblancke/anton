@@ -845,6 +845,44 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The same window, under a key this run DOES write. Owning the key is not owning the value
+   * (PR #174 review): a `dolt.user` another process repoints at a different account while a later
+   * publication step fails is that process's edit, and a rollback that claimed every difference on
+   * an owned key would restore the snapshot straight over it. What this run handed bd is the
+   * evidence — the file holds something else, so it is left standing.
+   */
+  it("keeps config.yaml when another process changes a key this run writes to a value it never wrote", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        // Somebody else repoints the account this switch is publishing, after the snapshot.
+        append("dolt.user: someone-else");
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        // The key that carries the concurrent edit is the one whose publication then fails, so this
+        // run never writes a `dolt.user` of its own over it.
+        if (args[2] === "user") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(configYamlValue(join(dir, ".beads"), "dolt.user")).toBe("someone-else");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(dolt\.user\)/);
+  });
+
+  /**
    * The failure this command exists to catch. `bd dolt test` connects to the SERVER; it says nothing
    * about whether this project can open its database there — bd's own project-identity guard refuses
    * a database belonging to another project long after the connection test has passed.

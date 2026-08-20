@@ -305,21 +305,30 @@ describe("ensureDoltConnection (server profile)", () => {
       expect(steps[steps.length - 1]).toEqual({ name: "dolt.user", status: "unset" });
     });
 
-    // Fail loud rather than leave a wrong account published: an unwritable config.yaml is reported
-    // with the line to remove by hand, and it fails the run like any other unpublishable key.
-    it("reports a value it cannot remove instead of claiming it is gone", () => {
-      const dir = repo(noUser, "dolt:\n    user: beads\n");
-      const configPath = join(dir, ".beads", "config.yaml");
-      chmodSync(configPath, 0o444);
+    /**
+     * Fail loud rather than leave a wrong account published: a config.yaml the strike-out cannot be
+     * written to is reported with the line to remove by hand, and it fails the run like any other
+     * unpublishable key. The failure comes from the WRITE, not from re-parsing the file afterwards
+     * (PR #174 review) — and because the write is atomic, the file the retraction could not change
+     * still holds every setting it held, rather than the truncation a half-finished write leaves.
+     * Skipped as root, which ignores the permission bits this fails the write with.
+     */
+    it.skipIf(process.getuid?.() === 0)("reports a value it cannot remove instead of claiming it is gone", () => {
+      const original = "dolt:\n    user: beads\n    host: dolt.example.dev\n";
+      const dir = repo(noUser, original);
+      const beadsDir = join(dir, ".beads");
+      chmodSync(beadsDir, 0o555);
       try {
-        const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec: recordingExec().exec });
+        const steps = ensureDoltConnection(dir, beadsDir, published, { exec: recordingExec().exec });
 
         const left = steps[steps.length - 1];
         expect(left).toMatchObject({ name: "dolt.user", status: "failed" });
         expect(left.detail).toContain("dolt.user");
         expect(left.detail).toContain("by hand");
+        // Intact, not truncated: the rest of the connection survives the failed retraction.
+        expect(readFileSync(join(beadsDir, "config.yaml"), "utf8")).toBe(original);
       } finally {
-        chmodSync(configPath, 0o644);
+        chmodSync(beadsDir, 0o755);
       }
     });
   });

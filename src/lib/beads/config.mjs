@@ -18,7 +18,7 @@
  * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
  * `.beads/metadata.json` (anton-4gd2).
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -491,17 +491,45 @@ export function configYamlValue(beadsDir, key) {
 }
 
 /**
- * Comment out every line `.beads/config.yaml` devotes to `key`, returning whether the file changed.
- * Commenting rather than deleting is `bd config unset`'s own strike-out style, and it leaves the old
- * value readable as history instead of vanishing from a committed file.
+ * Replace a file's contents so that a failure leaves the previous ones intact: the new text goes to
+ * a sibling temp file, which is renamed over the target only once it is fully written. A plain
+ * `writeFileSync` truncates its target before it can fail, so a full disk, a read-only mount or an
+ * I/O error part-way through leaves the file empty or half-written — a `.beads/` whose connection
+ * details or team defaults no longer parse, from commands whose whole point is not to lose boards
+ * (PR #174 review). `rename` is atomic within a filesystem, and the temp file is kept in the same
+ * directory to stay on one. The error still propagates; only the damage does not.
+ *
+ * The ONE atomic writer for everything under `.beads/` — `metadata.json` (server-mode.mjs, which
+ * re-exports this) and `config.yaml` (the retraction below).
+ */
+export function writeFileAtomic(path, text) {
+  const tmp = `${path}.anton-${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, text);
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
+/**
+ * Comment out every line `.beads/config.yaml` devotes to `key` — `{ status: "struck" | "absent" |
+ * "failed", detail? }`. Commenting rather than deleting is `bd config unset`'s own strike-out style,
+ * and it leaves the old value readable as history instead of vanishing from a committed file.
+ *
+ * Written atomically, and an I/O failure REPORTED rather than swallowed (PR #174 review): a plain
+ * write that dies part-way through leaves config.yaml truncated, and a caller that then re-parses
+ * the damaged file would read the key's disappearance as a successful retraction — and carry on
+ * over a file that has lost every other setting it held.
  */
 function retractConfigYamlKey(beadsDir, key) {
   const path = join(beadsDir, "config.yaml");
   let lines;
   try {
     lines = readFileSync(path, "utf8").split("\n");
-  } catch {
-    return false;
+  } catch (err) {
+    return { status: "failed", detail: err?.message || String(err) };
   }
   let changed = false;
   for (const entry of configYamlEntries(lines.join("\n"))) {
@@ -509,13 +537,13 @@ function retractConfigYamlKey(beadsDir, key) {
     lines[entry.line] = lines[entry.line].replace(/^(\s*)/, "$1# ");
     changed = true;
   }
-  if (!changed) return false;
+  if (!changed) return { status: "absent" };
   try {
-    writeFileSync(path, lines.join("\n"));
-  } catch {
-    return false;
+    writeFileAtomic(path, lines.join("\n"));
+  } catch (err) {
+    return { status: "failed", detail: err?.message || String(err) };
   }
-  return true;
+  return { status: "struck" };
 }
 
 /**
@@ -914,18 +942,28 @@ const SERVER_CONNECTION_KEYS = [
 ];
 
 /**
- * Every dotted `config.yaml` key a switch INTO `mode` may write — the team-config knobs plus, in
- * server mode, the `dolt.*` connection fields (published on the way in, retracted when
- * metadata.json stops declaring one).
+ * Every dotted `config.yaml` key a switch INTO `mode` may write, PAIRED WITH THE VALUE it would
+ * write — the team-config knobs plus, in server mode, the `dolt.*` connection fields. A value of
+ * `undefined` means the key is retracted rather than published (an optional field metadata.json
+ * stopped declaring); a required field metadata.json does not declare is omitted altogether, since
+ * a broken connection config is refused rather than written.
  *
  * This is what lets a rollback tell its own writes from somebody else's edit (PR #174 review). bd
  * patches config.yaml key by key — `bd config set` appends one line, `bd dolt set --update-config`
- * one per field, `bd config unset` strikes one out — so a difference under any OTHER key was made
- * by something that is not this run, and is not a difference a revert may quietly overwrite.
+ * one per field, `bd config unset` strikes one out — so a difference under any other key was made
+ * by something that is not this run. The VALUE matters for the same reason: a key this run owns
+ * that now holds something this run never asked for is somebody else's edit too, and a revert that
+ * assumed ownership by key alone would overwrite it silently (PR #174 review).
  */
-export function publishedConfigKeys(mode) {
-  const team = teamConfigKeys(mode).map(([key]) => key);
-  return mode === "server" ? [...team, ...SERVER_CONNECTION_KEYS.map(({ key }) => `dolt.${key}`)] : team;
+export function publishedConfigWrites(mode, info) {
+  const team = teamConfigKeys(mode).map(([key, want]) => [key, want]);
+  if (mode !== "server") return team;
+  const connection = SERVER_CONNECTION_KEYS.flatMap(({ key, required }) => {
+    const raw = info?.[key];
+    if (raw === undefined || raw === null || raw === "") return required ? [] : [[`dolt.${key}`, undefined]];
+    return [[`dolt.${key}`, String(raw)]];
+  });
+  return [...team, ...connection];
 }
 
 /**
@@ -943,6 +981,10 @@ export function publishedConfigKeys(mode) {
  * `dolt:` map bd itself writes since 1.1.0 survives an exit-0 "Unset dolt.user (in config.yaml)".
  * The verdict is read back from the FILE for that reason: a value that outlives both is reported as
  * a failure naming the hand fix, never assumed gone.
+ *
+ * A strike-out that could not be WRITTEN is reported straight from the write, not inferred from the
+ * file afterwards (PR #174 review): the I/O error names why the key is still there, which a re-read
+ * cannot.
  */
 export function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutMs) {
   const path = `dolt.${key}`;
@@ -950,7 +992,19 @@ export function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutM
   if (stale === undefined) return { name: path, status: "unset" };
 
   exec("bd", ["config", "unset", path], timeoutMs);
-  if (configYamlValue(beadsDir, path) !== undefined) retractConfigYamlKey(beadsDir, path);
+  if (configYamlValue(beadsDir, path) !== undefined) {
+    const struck = retractConfigYamlKey(beadsDir, path);
+    if (struck.status === "failed") {
+      return {
+        name: path,
+        status: "failed",
+        detail:
+          `could not strike ${path}: ${stale} out of .beads/config.yaml: ${struck.detail} — the file ` +
+          `still holds its previous contents, and .beads/metadata.json declares no "${metaKey}". ` +
+          "Free up space or fix the permissions on `.beads/`, then remove that line by hand",
+      };
+    }
+  }
 
   const left = configYamlValue(beadsDir, path);
   const declares = `.beads/metadata.json declares no "${metaKey}"`;
