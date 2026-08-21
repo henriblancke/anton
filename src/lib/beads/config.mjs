@@ -490,6 +490,11 @@ const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
  * block key itself for block-scalar text — so a caller diffing two files can see it change without
  * having to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as
  * absent, and so free text is never mistaken for settings.
+ *
+ * `value` is the trimmed line, EXCEPT inside a block scalar's body, which is reported verbatim
+ * (indentation kept, interior blanks included): whitespace is content there, so a re-indent or an
+ * added blank line is a real edit, and trimming it away would let a rollback restore over it
+ * silently (PR #174 review).
  */
 function* configYamlEntries(text) {
   // Blocks currently in scope, outermost first: { indent, key } for a map header, `seq` for the
@@ -497,6 +502,8 @@ function* configYamlEntries(text) {
   const stack = [];
   // The open block scalar, if any: { indent, path } of the `key: |` line whose body we are inside.
   let block = null;
+  // Blank lines seen inside the open block, not yet known to be interior to it.
+  let heldBlanks = 0;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].replace(/\r$/, "");
@@ -505,11 +512,18 @@ function* configYamlEntries(text) {
     if (block) {
       // A block scalar's body is free text: `#` starts no comment and `key: value` sets nothing.
       // It runs to the first non-blank line indented no deeper than the key that opened it.
-      if (trimmed === "") continue;
-      if (indent > block.indent) {
-        yield { line: i, kind: "opaque", path: block.path, value: trimmed };
+      // Blanks are held until a further body line proves them interior — a blank between the block
+      // and the next key is the document's whitespace, and `|`/`>` chomp trailing blanks anyway.
+      if (trimmed === "") {
+        heldBlanks++;
         continue;
       }
+      if (indent > block.indent) {
+        for (; heldBlanks > 0; heldBlanks--) yield { line: i - heldBlanks, kind: "opaque", path: block.path, value: "" };
+        yield { line: i, kind: "opaque", path: block.path, value: line };
+        continue;
+      }
+      heldBlanks = 0;
       block = null;
     }
     if (trimmed === "" || trimmed.startsWith("#")) continue;
@@ -579,8 +593,9 @@ export function parseConfigYaml(text) {
 
 /**
  * Everything in a `.beads/config.yaml` that {@link parseConfigYaml} cannot represent, as
- * `enclosing.path → [line, …]` in file order (each line trimmed) — sequence items, block-scalar
- * bodies, and any other line with no `key:` of its own.
+ * `enclosing.path → [line, …]` in file order — sequence items, block-scalar bodies, and any other
+ * line with no `key:` of its own. Lines are trimmed except inside a block scalar's body, which is
+ * kept verbatim so a whitespace-only edit to it still reads as an edit.
  *
  * The flat map is a lossy read of the file, and a rollback that diffed two texts through it alone
  * would call a difference it cannot see "no difference": a sequence entry added or reordered under a

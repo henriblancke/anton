@@ -150,13 +150,41 @@ dolt.user: beads
   it("treats a block scalar's body as opaque content, never as settings", () => {
     const text = "notes: |\n  dolt.user: historical\n  # not a comment\n\n  still body\ndolt.user: beads\n";
     expect(parseConfigYaml(text)).toEqual({ "dolt.user": "beads" });
-    expect(configYamlNonScalars(text).notes).toEqual(["notes: |", "dolt.user: historical", "# not a comment", "still body"]);
+    expect(configYamlNonScalars(text).notes).toEqual([
+      "notes: |",
+      "  dolt.user: historical",
+      "  # not a comment",
+      "",
+      "  still body",
+    ]);
   });
 
   it("closes a block scalar at the first line indented no deeper than its key", () => {
     const text = "dolt:\n  motd: >-\n    wrapped text\n  user: beads\nexport.auto: false\n";
     expect(parseConfigYaml(text)).toEqual({ "dolt.user": "beads", "export.auto": "false" });
-    expect(configYamlNonScalars(text)).toEqual({ "dolt.motd": ["motd: >-", "wrapped text"] });
+    expect(configYamlNonScalars(text)).toEqual({ "dolt.motd": ["motd: >-", "    wrapped text"] });
+  });
+
+  /**
+   * Whitespace IS content inside a block scalar: an added blank line or a re-indented body line
+   * changes what the value says. Trimming it away would leave the diff empty and let a rollback
+   * restore over somebody's edit (PR #174 review).
+   */
+  it("sees a body re-indented or a blank line added — both are edits to the value", () => {
+    const base = "notes: |\n  first\n  second\ndolt.user: beads\n";
+    const blanked = "notes: |\n  first\n\n  second\ndolt.user: beads\n";
+    const reindented = "notes: |\n  first\n      second\ndolt.user: beads\n";
+    expect(parseConfigYaml(blanked)).toEqual(parseConfigYaml(base));
+    expect(parseConfigYaml(reindented)).toEqual(parseConfigYaml(base));
+    expect(configYamlNonScalars(base).notes).toEqual(["notes: |", "  first", "  second"]);
+    expect(configYamlNonScalars(blanked).notes).toEqual(["notes: |", "  first", "", "  second"]);
+    expect(configYamlNonScalars(reindented).notes).toEqual(["notes: |", "  first", "      second"]);
+  });
+
+  it("does not read the blank line that merely follows a block as part of it", () => {
+    const text = "notes: |\n  body\n\ndolt.user: beads\n";
+    expect(configYamlNonScalars(text).notes).toEqual(["notes: |", "  body"]);
+    expect(configYamlNonScalars("notes: |\n  body\n\n").notes).toEqual(["notes: |", "  body"]);
   });
 
   it("keeps an ordinary scalar that merely starts with an indicator character", () => {
