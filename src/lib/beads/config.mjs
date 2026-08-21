@@ -521,7 +521,8 @@ function opensQuotedScalar(value) {
  * ignored. `line` is the 0-based index into `text.split("\n")`, for callers that rewrite the file.
  *
  * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold —
- * `"comment"` for a `#` line, or `"opaque"` for a line the map cannot hold: a `- item` of a
+ * `"comment"` for a `#` line (reported under the blocks its own indentation puts it inside), or
+ * `"opaque"` for a line the map cannot hold: a `- item` of a
  * sequence, anything under one, a `key: |` / `key:
  * >` block scalar and its body, a `key: "…` quoted scalar spanning lines and its continuation, a
  * plain scalar's continuation (any line indented deeper than the `key: value` above it), or
@@ -614,16 +615,21 @@ function* configYamlEntries(text) {
       plain = null;
     }
     if (trimmed === "") continue;
-    // A comment is content too, and the only content bd's parser drops entirely. Yielded under the
-    // path open ABOVE it — without unwinding the stack, since a comment's indentation is nobody's
-    // structure — so a caller diffing two files sees a comment added, edited or deleted (PR #174
-    // review). Nothing reading settings looks at these.
+    // A comment is content too, and the only content bd's parser drops entirely — yielded so a
+    // caller diffing two files sees one added, edited or deleted (PR #174 review). Nothing reading
+    // settings looks at these.
+    // Under the blocks its OWN INDENTATION puts it inside, which is why the still-open stack is
+    // read through an indent filter rather than used as it stands (PR #174 review): a retraction
+    // strikes a nested key out in place (`dolt:` / `  # user: old`), and a top-level `# user: old`
+    // somebody adds below that block would otherwise be reported under `dolt` too — indistinguishable
+    // from this run's own strike-out, and so silently discarded by a rollback. The stack itself is
+    // NOT unwound: a comment closes no block, and the next real line's scope is its own business.
     if (trimmed.startsWith("#")) {
       yield {
         line: i,
         kind: "comment",
         path: stack
-          .filter((s) => !s.seq)
+          .filter((s) => !s.seq && s.indent < indent)
           .map((s) => s.key)
           .join("."),
         value: trimmed,
@@ -761,8 +767,11 @@ export function configYamlNonScalars(text) {
  * through scalars alone would call that window's edit "no difference" and restore the older text
  * over it.
  *
- * Comments have no structure of their own, so a line is reported under the path open above it
- * rather than under one inferred from its indentation.
+ * A comment is reported under the blocks its own INDENTATION puts it inside. It closes no block and
+ * owns no structure, but the one caller that diffs comments has to tell the strike-outs it made
+ * itself from somebody else's prose (PR #174 review): a retraction comments a nested key out in
+ * place (`dolt:` / `  # user: old`), so a top-level `# user: old` a concurrent editor adds below
+ * that block must not read as the same line — forgiven as this run's, and then restored away.
  *
  * @param {string} text
  * @returns {Record<string, string[]>}

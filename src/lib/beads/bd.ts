@@ -1126,7 +1126,16 @@ export function createDoltSync(
 
 // The singleton is globalThis-anchored for the same cross-bundle reason as the status registry:
 // two module instances with separate coalescing maps would defeat the never-overlap invariant.
-const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync");
+//
+// Versioned for the same reason {@link PREFLIGHTED_KEY} is (PR #174 review), and here it is the
+// BEHAVIOUR rather than a value shape that changes: what the global holds is a closure, and
+// `Symbol.for` outlives module replacement — so under a Next.js dev hot reload this module would
+// adopt the previous build's engine and every change to the pass (the server-probe suppression that
+// keeps a published server-mode write from being rejected by a health probe behind it, say) would
+// go untested until the process restarted. A new key hands the reloaded code its own engine; the
+// old one stays reachable to whatever still holds it, which is the whole of what is given up —
+// only in dev, where a reload is the point. Bump it whenever a pass's behaviour changes.
+const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync.v2");
 const doltSync = ((globalThis as unknown as Record<symbol, ReturnType<typeof createDoltSync>>)[
   DOLT_SYNC_KEY
 ] ??= createDoltSync());

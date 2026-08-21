@@ -1198,6 +1198,37 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * And a comment that merely LOOKS like this run's strike-out is somebody else's too (PR #174
+   * review). A retraction strikes a nested key out in place (`dolt:` / `  # user: old`), so a
+   * top-level `# user: old` another process writes below that block is byte-identical to it once
+   * indentation is discarded — and reported under `dolt` too, the rollback would forgive it as its
+   * own, see the absence it asked for, and restore the snapshot straight over their line.
+   */
+  it("keeps config.yaml when a concurrent top-level comment mimics this run's nested strike-out", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    writeFileSync(configPath, "prefix: probe\ndolt:\n  user: old-account\n");
+    const { exec: base } = fakeBd({ dir, before: BOARD, test: { status: 1, stderr: "Connection failed" } });
+    const exec = (cmd: string, args: string[]): Result => {
+      if (args[0] === "config" && args[1] === "unset" && args[2] === "dolt.user") {
+        // Somebody documents the account the team is leaving — at the top level, in the window this
+        // run is striking the nested key out.
+        writeFileSync(configPath, `${readFileSync(configPath, "utf8")}# user: old-account\n`);
+        return { status: 0 };
+      }
+      return base(cmd, args);
+    };
+
+    const result = configureServerMode(dir, { ...flags, user: undefined }, { exec });
+
+    expect(result.ok).toBe(false);
+    // Their line stands, and this run's own strike-out with it — the file is left exactly as found.
+    expect(readFileSync(configPath, "utf8")).toContain("\n# user: old-account");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toContain("carries a change this command did not make ((top level))");
+  });
+
+  /**
    * The same window, under a key this run DOES write. Owning the key is not owning the value
    * (PR #174 review): a `dolt.user` another process repoints at a different account while a later
    * publication step fails is that process's edit, and a rollback that claimed every difference on

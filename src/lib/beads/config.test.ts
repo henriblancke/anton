@@ -135,6 +135,20 @@ describe("configYamlComments", () => {
     expect(configYamlComments(removed)).toEqual({});
   });
 
+  /**
+   * And under the blocks its OWN INDENTATION puts it inside (PR #174 review). The rollback tells the
+   * strike-outs it made itself from somebody else's prose by the path a comment reports under — a
+   * retraction comments a nested key out in place — so a top-level `# user: old` a concurrent editor
+   * adds below a `dolt:` block must NOT read as the struck-out `dolt.user` line above it, or the
+   * restore forgives it as this run's own and deletes it silently.
+   */
+  it("reports a comment under the blocks its indentation puts it inside, not the block still open", () => {
+    const text = "dolt:\n  # user: old\n# user: old\n";
+    expect(configYamlComments(text)).toEqual({ dolt: ["# user: old"], "": ["# user: old"] });
+    // The block is still open for SETTINGS — a comment closes nothing.
+    expect(parseConfigYaml("dolt:\n  # user: old\n# user: old\n  user: new\n")).toEqual({ "dolt.user": "new" });
+  });
+
   /** A block scalar's body is the value's own text: a `#` line in it is prose, not a comment. */
   it("does not mistake a block scalar's body for comments", () => {
     const text = "notes: |\n  # not a comment\ndolt.user: beads\n";

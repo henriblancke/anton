@@ -200,6 +200,34 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
   });
 
   /**
+   * The sync ENGINE is versioned for the same reason, and it is a closure rather than a value
+   * (PR #174 review): a hot reload replaces this module's code but not `globalThis`, so an
+   * unversioned key would hand the reloaded bundle the previous build's engine — and the
+   * probe-suppression this pass depends on (a server-mode write publishes itself; a probe behind it
+   * can only invent a failure) would never take effect until the process restarted.
+   */
+  it("ignores the engine a hot-reloaded process left under the previous singleton key", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const legacy = Symbol.for("anton.beads.doltSync");
+    const g = globalThis as unknown as Record<symbol, unknown>;
+    let stale = 0;
+    g[legacy] = () => {
+      stale++;
+      return Promise.resolve("synced");
+    };
+    try {
+      vi.resetModules();
+      // A freshly compiled instance of the module, as a dev hot reload leaves behind.
+      const reloaded = (await import("./bd")) as typeof import("./bd");
+      await reloaded.beads.sync(dir);
+      expect(stale).toBe(0);
+    } finally {
+      delete g[legacy];
+      vi.resetModules();
+    }
+  });
+
+  /**
    * The reason that cache EXPIRES (PR #174 review). A server that passed the probe at startup and
    * then went down would otherwise be reported healthy forever: server mode does nothing else on
    * the beat, so nothing would ever contradict the cached pass. After the TTL the probe runs again
