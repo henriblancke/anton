@@ -303,7 +303,9 @@ describe("ensureDoltConnection (server profile)", () => {
       const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec });
 
       expect(calls).not.toContainEqual(["bd", "config", "unset", "dolt.user"]);
-      expect(steps[steps.length - 1]).toEqual({ name: "dolt.user", status: "unset" });
+      // `key` rides along on every step so a caller tracking what it handed bd reads it rather than
+      // parsing the display name (server-mode.mjs's config.yaml rollback).
+      expect(steps[steps.length - 1]).toEqual({ name: "dolt.user", key: "dolt.user", status: "unset" });
     });
 
     /**
@@ -835,5 +837,27 @@ describe("configureBeadsForRepo scopes every bd spawn to the target project (ant
 
     const probe = boardCalls(bd.calls()).find((c) => c.args[0] === "dolt" && c.args[1] === "test");
     expect(probe?.env.BEADS_DOLT_PASSWORD).toBe("from-opts-env");
+  });
+
+  /**
+   * `anton setup` (bin/anton.mjs) wires its own repo's Dolt remote by calling
+   * `configureBeadsDoltSync` with no `exec` of its own, so the DEFAULT runner is the one that has to
+   * be scoped. The mode skip above it reads the target's metadata.json, but bd ranks an ambient
+   * `BEADS_DOLT_*` above that file — so an unscoped default would sail past the skip and then wire,
+   * pull and push against whichever board the launching shell exported (PR #174 review).
+   */
+  it("strips project identity from the Dolt remote wiring, which `anton setup` calls with no exec", () => {
+    const dir = gitRepo({ metadata: { dolt_mode: "embedded" }, origin: true });
+    const bd = stubBd();
+
+    const result = configureBeadsDoltSync({ repoDir: dir });
+
+    expect(result.status).toBe("configured");
+    const calls = boardCalls(bd.calls());
+    // The wiring really ran — an assertion over an empty call list proves nothing.
+    expect(calls.some((c) => c.args[0] === "dolt" && c.args[1] === "remote" && c.args[2] === "add")).toBe(true);
+    for (const call of calls) {
+      expect(Object.keys(call.env).filter((k) => PROJECT_SCOPED_BD_ENV.includes(k))).toEqual([]);
+    }
   });
 });

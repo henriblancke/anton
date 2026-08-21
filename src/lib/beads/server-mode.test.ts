@@ -943,6 +943,52 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The same window again, under a key this run wants and never writes. A concurrent editor setting
+   * `dolt.user` to the very account this switch was about to publish leaves the publication with
+   * nothing to do — the value already matches, so no `bd dolt set` runs and the step reports
+   * "already". Those bytes are therefore theirs, and a rollback claiming every key on the
+   * publication list would restore the snapshot straight over them while reporting a clean revert
+   * (PR #174 review). Ownership is claimed from the commands that RAN.
+   */
+  it("keeps config.yaml when a concurrent edit sets a key to the value this run would have published", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    let landed = false;
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        if (!landed) {
+          // Somebody else publishes the account this switch is about to, after the snapshot.
+          append(`dolt.user: ${flags.user}`);
+          landed = true;
+        }
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        // `user` is published last, so the failure that triggers the rollback lands before it.
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    // Never written by this run, so never rolled back over.
+    expect(configYamlValue(join(dir, ".beads"), "dolt.user")).toBe(flags.user);
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === `dolt.user=${flags.user}` && s.status === "already")).toBe(
+      true,
+    );
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(dolt\.user\)/);
+  });
+
+  /**
    * The failure this command exists to catch. `bd dolt test` connects to the SERVER; it says nothing
    * about whether this project can open its database there — bd's own project-identity guard refuses
    * a database belonging to another project long after the connection test has passed.

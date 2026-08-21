@@ -921,9 +921,22 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   let configPublished = false;
   // Each config.yaml key this run has handed bd, mapped to the value it handed over (`undefined`
   // where it asked for a retraction) — the evidence `foreignConfigEdits` weighs a difference against.
-  // Recorded at the ATTEMPT, not on success: a bd that patched the file and then failed still wrote
-  // that value, and a revert has to recognise it as its own.
   const wroteConfig = new Map();
+
+  /**
+   * Claim a key for this run — from what its command DID, never from the list of keys the run
+   * intended to write (PR #174 review).
+   *
+   * A "failed" is claimed: bd patches config.yaml key by key and can fail part-way through, so those
+   * bytes are this run's and a revert has to recognise them. A step that ran NOTHING — "already",
+   * "unset", "missing" — is not: the value it found matching is only presumably this run's, and when
+   * a concurrent editor set that key after the snapshot (`dolt.user` repointed at the account this
+   * switch happens to want), claiming it would have the rollback restore the older text straight
+   * over their edit and report a clean revert.
+   */
+  const claim = (key, want, status) => {
+    if (status === "set" || status === "failed" || status === "cleared") wroteConfig.set(key, want);
+  };
 
   /**
    * Snapshot config.yaml for the rollback, ONCE, immediately before this run first writes it —
@@ -1083,8 +1096,8 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       return fail({ before, connection, counts, backup });
     }
     for (const { key, metaKey } of stale) {
-      wroteConfig.set(`dolt.${key}`, undefined);
       const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
+      claim(`dolt.${key}`, undefined, retracted.status);
       record(retracted.name, retracted.status, retracted.detail);
       if (retracted.status === "failed") errors.push(retracted.detail);
     }
@@ -1270,15 +1283,19 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     return fail({ before, connection, counts, backup, missing, diverged, extra });
   }
   configPublished = true;
-  // Declared before the first patch lands, so a revert recognises anything bd wrote below — including
-  // a key whose command then failed part-way through the publication.
-  for (const [key, want] of publishedConfigWrites("server", connection)) wroteConfig.set(key, want);
+  // What each connection key WOULD be published as — the value {@link claim} records once a step
+  // reports that its command ran.
+  const wants = new Map(publishedConfigWrites("server", connection));
   for (const [key, want] of teamConfigKeys("server")) {
     const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
+    claim(key, want, status);
     record(`${key}=${want}`, status);
     if (status === "failed") errors.push(`could not set ${key}=${want}`);
   }
   for (const published of ensureDoltConnection(dir, beadsDir, connection, { exec })) {
+    // `undefined` where the field is retracted rather than published — the shape the rollback reads
+    // as "this run asked for the key to be gone".
+    claim(published.key, wants.get(published.key), published.status);
     steps.push(published);
     onStep(published);
     if (published.status === "missing" || published.status === "failed") errors.push(published.detail);

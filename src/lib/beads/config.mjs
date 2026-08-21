@@ -1119,6 +1119,10 @@ const SERVER_CONNECTION_KEYS = [
  * by something that is not this run. The VALUE matters for the same reason: a key this run owns
  * that now holds something this run never asked for is somebody else's edit too, and a revert that
  * assumed ownership by key alone would overwrite it silently (PR #174 review).
+ *
+ * It names what a write WOULD carry, not what was written: a key is only ever claimed once its own
+ * command has actually run, since a step that found the value already in place may be reading a
+ * concurrent editor's (PR #174 review — see `claim` in server-mode.mjs).
  */
 export function publishedConfigWrites(mode, info) {
   const team = teamConfigKeys(mode).map(([key, want]) => [key, want]);
@@ -1214,9 +1218,13 @@ export function staleConnectionKeys(beadsDir, info) {
  * mode (no Dolt server)"), so calling it there would turn a healthy embedded board into a wall of
  * failed steps.
  *
- * Returns one `{ name, status, detail? }` step per field: "already" | "set" | "failed" | "missing"
- * (required, absent from metadata) | "unset" (optional, published nowhere) | "cleared" (optional,
- * retracted from config.yaml — see {@link retractStaleConnectionKey}).
+ * Returns one `{ name, key, status, detail? }` step per field: "already" | "set" | "failed" |
+ * "missing" (required, absent from metadata) | "unset" (optional, published nowhere) | "cleared"
+ * (optional, retracted from config.yaml — see {@link retractStaleConnectionKey}).
+ *
+ * `key` is the dotted config.yaml key the step is about, carried separately from the display `name`
+ * so a caller tracking WHICH keys it handed bd reads it rather than parsing a label (server-mode.mjs
+ * weighs exactly that against a concurrent edit before rolling config.yaml back).
  *
  * @param {string} dir repo root
  * @param {string} beadsDir `<dir>/.beads`
@@ -1231,19 +1239,20 @@ export function ensureDoltConnection(dir, beadsDir, info, opts = {}) {
       spawnSync(cmd, args, { cwd: dir, encoding: "utf8", timeout: timeoutMs, killSignal: SPAWN_KILL_SIGNAL }));
 
   return SERVER_CONNECTION_KEYS.map(({ key, metaKey, required }) => {
+    const path = `dolt.${key}`;
     const raw = info?.[key];
     if (raw === undefined || raw === null || raw === "") {
       // Named as the fix, not as the symptom: what to add, and where.
       return required
-        ? { name: `dolt.${key}`, status: "missing", detail: `server mode declares no "${metaKey}" in .beads/metadata.json` }
-        : retractStaleConnectionKey(beadsDir, key, metaKey, exec, localMs);
+        ? { name: path, key: path, status: "missing", detail: `server mode declares no "${metaKey}" in .beads/metadata.json` }
+        : { ...retractStaleConnectionKey(beadsDir, key, metaKey, exec, localMs), key: path };
     }
     const want = String(raw);
-    const name = `dolt.${key}=${want}`;
-    if (configYamlHas(beadsDir, `dolt.${key}`, want)) return { name, status: "already" };
+    const name = `${path}=${want}`;
+    if (configYamlHas(beadsDir, path, want)) return { name, key: path, status: "already" };
     const r = exec("bd", ["dolt", "set", key, want, "--update-config"], localMs);
-    if ((r.status ?? 1) === 0) return { name, status: "set" };
-    return { name, status: "failed", detail: failureDetail(r, localMs, `${r.stdout ?? ""}${r.stderr ?? ""}`) };
+    if ((r.status ?? 1) === 0) return { name, key: path, status: "set" };
+    return { name, key: path, status: "failed", detail: failureDetail(r, localMs, `${r.stdout ?? ""}${r.stderr ?? ""}`) };
   });
 }
 
@@ -1312,7 +1321,8 @@ export function isFirstPublishPullOutput(output) {
  * The single Dolt-sync path shared by `anton setup` (bin/anton.mjs) and `anton init`/`addProject`
  * (via configureBeadsForRepo) so both wire the remote with IDENTICAL behavior + result shape
  * (anton-8qx). All external calls go through an injectable `exec` seam so tests can stub bd/git
- * (CI has neither); the default binds `repoDir` as cwd.
+ * (CI has neither); the default is the project-scoped runner every other bd call anton makes goes
+ * through ({@link scopedBdRunner}), bound to `repoDir`.
  *
  * Steps (idempotent): remote add → hydrate pull → publish push. The pull is best-effort — a fresh
  * origin has no `refs/dolt/data` yet, so it exits non-zero ("no branches found"); that's expected on
@@ -1334,7 +1344,8 @@ export function isFirstPublishPullOutput(output) {
  *   - { status: "error", detail }               — reading `sync.remote`, or `bd dolt remote add`
  *       itself, failed (a budget kill included — never a silent fallback to git origin)
  *
- * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} opts
+ * @param {{ repoDir: string, log?: (msg: string) => void, env?: NodeJS.ProcessEnv,
+ *   exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} opts
  */
 export function configureBeadsDoltSync(opts = {}) {
   const { repoDir: dir, log } = opts;
@@ -1343,26 +1354,25 @@ export function configureBeadsDoltSync(opts = {}) {
   // exec simply ignores the third argument, so the seam is unchanged for callers that stub it.
   const localMs = budgetMs("bd");
   const netMs = budgetMs("network");
-  const exec =
-    opts.exec ??
-    ((cmd, args, timeoutMs = netMs) =>
-      spawnSync(cmd, args, {
-        cwd: dir,
-        encoding: "utf8",
-        timeout: timeoutMs,
-        killSignal: SPAWN_KILL_SIGNAL,
-      }));
 
   if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
+
+  const board = readDoltMetadata(dir);
 
   // A shared-server board has no refs/dolt/data to wire, and the attempt does not merely waste work:
   // `bd dolt push/pull` executes ON THE SERVER, whose image ships no ssh client and no keys, so a
   // `git+ssh://` remote is unreachable from there by construction (DESIGN.md §3a). Skipping is the
   // config, not a degradation — the runtime sync nudges are neutralized separately (anton-0tul).
-  if (readDoltMetadata(dir).mode === "server") {
+  if (board.mode === "server") {
     emit("board is on a shared Dolt server — skipping refs/dolt/data remote wiring (nothing to reconcile).");
     return { status: "server-mode" };
   }
+
+  // Scoped to THIS project, like every other bd anton spawns (anton-ffmw.1): the skip above reads
+  // the target's metadata.json, but bd ranks an ambient `BEADS_DOLT_*` ABOVE that file — so an
+  // `anton setup` launched from a shell carrying another project's server identity would sail past
+  // the skip and then wire, pull and push against that OTHER board (PR #174 review).
+  const exec = scopedBdRunner(dir, board, opts);
 
   // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g. an
   // aws:// remote) wins over the git-origin fallback — anton drives whatever the project's beads
