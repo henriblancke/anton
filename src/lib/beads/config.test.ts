@@ -237,6 +237,51 @@ dolt.user: beads
     expect(configYamlNonScalars(reindented).notes).not.toEqual(configYamlNonScalars(base).notes);
   });
 
+  /**
+   * A plain scalar carries on over the lines indented deeper than its key, and `dolt.user:historical`
+   * is text there rather than a key: YAML only opens a mapping on a colon FOLLOWED BY WHITESPACE.
+   * Read as a setting, that line is a live `dolt.user` — enough to make stale-key cleanup strike out
+   * the middle of somebody's `notes:` and report a user it never cleared (PR #174 review).
+   */
+  it("treats a plain scalar's continuation as opaque, never as settings", () => {
+    const text = "notes: first\n  dolt.user:historical\n  # still the value\ndolt.user: beads\n";
+    expect(parseConfigYaml(text)).toEqual({ notes: "first", "dolt.user": "beads" });
+    expect(configYamlNonScalars(text).notes).toEqual(["  dolt.user:historical"]);
+    // A `#` line ends the scalar wherever it sits — YAML starts a comment at any `#` a space precedes.
+    expect(configYamlComments(text)).toEqual({ "": ["# still the value"] });
+  });
+
+  it("sees a continuation line edited or re-indented — the scalar diff sees neither", () => {
+    const base = "notes: first\n  second\ndolt.user: beads\n";
+    const edited = "notes: first\n  second thoughts\ndolt.user: beads\n";
+    const reindented = "notes: first\n      second\ndolt.user: beads\n";
+    expect(parseConfigYaml(edited)).toEqual(parseConfigYaml(base));
+    expect(parseConfigYaml(reindented)).toEqual(parseConfigYaml(base));
+    expect(configYamlNonScalars(base).notes).toEqual(["  second"]);
+    expect(configYamlNonScalars(edited).notes).toEqual(["  second thoughts"]);
+    expect(configYamlNonScalars(reindented).notes).toEqual(["      second"]);
+  });
+
+  /**
+   * The continuation ends where YAML says it does: at the first line indented no deeper than the key
+   * — and at any line carrying a `: `, which a plain scalar cannot hold at all. Swallowing those
+   * would hide real settings from enforcement, the mirror-image failure.
+   */
+  it("closes a plain scalar at a shallower line, and never swallows a `key: value`", () => {
+    expect(parseConfigYaml("dolt:\n  user: beads\n  motd: hello\nexport.auto: false\n")).toEqual({
+      "dolt.user": "beads",
+      "dolt.motd": "hello",
+      "export.auto": "false",
+    });
+    expect(parseConfigYaml("notes: first\n  dolt.user: beads\n")).toEqual({ notes: "first", "dolt.user": "beads" });
+    expect(configYamlNonScalars("notes: first\n  dolt.user: beads\n")).toEqual({});
+  });
+
+  it("does not read the blank line that merely follows a plain scalar as part of it", () => {
+    expect(configYamlNonScalars("notes: first\n\ndolt.user: beads\n")).toEqual({});
+    expect(configYamlNonScalars("notes: first\n\n  second\ndolt.user: beads\n").notes).toEqual(["", "  second"]);
+  });
+
   /** A scalar that closes on its own line is an ordinary setting — escapes and all. */
   it("does not swallow the file when a quoted scalar closes where YAML says it does", () => {
     expect(parseConfigYaml('notes: "one line"\ndolt.user: beads\n')).toEqual({ notes: "one line", "dolt.user": "beads" });

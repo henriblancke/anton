@@ -309,6 +309,24 @@ describe("ensureDoltConnection (server profile)", () => {
     });
 
     /**
+     * A plain scalar's continuation is somebody's prose, not a setting: `notes: first` followed by
+     * `  dolt.user:historical` is one value, since YAML opens a mapping only on a colon FOLLOWED BY
+     * WHITESPACE. Read as a live key, the cleanup would comment out the middle of that string and
+     * report a user it never cleared (PR #174 review).
+     */
+    it("leaves a plain scalar's continuation alone, however much it looks like the stale key", () => {
+      const original = "dolt.host: dolt.example.dev\nnotes: first\n  dolt.user:historical\n";
+      const dir = repo(noUser, original);
+      const { calls, exec } = recordingExec();
+
+      const steps = ensureDoltConnection(dir, join(dir, ".beads"), published, { exec });
+
+      expect(calls).not.toContainEqual(["bd", "config", "unset", "dolt.user"]);
+      expect(steps[steps.length - 1]).toMatchObject({ name: "dolt.user", status: "unset" });
+      expect(readFileSync(join(dir, ".beads", "config.yaml"), "utf8")).toBe(original);
+    });
+
+    /**
      * Fail loud rather than leave a wrong account published: a config.yaml the strike-out cannot be
      * written to is reported with the line to remove by hand, and it fails the run like any other
      * unpublishable key. The failure comes from the WRITE, not from re-parsing the file afterwards

@@ -475,6 +475,14 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
 const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
 
 /**
+ * A line YAML reads as opening a mapping key: a `:` followed by whitespace or end of line. That
+ * space is the whole distinction — `dolt.user: x` is a setting, `dolt.user:x` is ordinary text — and
+ * it is what tells the next setting apart from a plain scalar's continuation lines, which YAML
+ * forbids from carrying a `: ` at all.
+ */
+const MAPPING_KEY = /^[^:#]+:(\s|$)/;
+
+/**
  * The offset just past the `quote` that closes a quoted scalar in `text`, searching from `from`, or
  * `-1` when the scalar is still open at the end of the line — YAML continues it onto the lines
  * below. Escapes are YAML's own: a backslash escapes the next character inside a double-quoted
@@ -515,15 +523,16 @@ function opensQuotedScalar(value) {
  * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold —
  * `"comment"` for a `#` line, or `"opaque"` for a line the map cannot hold: a `- item` of a
  * sequence, anything under one, a `key: |` / `key:
- * >` block scalar and its body, a `key: "…` quoted scalar spanning lines and its continuation, or
+ * >` block scalar and its body, a `key: "…` quoted scalar spanning lines and its continuation, a
+ * plain scalar's continuation (any line indented deeper than the `key: value` above it), or
  * any other line with no `key:` of its own. An opaque line is
  * reported under the path of the nearest key enclosing it — the map key for a sequence item, the
  * block key itself for block-scalar text — so a caller diffing two files can see it change without
  * having to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as
  * absent, and so free text is never mistaken for settings.
  *
- * `value` is the trimmed line, EXCEPT inside a block scalar's body or a quoted scalar's
- * continuation, both reported verbatim (indentation kept, interior blanks included — and trailing
+ * `value` is the trimmed line, EXCEPT inside a block scalar's body or a scalar's continuation lines,
+ * all reported verbatim (indentation kept, interior blanks included — and trailing
  * blanks too under `|+`/`>+`, which keep them as content): whitespace is content there, so a
  * re-indent or an added blank line is a real edit, and trimming it away would let a rollback
  * restore over it silently (PR #174 review).
@@ -538,6 +547,9 @@ function* configYamlEntries(text) {
   // The open multiline quoted scalar, if any: { path, quote } of the `key: "…` line whose value we
   // are still inside — its continuation lines are that value's text, not settings of their own.
   let quoted = null;
+  // The last `key: value` scalar, if any: { indent, path }. A plain scalar carries on over the lines
+  // indented deeper than its key, so those are that value's text too.
+  let plain = null;
   // Blank lines seen inside the open block, not yet known to be interior to it.
   let heldBlanks = 0;
   const lines = text.split("\n");
@@ -576,6 +588,30 @@ function* configYamlEntries(text) {
       }
       heldBlanks = 0;
       block = null;
+    }
+    if (plain) {
+      // A plain scalar carries on over every line indented deeper than its key: `notes: first`
+      // followed by `  dolt.user:historical` is ONE value — the colon has no space after it, so YAML
+      // reads the second line as more of the string. Read as a setting instead, that line is a live
+      // `dolt.user`, and stale-key cleanup on a board whose metadata omits the user comments out the
+      // middle of somebody's `notes:` while reporting a user it never cleared (PR #174 review).
+      // Blanks are held until a further continuation proves them interior — a plain scalar folds the
+      // trailing ones away, so a blank before the next key is the document's whitespace.
+      // A `: `-carrying line is NOT continuation: YAML rejects one inside a plain scalar outright, so
+      // in a file bd can parse it can only be the next setting, however it is indented.
+      if (trimmed === "") {
+        heldBlanks++;
+        continue;
+      }
+      if (indent > plain.indent && !trimmed.startsWith("#") && !MAPPING_KEY.test(trimmed)) {
+        for (; heldBlanks > 0; heldBlanks--) yield { line: i - heldBlanks, kind: "opaque", path: plain.path, value: "" };
+        yield { line: i, kind: "opaque", path: plain.path, value: line };
+        continue;
+      }
+      // A `#` line ends the scalar wherever it sits: YAML starts a comment at any `#` a space
+      // precedes, so it is the document's, not the value's.
+      heldBlanks = 0;
+      plain = null;
     }
     if (trimmed === "") continue;
     // A comment is content too, and the only content bd's parser drops entirely. Yielded under the
@@ -637,6 +673,7 @@ function* configYamlEntries(text) {
       yield { line: i, kind: "opaque", path: full, value: trimmed };
     } else {
       yield { line: i, kind: "scalar", path: full, value: value.replace(/^["']|["']$/g, "") };
+      plain = { indent, path: full };
     }
   }
 }
