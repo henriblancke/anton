@@ -866,6 +866,45 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The same window, under a key whose value is a SEQUENCE. The rollback compares the two texts
+   * through bd's flat scalar parser, which holds no list at all — so an item appended under a
+   * list-valued key would leave that diff empty and the whole-file restore would discard the edit
+   * while reporting a clean revert (PR #174 review). Every line the flat map drops is compared too.
+   */
+  it("keeps config.yaml when a concurrent edit lands in a list the flat parser cannot represent", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    // A list-valued key already in the file when this run takes its snapshot.
+    writeFileSync(configPath, `${readFileSync(configPath, "utf8")}repos:\n  additional:\n    - one\n`);
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        // A teammate adds a second repo to the list, after the snapshot was taken. Not a scalar:
+        // the item lands under the existing header rather than as a `key: value` line of its own.
+        const text = readFileSync(configPath, "utf8").replace("    - one\n", "    - one\n    - two\n");
+        writeFileSync(configPath, text);
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toContain("    - two");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(repos\.additional\)/);
+  });
+
+  /**
    * The same window, under a key this run DOES write. Owning the key is not owning the value
    * (PR #174 review): a `dolt.user` another process repoints at a different account while a later
    * publication step fails is that process's edit, and a rollback that claimed every difference on

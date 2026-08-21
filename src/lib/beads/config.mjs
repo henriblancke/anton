@@ -468,33 +468,60 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
 }
 
 /**
- * Walk a `.beads/config.yaml`'s uncommented `key: value` lines, yielding `{ line, path, value }` for
- * each — the ONE reader of both encodings bd has shipped, so nothing below can disagree about what a
- * line means. bd 1.0.4 appends flat dotted lines (`export.auto: false`); bd 1.1.0 writes `export.*`
- * and `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping `sync.remote` flat. Both
+ * Walk every significant line of a `.beads/config.yaml`, yielding `{ line, kind, path, value }` —
+ * the ONE reader of both encodings bd has shipped, so nothing below can disagree about what a line
+ * means. bd 1.0.4 appends flat dotted lines (`export.auto: false`); bd 1.1.0 writes `export.*` and
+ * `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping `sync.remote` flat. Both
  * must resolve to the same dotted path so team-config enforcement doesn't keep re-setting keys it
  * already set (anton-qhoz). Nesting is tracked purely by indentation; blank and comment lines are
  * ignored. `line` is the 0-based index into `text.split("\n")`, for callers that rewrite the file.
+ *
+ * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold — or
+ * `"opaque"` for a line it cannot: a `- item` of a sequence, anything under one, the body of a block
+ * scalar, or any other line with no `key:` of its own. An opaque line is reported under the path of
+ * the nearest MAP key enclosing it, so a caller diffing two files can see it change without having
+ * to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as absent.
  */
 function* configYamlEntries(text) {
-  const stack = []; // parent map headers currently in scope, outermost first: { indent, key }
+  // Blocks currently in scope, outermost first: { indent, key } for a map header, `seq` for the
+  // sequence item whose body a deeper line belongs to.
+  const stack = [];
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].replace(/\r$/, "");
-    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
-    const m = line.match(/^(\s*)([^:#]+):\s*(.*)$/);
-    if (!m) continue;
-    const indent = m[1].length;
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+    // A `- ` line is a sequence item even when it carries a `key: value` of its own: flattening
+    // `- name: a` to a dotted path would let two items of one sequence collapse onto one key.
+    const item = trimmed.startsWith("-");
+    const m = item ? null : line.match(/^(\s*)([^:#]+):\s*(.*)$/);
+    // Unwind everything that cannot enclose this line. A map header at the line's OWN indent is a
+    // sibling of a `key:` line but the owner of a `- item` — YAML lets a sequence sit at its key's
+    // indent — while a sequence marker at that indent is the previous item, which ends here.
+    while (stack.length) {
+      const top = stack[stack.length - 1];
+      if (top.indent < indent || (item && !top.seq && top.indent === indent)) break;
+      stack.pop();
+    }
+    const path = stack
+      .filter((s) => !s.seq)
+      .map((s) => s.key)
+      .join(".");
+    // Inside a sequence item, even a `key: value` line is one item's field, not a settable path.
+    if (item || !m || stack.some((s) => s.seq)) {
+      yield { line: i, kind: "opaque", path, value: trimmed };
+      if (item) stack.push({ indent, seq: true });
+      continue;
+    }
     const key = m[2].trim();
     const value = m[3].trim();
-    // Unwind to the parent whose children sit at a deeper indent than this line.
-    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
-    const path = [...stack.map((s) => s.key), key].join(".");
+    const full = path === "" ? key : `${path}.${key}`;
     if (value === "") {
-      // A bare `key:` opens a nested map (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
+      // A bare `key:` opens a nested block (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
       stack.push({ indent, key });
     } else {
-      yield { line: i, path, value: value.replace(/^["']|["']$/g, "") };
+      yield { line: i, kind: "scalar", path: full, value: value.replace(/^["']|["']$/g, "") };
     }
   }
 }
@@ -505,11 +532,45 @@ function* configYamlEntries(text) {
  *
  * Exported because a rollback has to compare two TEXTS — the file as a run found it against the file
  * as it stands — rather than the file on disk against one key (PR #174 review).
+ *
+ * Scalars ONLY — a sequence is nowhere in here. Anything comparing two texts through this map must
+ * therefore also compare {@link configYamlNonScalars}, or a difference it cannot represent reads as
+ * no difference at all.
+ *
+ * @param {string} text
+ * @returns {Record<string, string>}
  */
 export function parseConfigYaml(text) {
+  /** @type {Record<string, string>} */
   const map = {};
-  for (const { path, value } of configYamlEntries(text)) map[path] = value;
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind === "scalar") map[path] = value;
+  }
   return map;
+}
+
+/**
+ * Everything in a `.beads/config.yaml` that {@link parseConfigYaml} cannot represent, as
+ * `enclosing.path → [line, …]` in file order (each line trimmed) — sequence items, block-scalar
+ * bodies, and any other line with no `key:` of its own.
+ *
+ * The flat map is a lossy read of the file, and a rollback that diffed two texts through it alone
+ * would call a difference it cannot see "no difference": a sequence entry added or reordered under a
+ * list-valued key between the snapshot and a failed publication would leave the scalar diff empty,
+ * and the whole-file restore would then discard that edit silently (PR #174 review). Sequences are
+ * ordered in YAML, so these are compared in file order — a reorder is an edit.
+ *
+ * @param {string} text
+ * @returns {Record<string, string[]>}
+ */
+export function configYamlNonScalars(text) {
+  /** @type {Record<string, string[]>} */
+  const byPath = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind !== "opaque") continue;
+    (byPath[path] ??= []).push(value);
+  }
+  return byPath;
 }
 
 /**
@@ -580,7 +641,9 @@ function retractConfigYamlKey(beadsDir, key) {
   }
   let changed = false;
   for (const entry of configYamlEntries(lines.join("\n"))) {
-    if (entry.path !== key) continue;
+    // Scalars only: an opaque line is reported under the path of the key ENCLOSING it, and striking
+    // it out would comment away a sequence that merely lives under the retracted key's name.
+    if (entry.kind !== "scalar" || entry.path !== key) continue;
     lines[entry.line] = lines[entry.line].replace(/^(\s*)/, "$1# ");
     changed = true;
   }

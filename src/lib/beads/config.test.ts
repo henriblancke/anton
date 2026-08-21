@@ -15,9 +15,11 @@ import {
   bundledBeadFormulaPath,
   bundledRunFormulaPath,
   configYamlHas,
+  configYamlNonScalars,
   ensureBeadFormula,
   ensureRunFormula,
   MIN_BD_VERSION,
+  parseConfigYaml,
   RUN_FORMULA_FILENAME,
 } from "./config.mjs";
 
@@ -100,6 +102,52 @@ describe("configYamlHas", () => {
     // 255`; those must never count as a live setting.
     const beadsDir = withConfig("# export:\n#     auto: false\n");
     expect(configYamlHas(beadsDir, "export.auto", "false")).toBe(false);
+  });
+});
+
+/**
+ * The flat map is a LOSSY read of config.yaml — it holds scalars and nothing else. A rollback diffs
+ * two texts through it, so whatever it drops has to be readable somewhere, or an edit it cannot
+ * represent reads as no edit at all and gets restored over (PR #174 review).
+ */
+describe("configYamlNonScalars", () => {
+  const SEQUENCE = `repos:
+  additional:
+    - one
+    - two
+dolt.user: beads
+`;
+
+  it("keeps the flat map to scalars, and reports sequence items under the key enclosing them", () => {
+    expect(parseConfigYaml(SEQUENCE)).toEqual({ "dolt.user": "beads" });
+    expect(configYamlNonScalars(SEQUENCE)).toEqual({ "repos.additional": ["- one", "- two"] });
+  });
+
+  it("sees an item added, removed or reordered — a scalar diff sees none of them", () => {
+    const added = SEQUENCE.replace("    - two\n", "    - two\n    - three\n");
+    const reordered = `repos:\n  additional:\n    - two\n    - one\ndolt.user: beads\n`;
+    expect(parseConfigYaml(added)).toEqual(parseConfigYaml(SEQUENCE));
+    expect(parseConfigYaml(reordered)).toEqual(parseConfigYaml(SEQUENCE));
+    expect(configYamlNonScalars(added)["repos.additional"]).toEqual(["- one", "- two", "- three"]);
+    expect(configYamlNonScalars(reordered)["repos.additional"]).toEqual(["- two", "- one"]);
+  });
+
+  it("owns an item to a same-indent parent, and a top-level sequence to no key at all", () => {
+    expect(configYamlNonScalars("repos:\n- one\n")).toEqual({ repos: ["- one"] });
+    expect(configYamlNonScalars("- one\n")).toEqual({ "": ["- one"] });
+  });
+
+  it("never flattens a sequence of maps onto dotted keys — two items would collapse into one", () => {
+    const items = "hooks:\n  - name: a\n    run: x\n  - name: b\n    run: y\n";
+    expect(parseConfigYaml(items)).toEqual({});
+    expect(configYamlNonScalars(items).hooks).toEqual(["- name: a", "run: x", "- name: b", "run: y"]);
+  });
+
+  it("reads both scalar encodings exactly as before, and carries no residue for either", () => {
+    expect(parseConfigYaml(FLAT)["export.auto"]).toBe("false");
+    expect(parseConfigYaml(NESTED)["dolt.auto-commit"]).toBe("on");
+    expect(configYamlNonScalars(FLAT)).toEqual({});
+    expect(configYamlNonScalars(NESTED)).toEqual({});
   });
 });
 

@@ -51,6 +51,7 @@ import {
   bdVersionAtLeast,
   budgetMs,
   checkSharedServer,
+  configYamlNonScalars,
   ensureBdConfig,
   ensureDoltConnection,
   failureDetail,
@@ -314,14 +315,26 @@ function isPublicationRewrite(text, wrote) {
  *
  * Compared through bd's own parser, so both encodings (flat dotted lines and bd 1.1.0's nested maps)
  * read the same, a struck-out key reads as absent, and formatting is not mistaken for an edit.
+ *
+ * That parser flattens the file to SCALARS, and what it cannot represent it cannot diff: a sequence
+ * entry added or reordered under a list-valued key in the same window would leave the scalar diff
+ * empty and let the whole-file restore discard it silently (PR #174 review). So every line the flat
+ * map drops is compared too ({@link configYamlNonScalars}), under the key that encloses it — bd
+ * patches scalars and this run asks for nothing else, so ANY such difference is somebody else's.
  */
 function foreignConfigEdits(before, current, wrote) {
   const was = parseConfigYaml(before ?? "");
   const now = parseConfigYaml(current ?? "");
-  return [...new Set([...Object.keys(was), ...Object.keys(now)])]
+  const wasLines = configYamlNonScalars(before ?? "");
+  const nowLines = configYamlNonScalars(current ?? "");
+  const unrepresented = [...new Set([...Object.keys(wasLines), ...Object.keys(nowLines)])]
+    .filter((key) => (wasLines[key] ?? []).join("\n") !== (nowLines[key] ?? []).join("\n"))
+    // A sequence at the top of the file has no enclosing key to name it by.
+    .map((key) => key || "(top level)");
+  const scalars = [...new Set([...Object.keys(was), ...Object.keys(now)])]
     .filter((key) => was[key] !== now[key])
-    .filter((key) => !(wrote.has(key) && now[key] === wrote.get(key)))
-    .sort();
+    .filter((key) => !(wrote.has(key) && now[key] === wrote.get(key)));
+  return [...new Set([...scalars, ...unrepresented])].sort();
 }
 
 /**
