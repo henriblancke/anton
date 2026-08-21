@@ -1193,6 +1193,45 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The same window again, with the concurrent edit HIDDEN behind this run's own line. bd appends
+   * and the flat parser keeps only the last value for a key, so a `dolt.host` somebody else appends
+   * just before this run appends its own reads back as exactly what this run asked for — the
+   * effective value alone would call the key unchanged-by-others and restore the snapshot straight
+   * over their line (PR #174 review). Every occurrence is weighed, so their line is seen.
+   */
+  it("keeps config.yaml when a concurrent edit is buried under this run's own line for the same key", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        // Somebody else publishes their own host in the instant before this run publishes its —
+        // leaving two `dolt.host` lines, of which only the last survives the flat read.
+        if (args[2] === "host") append("dolt.host: someone-else.example.dev");
+        // `database` is published after `host`, so the failure lands with both lines in the file.
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    // Their line is still there — the restore did not run over it.
+    expect(readFileSync(configPath, "utf8")).toContain("dolt.host: someone-else.example.dev");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(dolt\.host\)/);
+  });
+
+  /**
    * The failure this command exists to catch. `bd dolt test` connects to the SERVER; it says nothing
    * about whether this project can open its database there — bd's own project-identity guard refuses
    * a database belonging to another project long after the connection test has passed.
@@ -1691,6 +1730,35 @@ describe("configureServerMode", () => {
       expect(result.extra).toEqual(["probe-8"]);
       expect(result.warnings.join("\n")).toMatch(/holds 1 record this board does not \(probe-8\)/);
       expect(readMetadata(dir).dolt_database).toBe("probe");
+    });
+
+    /**
+     * An UNDECLARED source port is not 3306 (PR #174 review). metadata.json without
+     * `dolt_server_port` leaves bd falling back to config.yaml or the environment, so the pre-flip
+     * exports can be reading a server on another port while the destination resolves to the default
+     * — two different boards, read as one, with every arrival check skipped. Undeclared counts as a
+     * different target, so the comparison runs.
+     */
+    it("still compares when the source metadata declares no port at all", () => {
+      const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: CONNECTION.host, dolt_database: "probe" });
+      let reads = 0;
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (isRead(args)) {
+          // Reads 1 and 2 are the drift check against whatever server the fallback config names;
+          // the third is the read-back from the one this command just declared.
+          reads += 1;
+          return { status: 0, stdout: listing(reads < 3 ? BOARD : [...BOARD, "probe-8"]) };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, flags, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(result.extra).toEqual(["probe-8"]);
+      expect(result.warnings.join("\n")).toMatch(/holds 1 record this board does not \(probe-8\)/);
+      expect(readMetadata(dir).dolt_server_port).toBe(DEFAULT_DOLT_PORT);
     });
   });
 

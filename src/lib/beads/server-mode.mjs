@@ -315,6 +315,11 @@ function isPublicationRewrite(text, wrote) {
  * publication step fails — and an allowlist would call that difference Anton's and let the restore
  * discard it. What this run wrote is the evidence; the key set only bounds where to look.
  *
+ * Nor is the EFFECTIVE value enough on its own ({@link isOwnScalarWrite}, PR #174 review): bd
+ * appends, so a value another process appends for a key this run also writes is hidden the moment
+ * this run's own line lands after it — last-wins reads back exactly what this run asked for, and the
+ * restore drops their line without a word. Every occurrence is weighed, as for retracted keys.
+ *
  * Compared through bd's own parser, so both encodings (flat dotted lines and bd 1.1.0's nested maps)
  * read the same, a struck-out key reads as absent, and formatting is not mistaken for an edit.
  *
@@ -362,13 +367,38 @@ function foreignConfigEdits(before, current, wrote) {
   const unrepresented = [...new Set([...Object.keys(wasLines), ...Object.keys(nowLines)])].filter(
     (key) => (wasLines[key] ?? []).join("\n") !== (nowLines[key] ?? []).join("\n"),
   );
+  const nowScalars = configYamlScalars(current ?? "");
   const scalars = [...new Set([...Object.keys(was), ...Object.keys(now)])]
     .filter((key) => was[key] !== now[key])
-    .filter((key) => !(wrote.has(key) && now[key] === wrote.get(key)));
+    .filter((key) => !isOwnScalarWrite(key, wrote, now, wasScalars, nowScalars));
   return [...new Set([...scalars, ...unrepresented, ...commented])]
     // A sequence or comment at the top of the file has no enclosing key to name it by.
     .map((key) => key || "(top level)")
     .sort();
+}
+
+/**
+ * True when config.yaml's disagreement about scalar `key` is entirely this run's own write: the
+ * effective value is what this run handed bd, AND every line the file now devotes to the key carries
+ * either that value or one the snapshot already published.
+ *
+ * The effective value alone is not enough (PR #174 review). bd appends, and `parseConfigYaml` keeps
+ * only the last line for a path — so a value another process appends for a key this run also writes
+ * disappears from the flat map the moment this run's own line lands after it. The effective value
+ * then matches what this run asked for, the key reads as unchanged-by-others, and the whole-file
+ * restore deletes their line silently. Every OCCURRENCE is weighed instead, the way retracted keys
+ * already are ({@link isStrikeOut}): a line this run never wrote and the snapshot never held is
+ * somebody else's edit, wherever in the file it sits.
+ *
+ * By membership rather than count, because bd patches in place as well as appends: the ordinary case
+ * (a key whose one line this run rewrote) leaves no unaccounted-for value, while a duplicate of a
+ * value already in the snapshot carries nothing a restore can lose.
+ */
+function isOwnScalarWrite(key, wrote, now, wasScalars, nowScalars) {
+  if (!wrote.has(key) || now[key] !== wrote.get(key)) return false;
+  const mine = wrote.get(key);
+  const snapshot = new Set(wasScalars[key] ?? []);
+  return (nowScalars[key] ?? []).every((value) => value === mine || snapshot.has(value));
 }
 
 /**
@@ -813,12 +843,19 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   // comparisons below must all apply (PR #174 review). Compared on what selects a board — host,
   // port, database — and conservatively: anything undeclared or unequal counts as a different
   // target, so doubt costs a warning rather than silence.
+  // The port is required to be DECLARED, not defaulted (PR #174 review): a metadata.json without
+  // `dolt_server_port` does not mean 3306 on the source side — bd falls back to config.yaml's
+  // `dolt.server-port` (or the environment), so the pre-flip exports can be reading a non-default
+  // server while `resolveServerConnection` resolves the destination to 3306. Reading the two as
+  // equal there would skip every missing/divergent/server-only check on a command that has just
+  // repointed the project at a different server.
   const sameServerTarget =
     sourceIsServer &&
     typeof before.host === "string" &&
     typeof connection.host === "string" &&
     before.host.trim().toLowerCase() === connection.host.trim().toLowerCase() &&
-    (before.port ?? DEFAULT_DOLT_PORT) === connection.port &&
+    typeof before.port === "number" &&
+    before.port === connection.port &&
     before.database !== undefined &&
     before.database === connection.database;
   if (sourceIsServer) {
