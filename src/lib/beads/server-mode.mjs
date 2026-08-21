@@ -897,7 +897,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         "cannot be checked for what this board holds. Fix the read, or re-run with --force to accept " +
         "the server's board unverified — which is also the answer for a board that is genuinely " +
         "EMPTY, since an export bd printed warnings on stdout around is not distinguishable from no " +
-        "export at all (readBoardRecords).",
+        "export at all (readBoardRecords). If the DATABASE itself is what cannot be read (locked, " +
+        "corrupt), --force alone will not finish: the pre-flip backup is the same `bd export --all` " +
+        "and fails too, so that board needs `--force --no-backup`.",
     );
     return fail({ before, connection, counts });
   } else {
@@ -917,8 +919,20 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     record("backup", backup.status === "written" ? "ok" : "failed", backup.detail ?? backup.path);
     if (backup.status !== "written") {
       // Refusing here is the point of the flag: an unbacked flip is exactly what --no-backup opts
-      // into, and doing it by accident is not.
-      errors.push(`board backup failed: ${backup.detail}`);
+      // into, and doing it by accident is not. That holds under --force too — it buys past the
+      // arrived-whole check, not past a missing backup — so a board whose database cannot be read
+      // at all fails BOTH (same `bd export --all`) and the escape hatch is two flags, not one. The
+      // error names the second rather than leaving it to be discovered (PR #174 review). Skipping
+      // the backup on its own would be wrong: a read that failed on stdout noise says nothing about
+      // an export to a file, so backups that were perfectly possible would be dropped silently.
+      errors.push(
+        `board backup failed: ${backup.detail}` +
+          (recordsBefore.ok
+            ? ""
+            : " — this is the same `bd export --all` that could not read the board being moved, so --force " +
+              "does not get past it. Fix the export, or re-run with `--force --no-backup` to switch with " +
+              "neither a backup nor an arrived-whole check."),
+      );
       return fail({ before, connection, counts, backup });
     }
   }

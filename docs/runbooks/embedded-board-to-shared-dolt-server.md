@@ -197,7 +197,9 @@ most likely to see:
   accepts the server's board unverified. A genuinely **empty** board only reads this way when bd
   prints warnings on stdout around the empty export — zero records with nothing else printed is
   taken as the empty board it is — and `--force` is the right answer if it does: there is nothing to
-  lose track of.
+  lose track of. When it is the **database** that cannot be read (locked, corrupt), `--force` alone
+  stops one step later — the backup is the same `bd export --all` and fails too — so that board
+  takes **`--force --no-backup`**: no backup, no arrived-whole check, deliberately.
 
 **A warning rather than a failure — *"… holds N records this board does not"*.** Step 5 checks that
 everything on *this* board reached the server; records only the **server** has are the other direction,

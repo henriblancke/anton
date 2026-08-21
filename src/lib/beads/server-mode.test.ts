@@ -1289,6 +1289,42 @@ describe("configureServerMode", () => {
     expect(forced.counts).toEqual({ after: 1 });
   });
 
+  /**
+   * The case above stubs a board whose stdout read fails while the file export still works. A board
+   * that is unreadable OUTRIGHT — locked, corrupt — fails both, since the backup is the same
+   * `bd export --all`, so --force buys past the arrived-whole check and lands on the backup refusal
+   * one step later (PR #174 review). It stays a refusal — a read that failed on stdout noise says
+   * nothing about an export to a file, so skipping the backup on its own would drop backups that
+   * were possible — but the way through is NAMED rather than left to be discovered.
+   */
+  it("names --no-backup when --force alone cannot get past the backup of an unreadable board", () => {
+    const dir = repo(EMBEDDED);
+    const original = readFileSync(metadataPath(dir), "utf8");
+    // Every export fails, read and backup alike; the server holds a board of its own.
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (args[0] === "export") {
+        return isRead(args) && readMetadataFile(dir).raw.dolt_mode === "server"
+          ? { status: 0, stdout: listing(["other-1"]) }
+          : { status: 1, stderr: "database is locked" };
+      }
+      return { status: 0 };
+    };
+
+    const forced = configureServerMode(dir, { ...flags, force: true }, { exec });
+    expect(forced.ok).toBe(false);
+    expect(forced.errors.join("\n")).toMatch(/board backup failed: .*database is locked/);
+    expect(forced.errors.join("\n")).toContain("--force --no-backup");
+    // Refused before the flip: nothing to revert.
+    expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+
+    // Both flags together are the escape hatch the error advertises, and it works.
+    const switched = configureServerMode(dir, { ...flags, force: true, backup: false }, { exec });
+    expect(switched.ok).toBe(true);
+    expect(readMetadata(dir).dolt_mode).toBe("server");
+    expect(switched.steps.find((s: { name: string }) => s.name === "backup")?.status).toBe("skipped");
+  });
+
   it("refuses a server board missing issues the board being moved has — unless forced", () => {
     const dir = repo(EMBEDDED);
     const original = readFileSync(metadataPath(dir), "utf8");
