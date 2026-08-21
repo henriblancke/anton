@@ -649,8 +649,41 @@ describe("configureServerMode", () => {
       expect(ran.indexOf("bd config unset dolt.user")).toBeLessThan(ran.indexOf("bd dolt test"));
     });
 
+    /**
+     * The probe is not the FIRST authenticated call, and beating it is not enough (PR #174 review).
+     * On a project already reading a server the pre-flip `bd export --all` authenticates too, and it
+     * runs ahead of everything else — so a retraction placed after it leaves that read connecting as
+     * the stale account, failing, and refusing the run before the key is ever cleared. The one
+     * command that repairs the configuration could then not run without --force.
+     */
+    it("is cleared before the SOURCE board is read, so a server board can repair its own stale user", () => {
+      const dir = repo({ ...EMBEDDED, dolt_mode: "server", dolt_server_host: CONNECTION.host, dolt_server_port: 3306 });
+      const beadsDir = join(dir, ".beads");
+      writeFileSync(join(beadsDir, "config.yaml"), stale);
+      const calls: string[][] = [];
+      const exec = (cmd: string, args: string[]): Result => {
+        calls.push([cmd, ...args]);
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        // The stale account is gone from the server, so every bd call config.yaml still points at it
+        // fails to authenticate — including `bd config unset` itself, which the retraction survives
+        // by reading its verdict from the file rather than from bd's exit code.
+        if (configYamlValue(beadsDir, "dolt.user") !== undefined) return { status: 1, stderr: "Access denied for user" };
+        if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, toDefaultUser, { exec });
+
+      expect(result.ok).toBe(true);
+      expect(configYamlValue(beadsDir, "dolt.user")).toBeUndefined();
+      const ran = cmdline(calls);
+      expect(ran.indexOf("bd config unset dolt.user")).toBeLessThan(ran.findIndex((c) => c.startsWith("bd export")));
+    });
+
     // Clearing it is a write like any other this run makes, so a failure downstream puts it back —
-    // a rolled-back switch leaves config.yaml exactly as it found it.
+    // a rolled-back switch leaves config.yaml exactly as it found it. Nothing of the flip is in
+    // metadata.json when it happens this early, and the rollback says so rather than inventing a
+    // step for a file it never touched.
     it("is put back when the switch is rolled back", () => {
       const dir = repo(EMBEDDED);
       const configPath = join(dir, ".beads", "config.yaml");

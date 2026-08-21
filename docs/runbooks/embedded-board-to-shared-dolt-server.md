@@ -154,9 +154,16 @@ That command is the whole config half. It:
 6. publishes the connection into `.beads/config.yaml` (`bd dolt set … --update-config`) as the
    team-wide default, so the next clone inherits the target.
 
+Ahead of all six it clears any `dolt.<key>` that `.beads/config.yaml` still publishes and
+`.beads/metadata.json` no longer declares — in practice `dolt.user`, on a project moving to bd's
+default account. metadata.json outranks config.yaml but does not erase it, so bd would otherwise
+keep connecting as that retired account for every step below, starting with the read in step 1 on a
+project that is already on a server. Clearing it first is what lets this command repair the
+configuration instead of failing on it.
+
 **Any failure in 4–6 reverts `.beads/metadata.json` byte-for-byte** and exits non-zero — the project
-keeps working exactly as it did (1–3 fail before anything is written at all). The failures you are
-most likely to see:
+keeps working exactly as it did (1–3 fail before the switch is written; a key cleared above is put
+back with it). The failures you are most likely to see:
 
 - *"the server accepted the connection but will not serve the … database … PROJECT IDENTITY
   MISMATCH"* (or, from step 5, *"… but this project cannot read its board …"*) — the database on the
