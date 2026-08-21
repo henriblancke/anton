@@ -41,7 +41,7 @@
  * overwritten.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -51,6 +51,7 @@ import {
   bdVersionAtLeast,
   budgetMs,
   checkSharedServer,
+  configYamlComments,
   configYamlNonScalars,
   ensureBdConfig,
   ensureDoltConnection,
@@ -321,20 +322,55 @@ function isPublicationRewrite(text, wrote) {
  * empty and let the whole-file restore discard it silently (PR #174 review). So every line the flat
  * map drops is compared too ({@link configYamlNonScalars}), under the key that encloses it — bd
  * patches scalars and this run asks for nothing else, so ANY such difference is somebody else's.
+ *
+ * Comments are compared on the same footing ({@link configYamlComments}), because a comment is an
+ * edit somebody made too — a documented reason for a setting, a block being commented in or out —
+ * and dropping it from both sides would have the scalar diff come back empty and the restore
+ * discard it silently (PR #174 review). The one exception is this run's OWN strike-outs: a
+ * retraction comments a key out rather than deleting it (`bd config unset`'s style, and
+ * {@link retractStaleConnectionKey}'s), so a comment that is a struck-out line for a key this run
+ * retracted is this run's write, not somebody's prose.
  */
 function foreignConfigEdits(before, current, wrote) {
   const was = parseConfigYaml(before ?? "");
   const now = parseConfigYaml(current ?? "");
   const wasLines = configYamlNonScalars(before ?? "");
   const nowLines = configYamlNonScalars(current ?? "");
-  const unrepresented = [...new Set([...Object.keys(wasLines), ...Object.keys(nowLines)])]
-    .filter((key) => (wasLines[key] ?? []).join("\n") !== (nowLines[key] ?? []).join("\n"))
-    // A sequence at the top of the file has no enclosing key to name it by.
-    .map((key) => key || "(top level)");
+  // Every key this run asked bd to RETRACT — the only keys whose strike-out comments are ours.
+  const retracted = new Set([...wrote].filter(([, value]) => value === undefined).map(([key]) => key));
+  const wasComments = configYamlComments(before ?? "");
+  const nowComments = configYamlComments(current ?? "");
+  // Filtered on BOTH sides, so a strike-out that was already in the file when this run found it
+  // cannot read as one this run added.
+  const prose = (lines, path) => (lines ?? []).filter((line) => !isStrikeOut(line, path, retracted));
+  const commented = [...new Set([...Object.keys(wasComments), ...Object.keys(nowComments)])].filter(
+    (key) => prose(wasComments[key], key).join("\n") !== prose(nowComments[key], key).join("\n"),
+  );
+  const unrepresented = [...new Set([...Object.keys(wasLines), ...Object.keys(nowLines)])].filter(
+    (key) => (wasLines[key] ?? []).join("\n") !== (nowLines[key] ?? []).join("\n"),
+  );
   const scalars = [...new Set([...Object.keys(was), ...Object.keys(now)])]
     .filter((key) => was[key] !== now[key])
     .filter((key) => !(wrote.has(key) && now[key] === wrote.get(key)));
-  return [...new Set([...scalars, ...unrepresented])].sort();
+  return [...new Set([...scalars, ...unrepresented, ...commented])]
+    // A sequence or comment at the top of the file has no enclosing key to name it by.
+    .map((key) => key || "(top level)")
+    .sort();
+}
+
+/**
+ * True when `line` — a comment, reported under `path` — is the strike-out of a key in `retracted`.
+ *
+ * Matched in both of bd's encodings: a flat `# dolt.user: beads` carries the whole dotted path in
+ * the comment, while a nested one (`dolt:` / `  # user: beads`) carries only the leaf and takes the
+ * rest from the block it sits in. Anything else — including a struck-out key this run never asked
+ * to retract — is somebody else's line.
+ */
+function isStrikeOut(line, path, retracted) {
+  const m = line.replace(/^#+\s*/, "").match(/^([^:#]+):/);
+  if (!m) return false;
+  const key = m[1].trim();
+  return retracted.has(key) || retracted.has(path === "" ? key : `${path}.${key}`);
 }
 
 /**
@@ -494,6 +530,21 @@ export function readBoardRecords(dir, opts = {}) {
 }
 
 /**
+ * True when `path` is already an ignore file that hides everything beside it — the `*` rule this
+ * module writes. Read rather than assumed so a re-run does not rewrite a file that is already doing
+ * its job, and so a failure to write a NEW one cannot be confused with losing an existing one.
+ */
+function ignoresEverything(path) {
+  try {
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .some((line) => line.trim() === "*");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Export the board to JSONL before anything is changed — the safety net for the flip.
  *
  * `--all` because a partial export is a partial backup: infra beads, templates, gates and memories
@@ -524,9 +575,13 @@ export function backupBoard(dir, opts = {}) {
   } catch (e) {
     return { status: "failed", detail: `could not create ${dest}: ${String(e?.message ?? e)}` };
   }
+  // Atomically, and skipped when the rule is already there: a plain write truncates before it can
+  // fail, so an ENOSPC or I/O error here would leave an EMPTY .gitignore beside every earlier
+  // export — the whole backup directory suddenly visible to git, one `git add -A` away from
+  // committing a private board (PR #174 review).
   const ignore = join(dest, ".gitignore");
   try {
-    writeFileSync(ignore, "*\n");
+    if (!ignoresEverything(ignore)) writeFileAtomic(ignore, "*\n");
   } catch (e) {
     return { status: "failed", detail: `could not write ${ignore}: ${String(e?.message ?? e)}` };
   }

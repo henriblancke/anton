@@ -14,6 +14,7 @@ import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath,
   bundledRunFormulaPath,
+  configYamlComments,
   configYamlHas,
   configYamlNonScalars,
   ensureBeadFormula,
@@ -110,6 +111,38 @@ describe("configYamlHas", () => {
  * two texts through it, so whatever it drops has to be readable somewhere, or an edit it cannot
  * represent reads as no edit at all and gets restored over (PR #174 review).
  */
+/**
+ * The other thing the flat map drops. A comment carries a team's reasoning — why auto-push is off,
+ * a block somebody is mid-way through enabling — and a rollback that could not see one changing
+ * would restore an older text straight over it (PR #174 review).
+ */
+describe("configYamlComments", () => {
+  it("reports a comment under the path open above it, and never as a setting", () => {
+    const text = "# top\ndolt:\n  # inner\n  user: beads\n";
+    expect(parseConfigYaml(text)).toEqual({ "dolt.user": "beads" });
+    expect(configYamlNonScalars(text)).toEqual({});
+    expect(configYamlComments(text)).toEqual({ "": ["# top"], dolt: ["# inner"] });
+  });
+
+  it("sees a comment added, edited or removed — the scalar diff sees none of them", () => {
+    const base = "dolt.user: beads\n# why: the shared board\n";
+    const edited = "dolt.user: beads\n# why: the shared board, since August\n";
+    const removed = "dolt.user: beads\n";
+    expect(parseConfigYaml(edited)).toEqual(parseConfigYaml(base));
+    expect(parseConfigYaml(removed)).toEqual(parseConfigYaml(base));
+    expect(configYamlComments(base)).toEqual({ "": ["# why: the shared board"] });
+    expect(configYamlComments(edited)).toEqual({ "": ["# why: the shared board, since August"] });
+    expect(configYamlComments(removed)).toEqual({});
+  });
+
+  /** A block scalar's body is the value's own text: a `#` line in it is prose, not a comment. */
+  it("does not mistake a block scalar's body for comments", () => {
+    const text = "notes: |\n  # not a comment\ndolt.user: beads\n";
+    expect(configYamlComments(text)).toEqual({});
+    expect(configYamlNonScalars(text).notes).toEqual(["notes: |", "  # not a comment"]);
+  });
+});
+
 describe("configYamlNonScalars", () => {
   const SEQUENCE = `repos:
   additional:

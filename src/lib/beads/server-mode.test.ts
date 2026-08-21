@@ -429,6 +429,49 @@ describe("backupBoard", () => {
     const { exec } = fakeBd({ export: { status: 1, stderr: "export failed" } });
     expect(backupBoard(repo(EMBEDDED), { exec })).toEqual({ status: "failed", detail: "export failed" });
   });
+
+  /**
+   * The second run onto a directory that already holds exports must not rewrite the rule that hides
+   * them: a plain write truncates before it can fail, so one ENOSPC would leave an empty .gitignore
+   * beside every earlier board export — all of it visible to git (PR #174 review). An ignore file
+   * that already carries the rule is left exactly as it is, comments and all.
+   */
+  it("leaves an ignore file that already hides the backups exactly as it found it", () => {
+    const dir = repo(EMBEDDED);
+    const backups = join(dir, ".beads", "backups");
+    mkdirSync(backups, { recursive: true });
+    const existing = "# never commit a board export\n*\n";
+    writeFileSync(join(backups, ".gitignore"), existing);
+    writeFileSync(join(backups, "board-2026-08-17T00-00-00-000Z.jsonl"), "{}\n");
+
+    const { exec } = fakeBd();
+    expect(backupBoard(dir, { exec }).status).toBe("written");
+    expect(readFileSync(join(backups, ".gitignore"), "utf8")).toBe(existing);
+  });
+
+  /**
+   * And when the rule DOES have to be written and the write fails, the previous ignore file is still
+   * there — {@link writeFileAtomic} renames a finished temp file over it rather than truncating it.
+   * Skipped as root, for whom a read-only directory is not read-only.
+   */
+  it.skipIf(process.getuid?.() === 0)("keeps the previous ignore file when the rewrite fails", () => {
+    const dir = repo(EMBEDDED);
+    const backups = join(dir, ".beads", "backups");
+    mkdirSync(backups, { recursive: true });
+    // No `*` rule, so the write is attempted — into a directory nothing may write to.
+    const stale = "# an older rule that does not hide anything\n";
+    writeFileSync(join(backups, ".gitignore"), stale);
+    chmodSync(backups, 0o555);
+    try {
+      const { exec } = fakeBd();
+      const backup = backupBoard(dir, { exec });
+      expect(backup.status).toBe("failed");
+      expect(backup.detail).toContain(".gitignore");
+      expect(readFileSync(join(backups, ".gitignore"), "utf8")).toBe(stale);
+    } finally {
+      chmodSync(backups, 0o755);
+    }
+  });
 });
 
 describe("testDoltConnection", () => {
@@ -913,6 +956,62 @@ describe("configureServerMode", () => {
     expect(readFileSync(configPath, "utf8")).toContain("    - two");
     expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
     expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(repos\.additional\)/);
+  });
+
+  /**
+   * The same window, as a COMMENT. A comment is an edit somebody made — a documented reason for a
+   * setting, a block being commented in or out — and both of the parsers the rollback diffs through
+   * drop it, so a comment-only edit would leave the diff empty and the whole-file restore would
+   * discard it while reporting a clean revert (PR #174 review).
+   */
+  it("keeps config.yaml when the only concurrent edit is a comment", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        // A teammate documents why a setting is what it is, after the snapshot was taken.
+        append("# shared board: auto-push is the server's job, not ours");
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toContain("# shared board: auto-push is the server's job");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toContain("carries a change this command did not make ((top level))");
+  });
+
+  /**
+   * And the comment this run makes ITSELF is not somebody else's: a retraction strikes a key out
+   * rather than deleting it, so a rollback that read every new comment as foreign would decline to
+   * put back the very file it had just edited (PR #174 review).
+   */
+  it("still reverts config.yaml when the only new comment is this run's own strike-out", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    // A nested `dolt.user` — the encoding `bd config unset` reports success on without touching, so
+    // the strike-out below is anton's own.
+    const original = "prefix: probe\ndolt:\n  user: old-account\n";
+    writeFileSync(configPath, original);
+    const { exec } = fakeBd({ dir, before: BOARD, test: { status: 1, stderr: "Connection failed" } });
+
+    const result = configureServerMode(dir, { ...flags, user: undefined }, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "reverted")).toBe(true);
   });
 
   /**

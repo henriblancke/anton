@@ -483,8 +483,9 @@ const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
  * already set (anton-qhoz). Nesting is tracked purely by indentation; blank and comment lines are
  * ignored. `line` is the 0-based index into `text.split("\n")`, for callers that rewrite the file.
  *
- * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold — or
- * `"opaque"` for a line it cannot: a `- item` of a sequence, anything under one, a `key: |` / `key:
+ * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold —
+ * `"comment"` for a `#` line, or `"opaque"` for a line the map cannot hold: a `- item` of a
+ * sequence, anything under one, a `key: |` / `key:
  * >` block scalar and its body, or any other line with no `key:` of its own. An opaque line is
  * reported under the path of the nearest key enclosing it — the map key for a sequence item, the
  * block key itself for block-scalar text — so a caller diffing two files can see it change without
@@ -526,7 +527,23 @@ function* configYamlEntries(text) {
       heldBlanks = 0;
       block = null;
     }
-    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (trimmed === "") continue;
+    // A comment is content too, and the only content bd's parser drops entirely. Yielded under the
+    // path open ABOVE it — without unwinding the stack, since a comment's indentation is nobody's
+    // structure — so a caller diffing two files sees a comment added, edited or deleted (PR #174
+    // review). Nothing reading settings looks at these.
+    if (trimmed.startsWith("#")) {
+      yield {
+        line: i,
+        kind: "comment",
+        path: stack
+          .filter((s) => !s.seq)
+          .map((s) => s.key)
+          .join("."),
+        value: trimmed,
+      };
+      continue;
+    }
     // A `- ` line is a sequence item even when it carries a `key: value` of its own: flattening
     // `- name: a` to a dotted path would let two items of one sequence collapse onto one key.
     const item = trimmed.startsWith("-");
@@ -597,6 +614,9 @@ export function parseConfigYaml(text) {
  * line with no `key:` of its own. Lines are trimmed except inside a block scalar's body, which is
  * kept verbatim so a whitespace-only edit to it still reads as an edit.
  *
+ * Comments are NOT here — they are {@link configYamlComments}'s, kept separate because the one
+ * caller that diffs them has to forgive the strike-outs it made itself.
+ *
  * The flat map is a lossy read of the file, and a rollback that diffed two texts through it alone
  * would call a difference it cannot see "no difference": a sequence entry added or reordered under a
  * list-valued key between the snapshot and a failed publication would leave the scalar diff empty,
@@ -611,6 +631,33 @@ export function configYamlNonScalars(text) {
   const byPath = {};
   for (const { kind, path, value } of configYamlEntries(text)) {
     if (kind !== "opaque") continue;
+    (byPath[path] ??= []).push(value);
+  }
+  return byPath;
+}
+
+/**
+ * Every comment line of a `.beads/config.yaml`, as `enclosing.path → [line, …]` in file order —
+ * the same shape as {@link configYamlNonScalars}, over the one kind of content neither it nor the
+ * flat map holds.
+ *
+ * A comment is content a rollback must not silently discard (PR #174 review): a documented reason
+ * for a setting, or a commented-out block somebody is mid-way through enabling, is exactly the kind
+ * of edit that lands in the window between a run's snapshot and its failure — and diffing two texts
+ * through scalars alone would call that window's edit "no difference" and restore the older text
+ * over it.
+ *
+ * Comments have no structure of their own, so a line is reported under the path open above it
+ * rather than under one inferred from its indentation.
+ *
+ * @param {string} text
+ * @returns {Record<string, string[]>}
+ */
+export function configYamlComments(text) {
+  /** @type {Record<string, string[]>} */
+  const byPath = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind !== "comment") continue;
     (byPath[path] ??= []).push(value);
   }
   return byPath;
