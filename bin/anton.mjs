@@ -8,6 +8,9 @@
  *                  install required skills + selected agents into global ~/.claude (interactive;
  *                  `--agents <a,b,c>` / `--agents all` / `--no-agents` for non-interactive/CI) →
  *                  wire beads Dolt sync (git origin as Dolt remote + initial refs/dolt push)
+ *   anton server-mode  point ONE project's board at a shared Dolt server: back up → write
+ *                  .beads/metadata.json → bd dolt test → read the board back → publish the
+ *                  connection as the team default (reverts the write on any failure)
  *   anton doctor   prereq checks only (non-destructive)
  *   anton dev      next dev  (runner + scheduler auto-start via src/instrumentation.ts)
  *   anton start    next build (if stale) → next start
@@ -36,19 +39,26 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
-  beadsPrereqs,
   bdVersion,
   bdVersionAtLeast,
+  budgetMs,
+  checkSharedServer,
   configureBeadsDoltSync,
   configureBeadsForRepo,
   ensureBeadFormula,
   ensureBeadsGitignore,
   ensureRunFormula,
+  formatServerTarget,
   hasBeadsDir,
+  passwordVarHint,
+  readDoltMetadata,
+  scopedBdRunner,
+  SERVER_MIGRATION_RUNBOOK,
   BEAD_FORMULA_FILENAME,
   RUN_FORMULA_FILENAME,
   MIN_BD_VERSION,
 } from "../src/lib/beads/config.mjs";
+import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import { createInterface } from "node:readline/promises";
@@ -870,12 +880,69 @@ function checkPrereqs() {
   return ok && nodeOk;
 }
 
-/** One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default). */
+/**
+ * Is the board this command runs against actually usable? Reported alongside the tool prereqs, and
+ * only meaningful in SERVER mode: an embedded board is a local Dolt directory, so there is nothing
+ * to reach and nothing to say. A shared-server board keeps no local copy, which makes a board this
+ * machine cannot read an outage rather than stalled sync (DESIGN.md §3a) — so it is probed with
+ * `bd dolt test` AND a board read, and the failure names the configured target and the ways out.
+ *
+ * The read is not belt-and-braces: a connection test passes over a database that does not exist on
+ * the server and over one belonging to another project, so stopping there would exit this command
+ * clean on a board where nothing works (PR #174 review, {@link checkSharedServer}).
+ *
+ * Returns true when the board is fine OR the question does not apply (no `.beads/`, embedded mode),
+ * so only a genuinely unusable board fails the caller.
+ */
+function checkBoard(dir = process.cwd()) {
+  if (!hasBeadsDir(dir)) return true;
+  const board = readDoltMetadata(dir);
+  if (board.mode !== "server") return true;
+
+  const target = formatServerTarget(board);
+  const probe = checkSharedServer(dir, board);
+  const probes = c.dim("bd dolt test + board read");
+  if (probe.ok) {
+    console.log(`  ${c.green("✓")} ${"board".padEnd(9)} ${c.green(`shared Dolt server ${target} serving this board`)}  ${probes}`);
+    return true;
+  }
+  const headline =
+    probe.stage === "read"
+      ? `shared Dolt server ${target} answered but WILL NOT SERVE this board`
+      : `shared Dolt server ${target} UNREACHABLE`;
+  console.log(`  ${c.red("✗")} ${"board".padEnd(9)} ${c.red(headline)}  ${probes}`);
+  // bd's own failure is often several lines (its config warnings ride along); indent every one, so
+  // the cause reads as part of this report rather than as stray output.
+  for (const line of probe.detail.split("\n")) console.log(c.dim(`    ${line}`));
+  if (probe.stage === "read") {
+    // Host, port, account and transport are already proven by the probe that passed — pointing the
+    // reader back at them is what wastes the hour. What is left is the database itself.
+    console.log(c.dim(`    Check .beads/metadata.json names the database this board lives in (now "${board.database ?? "?"}"),`));
+    console.log(c.dim(`    that the "${board.user ?? "configured"}" account may read it, and that the board was copied onto the server:`));
+    console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
+  } else {
+    console.log(c.dim(`    Start the server (or restore the route to ${target}), check .beads/metadata.json`));
+    console.log(c.dim(`    names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell.`));
+  }
+  console.log(c.dim('    Or set "dolt_mode": "embedded" there to work from this machine\'s local copy meanwhile.'));
+  return false;
+}
+
+/**
+ * One `bd list` in `repo`, always JSON and never truncated (bd caps at 50 by default).
+ *
+ * Spawned through the project-scoped runner, not a bare `spawnSync` (anton-ffmw.1): `board-check`
+ * takes MANY repos in one invocation, so an ambient `BEADS_DOLT_*` inherited from the launch
+ * directory would have every one of them listed out of whichever database that names, and a project
+ * whose account has its own `BEADS_DOLT_PASSWORD_<USER>` would never receive it and fail to
+ * authenticate. The runner resolves both from the target repo's own metadata.json.
+ *
+ * The network budget, because in server mode this read crosses the wire — and an unbounded spawn is
+ * how a hung server turns a board audit into a hang.
+ */
 function bdList(repo, extra) {
-  return spawnSync("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  const exec = scopedBdRunner(repo, readDoltMetadata(repo));
+  return exec("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], budgetMs("network"));
 }
 
 /** bd's listing as an array, or null when this build's output can't be parsed. */
@@ -1056,8 +1123,15 @@ function cmdDoctor() {
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
-  console.log(ok ? c.green("\nAll required tools present.\n") : c.red("\nMissing required tools — install them, then re-run.\n"));
-  return ok ? 0 : 1;
+  // Last, because it is the only check that leaves the machine: a board on a shared server that
+  // nothing here can reach is as fatal as a missing tool, and doctor is where an operator looks first.
+  // Gated on the tool check: probing a board with no usable bd would report an "unreachable server"
+  // whose real cause is the missing tool named two lines above.
+  const boardOk = ok ? checkBoard() : true;
+  if (!ok) console.log(c.red("\nMissing required tools — install them, then re-run.\n"));
+  else if (!boardOk) console.log(c.red("\nThis repo's board is on a shared Dolt server this machine can't reach — see above.\n"));
+  else console.log(c.green("\nAll required tools present.\n"));
+  return ok && boardOk ? 0 : 1;
 }
 
 /**
@@ -1071,6 +1145,10 @@ function renderDoltSyncOutcome(dolt) {
   switch (dolt.status) {
     case "no-workspace":
       console.log(c.dim("  no .beads workspace at the package root — skipping."));
+      return true;
+    case "server-mode":
+      // Not a degradation: a shared-server board has no refs/dolt/data to wire (anton-4gd2).
+      console.log(c.dim("  board is on a shared Dolt server — no refs/dolt/data remote to wire."));
       return true;
     case "no-remote":
       console.log(c.red("  ✗ .beads exists but git has no `origin` remote — Dolt sync has nowhere to push."));
@@ -1357,6 +1435,9 @@ function renderDoltSync(sync) {
     case "no-workspace":
       console.log(c.yellow("! no .beads/ workspace — skipped Dolt remote wiring."));
       break;
+    case "server-mode":
+      console.log(c.dim("• board is on a shared Dolt server — no refs/dolt/data remote to wire."));
+      break;
     case "error":
       console.log(c.yellow(`! Dolt remote wiring failed: ${sync.detail}`));
       console.log(c.dim("  beads is configured; retry with `bd dolt remote add origin <url>` then `bd dolt push`."));
@@ -1414,22 +1495,27 @@ async function cmdInit(args = []) {
   const dir = resolve(rawPath ?? process.cwd());
   console.log(c.bold("anton init") + c.dim(` ${dir}`));
 
-  // Prereqs — fail loud, each with the fix (shared with addProject's self-heal gate).
-  const pre = beadsPrereqs(dir);
-  if (!pre.ok) {
-    console.log(c.red(`\n✗ ${pre.error.message}`));
-    if (pre.error.fix) console.log(c.dim(`  ${pre.error.fix}`));
-    return 1;
-  }
-
   // Enforce beads team-config via the shared config path (bd init when absent → config.yaml → .gitignore).
+  // It runs the prereq preflight ITSELF, and no gate may run ahead of it: on a server board the
+  // config path first retracts a stale `dolt.user` published in config.yaml, and a preflight before
+  // that retraction probes as the very account being retracted — so `anton init` would refuse the
+  // project over the exact fault it came to repair (PR #174 review). Prereq failures come back as
+  // `skipped` with the same message + fix this used to print.
   const beads = configureBeadsForRepo(dir, { prefix, log: (m) => console.log(c.dim(`  ${m}`)) });
   if (!beads.configured) {
-    console.log(c.red("\n✗ beads config failed — see output above."));
+    if (beads.skipped) {
+      console.log(c.red(`\n✗ ${beads.reason}`));
+      if (beads.fix) console.log(c.dim(`  ${beads.fix}`));
+    } else {
+      console.log(c.red("\n✗ beads config failed — see output above."));
+    }
     return 1;
   }
   for (const e of beads.errors) console.log(c.yellow(`  ${e}`));
-  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir})`));
+  // Naming the profile makes the board's mode visible where it was applied — a server-mode repo
+  // enforces a connection, not the refs/dolt/data knobs, and the two shouldn't look alike.
+  const profile = beads.mode === "server" ? "shared Dolt server board" : "embedded board";
+  console.log(c.green("\n✓ beads team-config enforced.") + c.dim(` (${dir} — ${profile})`));
 
   // Dolt remote wiring outcome — render every status branch, matching cmdSetup (anton-43b).
   renderDoltSync(beads.doltSync);
@@ -1483,6 +1569,204 @@ async function cmdInit(args = []) {
   return 0;
 }
 
+// ── Per-project server mode (anton server-mode — anton-yvjd) ─────────────────────────────────
+// Points ONE project's board at a shared `dolt sql-server` and proves the switch: back up, write
+// `.beads/metadata.json`, `bd dolt test`, confirm the board reads back whole, publish the connection
+// as the team default. The judgement lives in src/lib/beads/server-mode.mjs; this is its terminal.
+//
+// It configures the connection — it does NOT move the data. Copying an existing board's Dolt
+// history onto the server is docs/runbooks/embedded-board-to-shared-dolt-server.md, which a human
+// runs; this command is what makes that copy safe to point at (and refuses when it hasn't happened).
+
+/** The flags `server-mode` accepts — one source for `--help` and for the unknown-flag refusal. */
+const SERVER_MODE_FLAGS =
+  "[path] --host <h> [--port <n>] [--user <u>] --database <db> [--tls|--no-tls] [--no-backup] [--force]";
+
+/**
+ * Parse `anton server-mode` args: the first bare token is the target repo (default: cwd), the rest
+ * name the connection. `--flag <v>` and `--flag=<v>` both work, matching parseInitArgs. Anything
+ * else lands in `unknown`, a value flag left without a value lands in `missing`, and a second bare
+ * token lands in `extra` — the command refuses on any of the three rather than running a half-read
+ * connection or an ambiguous target.
+ */
+function parseServerModeArgs(args) {
+  const VALUE_FLAGS = {
+    "--host": "host",
+    "--port": "port",
+    "--user": "user",
+    "--database": "database",
+    "--db": "database",
+  };
+  const out = {
+    path: null,
+    host: null,
+    port: null,
+    user: null,
+    database: null,
+    // Undefined, not false: only a project that DECLARES a transport gets one written, so a repo
+    // configured before `--tls` existed keeps inheriting the ambient BEADS_DOLT_SERVER_TLS.
+    tls: undefined,
+    backup: true,
+    force: false,
+    unknown: [],
+    missing: [],
+    extra: [],
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--no-backup") {
+      out.backup = false;
+      continue;
+    }
+    if (a === "--force") {
+      out.force = true;
+      continue;
+    }
+    if (a === "--tls" || a === "--no-tls") {
+      out.tls = a === "--tls";
+      continue;
+    }
+    const eq = a.match(/^(--[a-z-]+)=(.*)$/);
+    const flag = eq ? eq[1] : a;
+    const key = VALUE_FLAGS[flag];
+    if (key) {
+      const value = eq ? eq[2] : args[i + 1];
+      // A value flag with nothing usable behind it is a typo, not an omission — and it must not read
+      // as one: resolveServerConnection falls back to the repo's existing metadata for every field
+      // left null, so a trailing `--database` would verify and publish the OLD database and still
+      // exit 0 (PR #174 review). The next token is left unconsumed when it is itself a flag, so it
+      // still gets parsed on its own terms.
+      if (value === undefined || value === "" || (!eq && value.startsWith("-"))) {
+        out.missing.push(flag);
+        continue;
+      }
+      out[key] = value;
+      if (!eq) i++;
+      continue;
+    }
+    // A typo is collected, never ignored: on a repo that already carries a connection, ignoring
+    // `--hots new-host` would verify and publish the OLD host and still exit 0 (PR #174 review).
+    if (a.startsWith("-")) {
+      out.unknown.push(flag);
+      continue;
+    }
+    // A second bare token is an ambiguous target, not a spare word. Keeping the first would rewrite
+    // and verify ONE repo's board connection while the operator named two, and still exit 0
+    // (PR #174 review) — so every extra positional is collected and the command refuses.
+    if (out.path === null) out.path = a;
+    else out.extra.push(a);
+  }
+  return out;
+}
+
+/** Keep a multi-line tool message inside the report's left margin instead of breaking out of it. */
+const indent = (text) => String(text).split("\n").join("\n  ");
+
+/** How each step status prints. Anything unrecognised prints plainly rather than being swallowed. */
+const SERVER_MODE_MARKS = {
+  ok: () => c.green("✓"),
+  set: () => c.green("✓"),
+  written: () => c.green("✓"),
+  already: () => c.dim("·"),
+  unset: () => c.dim("·"),
+  skipped: () => c.dim("·"),
+  reverted: () => c.yellow("↩"),
+  // A revert that declined to overwrite an edit someone else made after the flip — the file is
+  // theirs now, and the warning below says what is left pointing where.
+  kept: () => c.yellow("⚠"),
+  unchanged: () => c.dim("·"),
+  failed: () => c.red("✗"),
+  missing: () => c.red("✗"),
+  unreadable: () => c.red("✗"),
+};
+
+async function cmdServerMode(args = []) {
+  const parsed = parseServerModeArgs(args);
+  const malformed = [
+    parsed.unknown.length ? `unknown flag${parsed.unknown.length === 1 ? "" : "s"} ${parsed.unknown.join(", ")}` : null,
+    parsed.missing.length ? `missing value for ${parsed.missing.join(", ")}` : null,
+    parsed.extra.length
+      ? `unexpected argument${parsed.extra.length === 1 ? "" : "s"} ${parsed.extra.join(", ")} (one repo path at a time)`
+      : null,
+  ].filter(Boolean);
+  if (malformed.length) {
+    for (const m of malformed) console.log(c.red(`anton server-mode: ${m}`));
+    console.log(c.dim(`  usage: anton server-mode ${SERVER_MODE_FLAGS}\n`));
+    return 1;
+  }
+  const dir = resolve(parsed.path ?? process.cwd());
+  console.log(c.bold("anton server-mode") + c.dim(` ${dir}`));
+
+  // Steps print as they happen: an export plus two round trips to the server is long enough that a
+  // batched render reads as a hang. bd's own output is multi-line — its first line is the headline,
+  // the rest is repeated in full under the error below, where the reader is actually looking.
+  const renderStep = (s) => {
+    const mark = (SERVER_MODE_MARKS[s.status] ?? (() => c.dim("·")))();
+    const lines = String(s.detail ?? "").split("\n").filter(Boolean);
+    const detail = lines.length ? `${lines[0]}${lines.length > 1 ? " …" : ""}` : "";
+    console.log(`  ${mark} ${s.name}${detail ? c.dim(` — ${detail}`) : c.dim(` (${s.status})`)}`);
+  };
+
+  const result = configureServerMode(dir, parsed, {
+    log: (m) => console.log(c.dim(`    ${m}`)),
+    onStep: renderStep,
+  });
+
+  // What the run could not verify, on either exit. Printed in full and never dimmed: a warning here
+  // is the only notice an operator gets that a board on this machine went unchecked (PR #174 review).
+  const renderWarnings = () => {
+    for (const w of result.warnings ?? []) console.log(c.yellow(`\n!  ${indent(w)}`));
+  };
+
+  if (!result.ok) {
+    // The headline is the mode the run LEFT, not the one it intended: when the rollback cannot put
+    // metadata.json back, or declines because someone else edited it, the project is still reading
+    // the server — and "not switched" would send an operator back to a board nothing is reading
+    // (PR #174 review). `result.after` is the file itself, read on the way out.
+    const left = result.after;
+    if (left?.mode === "server") {
+      const where = `${left.user ? `${left.user}@` : ""}${left.host ?? "?"}:${left.port ?? "?"}/${left.database ?? "?"}`;
+      console.log(
+        c.red(
+          result.switchStillWritten
+            ? `\n✗ server mode was NOT verified — and this project is STILL pointed at ${where}: the switch could not be taken back out of .beads/metadata.json.`
+            : `\n✗ this project was NOT switched — it was ALREADY pointed at ${where}, and still is.`,
+        ),
+      );
+    } else {
+      console.log(c.red("\n✗ this project was NOT switched to server mode."));
+    }
+    for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
+    for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
+    renderWarnings();
+    // The two arrived-whole guards are the failures with a runbook behind them: the server is fine,
+    // the data simply is not on it yet — or the copy that is on it and this board were edited apart.
+    if (result.missing?.length || result.diverged?.length) {
+      console.log(c.dim("  → copy the board's Dolt history onto the server first:"));
+      console.log(c.dim(`    ${SERVER_MIGRATION_RUNBOOK}`));
+    }
+    console.log("");
+    return 1;
+  }
+
+  const { host, port, user, database, tls } = result.connection;
+  const transport = tls === undefined ? "" : tls ? " over TLS" : " without TLS";
+  console.log(
+    c.green("\n✓ server mode configured.") +
+      c.dim(` ${user ? `${user}@` : ""}${host}:${port}/${database}${transport}`),
+  );
+  // Records, not issues: the check reads `bd export --all`, so the count covers comment threads and
+  // persistent memories as well as beads (readBoardRecords).
+  if (result.counts?.after !== undefined) console.log(c.dim(`  board reads ${result.counts.after} records from the server.`));
+  if (result.backup?.path) console.log(c.dim(`  pre-switch backup: ${result.backup.path}`));
+  renderWarnings();
+  console.log(
+    c.dim("  Next: run the same command on every other machine (the connection travels in config.yaml,\n" +
+      "        the password does not — set it in each shell), then `anton start`.\n"),
+  );
+  return 0;
+}
+
 function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
   return runLocal("next", nextArgs("dev", args));
@@ -1526,6 +1810,7 @@ ${c.bold("Usage:")} anton <command>
 
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
+  ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim(SERVER_MODE_FLAGS)}
   ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
@@ -1553,6 +1838,8 @@ function main(argv) {
       return cmdDoctor();
     case "board-check":
       return cmdBoardCheck(rest);
+    case "server-mode":
+      return cmdServerMode(rest);
     case "dev":
       return cmdDev(rest);
     case "start":
@@ -1594,6 +1881,7 @@ export {
   nextArgs,
   main,
   parseInitArgs,
+  parseServerModeArgs,
   ensureBeadsGitignore,
   registerProject,
   resolveAntonDb,

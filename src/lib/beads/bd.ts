@@ -10,7 +10,9 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { githubRepoSlug } from "../git/remote";
 import { resolveBdBin } from "./bd-bin";
-import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode } from "./board-mode";
+import { buildBdEnv, passwordVarHint } from "./bd-env";
+import { BOARD_READ_PROBE, formatServerTarget } from "./config.mjs";
+import { isServerMode, readBoardMode, type BoardModeInfo } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
 import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
@@ -337,32 +339,11 @@ function killGraceMs(): number {
 /** Per-invocation knobs for {@link bd}: extra env, and stdin for the commands that read it. */
 interface BdOpts {
   /** Merged over `process.env` (e.g. BEADS_ACTOR for an attributed write). An `undefined` value
-   * REMOVES the variable rather than inheriting the server's — see {@link childEnv}. */
+   * REMOVES the variable rather than inheriting the server's — see `bd-env.ts`'s `buildBdEnv`. */
   env?: Record<string, string | undefined>;
   /** Written to bd's stdin, which is then closed. Required by `bd batch`, which reads its
    * commands from stdin — without it bd would block on an open pipe until the step budget. */
   stdin?: string;
-}
-
-/**
- * The server's env with `overrides` applied, where an `undefined` override REMOVES the variable
- * rather than leaving whatever the server was launched with. That deletion is the point: a gate call
- * that can't derive a slug must not inherit an ambient `GH_REPO`, which would override `gh`'s repo
- * resolution and answer this project's gates with another repository's verdict.
- */
-function childEnv(overrides: Record<string, string | undefined>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides };
-  for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete env[key];
-  // Project-scoped BEADS_DOLT_* never survive the spawn (anton-ffmw.1). They are bd's
-  // HIGHEST-priority config source, so anton's own connection settings — inherited from whatever
-  // directory anton was launched in — would override the TARGET project's .beads/metadata.json and
-  // point it at the wrong database. Same failure shape as the ambient GH_REPO noted above, and it
-  // was caught in production only because bd refuses on a project-id mismatch:
-  //   PROJECT IDENTITY MISMATCH — refusing to connect
-  // Stripping them lets each project's own metadata.json decide, which is per-directory and so
-  // cannot leak. An explicit override still wins: callers that deliberately set one keep it.
-  for (const key of PROJECT_SCOPED_BD_ENV) if (!(key in overrides)) delete env[key];
-  return env;
 }
 
 /**
@@ -397,10 +378,10 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
       cwd,
       // POSIX: make bd the leader of a new process group so the whole tree is reachable as one.
       detached: process.platform !== "win32",
-      // Always built through childEnv, even with no overrides: it is what strips the
-      // project-scoped BEADS_DOLT_* that would otherwise route this call at another
-      // project's database (anton-ffmw.1).
-      env: childEnv(opts?.env ?? {}),
+      // Always built through buildBdEnv, even with no overrides: it is what strips the
+      // project-scoped BEADS_DOLT_* that would otherwise route this call at another project's
+      // database, and what narrows the password to THIS project's user (anton-ffmw.1).
+      env: buildBdEnv(cwd, opts?.env ?? {}),
     });
 
     if (opts?.stdin !== undefined) {
@@ -419,7 +400,6 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
     let stderr = "";
     let settled = false;
     let drainTimer: NodeJS.Timeout | undefined;
-    let escalateTimer: NodeJS.Timeout | undefined;
 
     const killGroup = (sig: NodeJS.Signals) => {
       if (process.platform !== "win32" && child.pid) {
@@ -473,8 +453,9 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
     const budgetTimer = setTimeout(() => {
       killGroup("SIGTERM");
       // The escalation deliberately outlives the promise (as in runShell): the caller unwinds now,
-      // while the group still gets killed. Cleared as soon as bd actually exits.
-      escalateTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs());
+      // while the group still gets killed. It is never disarmed — bd's own exit says nothing about
+      // the descendants the reap is actually for (see the `exit` handler).
+      setTimeout(() => killGroup("SIGKILL"), killGraceMs());
       settle(() => {
         dropPipes();
         // Partial stdout/stderr is deliberately NOT attached: a wedged step's captured output is
@@ -528,7 +509,11 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
     child.on("close", (code, signal) => settle(() => finish(code, signal)));
 
     child.on("exit", (code, signal) => {
-      if (escalateTimer) clearTimeout(escalateTimer); // bd is gone; no SIGKILL needed
+      // A pending SIGKILL is deliberately NOT cancelled here. The reap targets the process group,
+      // and bd exiting on the SIGTERM proves nothing about the wedged `git fetch` that ignored it —
+      // that survivor is what holds the Dolt lock and what the escalation exists to reach. Disarming
+      // on the leader's exit would restore the very leak the group kill was added to close. When the
+      // group is already empty the escalation is a harmless ESRCH inside killGroup.
       if (settled) return; // already timed out (or overflowed) — the caller has its verdict
       drainTimer = setTimeout(
         () =>
@@ -787,8 +772,12 @@ export type SyncRequest = SyncMode | "backstop" | "push";
 export type SyncOutcome = "synced" | "not-wired" | "shared-server";
 
 /**
- * Server-mode preflight (anton-eg46). Runs `bd dolt test` ONCE per repo per process, the first time
- * a sync pass would have run, and throws an actionable error when the shared server is unreachable.
+ * Server-mode preflight (anton-eg46). Runs {@link PREFLIGHT_PROBES} — the connection test AND a board
+ * read — at most once per {@link PREFLIGHT_TTL_MS} per repo, on the sync pass that would otherwise
+ * have run, and throws an actionable error when this machine cannot use the board. Carried only by
+ * passes with no board write of their own behind them
+ * — the heartbeat and the read-freshness pulls; see `probeServer` on {@link runDoltSync} for why a
+ * post-write pass must not add this second failure boundary.
  *
  * Why it belongs here rather than at boot: it piggybacks on the heartbeat, so the failure lands in
  * the sync-status registry the operator is already watching, and a server that comes back up is
@@ -801,43 +790,107 @@ export type SyncOutcome = "synced" | "not-wired" | "shared-server";
  *   Dolt server unreachable at 127.0.0.1:0 and auto-start failed:
  *   dolt is not installed (not found in PATH)
  */
-const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
+/**
+ * Versioned because the registry's SHAPE changed (PR #174 review): the previous implementation
+ * stored a `Set<string>` under the unversioned `anton.beads.preflight`. `Symbol.for` is
+ * process-global and outlives module replacement, so under a Next.js dev hot reload this module
+ * would adopt that Set and the first heartbeat would die on `.get is not a function`. A new key
+ * makes the old value unreachable instead of mistyped; bump it again if the value shape changes.
+ */
+const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight.v2");
 
 /**
+ * How long a successful probe stands in for the server being up.
+ *
+ * A success EXPIRES rather than being remembered forever (PR #174 review): in server mode the
+ * preflight is the only thing the heartbeat does, so a permanently-cached pass means an outage
+ * after startup never reaches the sync-status registry — the UI keeps reporting a healthy shared
+ * board until some unrelated board operation happens to fail. Five minutes bounds that blind spot
+ * while keeping the probes off the ~10s beat (one round per repo per five minutes).
+ */
+export const PREFLIGHT_TTL_MS = 5 * 60_000;
+
+/** A successful probe: when it landed (epoch ms) and which server it proved reachable. */
+type Preflighted = { at: number; server: string };
+
+/**
+ * Each repo's last SUCCESSFUL probe.
+ *
  * Anchored on `globalThis` for the same cross-bundle reason as the status registry above: a route
  * handler bundle and the instrumentation-started sync engine each load their own compiled copy of
- * this module, and a plain module-level Set would give each one its own — turning "once per
- * process" into "once per bundle" and re-running `bd dolt test` for every one of them.
+ * this module, and a plain module-level Map would give each one its own — turning "once per TTL"
+ * into "once per TTL per bundle" and re-running `bd dolt test` for every one of them.
  */
-function preflightedSet(): Set<string> {
-  const g = globalThis as unknown as Record<symbol, Set<string> | undefined>;
-  return (g[PREFLIGHTED_KEY] ??= new Set());
+function preflightedAt(): Map<string, Preflighted> {
+  const g = globalThis as unknown as Record<symbol, Map<string, Preflighted> | undefined>;
+  return (g[PREFLIGHTED_KEY] ??= new Map());
 }
 
-/** Tests only — production preflights once per process by design. */
-export function resetServerPreflight(): void {
-  preflightedSet().clear();
+/**
+ * Everything about the configured target a probe's result is only valid for — host, port, database,
+ * account and transport, which is exactly what `bd dolt test` exercises (`bd-env.ts` scopes the
+ * spawn by the same fields).
+ *
+ * The repo path alone is NOT that key (PR #174 review): correcting metadata.json from one server to
+ * another is how an operator recovers from a bad connection, and a cache keyed on the path would
+ * keep reporting the OLD server's pass for up to a TTL — vouching for a target nothing has probed
+ * while `readBoardMode` has already picked the correction up.
+ */
+function serverIdentity(board: BoardModeInfo): string {
+  return JSON.stringify([board.host, board.port, board.user, board.database, board.tls]);
 }
+
+/** Tests only — production expires probes on the TTL by design. */
+export function resetServerPreflight(): void {
+  preflightedAt().clear();
+}
+
+/**
+ * The two probes, in order, with the message each failure needs. `bd dolt test` answers only "the
+ * server accepted a connection" — it names no database and reads nothing — so a preflight that
+ * stopped there would keep the sync status at `shared-server` while every board operation fails on a
+ * `dolt_database` that is missing, unmigrated, or another project's (bd's identity guard: `PROJECT
+ * IDENTITY MISMATCH — refusing to connect`). The board read is what closes that (PR #174 review),
+ * and it is the same one the CLI's gate uses ({@link checkSharedServer}), so the heartbeat and
+ * `anton doctor` cannot disagree about whether this board works.
+ */
+const PREFLIGHT_PROBES = [
+  {
+    args: ["dolt", "test"],
+    message: (cwd: string, target: string) =>
+      `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
+      `Check the server is up and reachable, that .beads/metadata.json names the right ` +
+      `host/port/user, and that this project's password is set in this process — ` +
+      `${passwordVarHint(cwd)} — or set dolt_mode back to "embedded" to work from the local copy.`,
+  },
+  {
+    args: BOARD_READ_PROBE,
+    message: (cwd: string, target: string) =>
+      `shared Dolt server ${target} accepted the connection but will not serve the board for ${cwd}. ` +
+      `Check that .beads/metadata.json names the database this project's board actually lives in, ` +
+      `that its database account may read it, and that the board has been copied onto the server — ` +
+      `or set dolt_mode back to "embedded" to work from the local copy.`,
+  },
+] as const;
 
 export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Promise<void> {
-  if (preflightedSet().has(cwd)) return;
-  const { host, port, database } = readBoardMode(cwd);
-  const target = `${host ?? "?"}:${port ?? "?"}${database ? `/${database}` : ""}`;
-  try {
-    await exec(cwd, ["dolt", "test"]);
-    // Recorded only on success, so a server that was down is retried on the next beat.
-    preflightedSet().add(cwd);
-  } catch (e) {
-    const err = e as Error & { stdout?: string; stderr?: string };
-    const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
-    throw new Error(
-      `shared Dolt server unreachable for ${cwd} (configured target ${target}). ` +
-        `Check the server is up and reachable, that .beads/metadata.json names the right ` +
-        `host/port, and that BEADS_DOLT_PASSWORD is set in this process — or set ` +
-        `dolt_mode back to "embedded" to work from the local copy. Underlying error: ${output}`,
-      { cause: e },
-    );
+  const board = readBoardMode(cwd);
+  const server = serverIdentity(board);
+  const last = preflightedAt().get(cwd);
+  if (last !== undefined && last.server === server && Date.now() - last.at < PREFLIGHT_TTL_MS) return;
+  const target = formatServerTarget(board);
+  for (const probe of PREFLIGHT_PROBES) {
+    try {
+      await exec(cwd, [...probe.args]);
+    } catch (e) {
+      const err = e as Error & { stdout?: string; stderr?: string };
+      const output = `${err.stderr ?? ""}\n${err.stdout ?? ""}`.trim() || err.message;
+      throw new Error(`${probe.message(cwd, target)} Underlying error: ${output}`, { cause: e });
+    }
   }
+  // Stamped only after BOTH probes pass, so a server that was down — or a board it would not serve —
+  // is retried on the next beat rather than waiting out a TTL it never earned.
+  preflightedAt().set(cwd, { at: Date.now(), server });
 }
 
 /**
@@ -856,11 +909,22 @@ export async function preflightSharedServer(cwd: string, exec: BdExec = bd): Pro
  * flag on the hot sync path. The unconditional repair (`bd recompute-blocked`) is reserved for the
  * places that gap can't reach — a freshly bootstrapped clone that never ran a local merge (see
  * configureBeadsForRepo in config.mjs) — rather than paid on every heartbeat pull.
+ *
+ * `probeServer` gates the server-mode health probe, and must be FALSE for a pass that follows this
+ * caller's own board write (PR #174 review). On a shared server the write IS the publication — it
+ * landed on the one database the moment bd committed it — so callers like `publishLease` and the
+ * step-3c claim publish await this pass only to confirm delivery that already happened. Probing
+ * there adds a SECOND, independent failure boundary after a successful write: a blip between the
+ * write and `bd dolt test` rejects the pass, and the caller reads that as "the lease/claim never
+ * published" and fails the run closed over a mutation every other machine can already see. The
+ * probe belongs on the passes with no write to vouch for them — the heartbeat and the read-
+ * freshness pulls — which is where anton-eg46's fail-loud lands anyway.
  */
 export async function runDoltSync(
   cwd: string,
   exec: BdExec = bd,
   mode: SyncMode = "full",
+  probeServer = true,
 ): Promise<SyncOutcome> {
   // Server mode: there is nothing to reconcile, so this resolves without spawning bd at all
   // (anton-0tul). Every writer is already on the one database, and the pull/push would run ON THE
@@ -870,7 +934,7 @@ export async function runDoltSync(
   // Distinct from "not-wired": that means a board with no propagation path and is worth surfacing;
   // this means propagation is inherent and there is nothing to report.
   if (isServerMode(cwd)) {
-    await preflightSharedServer(cwd, exec);
+    if (probeServer) await preflightSharedServer(cwd, exec);
     return "shared-server";
   }
 
@@ -931,6 +995,7 @@ export function createDoltSync(
   const trailing = new Map<string, { promise: Promise<SyncOutcome>; mode: SyncMode }>();
   const trailingMode = new Map<string, SyncMode>(); // live handle so an upgrade reaches the queued run
   const trailingNewWork = new Map<string, boolean>(); // did any queued request carry new local work?
+  const trailingProbe = new Map<string, boolean>(); // may the queued pass still run the server probe?
 
   // Repos whose backlog this process has reconciled against the remote — a full pass has pushed
   // (or resolved not-wired) at least once. `unpushedCount` lives only in memory, so after a restart
@@ -942,7 +1007,12 @@ export function createDoltSync(
   // commit. A backstop retry (newWork=false) re-attempts already-counted work and commits nothing
   // new, so it must never grow the backlog — otherwise a flaky remote turns one stranded change into
   // "N unpushed" after N failed retries (anton-rn88 review).
-  const start = (cwd: string, mode: SyncMode, newWork: boolean): Promise<SyncOutcome> => {
+  const start = (
+    cwd: string,
+    mode: SyncMode,
+    newWork: boolean,
+    probeServer: boolean,
+  ): Promise<SyncOutcome> => {
     recordStatus(cwd, { state: "syncing" });
     // Never start a pass on top of this process's OWN background board read (anton-3dpp). An
     // embedded board is single-holder: `bd dolt pull` takes the repo's exclusive Dolt lock, and a
@@ -981,7 +1051,7 @@ export function createDoltSync(
     };
     const p = Promise.resolve(issueSnapshotRefreshInFlight(cwd))
       .catch(() => {}) // a failed read is the reader's business; it still released the lock
-      .then(() => runDoltSync(cwd, exec, mode))
+      .then(() => runDoltSync(cwd, exec, mode, probeServer))
       .then(record);
     running.set(cwd, p);
     // Bookkeeping only — callers hold `p` and see its rejection; this chain must not re-reject.
@@ -1017,25 +1087,37 @@ export function createDoltSync(
     // Only a write-nudge introduces new local work; a backstop or durable "push" retry re-attempts
     // already-counted commits and must never inflate the backlog (anton-rn88).
     const newWork = request === "full";
+    // Only a pass with NO write of its own behind it may run the server-mode health probe — the
+    // heartbeat ("backstop") and the read-freshness pulls. A write-nudge ("full") and the durable
+    // push retry ("push") both follow a board write that, on a shared server, already published
+    // itself; probing after it can only invent a failure the write disproves (see runDoltSync).
+    const probeServer = request === "backstop" || request === "pull";
     const queued = trailing.get(cwd);
     if (queued) {
       if (mode === "full") trailingMode.set(cwd, "full");
       if (newWork) trailingNewWork.set(cwd, true); // a coalesced write carries new work into the pass
+      // Suppression is sticky and one-way: a coalesced pass resolves for EVERY request riding it,
+      // so one post-write caller is enough to disqualify the probe for the whole pass. The
+      // heartbeat that shares it loses nothing — it re-probes on the next beat.
+      if (!probeServer) trailingProbe.set(cwd, false);
       return queued.promise;
     }
     const current = running.get(cwd);
-    if (!current) return start(cwd, mode, newWork);
+    if (!current) return start(cwd, mode, newWork, probeServer);
     trailingMode.set(cwd, mode);
     trailingNewWork.set(cwd, newWork);
+    trailingProbe.set(cwd, probeServer);
     const next = current
       .catch(() => {}) // the current run's failure belongs to its own callers
       .then(() => {
         trailing.delete(cwd);
         const m = trailingMode.get(cwd) ?? "full";
         const nw = trailingNewWork.get(cwd) ?? false;
+        const probe = trailingProbe.get(cwd) ?? false;
         trailingMode.delete(cwd);
         trailingNewWork.delete(cwd);
-        return start(cwd, m, nw);
+        trailingProbe.delete(cwd);
+        return start(cwd, m, nw, probe);
       });
     trailing.set(cwd, { promise: next, mode });
     return next;
@@ -1044,7 +1126,16 @@ export function createDoltSync(
 
 // The singleton is globalThis-anchored for the same cross-bundle reason as the status registry:
 // two module instances with separate coalescing maps would defeat the never-overlap invariant.
-const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync");
+//
+// Versioned for the same reason {@link PREFLIGHTED_KEY} is (PR #174 review), and here it is the
+// BEHAVIOUR rather than a value shape that changes: what the global holds is a closure, and
+// `Symbol.for` outlives module replacement — so under a Next.js dev hot reload this module would
+// adopt the previous build's engine and every change to the pass (the server-probe suppression that
+// keeps a published server-mode write from being rejected by a health probe behind it, say) would
+// go untested until the process restarted. A new key hands the reloaded code its own engine; the
+// old one stays reachable to whatever still holds it, which is the whole of what is given up —
+// only in dev, where a reload is the point. Bump it whenever a pass's behaviour changes.
+const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync.v2");
 const doltSync = ((globalThis as unknown as Record<symbol, ReturnType<typeof createDoltSync>>)[
   DOLT_SYNC_KEY
 ] ??= createDoltSync());

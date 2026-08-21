@@ -11,8 +11,14 @@
  * The correct team-config is the Dolt-first model (issues live in Dolt, synced over refs/dolt/data;
  * the JSONL is a passive export): dolt.auto-commit "on", export.auto false, export.git-add false, and
  * a .gitignore that keeps the derived exports + Dolt runtime state out of git.
+ *
+ * That is the EMBEDDED profile — the default. A board can instead live on one shared `dolt
+ * sql-server` (DESIGN.md §3a), where the refs/dolt/data knobs describe a sync channel that does not
+ * exist; there the team-config is the CONNECTION instead. Both profiles live below in
+ * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
+ * `.beads/metadata.json` (anton-4gd2).
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -53,7 +59,7 @@ export const SPAWN_KILL_SIGNAL = "SIGKILL";
  * an ops escape hatch). A cap rather than an override so production keeps the proportions above.
  * Read per call so a change lands without a module reload.
  */
-function budgetMs(kind) {
+export function budgetMs(kind) {
   const raw = Number(process.env.ANTON_BEADS_SPAWN_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? Math.min(SPAWN_BUDGETS_MS[kind], raw) : SPAWN_BUDGETS_MS[kind];
 }
@@ -68,7 +74,7 @@ function timedOut(r) {
  * output, which would otherwise surface as an opaque `exit ?` and send the reader hunting a cause
  * that isn't there (the anton-be1s misreport). `output` is the caller's own stdout/stderr pick.
  */
-function failureDetail(r, timeoutMs, output) {
+export function failureDetail(r, timeoutMs, output) {
   if (timedOut(r)) return `timed out after ${timeoutMs}ms (killed with ${r.signal ?? SPAWN_KILL_SIGNAL})`;
   return output.trim() || `exit ${r.status ?? "?"}`;
 }
@@ -110,6 +116,16 @@ const MIN_BD = { major: 1, minor: 1, patch: 0 };
  */
 export const BD_MIGRATION_RUNBOOK =
   "https://github.com/henriblancke/anton/blob/main/docs/runbooks/bd-1.0.4-to-1.1.0-migration.md";
+
+/**
+ * Absolute URL to the embedded → server migration runbook — the data half `anton server-mode`
+ * refuses to do for you. A URL for the same reason as above. It lives HERE rather than in
+ * `server-mode.mjs` (which re-exports it) because the preflight below names it too: a server that
+ * answers but will not serve the board is most often a database that was never copied across, and
+ * `server-mode.mjs` imports this module, not the other way around.
+ */
+export const SERVER_MIGRATION_RUNBOOK =
+  "https://github.com/henriblancke/anton/blob/main/docs/runbooks/embedded-board-to-shared-dolt-server.md";
 
 /**
  * Parse a `bd --version` line (`bd version 1.1.0 (hash)`) into `{ major, minor, patch, raw }`, or
@@ -181,12 +197,16 @@ export function hasBeadsDir(dir) {
 }
 
 /**
- * Check the prereqs beads config needs (bd on PATH, an existing git repo with an origin remote).
- * Returns { ok } or { ok:false, error:{ message, fix } } — the CLI renders the fix loudly; the
- * self-heal path (addProject) uses it to skip cleanly on a repo that can't be configured (e.g. a
- * plain directory with no git), never corrupting the projects row.
+ * The half of the preflight that touches no board: bd is installed, new enough, and `dir` is a git
+ * repo. Split out from `beadsPrereqs` because it is the only half that is safe to run BEFORE the
+ * stale-connection retraction — it authenticates nothing, so it cannot be failed by the very stale
+ * `dolt.user` the retraction removes (PR #174 review).
+ *
+ * Returns { ok } or { ok:false, error:{ message, fix } }.
+ *
+ * @param {string} dir repo root
  */
-export function beadsPrereqs(dir) {
+export function beadsToolingPrereqs(dir) {
   if (!onPath("bd")) {
     return {
       ok: false,
@@ -217,6 +237,52 @@ export function beadsPrereqs(dir) {
       error: { message: `${dir} is not a git repository.`, fix: `git -C ${dir} init` },
     };
   }
+  return { ok: true };
+}
+
+/**
+ * The mode-dependent half of the preflight, because the two profiles depend on different things
+ * (DESIGN.md §3a): an embedded board reconciles per-machine copies over `refs/dolt/data` and so
+ * needs `origin`, while a server board has no local copy at all and so needs the SERVER. Checking
+ * an embedded board's origin on a server board would fail it for a channel it does not use; not
+ * checking the server would let the bootstrap proceed and die later, mid-run, inside bd.
+ *
+ * This half AUTHENTICATES and READS (see {@link checkSharedServer}), so it must run after any
+ * stale-connection retraction — otherwise it probes as the account being retracted.
+ *
+ * @param {string} dir repo root
+ * @param {{ exec?: Function, env?: NodeJS.ProcessEnv }} [opts] the `checkSharedServer` seam
+ */
+export function beadsBoardPrereqs(dir, opts = {}) {
+  const board = readDoltMetadata(dir);
+  if (board.mode === "server") {
+    const target = formatServerTarget(board);
+    const usable = checkSharedServer(dir, board, opts);
+    if (usable.ok) return { ok: true };
+    // Fail loud HERE rather than let bd fail later: in server mode there is no local copy, so a
+    // board this machine cannot read is an outage, and bd's own error names neither the configured
+    // target nor the way out ("unreachable at 127.0.0.1:0 … dolt is not installed").
+    // The two stages get different words because they have different fixes: an unreachable server is
+    // the server's problem, while a server that answers and then refuses the board is this project's
+    // connection naming the wrong (or an unmigrated) database.
+    return {
+      ok: false,
+      error: {
+        message:
+          usable.stage === "read"
+            ? `this project's board is on a shared Dolt server at ${target}, which accepted the connection but will not serve the "${board.database ?? "?"}" database — server mode keeps no local copy, so nothing here can read the board. (${usable.detail})`
+            : `this project's board is on a shared Dolt server at ${target}, which is unreachable — server mode keeps no local copy, so nothing here can read the board. (${usable.detail})`,
+        fix:
+          usable.stage === "read"
+            ? `Confirm ${join(dir, ".beads", "metadata.json")} names the database this project's board actually lives in, ` +
+              `that the "${board.user ?? "configured"}" account may read it, and that the board has been copied onto the ` +
+              `server (${SERVER_MIGRATION_RUNBOOK}) — or set "dolt_mode": "embedded" there to work from this machine's local copy.`
+            : `Start the server (or restore the route to ${target}), confirm ${join(dir, ".beads", "metadata.json")} ` +
+              `names the right host/port/user, and set ${passwordVarHint(board.user)} in this shell — ` +
+              `or set "dolt_mode": "embedded" there to work from this machine's local copy until it's back.`,
+      },
+    };
+  }
   if (!hasOriginRemote(dir)) {
     return {
       ok: false,
@@ -227,6 +293,23 @@ export function beadsPrereqs(dir) {
     };
   }
   return { ok: true };
+}
+
+/**
+ * The full prereq check — tooling then board — for callers that configure nothing and so have no
+ * retraction to sequence around. `configureBeadsForRepo` deliberately calls the two halves itself,
+ * with step 0b's stale-key retraction between them.
+ *
+ * Returns { ok } or { ok:false, error:{ message, fix } } — the CLI renders the fix loudly; the
+ * self-heal path uses it to skip cleanly on a repo that can't be configured (e.g. a plain directory
+ * with no git), never corrupting the projects row.
+ *
+ * @param {string} dir repo root
+ * @param {{ exec?: Function, env?: NodeJS.ProcessEnv }} [opts] the `checkSharedServer` seam
+ */
+export function beadsPrereqs(dir, opts = {}) {
+  const tooling = beadsToolingPrereqs(dir);
+  return tooling.ok ? beadsBoardPrereqs(dir, opts) : tooling;
 }
 
 /** The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime state. */
@@ -385,36 +468,322 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
 }
 
 /**
- * Parse `.beads/config.yaml` into a flat `dotted.path → value` map (surrounding quotes stripped),
- * accepting BOTH encodings bd has shipped. bd 1.0.4 appends flat dotted lines (`export.auto: false`);
- * bd 1.1.0 writes `export.*` and `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping
- * `sync.remote` flat. Both must resolve to the same dotted path so team-config enforcement doesn't
- * keep re-setting keys it already set (anton-qhoz). Nesting is tracked purely by indentation; blank
- * and comment lines are ignored. A later line for the same path wins (bd appends, so this reflects the
- * effective value).
+ * A YAML block-scalar header, as the whole value of a `key:` line — `|` or `>`, with the optional
+ * chomping (`-`/`+`) and explicit-indentation (`1`-`9`) indicators in either order, and an optional
+ * trailing comment. Anything else after the indicator (`|foo`) is an ordinary scalar, not a block.
  */
-function parseConfigYaml(text) {
-  const map = {};
-  const stack = []; // parent map headers currently in scope, outermost first: { indent, key }
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
-    const m = line.match(/^(\s*)([^:#]+):\s*(.*)$/);
-    if (!m) continue;
-    const indent = m[1].length;
+const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
+
+/**
+ * A line YAML reads as opening a mapping key: a `:` followed by whitespace or end of line. That
+ * space is the whole distinction — `dolt.user: x` is a setting, `dolt.user:x` is ordinary text — and
+ * it is what tells the next setting apart from a plain scalar's continuation lines, which YAML
+ * forbids from carrying a `: ` at all.
+ */
+const MAPPING_KEY = /^[^:#]+:(\s|$)/;
+
+/**
+ * The offset just past the `quote` that closes a quoted scalar in `text`, searching from `from`, or
+ * `-1` when the scalar is still open at the end of the line — YAML continues it onto the lines
+ * below. Escapes are YAML's own: a backslash escapes the next character inside a double-quoted
+ * scalar, and a doubled `''` is a literal apostrophe inside a single-quoted one.
+ */
+function closingQuote(text, quote, from) {
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (quote === '"' && c === "\\") {
+      i++;
+      continue;
+    }
+    if (c !== quote) continue;
+    if (quote === "'" && text[i + 1] === quote) {
+      i++;
+      continue;
+    }
+    return i + 1;
+  }
+  return -1;
+}
+
+/** True when `value` opens a quoted scalar it does not close — the rest of it is on the lines below. */
+function opensQuotedScalar(value) {
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && closingQuote(value, quote, 1) === -1;
+}
+
+/**
+ * Walk every significant line of a `.beads/config.yaml`, yielding `{ line, kind, path, value }` —
+ * the ONE reader of both encodings bd has shipped, so nothing below can disagree about what a line
+ * means. bd 1.0.4 appends flat dotted lines (`export.auto: false`); bd 1.1.0 writes `export.*` and
+ * `dolt.*` as nested maps (`export:` / `    auto: false`) while keeping `sync.remote` flat. Both
+ * must resolve to the same dotted path so team-config enforcement doesn't keep re-setting keys it
+ * already set (anton-qhoz). Nesting is tracked purely by indentation; blank and comment lines are
+ * ignored. `line` is the 0-based index into `text.split("\n")`, for callers that rewrite the file.
+ *
+ * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold —
+ * `"comment"` for a `#` line (reported under the blocks its own indentation puts it inside), or
+ * `"opaque"` for a line the map cannot hold: a `- item` of a
+ * sequence, anything under one, a `key: |` / `key:
+ * >` block scalar and its body, a `key: "…` quoted scalar spanning lines and its continuation, a
+ * plain scalar's continuation (any line indented deeper than the `key: value` above it), or
+ * any other line with no `key:` of its own. An opaque line is
+ * reported under the path of the nearest key enclosing it — the map key for a sequence item, the
+ * block key itself for block-scalar text — so a caller diffing two files can see it change without
+ * having to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as
+ * absent, and so free text is never mistaken for settings.
+ *
+ * `value` is the trimmed line, EXCEPT inside a block scalar's body or a scalar's continuation lines,
+ * all reported verbatim (indentation kept, interior blanks included — and trailing
+ * blanks too under `|+`/`>+`, which keep them as content): whitespace is content there, so a
+ * re-indent or an added blank line is a real edit, and trimming it away would let a rollback
+ * restore over it silently (PR #174 review).
+ */
+function* configYamlEntries(text) {
+  // Blocks currently in scope, outermost first: { indent, key } for a map header, `seq` for the
+  // sequence item whose body a deeper line belongs to.
+  const stack = [];
+  // The open block scalar, if any: { indent, path, keep } of the `key: |` line whose body we are
+  // inside — `keep` for the `+` chomping indicator, which makes trailing blank lines content.
+  let block = null;
+  // The open multiline quoted scalar, if any: { path, quote } of the `key: "…` line whose value we
+  // are still inside — its continuation lines are that value's text, not settings of their own.
+  let quoted = null;
+  // The last `key: value` scalar, if any: { indent, path }. A plain scalar carries on over the lines
+  // indented deeper than its key, so those are that value's text too.
+  let plain = null;
+  // Blank lines seen inside the open block, not yet known to be interior to it.
+  let heldBlanks = 0;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\r$/, "");
+    const trimmed = line.trim();
+    const indent = line.length - line.trimStart().length;
+    if (quoted) {
+      // A quoted scalar's continuation is the value's own text: `#` starts no comment there and
+      // `key: value` sets nothing, right up to the closing quote. Read as settings instead, a line
+      // like `  dolt.user: historical` inside somebody's `notes:` string would be a live top-level
+      // key — enough to make enforcement skip a required write, and to make a retraction comment
+      // out the middle of that string and leave the file unparseable (PR #174 review).
+      // Kept verbatim, and blank lines with it: both are content until the quote closes.
+      yield { line: i, kind: "opaque", path: quoted.path, value: line };
+      if (closingQuote(line, quoted.quote, 0) !== -1) quoted = null;
+      continue;
+    }
+    if (block) {
+      // A block scalar's body is free text: `#` starts no comment and `key: value` sets nothing.
+      // It runs to the first non-blank line indented no deeper than the key that opened it.
+      // Blanks are held until a further body line proves them interior — a blank between the block
+      // and the next key is the document's whitespace, and `|`/`>` chomp trailing blanks anyway.
+      // NOT under `+`, which keeps them: there those line breaks ARE the value, so dropping them
+      // would make two texts differing only in trailing blanks read as identical and let a rollback
+      // restore the older one over a real edit (PR #174 review).
+      if (trimmed === "") {
+        if (block.keep) yield { line: i, kind: "opaque", path: block.path, value: "" };
+        else heldBlanks++;
+        continue;
+      }
+      if (indent > block.indent) {
+        for (; heldBlanks > 0; heldBlanks--) yield { line: i - heldBlanks, kind: "opaque", path: block.path, value: "" };
+        yield { line: i, kind: "opaque", path: block.path, value: line };
+        continue;
+      }
+      heldBlanks = 0;
+      block = null;
+    }
+    if (plain) {
+      // A plain scalar carries on over every line indented deeper than its key: `notes: first`
+      // followed by `  dolt.user:historical` is ONE value — the colon has no space after it, so YAML
+      // reads the second line as more of the string. Read as a setting instead, that line is a live
+      // `dolt.user`, and stale-key cleanup on a board whose metadata omits the user comments out the
+      // middle of somebody's `notes:` while reporting a user it never cleared (PR #174 review).
+      // Blanks are held until a further continuation proves them interior — a plain scalar folds the
+      // trailing ones away, so a blank before the next key is the document's whitespace.
+      // A `: `-carrying line is NOT continuation: YAML rejects one inside a plain scalar outright, so
+      // in a file bd can parse it can only be the next setting, however it is indented.
+      if (trimmed === "") {
+        heldBlanks++;
+        continue;
+      }
+      if (indent > plain.indent && !trimmed.startsWith("#") && !MAPPING_KEY.test(trimmed)) {
+        for (; heldBlanks > 0; heldBlanks--) yield { line: i - heldBlanks, kind: "opaque", path: plain.path, value: "" };
+        yield { line: i, kind: "opaque", path: plain.path, value: line };
+        continue;
+      }
+      // A `#` line ends the scalar wherever it sits: YAML starts a comment at any `#` a space
+      // precedes, so it is the document's, not the value's.
+      heldBlanks = 0;
+      plain = null;
+    }
+    if (trimmed === "") continue;
+    // A comment is content too, and the only content bd's parser drops entirely — yielded so a
+    // caller diffing two files sees one added, edited or deleted (PR #174 review). Nothing reading
+    // settings looks at these.
+    // Under the blocks its OWN INDENTATION puts it inside, which is why the still-open stack is
+    // read through an indent filter rather than used as it stands (PR #174 review): a retraction
+    // strikes a nested key out in place (`dolt:` / `  # user: old`), and a top-level `# user: old`
+    // somebody adds below that block would otherwise be reported under `dolt` too — indistinguishable
+    // from this run's own strike-out, and so silently discarded by a rollback. The stack itself is
+    // NOT unwound: a comment closes no block, and the next real line's scope is its own business.
+    if (trimmed.startsWith("#")) {
+      yield {
+        line: i,
+        kind: "comment",
+        path: stack
+          .filter((s) => !s.seq && s.indent < indent)
+          .map((s) => s.key)
+          .join("."),
+        value: trimmed,
+      };
+      continue;
+    }
+    // A `- ` line is a sequence item even when it carries a `key: value` of its own: flattening
+    // `- name: a` to a dotted path would let two items of one sequence collapse onto one key.
+    const item = trimmed.startsWith("-");
+    const m = item ? null : line.match(/^(\s*)([^:#]+):\s*(.*)$/);
+    // Unwind everything that cannot enclose this line. A map header at the line's OWN indent is a
+    // sibling of a `key:` line but the owner of a `- item` — YAML lets a sequence sit at its key's
+    // indent — while a sequence marker at that indent is the previous item, which ends here.
+    while (stack.length) {
+      const top = stack[stack.length - 1];
+      if (top.indent < indent || (item && !top.seq && top.indent === indent)) break;
+      stack.pop();
+    }
+    const path = stack
+      .filter((s) => !s.seq)
+      .map((s) => s.key)
+      .join(".");
+    // Inside a sequence item, even a `key: value` line is one item's field, not a settable path.
+    if (item || !m || stack.some((s) => s.seq)) {
+      yield { line: i, kind: "opaque", path, value: trimmed };
+      if (item) stack.push({ indent, seq: true });
+      continue;
+    }
     const key = m[2].trim();
     const value = m[3].trim();
-    // Unwind to the parent whose children sit at a deeper indent than this line.
-    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
-    const path = [...stack.map((s) => s.key), key].join(".");
+    const full = path === "" ? key : `${path}.${key}`;
     if (value === "") {
-      // A bare `key:` opens a nested map (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
+      // A bare `key:` opens a nested block (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
       stack.push({ indent, key });
+    } else if (BLOCK_SCALAR_HEADER.test(value)) {
+      // `key: |` / `key: >` — the indicator is not the value, and the indented text below it is
+      // content, not settings. Reporting either as a scalar would expose a body line like
+      // `dolt.user: historical` as a live top-level setting: enough to make enforcement skip a
+      // required write, and to make a retraction comment out somebody's prose (PR #174 review).
+      block = { indent, path: full, keep: value.split(/\s/)[0].includes("+") };
+      yield { line: i, kind: "opaque", path: full, value: trimmed };
+    } else if (opensQuotedScalar(value)) {
+      // `key: "first` — a quoted scalar YAML carries on over the lines below. Opaque like a block
+      // scalar's, and for the same reason: the flat map cannot hold a value spanning lines, and
+      // every line of it is text rather than settings.
+      quoted = { path: full, quote: value[0] };
+      yield { line: i, kind: "opaque", path: full, value: trimmed };
     } else {
-      map[path] = value.replace(/^["']|["']$/g, "");
+      yield { line: i, kind: "scalar", path: full, value: value.replace(/^["']|["']$/g, "") };
+      plain = { indent, path: full };
     }
   }
+}
+
+/**
+ * Parse `.beads/config.yaml` into a flat `dotted.path → value` map (surrounding quotes stripped).
+ * A later line for the same path wins (bd appends, so this reflects the effective value).
+ *
+ * Exported because a rollback has to compare two TEXTS — the file as a run found it against the file
+ * as it stands — rather than the file on disk against one key (PR #174 review).
+ *
+ * Scalars ONLY — a sequence is nowhere in here. Anything comparing two texts through this map must
+ * therefore also compare {@link configYamlNonScalars}, or a difference it cannot represent reads as
+ * no difference at all.
+ *
+ * @param {string} text
+ * @returns {Record<string, string>}
+ */
+export function parseConfigYaml(text) {
+  /** @type {Record<string, string>} */
+  const map = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind === "scalar") map[path] = value;
+  }
   return map;
+}
+
+/**
+ * EVERY value a `.beads/config.yaml` publishes for each dotted path, in file order — what
+ * {@link parseConfigYaml} keeps only the last of.
+ *
+ * A retraction comments out every line the file devotes to a key, not just the effective one
+ * ({@link retractConfigYamlKey}), so a rollback recognising its own strike-outs has to know each
+ * value that was struck — the last-wins map would call the older duplicate's strike-out somebody
+ * else's line (PR #174 review).
+ *
+ * @param {string} text
+ * @returns {Record<string, string[]>}
+ */
+export function configYamlScalars(text) {
+  /** @type {Record<string, string[]>} */
+  const byPath = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind === "scalar") (byPath[path] ??= []).push(value);
+  }
+  return byPath;
+}
+
+/**
+ * Everything in a `.beads/config.yaml` that {@link parseConfigYaml} cannot represent, as
+ * `enclosing.path → [line, …]` in file order — sequence items, block-scalar bodies, and any other
+ * line with no `key:` of its own. Lines are trimmed except inside a block scalar's body, which is
+ * kept verbatim so a whitespace-only edit to it still reads as an edit.
+ *
+ * Comments are NOT here — they are {@link configYamlComments}'s, kept separate because the one
+ * caller that diffs them has to forgive the strike-outs it made itself.
+ *
+ * The flat map is a lossy read of the file, and a rollback that diffed two texts through it alone
+ * would call a difference it cannot see "no difference": a sequence entry added or reordered under a
+ * list-valued key between the snapshot and a failed publication would leave the scalar diff empty,
+ * and the whole-file restore would then discard that edit silently (PR #174 review). Sequences are
+ * ordered in YAML, so these are compared in file order — a reorder is an edit.
+ *
+ * @param {string} text
+ * @returns {Record<string, string[]>}
+ */
+export function configYamlNonScalars(text) {
+  /** @type {Record<string, string[]>} */
+  const byPath = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind !== "opaque") continue;
+    (byPath[path] ??= []).push(value);
+  }
+  return byPath;
+}
+
+/**
+ * Every comment line of a `.beads/config.yaml`, as `enclosing.path → [line, …]` in file order —
+ * the same shape as {@link configYamlNonScalars}, over the one kind of content neither it nor the
+ * flat map holds.
+ *
+ * A comment is content a rollback must not silently discard (PR #174 review): a documented reason
+ * for a setting, or a commented-out block somebody is mid-way through enabling, is exactly the kind
+ * of edit that lands in the window between a run's snapshot and its failure — and diffing two texts
+ * through scalars alone would call that window's edit "no difference" and restore the older text
+ * over it.
+ *
+ * A comment is reported under the blocks its own INDENTATION puts it inside. It closes no block and
+ * owns no structure, but the one caller that diffs comments has to tell the strike-outs it made
+ * itself from somebody else's prose (PR #174 review): a retraction comments a nested key out in
+ * place (`dolt:` / `  # user: old`), so a top-level `# user: old` a concurrent editor adds below
+ * that block must not read as the same line — forgiven as this run's, and then restored away.
+ *
+ * @param {string} text
+ * @returns {Record<string, string[]>}
+ */
+export function configYamlComments(text) {
+  /** @type {Record<string, string[]>} */
+  const byPath = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind !== "comment") continue;
+    (byPath[path] ??= []).push(value);
+  }
+  return byPath;
 }
 
 /**
@@ -427,32 +796,432 @@ function parseConfigYaml(text) {
  * on` lands it), which is not portable.
  */
 export function configYamlHas(beadsDir, key, want) {
-  let text = "";
+  return configYamlValue(beadsDir, key) === want;
+}
+
+/**
+ * The value `.beads/config.yaml` publishes for `key` (dotted path), or `undefined` when the file is
+ * missing, unreadable, or says nothing about it.
+ */
+export function configYamlValue(beadsDir, key) {
   try {
-    text = readFileSync(join(beadsDir, "config.yaml"), "utf8");
+    return parseConfigYaml(readFileSync(join(beadsDir, "config.yaml"), "utf8"))[key];
   } catch {
-    return false;
+    return undefined;
   }
-  return parseConfigYaml(text)[key] === want;
+}
+
+/**
+ * Replace a file's contents so that a failure leaves the previous ones intact: the new text goes to
+ * a sibling temp file, which is renamed over the target only once it is fully written. A plain
+ * `writeFileSync` truncates its target before it can fail, so a full disk, a read-only mount or an
+ * I/O error part-way through leaves the file empty or half-written — a `.beads/` whose connection
+ * details or team defaults no longer parse, from commands whose whole point is not to lose boards
+ * (PR #174 review). `rename` is atomic within a filesystem, and the temp file is kept in the same
+ * directory to stay on one. The error still propagates; only the damage does not.
+ *
+ * The ONE atomic writer for everything under `.beads/` — `metadata.json` (server-mode.mjs, which
+ * re-exports this) and `config.yaml` (the retraction below).
+ */
+export function writeFileAtomic(path, text) {
+  const tmp = `${path}.anton-${process.pid}.tmp`;
+  // `rename` carries the TEMP file's permissions onto the target, so a default-mode temp WIDENS a
+  // restricted file — a config.yaml kept at 0600 because it holds `github.token` or `linear.api_key`
+  // would come back 0644, exposing the secret to every other user on the machine (PR #174 review).
+  // Copy the target's bits onto the temp instead, and hold it at 0600 until then so the secret is
+  // never briefly world-readable under its temp name. Ownership can't follow (chown needs privilege);
+  // only the writer's own files are rewritten here, so the owner does not change.
+  const mode = existsSync(path) ? statSync(path).mode & 0o777 : undefined;
+  try {
+    writeFileSync(tmp, text, mode === undefined ? undefined : { mode: 0o600 });
+    // Unconditional: `mode` on writeFileSync only applies at CREATION, so a temp left by a crashed
+    // run with this pid would otherwise keep its own permissions.
+    if (mode !== undefined) chmodSync(tmp, mode);
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
+/**
+ * Comment out every line `.beads/config.yaml` devotes to `key` — `{ status: "struck" | "absent" |
+ * "failed", detail? }`. Commenting rather than deleting is `bd config unset`'s own strike-out style,
+ * and it leaves the old value readable as history instead of vanishing from a committed file.
+ *
+ * Written atomically, and an I/O failure REPORTED rather than swallowed (PR #174 review): a plain
+ * write that dies part-way through leaves config.yaml truncated, and a caller that then re-parses
+ * the damaged file would read the key's disappearance as a successful retraction — and carry on
+ * over a file that has lost every other setting it held.
+ */
+function retractConfigYamlKey(beadsDir, key) {
+  const path = join(beadsDir, "config.yaml");
+  let lines;
+  try {
+    lines = readFileSync(path, "utf8").split("\n");
+  } catch (err) {
+    return { status: "failed", detail: err?.message || String(err) };
+  }
+  let changed = false;
+  for (const entry of configYamlEntries(lines.join("\n"))) {
+    // Scalars only: an opaque line is reported under the key enclosing it, so striking one out would
+    // comment away a sequence — or a block scalar's free text — that merely lives under this name.
+    if (entry.kind !== "scalar" || entry.path !== key) continue;
+    lines[entry.line] = lines[entry.line].replace(/^(\s*)/, "$1# ");
+    changed = true;
+  }
+  if (!changed) return { status: "absent" };
+  try {
+    writeFileAtomic(path, lines.join("\n"));
+  } catch (err) {
+    return { status: "failed", detail: err?.message || String(err) };
+  }
+  return { status: "struck" };
 }
 
 /**
  * Idempotently ensure config.yaml carries `key: want`. `bd config set` patches config.yaml (appends a
  * single key line, never clobbering the rest); we skip the write when the file already matches so a
  * re-run is a true no-op. Returns "already" | "set" | "failed".
+ *
+ * `opts.exec` is the same seam `ensureDoltConnection` takes: a caller that must run bd under a
+ * project-scoped environment (server-mode.mjs) passes its own runner rather than inheriting the
+ * ambient one.
  */
-export function ensureBdConfig(dir, beadsDir, key, want) {
+export function ensureBdConfig(dir, beadsDir, key, want, opts = {}) {
   if (configYamlHas(beadsDir, key, want)) return "already";
-  const r = spawnSync("bd", ["config", "set", key, want], {
-    cwd: dir,
-    stdio: "ignore",
-    timeout: budgetMs("bd"),
-    killSignal: SPAWN_KILL_SIGNAL,
-  });
+  const ms = budgetMs("bd");
+  const r = opts.exec
+    ? opts.exec("bd", ["config", "set", key, want], ms)
+    : spawnSync("bd", ["config", "set", key, want], {
+        cwd: dir,
+        stdio: "ignore",
+        timeout: ms,
+        killSignal: SPAWN_KILL_SIGNAL,
+      });
   return (r.status ?? 1) === 0 ? "set" : "failed";
 }
 
-/** The config.yaml keys anton's team-config enforces (Dolt-first model). `dolt.auto-push false`
+/**
+ * `dolt_server_port` as a number, whatever JSON type it arrives as.
+ *
+ * bd writes this file too, and `bd dolt set port <n> --update-config` re-serializes the port as a
+ * STRING — so a number-only parse loses the port of every board bd has already published, which is
+ * every board this command has successfully switched (PR #174 review). What follows is not a
+ * warning but three silent failures: `anton init` reports the required port missing, the preflight
+ * names the target as `host:?`, and the per-server password variable is looked up under a
+ * port-less name no operator was told to set, so the next bd call cannot authenticate.
+ *
+ * Only a whole port number is accepted, in either encoding. Anything else — a float, a blank, a
+ * `"3306x"`, a value out of range — is still dropped rather than passed through: bd dialing a
+ * nonsense port is the same outage as bd dialing port 0, and the "missing" verdict at least names
+ * the fix.
+ */
+function asPort(value) {
+  const n = typeof value === "string" && /^\s*\d+\s*$/.test(value) ? Number(value) : value;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 && n <= 65535 ? n : undefined;
+}
+
+/**
+ * The board mode + connection a project declares in `.beads/metadata.json` — `embedded` (a Dolt
+ * database under `.beads/`, one copy per machine, reconciled over refs/dolt/data) or `server` (one
+ * shared `dolt sql-server` every machine reads and writes). See DESIGN.md §3a.
+ *
+ * metadata.json, not config.yaml or the environment: it is bd's per-directory source of truth, so it
+ * describes THIS project no matter which process asks or what that process was launched with. (The
+ * environment outranks it in bd's own precedence, which is exactly why anton scopes a bd spawn's env
+ * per project — see bd-env.ts, anton-ffmw.1.)
+ *
+ * Anything absent, unreadable, unparseable, or unrecognised resolves to `embedded`. That is the safe
+ * direction: embedded merely syncs when it need not, whereas a wrong "server" verdict would silently
+ * disable a solo board's only propagation path. Never throws — callers gate setup on it.
+ *
+ * The typed accessor `board-mode.ts` delegates here, so there is ONE parser of this file.
+ *
+ * @param {string} dir repo root (the directory containing `.beads/`)
+ * @returns {{ mode: "embedded"|"server", host?: string, port?: number, user?: string, database?: string,
+ *   tls?: boolean }}
+ */
+export function readDoltMetadata(dir) {
+  try {
+    const meta = JSON.parse(readFileSync(join(dir, ".beads", "metadata.json"), "utf8"));
+    if (meta?.dolt_mode !== "server") return { mode: "embedded" };
+    return {
+      mode: "server",
+      host: typeof meta.dolt_server_host === "string" ? meta.dolt_server_host : undefined,
+      port: asPort(meta.dolt_server_port),
+      user: typeof meta.dolt_server_user === "string" ? meta.dolt_server_user : undefined,
+      database: typeof meta.dolt_database === "string" ? meta.dolt_database : undefined,
+      // bd's own key (`dolt_server_tls`), left undefined when the project declares nothing — which
+      // is what {@link applyBoardTls} reads as "inherit the ambient setting".
+      tls: typeof meta.dolt_server_tls === "boolean" ? meta.dolt_server_tls : undefined,
+    };
+  } catch {
+    return { mode: "embedded" };
+  }
+}
+
+/**
+ * Env vars that name WHICH project/database bd talks to. Never inherited by a bd spawned against a
+ * different project — an inherited value silently overrides that project's own metadata.json
+ * (anton-ffmw.1; `bd-env.ts` carries the field report).
+ *
+ * Credentials and transport (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are deliberately
+ * absent: they answer "may I connect", not "connect to what", and a blanket strip would leave every
+ * spawn unable to authenticate. They are resolved per project instead — the password by
+ * {@link resolveBdPassword}, the transport by {@link applyBoardTls}.
+ *
+ * Defined here rather than in `bd-env.ts` so the pure-node CLI — which cannot import TypeScript —
+ * scopes its own bd spawns off the same list the server uses. `bd-env.ts` re-exports it.
+ */
+export const PROJECT_SCOPED_BD_ENV = [
+  // Whether to reach for a server at all, and which one.
+  "BEADS_DOLT_SERVER_MODE",
+  "BEADS_DOLT_SHARED_SERVER",
+  "BEADS_DOLT_PROXIED_SERVER",
+  "BEADS_DOLT_SERVER_HOST",
+  "BEADS_DOLT_SERVER_PORT",
+  "BEADS_DOLT_SERVER_USER",
+  "BEADS_DOLT_SERVER_DATABASE",
+  "BEADS_DOLT_SERVER_SOCKET",
+  // Embedded-mode routing: the data directory, and the ports of the per-project server bd starts
+  // over it. An inherited port dials another project's server exactly as a host/database would.
+  "BEADS_DOLT_DATA_DIR",
+  "BEADS_DOLT_PORT",
+  "BEADS_DOLT_REMOTESAPI_PORT",
+];
+
+/** The one credential var bd reads. Scoped per project rather than stripped — see the note above. */
+export const BD_PASSWORD_VAR = "BEADS_DOLT_PASSWORD";
+
+/** bd's transport switch. Per project via `dolt_server_tls` — see {@link applyBoardTls}. */
+export const BD_TLS_VAR = "BEADS_DOLT_SERVER_TLS";
+
+/**
+ * A value as an env-var name fragment: uppercased, every non-alphanumeric run folded to `_`.
+ *
+ * Deliberately lossy, not reversible: this is the name an OPERATOR types into their shell, and it is
+ * documented as derivable by hand (README, DESIGN.md §, the runbook, the /setup skill), which an
+ * escaped or hashed encoding would end. The cost is that identities differing only in WHICH
+ * non-alphanumerics they use (`db-a.example.com` vs `db.a-example.com`) fold to one token — two
+ * hosts one operator would have to own simultaneously, sharing an account name, with different
+ * passwords, before it could matter (PR #174 review).
+ */
+const envToken = (value) => String(value).toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+
+/**
+ * The board a bd spawn is being pointed at, as the env scoper needs it. A bare string is the
+ * user-only form kept for the many call sites that know nothing else about the target.
+ *
+ * @param {string|{ user?: string, host?: string, port?: number|string, tls?: boolean }|undefined} board
+ */
+function asBoard(board) {
+  return typeof board === "string" ? { user: board } : (board ?? {});
+}
+
+/**
+ * The env var holding `user`'s password: `BEADS_DOLT_PASSWORD_<USER>`, uppercased with every
+ * non-alphanumeric run folded to `_` so a user like `anton-bot` maps to a legal var name.
+ *
+ * Keyed by USER alone: the password belongs to the account, so two projects that legitimately share
+ * one account need one var, not two copies that can drift apart. When an account name is reused on
+ * DIFFERENT servers with different passwords, {@link serverScopedPasswordVar} is the rung above.
+ */
+export function scopedPasswordVar(user) {
+  return `${BD_PASSWORD_VAR}_${envToken(user)}`;
+}
+
+/**
+ * The env var holding `user`'s password *on this server*:
+ * `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` — or `undefined` when the board names no host/user.
+ *
+ * A credential belongs to an account ON a server, and a common account name (`beads`) is exactly
+ * what two teams' servers both tend to have. Scoped by user alone, those two passwords collide on
+ * one variable and one anton cannot hold both, so every bd call for one project authenticates with
+ * the other server's secret (PR #174 review). The port is part of the identity for the same reason
+ * the host is: two servers on one box are two servers.
+ *
+ * @param {string|{ user?: string, host?: string, port?: number|string }} board
+ */
+export function serverScopedPasswordVar(board) {
+  const { user, host, port } = asBoard(board);
+  if (!user || !host) return undefined;
+  return `${BD_PASSWORD_VAR}_${envToken(host)}${port === undefined ? "" : `_${envToken(port)}`}_${envToken(user)}`;
+}
+
+/**
+ * The password to hand a bd spawn against `board`, or `undefined` to leave whatever the parent
+ * holds — most specific first: this account on THIS server, then the account anywhere, then the
+ * ambient `BEADS_DOLT_PASSWORD` (a single shared account is still a valid deployment, and only an
+ * operator who has actually created per-project users should see any change).
+ *
+ * @param {NodeJS.ProcessEnv} parentEnv
+ * @param {string|{ user?: string, host?: string, port?: number|string }} board
+ */
+export function resolveBdPassword(parentEnv, board) {
+  const { user } = asBoard(board);
+  if (!user) return undefined;
+  const perServer = serverScopedPasswordVar(board);
+  return (perServer !== undefined ? parentEnv[perServer] : undefined) ?? parentEnv[scopedPasswordVar(user)];
+}
+
+/**
+ * Apply `board`'s declared transport to `env`, in place.
+ *
+ * TLS is per project — bd reads `dolt_server_tls` from the target's own `.beads/metadata.json` —
+ * but `BEADS_DOLT_SERVER_TLS` outranks that file in bd's precedence, so one anton driving a TLS
+ * server and a plaintext one breaks whichever project the ambient value does not describe: TLS
+ * requested but server does not support TLS, or its inverse (PR #174 review).
+ *
+ * So a project that declares a transport gets it, and only a project that declares NONE inherits
+ * the ambient setting — which is what keeps the documented single-server `BEADS_DOLT_SERVER_TLS=true`
+ * working for boards written before the key existed.
+ *
+ * @param {NodeJS.ProcessEnv} env mutated
+ * @param {string|{ tls?: boolean }} board
+ */
+export function applyBoardTls(env, board) {
+  const { tls } = asBoard(board);
+  if (tls === true) env[BD_TLS_VAR] = "true";
+  else if (tls === false) delete env[BD_TLS_VAR];
+  return env;
+}
+
+/**
+ * `parentEnv` with project identity stripped, the password narrowed to the target's account, and the
+ * transport set from what the target declares — the environment ONE bd invocation against one
+ * project gets.
+ *
+ * `bd-env.ts` layers call-site overrides on top of these same rules for the server; the CLI uses it
+ * directly.
+ *
+ * @param {NodeJS.ProcessEnv} parentEnv
+ * @param {string|{ user?: string, host?: string, port?: number|string, tls?: boolean }|undefined} board
+ *   the target project's connection (a bare string is its database user)
+ */
+export function scopeBdEnv(parentEnv, board) {
+  const env = { ...parentEnv };
+  for (const key of PROJECT_SCOPED_BD_ENV) delete env[key];
+  const password = resolveBdPassword(parentEnv, board);
+  if (password !== undefined) env[BD_PASSWORD_VAR] = password;
+  return applyBoardTls(env, board);
+}
+
+/**
+ * A bd/git runner bound to `dir` and to `board`'s credentials — the ONE way anton spawns bd against
+ * a project it is configuring. The environment carries no project identity of its own, so the
+ * target's `.beads/metadata.json` decides which database is opened, while the password and the
+ * transport are narrowed to that project's connection (anton-ffmw.1; `bd-env.ts` carries the field
+ * report).
+ *
+ * `opts.exec` short-circuits it, so every caller keeps the injectable seam its tests use.
+ *
+ * Output is capped at {@link BD_MAX_OUTPUT_BYTES} rather than spawnSync's 1 MiB default: a full
+ * `bd list --json` of a few hundred issues already clears 1 MiB, and the default silently truncates
+ * to a payload that no longer parses — a board read as unreadable because it is BIG.
+ *
+ * @param {string} dir cwd for the spawn (the target repo)
+ * @param {string|{ user?: string, host?: string, port?: number|string, tls?: boolean }|undefined} board
+ *   the project's connection (a bare string is its database user)
+ * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
+ *   env?: NodeJS.ProcessEnv }} [opts]
+ */
+/** Per-stream output ceiling for a spawned bd, matching the 64 MiB the TypeScript wrappers use. */
+const BD_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+export function scopedBdRunner(dir, board, opts = {}) {
+  if (opts.exec) return opts.exec;
+  const env = scopeBdEnv(opts.env ?? process.env, board);
+  return (cmd, args, timeoutMs = budgetMs("bd")) =>
+    spawnSync(cmd, args, {
+      cwd: dir,
+      encoding: "utf8",
+      env,
+      timeout: timeoutMs,
+      killSignal: SPAWN_KILL_SIGNAL,
+      maxBuffer: BD_MAX_OUTPUT_BYTES,
+    });
+}
+
+/**
+ * Which env var must hold `user`'s password — the per-user form when the project names a user, the
+ * shared fallback otherwise. Naming the wrong one is the difference between a one-line fix and a
+ * lost hour, so every "cannot reach the server" message routes through here (`bd-env.ts` wraps it
+ * for the server, which looks the user up from a repo path).
+ *
+ * The per-SERVER rung ({@link serverScopedPasswordVar}) is deliberately not listed here: it only
+ * matters when one account name is reused across servers, and naming three variables in every
+ * connection failure buries the one an ordinary deployment needs. `anton server-mode` names it
+ * where that case actually shows up.
+ */
+export function passwordVarHint(user) {
+  return user ? `${scopedPasswordVar(user)} (or ${BD_PASSWORD_VAR})` : BD_PASSWORD_VAR;
+}
+
+/**
+ * The configured server as an operator reads it — `host:port/database`, with `?` standing in for a
+ * field the project never declared (an undeclared host is itself a cause, and hiding it sends the
+ * reader looking for a network fault that isn't there). Shared with the runtime preflight in
+ * `bd.ts` so both failures name the same target the same way.
+ *
+ * @param {{ host?: string, port?: number|string, database?: string }} [connection]
+ */
+export function formatServerTarget(connection = {}) {
+  const { host, port, database } = connection;
+  return `${host ?? "?"}:${port ?? "?"}${database ? `/${database}` : ""}`;
+}
+
+/**
+ * The cheapest board READ bd offers — one `COUNT` against the configured database, not an export.
+ * Shared with the runtime preflight in `bd.ts` so the health gate a heartbeat applies is the same
+ * one `anton init`/`doctor` applied.
+ */
+export const BOARD_READ_PROBE = ["count", "--json"];
+
+/**
+ * Can this machine actually USE this project's board on the shared server `connection` names — the
+ * question every server-mode health gate asks. Two probes, because it takes both:
+ *
+ *   1. `bd dolt test` — is the server reachable and does it accept a connection. That is ALL it
+ *      verifies (bd's own help says so); it names no database and reads nothing.
+ *   2. `bd count` — can THIS project read ITS database there. A `dolt_database` that does not exist
+ *      on the server passes probe 1, and so does one belonging to ANOTHER project, where bd's
+ *      identity guard then refuses every board operation ("PROJECT IDENTITY MISMATCH — refusing to
+ *      connect"). Server mode keeps no local copy behind either, so a gate that stopped at probe 1
+ *      would let `anton init` and `anton doctor` exit clean — and the heartbeat keep reporting
+ *      `shared-server` — over a board on which nothing works (PR #174 review).
+ *
+ * Returns `{ ok: true }` or `{ ok: false, stage: "connect"|"read", detail }`; never throws, because
+ * callers gate a bootstrap on it. `stage` is what lets each caller name the right fix: an
+ * unreachable server and a server that answers but refuses this project's database are not the same
+ * problem.
+ *
+ * Spawned under the project-scoped environment, like every other bd call anton makes: an ambient
+ * `BEADS_DOLT_*` would otherwise have this verify some OTHER project's server (anton-ffmw.1).
+ *
+ * @param {string} dir repo root
+ * @param {{ host?: string, port?: number, user?: string, database?: string, tls?: boolean }} connection
+ * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string },
+ *   env?: NodeJS.ProcessEnv }} [opts]
+ */
+export function checkSharedServer(dir, connection = {}, opts = {}) {
+  const ms = budgetMs("network");
+  const exec = scopedBdRunner(dir, connection, opts);
+
+  const test = exec("bd", ["dolt", "test"], ms);
+  if ((test?.status ?? 1) !== 0) {
+    return { ok: false, stage: "connect", detail: failureDetail(test, ms, `${test?.stdout ?? ""}${test?.stderr ?? ""}`) };
+  }
+
+  const read = exec("bd", BOARD_READ_PROBE, ms);
+  if ((read?.status ?? 1) !== 0) {
+    return { ok: false, stage: "read", detail: failureDetail(read, ms, `${read?.stdout ?? ""}${read?.stderr ?? ""}`) };
+  }
+  return { ok: true };
+}
+
+/** The config.yaml keys anton's team-config enforces on an EMBEDDED board — the default profile,
+ * and the Dolt-first model (see `teamConfigKeys` for the server-mode one). `dolt.auto-push false`
  * because anton owns push cadence (write-nudged full passes, pull-only heartbeats): bd 1.0.2
  * auto-pushes after every write once a remote named `origin` exists, which both double-pushes
  * and re-creates the concurrent-push manifest-corruption risk (beads GH#2466) anton avoids.
@@ -473,12 +1242,214 @@ export function ensureBdConfig(dir, beadsDir, key, want) {
  * export.auto is still at its default (true), regenerate the JSONL snapshot as a side effect of its
  * own write. Disabling auto-export up front closes that window so the enforcement pass never emits
  * the very churn it exists to stop. */
-const CONFIG_KEYS = [
+export const EMBEDDED_CONFIG_KEYS = [
   ["export.auto", "false"],
   ["dolt.auto-commit", "on"],
   ["export.git-add", "false"],
   ["dolt.auto-push", "false"],
 ];
+
+/**
+ * The server-mode profile (anton-4gd2). Everything the embedded profile enforces about
+ * refs/dolt/data — `dolt.auto-push`, and the passive JSONL export that exists to back it
+ * (`export.auto`, `export.git-add`) — describes a sync channel a shared-server board does not have,
+ * so anton does not impose it: `bd dolt push/pull` runs ON THE SERVER, which cannot reach the git
+ * remote at all (DESIGN.md §3a). What survives is `dolt.auto-commit`: each write still becomes a
+ * Dolt commit, which is what gives the team a history on the shared database.
+ *
+ * `backup.enabled false` is the same class as those knobs (anton-0tul). bd's Dolt-native auto-backup
+ * registers a backup remote before each backup, and in server mode that registration runs ON THE
+ * SERVER as the project's database account — which is not privileged to do it, so every single bd
+ * write ends in `Warning: auto-backup failed: register backup remote: … command denied to user`.
+ * The warning is noise, not data risk (the write itself landed on the shared database), and noise on
+ * every write is how an operator learns to stop reading warnings. bd's own default is already false;
+ * pinning it is what keeps an inherited setting — or a future default flip — from re-creating that.
+ * It is enforced FIRST because each `bd config set` is itself a bd write, so a profile pass over a
+ * board that HAS auto-backup on would otherwise emit the very warning it exists to stop.
+ *
+ * Enforcement only ever ADDS keys, so a board moved from embedded keeps the export knobs it already
+ * carries — this is the profile for a project that has never been anything but server-mode.
+ */
+export const SERVER_CONFIG_KEYS = [
+  ["backup.enabled", "false"],
+  ["dolt.auto-commit", "on"],
+];
+
+/** The config.yaml keys enforced for `mode`. Embedded is the default and the fallback. */
+export function teamConfigKeys(mode) {
+  return mode === "server" ? SERVER_CONFIG_KEYS : EMBEDDED_CONFIG_KEYS;
+}
+
+/**
+ * The shared server's connection, as `bd dolt set <key>` names each field. Written from
+ * `.beads/metadata.json` (the per-directory truth) into `.beads/config.yaml` as `dolt.<key>`, so a
+ * teammate's clone inherits the target instead of being told to type it — config.yaml is bd's
+ * lowest-priority source, which is what makes it the right place for a team DEFAULT.
+ *
+ * `required` marks what a board cannot connect without: no host and no database is not a default to
+ * fall back on, it is a broken server config, and it is reported as an error rather than skipped.
+ * `port` is required for the same reason DESIGN.md §3a insists it stay in metadata.json despite bd's
+ * deprecation warning — absent it, bd dials port 0 against a remote host. `user` is optional: bd
+ * defaults to `root`, which is a real (if unadvisable) single-account setup — but an optional field
+ * metadata.json drops is RETRACTED from config.yaml rather than left standing, see
+ * {@link retractStaleConnectionKey}.
+ */
+const SERVER_CONNECTION_KEYS = [
+  { key: "host", metaKey: "dolt_server_host", required: true },
+  { key: "port", metaKey: "dolt_server_port", required: true },
+  { key: "database", metaKey: "dolt_database", required: true },
+  { key: "user", metaKey: "dolt_server_user", required: false },
+];
+
+/**
+ * Every dotted `config.yaml` key a switch INTO `mode` may write, PAIRED WITH THE VALUE it would
+ * write — the team-config knobs plus, in server mode, the `dolt.*` connection fields. A value of
+ * `undefined` means the key is retracted rather than published (an optional field metadata.json
+ * stopped declaring); a required field metadata.json does not declare is omitted altogether, since
+ * a broken connection config is refused rather than written.
+ *
+ * This is what lets a rollback tell its own writes from somebody else's edit (PR #174 review). bd
+ * patches config.yaml key by key — `bd config set` appends one line, `bd dolt set --update-config`
+ * one per field, `bd config unset` strikes one out — so a difference under any other key was made
+ * by something that is not this run. The VALUE matters for the same reason: a key this run owns
+ * that now holds something this run never asked for is somebody else's edit too, and a revert that
+ * assumed ownership by key alone would overwrite it silently (PR #174 review).
+ *
+ * It names what a write WOULD carry, not what was written: a key is only ever claimed once its own
+ * command has actually run, since a step that found the value already in place may be reading a
+ * concurrent editor's (PR #174 review — see `claim` in server-mode.mjs).
+ */
+export function publishedConfigWrites(mode, info) {
+  const team = teamConfigKeys(mode).map(([key, want]) => [key, want]);
+  if (mode !== "server") return team;
+  const connection = SERVER_CONNECTION_KEYS.flatMap(({ key, required }) => {
+    const raw = info?.[key];
+    if (raw === undefined || raw === null || raw === "") return required ? [] : [[`dolt.${key}`, undefined]];
+    return [[`dolt.${key}`, String(raw)]];
+  });
+  return [...team, ...connection];
+}
+
+/**
+ * Retract a `dolt.<key>` config.yaml still publishes for an OPTIONAL field metadata.json no longer
+ * declares, reported as `{ name, status: "unset" | "cleared" | "failed", detail? }`.
+ *
+ * Skipping it is not enough. metadata.json outranks config.yaml but does not erase it, so a
+ * leftover `dolt.user: beads` keeps bd connecting as that account while anton — which reads the
+ * connection from metadata.json — scopes the spawn's credentials as if no user were configured. The
+ * bd call then authenticates as the wrong account, or fails outright (PR #174 review). Both files
+ * are committed, so the stale key travels to every clone until someone notices.
+ *
+ * `bd config unset` first, because config.yaml is bd's file — then our own strike-out, because bd
+ * only rewrites the FLAT encoding while reporting success either way, so a key under the nested
+ * `dolt:` map bd itself writes since 1.1.0 survives an exit-0 "Unset dolt.user (in config.yaml)".
+ * The verdict is read back from the FILE for that reason: a value that outlives both is reported as
+ * a failure naming the hand fix, never assumed gone.
+ *
+ * A strike-out that could not be WRITTEN is reported straight from the write, not inferred from the
+ * file afterwards (PR #174 review): the I/O error names why the key is still there, which a re-read
+ * cannot.
+ */
+export function retractStaleConnectionKey(beadsDir, key, metaKey, exec, timeoutMs) {
+  const path = `dolt.${key}`;
+  const stale = configYamlValue(beadsDir, path);
+  if (stale === undefined) return { name: path, status: "unset" };
+
+  exec("bd", ["config", "unset", path], timeoutMs);
+  if (configYamlValue(beadsDir, path) !== undefined) {
+    const struck = retractConfigYamlKey(beadsDir, path);
+    if (struck.status === "failed") {
+      return {
+        name: path,
+        status: "failed",
+        detail:
+          `could not strike ${path}: ${stale} out of .beads/config.yaml: ${struck.detail} — the file ` +
+          `still holds its previous contents, and .beads/metadata.json declares no "${metaKey}". ` +
+          "Free up space or fix the permissions on `.beads/`, then remove that line by hand",
+      };
+    }
+  }
+
+  const left = configYamlValue(beadsDir, path);
+  const declares = `.beads/metadata.json declares no "${metaKey}"`;
+  return left === undefined
+    ? { name: path, status: "cleared", detail: `dropped stale ${path}: ${stale} — ${declares}` }
+    : {
+        name: path,
+        status: "failed",
+        detail: `.beads/config.yaml still publishes ${path}: ${left} but ${declares} — remove that line by hand`,
+      };
+}
+
+/**
+ * The OPTIONAL connection keys `.beads/config.yaml` still publishes that `info` no longer declares
+ * — exactly what {@link retractStaleConnectionKey} would clear, named before anything is written.
+ *
+ * Separated from the retraction itself so a caller that has to snapshot config.yaml for a rollback
+ * only pays for the snapshot when there is in fact a write coming, and so the retraction can be
+ * ordered ahead of a connection PROBE rather than behind it — by `server-mode.mjs` before its own
+ * `bd dolt test`, and by `configureBeadsForRepo` before the preflight's: a stale `dolt.user` makes
+ * bd authenticate as the wrong account, so a probe run before the retraction tests the wrong
+ * identity and fails a board that would have connected.
+ *
+ * @param {string} beadsDir `<dir>/.beads`
+ * @param {{ host?: string, port?: number, user?: string, database?: string }} info from readDoltMetadata
+ */
+export function staleConnectionKeys(beadsDir, info) {
+  return SERVER_CONNECTION_KEYS.filter(({ key, required }) => {
+    const raw = info?.[key];
+    const declared = !(raw === undefined || raw === null || raw === "");
+    return !required && !declared && configYamlValue(beadsDir, `dolt.${key}`) !== undefined;
+  });
+}
+
+/**
+ * Publish the server-mode connection from `.beads/metadata.json` to `.beads/config.yaml` as the
+ * team-wide default, via bd's own primitive: `bd dolt set <key> <value> --update-config` (it writes
+ * BOTH files, keeping them from drifting apart). Idempotent — a key config.yaml already carries is
+ * not re-set, so a re-run is a true no-op.
+ *
+ * Server mode only. `bd dolt set` refuses outright in embedded mode ("not supported in embedded
+ * mode (no Dolt server)"), so calling it there would turn a healthy embedded board into a wall of
+ * failed steps.
+ *
+ * Returns one `{ name, key, status, detail? }` step per field: "already" | "set" | "failed" |
+ * "missing" (required, absent from metadata) | "unset" (optional, published nowhere) | "cleared"
+ * (optional, retracted from config.yaml — see {@link retractStaleConnectionKey}).
+ *
+ * `key` is the dotted config.yaml key the step is about, carried separately from the display `name`
+ * so a caller tracking WHICH keys it handed bd reads it rather than parsing a label (server-mode.mjs
+ * weighs exactly that against a concurrent edit before rolling config.yaml back).
+ *
+ * @param {string} dir repo root
+ * @param {string} beadsDir `<dir>/.beads`
+ * @param {{ host?: string, port?: number, user?: string, database?: string }} info from readDoltMetadata
+ * @param {{ exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} [opts]
+ */
+export function ensureDoltConnection(dir, beadsDir, info, opts = {}) {
+  const localMs = budgetMs("bd");
+  const exec =
+    opts.exec ??
+    ((cmd, args, timeoutMs = localMs) =>
+      spawnSync(cmd, args, { cwd: dir, encoding: "utf8", timeout: timeoutMs, killSignal: SPAWN_KILL_SIGNAL }));
+
+  return SERVER_CONNECTION_KEYS.map(({ key, metaKey, required }) => {
+    const path = `dolt.${key}`;
+    const raw = info?.[key];
+    if (raw === undefined || raw === null || raw === "") {
+      // Named as the fix, not as the symptom: what to add, and where.
+      return required
+        ? { name: path, key: path, status: "missing", detail: `server mode declares no "${metaKey}" in .beads/metadata.json` }
+        : { ...retractStaleConnectionKey(beadsDir, key, metaKey, exec, localMs), key: path };
+    }
+    const want = String(raw);
+    const name = `${path}=${want}`;
+    if (configYamlHas(beadsDir, path, want)) return { name, key: path, status: "already" };
+    const r = exec("bd", ["dolt", "set", key, want, "--update-config"], localMs);
+    if ((r.status ?? 1) === 0) return { name, key: path, status: "set" };
+    return { name, key: path, status: "failed", detail: failureDetail(r, localMs, `${r.stdout ?? ""}${r.stderr ?? ""}`) };
+  });
+}
 
 /**
  * The ONE reconciled `bd init` flag set shared by every anton init path — `configureBeadsForRepo`
@@ -545,7 +1516,8 @@ export function isFirstPublishPullOutput(output) {
  * The single Dolt-sync path shared by `anton setup` (bin/anton.mjs) and `anton init`/`addProject`
  * (via configureBeadsForRepo) so both wire the remote with IDENTICAL behavior + result shape
  * (anton-8qx). All external calls go through an injectable `exec` seam so tests can stub bd/git
- * (CI has neither); the default binds `repoDir` as cwd.
+ * (CI has neither); the default is the project-scoped runner every other bd call anton makes goes
+ * through ({@link scopedBdRunner}), bound to `repoDir`.
  *
  * Steps (idempotent): remote add → hydrate pull → publish push. The pull is best-effort — a fresh
  * origin has no `refs/dolt/data` yet, so it exits non-zero ("no branches found"); that's expected on
@@ -557,6 +1529,7 @@ export function isFirstPublishPullOutput(output) {
  *
  * Returns `{ status, ... }`:
  *   - { status: "no-workspace" }                — no `.beads/` (nothing to wire)
+ *   - { status: "server-mode" }                 — the board lives on a shared Dolt server (anton-4gd2)
  *   - { status: "no-remote" }                   — no declared/origin remote to use
  *   - { status: "already", url }                — Dolt `origin` already points here
  *   - { status: "configured", url, pulled, pushed, pushAttempts, firstPublish, pushOutput } — remote
@@ -566,7 +1539,8 @@ export function isFirstPublishPullOutput(output) {
  *   - { status: "error", detail }               — reading `sync.remote`, or `bd dolt remote add`
  *       itself, failed (a budget kill included — never a silent fallback to git origin)
  *
- * @param {{ repoDir: string, log?: (msg: string) => void, exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} opts
+ * @param {{ repoDir: string, log?: (msg: string) => void, env?: NodeJS.ProcessEnv,
+ *   exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} opts
  */
 export function configureBeadsDoltSync(opts = {}) {
   const { repoDir: dir, log } = opts;
@@ -575,17 +1549,25 @@ export function configureBeadsDoltSync(opts = {}) {
   // exec simply ignores the third argument, so the seam is unchanged for callers that stub it.
   const localMs = budgetMs("bd");
   const netMs = budgetMs("network");
-  const exec =
-    opts.exec ??
-    ((cmd, args, timeoutMs = netMs) =>
-      spawnSync(cmd, args, {
-        cwd: dir,
-        encoding: "utf8",
-        timeout: timeoutMs,
-        killSignal: SPAWN_KILL_SIGNAL,
-      }));
 
   if (!existsSync(join(dir, ".beads"))) return { status: "no-workspace" };
+
+  const board = readDoltMetadata(dir);
+
+  // A shared-server board has no refs/dolt/data to wire, and the attempt does not merely waste work:
+  // `bd dolt push/pull` executes ON THE SERVER, whose image ships no ssh client and no keys, so a
+  // `git+ssh://` remote is unreachable from there by construction (DESIGN.md §3a). Skipping is the
+  // config, not a degradation — the runtime sync nudges are neutralized separately (anton-0tul).
+  if (board.mode === "server") {
+    emit("board is on a shared Dolt server — skipping refs/dolt/data remote wiring (nothing to reconcile).");
+    return { status: "server-mode" };
+  }
+
+  // Scoped to THIS project, like every other bd anton spawns (anton-ffmw.1): the skip above reads
+  // the target's metadata.json, but bd ranks an ambient `BEADS_DOLT_*` ABOVE that file — so an
+  // `anton setup` launched from a shell carrying another project's server identity would sail past
+  // the skip and then wire, pull and push against that OTHER board (PR #174 review).
+  const exec = scopedBdRunner(dir, board, opts);
 
   // Remote choice is dynamic per project: a `sync.remote` declared in .beads/config.yaml (e.g. an
   // aws:// remote) wins over the git-origin fallback — anton drives whatever the project's beads
@@ -721,22 +1703,32 @@ export function detectHooksManager(dir, priorHooksPath = null) {
 }
 
 /**
- * Run the full beads team-config path for `dir`, idempotently. Steps: workspace creation
- * (`bd init` when `.beads/` is absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else
- * no-op) → config.yaml enforcement → `.beads/.gitignore` → formulas (bead skeleton + run pipeline) →
+ * Run the full beads team-config path for `dir`, idempotently. Steps: stale-connection retraction
+ * (server mode, between the tooling and board preflight halves) → workspace creation (`bd init` when `.beads/` is
+ * absent, `bd bootstrap` for a fresh clone with no local Dolt DB, else no-op) → config.yaml enforcement → `.beads/.gitignore` → formulas (bead skeleton + run pipeline) →
  * Dolt remote wiring. Every step is best-effort and its outcome is collected in `steps`/`errors`
  * rather than thrown — the caller decides how loud to be (the CLI prints each step; addProject logs
  * a summary) and a step failure never aborts the caller.
  *
- * Returns:
- *   { configured, skipped, reason?, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
+ * The steps that describe refs/dolt/data — hydrating a fresh clone, the enforced sync knobs, the
+ * remote wiring — are the EMBEDDED profile. A server-mode board (DESIGN.md §3a) gets its connection
+ * published as the team default instead; see `teamConfigKeys` / `ensureDoltConnection` (anton-4gd2).
+ * That publication is one of the three FATAL steps (with `bd init` and `bd bootstrap`): a connection
+ * that did not reach config.yaml leaves the next clone dialling nothing, or an older server.
  *
- * When prereqs aren't met (no bd / not a git repo / no origin) it returns early with
- * `{ configured:false, skipped:true, reason, hasBeads }` and does nothing — so calling it on a plain
- * directory is a safe no-op.
+ * Returns:
+ *   { configured, skipped, reason?, fix?, mode, ranInit, ranBootstrap, steps: [{name,status,detail?}], errors, hasBeads }
+ *
+ * When prereqs aren't met (no bd / not a git repo / unreachable server / no origin) it returns early
+ * with `{ configured:false, skipped:true, reason, fix, hasBeads }` and does nothing — so calling it
+ * on a plain directory is a safe no-op. It owns that preflight: callers render `reason`/`fix` rather
+ * than gating on their own `beadsPrereqs`, which would run ahead of the stale-key retraction below.
  *
  * @param {string} dir absolute path to the target repo
- * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string }} [opts]
+ * @param {{ prefix?: string|null, log?: (msg: string) => void, appRoot?: string, env?: NodeJS.ProcessEnv,
+ *   exec?: (cmd: string, args: string[], timeoutMs?: number) => { status: number|null, stdout?: string, stderr?: string } }} [opts]
+ *   `env` is the parent environment every bd spawn is scoped from (default `process.env`); `exec`
+ *   replaces the spawn entirely, the seam the unit tests drive.
  *   `appRoot` anchors the bundled formula assets. Default: this module's package root — right
  *   for the CLI, which runs from anywhere. A caller inside the Next server bundle MUST pass its
  *   own anchor (`process.cwd()`): there `import.meta.url` points at a build chunk, so the default
@@ -749,12 +1741,66 @@ export function configureBeadsForRepo(dir, opts = {}) {
   const steps = [];
   const errors = [];
 
-  const pre = beadsPrereqs(dir);
+  // Which profile applies. Read once, up front: every branch below is the same decision, and a
+  // repo with no `.beads/` yet reads as embedded — which is right, since `bd init` creates exactly
+  // that (server mode is opt-in, entered by editing metadata.json).
+  const { mode, ...connection } = readDoltMetadata(dir);
+
+  // Every bd below runs under THIS project's identity, never anton's ambient `BEADS_DOLT_*` — which
+  // is whatever board the launch directory's .envrc last exported, and outranks the target's own
+  // metadata.json in bd's precedence (anton-ffmw.1). Built once, from the connection just read, so
+  // init, bootstrap and the config writes all address the same database with the same credentials.
+  const exec = scopedBdRunner(dir, connection, opts);
+
+  // 0a. The half of the preflight that authenticates nothing — bd installed, new enough, `dir` a git
+  //     repo — runs FIRST: step 0b spawns bd, so a missing or too-old bd must be named as such
+  //     rather than surfacing as a retraction that mysteriously failed.
+  const tooling = beadsToolingPrereqs(dir);
+
+  // 0b. Clear a stale optional connection key BEFORE the board preflight, for the same reason
+  //     `server-mode.mjs` clears one before its own probe (PR #174 review): metadata.json outranks
+  //     config.yaml but does not erase it, so a board that stopped declaring `dolt_server_user` —
+  //     moving to bd's default account — while config.yaml still publishes an older `dolt.user` is
+  //     a board bd authenticates as that older account. The board preflight's `bd dolt test` would
+  //     then probe the wrong identity and fail, and since that preflight returns early, step 2b's
+  //     retraction below could never run: `anton init` would refuse the project on a fault it is
+  //     carrying the fix for. Clearing it first means the probe tests the identity this project
+  //     actually declares.
+  //     Fatal if it will not come off, exactly as in step 2b: the key decides which account every
+  //     later bd call uses, so a probe past it proves nothing and the only fix is the operator's.
+  if (tooling.ok && mode === "server") {
+    for (const { key, metaKey } of staleConnectionKeys(beadsDir, connection)) {
+      const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
+      steps.push(retracted);
+      if (retracted.status === "failed") {
+        emit(`${retracted.name} — ${retracted.detail}`);
+        errors.push(retracted.detail);
+        return { configured: false, skipped: false, mode, ranInit: false, steps, errors, hasBeads: true };
+      }
+      emit(`${retracted.name} (${retracted.status})`);
+    }
+  }
+
+  // 0c. Now the board half, through the SAME runner as everything below it. Its server-mode leg
+  //     spawns a real `bd dolt test`, so left unscoped it would probe with `process.env` —
+  //     reporting a board unreachable whenever the password lives only in `opts.env`, and reaching
+  //     the host CLI even when the caller injected an executor precisely to avoid that.
+  //
+  //     These two halves are the ONLY preflight on the init path. A caller must not gate on its own
+  //     `beadsPrereqs` ahead of this call (PR #174 review): probing before step 0b authenticates as
+  //     the stale `dolt.user` this function exists to retract, so the repair would be refused by its
+  //     own gate. `fix` travels out with `reason` precisely so a CLI caller can render the same
+  //     guidance from here.
+  const pre = tooling.ok ? beadsBoardPrereqs(dir, { ...opts, exec }) : tooling;
   if (!pre.ok) {
     return {
       configured: false,
       skipped: true,
       reason: pre.error.message,
+      // The fix rides along with the reason so a CLI caller can print the same guidance it used to
+      // get from its own (now removed) preflight.
+      fix: pre.error.fix ?? null,
+      mode,
       ranInit: false,
       steps,
       errors,
@@ -789,35 +1835,31 @@ export function configureBeadsForRepo(dir, opts = {}) {
     emit(`bd ${initArgs.join(" ")}`);
     // The long budget: init creates the Dolt workspace and can reach the remote.
     const initMs = budgetMs("network");
-    const r = spawnSync("bd", initArgs, {
-      cwd: dir,
-      encoding: "utf8",
-      timeout: initMs,
-      killSignal: SPAWN_KILL_SIGNAL,
-    });
+    const r = exec("bd", initArgs, initMs);
     if ((r.status ?? 1) !== 0) {
       const detail = failureDetail(r, initMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd init", status: "failed", detail });
       errors.push(`bd init failed: ${detail}`);
-      return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
+      return { configured: false, skipped: false, mode, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
     }
     ranInit = true;
     steps.push({ name: "bd init", status: "ok" });
+  } else if (mode === "server") {
+    // A server-mode board keeps NO local Dolt DB — the database is the shared server — so the
+    // missing `.beads/dolt/` is the steady state here, not the fresh-clone signal it is on embedded.
+    // Bootstrapping would hydrate from refs/dolt/data, which this board does not use.
+    emit(".beads/ present and the board is on a shared Dolt server — enforcing team-config only (no bootstrap).");
+    steps.push({ name: "bd init", status: "already" });
   } else if (!hasLocalDoltDb(beadsDir)) {
     emit("bd bootstrap --non-interactive (fresh clone — hydrating the Dolt DB from origin)");
     // Hydrating a fresh clone pulls the whole board over refs/dolt/data — the long budget.
     const bootstrapMs = budgetMs("network");
-    const r = spawnSync("bd", ["bootstrap", "--non-interactive"], {
-      cwd: dir,
-      encoding: "utf8",
-      timeout: bootstrapMs,
-      killSignal: SPAWN_KILL_SIGNAL,
-    });
+    const r = exec("bd", ["bootstrap", "--non-interactive"], bootstrapMs);
     if ((r.status ?? 1) !== 0) {
       const detail = failureDetail(r, bootstrapMs, r.stderr || r.stdout || "");
       steps.push({ name: "bd bootstrap", status: "failed", detail });
       errors.push(`bd bootstrap failed: ${detail}`);
-      return { configured: false, skipped: false, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
+      return { configured: false, skipped: false, mode, ranInit: false, steps, errors, hasBeads: existsSync(beadsDir) };
     }
     ranBootstrap = true;
     steps.push({ name: "bd bootstrap", status: "ok" });
@@ -827,27 +1869,48 @@ export function configureBeadsForRepo(dir, opts = {}) {
     // right after bootstrap. Best-effort: idempotent on a consistent DB, and a failure here must
     // never abort an otherwise-good clone setup. timeout: a hung recompute (e.g. a Dolt DB lock)
     // must not stall the configure flow — the kill surfaces as rc.error/non-zero, i.e. "skipped".
-    const rc = spawnSync("bd", ["recompute-blocked"], {
-      cwd: dir,
-      encoding: "utf8",
-      timeout: budgetMs("bd"),
-      killSignal: SPAWN_KILL_SIGNAL,
-    });
+    const rc = exec("bd", ["recompute-blocked"], budgetMs("bd"));
     steps.push({ name: "bd recompute-blocked", status: (rc.status ?? 1) === 0 ? "ok" : "skipped" });
   } else {
     emit(".beads/ present with a local Dolt DB — enforcing team-config only (no re-init).");
     steps.push({ name: "bd init", status: "already" });
   }
 
-  // 2. Patch config.yaml idempotently (never clobber).
-  for (const [key, want] of CONFIG_KEYS) {
-    const status = ensureBdConfig(dir, beadsDir, key, want);
+  // 2. Patch config.yaml idempotently (never clobber), with the profile this board's mode calls for.
+  for (const [key, want] of teamConfigKeys(mode)) {
+    const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
     steps.push({ name: `${key}=${want}`, status });
     if (status === "failed") {
       emit(`could not set ${key}=${want}`);
       errors.push(`could not set ${key}=${want}`);
     } else {
       emit(`${key}=${want} (${status})`);
+    }
+  }
+
+  // 2b. Server mode only: publish the connection as the team-wide default so a teammate's clone
+  //     inherits the target instead of being told to type it. A required field missing from
+  //     metadata.json is an ERROR, not a silence — the board cannot reach its server without it.
+  //     And it FAILS the run, unlike the portable keys above: an unpublished connection is not a
+  //     degraded config, it is the wrong one. config.yaml is either missing the target or still
+  //     carrying an earlier server's, so the next clone connects somewhere else or not at all —
+  //     reported as `configured: true`, that is `anton init` exiting 0 over a board nobody can
+  //     reach (PR #174 review). Return here rather than collecting: everything below runs bd
+  //     against a database this project has just proved it cannot address.
+  if (mode === "server") {
+    let published = true;
+    for (const step of ensureDoltConnection(dir, beadsDir, connection, { exec })) {
+      steps.push(step);
+      if (step.status === "missing" || step.status === "failed") {
+        emit(`${step.name} — ${step.detail}`);
+        errors.push(step.detail);
+        published = false;
+      } else {
+        emit(`${step.name} (${step.status})`);
+      }
+    }
+    if (!published) {
+      return { configured: false, skipped: false, mode, ranInit, ranBootstrap, steps, errors, hasBeads: existsSync(beadsDir) };
     }
   }
 
@@ -898,7 +1961,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
 
   // 4. Wire the git-backed Dolt remote (remote add → hydrate pull → publish push). Shared here so
   //    both `anton init` and addProject inherit it (anton-43b). A failure is collected, not thrown.
-  const doltSync = configureBeadsDoltSync({ repoDir: dir, log: emit });
+  const doltSync = configureBeadsDoltSync({ repoDir: dir, log: emit, exec });
   steps.push({ name: "dolt remote sync", status: doltSync.status, detail: doltSync.detail });
   if (doltSync.status === "error") {
     errors.push(`dolt remote sync failed: ${doltSync.detail}`);
@@ -916,6 +1979,7 @@ export function configureBeadsForRepo(dir, opts = {}) {
   return {
     configured: true,
     skipped: false,
+    mode,
     ranInit,
     ranBootstrap,
     steps,

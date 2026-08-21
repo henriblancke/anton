@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 124cae45c200
+version: 9eaee75e8c3f
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -383,18 +383,26 @@ total and deterministic, so two machines agree on what is next:
 
 ### 2. Claim, then prove the claim held
 
-Claims ride eventually-consistent Dolt sync, so *writing* a claim is not *holding* one. Run the
-whole sequence, in order, for the top-ranked target:
+On an **embedded** board a claim rides eventually-consistent Dolt sync, so *writing* a claim is not
+*holding* one. Run the whole sequence, in order, for the top-ranked target:
 
 ```bash
-bd dolt pull                                 # 1. see a claim another machine already published
+bd dolt pull                                 # 1. embedded only: see a claim another machine already published
 BEADS_ACTOR="$ACTOR" bd update <id> --claim  # 2. bd's atomic local CAS — refuses a bead someone else holds
-bd dolt commit && bd dolt push               # 3. publish; a claim nobody else can see is not a claim
-sleep 2                                      # 4. settle — let a near-simultaneous rival reach the remote
-bd dolt pull                                 # 5. re-read after the merge has picked a winner
+bd dolt commit && bd dolt push               # 3. embedded only: publish; a claim nobody else can see is not a claim
+sleep 2                                      # 4. embedded only: settle — let a near-simultaneous rival reach the remote
+bd dolt pull                                 # 5. embedded only: re-read after the merge has picked a winner
 bd show <id> --json                          # 6. assert assignee == "$ACTOR"
 bd list --status all --json --limit 0        # 7. re-apply §1 to the target you now hold
 ```
+
+**On a shared-server board, run steps 2, 6 and 7 only.** Read the mode before you start — `dolt_mode`
+in `.beads/metadata.json`; absent or unreadable means embedded. When every worker writes the one
+`dolt sql-server` there is nothing to reconcile: the claim is visible to everybody the moment bd
+commits it, so the settle window buys nothing — and the sync steps don't merely waste time, they
+fail. `bd dolt pull/push` executes ON the server, which cannot reach the git remote
+(`Error 1105 (HY000): command denied to user`). anton's own runtime skips them for the same reason
+(`runDoltSync`, `claimVerified` — DESIGN.md §3a).
 
 Steps 6 and 7 are what make the claim trustworthy — winning the assignee proves the race, not that
 the prize is still worth having. Four outcomes, and only the first licenses a run:

@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { delimiter, dirname, join } from "node:path";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 import { agentsFromArgs, nextArgs, resolvePort } from "./anton.mjs";
 
@@ -116,7 +116,7 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     return bin;
   }
 
-  function runCheck(bin: string | null) {
+  function runCheck(bin: string | null, extraEnv: Record<string, string> = {}) {
     return spawnSync(process.execPath, [CLI, "board-check", repo], {
       encoding: "utf8",
       // A PATH holding ONLY the stub (plus node, which the stub's shebang resolves through) — so
@@ -124,6 +124,7 @@ describe("anton board-check (bd stubbed on PATH)", () => {
       // a null `stderr`.
       env: {
         ...process.env,
+        ...extraEnv,
         PATH: [bin, dirname(process.execPath)].filter(Boolean).join(delimiter),
       },
     });
@@ -211,6 +212,57 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.stderr).toContain("bd not found");
     expect(r.status).toBe(1);
   });
+
+  /**
+   * board-check's spawn is project-scoped like every other bd anton runs (anton-ffmw.1, PR #174
+   * review). It takes MANY repos in one invocation, so an ambient `BEADS_DOLT_*` — a launch
+   * directory's `.envrc` exported for some other project — would have each of them listed out of
+   * whichever database that names, and a project whose account has its own
+   * `BEADS_DOLT_PASSWORD_<USER>` would never receive it and simply fail to authenticate.
+   *
+   * Asserted against a real stub on PATH, because what is under test is the environment a real
+   * spawn receives — an injected exec would prove nothing about it.
+   */
+  it("strips ambient project identity and delivers the per-user password to its bd", async () => {
+    writeFileSync(
+      join(repo, ".beads", "metadata.json"),
+      JSON.stringify({
+        dolt_mode: "server",
+        dolt_server_host: "dolt.example.dev",
+        dolt_server_port: 3306,
+        dolt_server_user: "beads",
+        dolt_database: "this-project",
+      }),
+    );
+    const bin = await dirs.make("anton-bdenv-");
+    const log = join(bin, "env.json");
+    writeFakeBd(
+      bin,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        'const seen = Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith("BEADS_DOLT_")));',
+        `fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify(seen));`,
+        "console.log(JSON.stringify([]));",
+        "process.exit(0);",
+      ].join("\n"),
+    );
+
+    runCheck(bin, {
+      // Another project's identity and the shared credential, as an .envrc would export them.
+      BEADS_DOLT_SERVER_DATABASE: "someone-elses-board",
+      BEADS_DOLT_SERVER_HOST: "elsewhere.example.dev",
+      BEADS_DOLT_PASSWORD: "shared-account-secret",
+      BEADS_DOLT_PASSWORD_BEADS: "this-projects-secret",
+    });
+
+    const seen = JSON.parse(readFileSync(log, "utf8")) as Record<string, string>;
+    // Identity is stripped, so THIS repo's metadata.json decides which database is opened.
+    expect(seen.BEADS_DOLT_SERVER_DATABASE).toBeUndefined();
+    expect(seen.BEADS_DOLT_SERVER_HOST).toBeUndefined();
+    // ...and the credential is the one this project's account needs, not the ambient fallback.
+    expect(seen.BEADS_DOLT_PASSWORD).toBe("this-projects-secret");
+  });
 });
 
 // End-to-end via the real command, against the REAL bundled skills: doctor is the only thing that
@@ -267,5 +319,117 @@ describe("anton doctor — skill drift", () => {
   it("says nothing is drifted when no copy is installed at either scope", async () => {
     const r = runDoctor(await dirs.make("anton-home-"), await dirs.make("anton-cwd-"));
     expect(r.stdout).toContain("installed copies match the bundle");
+  });
+});
+
+/**
+ * `anton doctor` on a shared-server board (anton-eg46). Server mode keeps no local copy, so a server
+ * this machine cannot reach is a board outage, not slow sync — doctor probes it and fails, because
+ * doctor is where an operator looks first and bd's own error names neither the target nor the fix.
+ *
+ * Every required tool is stubbed on PATH: what is asserted is the exit code, so a CI box without
+ * `bd`/`claude` must not be what decides it.
+ */
+describe("anton doctor — shared-server board reachability", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const SERVER_METADATA = {
+    database: "dolt",
+    backend: "dolt",
+    dolt_mode: "server",
+    dolt_server_host: "dolt.example.dev",
+    dolt_server_port: 3306,
+    dolt_server_user: "beads",
+    dolt_database: "anton",
+  };
+
+  /**
+   * A bd stub answering the version gate and the two health probes. `board` picks which one fails:
+   * `"unreachable"` refuses the connection, `"unreadable"` accepts it and then refuses the board the
+   * way bd's project-identity guard does — the case `bd dolt test` alone cannot see.
+   */
+  function fakeBdServer(board: "ok" | "unreachable" | "unreadable"): string {
+    return [
+      "#!/usr/bin/env node",
+      "const a = process.argv.slice(2);",
+      'if (a[0] === "--version" || a[0] === "--help") { console.log("bd version 1.1.2 (fake)"); process.exit(0); }',
+      ...(board === "unreachable"
+        ? ['if (a[0] === "dolt" && a[1] === "test") { console.error("dial tcp 10.0.0.9:3306: connect: connection refused"); process.exit(1); }']
+        : []),
+      ...(board === "unreadable"
+        ? ['if (a[0] === "count") { console.error("PROJECT IDENTITY MISMATCH — refusing to connect"); process.exit(1); }']
+        : []),
+      "process.exit(0);",
+    ].join("\n");
+  }
+
+  /** A repo with the given board metadata, and `doctor` run in it against stubbed tools. */
+  async function runDoctorIn(metadata: Record<string, unknown> | null, board: "ok" | "unreachable" | "unreadable" = "ok") {
+    const home = await dirs.make("anton-home-");
+    const cwd = await dirs.make("anton-board-");
+    if (metadata) {
+      mkdirSync(join(cwd, ".beads"), { recursive: true });
+      writeFileSync(join(cwd, ".beads", "metadata.json"), JSON.stringify(metadata, null, 2));
+    }
+    const bin = await dirs.make("anton-bin-");
+    writeFakeBd(bin, fakeBdServer(board));
+    // The other required tools, so a missing `claude` in CI can't be what fails the check.
+    for (const tool of ["git", "claude"]) {
+      writeFileSync(join(bin, tool), `#!/usr/bin/env node\nprocess.exit(0);\n`);
+      chmodSync(join(bin, tool), 0o755);
+    }
+    return spawnSync(process.execPath, [CLI, "doctor"], {
+      encoding: "utf8",
+      cwd,
+      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HOME: home, ANTON_DB: join(home, "anton.db") },
+    });
+  }
+
+  it("fails with the configured host/port and both ways out when the server is unreachable", async () => {
+    const r = await runDoctorIn(SERVER_METADATA, "unreachable");
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("dolt.example.dev:3306/anton");
+    expect(r.stdout).toContain("UNREACHABLE");
+    expect(r.stdout).toContain("connection refused");
+    // The per-USER password variable, and the escape hatch back to the local copy.
+    expect(r.stdout).toContain("BEADS_DOLT_PASSWORD_BEADS");
+    expect(r.stdout).toContain('"dolt_mode": "embedded"');
+  });
+
+  /**
+   * The gap `bd dolt test` cannot see (PR #174 review): it names no database and reads nothing, so a
+   * connection is accepted over a database that is missing, unmigrated, or another project's. Server
+   * mode keeps no local copy behind it, so a doctor that stopped at the connection test would exit 0
+   * on a board where no operation works.
+   */
+  it("fails when the server answers but will not serve this project's board", async () => {
+    const r = await runDoctorIn(SERVER_METADATA, "unreadable");
+
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain("WILL NOT SERVE this board");
+    expect(r.stdout).toContain("PROJECT IDENTITY MISMATCH");
+    // Named for the database, not the network: host, port and account were just proven to work, and
+    // sending the reader back to them is the wasted hour this wording exists to avoid.
+    expect(r.stdout).toContain('names the database this board lives in (now "anton")');
+    expect(r.stdout).not.toContain("Start the server");
+    expect(r.stdout).toContain('"dolt_mode": "embedded"');
+  });
+
+  it("passes and names the server when it serves the board", async () => {
+    const r = await runDoctorIn(SERVER_METADATA);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("dolt.example.dev:3306/anton serving this board");
+  });
+
+  it("says nothing — and probes nothing — on an embedded board", async () => {
+    const r = await runDoctorIn({ dolt_mode: "embedded", dolt_database: "anton" });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toContain("shared Dolt server");
+    expect(r.stdout).toContain("All required tools present");
   });
 });

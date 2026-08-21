@@ -63,6 +63,15 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
         expect(doc).toMatch(/assert assignee == "\$ACTOR"/);
       });
 
+      // The sync legs are embedded-only (anton-0tul): on a shared server they reconcile nothing and
+      // fail outright — `bd dolt pull/push` runs ON the server, which cannot reach the git remote.
+      // A doc that teaches them unconditionally hands every server-mode worker a failing publish.
+      it("scopes the sync legs to an embedded board", () => {
+        expect(doc).toMatch(/\*\*On a shared-server board, run steps 2, 6 and 7 only\.\*\*/);
+        expect(doc).toMatch(/`dolt_mode`[\s\S]{0,80}`\.beads\/metadata\.json`/);
+        expect(doc).toMatch(/absent or unreadable means embedded/);
+      });
+
       it("names all four claim outcomes, and licenses a run only on the first", () => {
         expect(doc).toMatch(/assignee is you, and §1 still holds\*\* → you hold it/);
         expect(doc).toMatch(/Back off \*without writing anything\*/);

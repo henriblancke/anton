@@ -12,7 +12,9 @@ with multi-project support, an xterm, and durable background jobs.
 ## 1. What it is / isn't
 
 - **Local, not deployed.** Runs as a local Next.js server (like foolery/scotty). No Vercel
-  Workflow, no Cache Components — those solve serverless problems anton doesn't have.
+  Workflow, no Cache Components — those solve serverless problems anton doesn't have. The one
+  outbound exception is opt-in and self-hosted: a project may point its board at a shared Dolt
+  server you run ([§3a](#3a-board-modes--embedded-vs-shared-server)). anton itself still runs here.
 - **beads is the work source of truth.** Epics/tickets live in each project's `.beads/`
   (queried live via `bd --json`). anton's own SQLite (`anton.db`) holds app state: projects,
   runs, jobs, schedules, sessions, PR/worktree links.
@@ -72,7 +74,8 @@ how foolery works: it keeps no work DB — beads is the source of truth, shared 
 (`refs/dolt/data` on the git remote; the `.beads/*.jsonl` files are passive, git-ignored
 local exports); only machine-local config lives outside git.
 
-**Shareable/durable → beads (Dolt DB, synced via `refs/dolt/data`):**
+**Shareable/durable → beads (Dolt DB, synced via `refs/dolt/data` — or, opt-in, held on one shared
+`dolt sql-server`; see [§3a](#3a-board-modes--embedded-vs-shared-server)):**
 - epics/tickets and their Goal/Acceptance/Context/labels/deps
 - **approval** — a label on the epic (`approved`)
 - **stage** — labels (`stage:implementing` / `in-review`) as needed
@@ -103,35 +106,80 @@ configuration**; server mode is opt-in per project via `.beads/metadata.json`.
 
 | | **Embedded** (default) | **Server** |
 |---|---|---|
+| Who it's for | one machine, or teammates who tolerate push/pull lag | a small team wanting one real-time board |
 | Where the DB lives | `.beads/embeddeddolt/<db>/` on each machine | one `dolt sql-server`, shared |
 | How machines agree | `bd dolt pull/push` over `refs/dolt/data` on the git remote | they all write the same database |
 | Offline | works | needs the server reachable |
 | Sync status badge | `synced` / `not-wired` / `failing` | `shared-server` |
+| Claim safety | advisory | advisory — **unchanged** |
 
-Mode is read from `.beads/metadata.json` (`dolt_mode`) by `src/lib/beads/board-mode.ts`.
+Mode is read from `.beads/metadata.json` (`dolt_mode`) — parsed in `src/lib/beads/config.mjs`
+(`readDoltMetadata`, the one reader, so the CLI and the server cannot disagree) and served to the
+app through `src/lib/beads/board-mode.ts`, which adds the typed accessor and a per-process cache.
 Anything unreadable, absent, or unrecognised resolves to **embedded** — the safe direction, since
 embedded merely syncs when it need not, whereas a wrong "server" verdict would silently disable a
 solo board's only propagation path.
 
-**Two behaviours branch on it:**
+**Three behaviours branch on it:**
 
 1. **Sync is skipped entirely in server mode** (`runDoltSync`, `nudgeSync`). There is nothing to
    reconcile when every writer shares one database — and the attempt does not merely waste work, it
    fails: `bd dolt pull/push` executes *on the server*, and the `dolt-sql-server` image ships no ssh
    client and no keys, so a `git+ssh://` remote is unreachable from there by construction. Claim
    verification also skips its settle window, because a claim is visible to every other machine the
-   moment it commits.
+   moment it commits. The pass settles as its own terminal state — `shared-server`, with an empty
+   backlog — so the heartbeat never escalates a beat into a push pass looking for work that cannot
+   exist. The same rule reaches the *sessions* anton primes: the pickup protocol in `.beads/PRIME.md`
+   (and `skills/bd/SKILL.md`) runs its pull/publish/settle legs on an embedded board only.
 
-2. **Project-scoped `BEADS_DOLT_*` never survive a bd spawn** (`childEnv`). They are bd's
-   highest-priority config source, so anton's own connection settings — inherited from whatever
-   directory anton was launched in — would override the *target* project's `metadata.json` and point
-   it at the wrong database. Credentials (`BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`) are
-   deliberately not stripped: they are shared across projects on a given server.
+2. **A bd spawn's environment is scoped to the project it runs against** (`src/lib/beads/bd-env.ts`,
+   anton-ffmw.1). Env is bd's highest-priority config source, so anton's own connection settings —
+   inherited from whatever directory anton was launched in — would override the *target* project's
+   `metadata.json` and point it at the wrong database. Two rules:
+   - **Identity and routing are stripped** — every var that names *which* database to open, server
+     or embedded (`PROJECT_SCOPED_BD_ENV` is the list), leaving the target's own per-directory
+     `metadata.json` to decide.
+   - **The password is narrowed to the target's database user**: `BEADS_DOLT_PASSWORD_<USER>` wins
+     over the ambient `BEADS_DOLT_PASSWORD`, which is what makes per-project accounts work at all,
+     and `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>` wins over that — a credential belongs to an
+     account ON a server, and `beads` is exactly the account name two teams' servers both have.
+   - **The transport follows the target's own `dolt_server_tls`**: declared, it is applied; absent,
+     the ambient `BEADS_DOLT_SERVER_TLS` is inherited as before. Transport is not identity, but it is
+     still per project — one process-wide value cannot describe a TLS server and a plaintext one.
+   An explicit `env` override at the call site beats all of them.
 
-**Configuring server mode.** Put connection details in `.beads/metadata.json` — never in the
-environment, for the reason above, and never in `.beads/config.yaml` (it is the lowest-priority
-source, and `bd config set dolt.mode` writes a nested block the rest of that file's flat dotted keys
-do not match):
+3. **Setup enforces the profile the mode calls for** (`configureBeadsForRepo`, anton-4gd2). Embedded
+   gets the Dolt-first sync knobs it always had — `export.auto`/`export.git-add` false,
+   `dolt.auto-commit` on, `dolt.auto-push` false — plus the refs/dolt/data remote wiring and, on a
+   fresh clone, `bd bootstrap`. Server mode gets the CONNECTION instead: none of the refs/dolt/data
+   knobs are imposed (`dolt.auto-commit` survives — a write still becomes a Dolt commit, which is the
+   team's history), no remote is wired, and no clone is bootstrapped, since a shared-server board
+   keeps no local database to hydrate. It also pins `backup.enabled false`: bd's auto-backup
+   registers its backup remote *on the server* as the project's own account, which is not privileged
+   for it, so left on it ends every single write in `Warning: auto-backup failed: register backup
+   remote` — the sync nudges' noise in another costume.
+
+**Configuring server mode.** One command, per project: `anton server-mode <repo> --host … --port …
+--user … --database … [--tls|--no-tls]` (anton-yvjd, `src/lib/beads/server-mode.mjs`). It backs the board up
+(`bd export --all` into a self-ignored `.beads/backups/`), re-reads the source board immediately
+before the switch and refuses if it moved under the export (a writer that was never stopped writes
+beads the arrived-whole check below would never look for), writes the file below, verifies with
+`bd dolt test`, **reads the board back from the server** and confirms every record the project held
+a moment earlier is present there and says the same thing — a record being a `bd export --all` line,
+so an issue's comment thread and a `bd remember` memory are compared too, not just the issue
+projections a listing would show — then publishes the connection as the team default. Any failure after
+the write **reverts `metadata.json` byte-for-byte** — in server mode there is no local copy to fall
+back on, so a project left pointing at a server it cannot read is a board outage, and a half-applied
+switch is worse than none.
+
+The read-back is not belt-and-braces: `bd dolt test` proves the SERVER answers, not that this
+project can open its database there. bd's own project-identity guard refuses a database belonging to
+another project (`PROJECT IDENTITY MISMATCH — refusing to connect`) long after the connection test
+has passed, and a board that arrived empty — the copy never ran — connects perfectly.
+
+The connection is what that command writes; the **mode** lives in `.beads/metadata.json` and nowhere
+else, because `bd config set dolt.mode` reports success but writes a nested block into a file of flat
+dotted keys, from bd's lowest-priority source, and has no effect:
 
 ```json
 {
@@ -139,17 +187,94 @@ do not match):
   "dolt_server_host": "dolt.example.dev",
   "dolt_server_port": 3306,
   "dolt_server_user": "beads",
-  "dolt_database": "anton"
+  "dolt_database": "anton",
+  "dolt_server_tls": true
 }
 ```
 
-Credentials come from the environment (`BEADS_DOLT_PASSWORD`, plus `BEADS_DOLT_SERVER_TLS=true`
-when the server sets `require_secure_transport`). `dolt_server_port` must stay in `metadata.json`
-despite bd's deprecation warning — without it bd dials port 0 against a remote host.
+The **connection** is mirrored into `.beads/config.yaml` as a team-wide default — `dolt.host`,
+`dolt.port`, `dolt.user`, `dolt.database`, written by `bd dolt set <key> <value> --update-config`,
+which anton's team-config enforcement applies for you (`src/lib/beads/config.mjs`, anton-4gd2).
+metadata.json stays the truth anton reads; the mirror is what lets a clone that did not inherit one
+still find the server. It is enforcement, so a required field absent from metadata.json is reported
+as an error rather than defaulted — and an optional one (`dolt.user`) that metadata.json no longer
+declares is retracted from the mirror rather than left standing, since bd would otherwise fall back
+to it and connect as an account anton no longer scopes credentials for.
 
-On the first pass for a server-mode project anton runs `bd dolt test` once and, if the server is
-unreachable, records a failure naming the configured host/port and the ways out, rather than the
-raw `unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce.
+Credentials come from the environment, never from `metadata.json` — it is committed. Give each
+project's database user its own variable, `BEADS_DOLT_PASSWORD_<USER>` (uppercased, non-alphanumeric
+folded to `_`): the user above wants `BEADS_DOLT_PASSWORD_BEADS`. A bare `BEADS_DOLT_PASSWORD` is
+still honoured as the fallback for every project, which is the one-shared-account setup; per-user
+variables are what let that account be retired. When one account name is reused on DIFFERENT servers
+with different passwords, scope it further — `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>`, which wins
+over the per-user variable and is the only way one anton can hold both secrets. That name is derived
+by hand, so the fold is lossy on purpose: two hosts differing only in *which* non-alphanumerics they
+use (`db-a.example.com`, `db.a-example.com`) collapse to one variable. A pair like that sharing one
+account name is the single case the per-server rung cannot separate — give those accounts different
+names, and the per-user rung keeps them apart.
+
+`dolt_server_tls` is the transport, and it belongs in `metadata.json` for the same reason the host
+does: `BEADS_DOLT_SERVER_TLS` is one process-wide value, so a TLS server and a plaintext one driven
+by one anton cannot both be right about it (`--tls` / `--no-tls` write the key). A project that
+declares nothing inherits the ambient variable, which is what keeps single-server deployments
+working. `dolt_server_port` must stay in `metadata.json` despite bd's deprecation warning — without
+it bd dials port 0 against a remote host.
+
+**The health probe is two commands, not one.** `bd dolt test` proves only that the server accepted a
+connection; a `dolt_database` that is missing, unmigrated or another project's passes it and then
+refuses every board operation. So each gate follows it with the cheapest board READ bd offers (`bd
+count`), and reports which half failed — an unreachable server and a server that will not serve this
+board have different fixes. Stopping at the connection test is how a health gate exits clean on a
+board where nothing works.
+
+On the first pass for a server-mode project anton runs that pair once per repo per five minutes and,
+on a failure, records one naming the configured host/port and the ways out, rather than the raw
+`unreachable at 127.0.0.1:0 … dolt is not installed` that the underlying tools produce. The same
+probe gates the CLI: `anton init` (and the self-heal behind a UI-added project) refuses to configure
+a server-mode repo whose board it cannot read, and `anton doctor` reports the board alongside the
+tool prereqs and exits non-zero. Which prereq applies is decided by the mode — an embedded board
+needs `origin` (its `refs/dolt/data` channel), a server board needs the server — so neither is failed
+for the other's dependency.
+
+**Moving an existing board onto a server** is two jobs, and anton owns only the second. The board's
+history is a Dolt database directory, and it reaches the server's data volume by a copy a human runs
+— `docs/runbooks/embedded-board-to-shared-dolt-server.md`, validated end to end. `bd dolt remote add`
++ `bd dolt push` cannot stand in for it: in server mode the push executes ON the server, whose image
+ships no ssh client and no keys. Neither can `bd export` → `bd import`, which moves issues and drops
+the commit history. `anton server-mode` is the second job, and it refuses (and reverts) when the
+first has not happened. The embedded `.beads/embeddeddolt/<db>/` is left in place throughout — it is
+the history backup and the escape hatch below.
+
+**Connectivity — what each mode does when things break.** The trade is *offline tolerance* against
+*propagation delay*, and each mode fails in the shape you'd expect from where its data lives:
+
+- **Embedded** keeps a full copy per machine, so nothing about a red network stops you working: the
+  board reads and writes locally, and only *propagation* stalls. Committed-but-unpushed work is
+  counted rather than lost — the pill shows `failing · N unpushed`, and the heartbeat's backstop
+  pass keeps retrying the push until it lands. The cost is lag in the other direction: a teammate's
+  bead is invisible here until a `bd dolt pull` brings it over.
+- **Server** has no local copy, so reachability is not optional — every `bd` call needs the server,
+  and while it is down the board is down. That is the honest trade for zero propagation delay, and
+  it is why the failure is made loud: the preflight above names the configured host/port/database
+  and the fix, and the pill goes `failing` carrying that message. Writes error outright; reads keep
+  serving anton's retained in-memory board (a snapshot is marked stale, never blanked), so the pill
+  — not the board — is what tells you the data has stopped moving. A machine that still has its old
+  `.beads/embeddeddolt` directory can set `dolt_mode` back to `embedded` and keep working from it —
+  the escape hatch the preflight message points at — at the cost of rejoining the push/pull world
+  until the server is back.
+
+Recovery needs no restart in either mode: mode is cached per process, but reachability isn't, so a
+server that comes back is picked up on the next heartbeat.
+
+**Claim safety is unchanged — a claim stays advisory in both modes.** Server mode does not upgrade
+the soft-lock of §2, and nothing in this section should be read as a new guarantee. What it removes
+is *propagation delay*, not the *race*: the read-then-write window in `setAssigneeIfOwner` is
+serialized only within one anton process, so two anton servers — or a teammate's plain `bd` CLI —
+can still interleave read→assign→verify and both report success, exactly as they can on embedded.
+The claim simply becomes visible everywhere the instant it commits, which is why claim verification
+skips its settle window there. Double-*execution* is prevented by the run lease (§4), not by the
+claim; a hard cross-process CAS would need a new bd primitive and is deliberately not built
+(anton-od4, closed won't-fix).
 
 ## 4. Background jobs + durability (the hard part)
 

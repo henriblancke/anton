@@ -69,3 +69,5 @@ export.git-add: false
 
 dolt.auto-push: false
 sync.remote: "git+ssh://git@github.com/henriblancke/anton.git"
+backup:
+    enabled: false
