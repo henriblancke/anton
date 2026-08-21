@@ -174,6 +174,32 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
   });
 
   /**
+   * The registry key is versioned because its VALUE SHAPE changed (PR #174 review): #157 stored a
+   * `Set<string>` under `anton.beads.preflight`, and `Symbol.for` survives module replacement — so
+   * a Next.js dev hot reload would hand this module the old Set and the first heartbeat would die
+   * on `.get is not a function`. Simulated here by seeding the legacy key the way a reloaded
+   * process would have left it.
+   */
+  it("ignores the legacy Set a hot-reloaded process left under the old registry key", async () => {
+    const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
+    const legacy = Symbol.for("anton.beads.preflight");
+    const g = globalThis as unknown as Record<symbol, unknown>;
+    g[legacy] = new Set([dir]);
+    try {
+      const calls: string[][] = [];
+      const exec: TestExec = async (_cwd: string, args: string[]) => {
+        calls.push(args);
+        return "";
+      };
+      // Probes still run: the stale entry claiming this repo was already preflighted is unreachable.
+      await expect(runDoltSync(dir, exec, "full")).resolves.toBe("shared-server");
+      expect(calls.map((a) => a.join(" "))).toContain("dolt test");
+    } finally {
+      delete g[legacy];
+    }
+  });
+
+  /**
    * The reason that cache EXPIRES (PR #174 review). A server that passed the probe at startup and
    * then went down would otherwise be reported healthy forever: server mode does nothing else on
    * the beat, so nothing would ever contradict the cached pass. After the TTL the probe runs again

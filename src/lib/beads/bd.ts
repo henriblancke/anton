@@ -790,7 +790,14 @@ export type SyncOutcome = "synced" | "not-wired" | "shared-server";
  *   Dolt server unreachable at 127.0.0.1:0 and auto-start failed:
  *   dolt is not installed (not found in PATH)
  */
-const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight");
+/**
+ * Versioned because the registry's SHAPE changed (PR #174 review): the previous implementation
+ * stored a `Set<string>` under the unversioned `anton.beads.preflight`. `Symbol.for` is
+ * process-global and outlives module replacement, so under a Next.js dev hot reload this module
+ * would adopt that Set and the first heartbeat would die on `.get is not a function`. A new key
+ * makes the old value unreachable instead of mistyped; bump it again if the value shape changes.
+ */
+const PREFLIGHTED_KEY = Symbol.for("anton.beads.preflight.v2");
 
 /**
  * How long a successful probe stands in for the server being up.
