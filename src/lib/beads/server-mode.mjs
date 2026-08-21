@@ -539,12 +539,17 @@ export function readBoardRecords(dir, opts = {}) {
  * the one thing this directory exists to prevent (PR #174 review). An existing file is never
  * discarded over that: the catch-all is APPENDED, so it is the last word without taking anyone
  * else's rules out.
+ *
+ * Only ENOENT means "no ignore file here yet". Any other read error — a mode the process cannot
+ * read through, a transient I/O failure — is a file whose rules are unknown, and answering `*\n`
+ * there would overwrite them (PR #174 review); it is raised so the backup fails instead.
  */
 function ignoreAllPatch(path) {
   let existing;
   try {
     existing = readFileSync(path, "utf8");
-  } catch {
+  } catch (e) {
+    if (e?.code !== "ENOENT") throw e;
     return "*\n"; // no ignore file here yet — write the rule itself
   }
   const lines = existing.split("\n").map((line) => line.trim());
@@ -593,7 +598,7 @@ export function backupBoard(dir, opts = {}) {
     const patch = ignoreAllPatch(ignore);
     if (patch !== null) writeFileAtomic(ignore, patch);
   } catch (e) {
-    return { status: "failed", detail: `could not write ${ignore}: ${String(e?.message ?? e)}` };
+    return { status: "failed", detail: `could not update ${ignore}: ${String(e?.message ?? e)}` };
   }
 
   // A large board's export reads every record — the network budget, same as bd init/bootstrap.

@@ -488,6 +488,33 @@ describe("backupBoard", () => {
       chmodSync(backups, 0o755);
     }
   });
+
+  /**
+   * An ignore file that exists but cannot be READ is not an absent one: replacing it with a bare
+   * `*` would throw away whatever rules and comments it carries, in a directory whose parent still
+   * permits the rename (PR #174 review). Only ENOENT means "write the rule".
+   */
+  it.skipIf(process.getuid?.() === 0)("refuses the backup when the ignore file cannot be read", () => {
+    const dir = repo(EMBEDDED);
+    const backups = join(dir, ".beads", "backups");
+    mkdirSync(backups, { recursive: true });
+    const ignore = join(backups, ".gitignore");
+    const existing = "# rules this process may not read\n!*.jsonl\n";
+    writeFileSync(ignore, existing);
+    chmodSync(ignore, 0o000);
+    try {
+      const { calls, exec } = fakeBd();
+      const backup = backupBoard(dir, { exec });
+      expect(backup.status).toBe("failed");
+      expect(backup.detail).toContain(".gitignore");
+      // And nothing was exported into a directory git might not be hiding.
+      expect(cmdline(calls).some((c) => c.startsWith("bd export"))).toBe(false);
+      chmodSync(ignore, 0o644);
+      expect(readFileSync(ignore, "utf8")).toBe(existing);
+    } finally {
+      chmodSync(ignore, 0o644);
+    }
+  });
 });
 
 describe("testDoltConnection", () => {

@@ -92,14 +92,21 @@ Then, on the server host:
 
 ```bash
 docker stop dolt                                   # quiesce before swapping
-docker run --rm -v VOLUME:/dest alpine \
-  sh -c 'mv /dest/.staging/DB /dest/DB && rmdir /dest/.staging'
+docker run --rm -v VOLUME:/dest alpine sh -eu -c '
+  if [ -e /dest/DB ]; then
+    # Park the old database BEFORE the swap: mv onto an existing directory moves the staged copy
+    # INSIDE it as /dest/DB/DB, and Dolt then serves the old board as if nothing happened.
+    if [ -e /dest/.old-DB ]; then echo "/dest/.old-DB is in the way"; exit 1; fi
+    mv /dest/DB /dest/.old-DB
+  fi
+  mv /dest/.staging/DB /dest/DB
+  rmdir /dest/.staging'
 docker start dolt                                  # Dolt picks up new databases at start
 ```
 
-**Replacing an existing database rather than adding one?** Park the old copy under a **dot-directory**
-(`mv /dest/DB /dest/.old-DB`) or delete it. A plain `DB.old` is served as a database named `DB.old`
-and shows up in `SHOW DATABASES` — confusing at best.
+The parked copy goes under a **dot-directory** deliberately: Dolt serves every directory under its
+data dir as a database, so a plain `DB.old` shows up in `SHOW DATABASES` — confusing at best. Keep
+`.old-DB` until the new board has been verified, then delete it.
 
 Confirm the server sees it:
 
