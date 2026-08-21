@@ -220,6 +220,25 @@ dolt.user: beads
     expect(configYamlNonScalars("notes: |\n  body\n\n").notes).toEqual(["notes: |", "  body"]);
   });
 
+  /**
+   * `|+`/`>+` KEEP their trailing line breaks — they are part of the value, not the document's
+   * whitespace — so two texts differing only in how many blanks follow the body are different
+   * values, and a rollback that could not tell them apart would restore the older one (PR #174).
+   */
+  it("keeps the trailing blanks of a keep-chomped block, and still chomps them otherwise", () => {
+    const one = "notes: |+\n  body\n\ndolt.user: beads\n";
+    const two = "notes: |+\n  body\n\n\ndolt.user: beads\n";
+    expect(configYamlNonScalars(one).notes).toEqual(["notes: |+", "  body", ""]);
+    expect(configYamlNonScalars(two).notes).toEqual(["notes: |+", "  body", "", ""]);
+    expect(configYamlNonScalars(two).notes).not.toEqual(configYamlNonScalars(one).notes);
+    // The indicator can carry an explicit indentation digit on either side, and a comment after it.
+    expect(configYamlNonScalars("notes: >+2 # keep\n  body\n\n").notes).toEqual(["notes: >+2 # keep", "  body", "", ""]);
+    // `-` and the default still chomp: the blank after the body is the document's, not the value's.
+    expect(configYamlNonScalars("notes: |-\n  body\n\ndolt.user: beads\n").notes).toEqual(["notes: |-", "  body"]);
+    // Neither reading leaks a body line into the settings map.
+    expect(parseConfigYaml(two)).toEqual({ "dolt.user": "beads" });
+  });
+
   it("keeps an ordinary scalar that merely starts with an indicator character", () => {
     expect(parseConfigYaml("sync.remote: |pipe\n  nested: x\n")).toEqual({ "sync.remote": "|pipe", nested: "x" });
     expect(parseConfigYaml("notes: |2-\n  body\n")).toEqual({});

@@ -450,6 +450,22 @@ describe("backupBoard", () => {
   });
 
   /**
+   * Git resolves a path by the LAST pattern that matches it, so a `*` undone by a later `!*.jsonl`
+   * hides nothing — `git status -uall` lists the export (PR #174 review). The catch-all is appended
+   * so it has the last word, and the rules already there are kept.
+   */
+  it("appends the catch-all when a later re-inclusion un-hides the exports", () => {
+    const dir = repo(EMBEDDED);
+    const backups = join(dir, ".beads", "backups");
+    mkdirSync(backups, { recursive: true });
+    writeFileSync(join(backups, ".gitignore"), "*\n!*.jsonl\n");
+
+    const { exec } = fakeBd();
+    expect(backupBoard(dir, { exec }).status).toBe("written");
+    expect(readFileSync(join(backups, ".gitignore"), "utf8")).toBe("*\n!*.jsonl\n*\n");
+  });
+
+  /**
    * And when the rule DOES have to be written and the write fails, the previous ignore file is still
    * there — {@link writeFileAtomic} renames a finished temp file over it rather than truncating it.
    * Skipped as root, for whom a read-only directory is not read-only.

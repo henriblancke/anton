@@ -530,18 +530,27 @@ export function readBoardRecords(dir, opts = {}) {
 }
 
 /**
- * True when `path` is already an ignore file that hides everything beside it — the `*` rule this
- * module writes. Read rather than assumed so a re-run does not rewrite a file that is already doing
- * its job, and so a failure to write a NEW one cannot be confused with losing an existing one.
+ * The text `path` must hold for it to hide everything beside it, or `null` when it already does.
+ * Read rather than assumed so a re-run does not rewrite a file that is already doing its job, and so
+ * a failure to write a NEW one cannot be confused with losing an existing one.
+ *
+ * Git resolves a path by the LAST pattern that matches it, so a `*` followed by a re-inclusion
+ * (`!*.jsonl`) hides nothing — the board export beside it stays visible to `git add -A`, which is
+ * the one thing this directory exists to prevent (PR #174 review). An existing file is never
+ * discarded over that: the catch-all is APPENDED, so it is the last word without taking anyone
+ * else's rules out.
  */
-function ignoresEverything(path) {
+function ignoreAllPatch(path) {
+  let existing;
   try {
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .some((line) => line.trim() === "*");
+    existing = readFileSync(path, "utf8");
   } catch {
-    return false;
+    return "*\n"; // no ignore file here yet — write the rule itself
   }
+  const lines = existing.split("\n").map((line) => line.trim());
+  const catchAll = lines.lastIndexOf("*");
+  if (catchAll !== -1 && !lines.slice(catchAll + 1).some((line) => line.startsWith("!"))) return null;
+  return existing === "" || existing.endsWith("\n") ? `${existing}*\n` : `${existing}\n*\n`;
 }
 
 /**
@@ -575,13 +584,14 @@ export function backupBoard(dir, opts = {}) {
   } catch (e) {
     return { status: "failed", detail: `could not create ${dest}: ${String(e?.message ?? e)}` };
   }
-  // Atomically, and skipped when the rule is already there: a plain write truncates before it can
+  // Atomically, and skipped when the rule is already in effect: a plain write truncates before it can
   // fail, so an ENOSPC or I/O error here would leave an EMPTY .gitignore beside every earlier
   // export — the whole backup directory suddenly visible to git, one `git add -A` away from
   // committing a private board (PR #174 review).
   const ignore = join(dest, ".gitignore");
   try {
-    if (!ignoresEverything(ignore)) writeFileAtomic(ignore, "*\n");
+    const patch = ignoreAllPatch(ignore);
+    if (patch !== null) writeFileAtomic(ignore, patch);
   } catch (e) {
     return { status: "failed", detail: `could not write ${ignore}: ${String(e?.message ?? e)}` };
   }

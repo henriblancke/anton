@@ -493,15 +493,16 @@ const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
  * absent, and so free text is never mistaken for settings.
  *
  * `value` is the trimmed line, EXCEPT inside a block scalar's body, which is reported verbatim
- * (indentation kept, interior blanks included): whitespace is content there, so a re-indent or an
- * added blank line is a real edit, and trimming it away would let a rollback restore over it
- * silently (PR #174 review).
+ * (indentation kept, interior blanks included — and trailing blanks too under `|+`/`>+`, which keep
+ * them as content): whitespace is content there, so a re-indent or an added blank line is a real
+ * edit, and trimming it away would let a rollback restore over it silently (PR #174 review).
  */
 function* configYamlEntries(text) {
   // Blocks currently in scope, outermost first: { indent, key } for a map header, `seq` for the
   // sequence item whose body a deeper line belongs to.
   const stack = [];
-  // The open block scalar, if any: { indent, path } of the `key: |` line whose body we are inside.
+  // The open block scalar, if any: { indent, path, keep } of the `key: |` line whose body we are
+  // inside — `keep` for the `+` chomping indicator, which makes trailing blank lines content.
   let block = null;
   // Blank lines seen inside the open block, not yet known to be interior to it.
   let heldBlanks = 0;
@@ -515,8 +516,12 @@ function* configYamlEntries(text) {
       // It runs to the first non-blank line indented no deeper than the key that opened it.
       // Blanks are held until a further body line proves them interior — a blank between the block
       // and the next key is the document's whitespace, and `|`/`>` chomp trailing blanks anyway.
+      // NOT under `+`, which keeps them: there those line breaks ARE the value, so dropping them
+      // would make two texts differing only in trailing blanks read as identical and let a rollback
+      // restore the older one over a real edit (PR #174 review).
       if (trimmed === "") {
-        heldBlanks++;
+        if (block.keep) yield { line: i, kind: "opaque", path: block.path, value: "" };
+        else heldBlanks++;
         continue;
       }
       if (indent > block.indent) {
@@ -577,7 +582,7 @@ function* configYamlEntries(text) {
       // content, not settings. Reporting either as a scalar would expose a body line like
       // `dolt.user: historical` as a live top-level setting: enough to make enforcement skip a
       // required write, and to make a retraction comment out somebody's prose (PR #174 review).
-      block = { indent, path: full };
+      block = { indent, path: full, keep: value.split(/\s/)[0].includes("+") };
       yield { line: i, kind: "opaque", path: full, value: trimmed };
     } else {
       yield { line: i, kind: "scalar", path: full, value: value.replace(/^["']|["']$/g, "") };
