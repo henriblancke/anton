@@ -614,6 +614,27 @@ export function parseConfigYaml(text) {
 }
 
 /**
+ * EVERY value a `.beads/config.yaml` publishes for each dotted path, in file order — what
+ * {@link parseConfigYaml} keeps only the last of.
+ *
+ * A retraction comments out every line the file devotes to a key, not just the effective one
+ * ({@link retractConfigYamlKey}), so a rollback recognising its own strike-outs has to know each
+ * value that was struck — the last-wins map would call the older duplicate's strike-out somebody
+ * else's line (PR #174 review).
+ *
+ * @param {string} text
+ * @returns {Record<string, string[]>}
+ */
+export function configYamlScalars(text) {
+  /** @type {Record<string, string[]>} */
+  const byPath = {};
+  for (const { kind, path, value } of configYamlEntries(text)) {
+    if (kind === "scalar") (byPath[path] ??= []).push(value);
+  }
+  return byPath;
+}
+
+/**
  * Everything in a `.beads/config.yaml` that {@link parseConfigYaml} cannot represent, as
  * `enclosing.path → [line, …]` in file order — sequence items, block-scalar bodies, and any other
  * line with no `key:` of its own. Lines are trimmed except inside a block scalar's body, which is

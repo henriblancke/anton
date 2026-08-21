@@ -1058,6 +1058,35 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * But only the strike-out this run actually made. Another process commenting the same key out over
+   * a DIFFERENT value is its edit, and forgiving every strike-out by key would leave the scalar diff
+   * seeing exactly the absence this run asked for — so the restore would put the old account back
+   * over their line and report a clean revert (PR #174 review).
+   */
+  it("keeps config.yaml when another process strikes a retracted key out over a value this run never saw", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    writeFileSync(configPath, "prefix: probe\ndolt:\n  user: old-account\n");
+    const { exec: base } = fakeBd({ dir, before: BOARD, test: { status: 1, stderr: "Connection failed" } });
+    const exec = (cmd: string, args: string[]): Result => {
+      if (args[0] === "config" && args[1] === "unset" && args[2] === "dolt.user") {
+        // Somebody else repoints the account and comments it out, in the window this run is
+        // retracting the key it found there.
+        writeFileSync(configPath, readFileSync(configPath, "utf8").replace("  user: old-account", "  # user: new-account"));
+        return { status: 0 };
+      }
+      return base(cmd, args);
+    };
+
+    const result = configureServerMode(dir, { ...flags, user: undefined }, { exec });
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(configPath, "utf8")).toContain("# user: new-account");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(dolt\)/);
+  });
+
+  /**
    * The same window, under a key this run DOES write. Owning the key is not owning the value
    * (PR #174 review): a `dolt.user` another process repoints at a different account while a later
    * publication step fails is that process's edit, and a rollback that claimed every difference on

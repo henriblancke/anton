@@ -53,6 +53,7 @@ import {
   checkSharedServer,
   configYamlComments,
   configYamlNonScalars,
+  configYamlScalars,
   ensureBdConfig,
   ensureDoltConnection,
   failureDetail,
@@ -330,14 +331,26 @@ function isPublicationRewrite(text, wrote) {
  * retraction comments a key out rather than deleting it (`bd config unset`'s style, and
  * {@link retractStaleConnectionKey}'s), so a comment that is a struck-out line for a key this run
  * retracted is this run's write, not somebody's prose.
+ *
+ * By key AND struck VALUE, for the same reason the scalar diff weighs values (PR #174 review): a
+ * strike-out is only this run's where it carries the value the key held when this run took its
+ * snapshot. Another process commenting the key out itself — or striking it after repointing it —
+ * leaves a strike-out for a retracted key carrying a value this run never struck, and forgiving it
+ * by key alone would have the scalar diff see the requested absence and the restore discard their
+ * edit silently.
  */
 function foreignConfigEdits(before, current, wrote) {
   const was = parseConfigYaml(before ?? "");
   const now = parseConfigYaml(current ?? "");
   const wasLines = configYamlNonScalars(before ?? "");
   const nowLines = configYamlNonScalars(current ?? "");
-  // Every key this run asked bd to RETRACT — the only keys whose strike-out comments are ours.
-  const retracted = new Set([...wrote].filter(([, value]) => value === undefined).map(([key]) => key));
+  // Every key this run asked bd to RETRACT, paired with the values config.yaml published for it when
+  // this run took its snapshot — the only strike-outs that can be this run's own. Every value, not
+  // the effective one: a retraction strikes out each line the file devotes to the key.
+  const wasScalars = configYamlScalars(before ?? "");
+  const retracted = new Map(
+    [...wrote].filter(([, value]) => value === undefined).map(([key]) => [key, wasScalars[key] ?? []]),
+  );
   const wasComments = configYamlComments(before ?? "");
   const nowComments = configYamlComments(current ?? "");
   // Filtered on BOTH sides, so a strike-out that was already in the file when this run found it
@@ -359,18 +372,24 @@ function foreignConfigEdits(before, current, wrote) {
 }
 
 /**
- * True when `line` — a comment, reported under `path` — is the strike-out of a key in `retracted`.
+ * True when `line` — a comment, reported under `path` — is a strike-out this run made: a key in
+ * `retracted`, struck out over one of the values that key held when this run took its snapshot
+ * (`retracted` maps each retracted key to those values).
  *
  * Matched in both of bd's encodings: a flat `# dolt.user: beads` carries the whole dotted path in
  * the comment, while a nested one (`dolt:` / `  # user: beads`) carries only the leaf and takes the
- * rest from the block it sits in. Anything else — including a struck-out key this run never asked
- * to retract — is somebody else's line.
+ * rest from the block it sits in. Values are normalized as {@link parseConfigYaml} normalizes a
+ * live one, so a re-quoted strike-out is still recognized.
+ *
+ * Anything else — a struck-out key this run never asked to retract, or one struck out over a value
+ * this run never saw there — is somebody else's line (PR #174 review).
  */
 function isStrikeOut(line, path, retracted) {
-  const m = line.replace(/^#+\s*/, "").match(/^([^:#]+):/);
+  const m = line.replace(/^#+\s*/, "").match(/^([^:#]+):\s*(.*)$/);
   if (!m) return false;
   const key = m[1].trim();
-  return retracted.has(key) || retracted.has(path === "" ? key : `${path}.${key}`);
+  const struck = retracted.get(key) ?? retracted.get(path === "" ? key : `${path}.${key}`);
+  return struck !== undefined && struck.includes(m[2].trim().replace(/^["']|["']$/g, ""));
 }
 
 /**
