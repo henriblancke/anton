@@ -400,7 +400,6 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
     let stderr = "";
     let settled = false;
     let drainTimer: NodeJS.Timeout | undefined;
-    let escalateTimer: NodeJS.Timeout | undefined;
 
     const killGroup = (sig: NodeJS.Signals) => {
       if (process.platform !== "win32" && child.pid) {
@@ -454,8 +453,9 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
     const budgetTimer = setTimeout(() => {
       killGroup("SIGTERM");
       // The escalation deliberately outlives the promise (as in runShell): the caller unwinds now,
-      // while the group still gets killed. Cleared as soon as bd actually exits.
-      escalateTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs());
+      // while the group still gets killed. It is never disarmed — bd's own exit says nothing about
+      // the descendants the reap is actually for (see the `exit` handler).
+      setTimeout(() => killGroup("SIGKILL"), killGraceMs());
       settle(() => {
         dropPipes();
         // Partial stdout/stderr is deliberately NOT attached: a wedged step's captured output is
@@ -509,7 +509,11 @@ async function bd(cwd: string, args: string[], opts?: BdOpts): Promise<string> {
     child.on("close", (code, signal) => settle(() => finish(code, signal)));
 
     child.on("exit", (code, signal) => {
-      if (escalateTimer) clearTimeout(escalateTimer); // bd is gone; no SIGKILL needed
+      // A pending SIGKILL is deliberately NOT cancelled here. The reap targets the process group,
+      // and bd exiting on the SIGTERM proves nothing about the wedged `git fetch` that ignored it —
+      // that survivor is what holds the Dolt lock and what the escalation exists to reach. Disarming
+      // on the leader's exit would restore the very leak the group kill was added to close. When the
+      // group is already empty the escalation is a harmless ESRCH inside killGroup.
       if (settled) return; // already timed out (or overflowed) — the caller has its verdict
       drainTimer = setTimeout(
         () =>
