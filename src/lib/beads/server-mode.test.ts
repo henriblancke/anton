@@ -498,6 +498,10 @@ describe("configureServerMode", () => {
     expect(result.ok).toBe(false);
     expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
     expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(true);
+    // What the caller prints its headline from: the switch is out of the file, so the project is
+    // back on the embedded board it started on.
+    expect(result.after).toMatchObject({ mode: "embedded" });
+    expect(result.switchStillWritten).toBe(false);
     // Nothing was published: a board that cannot connect must not leave a team default behind.
     expect(cmdline(calls).some((c) => c.includes("--update-config"))).toBe(false);
   });
@@ -614,6 +618,10 @@ describe("configureServerMode", () => {
     expect(result.steps.some((s: { status: string }) => s.status === "reverted")).toBe(false);
     expect(result.errors.some((e: string) => e.includes("could not be put back"))).toBe(true);
     expect(result.errors.some((e: string) => e.includes("dolt.example.dev:3306"))).toBe(true);
+    // And says it in the two fields the terminal writes its headline from, rather than leaving the
+    // caller to announce a project that was "not switched" while it reads the server.
+    expect(result.after).toMatchObject({ mode: "server", host: "dolt.example.dev", database: "probe" });
+    expect(result.switchStillWritten).toBe(true);
   });
 
   /**
@@ -708,6 +716,9 @@ describe("configureServerMode", () => {
     expect(readMetadata(dir).project_id).toBe("corrected-9999");
     expect(result.steps.some((s: { status: string }) => s.status === "kept")).toBe(true);
     expect(result.warnings.some((w: string) => w.includes("edited after this command wrote the switch"))).toBe(true);
+    // A declined rollback leaves the switch standing just as a failed one does — same report.
+    expect(result.after).toMatchObject({ mode: "server", host: "dolt.example.dev" });
+    expect(result.switchStillWritten).toBe(true);
   });
 
   /**

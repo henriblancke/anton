@@ -1719,7 +1719,23 @@ async function cmdServerMode(args = []) {
   };
 
   if (!result.ok) {
-    console.log(c.red("\n✗ this project was NOT switched to server mode."));
+    // The headline is the mode the run LEFT, not the one it intended: when the rollback cannot put
+    // metadata.json back, or declines because someone else edited it, the project is still reading
+    // the server — and "not switched" would send an operator back to a board nothing is reading
+    // (PR #174 review). `result.after` is the file itself, read on the way out.
+    const left = result.after;
+    if (left?.mode === "server") {
+      const where = `${left.user ? `${left.user}@` : ""}${left.host ?? "?"}:${left.port ?? "?"}/${left.database ?? "?"}`;
+      console.log(
+        c.red(
+          result.switchStillWritten
+            ? `\n✗ server mode was NOT verified — and this project is STILL pointed at ${where}: the switch could not be taken back out of .beads/metadata.json.`
+            : `\n✗ this project was NOT switched — it was ALREADY pointed at ${where}, and still is.`,
+        ),
+      );
+    } else {
+      console.log(c.red("\n✗ this project was NOT switched to server mode."));
+    }
     for (const e of result.errors) console.log(c.red(`  ${indent(e)}`));
     for (const h of result.hints ?? []) console.log(c.dim(`  → ${h}`));
     renderWarnings();

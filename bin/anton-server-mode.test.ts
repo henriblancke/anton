@@ -26,7 +26,10 @@ const EMBEDDED = { database: "dolt", backend: "dolt", dolt_mode: "embedded", dol
  * one read that carries comments and memories); it answers with the ids in `.beads/.fake-board`
  * (local ids, then the server's, separated by `|`) so a case can make the server's board differ
  * from the local one. `bd export --all -o <file>` is the backup, and `bd dolt test` fails when
- * `.beads/.fake-unreachable` exists — the two failures the command is built to catch.
+ * `.beads/.fake-unreachable` exists — the two failures the command is built to catch. With
+ * `.beads/.fake-edit-on-test` it also EDITS metadata.json before failing that connection test,
+ * standing in for a concurrent editor: the rollback then declines to overwrite the edit and the
+ * project is left reading the server.
  */
 const FAKE_BD_SERVER = [
   "#!/usr/bin/env node",
@@ -45,6 +48,12 @@ const FAKE_BD_SERVER = [
   "  process.exit(0);",
   "}",
   'if (a[0] === "dolt" && a[1] === "test") {',
+  '  if (fs.existsSync(path.join(beads, ".fake-edit-on-test"))) {',
+  '    const m = path.join(beads, "metadata.json");',
+  '    const j = JSON.parse(fs.readFileSync(m, "utf8"));',
+  '    fs.writeFileSync(m, JSON.stringify({ ...j, project_id: "corrected-9999" }, null, 2) + "\\n");',
+  '    console.error("Connection failed"); process.exit(1);',
+  "  }",
   '  if (fs.existsSync(path.join(beads, ".fake-unreachable"))) { console.error("Connection failed"); process.exit(1); }',
   "  process.exit(0);",
   "}",
@@ -249,6 +258,26 @@ describe("anton server-mode (end to end over a stub bd)", () => {
     expect(r.status).toBe(1);
     expect(p.raw()).toBe(before);
     expect(r.stdout).toContain("NOT switched to server mode");
+  });
+
+  /**
+   * The headline has to be the mode the run LEFT. When the rollback cannot put metadata.json back —
+   * here because someone edited it after the flip, so restoring would discard that edit — the
+   * project keeps reading the server, and "NOT switched to server mode" would send an operator back
+   * to a board nothing is reading (PR #174 review).
+   */
+  it("says the project is still pointed at the server when the rollback could not undo the switch", async () => {
+    const p = await project({ ".fake-edit-on-test": "1" });
+
+    const r = p.run(CONNECT);
+
+    expect(r.status).toBe(1);
+    // The switch really is still in the file — the report is not a pessimistic guess.
+    expect(p.metadata().dolt_mode).toBe("server");
+    expect(r.stdout).toContain("STILL pointed at beads@dolt.example.dev:3306/probe");
+    expect(r.stdout).not.toContain("NOT switched to server mode");
+    // And the warning that says why, and what to do about it.
+    expect(r.stdout).toContain("edited after this command wrote the switch");
   });
 
   it("exits non-zero and points at the runbook when the server's board is missing issues", async () => {

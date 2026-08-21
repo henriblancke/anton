@@ -607,8 +607,12 @@ const step = (name, status, detail) => (detail === undefined ? { name, status } 
  *   destroying the file, which no amount of intent makes safe.
  * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
  *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
- * @returns {{ ok, steps, connection?, errors, warnings, before?, counts?, backup?, missing?,
- *   diverged?, extra?, drifted? }}
+ * @returns {{ ok, steps, connection?, errors, warnings, before?, after?, switchStillWritten?,
+ *   counts?, backup?, missing?, diverged?, extra?, drifted? }}
+ *   On a REFUSAL, `after` is `.beads/metadata.json` as the run left it ({@link readDoltMetadata}),
+ *   and `switchStillWritten` says whether this run's flip is what is holding it there — together
+ *   they are what a caller must report the mode from, since a rollback that fails or declines
+ *   leaves the project reading the server (PR #174 review).
  *   Every key list below is {@link readBoardRecords}'s: a bead id for an issue (comment thread
  *   included), `memory:<key>` for a persistent memory.
  *   `missing` is the keys this board holds that the server's copy does not; `diverged` the keys it
@@ -630,7 +634,23 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   const errors = [];
   const warnings = [];
   const beadsDir = join(dir, ".beads");
-  const fail = (extra = {}) => ({ ok: false, steps, errors, warnings, ...extra });
+  // True while this run's flip is in metadata.json — set by the write in step 6, cleared only by a
+  // rollback that actually put the earlier bytes back. A rollback that FAILS, or that declines
+  // because someone else edited the file, leaves the project reading the server, and a refusal that
+  // announced "not switched" over that would send an operator back to a board nothing is reading
+  // (PR #174 review). The terminal derives its headline from this and from `after`.
+  let switchStillWritten = false;
+  // What the run leaves behind, read from the file on the way out rather than inferred: the mode
+  // and connection `.beads/metadata.json` actually declares once every rollback has had its say.
+  const fail = (extra = {}) => ({
+    ok: false,
+    steps,
+    errors,
+    warnings,
+    after: readDoltMetadata(dir),
+    switchStillWritten,
+    ...extra,
+  });
   /** Record a step AND hand it to the caller as it happens — this flow is slow enough (an export,
    * two round trips to the server) that a terminal batching its output reads as a hang. */
   const record = (name, status, detail) => {
@@ -908,6 +928,8 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     }
   }
   record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
+  // From here on a refusal has something to undo — and something to report if it cannot.
+  if (prepared.status === "prepared") switchStillWritten = true;
 
   // What this invocation actually left in each file — a revert undoes THOSE bytes and nothing else.
   // Two flags, because config.yaml is written at two different points for two different reasons:
@@ -1011,6 +1033,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       if (ours) {
         const restored = tryRestore(prepared.path, prepared.before);
         if (restored.ok) {
+          // The only path that takes the switch back out of the file — every other one below leaves
+          // the project reading the server, which the report has to say rather than deny.
+          switchStillWritten = false;
           record("metadata.json", "reverted", `${reason} — the board is untouched`);
         } else {
           record("metadata.json", "failed", `${reason} — could not be put back: ${restored.detail}`);
