@@ -143,6 +143,27 @@ dolt.user: beads
     expect(configYamlNonScalars(items).hooks).toEqual(["- name: a", "run: x", "- name: b", "run: y"]);
   });
 
+  /**
+   * A block scalar's body is prose, not settings — exposing a body line as a live setting would let
+   * enforcement skip a required write and let a retraction comment out somebody's text (PR #174).
+   */
+  it("treats a block scalar's body as opaque content, never as settings", () => {
+    const text = "notes: |\n  dolt.user: historical\n  # not a comment\n\n  still body\ndolt.user: beads\n";
+    expect(parseConfigYaml(text)).toEqual({ "dolt.user": "beads" });
+    expect(configYamlNonScalars(text).notes).toEqual(["notes: |", "dolt.user: historical", "# not a comment", "still body"]);
+  });
+
+  it("closes a block scalar at the first line indented no deeper than its key", () => {
+    const text = "dolt:\n  motd: >-\n    wrapped text\n  user: beads\nexport.auto: false\n";
+    expect(parseConfigYaml(text)).toEqual({ "dolt.user": "beads", "export.auto": "false" });
+    expect(configYamlNonScalars(text)).toEqual({ "dolt.motd": ["motd: >-", "wrapped text"] });
+  });
+
+  it("keeps an ordinary scalar that merely starts with an indicator character", () => {
+    expect(parseConfigYaml("sync.remote: |pipe\n  nested: x\n")).toEqual({ "sync.remote": "|pipe", nested: "x" });
+    expect(parseConfigYaml("notes: |2-\n  body\n")).toEqual({});
+  });
+
   it("reads both scalar encodings exactly as before, and carries no residue for either", () => {
     expect(parseConfigYaml(FLAT)["export.auto"]).toBe("false");
     expect(parseConfigYaml(NESTED)["dolt.auto-commit"]).toBe("on");

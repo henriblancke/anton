@@ -468,6 +468,13 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
 }
 
 /**
+ * A YAML block-scalar header, as the whole value of a `key:` line — `|` or `>`, with the optional
+ * chomping (`-`/`+`) and explicit-indentation (`1`-`9`) indicators in either order, and an optional
+ * trailing comment. Anything else after the indicator (`|foo`) is an ordinary scalar, not a block.
+ */
+const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
+
+/**
  * Walk every significant line of a `.beads/config.yaml`, yielding `{ line, kind, path, value }` —
  * the ONE reader of both encodings bd has shipped, so nothing below can disagree about what a line
  * means. bd 1.0.4 appends flat dotted lines (`export.auto: false`); bd 1.1.0 writes `export.*` and
@@ -477,21 +484,35 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
  * ignored. `line` is the 0-based index into `text.split("\n")`, for callers that rewrite the file.
  *
  * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold — or
- * `"opaque"` for a line it cannot: a `- item` of a sequence, anything under one, the body of a block
- * scalar, or any other line with no `key:` of its own. An opaque line is reported under the path of
- * the nearest MAP key enclosing it, so a caller diffing two files can see it change without having
- * to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as absent.
+ * `"opaque"` for a line it cannot: a `- item` of a sequence, anything under one, a `key: |` / `key:
+ * >` block scalar and its body, or any other line with no `key:` of its own. An opaque line is
+ * reported under the path of the nearest key enclosing it — the map key for a sequence item, the
+ * block key itself for block-scalar text — so a caller diffing two files can see it change without
+ * having to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as
+ * absent, and so free text is never mistaken for settings.
  */
 function* configYamlEntries(text) {
   // Blocks currently in scope, outermost first: { indent, key } for a map header, `seq` for the
   // sequence item whose body a deeper line belongs to.
   const stack = [];
+  // The open block scalar, if any: { indent, path } of the `key: |` line whose body we are inside.
+  let block = null;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].replace(/\r$/, "");
     const trimmed = line.trim();
-    if (trimmed === "" || trimmed.startsWith("#")) continue;
     const indent = line.length - line.trimStart().length;
+    if (block) {
+      // A block scalar's body is free text: `#` starts no comment and `key: value` sets nothing.
+      // It runs to the first non-blank line indented no deeper than the key that opened it.
+      if (trimmed === "") continue;
+      if (indent > block.indent) {
+        yield { line: i, kind: "opaque", path: block.path, value: trimmed };
+        continue;
+      }
+      block = null;
+    }
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
     // A `- ` line is a sequence item even when it carries a `key: value` of its own: flattening
     // `- name: a` to a dotted path would let two items of one sequence collapse onto one key.
     const item = trimmed.startsWith("-");
@@ -520,6 +541,13 @@ function* configYamlEntries(text) {
     if (value === "") {
       // A bare `key:` opens a nested block (bd 1.1.0's `export:`/`dolt:`) — remember it as a parent.
       stack.push({ indent, key });
+    } else if (BLOCK_SCALAR_HEADER.test(value)) {
+      // `key: |` / `key: >` — the indicator is not the value, and the indented text below it is
+      // content, not settings. Reporting either as a scalar would expose a body line like
+      // `dolt.user: historical` as a live top-level setting: enough to make enforcement skip a
+      // required write, and to make a retraction comment out somebody's prose (PR #174 review).
+      block = { indent, path: full };
+      yield { line: i, kind: "opaque", path: full, value: trimmed };
     } else {
       yield { line: i, kind: "scalar", path: full, value: value.replace(/^["']|["']$/g, "") };
     }
@@ -641,8 +669,8 @@ function retractConfigYamlKey(beadsDir, key) {
   }
   let changed = false;
   for (const entry of configYamlEntries(lines.join("\n"))) {
-    // Scalars only: an opaque line is reported under the path of the key ENCLOSING it, and striking
-    // it out would comment away a sequence that merely lives under the retracted key's name.
+    // Scalars only: an opaque line is reported under the key enclosing it, so striking one out would
+    // comment away a sequence — or a block scalar's free text — that merely lives under this name.
     if (entry.kind !== "scalar" || entry.path !== key) continue;
     lines[entry.line] = lines[entry.line].replace(/^(\s*)/, "$1# ");
     changed = true;
