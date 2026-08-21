@@ -379,26 +379,45 @@ function foreignConfigEdits(before, current, wrote) {
 
 /**
  * True when config.yaml's disagreement about scalar `key` is entirely this run's own write: the
- * effective value is what this run handed bd, AND every line the file now devotes to the key carries
- * either that value or one the snapshot already published.
+ * effective value is what this run handed bd, AND the lines the file now devotes to the key are the
+ * lines the snapshot devoted to it, with only the one edit bd was asked to make.
  *
  * The effective value alone is not enough (PR #174 review). bd appends, and `parseConfigYaml` keeps
  * only the last line for a path — so a value another process appends for a key this run also writes
  * disappears from the flat map the moment this run's own line lands after it. The effective value
  * then matches what this run asked for, the key reads as unchanged-by-others, and the whole-file
  * restore deletes their line silently. Every OCCURRENCE is weighed instead, the way retracted keys
- * already are ({@link isStrikeOut}): a line this run never wrote and the snapshot never held is
- * somebody else's edit, wherever in the file it sits.
+ * already are ({@link isStrikeOut}).
  *
- * By membership rather than count, because bd patches in place as well as appends: the ordinary case
- * (a key whose one line this run rewrote) leaves no unaccounted-for value, while a duplicate of a
- * value already in the snapshot carries nothing a restore can lose.
+ * And weighed IN ORDER, not as a set (PR #174 review): "every remaining line carries a value this
+ * run wrote or the snapshot published" cannot see a line go MISSING. Another process deleting one of
+ * two `dolt.user` lines in the window this run is publishing leaves every surviving line accounted
+ * for, the key reads as Anton's, and the restore resurrects the line they deleted while reporting a
+ * clean revert. So the lines are matched positionally against the snapshot's, and only the two edits
+ * bd itself makes are forgiven: appending its line when the key is absent, or overwriting a line
+ * where it already sits. A list that is shorter than the snapshot's, or that has shifted under it,
+ * is somebody else's deletion.
+ *
+ * The one deletion no reading of the file can catch: where the snapshot published a SINGLE line for
+ * the key, another process deleting it before bd appends its own is byte-for-byte what bd patching
+ * that line in place looks like. Distinguishing them would need the file as it stood between the two
+ * writes, and bd's patches and a concurrent edit land in the same window (see {@link snapshotConfig}
+ * — the window the snapshot cannot close).
  */
 function isOwnScalarWrite(key, wrote, now, wasScalars, nowScalars) {
   if (!wrote.has(key) || now[key] !== wrote.get(key)) return false;
   const mine = wrote.get(key);
-  const snapshot = new Set(wasScalars[key] ?? []);
-  return (nowScalars[key] ?? []).every((value) => value === mine || snapshot.has(value));
+  const was = wasScalars[key] ?? [];
+  const current = nowScalars[key] ?? [];
+  // A retraction asks for EVERY line the key has to go, so a missing line is this run's own doing
+  // and only what survived has to be accounted for. (`undefined` is the shape `wrote` gives a key
+  // this run asked bd to unset; the strike-outs it leaves behind are {@link isStrikeOut}'s.)
+  if (mine === undefined) return current.every((value) => was.includes(value));
+  // Set the line bd appended aside — a key it found absent gets a new line at the end — and the rest
+  // must still be the file as this run found it, line for line, except where bd overwrote one in
+  // place with this run's own value.
+  const kept = current.length === was.length + 1 && current[current.length - 1] === mine ? current.slice(0, -1) : current;
+  return kept.length === was.length && kept.every((value, i) => value === mine || value === was[i]);
 }
 
 /**

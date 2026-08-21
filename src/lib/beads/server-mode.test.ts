@@ -1232,6 +1232,49 @@ describe("configureServerMode", () => {
   });
 
   /**
+   * The same window, as a DELETION. Another process removing one of two lines the snapshot held for
+   * a key this run also publishes leaves every SURVIVING line accounted for — each is either this
+   * run's own value or one the snapshot published — so weighing the values present would call the
+   * key Anton's and restore their deleted line back into the file while reporting a clean revert
+   * (PR #174 review). The lines are matched positionally against the snapshot's, so the one that
+   * went missing is seen.
+   */
+  it("keeps config.yaml when a concurrent edit deletes one of two lines a published key already had", () => {
+    const dir = repo(EMBEDDED);
+    const configPath = join(dir, ".beads", "config.yaml");
+    // Two `dolt.host` lines before this run touches the file — bd appends, so duplicates are
+    // ordinary, and only the last of them is the effective value.
+    const stale = "dolt.host: old-one.example.dev\n";
+    writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${stale}dolt.host: old-two.example.dev\n`);
+    const append = (line: string) => writeFileSync(configPath, `${readFileSync(configPath, "utf8")}${line}\n`);
+    const exec = (_cmd: string, args: string[]): Result => {
+      if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+      if (isRead(args)) return { status: 0, stdout: listing(BOARD) };
+      if (args[0] === "config" && args[1] === "set") {
+        append(`${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      if (args[0] === "dolt" && args[1] === "set") {
+        // Somebody else drops the older of the two lines in the instant this run publishes its own.
+        if (args[2] === "host") writeFileSync(configPath, readFileSync(configPath, "utf8").replace(stale, ""));
+        // `database` is published after `host`, so the failure lands with their deletion in place.
+        if (args[2] === "database") return { status: 1, stderr: "Access denied for user 'beads'" };
+        append(`dolt.${args[2]}: ${args[3]}`);
+        return { status: 0 };
+      }
+      return { status: 0 };
+    };
+
+    const result = configureServerMode(dir, flags, { exec });
+
+    expect(result.ok).toBe(false);
+    // Their deletion still stands — the restore did not put the line back.
+    expect(readFileSync(configPath, "utf8")).not.toContain("old-one.example.dev");
+    expect(result.steps.some((s: { name: string; status: string }) => s.name === "config.yaml" && s.status === "kept")).toBe(true);
+    expect(result.warnings.join("\n")).toMatch(/carries a change this command did not make \(dolt\.host\)/);
+  });
+
+  /**
    * The failure this command exists to catch. `bd dolt test` connects to the SERVER; it says nothing
    * about whether this project can open its database there — bd's own project-identity guard refuses
    * a database belonging to another project long after the connection test has passed.

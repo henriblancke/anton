@@ -214,6 +214,38 @@ dolt.user: beads
     expect(configYamlNonScalars(reindented).notes).toEqual(["notes: |", "  first", "      second"]);
   });
 
+  /**
+   * A quoted scalar carries on over the lines below it until its closing quote, and every one of
+   * those lines is the value's own text. Read as settings, a `dolt.user:` sitting inside somebody's
+   * `notes:` string is a live top-level key — enough to make config enforcement skip a required
+   * write, and to make a retraction comment out the middle of that string and leave the file
+   * unparseable (PR #174 review).
+   */
+  it("treats a multiline quoted scalar as opaque until its closing quote", () => {
+    const text = 'notes: "first\n  dolt.user: historical\n  # still the string"\ndolt.user: beads\n';
+    expect(parseConfigYaml(text)).toEqual({ "dolt.user": "beads" });
+    expect(configYamlComments(text)).toEqual({});
+    expect(configYamlNonScalars(text).notes).toEqual(['notes: "first', "  dolt.user: historical", '  # still the string"']);
+  });
+
+  /** Whitespace and blank lines inside the string are content too, and neither closes it. */
+  it("keeps a quoted scalar's continuation verbatim, blank lines included", () => {
+    const base = 'notes: "first\n\n  second"\ndolt.user: beads\n';
+    const reindented = 'notes: "first\n\n      second"\ndolt.user: beads\n';
+    expect(parseConfigYaml(base)).toEqual({ "dolt.user": "beads" });
+    expect(configYamlNonScalars(base).notes).toEqual(['notes: "first', "", '  second"']);
+    expect(configYamlNonScalars(reindented).notes).not.toEqual(configYamlNonScalars(base).notes);
+  });
+
+  /** A scalar that closes on its own line is an ordinary setting — escapes and all. */
+  it("does not swallow the file when a quoted scalar closes where YAML says it does", () => {
+    expect(parseConfigYaml('notes: "one line"\ndolt.user: beads\n')).toEqual({ notes: "one line", "dolt.user": "beads" });
+    // A backslash escapes the next character in a double-quoted scalar...
+    expect(parseConfigYaml('notes: "he said \\"no\\""\ndolt.user: beads\n')["dolt.user"]).toBe("beads");
+    // ...and a doubled apostrophe is a literal one, not the end of a single-quoted scalar.
+    expect(parseConfigYaml("notes: 'o''brien'\ndolt.user: beads\n")["dolt.user"]).toBe("beads");
+  });
+
   it("does not read the blank line that merely follows a block as part of it", () => {
     const text = "notes: |\n  body\n\ndolt.user: beads\n";
     expect(configYamlNonScalars(text).notes).toEqual(["notes: |", "  body"]);

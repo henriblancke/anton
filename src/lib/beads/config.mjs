@@ -475,6 +475,35 @@ export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
 const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
 
 /**
+ * The offset just past the `quote` that closes a quoted scalar in `text`, searching from `from`, or
+ * `-1` when the scalar is still open at the end of the line — YAML continues it onto the lines
+ * below. Escapes are YAML's own: a backslash escapes the next character inside a double-quoted
+ * scalar, and a doubled `''` is a literal apostrophe inside a single-quoted one.
+ */
+function closingQuote(text, quote, from) {
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (quote === '"' && c === "\\") {
+      i++;
+      continue;
+    }
+    if (c !== quote) continue;
+    if (quote === "'" && text[i + 1] === quote) {
+      i++;
+      continue;
+    }
+    return i + 1;
+  }
+  return -1;
+}
+
+/** True when `value` opens a quoted scalar it does not close — the rest of it is on the lines below. */
+function opensQuotedScalar(value) {
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && closingQuote(value, quote, 1) === -1;
+}
+
+/**
  * Walk every significant line of a `.beads/config.yaml`, yielding `{ line, kind, path, value }` —
  * the ONE reader of both encodings bd has shipped, so nothing below can disagree about what a line
  * means. bd 1.0.4 appends flat dotted lines (`export.auto: false`); bd 1.1.0 writes `export.*` and
@@ -486,16 +515,18 @@ const BLOCK_SCALAR_HEADER = /^[|>](?:[1-9][-+]?|[-+][1-9]?)?(?:\s+#.*)?$/;
  * `kind` is `"scalar"` for a `key: value` line — the only shape the dotted map can hold —
  * `"comment"` for a `#` line, or `"opaque"` for a line the map cannot hold: a `- item` of a
  * sequence, anything under one, a `key: |` / `key:
- * >` block scalar and its body, or any other line with no `key:` of its own. An opaque line is
+ * >` block scalar and its body, a `key: "…` quoted scalar spanning lines and its continuation, or
+ * any other line with no `key:` of its own. An opaque line is
  * reported under the path of the nearest key enclosing it — the map key for a sequence item, the
  * block key itself for block-scalar text — so a caller diffing two files can see it change without
  * having to model YAML. Nothing bd writes is opaque; the shape exists so a hand-edit is not read as
  * absent, and so free text is never mistaken for settings.
  *
- * `value` is the trimmed line, EXCEPT inside a block scalar's body, which is reported verbatim
- * (indentation kept, interior blanks included — and trailing blanks too under `|+`/`>+`, which keep
- * them as content): whitespace is content there, so a re-indent or an added blank line is a real
- * edit, and trimming it away would let a rollback restore over it silently (PR #174 review).
+ * `value` is the trimmed line, EXCEPT inside a block scalar's body or a quoted scalar's
+ * continuation, both reported verbatim (indentation kept, interior blanks included — and trailing
+ * blanks too under `|+`/`>+`, which keep them as content): whitespace is content there, so a
+ * re-indent or an added blank line is a real edit, and trimming it away would let a rollback
+ * restore over it silently (PR #174 review).
  */
 function* configYamlEntries(text) {
   // Blocks currently in scope, outermost first: { indent, key } for a map header, `seq` for the
@@ -504,6 +535,9 @@ function* configYamlEntries(text) {
   // The open block scalar, if any: { indent, path, keep } of the `key: |` line whose body we are
   // inside — `keep` for the `+` chomping indicator, which makes trailing blank lines content.
   let block = null;
+  // The open multiline quoted scalar, if any: { path, quote } of the `key: "…` line whose value we
+  // are still inside — its continuation lines are that value's text, not settings of their own.
+  let quoted = null;
   // Blank lines seen inside the open block, not yet known to be interior to it.
   let heldBlanks = 0;
   const lines = text.split("\n");
@@ -511,6 +545,17 @@ function* configYamlEntries(text) {
     const line = lines[i].replace(/\r$/, "");
     const trimmed = line.trim();
     const indent = line.length - line.trimStart().length;
+    if (quoted) {
+      // A quoted scalar's continuation is the value's own text: `#` starts no comment there and
+      // `key: value` sets nothing, right up to the closing quote. Read as settings instead, a line
+      // like `  dolt.user: historical` inside somebody's `notes:` string would be a live top-level
+      // key — enough to make enforcement skip a required write, and to make a retraction comment
+      // out the middle of that string and leave the file unparseable (PR #174 review).
+      // Kept verbatim, and blank lines with it: both are content until the quote closes.
+      yield { line: i, kind: "opaque", path: quoted.path, value: line };
+      if (closingQuote(line, quoted.quote, 0) !== -1) quoted = null;
+      continue;
+    }
     if (block) {
       // A block scalar's body is free text: `#` starts no comment and `key: value` sets nothing.
       // It runs to the first non-blank line indented no deeper than the key that opened it.
@@ -583,6 +628,12 @@ function* configYamlEntries(text) {
       // `dolt.user: historical` as a live top-level setting: enough to make enforcement skip a
       // required write, and to make a retraction comment out somebody's prose (PR #174 review).
       block = { indent, path: full, keep: value.split(/\s/)[0].includes("+") };
+      yield { line: i, kind: "opaque", path: full, value: trimmed };
+    } else if (opensQuotedScalar(value)) {
+      // `key: "first` — a quoted scalar YAML carries on over the lines below. Opaque like a block
+      // scalar's, and for the same reason: the flat map cannot hold a value spanning lines, and
+      // every line of it is text rather than settings.
+      quoted = { path: full, quote: value[0] };
       yield { line: i, kind: "opaque", path: full, value: trimmed };
     } else {
       yield { line: i, kind: "scalar", path: full, value: value.replace(/^["']|["']$/g, "") };
