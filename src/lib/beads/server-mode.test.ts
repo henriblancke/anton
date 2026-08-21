@@ -8,7 +8,7 @@
  * injected `exec` — the real one needs a live server, and a unit test must not.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -295,6 +295,28 @@ describe.skipIf(process.getuid?.() === 0)("writeFileAtomic", () => {
       chmodSync(beadsDir, 0o755);
     }
     expect(readdirSync(beadsDir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+});
+
+/**
+ * `rename` gives the target the temp file's permissions, so an atomic write must carry the old bits
+ * across: a `.beads/config.yaml` kept at 0600 because it holds a `github.token` would otherwise come
+ * back 0644 on any retraction or rollback, publishing the secret to the machine (PR #174 review).
+ */
+describe("writeFileAtomic permissions", () => {
+  it("preserves the target's restrictive mode across the rename", () => {
+    const path = metadataPath(repo(EMBEDDED));
+    chmodSync(path, 0o600);
+    writeFileAtomic(path, "replacement\n");
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readFileSync(path, "utf8")).toBe("replacement\n");
+  });
+
+  it("leaves a file that did not exist yet to the default mode a plain write would give it", () => {
+    const beadsDir = join(repo(), ".beads");
+    writeFileSync(join(beadsDir, "control.json"), "{}\n");
+    writeFileAtomic(join(beadsDir, "fresh.json"), "{}\n");
+    expect(statSync(join(beadsDir, "fresh.json")).mode & 0o777).toBe(statSync(join(beadsDir, "control.json")).mode & 0o777);
   });
 });
 

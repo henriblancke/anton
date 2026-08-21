@@ -18,7 +18,7 @@
  * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
  * `.beads/metadata.json` (anton-4gd2).
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -728,8 +728,18 @@ export function configYamlValue(beadsDir, key) {
  */
 export function writeFileAtomic(path, text) {
   const tmp = `${path}.anton-${process.pid}.tmp`;
+  // `rename` carries the TEMP file's permissions onto the target, so a default-mode temp WIDENS a
+  // restricted file — a config.yaml kept at 0600 because it holds `github.token` or `linear.api_key`
+  // would come back 0644, exposing the secret to every other user on the machine (PR #174 review).
+  // Copy the target's bits onto the temp instead, and hold it at 0600 until then so the secret is
+  // never briefly world-readable under its temp name. Ownership can't follow (chown needs privilege);
+  // only the writer's own files are rewritten here, so the owner does not change.
+  const mode = existsSync(path) ? statSync(path).mode & 0o777 : undefined;
   try {
-    writeFileSync(tmp, text);
+    writeFileSync(tmp, text, mode === undefined ? undefined : { mode: 0o600 });
+    // Unconditional: `mode` on writeFileSync only applies at CREATION, so a temp left by a crashed
+    // run with this pid would otherwise keep its own permissions.
+    if (mode !== undefined) chmodSync(tmp, mode);
     renameSync(tmp, path);
   } catch (e) {
     rmSync(tmp, { force: true });
