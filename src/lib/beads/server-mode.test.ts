@@ -695,6 +695,62 @@ describe("configureServerMode", () => {
       expect(result.ok).toBe(false);
       expect(readFileSync(configPath, "utf8")).toBe(stale);
     });
+
+    /**
+     * And put back by a refusal BEFORE the flip too (PR #174 review). The retraction is written in
+     * step 4, ahead of the source read, the backup, and both drift checks — every one of which can
+     * refuse the run. Returning from those without a rollback leaves the strike-out standing in a
+     * committed file under a report that says the project was not changed.
+     */
+    it("is put back when the run is refused before the flip, with no metadata.json step invented", () => {
+      const dir = repo(EMBEDDED);
+      const configPath = join(dir, ".beads", "config.yaml");
+      writeFileSync(configPath, stale);
+      // No `before` board: the source read fails, which is fatal without --force — and fires after
+      // the retraction has already written.
+      const { exec } = fakeBd({ dir });
+
+      const result = configureServerMode(dir, toDefaultUser, { exec });
+
+      expect(result.ok).toBe(false);
+      expect(result.switchStillWritten).toBe(false);
+      expect(readFileSync(configPath, "utf8")).toBe(stale);
+      expect(readMetadata(dir).dolt_mode).toBe("embedded");
+      // Nothing of the flip reached metadata.json, so the rollback reports config.yaml alone rather
+      // than a step for a file it never touched.
+      const reverted = result.steps.filter((s: { name: string; status: string }) => s.status === "reverted");
+      expect(reverted.map((s: { name: string }) => s.name)).toEqual(["config.yaml"]);
+    });
+
+    /**
+     * The same, from a refusal raised AFTER the flip was computed but before it was written — the
+     * one stretch where a rollback holds a `prepared` it must not report as a metadata.json write.
+     */
+    it("is put back when the board drifts, which refuses with the flip prepared but unwritten", () => {
+      const dir = repo(EMBEDDED);
+      const configPath = join(dir, ".beads", "config.yaml");
+      writeFileSync(configPath, stale);
+      const original = readFileSync(metadataPath(dir), "utf8");
+      // A writer that was never stopped files one bead between the measurement and the flip.
+      let reads = 0;
+      const exec = (_cmd: string, args: string[]): Result => {
+        if (args[0] === "--version") return { status: 0, stdout: "bd version 1.1.2" };
+        if (isRead(args)) {
+          reads += 1;
+          return { status: 0, stdout: listing(reads === 1 ? BOARD : [...BOARD, "probe-8"]) };
+        }
+        return { status: 0 };
+      };
+
+      const result = configureServerMode(dir, toDefaultUser, { exec });
+
+      expect(result.ok).toBe(false);
+      expect(result.drifted).toEqual(["probe-8"]);
+      expect(readFileSync(configPath, "utf8")).toBe(stale);
+      expect(readFileSync(metadataPath(dir), "utf8")).toBe(original);
+      const metaSteps = result.steps.filter((s: { name: string; status: string }) => s.name === "metadata.json");
+      expect(metaSteps).toEqual([]);
+    });
   });
 
   /**

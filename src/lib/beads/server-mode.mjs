@@ -999,10 +999,17 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
             'hand (`dolt_mode` back to "embedded" restores the local board) and re-run.',
         );
       }
-    } else if (prepared) {
+    } else if (prepared?.status === "already") {
       record("metadata.json", "unchanged", `${reason} — the file already said this, so nothing was written`);
     }
     if (configTouched) {
+      // What a failed restore leaves standing differs by phase: before publication the only bytes
+      // this run can have put in config.yaml are step 4's retraction, so the file is MISSING a key
+      // rather than holding half a connection, and saying the latter would send the operator
+      // looking for the wrong thing.
+      const leftBehind = configPublished
+        ? "It may therefore still hold half of the team-wide connection defaults, which every bd command in this project reads. "
+        : "It is therefore still missing the connection key this run struck out of it, which every bd command in this project reads. ";
       const current = readFileSnapshot(configPath);
       const foreign = current.ok ? foreignConfigEdits(configSnapshot, current.text, wroteConfig) : null;
       if (current.ok && current.text === configSnapshot) {
@@ -1014,9 +1021,9 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         } else {
           record("config.yaml", "failed", `${reason} — could not be put back: ${restored.detail}`);
           errors.push(
-            `${configPath} could not be put back after the switch ${reason}: ${restored.detail}. It may ` +
-              "hold half of the team-wide connection defaults, which every bd command in this project " +
-              "reads. Free up space or fix the permissions on `.beads/`, then check the file against " +
+            `${configPath} could not be put back after the switch ${reason}: ${restored.detail}. ` +
+              leftBehind +
+              "Free up space or fix the permissions on `.beads/`, then check the file against " +
               "git (`git diff -- .beads/config.yaml`) before re-running.",
           );
         }
@@ -1026,13 +1033,26 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         warnings.push(
           `${configPath} carries a change this command did not make${named}` +
             `${current.ok ? "" : ` (${current.detail})`}, so putting the earlier text back would ` +
-            "discard it — the file has been left exactly as it is. It may therefore still hold half " +
-            "of the team-wide connection defaults, which every bd command in this project reads. " +
+            "discard it — the file has been left exactly as it is. " +
+            leftBehind +
             "Check it against git (`git diff -- .beads/config.yaml`) and reconcile it by hand before " +
             "re-running.",
         );
       }
     }
+  };
+
+  /**
+   * Refuse from anywhere at or after step 4 — rolling back first, then reporting.
+   *
+   * Every refusal in that stretch can have config.yaml bytes behind it: step 4's retraction writes
+   * the file long before the flip does, and a bare `return fail(...)` leaves that strike-out standing
+   * under a report saying the project was not changed (PR #174 review). {@link revert} does nothing
+   * when nothing was written, so this is simply the exit for the whole stretch, pre-flip and post-.
+   */
+  const failWithRollback = (reason, extra) => {
+    revert(reason);
+    return fail(extra);
   };
 
   // Both the retraction below and the publication in step 12 take the project-scoped runner: on a
@@ -1074,8 +1094,12 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       if (retracted.status === "failed") errors.push(retracted.detail);
     }
     if (errors.length) {
-      revert("could not clear a stale connection key from config.yaml");
-      return fail({ before, connection, counts, backup });
+      return failWithRollback("could not clear a stale connection key from config.yaml", {
+        before,
+        connection,
+        counts,
+        backup,
+      });
     }
   }
 
@@ -1158,7 +1182,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         "corrupt), --force alone will not finish: the pre-flip backup is the same `bd export --all` " +
         "and fails too, so that board needs `--force --no-backup`.",
     );
-    return fail({ before, connection, counts });
+    return failWithRollback("could not read the board being moved", { before, connection, counts });
   } else {
     record("board records", "skipped", `${recordsBefore.detail} — --force`);
     emit(`could not read the current board (${recordsBefore.detail}) — --force: skipping the arrived-whole check.`);
@@ -1189,7 +1213,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
               "does not get past it. Fix the export, or re-run with `--force --no-backup` to switch with " +
               "neither a backup nor an arrived-whole check."),
       );
-      return fail({ before, connection, counts, backup });
+      return failWithRollback("could not back up the board", { before, connection, counts, backup });
     }
   }
 
@@ -1210,7 +1234,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   if (prepared.status === "unreadable") {
     record("metadata.json", "unreadable", prepared.detail);
     errors.push(`${prepared.detail} — nothing was written, so the board is untouched`);
-    return fail({ before, connection, counts, backup });
+    return failWithRollback("could not read metadata.json", { before, connection, counts, backup });
   }
 
   // 8. Re-read the board immediately before the flip and refuse if it moved. The reading in step 5
@@ -1236,7 +1260,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
           "— nothing has been changed. Fix the read and re-run, or re-run with --force to accept the " +
           "server's board unverified.",
       );
-      return fail({ before, connection, counts, backup });
+      return failWithRollback("could not re-read the board being moved", { before, connection, counts, backup });
     }
     // One comparison covers all three shapes of drift: a key only the later read has (created), one
     // only the earlier read has (deleted), and one both hold under different digests (updated).
@@ -1252,7 +1276,13 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
           "backup nor the arrived-whole check covers it. Stop anton (`anton stop`) and any agent or " +
           "shell writing here, then re-run.",
       );
-      return fail({ before, connection, counts, backup, drifted });
+      return failWithRollback("the board being moved changed while the switch was being prepared", {
+        before,
+        connection,
+        counts,
+        backup,
+        drifted,
+      });
     }
     record("board unchanged", "ok", `${recordsNow.keys.length} records, unchanged since the read`);
   }
@@ -1261,12 +1291,12 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   //    between them but the comparison itself (see 5a). metadata.json is the only place the mode can
   //    live: `bd config set dolt.mode` reports success while writing a nested block into a file of
   //    flat dotted keys, from bd's lowest-priority source, and has no effect (anton-4gd2).
-  //    Written atomically, and a failure reported rather than thrown: this is the one write that
-  //    happens before `revert` exists, so an unhandled ENOSPC/EROFS/EIO here would leave the CLI
-  //    exiting on a stack trace over a metadata.json a plain write had already truncated
-  //    (PR #174 review). {@link writeFileAtomic} keeps the previous file intact through the
-  //    failure, so there is nothing to roll back — config.yaml is not published until step 12 — and
-  //    the flow returns the same structured refusal every other pre-flip check does.
+  //    Written atomically, and a failure reported rather than thrown: an unhandled ENOSPC/EROFS/EIO
+  //    here would leave the CLI exiting on a stack trace over a metadata.json a plain write had
+  //    already truncated (PR #174 review). {@link writeFileAtomic} keeps the previous file intact
+  //    through the failure, so this file has nothing to roll back — and the flow returns the same
+  //    structured refusal every other pre-flip check does, through {@link failWithRollback}, which
+  //    still owes config.yaml step 4's retraction.
   if (prepared.status === "prepared") {
     // 9a. The merge in step 7 was computed over metadata.json as it read THEN, and the board
     //     re-read since can run for the whole network budget. An edit that landed in that window —
@@ -1279,7 +1309,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     if (!current.ok) {
       record("metadata.json", "failed", current.detail);
       errors.push(`${current.detail} — nothing was written, so the board is untouched`);
-      return fail({ before, connection, counts, backup });
+      return failWithRollback("could not re-read metadata.json", { before, connection, counts, backup });
     }
     if (current.text !== prepared.before) {
       const detail = "changed while the switch was being prepared";
@@ -1290,7 +1320,12 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
           "untouched. Stop anton (`anton stop`) and any agent or shell writing here, then re-run " +
           "to merge the switch over the current file.",
       );
-      return fail({ before, connection, counts, backup });
+      return failWithRollback("metadata.json changed while the switch was being prepared", {
+        before,
+        connection,
+        counts,
+        backup,
+      });
     }
     try {
       writeFileAtomic(prepared.path, prepared.text);
@@ -1301,11 +1336,12 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         `could not write ${prepared.path}: ${detail} — the file still holds its previous contents ` +
           "and the board is untouched. Free up space or fix the permissions on `.beads/`, then re-run.",
       );
-      return fail({ before, connection, counts, backup });
+      return failWithRollback("could not write the switch into metadata.json", { before, connection, counts, backup });
     }
   }
   record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
-  // From here on a refusal has something to undo — and something to report if it cannot.
+  // From here on a refusal has metadata.json to undo as well — config.yaml has been revertable since
+  // step 4 ({@link failWithRollback}).
   if (prepared.status === "prepared") {
     switchStillWritten = true;
     wroteMetadata = prepared.text;
@@ -1322,8 +1358,13 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         ? `the server accepted the connection but will not serve the "${connection.database}" database: ${tested.detail}`
         : `bd dolt test could not connect: ${tested.detail}`,
     );
-    revert(tested.stage === "read" ? "board unreadable on the server" : "could not connect");
-    return fail({ before, connection, counts, backup, hints: tested.hints });
+    return failWithRollback(tested.stage === "read" ? "board unreadable on the server" : "could not connect", {
+      before,
+      connection,
+      counts,
+      backup,
+      hints: tested.hints,
+    });
   }
 
   // 11. Prove THIS board arrived, not just that some board answers. The server's copy is checked by
@@ -1347,8 +1388,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
     // database — bd's own project-identity guard does exactly that when the connection names a
     // database belonging to another project ("PROJECT IDENTITY MISMATCH — refusing to connect").
     errors.push(`the server accepted the connection but this project cannot read its board: ${recordsAfter.detail}`);
-    revert("board unreadable on the server");
-    return fail({ before, connection, counts, backup });
+    return failWithRollback("board unreadable on the server", { before, connection, counts, backup });
   }
   counts.after = recordsAfter.keys.length;
 
@@ -1374,8 +1414,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
         `${counts.before} records (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}) — ` +
         "its history has not been copied onto the server yet",
     );
-    revert("server board is missing records");
-    return fail({ before, connection, counts, backup, missing });
+    return failWithRollback("server board is missing records", { before, connection, counts, backup, missing });
   }
 
   // 11b. Every key the server DOES hold, compared by content against the board being moved. A copy
@@ -1428,8 +1467,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
             "--all` from each before reaching for --force.)"
           : ""),
     );
-    revert("server board differs from this one");
-    return fail({ before, connection, counts, backup, missing, diverged });
+    return failWithRollback("server board differs from this one", { before, connection, counts, backup, missing, diverged });
   }
 
   // 11c. Keys the SERVER holds and this board does not. Two different things wear that shape and
@@ -1483,8 +1521,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
       `${configNow.detail} — the team-wide defaults are not published, because a half-written ` +
         "config.yaml could not be rolled back from a snapshot this cannot read",
     );
-    revert("could not snapshot config.yaml before publishing");
-    return fail({ before, connection, counts, backup, missing, diverged, extra });
+    return failWithRollback("could not snapshot config.yaml before publishing", { before, connection, counts, backup, missing, diverged, extra });
   }
   configPublished = true;
   // What each connection key WOULD be published as — the value {@link claim} records once a step
@@ -1508,8 +1545,7 @@ export function configureServerMode(dir, flags = {}, opts = {}) {
   // commands do first), so this is the same class of failure as a refused connection — and gets the
   // same answer: the project goes back to what it was rather than staying half-switched.
   if (errors.length) {
-    revert("could not publish the team-wide connection defaults");
-    return fail({ before, connection, counts, backup, missing, diverged, extra });
+    return failWithRollback("could not publish the team-wide connection defaults", { before, connection, counts, backup, missing, diverged, extra });
   }
 
   return { ok: true, steps, errors, warnings, before, connection, counts, backup, missing, diverged, extra };
