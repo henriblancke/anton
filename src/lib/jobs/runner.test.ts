@@ -1830,6 +1830,13 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   // daytime reserve never holds these ticks: the coarse gate admits and the fine gate decides.
   // sessionPct 85 → 15% headroom ≤ scarceHeadroomPct 20 → scarce (high-value only).
 
+  /**
+   * A project that has NOMINATED `risk:high` as its top value label (anton-prng). The scorer ships
+   * no vocabulary, so a gate test about high-value work has to say which label this board calls
+   * high-value — exactly as the project's settings do at runtime.
+   */
+  const VALUE_POLICY: BudgetPolicy = { ...DEFAULT_BUDGET_POLICY, valueLabels: ["risk:high"] };
+
   /** Labels by bead id for the gate's reader; anything not listed reads as label-less cleanup. */
   const labelsReader =
     (byBead: Record<string, string[]>): BeadLabelsReader =>
@@ -1853,6 +1860,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         readUsage: async () => usage({ sessionPct: 85 }),
+        policy: VALUE_POLICY,
         readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
       },
     );
@@ -1884,6 +1892,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // No burn samples → execute-epic costs the L-tier seed (20%), over the 15% headroom.
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
+      policy: VALUE_POLICY,
       readBeadLabels: labelsReader({ "A-1": ["risk:high"] }),
     });
     await r.enqueue({
@@ -1977,6 +1986,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         readUsage: async () => usage({ sessionPct }),
+        policy: VALUE_POLICY,
         readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
       },
     );

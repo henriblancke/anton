@@ -188,6 +188,13 @@ describe("Scheduler.tickOnce", () => {
       expect(row.enabled).toBe(enabled);
       expect(row.nextRunAt != null).toBe(enabled);
     }
+    // board-picker (anton-albm) named explicitly, not just covered by the loop above: it is the one
+    // automation that STARTS work rather than reporting on it, so a default that ever shipped armed
+    // would hand anton a standing approval the operator never gave.
+    const picker = rows.find((r) => r.type === "board-picker")!;
+    expect(picker.enabled).toBe(false);
+    expect(picker.cron).toBe("*/10 * * * *");
+    expect(picker.nextRunAt).toBeNull();
   });
 
   it("seeds once when two boots race the backfill — the read and the inserts are one transaction", async () => {

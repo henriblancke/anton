@@ -33,6 +33,7 @@ const DEFAULT_CRONS = {
   unstick: "10 * * * *",
   "gate-check": "*/10 * * * *",
   gardener: "0 5 * * *",
+  "board-picker": "*/10 * * * *",
 };
 
 type Earned = Parameters<typeof SettingsView>[0]["earned"];
@@ -59,6 +60,7 @@ function renderView(
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
   schedules: Parameters<typeof SettingsView>[0]["schedules"] = [],
   earned: Earned = NO_RECORD,
+  labelVocabulary: Parameters<typeof SettingsView>[0]["labelVocabulary"] = [],
 ) {
   return render(
     <SettingsView
@@ -69,6 +71,7 @@ function renderView(
       defaultCrons={DEFAULT_CRONS}
       agents={agents}
       bundledIds={[]}
+      labelVocabulary={labelVocabulary}
       earned={earned}
     />,
   );
@@ -410,6 +413,98 @@ describe("SettingsView pipeline variants (anton-aa3m)", () => {
   });
 });
 
+describe("SettingsView work value (anton-prng)", () => {
+  showing("value");
+
+  /** A board whose namespaces are its own — the picker must offer these, not labels anton assumed. */
+  const VOCABULARY = [
+    {
+      namespace: "severity",
+      labels: [
+        { label: "severity:sev1", count: 4 },
+        { label: "severity:sev2", count: 2 },
+      ],
+    },
+    { namespace: "", labels: [{ label: "approved", count: 9 }] },
+  ];
+
+  it("shows the zero-config state: nothing nominated, ranking by age alone", () => {
+    renderView({});
+    expect(screen.getByText(/Nothing nominated/)).toBeTruthy();
+  });
+
+  it("seeds the rows from the persisted nominations, in band order", () => {
+    renderView({ valueLabels: ["risk:high", "blocking-PR"] });
+    expect((screen.getByLabelText("Value label 1") as HTMLInputElement).value).toBe("risk:high");
+    expect((screen.getByLabelText("Value label 2") as HTMLInputElement).value).toBe("blocking-PR");
+  });
+
+  it("offers the board's OWN labels, grouped by namespace, and nominates one on click", () => {
+    const fetchMock = stubFetch();
+    renderView({}, [], [], NO_RECORD, VOCABULARY);
+
+    expect(screen.getByText("severity:")).toBeTruthy();
+    const chip = screen.getByRole("button", { name: /severity:sev1/ });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(
+      (screen.getByLabelText("Value label 1") as HTMLInputElement).value,
+    ).toBe("severity:sev1");
+    expect(
+      screen.getByRole("button", { name: /severity:sev1/ }).getAttribute("aria-pressed"),
+    ).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["severity:sev1"]);
+  });
+
+  it("PATCHes typed nominations on Save, dropping blank and repeat rows", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.change(screen.getByLabelText("Value label 1"), { target: { value: " risk:high " } });
+    // A repeat could never reach its tier (first match wins) and would 400 the whole save.
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.change(screen.getByLabelText("Value label 2"), { target: { value: "risk:high" } });
+    // An abandoned scaffolding row is not a nomination.
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["risk:high"]);
+  });
+
+  it("reorders a nomination — the list's order is the band order, so it must be editable", () => {
+    const fetchMock = stubFetch();
+    renderView({ valueLabels: ["risk:high", "blocking-PR"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Move value label 2 up" }));
+    expect((screen.getByLabelText("Value label 1") as HTMLInputElement).value).toBe("blocking-PR");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["blocking-PR", "risk:high"]);
+  });
+
+  it("removes a nomination, and an emptied list clears them", () => {
+    const fetchMock = stubFetch();
+    renderView({ valueLabels: ["risk:high"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove value label 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual([]);
+  });
+
+  it("says so when the board read came back empty, instead of offering nothing at all", () => {
+    renderView({});
+    expect(screen.getByText(/No labels read off this board yet/)).toBeTruthy();
+  });
+});
+
 describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
   showing("automation");
 
@@ -491,10 +586,25 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getAllByText("never").length).toBeGreaterThan(0);
   });
 
+  it("ships the board-picker row off, at the cadence it would be created at", () => {
+    // Seeded disabled (schedules.ts) because nothing an operator did not ask for should start
+    // running; the panel is where that choice is made, so the row must be visible while still off.
+    renderView({}, [], stringer());
+
+    expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+    // The pass decides only. The row must promise the ranking and NOT a start, or arming it reads
+    // as autopilot and the operator waits for work that was never going to begin.
+    expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
+    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
+  });
+
   it("reads 'not scheduled' when the automation is off or has no row", () => {
     renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
 
-    expect(screen.getAllByText("not scheduled").length).toBe(8);
+    expect(screen.getAllByText("not scheduled").length).toBe(9);
     // gardener has no row at all — it still shows the cadence it would be created at.
     expect(cadenceButton("gardener").textContent).toContain("Daily at 05:00");
   });
@@ -567,7 +677,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     );
     try {
       // Rendered from the page's snapshot: due in a minute, and never run.
-      expect(screen.getAllByText("never").length).toBe(8);
+      expect(screen.getAllByText("never").length).toBe(9);
 
       // Arriving at the panel re-reads once — a hash switch is not a navigation, so the snapshot
       // this page was rendered with could be an hour old.
@@ -576,7 +686,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
       // Both time columns moved to what the server now holds...
       expect(screen.getByText("in 30m")).toBeTruthy();
       expect(screen.getByText("1m ago")).toBeTruthy();
-      expect(screen.getAllByText("never").length).toBe(7);
+      expect(screen.getAllByText("never").length).toBe(8);
       // ...while the cadence stayed the operator's, not the poll's.
       expect(cadenceButton().textContent).toContain("Every 30 minutes");
 

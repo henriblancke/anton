@@ -24,7 +24,8 @@ export type JobType =
   | "unstick"
   | "gate-check"
   | "gardener"
-  | "product-master";
+  | "product-master"
+  | "board-picker";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).

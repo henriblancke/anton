@@ -40,6 +40,21 @@ interface VariantRow extends FormulaVariant {
   id: string;
 }
 
+/**
+ * A `ns:` group of the labels this project's board actually uses (anton-prng), mirrored from the
+ * server's LabelNamespace. `namespace` is `""` for bare labels like `approved`.
+ */
+interface LabelNamespace {
+  namespace: string;
+  labels: { label: string; count: number }[];
+}
+
+/** One nominated value label, with a stable local id so reordering never moves the operator's cursor. */
+interface ValueLabelRow {
+  id: string;
+  label: string;
+}
+
 /** Settings the UI can edit today. Kept local so this client module never imports server code. */
 interface EditableSettings {
   model?: string;
@@ -81,6 +96,8 @@ interface EditableSettings {
     daytimeReservePct?: number;
     weeklyTargetPct?: number;
   };
+  /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
+  valueLabels?: string[];
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -351,6 +368,12 @@ const SECTIONS = [
       "budget",
     ],
   },
+  {
+    id: "value",
+    label: "Work value",
+    group: "While a run works",
+    dirtyKeys: ["valueLabels"],
+  },
   { id: "gates", label: "Verify gates", group: "Before the PR opens", dirtyKeys: ["gates"] },
   {
     id: "review",
@@ -474,6 +497,12 @@ const AUTOMATIONS: AutomationSpec[] = [
     group: "Run health",
   },
   {
+    id: "board-picker",
+    label: "board-picker",
+    description: "ranks what could run next · records the plan · starts nothing yet",
+    group: "Board maintenance",
+  },
+  {
     id: "product-master",
     label: "product-master",
     description: "product judgment · proposes reprioritize / split / kill · applies what you armed",
@@ -529,6 +558,7 @@ export function SettingsView({
   defaultCrons,
   agents,
   bundledIds,
+  labelVocabulary,
   earned,
 }: {
   project: Project;
@@ -543,6 +573,8 @@ export function SettingsView({
   agents: DiscoveredAgent[];
   /** Ids anton ships as bundled specialists — the only agents the allowlist gates. */
   bundledIds: string[];
+  /** The label namespaces this project's board actually uses — what value nominations pick from. */
+  labelVocabulary: LabelNamespace[];
   /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
@@ -658,6 +690,12 @@ export function SettingsView({
     (settings.formulaVariants ?? []).map((v, i) => ({ id: `v${i}`, ...v })),
   );
   const nextVariantId = useRef(variantRows.length);
+  // Nominated value labels (anton-prng). Ordered like the variant rows and for the same reason: the
+  // array order IS the band order anton ranks by, so edits preserve it rather than re-sorting.
+  const [valueLabelRows, setValueLabelRows] = useState<ValueLabelRow[]>(() =>
+    (settings.valueLabels ?? []).map((label, i) => ({ id: `vl${i}`, label })),
+  );
+  const nextValueLabelId = useRef(valueLabelRows.length);
   // Per-kind proposal autonomy (anton-nbyy), held RESOLVED rather than as the sparse override map
   // the server stores: the control has to render a level for every kind, and "absent" is not one.
   const [proposalAutonomy, setProposalAutonomy] = useState(() =>
@@ -680,6 +718,9 @@ export function SettingsView({
    * moves, so a save would leave every indicator here stuck on.
    */
   const savedAutonomy = resolveProposalAutonomy(baseline.proposalAutonomy, earned);
+  // What a save would send, and what the board picker reads back as "already nominated".
+  const stagedValueLabels = nominatedLabels(valueLabelRows);
+  const nominated = new Set(stagedValueLabels);
   const dirty: Record<string, boolean> = {
     model: model !== (baseline.model ?? ""),
     agents: !sameIds(
@@ -691,6 +732,7 @@ export function SettingsView({
     productMasterPrompt:
       productMasterPrompt.trim() !== (baseline.productMasterPrompt ?? "").trim(),
     formulaVariants: !sameVariants(variantRows, baseline.formulaVariants ?? []),
+    valueLabels: !sameLabels(stagedValueLabels, baseline.valueLabels ?? []),
     concurrency: concurrency !== (baseline.concurrency ?? DEFAULT_CONCURRENCY),
     jobTimeoutMinutes:
       jobTimeoutMinutes !== (baseline.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES),
@@ -865,6 +907,27 @@ export function SettingsView({
     });
   }
 
+  /** Move a nomination one place up or down — the list's order is the band order an operator tunes. */
+  function moveValueLabel(id: string, delta: -1 | 1) {
+    setValueLabelRows((rows) => {
+      const at = rows.findIndex((r) => r.id === id);
+      const to = at + delta;
+      if (at < 0 || to < 0 || to >= rows.length) return rows;
+      const next = [...rows];
+      [next[at], next[to]] = [next[to], next[at]];
+      return next;
+    });
+  }
+
+  /** Nominate a label from the board's own vocabulary, or drop it if it is already nominated. */
+  function toggleValueLabel(label: string) {
+    setValueLabelRows((rows) =>
+      rows.some((r) => r.label.trim() === label)
+        ? rows.filter((r) => r.label.trim() !== label)
+        : [...rows, { id: `new-${nextValueLabelId.current++}`, label }],
+    );
+  }
+
   function toggleAgent(agent: string) {
     setActiveAgents((prev) => {
       const next = new Set(prev);
@@ -909,6 +972,11 @@ export function SettingsView({
           formulaVariants: variantRows
             .map((v) => ({ label: v.label.trim(), formula: v.formula.trim() }))
             .filter((v) => v.label && v.formula),
+          // Nominated value labels (anton-prng), in the order shown — that order is the band order.
+          // Blank scaffolding rows and a repeat nomination (unreachable by definition — the first
+          // match wins) are dropped rather than 400ing the whole save; [] clears the nominations,
+          // which puts ranking back on native fields alone.
+          valueLabels: nominatedLabels(valueLabelRows),
           concurrency,
           jobTimeoutMinutes,
           ticketTimeoutMinutes,
@@ -1636,7 +1704,160 @@ export function SettingsView({
           </div>
           )}
 
-          {/* Automation — full width, because seven schedules are records with identical fields and
+          {/* Work value — which of the BOARD'S OWN labels mark work worth scarce capacity
+              (anton-prng). anton nominates none: an unnominated board ranks on age alone. */}
+          {active === "value" && (
+          <section className="flex flex-col gap-3.5">
+            <div className="flex items-baseline gap-2.5">
+              <h2 className="text-[15px] font-semibold">Work value</h2>
+              <span className="text-xs text-subtle">
+                which labels mark work worth scarce capacity · highest tier first
+              </span>
+            </div>
+
+            <div className="flex max-w-2xl flex-col gap-2">
+              {valueLabelRows.length === 0 ? (
+                <p className="rounded-[10px] border border-dashed border-border px-3 py-3 text-[11.5px] text-subtle">
+                  Nothing nominated — anton ranks queued work by how long it has waited, and nothing
+                  else.
+                </p>
+              ) : (
+                <ul className="flex flex-col gap-2">
+                  {valueLabelRows.map((row, i) => (
+                    <li
+                      key={row.id}
+                      className="flex items-center gap-2 rounded-[10px] border border-border bg-card px-2.5 py-2"
+                    >
+                      <span className="w-4 shrink-0 text-center font-mono text-[10px] text-subtle">
+                        {i + 1}
+                      </span>
+                      <input
+                        type="text"
+                        value={row.label}
+                        onChange={(e) =>
+                          setValueLabelRows((rows) =>
+                            rows.map((r) => (r.id === row.id ? { ...r, label: e.target.value } : r)),
+                          )
+                        }
+                        placeholder="a label your board uses"
+                        maxLength={120}
+                        list="board-label-vocabulary"
+                        aria-label={`Value label ${i + 1}`}
+                        className="min-w-0 flex-1 rounded-lg border border-border bg-background px-2.5 py-1.5 font-mono text-[12px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+                      />
+                      <span className="hidden shrink-0 text-[10.5px] text-subtle sm:inline">
+                        {i === 0 ? "outranks everything below" : `below ${valueLabelRows[i - 1].label.trim() || `tier ${i}`}`}
+                      </span>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        onClick={() => moveValueLabel(row.id, -1)}
+                        disabled={i === 0}
+                        aria-label={`Move value label ${i + 1} up`}
+                      >
+                        <ChevronUpIcon aria-hidden="true" />
+                      </Button>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        onClick={() => moveValueLabel(row.id, 1)}
+                        disabled={i === valueLabelRows.length - 1}
+                        aria-label={`Move value label ${i + 1} down`}
+                      >
+                        <ChevronDownIcon aria-hidden="true" />
+                      </Button>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        onClick={() =>
+                          setValueLabelRows((rows) => rows.filter((r) => r.id !== row.id))
+                        }
+                        aria-label={`Remove value label ${i + 1}`}
+                      >
+                        <XIcon aria-hidden="true" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="self-start"
+                onClick={() =>
+                  setValueLabelRows((rows) => [
+                    ...rows,
+                    { id: `new-${nextValueLabelId.current++}`, label: "" },
+                  ])
+                }
+              >
+                <PlusIcon aria-hidden="true" />
+                Add label
+              </Button>
+            </div>
+
+            {/* The board's own vocabulary, grouped by namespace — anton ships none, so what can be
+                nominated is whatever this board already labels its work with. */}
+            {labelVocabulary.length === 0 ? (
+              <p className="max-w-2xl text-[11px] text-subtle">
+                No labels read off this board yet — type one above.
+              </p>
+            ) : (
+              <div className="flex max-w-2xl flex-col gap-3">
+                <span className="text-[12.5px] font-medium">
+                  On this board{" "}
+                  <span className="text-[11px] font-normal text-subtle">
+                    · click to nominate · the number is how many beads carry it
+                  </span>
+                </span>
+                {labelVocabulary.map((group) => (
+                  <div key={group.namespace} className="flex flex-col gap-1.5">
+                    <span className="font-mono text-[10.5px] text-subtle">
+                      {group.namespace ? `${group.namespace}:` : "no namespace"}
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {group.labels.map(({ label, count }) => (
+                        <button
+                          key={label}
+                          type="button"
+                          onClick={() => toggleValueLabel(label)}
+                          aria-pressed={nominated.has(label)}
+                          className={cn(
+                            "flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-mono text-[11px] transition-colors",
+                            nominated.has(label)
+                              ? "border-primary/60 bg-primary/10 text-foreground"
+                              : "border-border bg-card text-muted-foreground hover:border-primary/40 hover:text-foreground",
+                          )}
+                        >
+                          {label}
+                          <span className="text-[9.5px] text-subtle">{count}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {/* Typeahead for the free-text rows: the same vocabulary, so a typed nomination is a
+                label the board actually carries rather than one that matches nothing. */}
+            <datalist id="board-label-vocabulary">
+              {labelVocabulary.flatMap((group) =>
+                group.labels.map(({ label }) => <option key={label} value={label} />),
+              )}
+            </datalist>
+
+            <span className="max-w-2xl text-[11px] text-subtle">
+              anton ships no vocabulary — these are your board&apos;s labels, and nominating none is
+              a real answer. Nominated labels form disjoint value bands in the order above: any bead
+              in a higher band outranks every bead below it, and how long a bead has waited only
+              breaks ties inside its own band. Work carrying none of them ranks by age alone, under
+              everything nominated. That ranking is what decides which queued work anton spends
+              scarce capacity on first (Concurrency &amp; limits → Budget-aware execution).
+            </span>
+          </section>
+          )}
+
+          {/* Automation — full width, because the schedules are records with identical fields and
               a table is how you compare them (anton-ue90.4). */}
           {active === "automation" && (
           <section className="flex flex-col gap-3.5">
@@ -1837,6 +2058,23 @@ function sameVariants(rows: VariantRow[], stored: FormulaVariant[]): boolean {
     .filter((v) => v.label && v.formula);
   if (staged.length !== stored.length) return false;
   return staged.every((v, i) => v.label === stored[i].label && v.formula === stored[i].formula);
+}
+
+/**
+ * The nominations a save would send: trimmed, blanks dropped, and a repeat dropped rather than sent.
+ * A label nominated twice can never reach its second tier (the first match wins), so the server
+ * rejects it — pruning it here keeps one stray duplicate from failing an otherwise valid save.
+ */
+function nominatedLabels(rows: ValueLabelRow[]): string[] {
+  const seen = new Set<string>();
+  return rows
+    .map((r) => r.label.trim())
+    .filter((label) => label !== "" && !seen.has(label) && (seen.add(label), true));
+}
+
+/** Ordered label equality — the list's order is the band order, so a reorder IS an edit. */
+function sameLabels(staged: string[], stored: string[]): boolean {
+  return staged.length === stored.length && staged.every((label, i) => label === stored[i]);
 }
 
 function Field({

@@ -127,24 +127,34 @@ function ticketIndex(board: Bead[], cards: BoardCards): Map<string, Bead[]> {
  * its new parent's tickets, so its own approval stops meaning anything.
  */
 function runnableGap(target: Bead, board: Bead[]): ApprovalGap[] {
-  if (beads.isRunTarget(target, board)) return [];
-  const parent = beads.parentOf(target);
-  const type = target.issue_type ?? "unknown";
-  let why: string;
-  if (beads.isContainer(target, board)) {
-    why =
-      "it has feature children and is now a container epic — approve one of its features instead; each is its own run and its own PR";
-  } else if ((type === "task" || type === "bug") && parent) {
-    why = `it now sits under ${parent} and runs as one of that target's tickets, not on its own`;
-  } else {
-    why = `type "${type}" is not runnable — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
-  }
+  const why = notRunnableWhy(target, board);
+  if (!why) return [];
   return [
     {
       rule: "runnable",
       message: `${target.id} → no longer a run target: ${why}`,
     },
   ];
+}
+
+/**
+ * Why nothing can run this target, as the clause a refusal quotes — undefined when it IS one.
+ *
+ * Exported because the board-picker refuses on the same rule (jobs/picker-targets.ts) and has to
+ * tell the operator the same thing: a second wording of "this is a container epic, approve one of
+ * its features" would be a second answer to a question the board only has one answer to.
+ */
+export function notRunnableWhy(target: Bead, board: Bead[]): string | undefined {
+  if (beads.isRunTarget(target, board)) return undefined;
+  const parent = beads.parentOf(target);
+  const type = target.issue_type ?? "unknown";
+  if (beads.isContainer(target, board)) {
+    return "it has feature children and is now a container epic — approve one of its features instead; each is its own run and its own PR";
+  }
+  if ((type === "task" || type === "bug") && parent) {
+    return `it now sits under ${parent} and runs as one of that target's tickets, not on its own`;
+  }
+  return `type "${type}" is not runnable — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
 }
 
 /**

@@ -36,12 +36,19 @@ const AUTOMATIONS: AutomationSpec[] = [
     dependsOn: "run-health",
     group: "Run health",
   },
+  {
+    id: "board-picker",
+    label: "board-picker",
+    description: "ranks what could run next · records the plan · starts nothing yet",
+    group: "Board maintenance",
+  },
 ];
 
 const DEFAULT_CRONS: Record<string, string> = {
   "nightly-stringer": "0 3 * * *",
   "run-health": "0 * * * *",
   unstick: "10 * * * *",
+  "board-picker": "*/10 * * * *",
 };
 
 /** Every automation gets a row, so the table renders the same shape the settings page passes in. */
@@ -230,6 +237,16 @@ describe("the automation rows", () => {
   it("says which automations are fed once the one that feeds them is on", () => {
     renderTable({ "run-health": { enabled: true } });
     expect(screen.getByText(/fed by run-health/)).toBeTruthy();
+  });
+
+  it("says what the board-picker does and how often it would fire", () => {
+    // The pass decides only — it ranks the board and records the plan, and starts nothing. A row
+    // that promised a start would have an operator flip the switch and watch nothing happen, so the
+    // copy has to name the limit, not just the ambition.
+    renderTable();
+    expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
+    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
+    expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
   });
 
   it("hands a toggle back as the state the operator asked for", () => {

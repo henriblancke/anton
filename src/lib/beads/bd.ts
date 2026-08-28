@@ -13,6 +13,7 @@ import { resolveBdBin } from "./bd-bin";
 import { PROJECT_SCOPED_BD_ENV, isServerMode, readBoardMode } from "./board-mode";
 import { withBeadWriteLock } from "./claim-lock";
 import { isPipelineArtifact } from "./contract";
+import { rankTargets, type RankedTarget } from "./rank";
 import { invalidateIssueSnapshot, issueSnapshotRefreshInFlight } from "./snapshot";
 
 // Bead/BeadDep live in the leaf ./types module so snapshot.ts can share them without importing
@@ -1827,18 +1828,11 @@ export function parseRecomputeBlocked(raw: string): number {
 export const ownerOf = (b: Bead | undefined): string | undefined => b?.assignee?.trim() || undefined;
 
 /**
- * A claimable run target plus the facts it was ranked on, so "why is this next?" is answerable from
- * the value itself rather than by re-deriving the comparator at each consumer.
+ * A claimable run target plus the facts it was ranked on. The shape and the order both come from
+ * `./rank` — the PRIME order is the SAME order the picker and an external `bd` worker follow, so
+ * there is one definition of it and this module composes it (see {@link rankClaimableTargets}).
  */
-export interface ClaimableTarget {
-  bead: Bead;
-  /** bd priority: 0 = critical … 4 = lowest. A bead with none is treated as lowest. */
-  priority: number;
-  /** How many open beads this target transitively unblocks via `blocks` edges. */
-  unblocks: number;
-  /** The bead's `created_at`, the age tiebreak (oldest first); "" when bd reported none. */
-  createdAt: string;
-}
+export type ClaimableTarget = RankedTarget;
 
 /**
  * The claimable POOL query: every approved, unclaimed bead bd itself considers ready — its
@@ -1855,13 +1849,6 @@ export interface ClaimableTarget {
 export function buildClaimableReadyArgs(): string[] {
   return ["ready", "--label", LABELS.approved, "--unassigned", "--json", "--limit", "0"];
 }
-
-/** Missing bead priority sorts after every explicit priority (bd uses 0=critical … 4=lowest). */
-const DEFAULT_CLAIMABLE_PRIORITY = 4;
-
-/** A bead with no `created_at` sorts LAST on the age tiebreak — an unstamped bead must not jump
- * the queue ahead of work that has genuinely been waiting. */
-const UNDATED = "\uffff";
 
 /**
  * May a worker claim this bead and run it? The anton-side half of the claimable rule, applied to a
@@ -1886,72 +1873,18 @@ function isClaimable(b: Bead, board: Bead[]): boolean {
 }
 
 /**
- * `id → how many open beads it transitively unblocks`, built once per board.
- *
- * A `blocks` edge is (from = dependent, to = blocker), so the dependents of a target are what its
- * completion releases; the count is the transitive closure of that, restricted to beads that are
- * still open (a closed dependent was never waiting). Cycle-guarded via `seen`, and a dependent that
- * isn't on the board is traversed but not counted — it is evidence of an edge, not of open work.
- */
-function unblockCounter(board: Bead[]): (id: string) => number {
-  const dependents = new Map<string, string[]>();
-  for (const e of beads.edgesOf(board)) {
-    if (e.type !== "blocks") continue;
-    const list = dependents.get(e.to);
-    if (list) list.push(e.from);
-    else dependents.set(e.to, [e.from]);
-  }
-  const openIds = new Set(board.filter((b) => b.status !== "closed").map((b) => b.id));
-
-  return (id: string): number => {
-    const seen = new Set<string>([id]);
-    const queue = [id];
-    let count = 0;
-    while (queue.length) {
-      for (const next of dependents.get(queue.shift() as string) ?? []) {
-        if (seen.has(next)) continue;
-        seen.add(next);
-        queue.push(next);
-        if (openIds.has(next)) count++;
-      }
-    }
-    return count;
-  };
-}
-
-/**
- * The rank order itself — priority, then unblocking value, then age, then id. Total and
- * deterministic (the id tiebreak is what makes it total), so two machines reading the same board
- * agree on what anton picks up next.
- */
-function compareClaimable(a: ClaimableTarget, b: ClaimableTarget): number {
-  if (a.priority !== b.priority) return a.priority - b.priority; // P0 first
-  if (a.unblocks !== b.unblocks) return b.unblocks - a.unblocks; // frees the most work first
-  const ageA = a.createdAt || UNDATED;
-  const ageB = b.createdAt || UNDATED;
-  if (ageA !== ageB) return ageA < ageB ? -1 : 1; // oldest first
-  return a.bead.id < b.bead.id ? -1 : 1;
-}
-
-/**
- * Narrow bd's ready pool to the claimable run targets and RANK them (see {@link compareClaimable}).
- * Pure over its input — no bd spawn — so the rule is testable against fixture boards and reusable by
- * any caller that already holds a board.
+ * Narrow bd's ready pool to the claimable run targets and RANK them in the PRIME order
+ * ({@link rankTargets}). Pure over its input — no bd spawn — so the rule is testable against
+ * fixture boards and reusable by any caller that already holds a board.
  *
  * `pool` is bd's blocker-aware ready answer; `board` is the full `--status all` list, which supplies
  * the parentage, `blocks` edges and feature children the narrowing and the unblocking count need.
  */
 export function rankClaimableTargets(pool: Bead[], board: Bead[]): ClaimableTarget[] {
-  const unblocks = unblockCounter(board);
-  return pool
-    .filter((b) => isClaimable(b, board))
-    .map((bead) => ({
-      bead,
-      priority: bead.priority ?? DEFAULT_CLAIMABLE_PRIORITY,
-      unblocks: unblocks(bead.id),
-      createdAt: bead.created_at ?? "",
-    }))
-    .sort(compareClaimable);
+  return rankTargets(
+    pool.filter((b) => isClaimable(b, board)),
+    board,
+  );
 }
 
 /**
