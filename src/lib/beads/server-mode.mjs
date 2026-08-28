@@ -1,0 +1,1552 @@
+/**
+ * Point ONE project's board at a shared `dolt sql-server` (anton-yvjd) — the code half of the
+ * embedded → server move whose data half is `docs/runbooks/embedded-board-to-shared-dolt-server.md`.
+ *
+ * Per project, never per machine: the mode and the connection live in that project's
+ * `.beads/metadata.json` (DESIGN.md §3a), so one anton can drive an embedded board and a
+ * shared-server board side by side. Everything here takes a repo dir and touches nothing outside it.
+ *
+ * The command this module implements (`anton server-mode`) is deliberately NOT the migration. It
+ * cannot be: the board's history is a Dolt database directory that has to reach the server's data
+ * volume by a path anton has no business automating (the runbook streams it over ssh into the
+ * container's volume — `bd dolt remote add` + `bd dolt push` cannot do it, because in server mode
+ * the push executes ON THE SERVER, and the `dolt-sql-server` image ships no ssh client and no keys).
+ * What this module owns is everything around that copy, which is where a board actually gets lost:
+ *
+ *   1. **Back up first.** A JSONL export of the board as it stands, before the flip. The embedded
+ *      Dolt directory is left exactly where it is — it is the real history backup, and the escape
+ *      hatch if the server goes away.
+ *   2. **Write the connection, then prove it.** `bd dolt test` must connect, or the flip is undone.
+ *   3. **Prove the board arrived, whole and current.** The board read before the flip is compared
+ *      with the one read back from the server: every record must be there, and must say on the
+ *      server exactly what it says here. A record is a `bd export` line — an issue with its labels,
+ *      dependencies and full comment thread, or a persistent memory — because a comment and a
+ *      `bd remember` are durable board state a listing never shows, and stranding them is as
+ *      permanent as stranding a bead (PR #174 review). A missing record means the data copy has not
+ *      happened or landed in another database; one whose content differs means the server's copy and
+ *      this board were edited apart — in EITHER direction, because a later `updated_at` on the
+ *      server orders two writes without merging them and so is no proof its row carries this
+ *      board's edit. Both are the class of mistake that makes an otherwise-successful switch look
+ *      fine while the team stares at a board with work missing from it. It reverts rather than
+ *      reports.
+ *   4. **Prove nobody wrote it meanwhile.** The board is read once to measure and once more
+ *      immediately before the flip, and every record's CONTENT is compared, not just the key set: an
+ *      update the server's copy predates would otherwise sail through step 3 and be stranded in the
+ *      database this project is about to stop reading. What remains is the flip itself — a single
+ *      `metadata.json` write, milliseconds rather than the minutes an export takes.
+ *
+ * On any of those failures `metadata.json` AND `.beads/config.yaml` are restored byte-for-byte, so a
+ * failed attempt leaves a working board rather than a project pointed at a server it cannot read —
+ * unless something else has edited one of them since, which is reported and left alone rather than
+ * overwritten.
+ */
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+
+import {
+  MIN_BD_VERSION,
+  SERVER_MIGRATION_RUNBOOK,
+  bdVersion,
+  bdVersionAtLeast,
+  budgetMs,
+  checkSharedServer,
+  configYamlComments,
+  configYamlNonScalars,
+  configYamlScalars,
+  ensureBdConfig,
+  ensureDoltConnection,
+  failureDetail,
+  hasLocalDoltDb,
+  parseConfigYaml,
+  passwordVarHint,
+  publishedConfigWrites,
+  readDoltMetadata,
+  retractStaleConnectionKey,
+  scopedBdRunner,
+  serverScopedPasswordVar,
+  staleConnectionKeys,
+  teamConfigKeys,
+  writeFileAtomic,
+} from "./config.mjs";
+
+// One atomic writer for everything under `.beads/`; it lives in config.mjs (which needs it for
+// config.yaml) and is re-exported here, where metadata.json's callers look for it.
+export { writeFileAtomic };
+
+/** bd's own default MySQL port. Written explicitly — see `SERVER_METADATA_KEYS.port`. */
+export const DEFAULT_DOLT_PORT = 3306;
+
+/**
+ * Absolute URL to the embedded → server migration runbook — the data half this command refuses to
+ * do for you. Defined in `config.mjs` (which the server-mode preflight also names it from) and
+ * re-exported here, where this command's callers look for it.
+ */
+export { SERVER_MIGRATION_RUNBOOK };
+
+/**
+ * The `metadata.json` key each connection field lands in — bd's names, and what `readDoltMetadata`
+ * reads back. `port` is always written even when it is the default: bd's own deprecation warning
+ * notwithstanding, without it bd dials port 0 against a remote host (DESIGN.md §3a).
+ */
+export const SERVER_METADATA_KEYS = {
+  host: "dolt_server_host",
+  port: "dolt_server_port",
+  user: "dolt_server_user",
+  database: "dolt_database",
+  // Transport, and the reason it is written HERE: bd reads `dolt_server_tls` per directory, while
+  // `BEADS_DOLT_SERVER_TLS` is one process-wide value that outranks it — so one anton driving a TLS
+  // server and a plaintext one needs each project to declare its own (PR #174 review, `bd-env.ts`).
+  tls: "dolt_server_tls",
+};
+
+/** Where a pre-flip export lands. Self-ignoring, so a backup never becomes a commit. */
+const BACKUP_DIR = "backups";
+
+/**
+ * The RAW `.beads/metadata.json` as `{ status, raw, detail? }` — `status` is `"absent"` (no file
+ * yet), `"read"` (parsed into `raw`), or `"unreadable"` (the file is there and cannot be used).
+ *
+ * `readDoltMetadata` is the MODE reader and deliberately drops everything about an embedded board;
+ * this path needs the file as written — both to default the database name from the embedded board's
+ * own `dolt_database`, and to merge rather than replace (bd keeps `project_id`, `backend` and
+ * friends in there, and losing them would sever the workspace's identity).
+ *
+ * Which is exactly why "absent" and "unreadable" are told apart rather than both folded to `{}`:
+ * the write below MERGES over `raw`, so an unreadable file read as empty would silently REPLACE
+ * every key in it with the connection alone — losing `project_id` and `backend` to fix a mode (PR
+ * #174 review). An absent file has nothing to lose; an unparseable one has everything, so it is
+ * reported and the caller refuses.
+ */
+export function readMetadataFile(dir) {
+  const path = join(dir, ".beads", "metadata.json");
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (e) {
+    // ENOENT alone is "not written yet". Anything else — a permissions change, a path that is
+    // somehow a directory — is a file this cannot see, not a file that is not there.
+    if (e?.code === "ENOENT") return { status: "absent", raw: {} };
+    return { status: "unreadable", raw: {}, detail: `could not read ${path}: ${String(e?.message ?? e)}` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { status: "unreadable", raw: {}, detail: `${path} is not valid JSON: ${String(e?.message ?? e)}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { status: "unreadable", raw: {}, detail: `${path} is not a JSON object` };
+  }
+  return { status: "read", raw: parsed };
+}
+
+/**
+ * The connection to write, from what the project already declares plus what the caller passed.
+ *
+ * Flags win over the file, and the file is a real source of defaults rather than a formality: a
+ * board being moved already names its database (`dolt_database`), and a re-run to correct one field
+ * must not require re-typing the other three.
+ *
+ * Returns `{ connection, errors }`. `errors` names the missing FLAG, not the metadata key — the
+ * reader is at a prompt, not in an editor.
+ *
+ * @param {Record<string, unknown>} raw the `raw` of {@link readMetadataFile}
+ * @param {{ host?: string, port?: number|string, user?: string, database?: string, tls?: boolean }} flags
+ */
+export function resolveServerConnection(raw, flags = {}) {
+  const errors = [];
+  const pick = (flag, key) => {
+    const value = flags[flag] ?? raw[SERVER_METADATA_KEYS[key]];
+    return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+  };
+
+  const host = pick("host", "host");
+  const database = pick("database", "database");
+  const user = pick("user", "user");
+
+  const rawPort = flags.port ?? raw[SERVER_METADATA_KEYS.port] ?? DEFAULT_DOLT_PORT;
+  const port = Number(rawPort);
+
+  // Left undefined unless something declares it: an unasked-for `false` would strip the ambient
+  // BEADS_DOLT_SERVER_TLS that a single-server deployment is documented to rely on.
+  const rawTls = flags.tls ?? raw[SERVER_METADATA_KEYS.tls];
+  const tls = typeof rawTls === "boolean" ? rawTls : undefined;
+
+  if (!host) errors.push("no server host — pass --host <host>");
+  if (!database) errors.push("no database — pass --database <name> (the database this project's board lives in)");
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    errors.push(`invalid port "${rawPort}" — pass --port <1-65535>`);
+  }
+
+  return { connection: { host, port, user, database, tls }, errors };
+}
+
+/**
+ * Everything the flip needs, computed without touching a thing: `{ status, changed, before, path,
+ * text, detail? }`. `status` is `"prepared"` (write `text` and the mode is server), `"already"` (the
+ * file says exactly this already) or `"unreadable"` — which prepares NOTHING, because merging over a
+ * file this cannot parse would replace it wholesale (see {@link readMetadataFile}). `before` is the
+ * file's exact prior text, or `null` when there was none — what {@link restoreFile} puts back when a
+ * verification fails.
+ *
+ * Split from the write because ORDER is the protection here (PR #174 review). The board is read one
+ * last time immediately before the flip to prove no writer is still going, and anything that runs
+ * between that read and the write is a window in which an edit lands in the database this project is
+ * about to stop reading. bd offers no writer lock to hold across the two — there is no `bd lock`,
+ * and its `--readonly` binds only the invocation it is passed to — so the window is made as small as
+ * a window can be: reading `metadata.json`, merging it and serializing it all happen BEFORE that
+ * read, leaving the flip itself a byte comparison and a single `writeFileSync`. The comparison is
+ * what `before` is for on the caller's side too: preparing early means the merge can age against
+ * the file it was computed from, so the caller re-reads the bytes and refuses rather than writing
+ * over an edit that landed in between. Stopping every writer first, which the runbook demands and
+ * the drift check verifies, is what actually closes the window.
+ */
+/**
+ * A file's exact bytes as `{ ok: true, text }`, with `text: null` for one that does not exist —
+ * `{ ok: false, detail }` for one that exists and cannot be read. Reads rather than
+ * tests-then-reads: a file that turned into a directory, or lost its read permission, since the
+ * caller last looked is a controlled refusal here, where a bare `readFileSync` would throw past
+ * every revert path and take the CLI out on an uncaught rejection (PR #174 review). No snapshot
+ * also means no restore, which is itself the reason to refuse rather than continue.
+ */
+function readFileSnapshot(path) {
+  try {
+    return { ok: true, text: readFileSync(path, "utf8") };
+  } catch (e) {
+    if (e?.code === "ENOENT") return { ok: true, text: null };
+    return { ok: false, detail: `could not read ${path}: ${String(e?.message ?? e)}` };
+  }
+}
+
+export function prepareServerModeMetadata(dir, connection) {
+  const path = join(dir, ".beads", "metadata.json");
+  // The restore snapshot goes through the same guarded read as the parse below.
+  const snapshot = readFileSnapshot(path);
+  if (!snapshot.ok) return { status: "unreadable", changed: [], before: null, path, detail: snapshot.detail };
+  const before = snapshot.text;
+  const meta = readMetadataFile(dir);
+  if (meta.status === "unreadable") return { status: "unreadable", changed: [], before, path, detail: meta.detail };
+  const raw = meta.raw;
+
+  const next = { ...raw, dolt_mode: "server" };
+  for (const [field, key] of Object.entries(SERVER_METADATA_KEYS)) {
+    if (connection[field] !== undefined) next[key] = connection[field];
+  }
+
+  const changed = Object.keys(next).filter((k) => raw[k] !== next[k]);
+  const text = `${JSON.stringify(next, null, 2)}\n`;
+  if (before === text) return { status: "already", changed: [], before, path, text };
+  return { status: "prepared", changed, before, path, text };
+}
+
+/**
+ * {@link prepareServerModeMetadata} and then the write — `{ status: "already"|"written"|"unreadable",
+ * changed, before, path }`. The one-call form, for callers with no read to sequence against.
+ */
+export function writeServerModeMetadata(dir, connection) {
+  const prepared = prepareServerModeMetadata(dir, connection);
+  if (prepared.status !== "prepared") return prepared;
+  writeFileAtomic(prepared.path, prepared.text);
+  return { ...prepared, status: "written" };
+}
+
+/** The metadata.json keys `bd dolt set … --update-config` re-serializes as it publishes. */
+const PUBLISHED_METADATA_KEYS = new Set(Object.values(SERVER_METADATA_KEYS));
+
+/**
+ * True when `text` is metadata.json still holding the switch this run wrote, re-serialized by bd's
+ * own publication — as opposed to somebody else's edit.
+ *
+ * Publication runs `bd dolt set <key> <value> --update-config`, which writes BOTH files (see
+ * {@link ensureDoltConnection}). So the moment one of those succeeds, metadata.json no longer holds
+ * the exact bytes the flip wrote, even with nothing else on the machine touching it. Comparing bytes
+ * alone would then read bd's own rewrite as a concurrent editor and decline the rollback of a failed
+ * publication — leaving `dolt_mode: server` behind while the command reports the project was not
+ * switched (PR #174 review). Content is compared instead, and ONLY bd's re-encoding is forgiven:
+ * every key this run wrote must still carry the value it wrote — loosely for the connection keys bd
+ * rewrites, since it re-serializes a port as its own JSON type, and exactly for everything else,
+ * `project_id` and `backend` included. A key that was NOT in what this run wrote is nobody's
+ * re-encoding: publication only ever re-serializes keys metadata.json already declared (the flip
+ * merges over them, so every one of them is in `wrote`), while an optional field this run left out —
+ * `dolt_server_tls`, an absent `dolt_server_user` — can only have APPEARED because somebody else
+ * added it, and forgiving that would let the restore silently drop their edit (PR #174 review).
+ * Anything this run did not write, whatever its key, is refused as before.
+ */
+function isPublicationRewrite(text, wrote) {
+  if (typeof text !== "string" || typeof wrote !== "string") return false;
+  let now;
+  let mine;
+  try {
+    now = JSON.parse(text);
+    mine = JSON.parse(wrote);
+  } catch {
+    return false;
+  }
+  const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  if (!isObject(now) || !isObject(mine)) return false;
+  for (const key of new Set([...Object.keys(mine), ...Object.keys(now)])) {
+    if (PUBLISHED_METADATA_KEYS.has(key) && key in mine) {
+      // Loose only for a connection key this run actually wrote: bd re-serializes a port as its own
+      // JSON type. A key only the rewrite has falls through to the exact compare below — against
+      // `undefined` — and so is refused.
+      if (String(now[key]) !== String(mine[key])) return false;
+    } else if (stableJson(now[key]) !== stableJson(mine[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The config.yaml keys on which `current` disagrees with `before` and which this run cannot claim —
+ * i.e. somebody else's edit, sorted. Empty means every difference is one of this run's own writes.
+ *
+ * config.yaml's counterpart to {@link isPublicationRewrite}, and there for the same reason
+ * (PR #174 review): between the snapshot and a failed publication there is a window in which an
+ * agent or a person edits the file, and restoring the snapshot over that edit would discard it
+ * silently. Bytes cannot answer who wrote what here — bd's own patches change them too — but the
+ * writes this invocation ASKED FOR can: `wrote` maps each key this run handed bd to the value it
+ * handed over (`undefined` for a key it retracted), and bd patches config.yaml one key at a time.
+ * So a difference is this run's only where the file now holds exactly what this run asked for.
+ *
+ * Matching by key alone is not enough (PR #174 review): a key this run owns can be changed by
+ * another process in the same window — `dolt.user` repointed at a different account while a later
+ * publication step fails — and an allowlist would call that difference Anton's and let the restore
+ * discard it. What this run wrote is the evidence; the key set only bounds where to look.
+ *
+ * Nor is the EFFECTIVE value enough on its own ({@link isOwnScalarWrite}, PR #174 review): bd
+ * appends, so a value another process appends for a key this run also writes is hidden the moment
+ * this run's own line lands after it — last-wins reads back exactly what this run asked for, and the
+ * restore drops their line without a word. Every occurrence is weighed, as for retracted keys.
+ *
+ * Compared through bd's own parser, so both encodings (flat dotted lines and bd 1.1.0's nested maps)
+ * read the same, a struck-out key reads as absent, and formatting is not mistaken for an edit.
+ *
+ * That parser flattens the file to SCALARS, and what it cannot represent it cannot diff: a sequence
+ * entry added or reordered under a list-valued key in the same window would leave the scalar diff
+ * empty and let the whole-file restore discard it silently (PR #174 review). So every line the flat
+ * map drops is compared too ({@link configYamlNonScalars}), under the key that encloses it — bd
+ * patches scalars and this run asks for nothing else, so ANY such difference is somebody else's.
+ *
+ * Comments are compared on the same footing ({@link configYamlComments}), because a comment is an
+ * edit somebody made too — a documented reason for a setting, a block being commented in or out —
+ * and dropping it from both sides would have the scalar diff come back empty and the restore
+ * discard it silently (PR #174 review). The one exception is this run's OWN strike-outs: a
+ * retraction comments a key out rather than deleting it (`bd config unset`'s style, and
+ * {@link retractStaleConnectionKey}'s), so a comment that is a struck-out line for a key this run
+ * retracted is this run's write, not somebody's prose.
+ *
+ * By key AND struck VALUE, for the same reason the scalar diff weighs values (PR #174 review): a
+ * strike-out is only this run's where it carries the value the key held when this run took its
+ * snapshot. Another process commenting the key out itself — or striking it after repointing it —
+ * leaves a strike-out for a retracted key carrying a value this run never struck, and forgiving it
+ * by key alone would have the scalar diff see the requested absence and the restore discard their
+ * edit silently.
+ */
+function foreignConfigEdits(before, current, wrote) {
+  const was = parseConfigYaml(before ?? "");
+  const now = parseConfigYaml(current ?? "");
+  const wasLines = configYamlNonScalars(before ?? "");
+  const nowLines = configYamlNonScalars(current ?? "");
+  // Every key this run asked bd to RETRACT, paired with the values config.yaml published for it when
+  // this run took its snapshot — the only strike-outs that can be this run's own. Every value, not
+  // the effective one: a retraction strikes out each line the file devotes to the key.
+  const wasScalars = configYamlScalars(before ?? "");
+  const retracted = new Map(
+    [...wrote].filter(([, value]) => value === undefined).map(([key]) => [key, wasScalars[key] ?? []]),
+  );
+  const wasComments = configYamlComments(before ?? "");
+  const nowComments = configYamlComments(current ?? "");
+  // Filtered on BOTH sides, so a strike-out that was already in the file when this run found it
+  // cannot read as one this run added.
+  const prose = (lines, path) => (lines ?? []).filter((line) => !isStrikeOut(line, path, retracted));
+  const commented = [...new Set([...Object.keys(wasComments), ...Object.keys(nowComments)])].filter(
+    (key) => prose(wasComments[key], key).join("\n") !== prose(nowComments[key], key).join("\n"),
+  );
+  const unrepresented = [...new Set([...Object.keys(wasLines), ...Object.keys(nowLines)])].filter(
+    (key) => (wasLines[key] ?? []).join("\n") !== (nowLines[key] ?? []).join("\n"),
+  );
+  const nowScalars = configYamlScalars(current ?? "");
+  const scalars = [...new Set([...Object.keys(was), ...Object.keys(now)])]
+    .filter((key) => was[key] !== now[key])
+    .filter((key) => !isOwnScalarWrite(key, wrote, now, wasScalars, nowScalars));
+  return [...new Set([...scalars, ...unrepresented, ...commented])]
+    // A sequence or comment at the top of the file has no enclosing key to name it by.
+    .map((key) => key || "(top level)")
+    .sort();
+}
+
+/**
+ * True when config.yaml's disagreement about scalar `key` is entirely this run's own write: the
+ * effective value is what this run handed bd, AND the lines the file now devotes to the key are the
+ * lines the snapshot devoted to it, with only the one edit bd was asked to make.
+ *
+ * The effective value alone is not enough (PR #174 review). bd appends, and `parseConfigYaml` keeps
+ * only the last line for a path — so a value another process appends for a key this run also writes
+ * disappears from the flat map the moment this run's own line lands after it. The effective value
+ * then matches what this run asked for, the key reads as unchanged-by-others, and the whole-file
+ * restore deletes their line silently. Every OCCURRENCE is weighed instead, the way retracted keys
+ * already are ({@link isStrikeOut}).
+ *
+ * And weighed IN ORDER, not as a set (PR #174 review): "every remaining line carries a value this
+ * run wrote or the snapshot published" cannot see a line go MISSING. Another process deleting one of
+ * two `dolt.user` lines in the window this run is publishing leaves every surviving line accounted
+ * for, the key reads as Anton's, and the restore resurrects the line they deleted while reporting a
+ * clean revert. So the lines are matched positionally against the snapshot's, and only the two edits
+ * bd itself makes are forgiven: appending its line when the key is absent, or overwriting a line
+ * where it already sits. A list that is shorter than the snapshot's, or that has shifted under it,
+ * is somebody else's deletion.
+ *
+ * The one deletion no reading of the file can catch: where the snapshot published a SINGLE line for
+ * the key, another process deleting it before bd appends its own is byte-for-byte what bd patching
+ * that line in place looks like. Distinguishing them would need the file as it stood between the two
+ * writes, and bd's patches and a concurrent edit land in the same window (see {@link snapshotConfig}
+ * — the window the snapshot cannot close).
+ */
+function isOwnScalarWrite(key, wrote, now, wasScalars, nowScalars) {
+  if (!wrote.has(key) || now[key] !== wrote.get(key)) return false;
+  const mine = wrote.get(key);
+  const was = wasScalars[key] ?? [];
+  const current = nowScalars[key] ?? [];
+  // A retraction asks for EVERY line the key has to go, so a missing line is this run's own doing
+  // and only what survived has to be accounted for. (`undefined` is the shape `wrote` gives a key
+  // this run asked bd to unset; the strike-outs it leaves behind are {@link isStrikeOut}'s.)
+  if (mine === undefined) return current.every((value) => was.includes(value));
+  // Set the line bd appended aside — a key it found absent gets a new line at the end — and the rest
+  // must still be the file as this run found it, line for line, except where bd overwrote one in
+  // place with this run's own value.
+  const kept = current.length === was.length + 1 && current[current.length - 1] === mine ? current.slice(0, -1) : current;
+  return kept.length === was.length && kept.every((value, i) => value === mine || value === was[i]);
+}
+
+/**
+ * True when `line` — a comment, reported under `path` — is a strike-out this run made: a key in
+ * `retracted`, struck out over one of the values that key held when this run took its snapshot
+ * (`retracted` maps each retracted key to those values).
+ *
+ * Matched in both of bd's encodings: a flat `# dolt.user: beads` carries the whole dotted path in
+ * the comment, while a nested one (`dolt:` / `  # user: beads`) carries only the leaf and takes the
+ * rest from the block it sits in. Values are normalized as {@link parseConfigYaml} normalizes a
+ * live one, so a re-quoted strike-out is still recognized.
+ *
+ * Anything else — a struck-out key this run never asked to retract, or one struck out over a value
+ * this run never saw there — is somebody else's line (PR #174 review).
+ */
+function isStrikeOut(line, path, retracted) {
+  const m = line.replace(/^#+\s*/, "").match(/^([^:#]+):\s*(.*)$/);
+  if (!m) return false;
+  const key = m[1].trim();
+  const struck = retracted.get(key) ?? retracted.get(path === "" ? key : `${path}.${key}`);
+  return struck !== undefined && struck.includes(m[2].trim().replace(/^["']|["']$/g, ""));
+}
+
+/**
+ * Put back a file this flow replaced — `before` is its exact prior text, `null` when it did not
+ * exist (in which case the file is removed). Used for both `metadata.json` and `config.yaml`.
+ */
+export function restoreFile(path, before) {
+  if (before === null) rmSync(path, { force: true });
+  else writeFileAtomic(path, before);
+}
+
+/** Everything a bd invocation printed, both streams — bd puts its config warnings on stderr. */
+const output = (r) => `${r?.stdout ?? ""}${r?.stderr ?? ""}`;
+
+/**
+ * The arguments that read EVERY durable thing this project's board holds, as JSONL on stdout.
+ *
+ * `bd export`, NOT `bd list --json`, and that is the whole of the point (PR #174 review). A listing
+ * carries issue projections: it counts an issue's comments without printing them, and it does not
+ * print persistent memories (`bd remember`) at all. Both are durable board state — a review thread
+ * is the reasoning behind a decision, a memory is what the next session inherits — so a comment
+ * EDITED in place, or a memory written on either side of the copy, is a difference every check
+ * below would score as "identical" before flipping the project onto a database that does not hold
+ * it. `bd export` is the one read that carries all of it: one line per record, an issue with its
+ * labels, dependencies and full comment thread, or a `{"_type":"memory"}` row.
+ *
+ * `--all` is what widens it past regular issues to infra beads, templates, gates AND memories
+ * (memories are excluded by default because they can carry agent context); closed issues come as
+ * standard. It is also exactly what {@link backupBoard} writes, so what is verified and what is
+ * backed up are the same board. `bd export --all` exists in bd 1.1.0, anton's floor
+ * (MIN_BD_VERSION).
+ */
+const exportAllArgs = () => ["export", "--all"];
+
+/**
+ * The key one exported record is compared under, or `undefined` when it carries nothing to compare
+ * it by. An issue keeps its own bd id — the thing an operator pastes into `bd show` when a message
+ * names it — and every other record type is namespaced by its `_type`, so a memory keyed `probe-3`
+ * cannot pass for the bead of that name.
+ */
+function recordKey(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return undefined;
+  const id = typeof record.id === "string" && record.id !== "" ? record.id : undefined;
+  const type = typeof record._type === "string" && record._type !== "" ? record._type : undefined;
+  // No `_type` is bd's older export shape, which wrote issues alone.
+  if (type === undefined || type === "issue") return id;
+  const own = typeof record.key === "string" && record.key !== "" ? record.key : id;
+  return own === undefined ? undefined : `${type}:${own}`;
+}
+
+/** JSON with object keys sorted at every depth, and every array ordered by its own serialization:
+ * bd's field order and its row order — including the order it prints an issue's comments in — are
+ * presentation, not board content, so none of them may read as a mid-flip edit. */
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).sort().join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * A fingerprint of one exported record as bd printed it — EVERY field, not a chosen few, so a
+ * status, title, assignee, label, dependency, COMMENT or memory value written while the switch is
+ * being prepared cannot slip past the drift check by leaving the key set intact (PR #174 review).
+ * Hashed rather than kept, so a fingerprint per record costs 40 bytes on a board of any size.
+ */
+const recordDigest = (record) => createHash("sha1").update(stableJson(record)).digest("hex");
+
+/**
+ * bd's own last-write stamp for one record as epoch ms, or `undefined` when it carries none this can
+ * order (a memory carries none). It names, but never excuses, a content difference across the
+ * migration boundary: a server copy BEHIND this board is a snapshot copied before the last edits,
+ * one AHEAD of it is a board someone kept writing after the copy. Both are divergence — ordering two
+ * writes is not merging them — so the stamp chooses which fix the message names, not whether the
+ * flip is allowed (PR #174 review).
+ */
+const recordUpdatedAt = (record) => {
+  const ms = typeof record?.updated_at === "string" ? Date.parse(record.updated_at) : Number.NaN;
+  return Number.isNaN(ms) ? undefined : ms;
+};
+
+/**
+ * Everything this project's board holds right now: one key per record, and a content fingerprint
+ * per key. A record is an issue (with its labels, dependencies and comment thread) or a persistent
+ * memory — see {@link exportAllArgs} for why the read is an export rather than a listing.
+ *
+ * IDENTITY, not cardinality, is what answers "did the history actually arrive". A count proves only
+ * that SOME board is on the other end: a server holding a stale or divergent copy of the same
+ * project can match — or beat — the local count while missing issues the board being moved has, and
+ * the flip would accept it and keep writing into the divergent copy. Comparing the key sets catches
+ * that; comparing two numbers cannot. This runs once, on a one-time migration, so reading the whole
+ * board is worth what it costs over `bd count`.
+ *
+ * The `digests` answer the other question — "is this the same board" — which keys alone cannot: a
+ * writer that UPDATES an existing issue, or edits a comment on one, leaves the key set identical,
+ * and so does a server snapshot copied before that update was made. `updated` orders two differing
+ * copies of one record, which is how the second case can say which side was written last — not
+ * whether the difference is safe.
+ *
+ * Returns `{ ok: true, keys, digests, updated }` or `{ ok: false, detail }` — a board that cannot be
+ * read is reported, never silently treated as empty.
+ *
+ * @param {string} dir repo root
+ * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv }} [opts]
+ *   `board` is the connection bd runs under (credentials + transport) — the board's own before the
+ *   flip, the server's after it.
+ */
+export function readBoardRecords(dir, opts = {}) {
+  const exec = scopedBdRunner(dir, opts.board, opts);
+  // The network budget, not the local `bd` one: in server mode this read crosses the wire to the
+  // Dolt server, exactly like the export in `backupBoard`. On a large board over a slow link the
+  // 60s local budget times out — and a timeout here is not a warning, it is a refused flip before
+  // it and a full revert after it (PR #174 review).
+  const ms = budgetMs("network");
+  const r = exec("bd", exportAllArgs(), ms);
+  if ((r?.status ?? 1) !== 0) return { ok: false, detail: failureDetail(r, ms, output(r)) };
+
+  // stdout only — bd's warnings go to stderr, and JSONL turns the ones that don't into a line that
+  // simply does not parse, rather than brackets a scan has to tell apart from the payload's.
+  const digests = new Map();
+  const updated = new Map();
+  let noise = false;
+  for (const line of (r?.stdout ?? "").split("\n")) {
+    if (line.trim() === "") continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      noise = true; // a warning bd printed on stdout, not a record
+      continue;
+    }
+    const key = recordKey(record);
+    if (key === undefined) {
+      // A record with nothing to compare it under cannot be verified, and dropping it quietly is
+      // precisely how state gets stranded — so the whole read is reported as unusable instead.
+      if (record && typeof record === "object" && !Array.isArray(record)) {
+        return { ok: false, detail: "bd export printed a record with no id or key to compare it under" };
+      }
+      noise = true; // a bare string or number: bd talking, not exporting
+      continue;
+    }
+    digests.set(key, recordDigest(record));
+    updated.set(key, recordUpdatedAt(record));
+  }
+
+  // No records is a real answer — an empty board exports nothing — but ONLY when stdout held
+  // nothing else either. Zero records alongside output this could not parse is a read that went
+  // wrong, and calling that "the board is empty" would make the arrived-whole check in
+  // configureServerMode pass over ANY server board. --force is the deliberate way through, and the
+  // step that needs it names it.
+  if (digests.size === 0 && noise) return { ok: false, detail: "bd export printed no readable board" };
+  return { ok: true, keys: [...digests.keys()], digests, updated };
+}
+
+/**
+ * The text `path` must hold for it to hide everything beside it, or `null` when it already does.
+ * Read rather than assumed so a re-run does not rewrite a file that is already doing its job, and so
+ * a failure to write a NEW one cannot be confused with losing an existing one.
+ *
+ * Git resolves a path by the LAST pattern that matches it, so a `*` followed by a re-inclusion
+ * (`!*.jsonl`) hides nothing — the board export beside it stays visible to `git add -A`, which is
+ * the one thing this directory exists to prevent (PR #174 review). An existing file is never
+ * discarded over that: the catch-all is APPENDED, so it is the last word without taking anyone
+ * else's rules out.
+ *
+ * Only ENOENT means "no ignore file here yet". Any other read error — a mode the process cannot
+ * read through, a transient I/O failure — is a file whose rules are unknown, and answering `*\n`
+ * there would overwrite them (PR #174 review); it is raised so the backup fails instead.
+ */
+function ignoreAllPatch(path) {
+  let existing;
+  try {
+    existing = readFileSync(path, "utf8");
+  } catch (e) {
+    if (e?.code !== "ENOENT") throw e;
+    return "*\n"; // no ignore file here yet — write the rule itself
+  }
+  const lines = existing.split("\n").map((line) => line.trim());
+  const catchAll = lines.lastIndexOf("*");
+  if (catchAll !== -1 && !lines.slice(catchAll + 1).some((line) => line.startsWith("!"))) return null;
+  return existing === "" || existing.endsWith("\n") ? `${existing}*\n` : `${existing}\n*\n`;
+}
+
+/**
+ * Export the board to JSONL before anything is changed — the safety net for the flip.
+ *
+ * `--all` because a partial export is a partial backup: infra beads, templates, gates and memories
+ * are board state too. Written under `.beads/backups/`, which is made self-ignoring so a backup can
+ * never be committed (a JSONL export of a private board is not a thing to push by accident).
+ *
+ * This is an interchange snapshot, NOT the history: only the Dolt directory carries commits. It
+ * exists so a board can be rebuilt if the move goes wrong AND the embedded copy is gone — which is
+ * why the runbook also says to keep that copy.
+ *
+ * Returns `{ status: "written"|"failed", path?, detail? }`.
+ *
+ * @param {string} dir repo root
+ * @param {{ board?: object, exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date }} [opts]
+ *   `board` is the connection bd runs under — see {@link readBoardRecords}.
+ */
+export function backupBoard(dir, opts = {}) {
+  const exec = scopedBdRunner(dir, opts.board, opts);
+  const beadsDir = join(dir, ".beads");
+  const dest = join(beadsDir, BACKUP_DIR);
+  const stamp = (opts.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, "-");
+  const path = join(dest, `board-${stamp}.jsonl`);
+
+  // Separate catches so the detail names the thing that actually failed — an unwritable .gitignore
+  // in a directory that was created fine is a different fix from a directory that cannot be made.
+  try {
+    mkdirSync(dest, { recursive: true });
+  } catch (e) {
+    return { status: "failed", detail: `could not create ${dest}: ${String(e?.message ?? e)}` };
+  }
+  // Atomically, and skipped when the rule is already in effect: a plain write truncates before it can
+  // fail, so an ENOSPC or I/O error here would leave an EMPTY .gitignore beside every earlier
+  // export — the whole backup directory suddenly visible to git, one `git add -A` away from
+  // committing a private board (PR #174 review).
+  const ignore = join(dest, ".gitignore");
+  try {
+    const patch = ignoreAllPatch(ignore);
+    if (patch !== null) writeFileAtomic(ignore, patch);
+  } catch (e) {
+    return { status: "failed", detail: `could not update ${ignore}: ${String(e?.message ?? e)}` };
+  }
+
+  // A large board's export reads every record — the network budget, same as bd init/bootstrap.
+  const ms = budgetMs("network");
+  const r = exec("bd", ["export", "--all", "-o", path], ms);
+  if ((r?.status ?? 1) !== 0) return { status: "failed", detail: failureDetail(r, ms, output(r)) };
+  return { status: "written", path };
+}
+
+/**
+ * The health probe against the configured server, with the hints an operator needs when it fails:
+ * a connection this project cannot make is almost always a missing password variable, and the
+ * variable's name is per-USER (anton-ffmw.1), so guessing it is a wasted hour.
+ *
+ * Returns `{ ok: true }` or `{ ok: false, stage, detail, hints }` — `stage` is
+ * {@link checkSharedServer}'s, so the caller can say whether the SERVER refused or the board did.
+ */
+export function testDoltConnection(dir, connection, opts = {}) {
+  // The probe itself is config.mjs's, shared with the `anton init`/`doctor` preflight (anton-eg46)
+  // so a connection this command accepts is one those will too. Only the hints are this command's:
+  // it is mid-flip, with the connection it just wrote in hand.
+  const probe = checkSharedServer(dir, connection, { ...opts, exec: scopedBdRunner(dir, connection, opts) });
+  if (probe.ok) return { ok: true };
+
+  // A board that refused the READ has already proven host, port, account and transport work, so the
+  // credential and TLS hints would only send the operator to check what the probe just verified.
+  // What is left is the database itself: named wrongly, not copied across, or another project's.
+  if (probe.stage === "read") {
+    return {
+      ok: false,
+      stage: probe.stage,
+      detail: probe.detail,
+      hints: [
+        `confirm "${connection.database}" is the database THIS project's board lives in, and that the ` +
+          `"${connection.user ?? "configured"}" account may read it`,
+        `copy the board onto the server first if it is not there yet — ${SERVER_MIGRATION_RUNBOOK}`,
+      ],
+    };
+  }
+
+  const perServer = serverScopedPasswordVar(connection);
+  const hints = [
+    `set ${passwordVarHint(connection.user)}${connection.user ? ` for the "${connection.user}" account` : " for the database user"}`,
+    // The rung above, named only here: it exists for the operator who drives two servers whose
+    // accounts happen to share a name, and that operator is the one standing in front of this
+    // failure (PR #174 review).
+    ...(perServer ? [`or ${perServer}, when another project uses the same "${connection.user}" account on a different server`] : []),
+    "pass --tls when the server sets require_secure_transport (--no-tls when it does not) — that is " +
+      "THIS project's transport, where a process-wide BEADS_DOLT_SERVER_TLS is one value for every project",
+    `confirm the server is reachable at ${connection.host}:${connection.port} and serves the "${connection.database}" database`,
+  ];
+  return { ok: false, stage: probe.stage, detail: probe.detail, hints };
+}
+
+/** One step of the flow, in the `{ name, status, detail? }` shape configureBeadsForRepo reports. */
+const step = (name, status, detail) => (detail === undefined ? { name, status } : { name, status, detail });
+
+/**
+ * Configure THIS project for server mode and prove it works: back up → write the connection →
+ * `bd dolt test` → confirm the board reads back whole → publish the connection as the team default.
+ *
+ * The first failure returns; a failure after `metadata.json` was written also reverts it, so the
+ * project is never left pointing at a server it cannot read (in server mode there is no local copy
+ * to fall back on — an unreachable server is a board outage, DESIGN.md §3a).
+ *
+ * @param {string} dir repo root
+ * @param {{ host?: string, port?: number|string, user?: string, database?: string, tls?: boolean,
+ *   backup?: boolean, force?: boolean }} flags
+ *   `tls` declares the transport in this project's metadata.json (undefined leaves it undeclared,
+ *   inheriting the ambient `BEADS_DOLT_SERVER_TLS`); `backup: false` skips the pre-flip export;
+ *   `force: true` accepts a server board that is MISSING records the board being moved has, or that
+ *   says something DIFFERENT about them in either direction (starting a deliberately fresh board,
+ *   or switching a machine whose local board is a leftover copy), and is the only way to switch when
+ *   the board being moved cannot be read at all — with no source read, nothing verifies what
+ *   arrived. It does NOT get past an unreadable `metadata.json`: that refusal is about not
+ *   destroying the file, which no amount of intent makes safe.
+ * @param {{ exec?: Function, env?: NodeJS.ProcessEnv, now?: () => Date, log?: (msg: string) => void,
+ *   onStep?: (step: { name: string, status: string, detail?: string }) => void }} [opts]
+ * @returns {{ ok, steps, connection?, errors, warnings, before?, after?, switchStillWritten?,
+ *   counts?, backup?, missing?, diverged?, extra?, drifted? }}
+ *   On a REFUSAL, `after` is `.beads/metadata.json` as the run left it ({@link readDoltMetadata}),
+ *   and `switchStillWritten` says whether this run's flip is what is holding it there — together
+ *   they are what a caller must report the mode from, since a rollback that fails or declines
+ *   leaves the project reading the server (PR #174 review).
+ *   Every key list below is {@link readBoardRecords}'s: a bead id for an issue (comment thread
+ *   included), `memory:<key>` for a persistent memory.
+ *   `missing` is the keys this board holds that the server's copy does not; `diverged` the keys it
+ *   does hold but says something different about, in either direction — both empty once the checks
+ *   have passed. `extra` is the other direction — keys only the SERVER has, which pass (they strand
+ *   nothing) and are warned about, since they are either work created there or work deleted here
+ *   that the flip brings back, and nothing bd prints tells those apart (see step 11c).
+ *   `warnings` is what the run could NOT verify, on a run that otherwise succeeded — a project
+ *   already reading the server verifies nothing about the embedded board still sitting next to it
+ *   (see step 5), and a key only the server holds is not decidable from either read (step 11c).
+ *   Callers must show them: they are the only notice an operator gets.
+ *   `drifted` is the keys that appeared, disappeared or were EDITED on the board being moved while
+ *   the switch was being prepared, i.e. a writer that was never stopped.
+ */
+export function configureServerMode(dir, flags = {}, opts = {}) {
+  const emit = typeof opts.log === "function" ? opts.log : () => {};
+  const onStep = typeof opts.onStep === "function" ? opts.onStep : () => {};
+  const steps = [];
+  const errors = [];
+  const warnings = [];
+  const beadsDir = join(dir, ".beads");
+  // True while this run's flip is in metadata.json — set by the write in step 9, cleared only by a
+  // rollback that actually put the earlier bytes back. A rollback that FAILS, or that declines
+  // because someone else edited the file, leaves the project reading the server, and a refusal that
+  // announced "not switched" over that would send an operator back to a board nothing is reading
+  // (PR #174 review). The terminal derives its headline from this and from `after`.
+  let switchStillWritten = false;
+  // What the run leaves behind, read from the file on the way out rather than inferred: the mode
+  // and connection `.beads/metadata.json` actually declares once every rollback has had its say.
+  const fail = (extra = {}) => ({
+    ok: false,
+    steps,
+    errors,
+    warnings,
+    after: readDoltMetadata(dir),
+    switchStillWritten,
+    ...extra,
+  });
+  /** Record a step AND hand it to the caller as it happens — this flow is slow enough (an export,
+   * two round trips to the server) that a terminal batching its output reads as a hang. */
+  const record = (name, status, detail) => {
+    const s = step(name, status, detail);
+    steps.push(s);
+    onStep(s);
+    return s;
+  };
+
+  // 1. Preconditions. Notably NOT `beadsPrereqs`: that requires a git `origin`, which is the
+  //    refs/dolt/data channel a server-mode board does not use. What it does need is bd and an
+  //    initialized workspace to point at. The version probe goes through the project-scoped runner
+  //    like every other bd call here, so an injected `exec` controls the whole flow.
+  const probe = scopedBdRunner(dir, undefined, opts);
+  const version = bdVersion(() => probe("bd", ["--version"], budgetMs("probe")));
+  if (!bdVersionAtLeast(version)) {
+    errors.push(
+      version
+        ? `bd ${version.raw} is too old — anton requires bd ${MIN_BD_VERSION}+`
+        : "bd not found on PATH — install it with `brew install gastownhall/tap/bd`",
+    );
+    return fail();
+  }
+  if (!existsSync(beadsDir)) {
+    errors.push(`no .beads/ workspace at ${dir} — run \`anton init\` there first`);
+    return fail();
+  }
+
+  // 2. What the project is now, and what it should become. A metadata.json that EXISTS and cannot
+  //    be parsed stops the command dead — and not even --force gets through, because the flip's own
+  //    write merges over that file: reading it as empty would replace bd's `project_id`, `backend`
+  //    and every key this module does not know about with the connection alone (PR #174 review).
+  //    An unreadable file is a board with a broken identity, which is not a thing to fix by
+  //    overwriting it.
+  const meta = readMetadataFile(dir);
+  if (meta.status === "unreadable") {
+    record("metadata.json", "failed", meta.detail);
+    errors.push(
+      `${meta.detail} — switching writes this file by MERGING into it, so an unreadable one would ` +
+        "be replaced outright, losing project_id, backend and anything else bd keeps there. " +
+        "Repair or restore it (`.beads/backups/`, or git) and re-run.",
+    );
+    return fail();
+  }
+  const before = readDoltMetadata(dir);
+  const { connection, errors: invalid } = resolveServerConnection(meta.raw, flags);
+  if (invalid.length) {
+    errors.push(...invalid);
+    return fail({ before });
+  }
+
+  // What each read below counted, and what the pre-flip export left behind — declared here because
+  // every refusal from this point on reports them, including the ones that fire before they are set.
+  const counts = {};
+  let backup;
+
+  // 3. Prove config.yaml is readable BEFORE anything writes it — the retraction in step 4, and the
+  //    publication in step 12. A file that cannot be read (a permissions change, a path that is
+  //    somehow a directory) is a rollback that cannot happen, and finding that out after a write
+  //    means the project is already changed with no revert on the way out (PR #174 review). Ask
+  //    while there is nothing to undo.
+  //    The bytes `revert` actually restores are re-read immediately before publication (step 12);
+  //    this text only proves the read works and is refused on if it does not.
+  const configPath = join(beadsDir, "config.yaml");
+  let configBefore = null;
+  try {
+    configBefore = existsSync(configPath) ? readFileSync(configPath, "utf8") : null;
+  } catch (e) {
+    record("config.yaml", "failed", String(e?.message ?? e));
+    errors.push(
+      `could not read ${configPath}: ${String(e?.message ?? e)} — it is half of what a failed ` +
+        "switch is rolled back from, so the flip is refused rather than made unrevertable",
+    );
+    return fail({ before, connection, counts, backup });
+  }
+
+  // What this invocation actually left in each file — a revert undoes THOSE bytes and nothing else.
+  // Declared before the first write rather than after the flip, because the retraction in step 4
+  // writes config.yaml while metadata.json is still untouched, and that write has to be revertable
+  // too. `prepared` is the flip as step 7 computed it and `wroteMetadata` the bytes step 9 actually
+  // wrote — both null until then, which is what tells a rollback the flip never happened.
+  // Two flags for config.yaml, because it is written at two different points for two different
+  // reasons: `configTouched` says a revert has bytes to put back (the retraction in step 4, or the
+  // publication in step 12), while `configPublished` says `bd dolt set --update-config` has started
+  // — which is the only thing that also rewrites metadata.json, and so the only thing whose rewrite
+  // the rollback may recognise as its own.
+  let prepared = null;
+  let wroteMetadata = null;
+  let configSnapshot = configBefore;
+  let configTouched = false;
+  let configPublished = false;
+  // Each config.yaml key this run has handed bd, mapped to the value it handed over (`undefined`
+  // where it asked for a retraction) — the evidence `foreignConfigEdits` weighs a difference against.
+  const wroteConfig = new Map();
+
+  /**
+   * Claim a key for this run — from what its command DID, never from the list of keys the run
+   * intended to write (PR #174 review).
+   *
+   * A "failed" is claimed: bd patches config.yaml key by key and can fail part-way through, so those
+   * bytes are this run's and a revert has to recognise them. A step that ran NOTHING — "already",
+   * "unset", "missing" — is not: the value it found matching is only presumably this run's, and when
+   * a concurrent editor set that key after the snapshot (`dolt.user` repointed at the account this
+   * switch happens to want), claiming it would have the rollback restore the older text straight
+   * over their edit and report a clean revert.
+   */
+  const claim = (key, want, status) => {
+    if (status === "set" || status === "failed" || status === "cleared") wroteConfig.set(key, want);
+  };
+
+  /**
+   * Snapshot config.yaml for the rollback, ONCE, immediately before this run first writes it —
+   * `{ ok }` / `{ ok: false, detail }`.
+   *
+   * Not reused from step 3 (PR #174 review): everything between the two — the flip, and on the
+   * publication path a connection test and a server export with a multi-minute budget — is a window
+   * in which someone edits config.yaml, and restoring step 3's text would silently drop that edit.
+   * And never re-taken: what a revert owes the operator is the file as this run FOUND it, so once
+   * the retraction below has written, its own pre-image is the snapshot the publication rolls back
+   * to as well.
+   * Taking it late narrows the window but cannot close it — an edit can still land while bd is
+   * patching the file — which is why the restore also checks WHICH keys moved before putting these
+   * bytes back ({@link foreignConfigEdits}).
+   */
+  const snapshotConfig = () => {
+    if (configTouched) return { ok: true };
+    const now = readFileSnapshot(configPath);
+    if (!now.ok) return now;
+    configSnapshot = now.text;
+    configTouched = true;
+    return { ok: true };
+  };
+
+  /**
+   * {@link restoreFile}, as `{ ok }` / `{ ok: false, detail }` rather than a throw.
+   *
+   * A rollback runs on the failure path, where the disk is often the reason for the failure being
+   * rolled back in the first place: an ENOSPC or EROFS in the restore would escape {@link revert},
+   * take the CLI out on a stack trace instead of its structured report, and leave the operator with
+   * no statement at all of which mode the project ended up in — while metadata.json still points at
+   * the server that was just rejected (PR #174 review). Caught, so the mode can be said out loud.
+   */
+  const tryRestore = (path, before) => {
+    try {
+      restoreFile(path, before);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, detail: String(e?.message ?? e) };
+    }
+  };
+
+  /**
+   * Undo this run's writes and report why — the board keeps working exactly as it did.
+   *
+   * Restores only what it can still prove it wrote (PR #174 review). Everything after the flip —
+   * the connection test, the board export the server answers with a multi-minute budget, the
+   * publication — is a window in which another clone's switch, an agent or a person edits
+   * metadata.json, and putting the pre-flip text back over that edit would discard it silently,
+   * which is the failure this whole command exists not to commit. So the current bytes are compared
+   * with what the flip wrote: equal means the edit never happened and the restore is exact; anything
+   * else means someone else owns the file now, and the run says so rather than overwriting them.
+   * Once publication has started, bd's OWN rewrite of metadata.json is the expected difference and
+   * is recognized as this run's ({@link isPublicationRewrite}) — without that, every failed
+   * publication would decline its own rollback and strand the project in server mode while reporting
+   * it was not switched (PR #174 review).
+   * config.yaml gets the same treatment by KEY AND VALUE rather than by bytes
+   * ({@link foreignConfigEdits}), because bd's own patches change its bytes too: it is snapshotted as
+   * late as this run can take it ({@link snapshotConfig}), and restored only when every key that has
+   * moved since now holds exactly what this run handed bd for it. Anything else — a key this run
+   * never writes, or one it does write now carrying a value it never asked for — is an edit that
+   * landed in the window the snapshot cannot close, and it is left standing rather than overwritten
+   * (PR #174 review).
+   * A rollback can also run BEFORE the flip is computed — step 4's retraction is a config.yaml write
+   * with no metadata write behind it yet — and then there is no metadata step at all: reporting one
+   * would claim a file this run never touched.
+   * Neither restore is allowed to throw ({@link tryRestore}).
+   */
+  const revert = (reason) => {
+    if (wroteMetadata !== null) {
+      const current = readFileSnapshot(prepared.path);
+      const ours =
+        current.ok &&
+        (current.text === wroteMetadata || (configPublished && isPublicationRewrite(current.text, wroteMetadata)));
+      if (ours) {
+        const restored = tryRestore(prepared.path, prepared.before);
+        if (restored.ok) {
+          // The only path that takes the switch back out of the file — every other one below leaves
+          // the project reading the server, which the report has to say rather than deny.
+          switchStillWritten = false;
+          record("metadata.json", "reverted", `${reason} — the board is untouched`);
+        } else {
+          record("metadata.json", "failed", `${reason} — could not be put back: ${restored.detail}`);
+          errors.push(
+            `${prepared.path} could not be put back after the switch ${reason}: ${restored.detail}. ` +
+              `This project is therefore STILL pointed at ${connection.host}:${connection.port}, and ` +
+              "the board it was reading before is not being read by anything. Free up space or fix " +
+              'the permissions on `.beads/`, then put `dolt_mode` back to "embedded" in ' +
+              `${prepared.path} by hand (which restores the local board) and re-run.`,
+          );
+        }
+      } else {
+        record("metadata.json", "kept", `${reason} — edited since the switch was written, so NOT restored`);
+        warnings.push(
+          `${prepared.path} was edited after this command wrote the switch into it` +
+            `${current.ok ? "" : ` (${current.detail})`}, so putting the earlier text back would ` +
+            "discard that edit — it has been left exactly as it is. This project therefore still " +
+            `points at ${connection.host}:${connection.port}, which ${reason}. Reconcile the file by ` +
+            'hand (`dolt_mode` back to "embedded" restores the local board) and re-run.',
+        );
+      }
+    } else if (prepared?.status === "already") {
+      record("metadata.json", "unchanged", `${reason} — the file already said this, so nothing was written`);
+    }
+    if (configTouched) {
+      // What a failed restore leaves standing differs by phase: before publication the only bytes
+      // this run can have put in config.yaml are step 4's retraction, so the file is MISSING a key
+      // rather than holding half a connection, and saying the latter would send the operator
+      // looking for the wrong thing.
+      const leftBehind = configPublished
+        ? "It may therefore still hold half of the team-wide connection defaults, which every bd command in this project reads. "
+        : "It is therefore still missing the connection key this run struck out of it, which every bd command in this project reads. ";
+      const current = readFileSnapshot(configPath);
+      const foreign = current.ok ? foreignConfigEdits(configSnapshot, current.text, wroteConfig) : null;
+      if (current.ok && current.text === configSnapshot) {
+        record("config.yaml", "unchanged", `${reason} — nothing of this run's ever reached the file`);
+      } else if (foreign && !foreign.length) {
+        const restored = tryRestore(configPath, configSnapshot);
+        if (restored.ok) {
+          record("config.yaml", "reverted", `${reason} — the team-wide defaults are back as they were`);
+        } else {
+          record("config.yaml", "failed", `${reason} — could not be put back: ${restored.detail}`);
+          errors.push(
+            `${configPath} could not be put back after the switch ${reason}: ${restored.detail}. ` +
+              leftBehind +
+              "Free up space or fix the permissions on `.beads/`, then check the file against " +
+              "git (`git diff -- .beads/config.yaml`) before re-running.",
+          );
+        }
+      } else {
+        const named = foreign?.length ? ` (${foreign.slice(0, 5).join(", ")}${foreign.length > 5 ? ", …" : ""})` : "";
+        record("config.yaml", "kept", `${reason} — edited since the snapshot, so NOT restored`);
+        warnings.push(
+          `${configPath} carries a change this command did not make${named}` +
+            `${current.ok ? "" : ` (${current.detail})`}, so putting the earlier text back would ` +
+            "discard it — the file has been left exactly as it is. " +
+            leftBehind +
+            "Check it against git (`git diff -- .beads/config.yaml`) and reconcile it by hand before " +
+            "re-running.",
+        );
+      }
+    }
+  };
+
+  /**
+   * Refuse from anywhere at or after step 4 — rolling back first, then reporting.
+   *
+   * Every refusal in that stretch can have config.yaml bytes behind it: step 4's retraction writes
+   * the file long before the flip does, and a bare `return fail(...)` leaves that strike-out standing
+   * under a report saying the project was not changed (PR #174 review). {@link revert} does nothing
+   * when nothing was written, so this is simply the exit for the whole stretch, pre-flip and post-.
+   */
+  const failWithRollback = (reason, extra) => {
+    revert(reason);
+    return fail(extra);
+  };
+
+  // Both the retraction below and the publication in step 12 take the project-scoped runner: on a
+  // server board `bd config unset` and `bd dolt set` talk to the database, so they need the same
+  // narrowed credentials the connection test proves.
+  const exec = scopedBdRunner(dir, connection, opts);
+
+  // 4. Retract an optional connection key config.yaml still publishes and the switch stops
+  //    declaring — BEFORE the first bd call that authenticates, which is the source-board export in
+  //    step 5, not just the probe in step 10 (PR #174 review). metadata.json outranks config.yaml
+  //    but does not erase it, so a project moving to bd's default account (no `dolt_server_user`)
+  //    while config.yaml still carries an older `dolt.user` is a project bd connects as that older
+  //    account. On a board that is ALREADY on a server, that account is what step 5 reads the source
+  //    with: it fails to authenticate, and the run refuses before it ever reaches a retraction
+  //    placed later — so the one command that repairs the stale key cannot run without --force. Any
+  //    later placement has the same shape, one step further on. Clearing it first means every bd
+  //    call below, on both sides of the flip, uses the identity this project actually declares.
+  //    The verdict comes from the FILE, which is why running this before the flip is safe even
+  //    though `bd config unset` may still be talking to the board being left: a bd that refuses the
+  //    call changes nothing about the strike-out that follows it ({@link retractStaleConnectionKey}).
+  //    A key that will NOT come off is fatal here for the same reason it is in step 12: it decides
+  //    which account every later bd call uses, and the only fix is the operator's.
+  const stale = staleConnectionKeys(beadsDir, connection);
+  if (stale.length) {
+    const snapshot = snapshotConfig();
+    if (!snapshot.ok) {
+      record("config.yaml", "failed", snapshot.detail);
+      errors.push(
+        `${snapshot.detail} — a stale connection key cannot be cleared from a file whose earlier ` +
+          "contents could not be snapshotted, because a failed switch could not then be rolled back",
+      );
+      // No rollback to run: this is the run's first write and it never happened.
+      return fail({ before, connection, counts, backup });
+    }
+    for (const { key, metaKey } of stale) {
+      const retracted = retractStaleConnectionKey(beadsDir, key, metaKey, exec, budgetMs("bd"));
+      claim(`dolt.${key}`, undefined, retracted.status);
+      record(retracted.name, retracted.status, retracted.detail);
+      if (retracted.status === "failed") errors.push(retracted.detail);
+    }
+    if (errors.length) {
+      return failWithRollback("could not clear a stale connection key from config.yaml", {
+        before,
+        connection,
+        counts,
+        backup,
+      });
+    }
+  }
+
+  // 5. Read the board — every issue, comment thread and memory — while it is still pointed where it
+  //    is now. This is the set the post-flip read is checked against, and it is taken BEFORE the
+  //    backup so everything in it is something the export below also carries (both are `bd export
+  //    --all`, so that is exact). Step 8 re-reads it against the flip, so the ageing this ordering
+  //    costs is caught rather than trusted.
+  //    WHOSE board that is, is the question a clone has to answer for itself. In server mode it is
+  //    the SERVER's — so every check below compares the server with itself and proves nothing about
+  //    any board on this machine. On a clone that never held the board that is the ordinary case
+  //    (the runbook's second-machine step, which passes trivially by design). On a clone that DID,
+  //    it is a trap: `.beads/metadata.json` is TRACKED, so the flip reaches every clone on `git
+  //    pull` — before anyone checks that clone — and whatever it wrote embedded-side stays in
+  //    `.beads/`, absent from the server's copy (PR #174 review). Nothing here can tell a leftover
+  //    database deliberately abandoned after the move (the runbook keeps it, on every machine) from
+  //    one holding edits that never travelled: comparison shows divergence either way. So the run
+  //    reports what it did NOT verify instead of claiming a check it cannot make.
+  const sourceIsServer = before.mode === "server";
+  // Whether both reads come from the SAME board — which `sourceIsServer` alone does NOT say. A
+  // re-run that repoints an existing server board at another host or database reads one server
+  // before the flip and a different one after, so the copy-arrived question is live again and the
+  // comparisons below must all apply (PR #174 review). Compared on what selects a board — host,
+  // port, database — and conservatively: anything undeclared or unequal counts as a different
+  // target, so doubt costs a warning rather than silence.
+  // The port is required to be DECLARED, not defaulted (PR #174 review): a metadata.json without
+  // `dolt_server_port` does not mean 3306 on the source side — bd falls back to config.yaml's
+  // `dolt.server-port` (or the environment), so the pre-flip exports can be reading a non-default
+  // server while `resolveServerConnection` resolves the destination to 3306. Reading the two as
+  // equal there would skip every missing/divergent/server-only check on a command that has just
+  // repointed the project at a different server.
+  const sameServerTarget =
+    sourceIsServer &&
+    typeof before.host === "string" &&
+    typeof connection.host === "string" &&
+    before.host.trim().toLowerCase() === connection.host.trim().toLowerCase() &&
+    typeof before.port === "number" &&
+    before.port === connection.port &&
+    before.database !== undefined &&
+    before.database === connection.database;
+  if (sourceIsServer) {
+    const local = hasLocalDoltDb(beadsDir);
+    record(
+      "local board",
+      local ? "skipped" : "ok",
+      local
+        ? "present and NOT compared — this project already reads the server"
+        : "none on this machine — nothing local to strand",
+    );
+    if (local) {
+      warnings.push(
+        "this project's metadata.json already says server mode, so the checks below read a server on " +
+          `both sides — and ${beadsDir} still holds a local embedded Dolt database that nothing ` +
+          "here has compared with either. metadata.json is tracked by git: the switch reaches every clone " +
+          "on `git pull`, ahead of anyone checking that clone, so anything written here before the " +
+          "pull is still in the local database and not on the server. To check it, put `dolt_mode` " +
+          'back to "embedded" in .beads/metadata.json (git stash / git checkout the pulled change), ' +
+          "run `bd export --all`, compare it with the server's, then re-run this command. " +
+          "Nothing to do if that database is the leftover the runbook says to keep.",
+      );
+    }
+  }
+
+  const recordsBefore = readBoardRecords(dir, { ...opts, board: before });
+  if (recordsBefore.ok) {
+    counts.before = recordsBefore.keys.length;
+    record("board records", "ok", `${recordsBefore.keys.length} records${sourceIsServer ? ", read from the server" : ""}`);
+  } else if (!flags.force) {
+    // Fatal without --force. The arrived-whole check in step 11 is the only thing standing between
+    // this project and a stale or unrelated copy on the server, and it needs this read to run —
+    // with no source set to compare, a successful switch says nothing about what arrived. Treating
+    // that as "nothing missing" is how an unverified board gets reported as a clean move.
+    record("board records", "failed", recordsBefore.detail);
+    errors.push(
+      `could not read the board being moved: ${recordsBefore.detail} — without it the server's copy ` +
+        "cannot be checked for what this board holds. Fix the read, or re-run with --force to accept " +
+        "the server's board unverified — which is also the answer for a board that is genuinely " +
+        "EMPTY, since an export bd printed warnings on stdout around is not distinguishable from no " +
+        "export at all (readBoardRecords). If the DATABASE itself is what cannot be read (locked, " +
+        "corrupt), --force alone will not finish: the pre-flip backup is the same `bd export --all` " +
+        "and fails too, so that board needs `--force --no-backup`.",
+    );
+    return failWithRollback("could not read the board being moved", { before, connection, counts });
+  } else {
+    record("board records", "skipped", `${recordsBefore.detail} — --force`);
+    emit(`could not read the current board (${recordsBefore.detail}) — --force: skipping the arrived-whole check.`);
+  }
+
+  // 6. Back up before the flip. Only meaningful on an embedded board: a server board's data is not
+  //    here, and exporting it would back up the very thing the move is leaving alone.
+  if (before.mode !== "embedded") {
+    record("backup", "skipped", "board is already on a shared server — its data is not local");
+  } else if (flags.backup === false) {
+    record("backup", "skipped", "--no-backup");
+  } else {
+    backup = backupBoard(dir, { ...opts, board: before });
+    record("backup", backup.status === "written" ? "ok" : "failed", backup.detail ?? backup.path);
+    if (backup.status !== "written") {
+      // Refusing here is the point of the flag: an unbacked flip is exactly what --no-backup opts
+      // into, and doing it by accident is not. That holds under --force too — it buys past the
+      // arrived-whole check, not past a missing backup — so a board whose database cannot be read
+      // at all fails BOTH (same `bd export --all`) and the escape hatch is two flags, not one. The
+      // error names the second rather than leaving it to be discovered (PR #174 review). Skipping
+      // the backup on its own would be wrong: a read that failed on stdout noise says nothing about
+      // an export to a file, so backups that were perfectly possible would be dropped silently.
+      errors.push(
+        `board backup failed: ${backup.detail}` +
+          (recordsBefore.ok
+            ? ""
+            : " — this is the same `bd export --all` that could not read the board being moved, so --force " +
+              "does not get past it. Fix the export, or re-run with `--force --no-backup` to switch with " +
+              "neither a backup nor an arrived-whole check."),
+      );
+      return failWithRollback("could not back up the board", { before, connection, counts, backup });
+    }
+  }
+
+  // 7. Compute the flip — the merged metadata.json text, and the prior text a revert restores —
+  //     BEFORE the re-read below rather than after it. That read is what proves no writer is still
+  //     going, and everything between it and the write is a window in which an edit lands in the
+  //     database this project is about to stop reading. There is no lock to hold across the two: bd
+  //     exposes none (no `bd lock`; `--readonly` binds only the invocation it is passed to), and a
+  //     lock anton invented would be honoured by nothing that writes this board (PR #174 review).
+  //     So the window is made as small as one can be — reading, merging and serializing the file all
+  //     happen here, leaving step 9 a byte comparison and a single `writeFileSync` — and the checks
+  //     below refuse on any drift they did see, in the board (step 8) and in the file itself (9a).
+  //     Stopping every writer first, which the runbook demands, is what closes it.
+  //     Preparing here also moves the unreadable-metadata refusal ahead of the work it would waste.
+  prepared = prepareServerModeMetadata(dir, connection);
+  // Step 2 read the same file; this catches the window between — and keeps a refusal from reading as
+  // a success to anything that calls the write directly.
+  if (prepared.status === "unreadable") {
+    record("metadata.json", "unreadable", prepared.detail);
+    errors.push(`${prepared.detail} — nothing was written, so the board is untouched`);
+    return failWithRollback("could not read metadata.json", { before, connection, counts, backup });
+  }
+
+  // 8. Re-read the board immediately before the flip and refuse if it moved. The reading in step 5
+  //     ages across the backup — minutes of `bd export` on a big board — and nothing stops anton's
+  //     scheduler or another shell from writing the embedded board in that window. An issue created
+  //     there is missing from the server AND missing from the set step 11 checks, so the command
+  //     would report a clean arrival over a bead nobody sees again; the later backup can even
+  //     contain it without the verification ever noticing. The runbook's first instruction is to
+  //     stop every writer — this is what proves it happened (PR #174 review).
+  //     CONTENT, not just keys: a writer that closes a bead, retitles it, moves a label, adds a
+  //     dependency, files a COMMENT or writes a memory leaves the key set identical or nearly so, so
+  //     a check on keys alone would pass here AND on the server (step 11b compares content precisely
+  //     because of this), stranding that write in a database this project is about to stop reading.
+  //     The per-record digests catch every one.
+  //     Skipped under --force, which already accepts the server's board unverified: the second read
+  //     costs a full board export and would only refine a check that flag has switched off.
+  if (recordsBefore.ok && !flags.force) {
+    const recordsNow = readBoardRecords(dir, { ...opts, board: before });
+    if (!recordsNow.ok) {
+      record("board unchanged", "failed", recordsNow.detail);
+      errors.push(
+        `the board being moved became unreadable while the switch was being prepared: ${recordsNow.detail} ` +
+          "— nothing has been changed. Fix the read and re-run, or re-run with --force to accept the " +
+          "server's board unverified.",
+      );
+      return failWithRollback("could not re-read the board being moved", { before, connection, counts, backup });
+    }
+    // One comparison covers all three shapes of drift: a key only the later read has (created), one
+    // only the earlier read has (deleted), and one both hold under different digests (updated).
+    const drifted = [...new Set([...recordsBefore.keys, ...recordsNow.keys])].filter(
+      (key) => recordsBefore.digests.get(key) !== recordsNow.digests.get(key),
+    );
+    if (drifted.length) {
+      record("board unchanged", "failed", `${drifted.length} record${drifted.length === 1 ? "" : "s"} changed`);
+      errors.push(
+        `the board being moved changed while the switch was being prepared — ${drifted.length} record` +
+          `${drifted.length === 1 ? "" : "s"} appeared, disappeared or were edited (${drifted.slice(0, 5).join(", ")}` +
+          `${drifted.length > 5 ? ", …" : ""}). Something is still writing this board, so neither the ` +
+          "backup nor the arrived-whole check covers it. Stop anton (`anton stop`) and any agent or " +
+          "shell writing here, then re-run.",
+      );
+      return failWithRollback("the board being moved changed while the switch was being prepared", {
+        before,
+        connection,
+        counts,
+        backup,
+        drifted,
+      });
+    }
+    record("board unchanged", "ok", `${recordsNow.keys.length} records, unchanged since the read`);
+  }
+
+  // 9. The flip: ONE write, immediately after the read that proved the board stood still — nothing
+  //    between them but the comparison itself (see 5a). metadata.json is the only place the mode can
+  //    live: `bd config set dolt.mode` reports success while writing a nested block into a file of
+  //    flat dotted keys, from bd's lowest-priority source, and has no effect (anton-4gd2).
+  //    Written atomically, and a failure reported rather than thrown: an unhandled ENOSPC/EROFS/EIO
+  //    here would leave the CLI exiting on a stack trace over a metadata.json a plain write had
+  //    already truncated (PR #174 review). {@link writeFileAtomic} keeps the previous file intact
+  //    through the failure, so this file has nothing to roll back — and the flow returns the same
+  //    structured refusal every other pre-flip check does, through {@link failWithRollback}, which
+  //    still owes config.yaml step 4's retraction.
+  if (prepared.status === "prepared") {
+    // 9a. The merge in step 7 was computed over metadata.json as it read THEN, and the board
+    //     re-read since can run for the whole network budget. An edit that landed in that window —
+    //     a project_id correction, a TLS or connection fix, another clone's switch — is text this
+    //     write would replace with a merge that never saw it, and a rename is not something the
+    //     losing edit comes back from (PR #174 review). The board's own drift check refuses on the
+    //     same evidence; this is the file's. Bytes, not parsed keys: what a revert restores is
+    //     bytes, so anything that would not restore identically counts as drift.
+    const current = readFileSnapshot(prepared.path);
+    if (!current.ok) {
+      record("metadata.json", "failed", current.detail);
+      errors.push(`${current.detail} — nothing was written, so the board is untouched`);
+      return failWithRollback("could not re-read metadata.json", { before, connection, counts, backup });
+    }
+    if (current.text !== prepared.before) {
+      const detail = "changed while the switch was being prepared";
+      record("metadata.json", "failed", detail);
+      errors.push(
+        `${prepared.path} ${detail} — something else edited it, and writing the switch computed ` +
+          "from its earlier contents would drop that edit. Nothing was written, so the board is " +
+          "untouched. Stop anton (`anton stop`) and any agent or shell writing here, then re-run " +
+          "to merge the switch over the current file.",
+      );
+      return failWithRollback("metadata.json changed while the switch was being prepared", {
+        before,
+        connection,
+        counts,
+        backup,
+      });
+    }
+    try {
+      writeFileAtomic(prepared.path, prepared.text);
+    } catch (e) {
+      const detail = String(e?.message ?? e);
+      record("metadata.json", "failed", detail);
+      errors.push(
+        `could not write ${prepared.path}: ${detail} — the file still holds its previous contents ` +
+          "and the board is untouched. Free up space or fix the permissions on `.beads/`, then re-run.",
+      );
+      return failWithRollback("could not write the switch into metadata.json", { before, connection, counts, backup });
+    }
+  }
+  record("metadata.json", prepared.status === "prepared" ? "written" : prepared.status, prepared.changed.join(", ") || undefined);
+  // From here on a refusal has metadata.json to undo as well — config.yaml has been revertable since
+  // step 4 ({@link failWithRollback}).
+  if (prepared.status === "prepared") {
+    switchStillWritten = true;
+    wroteMetadata = prepared.text;
+  }
+
+  // 10. Prove the connection — and that the database on the other end serves THIS board — before
+  //    anything else trusts it. The second half is why the step is named for what it proves rather
+  //    than for `bd dolt test` alone: that command answers only "the server accepted a connection".
+  const tested = testDoltConnection(dir, connection, opts);
+  record("server connection", tested.ok ? "ok" : "failed", tested.detail);
+  if (!tested.ok) {
+    errors.push(
+      tested.stage === "read"
+        ? `the server accepted the connection but will not serve the "${connection.database}" database: ${tested.detail}`
+        : `bd dolt test could not connect: ${tested.detail}`,
+    );
+    return failWithRollback(tested.stage === "read" ? "board unreadable on the server" : "could not connect", {
+      before,
+      connection,
+      counts,
+      backup,
+      hints: tested.hints,
+    });
+  }
+
+  // 11. Prove THIS board arrived, not just that some board answers. The server's copy is checked by
+  //    identity: a stale or divergent copy of the same project can hold as many records as the board
+  //    being moved — more, even — while missing the ones written here since it diverged, and a
+  //    count would wave it through onto an incomplete board every later write then compounds.
+  //    And by CONTENT, because key membership has the same blind spot on this side of the boundary
+  //    as it does on the other one (step 8): a server snapshot copied from an older export holds
+  //    every key while its titles, statuses, labels, dependencies, assignees and comment threads
+  //    predate the board being moved, and a keys-only check would flip onto it and strand every one
+  //    of those updates in the database this project is about to stop reading (PR #174 review).
+  const recordsAfter = readBoardRecords(dir, { ...opts, board: connection });
+  record(
+    "server board records",
+    recordsAfter.ok ? "ok" : "failed",
+    recordsAfter.ok ? `${recordsAfter.keys.length} records` : recordsAfter.detail,
+  );
+  if (!recordsAfter.ok) {
+    // Fatal, unlike the pre-flip read: reading the board back IS the verification, and `bd dolt
+    // test` does not stand in for it. A server can answer the connection test and still refuse the
+    // database — bd's own project-identity guard does exactly that when the connection names a
+    // database belonging to another project ("PROJECT IDENTITY MISMATCH — refusing to connect").
+    errors.push(`the server accepted the connection but this project cannot read its board: ${recordsAfter.detail}`);
+    return failWithRollback("board unreadable on the server", { before, connection, counts, backup });
+  }
+  counts.after = recordsAfter.keys.length;
+
+  // Every comparison below (11a missing, 11b diverged, 11c server-only) answers ONE question — did this
+  // board's history arrive on the server — and that question only exists across a COPY boundary.
+  // When both reads hit the same server database there is none: a re-run that changes only the
+  // account or the TLS setting reads one database twice, so a record a teammate edits or deletes
+  // between the two reads comes back divergent or missing from the very database that holds it, and
+  // the run would report a failed migration and roll back a switch that was correct (PR #174
+  // review). Being in server mode is NOT enough to claim that — repointing at another host or
+  // database is a copy boundary again, and every check has to apply — which is what
+  // `sameServerTarget` decides, conservatively.
+  const compareCopy = recordsBefore.ok && !sameServerTarget;
+  if (recordsBefore.ok && sameServerTarget) {
+    record("arrived-whole check", "skipped", "both reads hit the same server database — nothing was copied");
+  }
+
+  const onServer = new Set(recordsAfter.keys);
+  const missing = compareCopy ? recordsBefore.keys.filter((key) => !onServer.has(key)) : [];
+  if (missing.length && !flags.force) {
+    errors.push(
+      `the server's "${connection.database}" database is missing ${missing.length} of this board's ` +
+        `${counts.before} records (${missing.slice(0, 5).join(", ")}${missing.length > 5 ? ", …" : ""}) — ` +
+        "its history has not been copied onto the server yet",
+    );
+    return failWithRollback("server board is missing records", { before, connection, counts, backup, missing });
+  }
+
+  // 11b. Every key the server DOES hold, compared by content against the board being moved. A copy
+  //     whose digest matches is the same record; ANY difference is divergence and refuses, in both
+  //     directions. A NEWER `updated_at` on the server is not the exception it looks like (PR #174
+  //     review): it says the server's row was written last, not that it carries this board's edit.
+  //     Close a bead here at t1 while the stale server copy is retitled at t2 and the server wins
+  //     on timestamp while missing the close — flipping onto it strands exactly the update the
+  //     check exists to protect. Nothing bd prints proves the server's row descends from this one,
+  //     so content equality is the only evidence accepted; `--force` remains the deliberate
+  //     override, and the key check still accepts keys the server holds and this board does not.
+  const diverged = compareCopy
+    ? recordsBefore.keys.filter((key) => onServer.has(key) && recordsAfter.digests.get(key) !== recordsBefore.digests.get(key))
+    : [];
+  // The stamp picks the fix to name, not the verdict: behind → the copy is old, re-run Phase 1;
+  // ahead → both sides were written after the copy, so the two boards have to be reconciled by a
+  // human (or forced, if this board is the leftover of a machine that already switched).
+  const ahead = diverged.filter((key) => {
+    const here = recordsBefore.updated.get(key);
+    const there = recordsAfter.updated.get(key);
+    return here !== undefined && there !== undefined && there > here;
+  });
+  if (diverged.length && !flags.force) {
+    const n = diverged.length;
+    errors.push(
+      `the server's "${connection.database}" database holds all of this board's records but ${n} ` +
+        `of them say${n === 1 ? "s" : ""} something different there ` +
+        `(${diverged.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}) — a title, a status, a label, a ` +
+        "dependency, a comment or a memory value. The copy on the server and this " +
+        "board were edited apart, so switching would strand every one of those differences in the " +
+        "database being left behind. " +
+        (ahead.length === n
+          ? "Those rows were written LAST on the server, which does not mean they contain this " +
+            "board's edits — a later timestamp orders two writes, it does not merge them. Reconcile " +
+            "the two boards (compare a `bd export --all` from each); --force is right only when this " +
+            "machine's board is a leftover copy nobody has written since it was copied."
+          : ahead.length
+            ? `${ahead.length} of them (${ahead.slice(0, 5).join(", ")}${ahead.length > 5 ? ", …" : ""}) ` +
+              "were written last on the server, which orders the two writes without merging them; the " +
+              "rest are older there. Re-run Phase 1 of the runbook with a current copy, or reconcile " +
+              "the two boards before forcing."
+            : "The copy on the server predates this board. Re-run Phase 1 of the runbook with a " +
+              "current copy.") +
+        // EVERY record differing is not a stale snapshot — nothing edits a whole board — it is the
+        // two sides describing the same rows differently. Named, because the fix is the opposite
+        // one (look at the exports, then --force) and an operator should not have to guess.
+        (n === recordsBefore.keys.length
+          ? " (That is EVERY record on the board, which usually means the two sides print the same " +
+            "rows differently rather than that the boards really diverged — compare a `bd export " +
+            "--all` from each before reaching for --force.)"
+          : ""),
+    );
+    return failWithRollback("server board differs from this one", { before, connection, counts, backup, missing, diverged });
+  }
+
+  // 11c. Keys the SERVER holds and this board does not. Two different things wear that shape and
+  //     nothing bd prints tells them apart (PR #174 review): a teammate's issue created on the
+  //     server after Phase 1 copied it — the ordinary case for a machine joining a board others
+  //     already moved onto — or an issue deleted HERE after that copy (`bd delete`, an epic removed
+  //     with --cascade), which the server still carries and the flip would bring back. Deciding
+  //     would need ancestry or a tombstone; bd exposes neither, so the run does not decide.
+  //     Reported rather than refused, because the two directions are not the same failure: a
+  //     missing or divergent record is this board's work stranded in a database about to be
+  //     abandoned, which nothing recovers — one only the server has is work that survives the flip
+  //     either way, and a resurrected bead is deleted again in one command. Refusing would also push
+  //     the runbook's second machine onto --force, which switches off the checks above that guard
+  //     the unrecoverable half. So the keys are named and the operator decides.
+  //     Suppressed with the rest of the copy checks when both reads hit the SAME server database
+  //     (`compareCopy`): there a key in one and not the other is a teammate writing between two
+  //     reads — nothing to do with a copy, and the warning would be pure noise.
+  const here = new Set(recordsBefore.ok ? recordsBefore.keys : []);
+  const extra = compareCopy ? recordsAfter.keys.filter((key) => !here.has(key)) : [];
+  if (extra.length) {
+    const n = extra.length;
+    const named = `${extra.slice(0, 5).join(", ")}${n > 5 ? ", …" : ""}`;
+    record("server-only records", "skipped", `${n} not compared — present there, absent here`);
+    warnings.push(
+      `the server's "${connection.database}" database holds ${n} record${n === 1 ? "" : "s"} this ` +
+        `board does not (${named}). Everything this board holds arrived intact — these are the other ` +
+        "direction, and nothing here can say which of two things they are: work created on the " +
+        `server since it was copied (normal — the board moved on without this machine), or work ` +
+        `deleted HERE after the copy, which the server still carries and this switch has just brought ` +
+        "back. Check them (`bd show <id>`): keep them, or delete them again on the now-shared board.",
+    );
+  }
+
+  // 12. Only now publish the team-wide defaults into config.yaml — `revert` restores the file from
+  //    the snapshot below, so a failed attempt leaves it exactly as it was rather than carrying
+  //    half a connection. `bd dolt set --update-config` refuses in embedded mode, which is why this
+  //    comes after the metadata write rather than before it.
+  //    {@link snapshotConfig} takes it as late as it can and only once (PR #174 review) — not
+  //    reused from step 3, since everything between the two (the flip, the connection test, a
+  //    server export with a multi-minute budget) is a window in which someone edits config.yaml,
+  //    and not re-taken if step 4 already wrote, since a revert owes the file as this run FOUND
+  //    it. Either way the window is the smallest available: once bd starts patching the file, its
+  //    writes and a concurrent edit are the same bytes to anything looking from here.
+  //    An unreadable file refuses rather than publishes, for the same reason step 3 does: a
+  //    snapshot that cannot be taken is a rollback that cannot happen, and the half-written
+  //    config.yaml a failed publication leaves behind is exactly what a rollback is for.
+  const configNow = snapshotConfig();
+  if (!configNow.ok) {
+    record("config.yaml", "failed", configNow.detail);
+    errors.push(
+      `${configNow.detail} — the team-wide defaults are not published, because a half-written ` +
+        "config.yaml could not be rolled back from a snapshot this cannot read",
+    );
+    return failWithRollback("could not snapshot config.yaml before publishing", { before, connection, counts, backup, missing, diverged, extra });
+  }
+  configPublished = true;
+  // What each connection key WOULD be published as — the value {@link claim} records once a step
+  // reports that its command ran.
+  const wants = new Map(publishedConfigWrites("server", connection));
+  for (const [key, want] of teamConfigKeys("server")) {
+    const status = ensureBdConfig(dir, beadsDir, key, want, { exec });
+    claim(key, want, status);
+    record(`${key}=${want}`, status);
+    if (status === "failed") errors.push(`could not set ${key}=${want}`);
+  }
+  for (const published of ensureDoltConnection(dir, beadsDir, connection, { exec })) {
+    // `undefined` where the field is retracted rather than published — the shape the rollback reads
+    // as "this run asked for the key to be gone".
+    claim(published.key, wants.get(published.key), published.status);
+    steps.push(published);
+    onStep(published);
+    if (published.status === "missing" || published.status === "failed") errors.push(published.detail);
+  }
+  // A bd that cannot write the team defaults cannot open the database either (that is what those
+  // commands do first), so this is the same class of failure as a refused connection — and gets the
+  // same answer: the project goes back to what it was rather than staying half-switched.
+  if (errors.length) {
+    return failWithRollback("could not publish the team-wide connection defaults", { before, connection, counts, backup, missing, diverged, extra });
+  }
+
+  return { ok: true, steps, errors, warnings, before, connection, counts, backup, missing, diverged, extra };
+}
