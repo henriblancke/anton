@@ -5,6 +5,7 @@
   "dolt_server_host": "dolt.refter.dev",
   "dolt_server_port": 3306,
   "dolt_server_user": "beads",
+  "dolt_server_tls": true,
   "dolt_database": "anton",
   "project_id": "b78d43e3-4df3-4615-9ea0-dede6273eb93"
 }
