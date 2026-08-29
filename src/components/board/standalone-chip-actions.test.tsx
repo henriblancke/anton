@@ -32,6 +32,12 @@ const contractOf = (over: Partial<Parameters<typeof contractStatusOf>[0]>) =>
 
 const SHAPED = "## Goal\nG\n\n## Context\nC\n\n## Out of scope\nO\n\n## Verify\nV";
 
+/** The rendered `<button>` tag carrying `marker`, so a test can assert on one half of the split. */
+const buttonTag = (html: string, marker: string) => {
+  const at = html.indexOf(marker);
+  return at < 0 ? "" : html.slice(html.lastIndexOf("<button", at), html.indexOf(">", at) + 1);
+};
+
 describe("canOfferRun", () => {
   const item = makeStandaloneItem();
 
@@ -77,7 +83,8 @@ describe("ApproveRunAction", () => {
       />,
     );
     // Both halves lock, not just the one that was clicked — either would start the same run.
-    expect(html.match(/\sdisabled=""/g)).toHaveLength(2);
+    expect(buttonTag(html, "Queue this run")).toContain('disabled=""');
+    expect(buttonTag(html, "Approve and run now")).toContain('disabled=""');
     expect(html).toContain("…");
   });
 
