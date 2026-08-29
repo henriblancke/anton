@@ -12,6 +12,7 @@ import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
+import { lastRunsBySchedule, type ScheduleLastRun } from "./schedule-runs";
 
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
@@ -37,6 +38,11 @@ export interface ScheduleSummary {
   enabled: boolean;
   lastRunAt?: number;
   nextRunAt?: number;
+  /**
+   * How the last fire ENDED (anton-znoz) — absent until this schedule has settled a job, and absent
+   * from every write path that only touches the row itself. `lastRunAt` says when; this says what.
+   */
+  lastRun?: ScheduleLastRun;
 }
 
 function secDate(ms: number): Date {
@@ -139,13 +145,22 @@ export async function updateSchedule(
   await db.update(schema.schedules).set(set).where(eq(schema.schedules.id, id));
 }
 
-/** All schedules for a project (UI read path via shared anton.db). */
+/**
+ * All schedules for a project (UI read path via shared anton.db), each carrying how its last fire
+ * ended. The outcome is joined here rather than left to the caller so every path that renders a
+ * schedule — the settings page's server render, the panel's poll, a PATCH response — shows the same
+ * row; a patch that answered without it would blank the outcome column on every toggle.
+ */
 export async function listSchedules(projectId: string): Promise<ScheduleSummary[]> {
-  const rows = await getDb()
-    .select()
-    .from(schema.schedules)
-    .where(eq(schema.schedules.projectId, projectId));
-  return rows.map(toScheduleSummary);
+  const [rows, lastRuns] = await Promise.all([
+    getDb().select().from(schema.schedules).where(eq(schema.schedules.projectId, projectId)),
+    lastRunsBySchedule(projectId),
+  ]);
+  return rows.map((row) => {
+    const summary = toScheduleSummary(row);
+    const lastRun = lastRuns[row.id];
+    return lastRun ? { ...summary, lastRun } : summary;
+  });
 }
 
 /**

@@ -22,6 +22,7 @@ import {
   AutomationTable,
   type AutomationScheduleState,
   type AutomationSpec,
+  type ScheduleLastRun,
 } from "@/components/settings/automation-table";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
@@ -538,6 +539,8 @@ interface AutomationSchedule {
   nextRunAt?: number;
   /** Epoch SECONDS of the last fire; absent until it has run once. */
   lastRunAt?: number;
+  /** How that fire ended (anton-znoz); absent until a fired job has settled. */
+  lastRun?: ScheduleLastRun;
 }
 
 /**
@@ -646,6 +649,7 @@ export function SettingsView({
             cron: row?.cron ?? defaultCrons[a.id] ?? "",
             nextRunAt: row?.nextRunAt,
             lastRunAt: row?.lastRunAt,
+            lastRun: row?.lastRun,
           },
         ];
       }),
@@ -800,6 +804,7 @@ export function SettingsView({
             cron: schedule.cron,
             nextRunAt: schedule.nextRunAt,
             lastRunAt: schedule.lastRunAt,
+            lastRun: schedule.lastRun,
           },
         }));
       }
@@ -828,10 +833,11 @@ export function SettingsView({
   /**
    * Keep the open Automation panel's next-run and last-run times live (anton-ue90).
    *
-   * Only the two TIME fields are taken from the poll. Cadence and enabled state are owned by this
-   * page's optimistic writes, and letting a poll land on them would let a response that left the
-   * server before an edit arrive after it and quietly put the old cadence back on screen — while the
-   * editor's own draft, seeded once from the `cron` prop, kept showing the new one.
+   * Only the SERVER-OWNED fields are taken from the poll — the two times and the last fire's outcome.
+   * Cadence and enabled state are owned by this page's optimistic writes, and letting a poll land on
+   * them would let a response that left the server before an edit arrive after it and quietly put the
+   * old cadence back on screen — while the editor's own draft, seeded once from the `cron` prop, kept
+   * showing the new one.
    */
   useEffect(() => {
     if (active !== "automation") return;
@@ -865,7 +871,12 @@ export function SettingsView({
           const current = next[row.type];
           // A row for a type this build doesn't list is not ours to show.
           if (!current) continue;
-          next[row.type] = { ...current, nextRunAt: row.nextRunAt, lastRunAt: row.lastRunAt };
+          next[row.type] = {
+            ...current,
+            nextRunAt: row.nextRunAt,
+            lastRunAt: row.lastRunAt,
+            lastRun: row.lastRun,
+          };
         }
         return next;
       });

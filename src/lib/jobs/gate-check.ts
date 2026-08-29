@@ -55,7 +55,7 @@ import {
   type ResumePlan,
 } from "./gate-targets";
 import { enqueueReviewFixIfAbsent, systemClock, type AntonDb, type Clock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 import { resumeEpic } from "./unstick";
 
 /**
@@ -351,7 +351,7 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
 
-  return async function gateCheck(ctx: JobContext): Promise<void> {
+  return async function gateCheck(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as GateCheckPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -389,5 +389,12 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     }
 
     assertGatesEvaluated(pass.repo, evaluation.errors);
+
+    // A slot where every gate is still open is the NORMAL case for a job that runs every ten
+    // minutes; it has to read as "nothing to do", or the column is a wall of green that means
+    // nothing.
+    return wroteToBoard(evaluation.resolved, surfaced, handedBack)
+      ? { changed: true, note: `closed ${evaluation.resolved} gate(s)` }
+      : { changed: false, note: "no gate closed" };
   };
 }

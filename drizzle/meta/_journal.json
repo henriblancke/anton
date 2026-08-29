@@ -134,6 +134,13 @@
       "when": 1787110055236,
       "tag": "0018_backfill_value_labels",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1788029979284,
+      "tag": "0019_job_outcome",
+      "breakpoints": true
     }
   ]
 }

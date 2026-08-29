@@ -785,11 +785,48 @@ export async function renewLease(
     .where(eq(schema.jobs.id, jobId));
 }
 
-export async function complete(db: AntonDb, clock: Clock, jobId: string): Promise<void> {
+/**
+ * What a handler reports it actually DID (anton-znoz). A job's `status` says whether it finished;
+ * this says whether finishing meant anything — the difference between a nightly scan that filed
+ * three beads and one that found nothing, which the Automation table reads as "worked" vs "nothing
+ * to do". Handlers that report nothing settle with a NULL outcome, which is a third claim again
+ * ("ran, effect unknown") and is never dressed up as either.
+ */
+export interface JobEffect {
+  /** Did this run change anything — the board, the queue, a report row? */
+  changed: boolean;
+  /** One short line naming what it did, or why there was nothing to do. */
+  note?: string;
+}
+
+/** How a `JobEffect` is stored on the row: the two values `jobs.outcome` ever holds. */
+export type JobOutcome = "ok" | "noop";
+
+/** Persisted shape of an effect — kept next to `complete` so writer and reader agree. */
+export function toJobOutcome(effect: JobEffect | undefined): {
+  outcome: JobOutcome | null;
+  outcomeNote: string | null;
+} {
+  if (!effect) return { outcome: null, outcomeNote: null };
+  return { outcome: effect.changed ? "ok" : "noop", outcomeNote: effect.note ?? null };
+}
+
+export async function complete(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  effect?: JobEffect,
+): Promise<void> {
   const nowMs = clock.now();
   await db
     .update(schema.jobs)
-    .set({ status: "done", leaseExpiresAt: null, lastError: null, updatedAt: secDate(nowMs) })
+    .set({
+      status: "done",
+      leaseExpiresAt: null,
+      lastError: null,
+      ...toJobOutcome(effect),
+      updatedAt: secDate(nowMs),
+    })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 

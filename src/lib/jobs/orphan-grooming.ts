@@ -14,7 +14,7 @@ import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 export interface OrphanGroomingPayload {
   projectId: string;
@@ -94,7 +94,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
   const db = deps.db;
   void (deps.clock ?? systemClock); // reserved for future time-based grooming (e.g. age threshold)
 
-  return async function orphanGrooming(ctx: JobContext): Promise<void> {
+  return async function orphanGrooming(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as OrphanGroomingPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -102,7 +102,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
 
     const all = await beads.list(repo, ["--status", "all"]);
     const orphans = findOrphans(all);
-    if (orphans.length === 0) return; // nothing loose — done.
+    if (orphans.length === 0) return { changed: false, note: "no loose tickets" };
 
     await ctx.heartbeat();
 
@@ -144,6 +144,10 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
     await beads
       .sync(repo)
       .catch((e) => console.error("[orphan-grooming] beads dolt sync failed", e));
+
+    // `linked`, not `orphans.length`: a ticket bd refused to link was not bucketed, and the row must
+    // not claim it was.
+    return { changed: linked > 0, note: `bucketed ${linked} loose ticket(s)` };
   };
 }
 

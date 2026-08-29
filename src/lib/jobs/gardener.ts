@@ -39,7 +39,7 @@ import { fileGardenerProposals, type EmissionArbitrationDeps } from "./gardener-
 import { remainingApplyBudget } from "./pass-budget";
 import { deferPassSession, passProject, pullBoard, type PassScope } from "./pass-preamble";
 import { systemClock, type AntonDb, type Clock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 export { STALE_IN_PROGRESS_DAYS, STALE_OPEN_DAYS } from "./gardener-hygiene";
 
@@ -71,7 +71,7 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
   const clock = deps.clock ?? systemClock;
   const nudge = deps.nudge ?? ((project: NudgeTarget) => nudgeSync(project, "gardener"));
 
-  return async function gardener(ctx: JobContext): Promise<void> {
+  return async function gardener(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as GardenerPayload;
     const project = await passProject(db, projectId);
     const repo = project.repoPath;
@@ -82,6 +82,10 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
      * and a nightly patrol with nothing to shadow leaves no empty session behind.
      */
     const session = deferPassSession(db, clock, { ctx, projectId, kind: "gardener" });
+
+    // Held outside the try so the settle below can report it: the tiers that produce it all run
+    // inside, and only a patrol that reached the end of them has an effect to state.
+    let effect: JobEffect;
 
     // Settled on EVERY exit path, not just the proposal tier's. The budget read below opens the row
     // itself when an earlier attempt spent part of the cap (it writes a note), so any throw between
@@ -168,10 +172,19 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
       // After the report is published, so a failure filing proposals costs the pass its judgment tier
       // and not its findings.
       await fileGardenerProposals(scope, { findings, observedAtMs, arbitration: deps.arbitration });
+
+      // A patrol that closed nothing and found nothing is the healthy board's outcome, and the one
+      // an operator most needs told apart from a patrol that never ran.
+      const closed = applied.closedEpics.length;
+      effect =
+        closed > 0 || applied.rowsRecomputed > 0 || findings.length > 0
+          ? { changed: true, note: `closed ${closed} epic(s), ${findings.length} finding(s)` }
+          : { changed: false, note: "board clean" };
     } catch (e) {
       await session.end("failed");
       throw e;
     }
     await session.end("done");
+    return effect;
   };
 }

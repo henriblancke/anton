@@ -62,6 +62,14 @@ export const jobs = sqliteTable(
     leaseExpiresAt: ts("lease_expires_at"),
     attempts: integer("attempts").notNull().default(0),
     lastError: text("last_error"),
+    // What the handler reported it actually DID, written when the job completes (anton-znoz).
+    // `ok` = it changed something, `noop` = it ran and found nothing to do. A successful job with a
+    // NULL outcome is one whose handler reports nothing — the two are different claims, and the
+    // Automation table says so rather than reading silence as "worked".
+    // effect | note: the schedule's last-run outcome is derived from these plus `status`, so a
+    // failure needs no outcome of its own (it is `status` + `lastError`).
+    outcome: text("outcome"),
+    outcomeNote: text("outcome_note"),
     createdAt: ts("created_at").notNull().default(now),
     updatedAt: ts("updated_at").notNull().default(now),
   },

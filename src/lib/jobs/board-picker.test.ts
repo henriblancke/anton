@@ -84,6 +84,22 @@ describe("makeBoardPickerHandler", () => {
     expect(plan?.generatedAt).toBe(Math.floor(NOW / 1000));
   });
 
+  // A pass ALWAYS writes a plan row, so the write is not the effect — the ranking is. An empty
+  // board makes every ten-minute slot look like work if the two are conflated (anton-znoz).
+  it("reports a ranked plan as work done and an empty one as nothing to do", async () => {
+    board.current = [bead("t1", { priority: 2 })];
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: true,
+      note: "ranked 1 target(s)",
+    });
+
+    board.current = [];
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: false,
+      note: "nothing claimable to rank",
+    });
+  });
+
   it("reads the board strictly, so a gate-less read retries instead of recording it as blocked", async () => {
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
     expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true }]);

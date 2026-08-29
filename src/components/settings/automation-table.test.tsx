@@ -227,6 +227,51 @@ describe("the automation rows", () => {
     expect(screen.getAllByText("never").length).toBe(AUTOMATIONS.length - 1);
   });
 
+  // "3h ago" alone reads as healthy whether the pass did work, found nothing, or parked on an
+  // error — which is what made the column unanswerable (anton-znoz).
+
+  it("says what came of the last fire, not just when it was", () => {
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: NOW_SEC() - 3 * 3600 - 60,
+        lastRun: { outcome: "ok", at: NOW_SEC() - 3 * 3600 - 60, note: "triaged 4 signal(s)" },
+      },
+    });
+    expect(screen.getByText("3h ago")).toBeTruthy();
+    expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
+  });
+
+  it("tells a fire that did nothing apart from one that did work", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 60,
+        lastRun: { outcome: "noop", at: NOW_SEC() - 60, note: "no stalls found" },
+      },
+    });
+    expect(screen.getByText("no stalls found")).toBeTruthy();
+    // The no-op is named for a screen reader too, where the note alone would not carry the verdict.
+    expect(screen.getByText("nothing to do —")).toBeTruthy();
+  });
+
+  it("shows a failed fire with the error that explains it", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: { outcome: "failed", at: NOW_SEC() - 120, note: "gh: not authenticated" },
+      },
+    });
+    expect(screen.getByText("gh: not authenticated")).toBeTruthy();
+    expect(screen.getByText("failed —")).toBeTruthy();
+  });
+
+  // A row that fired before the outcome column existed, or whose handler reports no effect, knows
+  // only that it ran and did not fail — and must not claim more than that.
+  it("falls back to the time alone when the fire reported no outcome", () => {
+    renderTable({ "run-health": { lastRunAt: NOW_SEC() - 120 } });
+    expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.queryByText("nothing to do")).toBeNull();
+  });
+
   // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
   // and without saying so the row reads as a failure.
   it("says which automations are idle because the one that feeds them is off", () => {

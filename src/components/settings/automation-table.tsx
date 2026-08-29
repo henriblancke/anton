@@ -8,6 +8,22 @@ import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/atoms";
 import { CadenceEditor } from "@/components/settings/cadence-editor";
 
+/**
+ * How the last fire ENDED, mirrored from the server's `ScheduleLastRun` (lib/schedule-runs.ts) so
+ * this client module imports no server code. `noop` is the one that earns its own state: an
+ * automation that ran and had nothing to do is working, and reading it as either success or silence
+ * is what made "last run: 3h ago" unanswerable.
+ */
+export type ScheduleRunOutcome = "ok" | "noop" | "failed" | "cancelled";
+
+export interface ScheduleLastRun {
+  outcome: ScheduleRunOutcome;
+  /** Epoch SECONDS — when the fire settled. */
+  at: number;
+  /** One short line: what it did, or why it failed. */
+  note?: string;
+}
+
 /** One automation's live schedule state. `enabled: null` = this project has no row for it yet. */
 export interface AutomationScheduleState {
   enabled: boolean | null;
@@ -17,7 +33,23 @@ export interface AutomationScheduleState {
   nextRunAt?: number;
   /** Epoch SECONDS of the last fire, as stored. Absent until it has run once. */
   lastRunAt?: number;
+  /** How that fire ended. Absent until a job this schedule enqueued has settled. */
+  lastRun?: ScheduleLastRun;
 }
+
+/**
+ * The four outcomes, as a dot and a word.
+ *
+ * A no-op gets the SAME neutral weight as an unknown rather than the success colour: the column is
+ * scanned for the one row that is wrong, and painting every idle ten-minute poll green is how a real
+ * failure gets lost in it. Only failure is coloured, because only failure is a decision.
+ */
+const OUTCOME_STYLES: Record<ScheduleRunOutcome, { dot: string; label: string; text: string }> = {
+  ok: { dot: "bg-stage-done", label: "ok", text: "text-muted-foreground" },
+  noop: { dot: "bg-border", label: "nothing to do", text: "text-subtle" },
+  failed: { dot: "bg-risk-high", label: "failed", text: "text-risk-high" },
+  cancelled: { dot: "bg-risk-med", label: "cancelled", text: "text-muted-foreground" },
+};
 
 /** What one automation is, and what makes it inert. */
 export interface AutomationSpec {
@@ -258,19 +290,56 @@ function AutomationTableRow({
       </td>
 
       <td className="px-2.5 py-2 align-middle font-mono text-[11.5px] tabular-nums whitespace-nowrap text-muted-foreground">
-        {state.lastRunAt ? (
-          <span title={formatInstant(state.lastRunAt)}>
-            {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString(), now)}
-          </span>
-        ) : (
-          <span className="text-subtle">never</span>
-        )}
+        <LastRunCell state={state} now={now} />
       </td>
 
       <td className="px-2.5 py-2 text-right align-middle">
         <Toggle checked={on} onChange={onToggle} label={automation.label} />
       </td>
     </tr>
+  );
+}
+
+/**
+ * When the automation last fired, and what came of it (anton-znoz).
+ *
+ * "3h ago" alone reads as healthy whether the pass filed three beads, found nothing, or parked on a
+ * bd failure — so the time is the headline and the outcome is the line under it, in the row's own
+ * words ("closed 2 gate(s)", "no gate closed") rather than a status vocabulary an operator has to
+ * learn. A fire that predates the outcome column, or whose handler reports no effect, says "ok" and
+ * claims nothing more.
+ */
+function LastRunCell({ state, now }: { state: AutomationScheduleState; now: number }) {
+  if (!state.lastRunAt) return <span className="text-subtle">never</span>;
+
+  const style = state.lastRun ? OUTCOME_STYLES[state.lastRun.outcome] : undefined;
+  const detail = state.lastRun?.note ?? style?.label;
+
+  return (
+    <span className="flex flex-col gap-0.5">
+      <span className="flex items-center gap-1.5">
+        {style ? (
+          <span
+            className={cn("size-1.5 shrink-0 rounded-full", style.dot)}
+            aria-hidden="true"
+          />
+        ) : null}
+        <span title={formatInstant(state.lastRunAt)}>
+          {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString(), now)}
+        </span>
+      </span>
+      {detail ? (
+        <span
+          className={cn("max-w-[15rem] truncate text-[10.5px]", style?.text ?? "text-subtle")}
+          // The failure note is an error message and can outrun the column; the tooltip keeps it.
+          title={detail}
+        >
+          {/* Screen readers get the outcome named, not just the note that happens to imply it. */}
+          <span className="sr-only">{style ? `${style.label} — ` : ""}</span>
+          {detail}
+        </span>
+      ) : null}
+    </span>
   );
 }
 

@@ -190,6 +190,57 @@ describe("JobRunner (live, in-memory db)", () => {
     }
   }
 
+  // ── the handler's own claim about what it DID (anton-znoz) ──
+  //
+  // `status` says the job finished; `outcome` says whether finishing meant anything. The Automation
+  // table reads the two together, so a run that reported nothing must not be dressed up as either.
+
+  it("records a handler's reported effect on the completed job", async () => {
+    const r = runner(async () => ({ changed: true, note: "bucketed 3 loose ticket(s)" }));
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("ok");
+    expect(job?.outcomeNote).toBe("bucketed 3 loose ticket(s)");
+  });
+
+  it("records a no-op distinctly from a run that changed something", async () => {
+    const r = runner(async () => ({ changed: false, note: "no loose tickets" }));
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("noop");
+    expect(job?.outcomeNote).toBe("no loose tickets");
+  });
+
+  it("leaves the outcome null for a handler that reports nothing", async () => {
+    const r = runner(async () => {});
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBeNull();
+    expect(job?.outcomeNote).toBeNull();
+  });
+
+  it("records no outcome for a job that parked — a failure is status + lastError", async () => {
+    const r = runner(async () => {
+      throw new PoisonError("boom");
+    });
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("parked");
+    expect(job?.outcome).toBeNull();
+    expect(job?.lastError).toContain("boom");
+  });
+
   it("runs a queued job to completion", async () => {
     let ran = 0;
     const r = runner(async () => {

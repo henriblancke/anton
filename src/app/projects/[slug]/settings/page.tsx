@@ -34,6 +34,7 @@ export default async function ProjectSettingsPage({
     cron: s.cron,
     nextRunAt: s.nextRunAt,
     lastRunAt: s.lastRunAt,
+    lastRun: s.lastRun,
   }));
   // The cadence each automation ships with, so "Reset to default" has one source of truth.
   const defaultCrons = Object.fromEntries(DEFAULT_SCHEDULES.map((d) => [d.type, d.cron]));

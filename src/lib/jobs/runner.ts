@@ -41,6 +41,7 @@ import {
   toMs,
   type AntonDb,
   type Clock,
+  type JobEffect,
   type JobRow,
   type JobType,
 } from "./queue";
@@ -203,7 +204,16 @@ export interface JobContext {
   report: (info: LiveJobInfo) => void;
 }
 
-export type JobHandler = (ctx: JobContext) => Promise<void>;
+/**
+ * A handler settles by returning: a {@link JobEffect} states whether the run changed anything, and
+ * `void` leaves that unstated. Returning it (rather than reporting through `ctx`) keeps the claim on
+ * the same path as the throw that would have contradicted it — a handler cannot report "nothing to
+ * do" and then fail.
+ */
+export type JobHandler = (ctx: JobContext) => Promise<JobEffect | void>;
+
+// Re-exported so a handler module imports its whole contract — context, signature, return — from one place.
+export type { JobEffect } from "./queue";
 
 export type Outcome =
   | { kind: "success" }
@@ -1016,6 +1026,8 @@ export class JobRunner {
       armTimeout();
 
       let outcome: Outcome;
+      // What the handler reported it did — carried to `settle` so only a COMPLETED job records it.
+      let effect: JobEffect | undefined;
       try {
         if (!handler) throw new Error(`no handler registered for job type "${job.type}"`);
         const ctx: JobContext = {
@@ -1032,7 +1044,7 @@ export class JobRunner {
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
         };
-        await handler(ctx);
+        effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };
       } catch (e) {
         // A timeout abort is a retryable failure with a clear reason (not a poison/quota misread).
@@ -1048,7 +1060,7 @@ export class JobRunner {
         if (timeoutTimer) clearTimeout(timeoutTimer);
       }
 
-      await this.settle(job, outcome, policy);
+      await this.settle(job, outcome, policy, effect);
     } catch (e) {
       // Policy resolution or the settle write itself failed — log and release the slot; the lease
       // expires and the job is reclaimed on a later tick.
@@ -1104,7 +1116,12 @@ export class JobRunner {
     }
   }
 
-  private async settle(job: JobRow, outcome: Outcome, policy: JobPolicy): Promise<void> {
+  private async settle(
+    job: JobRow,
+    outcome: Outcome,
+    policy: JobPolicy,
+    effect?: JobEffect,
+  ): Promise<void> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
     // Fast-path a cancel already visible at this read. The queue transition below also compares from
@@ -1116,7 +1133,7 @@ export class JobRunner {
     const action = nextAction(config, fresh, outcome, this.clock.now());
     switch (action.action) {
       case "complete":
-        await complete(this.db, this.clock, job.id);
+        await complete(this.db, this.clock, job.id, effect);
         break;
       case "reschedule":
         await reschedule(this.db, this.clock, job.id, action.runAtMs, {

@@ -40,6 +40,7 @@ import {
   exhaustedParkAttempts,
   POISON_PARK_PREFIX,
   type JobContext,
+  type JobEffect,
   type JobHandler,
 } from "./runner";
 
@@ -393,7 +394,7 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
   const clock = deps.clock ?? systemClock;
   const readPrActivity = deps.readPrActivity ?? getPrActivity;
 
-  return async function runHealth(ctx: JobContext): Promise<void> {
+  return async function runHealth(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as RunHealthPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -453,6 +454,12 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     // gated here explicitly. A cancelled sweep must leave the previous report standing.
     ctx.signal.throwIfAborted();
     await saveRunHealthReport(db, clock, { projectId, jobId: ctx.jobId, findings });
+
+    // The report row is replaced every sweep, so writing it is not the effect — FINDING something
+    // is. A clean sweep is the healthy outcome and says so.
+    return findings.length > 0
+      ? { changed: true, note: `${findings.length} finding(s)` }
+      : { changed: false, note: "no stalls found" };
   };
 }
 
