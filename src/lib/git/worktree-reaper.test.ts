@@ -243,6 +243,31 @@ suite("the sweep over real residue (real git)", () => {
     }
   });
 
+  it("reports a lock that appears AFTER planning as skipped, not as reaped", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-late" });
+    // The candidate as planning saw it: unlocked, settled, reapable.
+    const candidates = [
+      { branch: wt.branch, path: wt.path, beadId: "anton-late", runLive: false, bead: "settled" as const },
+    ];
+    // The window this closes: another tool locks the checkout between the plan and the removal.
+    execFileSync("git", ["-C", repo, "worktree", "lock", "--reason", "supacode", wt.path]);
+
+    try {
+      const report = await reapWorktrees({ repoPath: repo, candidates, lookupPr: noPr });
+
+      expect(report.reaped).toEqual([]);
+      expect(report.skipped.map((e) => e.reason)).toEqual([
+        expect.stringContaining("locked by another owner (supacode)"),
+      ]);
+      expect(existsSync(wt.path)).toBe(true);
+      expect(branches()).toContain("anton/anton-late");
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+    }
+  });
+
   it("scopes the sweep to anton's worktrees root — an agent checkout elsewhere is not a candidate", async () => {
     const outsideRoot = realpathSync(mkdtempSync(join(tmpdir(), "anton-reap-other-")));
     const outside = join(outsideRoot, "claude-worktree");

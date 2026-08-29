@@ -108,35 +108,49 @@ export async function releaseRunResources(args: {
     },
     isBeadSettled: async () => (await beads.show(args.repoPath, args.beadId)).status === "closed",
   });
-  const session = deferPassSession(args.db, args.clock, {
-    ctx: args.ctx,
-    projectId: args.projectId,
-    runId: args.runId,
-    kind: "worktree-reaper",
-  });
-  await session.log(
-    formatReapReport(
-      { reaped: [entry], skipped: [] },
-      `worktree-reaper: run ${args.beadId} settled as ${args.status}`,
-    ),
-  );
-  await session.end("done");
+  // A pure keep released nothing and has nothing to account for. Without this gate every quota park
+  // — which stops with the worktree deliberately intact so the run resumes in it — would leave one
+  // empty "skipped" teardown session on the run's timeline, per attempt.
+  if (entry.outcome !== "kept") {
+    const session = deferPassSession(args.db, args.clock, {
+      ctx: args.ctx,
+      projectId: args.projectId,
+      runId: args.runId,
+      kind: "worktree-reaper",
+    });
+    await session.log(
+      formatReapReport(
+        { reaped: [entry], skipped: [] },
+        `worktree-reaper: run ${args.beadId} settled as ${args.status}`,
+      ),
+    );
+    await session.end("done");
+  }
   return entry;
+}
+
+/**
+ * The board the sweep judges from, pulled first and FAIL-CLOSED — the one pass whose pull is not
+ * best-effort. This checkout's Dolt working set trails the remote by a sync heartbeat, so a bead
+ * another machine reopened still reads as closed here; sweeping from that stale board would classify
+ * live work as residue and delete its worktree and branch. A failed pull therefore fails the pass,
+ * which the runner retries: unreaped residue costs disk until the next sweep, the other way costs
+ * someone's checkout. `beads.pull` already resolves for the boards with nothing to pull — a
+ * shared-server board and a workspace with no remote — so only a real sync failure lands here.
+ */
+export async function readBoardOrFail(
+  repo: string,
+  pull: (repo: string) => Promise<void> = beads.pull,
+): Promise<Bead[]> {
+  await pull(repo);
+  return loadAllIssues(repo);
 }
 
 export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
   const branchPrefix = deps.branchPrefix ?? "anton";
-  const readBoard =
-    deps.readBoard ??
-    (async (repo: string) => {
-      // Pulled first: the board decides what may be deleted, and this checkout's Dolt working set
-      // trails the remote by a sync heartbeat — a bead another machine reopened must not read as
-      // closed here. Best-effort, like every other pass's pull.
-      await beads.pull(repo).catch((e) => console.warn(`[worktree-reaper] board pull failed`, e));
-      return loadAllIssues(repo);
-    });
+  const readBoard = deps.readBoard ?? ((repo: string) => readBoardOrFail(repo));
 
   return async function worktreeReaper(ctx: JobContext): Promise<void> {
     const { projectId } = ctx.payload as WorktreeReaperPayload;

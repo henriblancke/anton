@@ -17,6 +17,7 @@ import { createWorktree, WORKTREES_ROOT_ENV } from "../git/worktree";
 import {
   beadStateOf,
   makeWorktreeReaperHandler,
+  readBoardOrFail,
   reapSummary,
   releaseRunResources,
 } from "./worktree-reaper";
@@ -42,6 +43,7 @@ describe("beadStateOf", () => {
 describe("reapSummary", () => {
   it("counts what was actually removed, not what was planned", () => {
     const entry = (over: object) => ({
+      outcome: "acted" as const,
       branch: "anton/x",
       reason: "r",
       worktreeRemoved: false,
@@ -54,6 +56,18 @@ describe("reapSummary", () => {
         skipped: [entry({})],
       }),
     ).toBe("reaped 1 worktree(s) and 2 branch(es); skipped 1");
+  });
+});
+
+describe("readBoardOrFail", () => {
+  it("fails the pass when the board pull fails — a destructive sweep never judges from a stale board", async () => {
+    // The failure mode this guards: another machine reopens a bead, this checkout's Dolt working set
+    // still records it closed, and the sweep deletes the worktree and branch of live work.
+    await expect(
+      readBoardOrFail("/nonexistent-repo", async () => {
+        throw new Error("failed to pull from origin/main");
+      }),
+    ).rejects.toThrow(/failed to pull/);
   });
 });
 
@@ -244,6 +258,46 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
     await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
     await tdb.db.delete(schema.runs).where(eq(schema.runs.id, runId));
     // The kept branch is real residue the next test's sweep would find, so this one hands it back.
+    execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+  });
+
+  it("leaves no session behind for a park that keeps both — a quota park is not a teardown", async () => {
+    await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-prk" });
+    const runId = randomUUID();
+    await tdb.db.insert(schema.runs).values({
+      id: runId,
+      projectId,
+      epicBeadId: "anton-prk",
+      branch: wt.branch,
+      worktreePath: wt.path,
+      status: "parked",
+    });
+
+    const entry = await releaseRunResources({
+      db: tdb.db,
+      clock: systemClock,
+      ctx: ctx(await jobRow()),
+      projectId,
+      runId,
+      repoPath: repo,
+      worktree: wt,
+      beadId: "anton-prk",
+      status: "parked",
+    });
+
+    // The run resumes in this very worktree, so nothing was released — and a run that parks on a
+    // usage limit many times must not accumulate one empty "skipped" row per attempt.
+    expect(entry.outcome).toBe("kept");
+    expect(existsSync(wt.path)).toBe(true);
+    const sessions = await tdb.db
+      .select()
+      .from(schema.sessions)
+      .where(eq(schema.sessions.projectId, projectId));
+    expect(sessions).toEqual([]);
+
+    await tdb.db.delete(schema.runs).where(eq(schema.runs.id, runId));
+    execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
     execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
   });
 

@@ -39,8 +39,22 @@ export interface ReapPlan {
   reason: string;
 }
 
+/**
+ * What became of a candidate — the ACT, not the plan. A lock can appear between planning and
+ * removal, so a plan that intended to reap can still end in `refused`; classifying off the plan
+ * reported such a refusal as reaped and left the sweep's skip count at zero.
+ */
+export type ReapOutcome =
+  /** The removal ran. Either resource may already have been gone; `actedLine` says which. */
+  | "acted"
+  /** The plan intended nothing: the resource is still in use. */
+  | "kept"
+  /** The plan intended to act and removal refused — a lock that appeared after planning. */
+  | "refused";
+
 /** One judged worktree/branch pair, carrying what actually happened to it. */
 export interface ReapEntry {
+  outcome: ReapOutcome;
   branch: string;
   /** The registered checkout, when there still is one — residue can be a branch with none left. */
   path?: string;
@@ -277,7 +291,7 @@ async function applyPlan(
 ): Promise<ReapEntry> {
   const base = { ...entry, worktreeRemoved: false, branchDeleted: false };
   if (!plan.removeWorktree && !plan.deleteBranch) {
-    return { ...base, reason: `skipped ${entry.path ?? entry.branch}: ${plan.reason}` };
+    return { ...base, outcome: "kept", reason: `skipped ${entry.path ?? entry.branch}: ${plan.reason}` };
   }
 
   // Residue can be a branch whose checkout is already gone; `removeWorktree` still prunes and
@@ -292,10 +306,11 @@ async function applyPlan(
   // The lock can appear between the plan and the act; `removeWorktree` refuses it either way, so
   // the entry reports the refusal rather than the plan's optimism.
   if (outcome.skipped) {
-    return { ...base, reason: `skipped ${entry.path ?? entry.branch}: ${outcome.skipped}` };
+    return { ...base, outcome: "refused", reason: `skipped ${entry.path ?? entry.branch}: ${outcome.skipped}` };
   }
   return {
     ...base,
+    outcome: "acted",
     reason: actedLine(entry, plan, outcome),
     worktreeRemoved: outcome.removed,
     branchDeleted: outcome.branchDeleted,
@@ -320,7 +335,9 @@ export async function reapWorktrees(args: {
       : undefined;
     const plan = planReap(candidate, openPr);
     const entry = await applyPlan(args.repoPath, candidate, plan);
-    (plan.removeWorktree || plan.deleteBranch ? report.reaped : report.skipped).push(entry);
+    // Classified on the outcome, never the plan: a checkout locked between planning and removal is
+    // refused, and reporting that as reaped would claim work the sweep did not do.
+    (entry.outcome === "acted" ? report.reaped : report.skipped).push(entry);
   }
   return report;
 }

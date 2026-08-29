@@ -268,6 +268,31 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  it("SKIPS a locked checkout even when `git worktree list` cannot be read", async () => {
+    // An unreadable listing used to read as "nothing is locked": force-removal was then refused by
+    // git for the lock, and the orphan fallback recursively deleted the owner's checkout anyway.
+    const branch = "anton/run-locked-unlistable";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    writeFileSync(join(wt.path, "in-progress.txt"), "another tool's work\n");
+    execFileSync("git", ["-C", repo, "worktree", "lock", "--reason", "supacode", wt.path]);
+
+    try {
+      // A repoPath git can't list from — the moved/partially-deleted-repo shape. The lock is still
+      // legible where git actually keeps it, in the checkout's own admin directory.
+      const removal = await removeWorktree(
+        { ...wt, repoPath: join(repo, "moved-away") },
+        { deleteBranch: true },
+      );
+
+      expect(removal.removed).toBe(false);
+      expect(removal.skipped).toMatch(/locked by another owner/);
+      expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+      await removeWorktree(wt, { deleteBranch: true });
+    }
+  });
+
   it("removes a verified orphan when the main repository metadata is gone", async () => {
     const orphanRepo = mkdtempSync(join(tmpdir(), "anton-wt-orphan-repo-"));
     const orphanPath = mkdtempSync(join(tmpdir(), "anton-wt-orphan-checkout-"));

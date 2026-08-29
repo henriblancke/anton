@@ -367,15 +367,44 @@ export interface WorktreeRemoval {
 }
 
 /**
+ * Whether the checkout is locked, read from the `locked` file in the admin directory its own `.git`
+ * marker points at. This needs neither the repo's index nor `git worktree list`, so it is what still
+ * settles the question when the listing itself is unreadable. Undefined means "cannot tell" — never
+ * "not locked".
+ */
+async function lockedInAdminDir(wt: Worktree): Promise<boolean | undefined> {
+  try {
+    const marker = await readFile(join(wt.path, ".git"), "utf8");
+    const gitDir = marker.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+    return gitDir ? existsSync(join(resolve(gitDir), "locked")) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Why `wt` must be left alone, or undefined when it is anton's to remove. Today that is exactly one
  * case: another tool locked the checkout. `git worktree remove --force` refuses a locked worktree,
  * and the orphan fallback below would then delete a directory another owner is working in — the lock
- * is precisely the statement that it must not. Fail OPEN on an unreadable listing: that is the
- * moved/deleted-repo case the fallback exists to serve, and no lock can be proven either way.
+ * is precisely the statement that it must not.
+ *
+ * An unreadable listing erases that evidence, so for a checkout still ON DISK it fails CLOSED: the
+ * lock is re-read from the admin directory, and one that can be neither proven nor ruled out is left
+ * for a later pass rather than force-deleted. A path that is already gone has nothing to destroy, so
+ * pruning and branch deletion still proceed — that is the moved/deleted-repo case the fallback below
+ * exists to serve.
  */
 async function removalBlocker(wt: Worktree): Promise<string | undefined> {
   const target = resolve(wt.path);
-  const records = await listWorktrees(wt.repoPath).catch(() => [] as WorktreeRecord[]);
+  const records = await listWorktrees(wt.repoPath).catch(() => null);
+  if (records === null) {
+    if (!existsSync(wt.path)) return undefined;
+    const locked = await lockedInAdminDir(wt);
+    if (locked === false) return undefined;
+    return locked
+      ? "locked by another owner (its lock file, read directly — git's worktree list was unreadable)"
+      : "git's worktree list is unreadable, so another owner's lock cannot be ruled out";
+  }
   const record = records.find((r) => resolve(r.path) === target);
   if (!record?.locked) return undefined;
   return `locked by another owner (${record.lockReason ?? "no reason given"})`;
