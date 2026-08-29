@@ -1620,6 +1620,49 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(offer()).toBeNull();
   });
 
+  it("opens no offer for a picker disarmed while its own arm was still in flight", async () => {
+    let finishArm: (() => void) | undefined;
+    let finishDisarm: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = (row: Record<string, unknown>) =>
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...row } }));
+      // Both picker writes are held, so the test decides which response lands first.
+      if (patch.type !== "board-picker") return Promise.resolve(stored(patch));
+      return new Promise<Response>((resolve) => {
+        const answer = () => resolve(stored({ cron: "*/10 * * * *", ...patch }));
+        if (patch.enabled === true) finishArm = answer;
+        else finishDisarm = answer;
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(finishArm).toBeTruthy());
+
+    // Disarm the SAME row with its arm still open. The withdrawal fires before any offer exists, so
+    // nothing but the operator's last click stops the arm's response putting a question on screen
+    // about a picker they have already turned off — and accepting it would raise product-master to
+    // daily for a picker that executes nothing.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    await waitFor(() => expect(finishDisarm).toBeTruthy());
+
+    finishArm!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
+    expect(offer()).toBeNull();
+
+    finishDisarm!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker disabled"));
+    expect(offer()).toBeNull();
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+  });
+
   it("does not put an answered offer back once its job was switched off mid-write", async () => {
     let failOptOut: (() => void) | undefined;
     const fetchMock = stubPanelFetch();

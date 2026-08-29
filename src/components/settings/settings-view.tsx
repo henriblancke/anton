@@ -688,6 +688,11 @@ export function SettingsView({
   // its offer on a failed write, and only this tells that restore apart from one that would put back
   // a question the operator already invalidated while the PATCH was open.
   const cadenceOfferGeneration = useRef(0);
+  // The picker state the operator last ASKED for, recorded before its PATCH goes out. The rows alone
+  // cannot answer that after an await: a disable clicked while the arm is still open withdraws an
+  // offer that does not exist yet, and the arm's response — which reports the row as armed — can
+  // still land first. Only the last click says whether an offer's premise is still standing.
+  const armingIntent = useRef(automations[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true);
   // A schedule PATCH and the schedule poll both write the same rows, and the PATCH is the one that
   // knows the truth — its response carries the server's recomputed nextRunAt. These two let a poll
   // recognise that it raced a write and drop its own (pre-write) answer rather than applying it on
@@ -950,6 +955,9 @@ export function SettingsView({
     if ((id === AUTOPILOT_ARMING_AUTOMATION && !next) || id === cadenceOffer?.automationId) {
       withdrawCadenceOffer();
     }
+    // Recorded with the withdrawal, not after the write: a disable can only take the arm's offer off
+    // screen if it is on record before that arm's response gets to open one.
+    if (id === AUTOPILOT_ARMING_AUTOMATION) armingIntent.current = next;
     const stored = await patchSchedule(
       id,
       { enabled: next },
@@ -968,18 +976,21 @@ export function SettingsView({
   /**
    * Offer to raise product-master from weekly to daily, if there is anything to offer.
    *
-   * Silent in three cases, each of which would make the offer a lie or a nag: the operator already
-   * answered `keep weekly`; product-master is off, so its output feeds nothing and its cadence is
+   * Silent in four cases, each of which would make the offer a lie or a nag: the operator already
+   * answered `keep weekly`; they have since asked for the picker to be off, so nothing executes what
+   * product-master judges; product-master is off, so its output feeds nothing and its cadence is
    * moot; or its cadence is not weekly — already daily-or-faster, or hand-written, and neither is
    * ours to rewrite (see {@link dailyEquivalentOf}).
    *
-   * All three are asked of the refs, because the only caller asks AFTER awaiting the arm: the
-   * operator can disable product-master, retime it, or decline while that PATCH is open, and an
-   * offer built from the snapshot the arm started with would name a cadence for a job that is off —
-   * or, once accepted, overwrite the time they just set with one derived from the row it replaced.
+   * All four are asked of the refs, because the only caller asks AFTER awaiting the arm: the
+   * operator can disarm the picker, disable product-master, retime it, or decline while that PATCH
+   * is open, and an offer built from the snapshot the arm started with would name a cadence for a
+   * job that is off — or, once accepted, overwrite the time they just set with one derived from the
+   * row it replaced.
    */
   function offerDailyProductMaster() {
     if (keepWeekly.current) return;
+    if (!armingIntent.current) return;
     const coupled = automationsRef.current[CADENCE_COUPLED_AUTOMATION];
     if (coupled?.enabled !== true) return;
     const daily = dailyEquivalentOf(coupled.cron);
