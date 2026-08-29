@@ -1515,6 +1515,71 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // Naming the side effect is how the idiom is usually written — the comment is the only thing
+    // that says WHAT the module installs. It must not turn the line back into a specifier list.
+    it("keeps side-effect imports that carry a trailing comment", async () => {
+      const repo = writeRepo({
+        "src/register.ts": [
+          'import "./register-plugin"; // install hooks',
+          'import "./polyfill"; /* patch fetch */',
+          'import "./telemetry"; // start the reporter',
+          "export const ready = true;",
+          "",
+        ].join("\n"),
+        "src/bound.ts": [
+          'import { parseBdVersion } from "./bd-bin"; // version',
+          'import { resolveBdBin } from "./bd-bin"; // path',
+          'import { preflightBd } from "./bd-bin"; // guard',
+          "export const used = [parseBdVersion, resolveBdBin, preflightBd];",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/register.ts", 1]], 3),
+        clone([["src/bound.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/register.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/bound.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // `const x = (` opens a parameter list or a parenthesized expression, and only the closing line
+    // says which: a `=>` cannot be pushed past it. Without that check a window of calls reads as a
+    // props list and a real duplicate of runtime work is thrown away unread.
+    it("reads a parenthesized expression as code and a wrapped parameter list as a signature", async () => {
+      const repo = writeRepo({
+        "src/result.ts": [
+          "export const result = (",
+          "  computeAlpha(),",
+          "  computeBeta(),",
+          "  computeGamma()",
+          ");",
+          "",
+        ].join("\n"),
+        "src/render.ts": [
+          "export const render = (",
+          "  title: string,",
+          "  body: string,",
+          "  footer: string,",
+          ") => title;",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/result.ts", 2]], 3),
+        clone([["src/render.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/result.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/render.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
     // A window of nothing but closers is dropped too — but "declares rather than computes" would be
     // the wrong diagnosis to hand an operator, since there is nothing there that declares either.
     it("says a block holds no content line rather than blaming its declarations", async () => {

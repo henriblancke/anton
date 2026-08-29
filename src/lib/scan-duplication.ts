@@ -106,13 +106,21 @@ const TYPE_START =
  * `import "./register-plugin";` — an import that binds NOTHING is there for what the module does on
  * load: registering a plugin, installing a polyfill. That runs, so the line computes rather than
  * declares, and a window of them is duplicated setup triage can act on.
+ *
+ * The trailing comment is part of the idiom — `import "./register"; // install hooks` is how the
+ * side effect gets named at all, and rejecting it would file the window with the specifier lists.
+ * It is matched after the quoted specifier, so a `//` inside a URL import stays inside the string.
  */
-const SIDE_EFFECT_IMPORT = /^import\s+["'][^"']+["']\s*;?$/;
+const SIDE_EFFECT_IMPORT = /^import\s+["'][^"']+["']\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
 
 /** `function foo(` / `export async function foo(` — a declaration header, not a call. */
 const FUNCTION_START = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
 
-/** `const Foo = ({` / `export const f = async (` — the other spelling of the same header. */
+/**
+ * `const Foo = ({` / `export const f = async (` — the other spelling of the same header. Only a
+ * CANDIDATE: `const result = (` opens a parenthesized expression just as well, and the two are told
+ * apart on the line that closes the paren, not here.
+ */
 const ARROW_START = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*(?:async\s*)?\(/;
 
 /** `let repo: string;` — a binding with no initializer runs nothing at all. */
@@ -200,8 +208,10 @@ function continues(
 /**
  * What a signature line carries once its parameter list closes. `) {` and `): Promise<void> {`
  * open a body — nothing runs on that line; `) => left * right` IS the body and runs on every call.
+ * `undefined` when the list does not close here at all, which is what tells an empty tail (`)`)
+ * apart from a line that closes nothing.
  */
-function closingTail(line: string, depth: number): string {
+function closingTail(line: string, depth: number): string | undefined {
   const text = stripNoise(line);
   let open = depth;
   for (let i = 0; i < text.length; i += 1) {
@@ -211,7 +221,7 @@ function closingTail(line: string, depth: number): string {
       if (open <= 0) return text.slice(i + 1);
     }
   }
-  return "";
+  return undefined;
 }
 
 /**
@@ -252,6 +262,11 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   let inComment = false;
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
+  // Where the open signature started, and whether its arrow is still owed. `const x = (` reads as a
+  // parameter list until the closing paren says otherwise, so the lines it claimed must be
+  // reachable to hand back when no `=>` arrives.
+  let signatureStart = 0;
+  let arrow: "owed" | "settled" | "absent" = "settled";
 
   const lines = source.split("\n");
   for (let index = 0; index < lines.length; index += 1) {
@@ -304,8 +319,24 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         const tail = closingTail(line, depth);
         depth += parenDelta(line);
         const closes = depth <= 0;
+        // The paren closed: settle what it was. An arrow's `=>` cannot be pushed to the next line —
+        // the grammar forbids the break — so its absence here proves the construct was a
+        // parenthesized EXPRESSION, and every line it swallowed (`computeA(),`) runs. Hand them back
+        // as code rather than letting a window of calls read as a declaration.
+        if (tail !== undefined && arrow === "owed") {
+          arrow = tail.includes("=>") ? "settled" : "absent";
+          if (arrow === "absent") {
+            for (let i = signatureStart; i < classes.length; i += 1) {
+              if (classes[i] === "signature") classes[i] = "code";
+            }
+          }
+        }
         classes.push(
-          hasParameterDefault(line) || (closes && hasArrowBody(tail)) ? "code" : "signature",
+          arrow === "absent" ||
+            hasParameterDefault(line) ||
+            (closes && tail !== undefined && hasArrowBody(tail))
+            ? "code"
+            : "signature",
         );
         if (closes) {
           statement = undefined;
@@ -331,13 +362,17 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       continue;
     }
 
-    if (FUNCTION_START.test(line) || ARROW_START.test(line)) {
+    const declared = FUNCTION_START.test(line);
+    if (declared || ARROW_START.test(line)) {
       const open = parenDelta(line);
       // Only a header whose parameter list runs on is a declaration BLOCK; one that closes on its
       // own line is a single line of real code and is counted as such — as is one that defaults.
       classes.push(open > 0 && !headerHasParameterDefault(line) ? "signature" : "code");
       if (open > 0) {
         statement = "signature";
+        // `function foo(` names a function whatever follows; `const foo = (` still owes an arrow.
+        arrow = declared ? "settled" : "owed";
+        signatureStart = index;
         depth = open;
       }
       continue;
