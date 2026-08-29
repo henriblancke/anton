@@ -92,7 +92,7 @@ export interface ScanSummary {
    * Absent when there was none anton could read (a whole-repo pass, or an unidentified state).
    *
    * It is what tells a retry's rescan apart from a continuation: a pass that dies before triage puts
-   * the baseline BACK (src/lib/jobs/nightly-stringer.ts), so the retry measures from THIS value
+   * the baseline BACK (src/lib/jobs/nightly-stringer-scan.ts), so the retry measures from THIS value
    * again and REPLAYS the same window — see {@link reconcileAttempt}. A whole-repo pass opens at no
    * baseline, so absent here plus an observed {@link baselineScan} is that same proof. Written once,
    * at insert: neither a replay nor a fold moves where the window opens.
@@ -317,7 +317,7 @@ interface AttemptWindow {
 /**
  * The retry measured from exactly where this point's window OPENS, so it rescanned that window
  * whole. That is the ordinary shape of a retry, not an oddity: a pass that dies before triage hands
- * its window back (src/lib/jobs/nightly-stringer.ts), precisely so the retry rescans it rather than
+ * its window back (src/lib/jobs/nightly-stringer-scan.ts), precisely so the retry rescans it rather than
  * closing green over untriaged findings.
  *
  * A pass that ESTABLISHED the baseline replays the same way and names neither end: its window opens
