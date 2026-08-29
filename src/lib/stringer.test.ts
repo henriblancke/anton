@@ -1084,6 +1084,43 @@ describe("scan", () => {
       expect(describeDeadcodeFilter(result.deadcode)).toBeUndefined();
     });
 
+    // stringer spells `FilePath` however its collector saw the file. An absolute one has to be made
+    // repo-relative before it can be discounted from git's hits, or the declaration reads as its own
+    // caller and erases the finding — the exact inverse of what the check is for.
+    it("excludes the declaring file when the signal spells it absolutely", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts":
+          "export function neverCalled(n: number): number {\n  return n > 0 ? neverCalled(n - 1) : 0;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused(join(repo, "src/lib/orphan.ts"), "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode).toEqual({ dropped: [] });
+    });
+
+    // A name written in prose is being described, not called. Without this the module that documents
+    // a symbol keeps it alive forever, and the filter goes blind to the symbols it exists to check.
+    it("does not count a name in a comment or a doc as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts":
+          "// neverCalled was the old nightly entry point.\n/**\n * neverCalled goes next.\n */\nexport const kept = 1;\n",
+        "docs/history.md": "- `neverCalled` used to run every night\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
       const repo = initRepo({
         "src/lib/types.ts": "export type ScanPass = { id: string };\n",
