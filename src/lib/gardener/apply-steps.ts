@@ -11,8 +11,10 @@
  */
 import { approvalGaps, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { swapUnderLock } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
+import { resolveOperator } from "../operator";
 import {
   indexBoard,
   isInFlight,
@@ -37,6 +39,7 @@ import {
   orderingUnstated,
   premiseTouched,
   settledWord,
+  startBarred,
   survivorUnusable,
   takingTicket,
   unapproveNote,
@@ -91,6 +94,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "reprioritize":
     case "link":
     case "reparent":
+    case "approve":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -160,6 +164,11 @@ function lockedBeads(step: ApplyStep): string[] {
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
  *
+ * The two APPROVAL moves buy one each for a different question — not "did the topology move" but
+ * "does the approve gate still say what the ask read": {@link assertStillDegraded} for the
+ * withdrawal, {@link assertStillStartable} for the start. Both are gate re-derivations rather than
+ * serializations, and each refuses the opposite direction of the same drift.
+ *
  * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
  * {@link alreadySatisfied}.
  *
@@ -192,6 +201,7 @@ export async function applyStep(
     await assertRetirementHolds(repo, step);
     await assertHomeHolds(repo, step);
     await assertEvidenceHolds(repo, step);
+    await assertStartHolds(repo, step);
     const write = await lockedWrite(repo, step);
     signal?.throwIfAborted();
     await runStep(repo, write);
@@ -260,6 +270,35 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
 }
 
 /**
+ * What an APPROVE owes the target it is about to release a run on — the evidence fence of the one
+ * move that starts work, re-asked from a board read taken INSIDE the subject's own write lock.
+ *
+ * The mirror of {@link assertStillDegraded}, and it exists for the mirror reason: that check refuses
+ * a withdrawal whose gaps were repaired since the decision, and this refuses a start whose target
+ * stopped clearing the gate since the decision. Everything else the locked half asks — status,
+ * liveness, claim, the premise stamp — is untouched by the writes that break the gate: an Acceptance
+ * section edited away, a feature landed under a legacy epic, a `blocks` edge drawn. Without this,
+ * the label goes on work the picker itself would no longer offer, and a run starts on it.
+ *
+ * Genuine serialization for the target's own body (`ticket-detail.ts` `updateTicket` takes this very
+ * lock) and for a claim (beads/claim.ts, the same chain); a narrowing for the rest of the subtree
+ * and for the blocker graph, whose edits take their own beads' locks.
+ */
+async function assertStartHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "approve") return;
+  const board = await lockedBoard(repo, `before approving ${step.id}`);
+  assertStillStartable(step.id, board);
+}
+
+/** The picker's own eligibility, re-asked under the lock through the helper the decision used. */
+function assertStillStartable(id: string, board: BoardIndex): void {
+  const subject = board.byId.get(id);
+  if (!subject) throw new SubjectMovedError(missing(id));
+  const barred = startBarred(subject, board.all, HOME_STANDING.locked);
+  if (barred) throw new SubjectMovedError(barred);
+}
+
+/**
  * The step as it will be WRITTEN. Only an unapprove differs from what was decided: its note carries
  * the approval gaps, re-derived once more from a board read taken inside the subject's own lock. The
  * decision asked the same question of the route's snapshot, which is already seconds old when this
@@ -298,6 +337,9 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // board's state, so there is no write to make — and no second note to leave on a bead whose
   // approval is already gone.
   if (step.verb === "unapprove") return !beads.isApproved(subject);
+  // Its mirror: somebody granted the approval by hand, or a concurrent approve landed it. The ask is
+  // answered, so there is nothing to write — and nothing to auto-claim over their reservation.
+  if (step.verb === "approve") return beads.isApproved(subject);
   return false;
 }
 
@@ -628,6 +670,9 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
       await beads.note(repo, step.id, step.note);
       await beads.untag(repo, step.id, [LABELS.approved]);
       return;
+    case "approve":
+      await grantApproval(repo, step.id);
+      return;
     case "close":
       await beads.close(repo, step.id, step.reason);
       return;
@@ -638,6 +683,37 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
       await beads.defer(repo, step.id);
       return;
   }
+}
+
+/**
+ * Grant the gate the way the approve route grants it: the auto-claim FIRST, then the label — the
+ * same composition, through the same compare-and-swap (`beads/claim.ts`), so the two writers cannot
+ * settle ownership by different rules.
+ *
+ * The order is the route's and only it is safe to fail between. `approved` is what locks the
+ * reservation — the claim route refuses to touch an approved target — so a label that landed ahead
+ * of the claim leaves a window in which a teammate's steal is still legal, on work anton is about to
+ * run. A claim that lands without the label is a reserved target nothing picks up, which the retry
+ * converges on: the swap reads owner→owner and writes nothing, then the label follows.
+ *
+ * The CAS is redundant against this process and not against the board: the fence above already
+ * re-read the subject under this very lock, so a claim from another anton write queues behind us —
+ * but bd is shared, and a teammate's `bd assign` from a shell takes no lock at all. Losing the swap
+ * is the board declining, not a bd failure, which is why it refuses as a {@link SubjectMovedError}.
+ *
+ * `resolveOperator` is this machine's identity, memoized after its first read — the same one every
+ * anton job claims under, so a shared board shows whose pipeline the start belongs to. With no
+ * identity resolvable at all the swap is a verified no-op, exactly as it is on the route.
+ */
+async function grantApproval(repo: string, id: string): Promise<void> {
+  const operator = await resolveOperator();
+  const swap = await swapUnderLock(repo, id)(undefined, operator);
+  if (!swap.ok) {
+    throw new SubjectMovedError(
+      `${id} was claimed by ${swap.owner ?? "another writer"} since this proposal was decided — approving it now would start a run on work somebody else has reserved`,
+    );
+  }
+  await beads.approve(repo, id);
 }
 
 // ── rollback ──

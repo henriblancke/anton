@@ -17,6 +17,7 @@ import { parseGardenerPlan } from "./detections";
 import {
   apply,
   applyWith,
+  APPROVE,
   bead,
   blockedBy,
   calls,
@@ -44,6 +45,7 @@ import {
   resetSeam,
   setSnapshot,
   showBead,
+  startable,
   SUPERSEDE,
   warm,
 } from "./apply.fixture";
@@ -73,9 +75,15 @@ vi.mock("../beads/bd", async () => {
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
+      approve: (_cwd: string, id: string) => record("approve", id),
+      assign: (_cwd: string, id: string, actor: string) => record("assign", id, actor),
+      unassign: (_cwd: string, id: string) => record("assign", id, ""),
     },
   };
 });
+
+/** The machine identity an approve auto-claims under — resolved from git/env in production. */
+vi.mock("../operator", () => ({ resolveOperator: async () => "operator-1" }));
 
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
@@ -761,6 +769,109 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/the board could not be re-read before withdrawing the approval/);
       expect(err.message).toContain("database is locked");
       // The ask stays open and the label stays on: a board anton cannot see whole authorises nothing.
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+  });
+
+  /**
+   * The start (anton-gmbz) — the mirror of the withdrawal above, and the one move that releases a
+   * run rather than tidying the board. Its fence is the picker's own eligibility, re-asked under the
+   * subject's write lock: still open, still unclaimed, still unapproved, still clearing the gate.
+   */
+  describe("granting the approval the board's next work is missing", () => {
+    it("auto-claims the target and THEN labels it, in the approve route's own order", async () => {
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      // The reservation first: `approved` is what locks it, so a label ahead of the claim leaves a
+      // window a teammate's steal is still legal in — on work anton is about to run.
+      expect(calls[0]).toBe("assign anton-a operator-1");
+      expect(calls[1]).toBe("approve anton-a");
+      expect(result.changed).toEqual(["anton-a"]);
+      expect(calls.at(-1)).toBe(
+        "close anton-p1 applied: approved anton-a, so a run can start on it",
+      );
+    });
+
+    it("settles when somebody granted it by hand — the ask's outcome, whoever wrote it", async () => {
+      await applyWith(proposalFor(APPROVE), [warm("anton-a", { labels: [LABELS.approved] })]);
+
+      // No second claim over their reservation, and no fence refusal over the write that granted it.
+      expect(calls.filter((c) => !c.startsWith("note") && !c.startsWith("close"))).toEqual([]);
+      expect(calls.at(-1)).toMatch(/close anton-p1 applied: anton-a already carries `approved`/);
+    });
+
+    // Every one of these leaves the OTHER bars untouched — the bead stays open, unclaimed and
+    // unapproved while its Acceptance is edited away or a blocker is drawn — so only re-deriving the
+    // gate refuses them. Asked of the snapshot here; the same helper is re-asked under the lock below.
+    it.each([
+      ["a run has since claimed", () => startable({ assignee: "someone", status: "in_progress", updated_at: "2026-07-15T00:00:00Z" }), /queue a start on work another run already owns/],
+      ["a human has since reserved", () => startable({ assignee: "teammate" }), /work anton may start — held by teammate \(claimed\)/],
+      ["lost its Acceptance", () => cold("anton-a"), /work anton may start — .*no Acceptance criteria.* \(approval-gap\)/],
+      ["gained a blocker", () => blockedBy("anton-a", "anton-z", { acceptance_criteria: "- [ ] it ships", updated_at: "2025-01-01T00:00:00Z" }), /work anton may start — .*\(blocked\)/],
+      ["stopped being a run target", () => child("anton-a", "anton-card", { acceptance_criteria: "- [ ] it ships", updated_at: "2025-01-01T00:00:00Z" }), /work anton may start — .*\(not-a-run-target\)/],
+      ["settled", () => bead("anton-a", { status: "closed" }), /anton-a is closed — approving it would queue nothing/],
+    ])("refuses a target %s since the ask was filed", async (_why, subject, reason) => {
+      const err = (await applyWith(proposalFor(APPROVE), [
+        subject(),
+        bead("anton-z"),
+        CARD,
+      ]).catch((e) => e)) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(reason);
+      // The ask stays open with the reason on it, and the label was never written.
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("refuses a start whose target was rewritten since the ask was filed", async () => {
+      // The bead still clears every gate — it is the JUDGMENT that went stale. "This is the work
+      // worth starting next" was read off a contract somebody has since replaced, and no board read
+      // restates it, so the filing stamp is the only fence there is.
+      const err = (await applyWith(proposalFor(APPROVE), [
+        startable({ updated_at: "2026-07-15T00:00:00Z" }),
+      ]).catch((e) => e)) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /no longer the bead whose contract this start was judged from, and approving it now would set a run loose on work somebody has since rewritten/,
+      );
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("refuses a gate that broke between the decision and the write, under the bead's own lock", async () => {
+      // The snapshot shows a startable target; the read taken inside the write lock shows its
+      // Acceptance gone. Status, liveness, claim and the premise stamp are all as the plan found
+      // them, so nothing but the re-derived gate can catch it.
+      liveBeads.set("anton-a", cold("anton-a"));
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/anton-a is no longer work anton may start/);
+      expect(err.message).toMatch(/no Acceptance criteria/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("refuses a reservation taken between the fence and the write, losing the swap", async () => {
+      // The last window there is: the fence's board read cleared, and a teammate's `bd assign` from
+      // a shell — which takes no in-process lock — lands before the auto-claim. The CAS is what sees
+      // it, and losing is the board declining, not a bd failure.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+      };
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate since this proposal was decided — approving it now would start a run on work somebody else has reserved/,
+      );
+      // Neither write: the reservation was not stolen and the label never went on.
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
   });

@@ -87,6 +87,17 @@ export interface ClaimGuard {
    * the very lock `fn` is holding and deadlock.
    */
   withClaimLock<T>(repoPath: string, id: string, fn: (swap: LockedSwap) => Promise<T>): Promise<T>;
+  /**
+   * The CAS ALONE, for a caller that already holds this bead's write lock through
+   * {@link withBeadWriteLock} rather than through {@link withClaimLock} — gardener/apply-steps.ts
+   * takes it for a whole re-read-and-write sequence spanning several beads. Both spellings queue on
+   * the one chain map, so calling `withClaimLock` from inside one waits on the lock the caller is
+   * holding and deadlocks; this is the same swap without that second acquisition.
+   *
+   * Never call it outside such a lock: unserialized, it is exactly the lost-update race this module
+   * exists to close.
+   */
+  swapUnderLock(repoPath: string, id: string): LockedSwap;
   /** Set `id`'s assignee to `next` (undefined releases it) only if it still reads as `expectedOwner`. */
   setAssigneeIfOwner(
     repoPath: string,
@@ -142,6 +153,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
 
   return {
     withClaimLock,
+    swapUnderLock: swapUnlocked,
     setAssigneeIfOwner: (repoPath, id, expectedOwner, next) =>
       withClaimLock(repoPath, id, (swap) => swap(expectedOwner, next)),
   };
@@ -160,6 +172,10 @@ const CLAIM_GUARD_KEY = Symbol.for("anton.beads.claimGuard");
 export const claimGuard = ((globalThis as unknown as Record<symbol, ClaimGuard>)[
   CLAIM_GUARD_KEY
 ] ??= createClaimGuard());
+
+/** The CAS for a caller already holding `id`'s write lock. See {@link ClaimGuard.swapUnderLock}. */
+export const swapUnderLock: ClaimGuard["swapUnderLock"] = (repoPath, id) =>
+  claimGuard.swapUnderLock(repoPath, id);
 
 /** Run `fn` under `id`'s claim-write lock. See {@link ClaimGuard.withClaimLock}. */
 export const withClaimLock: ClaimGuard["withClaimLock"] = (repoPath, id, fn) =>

@@ -83,6 +83,9 @@ export function record(verb: string, ...args: string[]): Promise<string> {
   // state would make those guards untestable.
   if (verb === "reparent") setLive(args[0] as string, { parent: args[1] || undefined });
   if (verb === "close") setLive(args[0] as string, { status: "closed" });
+  // The auto-claim an approve makes VERIFIES itself by reading the assignee back (beads/claim.ts),
+  // so a board that answered with pre-write state would fail every swap as a lost race.
+  if (verb === "assign") setLive(args[0] as string, { assignee: args[1] || undefined });
   afterWrite?.(call);
   return Promise.resolve("");
 }
@@ -304,6 +307,21 @@ export const runCard = (extra: Partial<Bead> = {}): Bead =>
 /** The subject as a ticket of {@link runCard}, untouched since the filing like every retirement's. */
 export const ticket = (extra: Partial<Bead> = {}): Bead =>
   child("anton-a", "anton-run", { updated_at: "2025-01-01T00:00:00Z", ...extra });
+
+/**
+ * A run target the picker would offer: a parentless task, untouched since the filing, clearing all
+ * four of approval's promises — and carrying no `approved` label, which is the whole ask. What an
+ * {@link APPROVE} subject has to still look like at approve time.
+ */
+export const startable = (extra: Partial<Bead> = {}): Bead =>
+  cold("anton-a", { acceptance_criteria: "- [ ] it ships", ...extra });
+
+/** The product master's start (anton-gmbz): grant the gate on the work the board ranks next. */
+export const APPROVE = planFor({
+  kind: "withheld-approval",
+  move: "approve",
+  subjects: ["anton-a"],
+});
 
 /** The three retirement plans against one subject, with the board each needs. */
 export const retirements = (board: Bead[]): [GardenerPlan, Bead[]][] => [

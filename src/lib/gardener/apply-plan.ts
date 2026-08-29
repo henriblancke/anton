@@ -31,6 +31,7 @@ import {
   type GardenerDetectionKind,
   type GardenerPlan,
 } from "./detections";
+import { ineligibility } from "../jobs/picker-targets";
 import { impliesOrdering } from "./relink";
 
 /**
@@ -121,6 +122,14 @@ export type ApplyStep =
        */
       note: string;
     })
+  /**
+   * The mirror of `unapprove`, and the one step that STARTS work rather than tidying the board: it
+   * grants the founder's own gate on the target the pass judged worth running next. It carries no
+   * counterpart and no ticket owner — a withheld-approval subject is a run target itself, so its own
+   * signals are the whole answer — but it IS fenced, because "this is the work worth starting" is a
+   * judgment about the bead's contract that no board read restates ({@link EVIDENCE_PREMISE}).
+   */
+  | (StepSubject & EvidenceFence & { verb: "approve" })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "close"; reason: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "supersede"; replacement: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "defer" });
@@ -248,14 +257,7 @@ export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): A
         reason: `splitting ${list(plan.subjects)} means writing new contracts, which anton will not do on its own — decompose it with \`/shape\` (the proposal's sketch is the starting point) and decline this proposal`,
       };
     case "approve":
-      // The move exists in the vocabulary before its write does (anton-1ivg): the step that grants
-      // the gate lands with its own evidence fence in anton-gmbz. Refusing until then is the honest
-      // answer — granting an approval without re-reading the target under the write lock is exactly
-      // the race that step is being built to close.
-      return {
-        status: "refuse",
-        reason: `approving ${list(plan.subjects)} is not a move anton can apply yet — grant the approval yourself if you agree, then decline this proposal`,
-      };
+      return planApprove(plan, index, at);
   }
 }
 
@@ -673,6 +675,97 @@ export function unapproveNote(gaps: ApprovalGap[]): string {
   );
 }
 
+// ── approve ──
+
+/**
+ * Granting the approval the board's next work is missing (anton-gmbz) — the mirror of
+ * {@link planUnapprove}, and the only move here that STARTS work.
+ *
+ * It asks the same four questions the picker asks of every candidate ({@link startBarred}) and its
+ * premise is FENCED where the withdrawal's is re-derived, because the two asks rest on opposite
+ * kinds of evidence. "This target no longer clears the gate" is a pure function of the board, so
+ * re-deriving it makes repair a real second answer; "this is the work worth starting next" is a
+ * judgment about the bead's contract that no board read restates, and approving a rescoped one
+ * spends the pass's dearest write on a target nobody judged.
+ *
+ * A target that somebody has ALREADY approved settles, ahead of the fence — the outcome the ask
+ * wanted is the board's state whoever wrote it, and refusing over a stamp would leave the ask open
+ * forever against a board that agrees with it (the same order `planReprioritize` uses).
+ */
+function planApprove(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "an approve proposal names exactly one run target" };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  if (beads.isApproved(subject)) {
+    return { status: "settled", summary: `${subject.id} already carries \`${LABELS.approved}\`` };
+  }
+  const barred = approveBarred(plan, subject, index, at);
+  if (barred) return { status: "refuse", reason: barred };
+  return {
+    status: "apply",
+    steps: [
+      {
+        verb: "approve",
+        id: subject.id,
+        claim: runClaimOf(subject),
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
+    summary: `approved ${subject.id}, so a run can start on it`,
+  };
+}
+
+/** Why this target may not be started, or undefined. */
+function approveBarred(
+  plan: GardenerPlan,
+  subject: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
+  if (!isOpenWork(subject)) {
+    return `${subject.id} is ${settledWord(subject)} — approving it would queue nothing`;
+  }
+  // The liveness half first, because {@link startBarred} cannot see it: a bead that is `open` and
+  // unassigned still reads as startable to the picker while a run holds a lease on it or its PR is
+  // up. Then the picker's own eligibility, then the premise no board read restates.
+  return (
+    subjectBusy(subject, at, DOING.approve, CLAIM_COST.start) ??
+    startBarred(subject, index.all, HOME_STANDING.snapshot) ??
+    premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs)
+  );
+}
+
+/**
+ * Why the board itself would not offer this bead as work to start, or undefined — a run target,
+ * `open`, unclaimed, and clearing all four of approval's promises.
+ *
+ * Delegated whole to the picker's own {@link ineligibility} rather than re-derived, for the reason
+ * every other bar in this module is shared: a second definition of "startable" would let an approve
+ * proposal grant the gate on a bead the picker itself refuses, or refuse one a human could approve
+ * by hand. It is also what keeps the move inside the picker's policy instead of beside it.
+ *
+ * Only the STRUCTURAL half — the picker's policy predicate narrows this set further, and that
+ * narrowing belongs to the pass that files the ask, not to the write that executes it.
+ *
+ * Asked twice, like every other bar: once against the caller's snapshot, and again against a board
+ * read taken inside the subject's own write lock (apply-steps.ts `assertStillStartable`). `standing`
+ * is which of the two is speaking — the snapshot states a fact, the write states a CHANGE, because
+ * the decision already cleared this bar (see {@link HOME_STANDING}).
+ */
+export function startBarred(
+  subject: Bead,
+  board: Bead[],
+  standing: HomeStanding,
+): string | undefined {
+  const excluded = ineligibility(subject, board);
+  if (!excluded) return undefined;
+  return `${subject.id} ${standing} work anton may start — ${excluded.detail} (${excluded.reason}) — so approving it would set a run loose on a target the board itself refuses`;
+}
+
 // ── retire ──
 
 function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
@@ -903,6 +996,10 @@ const CLAIM_COST = {
   // the run when the label is gone, so this does not race the run — it ends it.
   approval:
     "would poison the run that owns it, which re-checks the approval after its claim settles and stops when the label is gone",
+  // The one move that does not write OVER a run but beside it: approving work somebody already
+  // holds queues a second start on it rather than pulling it away from the first.
+  start:
+    "would queue a start on work another run already owns, and the approval anton grants is what releases it",
 } as const;
 
 /**
@@ -1331,6 +1428,7 @@ export const DOING: Record<ApplyStep["verb"], string> = {
   link: "recording it as blocked",
   reprioritize: "re-ranking it",
   unapprove: "withdrawing its approval",
+  approve: "approving it",
   close: "retiring it",
   supersede: "retiring it",
   defer: "retiring it",
