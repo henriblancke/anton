@@ -22,11 +22,13 @@
 import { loadAllIssues } from "../beads/issues";
 import { describeFailureStreak } from "../autopilot-failure-streak";
 import { describeScoreSlide } from "../autopilot-score-slide";
+import { describeWipHold } from "../autopilot-wip";
 import { saveBoardPickerPlan } from "../board-picker-plan";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import { checkFailureStreak } from "./picker-failure-breaker";
 import { checkScoreSlide } from "./picker-score-breaker";
+import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
 import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./picker-decision";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -40,6 +42,11 @@ export interface BoardPickerPayload {
 export interface BoardPickerDeps {
   db: AntonDb;
   clock?: Clock;
+  /**
+   * How the WIP hold learns a PR's state. Injectable so tests (and any future non-GitHub forge)
+   * don't need `gh`; the default is the real read-only `gh pr view`, as run-health uses.
+   */
+  readPrActivity?: ReadPrActivity;
 }
 
 /** Build the runner handler. Register it as the "board-picker" handler. */
@@ -80,6 +87,22 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     if (slide?.latched) {
       console.warn(`[board-picker] ${projectId}: disarmed — ${describeScoreSlide(slide.slide)}`);
     }
+
+    // The FLOW brake (R4.2), and the only one that clears itself: while the operator's review queue
+    // is full, anton stops starting work and the next merge or close releases it. Reported at info
+    // rather than warn, and worded as a limit rather than a fault, because that is what it is — a
+    // hold drawn like a failure teaches an operator to discount the band the disarms need.
+    //
+    // Derived, never latched: the arming step (R1.5) re-asks this on the pass that would start the
+    // work, so nothing here has to persist an answer that the next merge invalidates.
+    const hold = await checkWipLimit(db, {
+      projectId,
+      repoPath: project.repoPath,
+      board,
+      signal: ctx.signal,
+      ...(deps.readPrActivity ? { readPrActivity: deps.readPrActivity } : {}),
+    });
+    if (hold) console.info(`[board-picker] ${projectId}: holding — ${describeWipHold(hold)}`);
 
     const decision = decideBoardPickerPlan({
       board,

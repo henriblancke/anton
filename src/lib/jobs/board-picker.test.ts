@@ -6,11 +6,13 @@
  * that two overlapping passes leave one plan rather than two. A pass that resolved without writing
  * would be indistinguishable from an armed schedule that never fired.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
 import { activeDisarm } from "../autopilot-disarm";
+import { LABELS } from "../beads/bd";
+import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
 import { PoisonError } from "./errors";
 import type { Clock } from "./queue";
@@ -40,6 +42,16 @@ function bead(id: string, o: Partial<Bead> = {}): Bead {
     acceptance_criteria: "- [ ] it ships",
     ...o,
   };
+}
+
+/** Just the pass's hold lines — other modules log to console.info too. */
+function holdLines(spy: MockInstance<typeof console.info>): string[] {
+  return spy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes("holding"));
+}
+
+/** A `gh pr view` stand-in for the WIP hold's PR confirmation. */
+function prActivity(number: number, state: string): PrActivity {
+  return { number, state, url: `https://example.test/pull/${number}`, updatedAtMs: 0, isDraft: false };
 }
 
 function fakeCtx(over: Partial<JobContext> = {}): JobContext {
@@ -201,6 +213,67 @@ describe("makeBoardPickerHandler", () => {
     expect(disarm?.evidence).toHaveLength(3);
     // The brake and the ranking remain different jobs, exactly as for the failure streak.
     expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+  });
+
+  it("holds — not disarms — while the operator's review queue is full, and says so as a limit", async () => {
+    // The flow brake (R4.2). Nothing is latched and nothing is written: the pass still records its
+    // ranking, because a hold stops STARTING work, not deciding what would start.
+    const IN_REVIEW = LABELS.stage("in-review");
+    const prs = [11, 12, 13];
+    board.current = [
+      bead("t1"),
+      ...prs.map((n) =>
+        bead(`anton-${n}`, { labels: [IN_REVIEW], metadata: { pr: `gh-${n}` } }),
+      ),
+    ];
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await makeBoardPickerHandler({
+      db: t.db,
+      clock,
+      readPrActivity: async (_repo, number) => prActivity(number, "OPEN"),
+    })(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeUndefined();
+    expect(holdLines(info)).toEqual([
+      "[board-picker] p1: holding — 3 open PRs are waiting on review — " +
+        "this project pauses new work at 3 (#11, #12, #13)",
+    ]);
+    // The brake and the ranking remain different jobs, exactly as for the two disarms.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toContain("t1");
+    info.mockRestore();
+  });
+
+  it("stops holding on the next pass once one of those PRs merges", async () => {
+    const IN_REVIEW = LABELS.stage("in-review");
+    const prs = [11, 12, 13];
+    board.current = [
+      bead("t1"),
+      ...prs.map((n) =>
+        bead(`anton-${n}`, { labels: [IN_REVIEW], metadata: { pr: `gh-${n}` } }),
+      ),
+    ];
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    // #12 merges between the passes. The board is untouched — review-fix has not finalized the bead
+    // yet — so the release can only come from the PR state itself.
+    let merged = false;
+    const pass = makeBoardPickerHandler({
+      db: t.db,
+      clock,
+      readPrActivity: async (_repo, number) =>
+        prActivity(number, merged && number === 12 ? "MERGED" : "OPEN"),
+    });
+
+    await pass(fakeCtx());
+    expect(holdLines(info)).toHaveLength(1);
+
+    merged = true;
+    await pass(fakeCtx());
+
+    // No second hold line, and nothing an operator had to clear to get there.
+    expect(holdLines(info)).toHaveLength(1);
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toContain("t1");
+    info.mockRestore();
   });
 
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {

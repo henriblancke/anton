@@ -483,6 +483,24 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect(persisted()).toMatchObject({ autopilotScoreFloor: 0, autopilotScoreWindow: 4 });
   });
 
+  it("PATCH persists the WIP limit, including 0 as the off switch (anton-wy9y)", async () => {
+    const res = await PATCH(patchReq({ autopilotWipLimit: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().autopilotWipLimit).toBe(5);
+
+    // 0 is a VALUE here, not a clear: it is how an operator who reviews faster than anton ships
+    // turns the hold off.
+    const off = await PATCH(patchReq({ autopilotWipLimit: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotWipLimit).toBe(0);
+
+    for (const bad of [21, -1, 1.5, "three"]) {
+      const rejected = await PATCH(patchReq({ autopilotWipLimit: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotWipLimit/);
+    }
+    expect(persisted().autopilotWipLimit).toBe(0);
+  });
+
   it("PATCH rejects out-of-range score-alarm thresholds", async () => {
     for (const bad of [11, -1, 4.5, "low"]) {
       const res = await PATCH(patchReq({ reviewMinScore: bad }), ctx("tmp"));

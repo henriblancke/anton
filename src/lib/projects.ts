@@ -29,6 +29,7 @@ import {
 } from "./scan-severity";
 import type { FailureBreakerConfig } from "./autopilot-failure-streak";
 import type { ScoreBreakerConfig } from "./autopilot-score-slide";
+import type { WipLimitConfig } from "./autopilot-wip";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -192,6 +193,13 @@ export interface ProjectSettings {
    * window entirely rather than being read through. Absent → DEFAULT_AUTOPILOT_SCORE_WINDOW.
    */
   autopilotScoreWindow?: number;
+  /**
+   * How many unmerged PRs in review HOLD the picker for this project (anton-wy9y / R4.2). Not a
+   * disarm: nothing is wrong, in-flight work is untouched, and the next merge or close releases it
+   * with no human act. `0` turns the hold off outright — the single knob for an operator who
+   * reviews faster than anton ships. Absent → DEFAULT_AUTOPILOT_WIP_LIMIT.
+   */
+  autopilotWipLimit?: number;
   /**
    * Max concurrent execute-epic runs for this project (anton-xbk). The runner gates approved-epic
    * execution per project against this; other job types (review-fix/nightly) don't count against
@@ -388,6 +396,13 @@ export const DEFAULT_AUTOPILOT_SCORE_FLOOR = 7;
  * operator to re-arm without reading the series.
  */
 export const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
+/**
+ * Three unmerged PRs is already a full sitting for one reviewer, and it is the same number as
+ * {@link DEFAULT_CONCURRENCY} on purpose: a project running flat out can carry every one of its
+ * concurrent runs through to review before the brake bites. So the hold fires on the queue growing
+ * past what anton can produce at once — a review backlog — rather than on anton's own concurrency.
+ */
+export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
@@ -403,6 +418,8 @@ export const AUTOPILOT_FAILURE_STREAK_RANGE = { min: 0, max: 10 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression breaker off. */
 export const AUTOPILOT_SCORE_FLOOR_RANGE = { min: 0, max: 10 } as const;
 export const AUTOPILOT_SCORE_WINDOW_RANGE = { min: 1, max: 10 } as const;
+/** `0` is in range on purpose: it is how the operator turns the WIP hold off. */
+export const AUTOPILOT_WIP_LIMIT_RANGE = { min: 0, max: 20 } as const;
 
 /** A project's resolved self-review configuration (anton-3apm) — never partial. */
 export interface ReviewConfig {
@@ -468,6 +485,17 @@ export function resolveScoreBreaker(settings: ProjectSettings): ScoreBreakerConf
   const floor = settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR;
   if (floor <= 0) return undefined;
   return { floor, window: settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW };
+}
+
+/**
+ * The WIP hold's configuration, with the default applied (anton-wy9y).
+ *
+ * Absent rather than a limit of 0, the same seam its three siblings give their detectors — the
+ * picker pass reads "no hold" as a shape rather than having to know that 0 is the off switch.
+ */
+export function resolveWipLimit(settings: ProjectSettings): WipLimitConfig | undefined {
+  const limit = settings.autopilotWipLimit ?? DEFAULT_AUTOPILOT_WIP_LIMIT;
+  return limit > 0 ? { limit } : undefined;
 }
 
 /** A project's resolved product-master configuration (anton-d2sx) — never partial. */

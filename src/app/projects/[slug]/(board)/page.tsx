@@ -6,7 +6,7 @@ import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
 import { openEscalations } from "@/lib/escalations";
-import { currentDisarm } from "@/lib/autopilot-disarm";
+import { currentBreaker } from "@/lib/autopilot-state";
 
 export const dynamic = "force-dynamic";
 
@@ -22,13 +22,14 @@ export default async function ProjectBoardPage({
   //   • settings — whether this project paces autonomous work (anton-y2ue), which drives the
   //     per-card approval affordance (Approve immediate vs Queue paced).
   //   • escalations — stalls the unstick pass could not safely restart (anton-wvcy).
-  //   • disarm — whether a quality breaker has frozen the autopilot (anton-5c8h), which the board
-  //     states in its own band rather than making the operator open settings to find out.
-  const [board, settings, escalations, disarm] = await Promise.all([
+  //   • breaker — whether the autopilot has stopped, and which kind: a quality disarm that needs a
+  //     human (anton-5c8h) or the self-clearing WIP hold (anton-wy9y). Stated in the board's own
+  //     band rather than making the operator open settings to find out.
+  const [board, settings, escalations, breaker] = await Promise.all([
     project ? getBoard(project) : null,
     getProjectSettingsBySlug(slug),
     project ? openEscalations(project.id) : [],
-    project ? currentDisarm(project.id) : undefined,
+    project ? currentBreaker(project) : undefined,
   ]);
 
   return (
@@ -44,7 +45,7 @@ export default async function ProjectBoardPage({
             slug={slug}
             initialBoard={board}
             escalations={escalations}
-            breaker={disarm}
+            breaker={breaker}
             budgetAware={settings.budgetAware === true}
           />
         </Suspense>
