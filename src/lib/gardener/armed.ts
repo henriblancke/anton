@@ -162,12 +162,18 @@ export interface ArmedInput {
 /** Nothing armed, or nothing left to do — a fresh value each time, never a shared array. */
 const nothing = (): ArmedResult => ({ records: [], attempted: 0, deferred: [] });
 
+/** One armed ask and the plan that would be applied for it — what the walk carries per proposal. */
+export interface ArmedTarget {
+  proposal: EmittedProposal;
+  plan: GardenerPlan;
+}
+
 /** The proposals this policy has ARMED — the manual-move floor already applied by `autonomyFor`. */
-function armed(
+export function armedTargets(
   created: EmittedProposal[],
   policy: ProposalAutonomyPolicy,
   record: ProposalTrackRecord,
-): Array<{ proposal: EmittedProposal; plan: GardenerPlan }> {
+): ArmedTarget[] {
   return created.flatMap((proposal) => {
     const plan = planOf(proposal.detection);
     return autonomyFor(plan.kind, plan, policy, record) === "apply" ? [{ proposal, plan }] : [];
@@ -175,16 +181,34 @@ function armed(
 }
 
 /**
+ * One walk in flight: what it has recorded, and the asks it is leaving open.
+ *
+ * Threaded through the steps below rather than closed over by them, so each decision this walk makes
+ * — refresh, reserve, apply, stop, publish — is a named function that can be read and driven on its
+ * own. The two fields are the walk's only mutable state, and every step that adds to either says so
+ * in its own name.
+ */
+interface ArmedWalk {
+  input: ArmedInput;
+  records: ArmedRecord[];
+  /** Armed asks this walk did not apply: the cap's overflow, plus whatever a stop left untried. */
+  held: string[];
+}
+
+/** What one attempt tells the walk to do next. A CANCEL is neither — it throws ({@link cancelled}). */
+type StepOutcome = "continue" | "stop";
+
+/**
  * Apply what this pass filed, for the kinds armed at `apply`. Throws for two reasons and no others:
- * the pass was CANCELLED (see the checks below), or it made unattended moves it could neither
- * publish nor report ({@link stranding}). An armed proposal that cannot be APPLIED is neither — it
- * is a line in the log and an ask still standing on the board.
+ * the pass was CANCELLED (the checks in {@link applyStep} and {@link finish}), or it made unattended
+ * moves it could neither publish nor report ({@link stranding}). An armed proposal that cannot be
+ * APPLIED is neither — it is a line in the log and an ask still standing on the board.
  *
  * The cap counts ATTEMPTS, not successful writes: it bounds how much unattended work one pass does,
  * and a pass that refused ten in a row has still spent ten applies' worth of board reads and locks.
  */
 export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResult> {
-  const targets = armed(input.created, input.policy, input.record);
+  const targets = armedTargets(input.created, input.policy, input.record);
   // Nothing armed: no walk for a cancel to stop, and no ask this pass leaves standing. The abort
   // still PROPAGATES — here and at every check below, it is never a normal return. The runner reads
   // a handler that resolves as a pass that finished (jobs/runner.ts), and no later pass revisits
@@ -200,198 +224,283 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
   // creates and this walk — the window where the caller's shadow returns early and this call is the
   // first thing to see the abort — would otherwise throw naming nothing, and the proposals it just
   // filed would be neither applied nor reported while their fingerprints stop any later pass
-  // re-deciding them. So it falls through to the loop's own first check, which stops before any
+  // re-deciding them. So it falls through to the step's own first check, which stops before any
   // board read and records what stays open, exactly as a cancel arriving one iteration later does.
 
   const limit = Math.max(0, input.limit ?? MAX_APPLIES_PER_PASS);
-  const held = targets.slice(limit).map(({ proposal }) => proposal.id);
-  // Never a silent cap. An operator who armed a kind and finds three beads moved has to be able to
-  // tell "that was all of it" from "we stopped at three" — by count AND by id, so the asks the cap
-  // held back are answerable without diffing the board against the log.
-  if (held.length > 0) {
-    // The cap is named as the PASS's, never as this call's remaining budget alone: the
-    // product-master pass spends one budget across two tiers, and "applies at most 0" would read as
-    // a broken setting rather than as a pass that had already spent its writes. What an earlier
-    // tier spent is named ALONGSIDE it, so "held back 4 — one pass applies at most 3" never reads
-    // as a cap that should have let a fourth through.
-    const spent = MAX_APPLIES_PER_PASS - limit;
-    await write(
-      input,
-      `APPLY held back ${held.length} armed proposal(s) — one pass applies at most ` +
-        `${MAX_APPLIES_PER_PASS}` +
-        (spent > 0 ? `, and ${spent} of those were already spent earlier in this pass` : "") +
-        `; they stay open as ordinary asks (${held.join(", ")})`,
-    );
+  const walk: ArmedWalk = {
+    input,
+    records: [],
+    held: targets.slice(limit).map(({ proposal }) => proposal.id),
+  };
+  const capped = heldBackNote(walk.held, limit);
+  if (capped) await write(input, capped);
+
+  // `rest` is what the walk has not tried, this attempt first — the slice every stop and every
+  // cancel names as the asks it leaves standing.
+  for (let rest = targets.slice(0, limit); rest.length > 0; rest = rest.slice(1)) {
+    if ((await applyStep(walk, rest)) === "stop") break;
+  }
+  return finish(walk);
+}
+
+/**
+ * The cap's refusal, in words — never a silent cap.
+ *
+ * An operator who armed a kind and finds three beads moved has to be able to tell "that was all of
+ * it" from "we stopped at three" — by count AND by id, so the asks the cap held back are answerable
+ * without diffing the board against the log.
+ *
+ * The cap is named as the PASS's, never as this call's remaining budget alone: the product-master
+ * pass spends one budget across two tiers, and "applies at most 0" would read as a broken setting
+ * rather than as a pass that had already spent its writes. What an earlier tier spent is named
+ * ALONGSIDE it, so "held back 4 — one pass applies at most 3" never reads as a cap that should have
+ * let a fourth through.
+ */
+export function heldBackNote(held: string[], limit: number): string | undefined {
+  if (held.length === 0) return undefined;
+  const spent = MAX_APPLIES_PER_PASS - limit;
+  return (
+    `APPLY held back ${held.length} armed proposal(s) — one pass applies at most ` +
+    `${MAX_APPLIES_PER_PASS}` +
+    (spent > 0 ? `, and ${spent} of those were already spent earlier in this pass` : "") +
+    `; they stay open as ordinary asks (${held.join(", ")})`
+  );
+}
+
+/**
+ * One armed ask, attempted: cleared for a write, bought against the cap, then applied.
+ *
+ * `rest` is the asks the walk has left, this one first, because that is what a stop or a cancel has
+ * to name as still open. The step decides only its own ask: `stop` ends the walk with the reason
+ * already on the record, and a cancel is not an outcome at all — it throws through {@link cancelled}
+ * rather than coming back as one, so no caller can mistake a stopped pass for a finished one.
+ */
+async function applyStep(walk: ArmedWalk, rest: ArmedTarget[]): Promise<StepOutcome> {
+  const { proposal, plan } = rest[0];
+  if (!(await clearedToApply(walk, rest))) return "stop";
+  const base = baseOf(proposal.id, plan);
+  if (!(await reserve(walk, base, rest))) return "stop";
+  return applyReserved(walk, base, rest);
+}
+
+/**
+ * May this ask be applied at all — is the pass still running, and is the board it would be decided
+ * against the current one?
+ *
+ * Both answers are checked again on the far side of the pull, because it is the walk's longest
+ * await: a cancel arriving inside it would otherwise not be seen until this proposal had already
+ * been applied — an unattended write out of a pass an operator (or the no-progress timeout) has
+ * stopped. Both checks land BEFORE the reservation, so a cancel here costs the cap nothing.
+ */
+async function clearedToApply(walk: ArmedWalk, rest: ArmedTarget[]): Promise<boolean> {
+  const { signal } = walk.input;
+  // Between every apply, not once up front: each one is a board write, and a cancel arriving
+  // mid-walk has to stop the rest rather than let a cancelled pass finish every armed move.
+  if (signal?.aborted) return cancelled(walk, signal, rest);
+  if (!(await refreshBoard(walk, rest))) return false;
+  if (signal?.aborted) return cancelled(walk, signal, rest);
+  return true;
+}
+
+/**
+ * What the bought attempt did — the one step of the walk that touches the board, and the record of
+ * how it went.
+ *
+ * The reservation is already spent: the cap is paid on the attempt, not on the write. So every exit
+ * here gives it an OUTCOME rather than leaving an `APPLYING` line nobody can resolve, including the
+ * cancel — the last check this walk can make lands before applyOne's board read, and there anton
+ * KNOWS nothing was written.
+ */
+async function applyReserved(
+  walk: ArmedWalk,
+  base: ArmedAsk,
+  rest: ArmedTarget[],
+): Promise<StepOutcome> {
+  const { input } = walk;
+  if (input.signal?.aborted) {
+    await record(walk, unmadeOf(base));
+    return cancelled(walk, input.signal, rest.slice(1));
   }
 
-  const records: ArmedRecord[] = [];
-  const attempts = targets.slice(0, limit);
-  /**
-   * Stop applying, saying WHY and naming what is left standing — the cap's other silent failure.
-   * The console always gets it; the line is RETURNED so a caller whose log is still healthy can put
-   * it on the record too (the one below cannot — writing the record is what failed).
-   */
-  const stop = (why: string, untried: Array<{ proposal: EmittedProposal }>): string => {
-    const ids = untried.map((target) => target.proposal.id);
-    held.push(...ids);
-    const line =
-      `APPLY stopped — ${why}` +
-      (ids.length > 0
-        ? `; ${ids.length} armed proposal(s) stay open as ordinary asks (${ids.join(", ")})`
-        : "");
-    console.error(`${input.producer} ${line}`);
-    return line;
-  };
+  const { record: outcome, stopped } = await applyOne(input, base);
+  const recorded = await record(walk, outcome);
+  // A cancel that landed inside applyOne's board read. Nothing was written — its outcome line says
+  // so — and the rest of the walk is the pass being STOPPED, never a walk that finished. Ahead of
+  // the recording check below: a cancel is not an outcome, and a log that also failed does not turn
+  // one into a pass that ran to the end.
+  if (stopped && input.signal) return cancelled(walk, input.signal, rest.slice(1));
+  // The outcome supersedes the reservation (record.ts). Losing it costs the record what the write
+  // DID, never the fact that it happened — but a log that has started refusing writes is no longer
+  // one this pass can account against, so it stops here rather than reserving into it again.
+  if (recorded) return "continue";
+  stop(
+    walk,
+    `the outcome of ${base.proposal} could not be recorded — the attempt itself is on the record, ` +
+      `but what it did to the board is not`,
+    rest.slice(1),
+  );
+  return "stop";
+}
 
-  /**
-   * Publish what the walk DID write, whichever way it ended, and say so when it did not land. A
-   * cancelled walk owes this as much as a finished one: the applies behind the cancel are real board
-   * writes, and one no other machine can see is half a write.
-   *
-   * AWAITED, unlike every other propagation anton nudges (beads/sync-nudge.ts). Those follow a write
-   * a human just made and is watching; these were made with nobody there, and this record is the
-   * only place they are ever seen. Two machines can each finish their pre-apply pull before either
-   * publishes — the bead locks serialize within ONE process — so the loser's push can fail on a
-   * conflict it cannot merge, and a walk that only fired the nudge would report APPLIED for a move
-   * the shared board never received. The nudge still runs first: it is what counts the write into
-   * the unpushed backlog and enqueues the durable retry that parks for a human on exhaustion. This
-   * only adds the answer an unattended pass cannot get from a fire-and-forget call.
-   *
-   * What that answer does NOT buy is that the premise still held. `beads.push` PULLS before it
-   * pushes (beads/bd.ts `runDoltSync`), and Dolt merges a concurrent write to a DIFFERENT column of
-   * the same bead rather than conflicting on it — only a same-cell divergence rejects. So a machine
-   * that touched a subject after this apply's pre-apply pull can land beside the move and the push
-   * still succeeds: the walk decided on evidence its own publication has just superseded.
-   *
-   * The merged board is not re-decided against, because no answer read there could be acted on. The
-   * move is already on the shared board; this pass's own write bumps the very `updated_at` the
-   * evidence fence dates against (apply.ts `observedAtOf`), so the other machine's write cannot be
-   * told from ours; and bd offers no cross-machine compare-and-set that could have refused instead.
-   * Un-writing an applied move unattended would rest on weaker evidence than the move it undid. What
-   * is left is a merge a human reads off the subject — which the record above names by id.
-   *
-   * Returns the correction it could NOT record, and only for stranded moves — see {@link stranding}.
-   */
-  const publish = async (): Promise<string | undefined> => {
-    if (records.length === 0) return undefined;
-    // Once, on the way out, whatever the outcomes were: a REFUSAL writes too (apply attaches its
-    // reason to the proposal), and the nudge coalesces per repo — so a pass that happened to write
-    // nothing costs a no-op push, while one that moved a bead never leaves it on this machine alone.
-    input.nudge();
-    console.log(`${input.producer} ${summaryOf(records)}`);
-    const unpublished = await pushFailure(input.repo);
-    if (!unpublished) return undefined;
-    // The record's own correction, in the one place a founder reads the pass: what is written above
-    // as APPLIED happened HERE and has not reached the shared board. Shaped as a pass note (no
-    // `(kind)` group), so it lands beside the counts rather than as a seventh proposal (record.ts).
-    const applied = records.filter(movedTheBoard).map((r) => r.proposal);
-    const recorded = await write(
-      input,
-      `APPLY could not publish this pass's board writes — ` +
-        (applied.length > 0
-          ? `the ${applied.length} move(s) recorded above (${applied.join(", ")}) are on this ` +
-            `machine only`
-          : `what this pass wrote is on this machine only`) +
-        ` until the sync retry lands them, and another machine's board does not yet show them ` +
-        `— ${unpublished}`,
-    );
-    return recorded ? undefined : stranding(applied, unpublished);
-  };
+/** One outcome, kept by the walk and put on the record — reported as the log took it, or did not. */
+async function record(walk: ArmedWalk, outcome: ArmedRecord): Promise<boolean> {
+  walk.records.push(outcome);
+  return write(walk.input, lineOf(outcome));
+}
 
-  /** Cancelled mid-walk: name what stays open, publish what landed, and propagate the abort. */
-  const cancelled = async (
-    signal: AbortSignal,
-    untried: Array<{ proposal: EmittedProposal }>,
-  ): Promise<never> => {
-    await write(input, stop("the pass was cancelled", untried));
-    // The unrecorded correction is dropped rather than raised: the cancel is already the louder
-    // answer — the runner records a stopped pass, never a clean one — and swapping the abort reason
-    // for a log failure would file a guillotined pass as an ordinary error.
-    await publish();
-    throw signal.reason;
-  };
+/**
+ * The shared board, refreshed for THIS apply — for the same reason the board read inside
+ * {@link applyOne} is a fresh one per proposal, one step further out: that read only re-reads this
+ * checkout, so a subject another machine moved since the pass's own pull reads as untouched and
+ * apply's premise checks pass on evidence that is no longer true.
+ *
+ * Fails CLOSED, unlike the pass-level pull (jobs/pass-preamble.ts): that one costs a pass its
+ * freshness on reads nobody writes from, while this is the last thing between a stale premise and an
+ * unattended board write. The asks behind it stay open rather than being tried against the same
+ * stale board — the remote is unreachable for all of them, not just this one.
+ */
+async function refreshBoard(walk: ArmedWalk, rest: ArmedTarget[]): Promise<boolean> {
+  const stale = await pullFailure(walk.input.repo);
+  if (!stale) return true;
+  const why =
+    `the shared board could not be pulled before ${rest[0].proposal.id}, so anton cannot tell ` +
+    `whether another machine has already moved what this would write — ${stale}`;
+  await write(walk.input, stop(walk, why, rest));
+  return false;
+}
 
-  for (const [i, { proposal, plan }] of attempts.entries()) {
-    // Between every apply, not once up front: each one is a board write, and a cancel arriving
-    // mid-loop has to stop the rest rather than let a cancelled pass finish every armed move.
-    if (input.signal?.aborted) return cancelled(input.signal, attempts.slice(i));
+/**
+ * Buy the attempt before the board is touched, never after.
+ *
+ * The record IS the accounting — a retry of this job reconstructs what earlier attempts spent from
+ * these very lines (jobs/pass-budget.ts) — so an apply whose line is written afterwards is, for the
+ * window in between, an unattended board write nothing can see, and a retry landing in that window
+ * gets a cap it has already spent. Reserving first turns the one failure that cost the cap its
+ * meaning into a pass that simply never applied: no line, no write.
+ *
+ * The stop it writes on failure goes to the console alone — recording is what just failed.
+ */
+async function reserve(walk: ArmedWalk, base: ArmedAsk, rest: ArmedTarget[]): Promise<boolean> {
+  if (await write(walk.input, reservationOf(base))) return true;
+  stop(
+    walk,
+    `the attempt at ${base.proposal} could not be recorded, so this pass did not make it — it can ` +
+      `no longer account for what it spends`,
+    rest,
+  );
+  return false;
+}
 
-    // The shared board, refreshed for THIS apply — for the same reason the board read below is a
-    // fresh one per proposal, one step further out: the read that follows only re-reads this
-    // checkout, so a subject another machine moved since the pass's own pull reads as untouched and
-    // apply's premise checks pass on evidence that is no longer true.
-    //
-    // Fails CLOSED, unlike the pass-level pull (jobs/pass-preamble.ts): that one costs a pass its
-    // freshness on reads nobody writes from, while this is the last thing between a stale premise
-    // and an unattended board write. The asks behind it stay open rather than being tried against
-    // the same stale board — the remote is unreachable for all of them, not just this one.
-    const stale = await pullFailure(input.repo);
-    if (stale) {
-      await write(
-        input,
-        stop(
-          `the shared board could not be pulled before ${proposal.id}, so anton cannot tell ` +
-            `whether another machine has already moved what this would write — ${stale}`,
-          attempts.slice(i),
-        ),
-      );
-      break;
-    }
-    // The pull is the loop's longest await, and a cancel arriving inside it would otherwise not be
-    // seen until this proposal had already been applied — an unattended write out of a pass an
-    // operator (or the no-progress timeout) has stopped. Checked BEFORE the reservation, so a
-    // cancel here costs the cap nothing.
-    if (input.signal?.aborted) return cancelled(input.signal, attempts.slice(i));
+/**
+ * Stop applying, saying WHY and naming what is left standing — the cap's other silent failure.
+ *
+ * The console always gets it; the line is RETURNED so a caller whose log is still healthy can put it
+ * on the record too (the ones that cannot are the ones where writing the record is what failed).
+ */
+function stop(walk: ArmedWalk, why: string, untried: ArmedTarget[]): string {
+  const ids = untried.map((target) => target.proposal.id);
+  walk.held.push(...ids);
+  const line = stopNote(why, ids);
+  console.error(`${walk.input.producer} ${line}`);
+  return line;
+}
 
-    // The spend is recorded BEFORE the board is touched, never after. The record IS the accounting —
-    // a retry of this job reconstructs what earlier attempts spent from these very lines
-    // (jobs/pass-budget.ts) — so an apply whose line is written afterwards is, for the window in
-    // between, an unattended board write nothing can see, and a retry landing in that window gets a
-    // cap it has already spent. Reserving first turns the one failure that cost the cap its meaning
-    // into a pass that simply never applied: no line, no write.
-    const base = baseOf(proposal.id, plan);
-    if (!(await write(input, reservationOf(base)))) {
-      stop(
-        `the attempt at ${proposal.id} could not be recorded, so this pass did not make it — it ` +
-          `can no longer account for what it spends`,
-        attempts.slice(i),
-      );
-      break;
-    }
-    // The last check this loop can make; the board read INSIDE applyOne gets the one on its far
-    // side. The attempt is bought and stays bought — the cap is spent on a reservation, not on a
-    // write — but it is given its outcome rather than left standing as an `APPLYING` line nobody
-    // can resolve: here anton KNOWS nothing was written, and a reservation with no outcome tells a
-    // founder to go and look.
-    if (input.signal?.aborted) {
-      const unmade = unmadeOf(base);
-      records.push(unmade);
-      await write(input, lineOf(unmade));
-      return cancelled(input.signal, attempts.slice(i + 1));
-    }
+/** The stop, as one line: the reason, and by id the armed asks that stay open behind it. */
+export function stopNote(why: string, untried: string[]): string {
+  return (
+    `APPLY stopped — ${why}` +
+    (untried.length > 0
+      ? `; ${untried.length} armed proposal(s) stay open as ordinary asks (${untried.join(", ")})`
+      : "")
+  );
+}
 
-    const { record, stopped } = await applyOne(input, base);
-    records.push(record);
-    const recorded = await write(input, lineOf(record));
-    // A cancel that landed inside applyOne's board read. Nothing was written — its outcome line says
-    // so — and the rest of the walk is the pass being STOPPED, never a walk that finished. Ahead of
-    // the recording check below: a cancel is not an outcome, and a log that also failed does not
-    // turn one into a pass that ran to the end.
-    if (stopped && input.signal) return cancelled(input.signal, attempts.slice(i + 1));
-    // The outcome supersedes the reservation (record.ts). Losing it costs the record what the write
-    // DID, never the fact that it happened — but a log that has started refusing writes is no longer
-    // one this pass can account against, so it stops here rather than reserving into it again.
-    if (recorded) continue;
-    stop(
-      `the outcome of ${proposal.id} could not be recorded — the attempt itself is on the record, ` +
-        `but what it did to the board is not`,
-      attempts.slice(i + 1),
-    );
-    break;
-  }
+/** Cancelled mid-walk: name what stays open, publish what landed, and propagate the abort. */
+async function cancelled(
+  walk: ArmedWalk,
+  signal: AbortSignal,
+  untried: ArmedTarget[],
+): Promise<never> {
+  await write(walk.input, stop(walk, "the pass was cancelled", untried));
+  // The unrecorded correction is dropped rather than raised: the cancel is already the louder
+  // answer — the runner records a stopped pass, never a clean one — and swapping the abort reason
+  // for a log failure would file a guillotined pass as an ordinary error.
+  await publish(walk);
+  throw signal.reason;
+}
 
-  const unrecorded = await publish();
-  // The one cancel window with no next iteration to catch it: the signal aborted after the last
+/**
+ * Publish what the walk DID write, whichever way it ended, and say so when it did not land. A
+ * cancelled walk owes this as much as a finished one: the applies behind the cancel are real board
+ * writes, and one no other machine can see is half a write.
+ *
+ * AWAITED, unlike every other propagation anton nudges (beads/sync-nudge.ts). Those follow a write a
+ * human just made and is watching; these were made with nobody there, and this record is the only
+ * place they are ever seen. Two machines can each finish their pre-apply pull before either
+ * publishes — the bead locks serialize within ONE process — so the loser's push can fail on a
+ * conflict it cannot merge, and a walk that only fired the nudge would report APPLIED for a move the
+ * shared board never received. The nudge still runs first: it is what counts the write into the
+ * unpushed backlog and enqueues the durable retry that parks for a human on exhaustion. This only
+ * adds the answer an unattended pass cannot get from a fire-and-forget call.
+ *
+ * What that answer does NOT buy is that the premise still held. `beads.push` PULLS before it pushes
+ * (beads/bd.ts `runDoltSync`), and Dolt merges a concurrent write to a DIFFERENT column of the same
+ * bead rather than conflicting on it — only a same-cell divergence rejects. So a machine that
+ * touched a subject after this apply's pre-apply pull can land beside the move and the push still
+ * succeeds: the walk decided on evidence its own publication has just superseded.
+ *
+ * The merged board is not re-decided against, because no answer read there could be acted on. The
+ * move is already on the shared board; this pass's own write bumps the very `updated_at` the
+ * evidence fence dates against (apply.ts `observedAtOf`), so the other machine's write cannot be
+ * told from ours; and bd offers no cross-machine compare-and-set that could have refused instead.
+ * Un-writing an applied move unattended would rest on weaker evidence than the move it undid. What
+ * is left is a merge a human reads off the subject — which the record above names by id.
+ *
+ * Returns the correction it could NOT record, and only for stranded moves — see {@link stranding}.
+ */
+async function publish(walk: ArmedWalk): Promise<string | undefined> {
+  const { input, records } = walk;
+  if (records.length === 0) return undefined;
+  // Once, on the way out, whatever the outcomes were: a REFUSAL writes too (apply attaches its
+  // reason to the proposal), and the nudge coalesces per repo — so a pass that happened to write
+  // nothing costs a no-op push, while one that moved a bead never leaves it on this machine alone.
+  input.nudge();
+  console.log(`${input.producer} ${summaryOf(records)}`);
+  const unpublished = await pushFailure(input.repo);
+  if (!unpublished) return undefined;
+  const applied = records.filter(movedTheBoard).map((r) => r.proposal);
+  const recorded = await write(input, unpublishedNote(applied, unpublished));
+  return recorded ? undefined : stranding(applied, unpublished);
+}
+
+/**
+ * The record's own correction, in the one place a founder reads the pass: what is written above as
+ * APPLIED happened HERE and has not reached the shared board.
+ *
+ * Shaped as a pass note (no `(kind)` group), so it lands beside the counts rather than as one more
+ * proposal (record.ts).
+ */
+export function unpublishedNote(applied: string[], unpublished: string): string {
+  return (
+    `APPLY could not publish this pass's board writes — ` +
+    (applied.length > 0
+      ? `the ${applied.length} move(s) recorded above (${applied.join(", ")}) are on this machine ` +
+        `only`
+      : `what this pass wrote is on this machine only`) +
+    ` until the sync retry lands them, and another machine's board does not yet show them ` +
+    `— ${unpublished}`
+  );
+}
+
+/**
+ * The walk's last word: publish what it wrote, then fail the pass for the only two things it may not
+ * finish over — a cancel, and moves it could neither publish nor report.
+ */
+async function finish(walk: ArmedWalk): Promise<ArmedResult> {
+  const { input, records, held } = walk;
+  const unrecorded = await publish(walk);
+  // The one cancel window with no next attempt to catch it: the signal aborted after the last
   // proposal cleared its checkpoints — inside apply's own write, its outcome line, or the awaited
   // publish above. Returning here would hand the runner a handler that RESOLVED, which it records as
   // a pass that finished even when its own no-progress timer fired the abort (jobs/runner.ts), so a
@@ -399,7 +508,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
   // are real and already on the log, and a cancel is not a rollback — but the pass is stopped, and
   // the record says so before the reason propagates.
   if (input.signal?.aborted) {
-    await write(input, stop("the pass was cancelled", []));
+    await write(input, stop(walk, "the pass was cancelled", []));
     throw input.signal.reason;
   }
   // Fails the pass, and this is the only thing besides a cancel that does. Every other broken write
@@ -421,7 +530,7 @@ export async function applyArmedProposals(input: ArmedInput): Promise<ArmedResul
  * pass — while a MOVE the record still calls `APPLIED` is the record lying about the board, which is
  * the one thing this walk's awaited publish exists to prevent.
  */
-function stranding(applied: string[], unpublished: string): string | undefined {
+export function stranding(applied: string[], unpublished: string): string | undefined {
   if (applied.length === 0) return undefined;
   return (
     `the armed pass applied ${applied.length} proposal(s) (${applied.join(", ")}) that could not be ` +
@@ -655,7 +764,7 @@ async function applyOne(input: ArmedInput, base: ArmedAsk): Promise<ArmedAttempt
  * rolled-back board would tell a founder nothing happened while the proposal's own fingerprint keeps
  * any later pass from re-deciding it, and nobody would ever settle the still-open ask.
  */
-function outcomeOf(failure: ProposalApplyError | undefined): ArmedOutcome {
+export function outcomeOf(failure: ProposalApplyError | undefined): ArmedOutcome {
   if (!failure) return "error";
   switch (failure.failure) {
     case "unsettled":
@@ -697,7 +806,7 @@ const strandedWrite = (record: ArmedRecord): boolean =>
  * a rollback that finished — and the Jobs page, the surface a founder audits an unattended write on,
  * would say "nothing landed" over beads this pass moved and cannot un-move.
  */
-function verdictOf(record: ArmedRecord): ApplyVerdict {
+export function verdictOf(record: ArmedRecord): ApplyVerdict {
   if (strandedWrite(record)) return "COULD NOT ROLL BACK";
   return VERDICT[record.outcome];
 }
@@ -715,7 +824,7 @@ function lineOf(record: ArmedRecord): string {
  * a setting that failed to take. There is always at least one clause — the caller only summarises a
  * pass that attempted something.
  */
-function summaryOf(records: ArmedRecord[]): string {
+export function summaryOf(records: ArmedRecord[]): string {
   const of = (outcome: ArmedOutcome) => records.filter((r) => r.outcome === outcome);
   const applied = of("applied");
   const unsettled = of("unsettled");
