@@ -257,20 +257,28 @@ async function codeReferencingFiles(
  * punctuation (`$mount`) matches itself rather than a pattern, `-z` so a non-ASCII path comes back
  * unquoted under `core.quotePath`, `-I` so a binary blob is never read as a call site, `-n` so a
  * hit can be located in its file and judged against the comments open around it.
+ *
+ * The caller's signal goes to the child so a cancelled job kills the grep it is waiting on instead
+ * of paying out its 30s timeout.
  */
 async function filesMentioning(
   repoPath: string,
   symbol: string,
   commented: Map<string, Set<number> | undefined>,
+  abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
   try {
     const { stdout } = await execFileAsync(
       "git",
       ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "--untracked", "-e", symbol],
-      { timeout: GREP_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 },
+      { timeout: GREP_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, signal: abort },
     );
     return await codeReferencingFiles(repoPath, candidateHits(stdout), commented);
   } catch (err) {
+    // A cancelled job is not an unsearchable tree. Reporting the kill as `unavailable` would let the
+    // scan finish and record the pass, holding up shutdown and the `--delta` baseline unwind — so
+    // the abort is rethrown, ahead of the exit-code test because a killed grep can surface as either.
+    abort?.throwIfAborted();
     // Exit 1 is `git grep`'s "no match" — the answer, not a failure. Anything else is git unable to
     // answer at all, which must not read as "nothing references it".
     const e = err as { code?: number | string } | null;
@@ -291,10 +299,15 @@ async function filesMentioning(
  * phantoms.
  *
  * Only reached when a scan actually carries a deadcode signal, so an ordinary pass runs no git.
+ *
+ * Cancellation throws rather than returning a partial verdict: a pass the caller stopped has not
+ * checked the tree, and letting it return would write a scan file and record a health point for a
+ * job already on its way out.
  */
 export async function filterDeadcodeSignals(
   repoPath: string,
   signals: ScanSignal[],
+  abort?: AbortSignal,
 ): Promise<{ kept: ScanSignal[]; deadcode: DeadcodeFilter }> {
   const relevant = signals.filter((signal) => collectorOf(signal) === DEADCODE_COLLECTOR);
   if (relevant.length === 0) return { kept: signals, deadcode: { dropped: [] } };
@@ -307,6 +320,9 @@ export async function filterDeadcodeSignals(
 
   for (const signal of relevant) {
     if (unavailable) break;
+    // Before starting another symbol's grep, not just inside it: a cancelled job should not spend
+    // the tree on findings nobody will read.
+    abort?.throwIfAborted();
     const symbol = symbolOf(signal);
     const path = filePathOf(repoPath, signal);
     // No symbol or no file is nothing anton can check: a mention count needs both a name to look
@@ -316,7 +332,7 @@ export async function filterDeadcodeSignals(
     let files = seen.get(symbol);
     if (!files) {
       if (seen.size >= SYMBOL_BUDGET) break;
-      const found = await filesMentioning(repoPath, symbol, commented);
+      const found = await filesMentioning(repoPath, symbol, commented, abort);
       if (!Array.isArray(found)) {
         unavailable = found.unavailable;
         break;

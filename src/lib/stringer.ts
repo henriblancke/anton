@@ -597,6 +597,7 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
 async function readAnnotatedSignals(
   scanFile: string,
   repoPath: string,
+  abort?: AbortSignal,
 ): Promise<{
   signals: ScanSignal[];
   untracked: UntrackedFilter;
@@ -636,7 +637,7 @@ async function readAnnotatedSignals(
   // Coupling last: it reads the source of the modules a signal names, so it should never be paid for
   // a finding the index already contradicted.
   const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, tracked);
-  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, coupled);
+  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, coupled, abort);
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
   return { signals: kept, untracked, coupling, deadcode };
@@ -711,10 +712,12 @@ export async function scan(opts: {
     deadcode: DeadcodeFilter;
   };
   try {
-    read = await readAnnotatedSignals(opts.scanFile, opts.repoPath);
+    read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, opts.signal);
   } catch (err) {
     // Refusing the output means refusing the whole pass, baseline included: the retry has to see the
-    // same window this attempt consumed, or its findings are lost to a clean-looking rescan.
+    // same window this attempt consumed, or its findings are lost to a clean-looking rescan. A
+    // cancel lands here too — the reference check stops on the caller's signal, and the pass it
+    // abandons still consumed the window.
     throw await rejectWithBaselineRestored(err, unwind);
   }
 

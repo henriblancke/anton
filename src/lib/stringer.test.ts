@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
-import { describeDeadcodeFilter } from "./scan-deadcode";
+import { describeDeadcodeFilter, filterDeadcodeSignals } from "./scan-deadcode";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
@@ -1211,6 +1211,43 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
       expect(result.deadcode.unavailable).toBeTruthy();
       expect(describeDeadcodeFilter(result.deadcode)).toContain("could not be searched");
+    });
+
+    // A cancelled job must stop the check, not ride it out: the greps are what the shutdown waits
+    // on, and a filter that returned a verdict anyway would let the pass record itself.
+    describe("cancellation", () => {
+      it("starts no grep once the caller has aborted", async () => {
+        const repo = initRepo({
+          "src/testing/integration.ts": "export function withOperator() {}\n",
+          "src/routes/claim.test.ts": "withOperator();\n",
+        });
+
+        await expect(
+          filterDeadcodeSignals(
+            repo,
+            [unused("src/testing/integration.ts", "withOperator")],
+            AbortSignal.abort(),
+          ),
+        ).rejects.toMatchObject({ name: "AbortError" });
+      });
+
+      // The abort kills the grep anton is waiting on; reporting that as an unsearchable tree would
+      // count the pass as verified-but-unavailable and let it finish writing.
+      it("rejects rather than reporting the killed grep as an unsearchable tree", async () => {
+        const repo = initRepo({
+          "src/testing/integration.ts": "export function withOperator() {}\n",
+          "src/routes/claim.test.ts": "withOperator();\n",
+        });
+        const ac = new AbortController();
+        const filtering = filterDeadcodeSignals(
+          repo,
+          [unused("src/testing/integration.ts", "withOperator")],
+          ac.signal,
+        );
+        ac.abort();
+
+        await expect(filtering).rejects.toMatchObject({ name: "AbortError" });
+      });
     });
   });
 
