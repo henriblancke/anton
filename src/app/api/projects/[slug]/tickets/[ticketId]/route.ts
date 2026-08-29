@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { deleteTicket, getTicketDetail, updateTicket } from "@/lib/ticket-detail";
 import { parseTicketPatch } from "@/lib/ticket-patch";
-import { notFoundResponse, withProject } from "../../resolve-project";
+import { notFoundResponse, parseJsonBody, withProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -18,12 +18,8 @@ export const GET = withProject<{ slug: string; ticketId: string }>(
 
 export const PATCH = withProject<{ slug: string; ticketId: string }>(
   async (request, { project, params }) => {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-    }
+    const { body, response: badBody } = await parseJsonBody(request);
+    if (badBody) return badBody;
 
     const parsed = parseTicketPatch(body);
     if ("error" in parsed) {
