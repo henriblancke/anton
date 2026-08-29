@@ -2,7 +2,7 @@
  * End-to-end proof of anton-3t2.4's acceptance: "Orphan tickets are periodically grouped under an
  * epic." Drives the REAL orphan-grooming handler + REAL bd against a temp repo. Skipped without bd.
  */
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
@@ -10,7 +10,7 @@ import { driveJob } from "@/lib/testing/jobs";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
-import { type Clock } from "./queue";
+import { getJob, type Clock } from "./queue";
 import { makeOrphanGroomingHandler, ORPHAN_EPIC_LABEL } from "./orphan-grooming";
 
 class FakeClock implements Clock {
@@ -142,5 +142,21 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
       ((c?.parent ?? c?.parent_id) as string | undefined) ??
       beads.edgesOf(final).find((e) => e.type === "parent-child" && e.from === orphanC)?.to;
     expect(cParent).toBe(groomingEpic.id);
+  });
+
+  it("reports links bd refused instead of passing them off as a clean pass", async () => {
+    // Every link failing leaves the loose tickets exactly as actionable as before, so a bare
+    // "bucketed 0" would read as a neutral nothing-to-do and hide the failure (anton-znoz review).
+    createTicket(repo, "Loose ticket D");
+    const link = vi.spyOn(beads, "link").mockRejectedValue(new Error("bd: refused"));
+    try {
+      const jobId = await runGrooming();
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("done");
+      expect(job?.outcomeNote).toContain("1 failed to link");
+      expect(job?.outcomeNote).toContain("bucketed 0");
+    } finally {
+      link.mockRestore();
+    }
   });
 });

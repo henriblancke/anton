@@ -111,6 +111,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
       (b) => beads.isEpic(b) && b.status !== "closed" && b.labels?.includes(ORPHAN_EPIC_LABEL),
     )?.id;
 
+    let createdEpic = false;
     if (!epicId) {
       epicId = await beads.create(repo, {
         title: ORPHAN_EPIC_TITLE,
@@ -118,6 +119,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
         description: ORPHAN_EPIC_DESCRIPTION,
       });
       await beads.tag(repo, epicId, [ORPHAN_EPIC_LABEL]);
+      createdEpic = true;
     }
 
     // Link each orphan under the epic (child → parent). Best-effort per ticket so one bad id
@@ -146,8 +148,13 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
       .catch((e) => console.error("[orphan-grooming] beads dolt sync failed", e));
 
     // `linked`, not `orphans.length`: a ticket bd refused to link was not bucketed, and the row must
-    // not claim it was.
-    return { changed: linked > 0, note: `bucketed ${linked} loose ticket(s)` };
+    // not claim it was. The failures ride out in the note too — a pass where every link failed still
+    // left loose tickets actionable (and may have just created the epic), so reporting a bare
+    // "bucketed 0" would hide a partial pass behind a neutral no-op (anton-znoz review).
+    const note = failed.length
+      ? `bucketed ${linked} loose ticket(s); ${failed.length} failed to link`
+      : `bucketed ${linked} loose ticket(s)`;
+    return { changed: linked > 0 || createdEpic, note };
   };
 }
 
