@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
+import { describeDeadcodeFilter } from "./scan-deadcode";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
@@ -994,6 +995,146 @@ describe("scan", () => {
       expect((result.signals[2] as { Title: string }).Title).toBe(
         "High coupling: src/only-values imports 12 modules",
       );
+    });
+  });
+
+  // anton-23xe: the `deadcode` collector doesn't follow every reference — all ten unused-function
+  // signals in the 2026-08-17 scan named a symbol with real callers, every one of them in a test
+  // file. They cost the health record a debt point a night and triage the judgment to re-derive
+  // that they were wrong.
+  describe("dead-code signals whose symbol has callers elsewhere in the tree", () => {
+    /** A committed tree — the reference check asks git what the repo holds. */
+    function initRepo(files: Record<string, string>): string {
+      const repo = join(dir, "repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      return repo;
+    }
+
+    /** stringer's own phrasing, tags and confidence for an unused symbol. */
+    const unused = (path: string, symbol: string, kind = "unused-function") => ({
+      Source: "deadcode",
+      Kind: kind,
+      FilePath: path,
+      Line: 1,
+      Title: `Unused ${kind === "unused-type" ? "type" : "function"}: ${symbol}`,
+      Description: "",
+      Confidence: 0.3,
+      Tags: ["dead-code", "cleanup-candidate", "test-only-reference"],
+    });
+
+    it("drops the ones with callers and reports the rest unchanged, on both sides of the seam", async () => {
+      const repo = initRepo({
+        // withOperator in miniature: declared in a helper, called only from a suite.
+        "src/testing/integration.ts": "export function withOperator() {}\n",
+        "src/routes/claim.test.ts": "import { withOperator } from '../testing/integration';\nwithOperator();\n",
+        // ...and one nobody anywhere calls.
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+      });
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [
+          unused("src/testing/integration.ts", "withOperator"),
+          unused("src/lib/orphan.ts", "neverCalled"),
+        ],
+        metadata: { total_count: 2 },
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      // The genuinely unreferenced one survives, at the severity it always carried.
+      expect(result.signals).toMatchObject([
+        { Title: "Unused function: neverCalled", AntonSeverity: "low", AntonClass: "debt" },
+      ]);
+      expect(result.deadcode.dropped).toMatchObject([
+        { path: "src/testing/integration.ts", symbol: "withOperator", kind: "unused-function" },
+      ]);
+      // The drop names its caller, so it can be checked by hand without re-running the scan.
+      expect(result.deadcode.dropped[0].reason).toContain("src/routes/claim.test.ts");
+      expect(describeDeadcodeFilter(result.deadcode)).toContain("dropped 1 dead-code signal(s)");
+      // Same set on both sides: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { Title: string }[] };
+      expect(written.signals.map((s) => s.Title)).toEqual(["Unused function: neverCalled"]);
+    });
+
+    // A symbol that only ever mentions itself — its own declaration, its own recursive call — is
+    // exactly what the collector claims, so nothing here may read as a caller.
+    it("does not count the declaring file's own mentions as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts":
+          "export function neverCalled(n: number): number {\n  return n > 0 ? neverCalled(n - 1) : 0;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("./src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode).toEqual({ dropped: [] });
+      expect(describeDeadcodeFilter(result.deadcode)).toBeUndefined();
+    });
+
+    it("drops an unused type the same way, and reads a whole-word reference only", async () => {
+      const repo = initRepo({
+        "src/lib/types.ts": "export type ScanPass = { id: string };\n",
+        "src/lib/pass.ts": "import type { ScanPass } from './types';\nexport const p: ScanPass = { id: '1' };\n",
+        // `neverCalledTwice` contains `neverCalled`, but a substring is not a reference to it.
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/other.ts": "export function neverCalledTwice() {}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/types.ts", "ScanPass", "unused-type"),
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "ScanPass", kind: "unused-type" }]);
+    });
+
+    // Under-filtering costs one triaged bead; over-filtering deletes a finding nobody hears about
+    // again. So anything anton cannot check rides through untouched.
+    it("keeps every signal it cannot check — other collectors, unreadable titles, pathless signals", async () => {
+      const repo = initRepo({ "src/lib/orphan.ts": "export function neverCalled() {}\n" });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        { Source: "todos", Kind: "todo", FilePath: "src/lib/orphan.ts", Title: "TODO: neverCalled" },
+        { ...unused("src/lib/orphan.ts", "neverCalled"), Title: "Dead code found in this file" },
+        { ...unused("src/lib/orphan.ts", "neverCalled"), FilePath: "" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(3);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A filter that can't search the tree must under-filter rather than delete findings — and say
+    // why, so the surviving signals aren't read as the repo suddenly growing dead code.
+    it("counts everything and reports why when the tree cannot be searched", async () => {
+      const notARepo = join(dir, "loose");
+      mkdirSync(notARepo, { recursive: true });
+      writeFileSync(join(notARepo, "orphan.ts"), "export function neverCalled() {}\n", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+      expect(result.deadcode.unavailable).toBeTruthy();
+      expect(describeDeadcodeFilter(result.deadcode)).toContain("could not be searched");
     });
   });
 

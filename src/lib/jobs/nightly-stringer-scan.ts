@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { appendSessionLog } from "../sessions";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
+import { describeDeadcodeFilter } from "../scan-deadcode";
 import { summarizeSignals, type ScanCounts } from "../scan-health";
 import {
   describeCollectorFailure,
@@ -128,6 +129,18 @@ async function reportScanDiagnostics(
   // only place the drop and its proof still exist.
   const couplingLine = describeCouplingFilter(result.coupling);
   if (couplingLine) await appendSessionLog(logPath, `[stringer] ${couplingLine}\n`);
+
+  // Dead-code findings whose symbol has callers the collector never followed (anton-23xe). A silent
+  // filter is indistinguishable from a collector that found nothing, and a tree anton could not
+  // search leaves the phantoms counted — both belong on the session rather than in the counts alone.
+  const deadcodeLine = describeDeadcodeFilter(result.deadcode);
+  if (deadcodeLine) {
+    const prefix = result.deadcode.unavailable ? "WARNING: " : "";
+    await appendSessionLog(logPath, `[stringer] ${prefix}${deadcodeLine}\n`);
+    if (result.deadcode.unavailable) {
+      console.warn(`[nightly-stringer] ${project.slug}: ${deadcodeLine}`);
+    }
+  }
 }
 
 /**
