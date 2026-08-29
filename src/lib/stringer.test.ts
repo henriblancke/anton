@@ -1160,6 +1160,42 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
     });
 
+    // A hit is a line, not a position: prose written after real code carries no marker where the
+    // line begins, so reading the line as code proves a caller that isn't there.
+    it("does not count a name in a comment opened after code as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts":
+          "export const kept = 1; /* neverCalled was removed */\nexport const also = 2; // neverCalled went with it\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // `;` opens a comment in Lisp and guards ASI in TypeScript. Reading every marker in every file
+    // leaves a symbol with a real caller counted as dead — the phantom this filter exists to stop.
+    it("counts a caller whose line opens with a marker its own language does not have", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.ts": "const ready = true\n;neverCalled()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+    });
+
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
       const repo = initRepo({
         "src/lib/types.ts": "export type ScanPass = { id: string };\n",

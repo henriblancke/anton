@@ -12,11 +12,12 @@
  *
  * The check is `git grep`, not a parse: the question is only whether the symbol is written outside
  * the file that declares it, and the index already knows which files to read without walking
- * `node_modules` or a build dir. Grep sees text, so hits are read line by line and prose is
- * discounted — a name in a comment or a doc is being described, not called, and this module's own
- * docblock would otherwise keep the symbols it names alive forever. A hit that no single line marks
- * as prose is checked against the block comments open above it, because the middle of a block
- * carries no marker and would otherwise read as a call. Conservative in the direction that matters
+ * `node_modules` or a build dir. Grep sees text, so hits are read against the prose around them —
+ * a name in a comment or a doc is being described, not called, and this module's own docblock would
+ * otherwise keep the symbols it names alive forever. Prose is judged in the file's own language,
+ * and by where the symbol sits rather than how its line begins: the middle of a block carries no
+ * marker, a comment opened after code carries one the line start never shows, and `;` opens a
+ * comment in Lisp but guards a real call in TypeScript. Conservative in the direction that matters
  * — a tree anton cannot search, or a file it cannot read, drops nothing, so an unsearchable repo
  * over-reports rather than deleting a finding nobody hears about again.
  */
@@ -60,80 +61,140 @@ const UNUSED_TITLE = /^\s*unused\s+[\w-]+\s*:\s*([A-Za-z_$][\w$]*)/i;
 const PROSE_FILE = /\.(?:md|mdx|markdown|txt|rst|adoc|org)$/i;
 
 /**
- * A line that opens with a comment marker in the languages stringer collects. Only the start of the
- * trimmed line is checked: a trailing `// note` on a real statement still counts, which errs toward
- * keeping a signal anton cannot disprove.
+ * A line opening with a comment marker in *some* language, for a file whose language anton has no
+ * grammar for below. It is the union across languages, so a marker one language doesn't share is
+ * still read as prose — `;` is a Lisp comment and an ASI guard, and without knowing the file this
+ * has to assume the reading that keeps a signal anton cannot disprove. Only the start of the
+ * trimmed line is checked, for the same reason.
  */
 const COMMENT_LINE = /^(?:\/\/|\/\*|\*\/|\*|#|--|;|%|<!--|"""|''')/;
 
+interface CommentSyntax {
+  files: RegExp;
+  /** Markers that comment out the rest of their line. */
+  line: string[];
+  /** Delimiter pairs that span lines, opener then closer. */
+  block: [string, string][];
+}
+
 /**
- * Block comment delimiters by file kind, opener then closer. A continuation line in the middle of a
- * block carries no marker of its own, so the line test alone reads `neverCalled was removed later`
- * as code and a symbol merely being described proves a caller that does not exist. Only the
- * grammars stringer's collectors actually meet are tracked; a language without one is judged line
- * by line, as before.
+ * Comment grammar by file kind. Judging a hit by how its line begins gets both ends wrong: the
+ * middle of a block carries no marker of its own, so `neverCalled was removed later` reads as a
+ * call, while a legitimate `;neverCalled()` reads as a Lisp comment. Knowing the language lets a
+ * hit be judged where it actually sits. Only the grammars stringer's collectors meet are tracked;
+ * a language without one falls back to the union line test above.
  */
-const BLOCK_COMMENTS: { files: RegExp; delimiters: [string, string][] }[] = [
+const COMMENT_SYNTAX: CommentSyntax[] = [
   {
     files:
       /\.(?:[cm]?[jt]sx?|go|rs|java|kt|kts|scala|swift|c|h|cc|cpp|hpp|cs|php|css|scss|less|dart|proto)$/i,
-    delimiters: [["/*", "*/"]],
+    line: ["//"],
+    block: [["/*", "*/"]],
   },
   {
     files: /\.(?:html?|xml|svg|vue|svelte|astro)$/i,
-    delimiters: [
+    line: ["//"],
+    block: [
       ["<!--", "-->"],
       ["/*", "*/"],
     ],
   },
   {
     files: /\.(?:py|pyi)$/i,
-    delimiters: [
+    line: ["#"],
+    block: [
       ['"""', '"""'],
       ["'''", "'''"],
     ],
   },
+  {
+    files: /\.(?:rb|sh|bash|zsh|ya?ml|toml)$/i,
+    line: ["#"],
+    block: [],
+  },
 ];
 
-/** The block grammar to read a file with, or undefined when its language has none anton tracks. */
-function blockDelimitersOf(file: string): [string, string][] | undefined {
-  return BLOCK_COMMENTS.find((syntax) => syntax.files.test(file))?.delimiters;
+/** The grammar to read a file with, or undefined when anton tracks none for its language. */
+function commentSyntaxOf(file: string): CommentSyntax | undefined {
+  return COMMENT_SYNTAX.find((syntax) => syntax.files.test(file));
+}
+
+/** The first comment starting at or after `from`, whichever kind opens earliest. */
+function nextComment(
+  line: string,
+  from: number,
+  syntax: CommentSyntax,
+): { at: number; marker: string; closer?: string } | undefined {
+  let found: { at: number; marker: string; closer?: string } | undefined;
+  for (const marker of syntax.line) {
+    const at = line.indexOf(marker, from);
+    if (at >= 0 && (!found || at < found.at)) found = { at, marker };
+  }
+  for (const [opener, closer] of syntax.block) {
+    const at = line.indexOf(opener, from);
+    if (at >= 0 && (!found || at < found.at)) found = { at, marker: opener, closer };
+  }
+  return found;
+}
+
+/** The line with its comment spans replaced by spaces — same length, so offsets still line up. */
+function blankSpans(line: string, spans: [number, number][]): string {
+  if (spans.length === 0) return line;
+  let out = "";
+  let cursor = 0;
+  for (const [start, end] of spans) {
+    out += line.slice(cursor, start) + " ".repeat(end - start);
+    cursor = end;
+  }
+  return out + line.slice(cursor);
 }
 
 /**
- * The 1-based lines that begin inside an open block comment. The scan is textual, so a delimiter
- * written inside a string literal opens a block that isn't there — and every such mistake ends in
- * "this line is prose", which leaves a signal standing rather than deleting one.
+ * The file's lines with every comment blanked out, so a hit is read against the code actually left
+ * on its line. The scan is textual: a delimiter inside a string literal opens a block that isn't
+ * there, and a `//` inside a URL comments out the rest of its line. Every such mistake ends in
+ * "this hit is prose", which leaves a signal standing rather than deleting one.
  */
-function blockCommentedLines(text: string, delimiters: [string, string][]): Set<number> {
-  const inside = new Set<number>();
+function maskComments(text: string, syntax: CommentSyntax): string[] {
   let closer: string | undefined;
-  text.split("\n").forEach((line, index) => {
-    if (closer) inside.add(index + 1);
+  return text.split("\n").map((line) => {
+    const spans: [number, number][] = [];
     let at = 0;
     while (at < line.length) {
       if (closer) {
         const end = line.indexOf(closer, at);
-        if (end < 0) return;
-        at = end + closer.length;
-        closer = undefined;
+        const stop = end < 0 ? line.length : end + closer.length;
+        spans.push([at, stop]);
+        at = stop;
+        if (end >= 0) closer = undefined;
         continue;
       }
-      let opensAt = -1;
-      let opened: [string, string] | undefined;
-      for (const delimiter of delimiters) {
-        const found = line.indexOf(delimiter[0], at);
-        if (found >= 0 && (opensAt < 0 || found < opensAt)) {
-          opensAt = found;
-          opened = delimiter;
-        }
+      const opened = nextComment(line, at, syntax);
+      if (!opened) break;
+      if (!opened.closer) {
+        spans.push([opened.at, line.length]);
+        break;
       }
-      if (!opened) return;
-      at = opensAt + opened[0].length;
-      closer = opened[1];
+      spans.push([opened.at, opened.at + opened.marker.length]);
+      at = opened.at + opened.marker.length;
+      closer = opened.closer;
     }
+    return blankSpans(line, spans);
   });
-  return inside;
+}
+
+/** Word characters as `git grep -w` counts them, so this reads a hit the way grep found it. */
+const WORD_CHAR = /[0-9A-Za-z_]/;
+
+/** Whether the line still writes the symbol as a whole word once its comments are blanked out. */
+function referencesWord(line: string | undefined, symbol: string): boolean {
+  if (line === undefined) return false;
+  for (let at = line.indexOf(symbol); at >= 0; at = line.indexOf(symbol, at + 1)) {
+    const before = at > 0 ? line[at - 1] : "";
+    const after = line[at + symbol.length] ?? "";
+    if (!WORD_CHAR.test(before) && !WORD_CHAR.test(after)) return true;
+  }
+  return false;
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -193,9 +254,11 @@ type CandidateHits = Map<string, number[]>;
  * as `path\0line\0text\n`, so a file is judged by its hits rather than by appearing in a filename
  * list.
  *
- * Documentation files and lines opening with a comment marker are discounted here without reading
- * anything — a name written in prose is not a reference. What survives still has to clear the
- * block-comment check: from one line, a hit in the middle of an open block looks exactly like code.
+ * Documentation files are discounted here without reading anything — a name written in prose is not
+ * a reference. So is a line opening with a comment marker, but only in a file whose language anton
+ * has no grammar for: the rest are judged against their own text, where a comment opened mid-line
+ * and the middle of a block are both visible and `;` is not mistaken for a marker.
+ *
  * A name inside a string literal or a same-named local declaration still counts: grep cannot tell
  * those from a call, and only a parser could.
  */
@@ -208,7 +271,8 @@ function candidateHits(stdout: string): CandidateHits {
     if (textStart < 0) continue;
     const file = normalize(record.slice(0, pathEnd));
     if (PROSE_FILE.test(file)) continue;
-    if (COMMENT_LINE.test(record.slice(textStart + 1).trimStart())) continue;
+    if (!commentSyntaxOf(file) && COMMENT_LINE.test(record.slice(textStart + 1).trimStart()))
+      continue;
     const line = Number(record.slice(pathEnd + 1, textStart));
     if (!Number.isInteger(line) || line < 1) continue;
     hits.set(file, [...(hits.get(file) ?? []), line]);
@@ -217,36 +281,36 @@ function candidateHits(stdout: string): CandidateHits {
 }
 
 /**
- * The files holding at least one hit that still reads as code once open block comments are
- * accounted for. A file is read only when its language has block comments and one of its hits
- * already cleared the line test, and the result is cached across symbols because one busy file
- * answers for many of them.
+ * The files holding at least one hit that still writes the symbol as code once the comments around
+ * it are blanked out. A file is read only when anton knows its language and it carries a hit, and
+ * the masked text is cached across symbols because one busy file answers for many of them.
  *
  * A file anton cannot read proves nothing: without its text there is no evidence the hit is a call,
  * and an unproven caller must not delete a finding.
  */
 async function codeReferencingFiles(
   repoPath: string,
+  symbol: string,
   hits: CandidateHits,
-  commented: Map<string, Set<number> | undefined>,
+  masked: Map<string, string[] | undefined>,
 ): Promise<string[]> {
   const files: string[] = [];
   for (const [file, lines] of hits) {
-    const delimiters = blockDelimitersOf(file);
-    if (!delimiters) {
+    const syntax = commentSyntaxOf(file);
+    if (!syntax) {
       files.push(file);
       continue;
     }
-    if (!commented.has(file)) {
+    if (!masked.has(file)) {
       try {
         const text = await readFile(join(repoPath, file), "utf8");
-        commented.set(file, blockCommentedLines(text, delimiters));
+        masked.set(file, maskComments(text, syntax));
       } catch {
-        commented.set(file, undefined);
+        masked.set(file, undefined);
       }
     }
-    const prose = commented.get(file);
-    if (prose && lines.some((line) => !prose.has(line))) files.push(file);
+    const code = masked.get(file);
+    if (code && lines.some((line) => referencesWord(code[line - 1], symbol))) files.push(file);
   }
   return files;
 }
@@ -256,7 +320,7 @@ async function codeReferencingFiles(
  * isn't ignored, since a caller written today is a caller. `-F`/`-w` so a symbol carrying regex
  * punctuation (`$mount`) matches itself rather than a pattern, `-z` so a non-ASCII path comes back
  * unquoted under `core.quotePath`, `-I` so a binary blob is never read as a call site, `-n` so a
- * hit can be located in its file and judged against the comments open around it.
+ * hit can be located in its file and judged against the comments around it.
  *
  * The caller's signal goes to the child so a cancelled job kills the grep it is waiting on instead
  * of paying out its 30s timeout.
@@ -264,7 +328,7 @@ async function codeReferencingFiles(
 async function filesMentioning(
   repoPath: string,
   symbol: string,
-  commented: Map<string, Set<number> | undefined>,
+  masked: Map<string, string[] | undefined>,
   abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
   try {
@@ -273,7 +337,7 @@ async function filesMentioning(
       ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "--untracked", "-e", symbol],
       { timeout: GREP_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, signal: abort },
     );
-    return await codeReferencingFiles(repoPath, candidateHits(stdout), commented);
+    return await codeReferencingFiles(repoPath, symbol, candidateHits(stdout), masked);
   } catch (err) {
     // A cancelled job is not an unsearchable tree. Reporting the kill as `unavailable` would let the
     // scan finish and record the pass, holding up shutdown and the `--delta` baseline unwind — so
@@ -314,7 +378,7 @@ export async function filterDeadcodeSignals(
 
   const seen = new Map<string, string[]>();
   /** One read per file, however many symbols land in it. */
-  const commented = new Map<string, Set<number> | undefined>();
+  const masked = new Map<string, string[] | undefined>();
   const verdicts = new Map<ScanSignal, string>();
   let unavailable: string | undefined;
 
@@ -332,7 +396,7 @@ export async function filterDeadcodeSignals(
     let files = seen.get(symbol);
     if (!files) {
       if (seen.size >= SYMBOL_BUDGET) break;
-      const found = await filesMentioning(repoPath, symbol, commented, abort);
+      const found = await filesMentioning(repoPath, symbol, masked, abort);
       if (!Array.isArray(found)) {
         unavailable = found.unavailable;
         break;
