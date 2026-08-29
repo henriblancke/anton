@@ -186,6 +186,9 @@ describe("answerGateWait — resume closes the gate FIRST", () => {
       order.push("gate");
       return "ok";
     });
+    beadsPull.mockImplementation(async () => {
+      order.push("pull");
+    });
     loadAllIssues.mockImplementation(async () => {
       order.push("board");
       return board();
@@ -197,7 +200,9 @@ describe("answerGateWait — resume closes the gate FIRST", () => {
 
     const applied = await answerGateWait(project, "resume", view(), "g-1", "anton-e1");
 
-    expect(order).toEqual(["gate", "board", "resume"]);
+    // The pull sits BETWEEN the close and the read: pulling before the close can miss the very
+    // write being answered, and reading before the pull decides on a stale board.
+    expect(order).toEqual(["gate", "pull", "board", "resume"]);
     expect(applied).toEqual({ detail: "enqueued" });
     expect(gateResolve.mock.calls[0]![2]).toContain("resolved");
   });
