@@ -174,10 +174,13 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
       await fileGardenerProposals(scope, { findings, observedAtMs, arbitration: deps.arbitration });
 
       // A patrol that closed nothing and found nothing is the healthy board's outcome, and the one
-      // an operator most needs told apart from a patrol that never ran.
-      const closed = applied.closedEpics.length;
+      // an operator most needs told apart from a patrol that never ran. Read from the MERGED
+      // `actions`, not this attempt's `applied`: the safe verbs are idempotent, so a retry after a
+      // report-verb failure sweeps nothing and would report "nothing to do" for a patrol that closed
+      // work — the same misreport the report row exists to prevent.
+      const closed = actions.closedEpics.length;
       effect =
-        closed > 0 || applied.rowsRecomputed > 0 || findings.length > 0
+        closed > 0 || actions.rowsRecomputed > 0 || findings.length > 0
           ? { changed: true, note: `closed ${closed} epic(s), ${findings.length} finding(s)` }
           : { changed: false, note: "board clean" };
     } catch (e) {
