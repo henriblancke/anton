@@ -28,6 +28,7 @@ import {
   POLICY_CONTROL_NAMESPACES,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
+  POLICY_TYPES_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -149,6 +150,17 @@ export function PolicyDraftSection({
   const [policy, setPolicy] = useState<Policy>(stored ?? draft.policy);
   const [saving, setSaving] = useState(false);
 
+  // A first render off a FAILED board read seeds the controls from the empty-board fallback. React
+  // keeps client state across the `router.refresh()` that later delivers a real read, so without
+  // this the panel would arm the failure-derived policy while the banner and rationale beside it
+  // describe the recovered one. Nothing is lost by re-seeding: saving is disabled while the board is
+  // unreadable, and every criterion is authored against a vocabulary that read returned none of.
+  const [seededBlind, setSeededBlind] = useState(boardUnavailable);
+  if (seededBlind && !boardUnavailable) {
+    setSeededBlind(false);
+    setPolicy(stored ?? draft.policy);
+  }
+
   // Pointer for the mouse, keyboard for everyone else: a ranking that can only be expressed by
   // dragging is a ranking some operators cannot express at all.
   const sensors = useSensors(
@@ -162,13 +174,19 @@ export function PolicyDraftSection({
     armed ? undefined : draft.rationale.find((r) => r.criterion === criterion);
 
   const types = policy.types ?? [];
-  const toggleType = (type: string) =>
+  // A board can expose more issue types than the store will hold, and a 17th chip previews a policy
+  // the accept can only come back from as a 400 — the same ceiling the namespace controls keep.
+  const typesAtCeiling = types.length >= POLICY_TYPES_MAX;
+  const toggleType = (type: string) => {
+    const on = types.includes(type);
+    if (!on && typesAtCeiling) return;
     setPolicy((p) => {
-      const next = types.includes(type) ? types.filter((t) => t !== type) : [...types, type].sort();
+      const next = on ? types.filter((t) => t !== type) : [...types, type].sort();
       // Empty means "not asserted", never "match nothing" — an operator clearing every chip is
       // removing the constraint, not asking anton to consider no work at all.
       return { ...p, types: next.length ? next : undefined };
     });
+  };
 
   const criterionFor = (namespace: string): PolicyLabelCriterion | undefined =>
     (policy.labels ?? []).find((c) => c.namespace === namespace);
@@ -282,6 +300,13 @@ export function PolicyDraftSection({
   );
 
   const unconstrained = useMemo(() => isUnconstrained(policy), [policy]);
+
+  // The board's types, plus any the policy names that the board no longer uses — a type left over
+  // from a renamed convention has to stay visible to be removable.
+  const typeVocabulary = useMemo(
+    () => [...new Set([...issueTypes, ...(policy.types ?? [])])].sort(),
+    [issueTypes, policy.types],
+  );
 
   // Which namespaces discovery read as a SCALE. A HINT only: ranking is offered wherever the
   // operator selected values to order, because the scales anton recognises are anton's vocabulary
@@ -402,11 +427,12 @@ export function PolicyDraftSection({
         <div className="flex max-w-2xl flex-col gap-3">
           <Criterion label="Issue type" why={why("types")}>
             <div className="flex flex-wrap gap-1.5">
-              {[...new Set([...issueTypes, ...types])].sort().map((type) => (
+              {typeVocabulary.map((type) => (
                 <Chip
                   key={type}
                   name={type}
                   on={types.includes(type)}
+                  disabled={typesAtCeiling && !types.includes(type)}
                   onClick={() => toggleType(type)}
                 >
                   {type}
@@ -416,6 +442,12 @@ export function PolicyDraftSection({
             {types.length === 0 && (
               <p className="text-[11px] text-subtle">
                 No type constraint — anton will consider every kind of work on this board.
+              </p>
+            )}
+            {typesAtCeiling && typeVocabulary.length > types.length && (
+              <p className="text-[11px] text-subtle">
+                A policy admits at most {POLICY_TYPES_MAX} issue types — the store accepts no more.
+                Remove one to admit another.
               </p>
             )}
           </Criterion>

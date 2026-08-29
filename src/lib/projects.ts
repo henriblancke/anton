@@ -31,6 +31,8 @@ import {
   POLICY_BOUND_MAX,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
+  POLICY_PRIORITY_MAX,
+  POLICY_TYPES_MAX,
   type Policy,
 } from "./policy/types";
 import type { ScoreAlarm } from "./jobs/review-alarm";
@@ -571,11 +573,11 @@ export function resolveValueLabels(settings: ProjectSettings): string[] {
  */
 export const pickerPolicySchema = z
   .object({
-    types: z.array(z.string().trim().min(1).max(40)).min(1).max(16),
+    types: z.array(z.string().trim().min(1).max(40)).min(1).max(POLICY_TYPES_MAX),
     // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent, so `max` is
     // the floor and `min` the ceiling.
-    maxPriority: z.number().int().min(0).max(4),
-    minPriority: z.number().int().min(0).max(4),
+    maxPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
+    minPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
     // Parent hops above the bead — 0 is top-level. Bounded rather than open-ended because a board
     // nests epic → feature → ticket, and a depth beyond that is a typo, not a policy.
     maxParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),

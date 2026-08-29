@@ -25,6 +25,7 @@ import {
   POLICY_BOUND_MAX,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
+  POLICY_TYPES_MAX,
 } from "@/lib/policy/types";
 import type { Project } from "@/lib/types";
 
@@ -106,6 +107,12 @@ const FITTED: PolicyDraft = {
     },
     { criterion: "blockers", summary: "A target with an unmet blocker is never started.", citedBeadIds: [] },
   ],
+};
+
+/** The same fitted draft with no type criterion — what a recovered read may legitimately propose. */
+const FITTED_WITHOUT_TYPES: PolicyDraft = {
+  ...FITTED,
+  policy: { ...FITTED.policy, types: undefined },
 };
 
 const THIN: PolicyDraft = {
@@ -619,6 +626,94 @@ describe("what it refuses to arm", () => {
   it("offers no removal before anything is armed", () => {
     renderPanel();
     expect(screen.queryByRole("button", { name: "Remove policy" })).toBeNull();
+  });
+});
+
+/**
+ * The board read is the one input that can arrive WRONG and then be corrected. A failed read seeds
+ * the controls from an empty board; the refresh that recovers it re-renders this component with a
+ * real draft while React keeps the old state — so what the panel would arm and what its banner and
+ * rationale describe must not be allowed to drift apart.
+ */
+describe("a recovered board read re-seeds the controls", () => {
+  it("drops the failure-derived draft once the board answers again", () => {
+    const { rerender } = renderPanel({ boardUnavailable: true, draft: THIN, issueTypes: [] });
+    // Seeded blind: the fallback's own types, and none of the board's vocabulary to edit against.
+    expect(checked("bug")).toBe("true");
+    expect(screen.queryByRole("switch", { name: "feature" })).toBeNull();
+
+    rerender(
+      <PolicyDraftSection
+        project={project}
+        draft={FITTED_WITHOUT_TYPES}
+        issueTypes={["bug", "chore", "feature", "task"]}
+        labelVocabulary={VOCABULARY}
+      />,
+    );
+
+    // The recovered draft asserts no type criterion, so neither may the controls — holding `bug` and
+    // `chore` here would arm a policy the rationale beside it never proposed.
+    expect(checked("bug")).toBe("false");
+    expect(screen.getByRole("note").textContent).toContain("this project's own history");
+    expect((screen.getByRole("button", { name: "Use this policy" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("leaves an operator's edits alone when the board was readable all along", () => {
+    const { rerender } = renderPanel({ candidates: CANDIDATES });
+    fireEvent.click(screen.getByRole("switch", { name: "feature" }));
+    expect(checked("feature")).toBe("true");
+
+    // An ordinary refresh — a poll, another panel's save — must not throw away work in progress.
+    rerender(
+      <PolicyDraftSection
+        project={project}
+        draft={FITTED}
+        issueTypes={["bug", "chore", "feature", "task"]}
+        labelVocabulary={VOCABULARY}
+        candidates={CANDIDATES}
+      />,
+    );
+    expect(checked("feature")).toBe("true");
+  });
+});
+
+/**
+ * The store's ceiling on the native membership criterion, for the same reason as the discovered
+ * ones: a board with more issue types than a policy may name is a board where a 17th chip previews
+ * something the accept can only come back from as a 400.
+ */
+describe("the type criterion stays inside what the store accepts", () => {
+  const MANY_TYPES = Array.from({ length: POLICY_TYPES_MAX + 1 }, (_, i) => `t${i}`);
+  const full = MANY_TYPES.slice(0, POLICY_TYPES_MAX);
+  const spare = `t${POLICY_TYPES_MAX}`;
+
+  it("refuses the type past the ceiling instead of previewing a policy that cannot be saved", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: { types: full }, issueTypes: MANY_TYPES });
+    const chip = screen.getByRole("switch", { name: spare }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    fireEvent.click(chip);
+    expect(checked(spare)).toBe("false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).types).toHaveLength(POLICY_TYPES_MAX);
+  });
+
+  it("says why, and reopens the refused type once another is cleared", () => {
+    renderPanel({ stored: { types: full }, issueTypes: MANY_TYPES });
+    expect(screen.getByText(new RegExp(`at most ${POLICY_TYPES_MAX} issue types`))).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: "t0" }));
+    const chip = screen.getByRole("switch", { name: spare }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(false);
+    fireEvent.click(chip);
+    expect(checked(spare)).toBe("true");
+  });
+
+  it("leaves a board under the ceiling fully selectable", () => {
+    renderPanel();
+    expect((screen.getByRole("switch", { name: "feature" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/at most 16 issue types/)).toBeNull();
   });
 });
 

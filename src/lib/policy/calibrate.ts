@@ -28,6 +28,8 @@ import {
   POLICY_CONTROL_NAMESPACES,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
+  POLICY_PRIORITY_MAX,
+  POLICY_TYPES_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -57,15 +59,16 @@ export const FALLBACK_POLICY: Policy = {
 const MAX_CITED = 4;
 
 /**
- * The ceilings `pickerPolicySchema` enforces at the API boundary. A draft that crosses one is worse
- * than no draft: the operator clicks accept and gets a 400 they cannot resolve from the panel. So a
- * criterion that would cross a ceiling is OMITTED rather than clamped — clamping would narrow the
- * proposal until it refused the very approvals it was read from, which is the one thing this
- * derivation promises never to do.
+ * The ceilings `pickerPolicySchema` enforces at the API boundary, every one of them read from the
+ * shared constants the schema itself is built from — a limit copied here as a literal would drift the
+ * day the schema's moved. A draft that crosses one is worse than no draft: the operator clicks accept
+ * and gets a 400 they cannot resolve from the panel. So a criterion that would cross a ceiling is
+ * OMITTED rather than clamped — clamping would narrow the proposal until it refused the very
+ * approvals it was read from, which is the one thing this derivation promises never to do.
  */
 const SCHEMA_LIMITS = {
-  types: 16,
-  priority: 4,
+  types: POLICY_TYPES_MAX,
+  priority: POLICY_PRIORITY_MAX,
   criterionValues: POLICY_CRITERION_VALUES_MAX,
   labelCriteria: POLICY_LABEL_CRITERIA_MAX,
 } as const;

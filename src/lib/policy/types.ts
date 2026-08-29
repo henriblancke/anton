@@ -143,6 +143,19 @@ export const POLICY_BOUND_MAX = {
 } as const;
 
 /**
+ * How many issue types one policy may admit, held beside the bounds above for the same reason: the
+ * calibrator must not propose — and the editor must not offer — a `types` criterion the schema would
+ * reject, spending the operator's accept on a 400 the panel cannot explain.
+ */
+export const POLICY_TYPES_MAX = 16;
+
+/**
+ * The least urgent priority a policy may name as its floor — 4 is the bottom of bd's own 0-4 scale,
+ * so a floor above it is a priority no bead can carry.
+ */
+export const POLICY_PRIORITY_MAX = 4;
+
+/**
  * How many values one discovered-namespace criterion may carry, held beside the bounds above for the
  * same reason: the editor must refuse the 33rd chip rather than spend an operator's accept on a 400
  * the panel cannot explain. A namespace with more observed values than this is stated by selecting
