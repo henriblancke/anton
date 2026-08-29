@@ -15,6 +15,9 @@
  *    something landed; an empty PR is the false success the delivery gate already refuses.
  * 4. **A rollback that FAILS halts the run.** Carrying on past leftovers it could not remove would
  *    hand them to the next ticket's commit — the mis-attribution above, by another route.
+ * 5. **The tickets BEHIND a timed-out one are skipped, not dispatched** (anton-67xj). Their premise
+ *    was rolled back off the branch, so dispatching them buys a zero diff and a poisoned run; the
+ *    run narrows to the independent work and still opens its PR for it.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -277,6 +280,115 @@ process.exit(0);`),
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
       // Hand the read-only directory back, or the sandbox teardown inherits the same failure.
       execFileSync("chmod", ["-R", "u+rwX", join(sandbox, "worktrees")]);
+    }
+  });
+
+  it("skips the tickets that depend on a timed-out one, and still ships the independent work (anton-67xj)", async () => {
+    // The cascade this closes: a ticket that ran out of time had its work ROLLED BACK, so the ticket
+    // written against that work is dispatched onto a branch where the mechanism it needs does not
+    // exist. Its agent reports the absence, exits with a zero diff, and the no-delivery gate poisons
+    // the whole run — stranding the commits the INDEPENDENT tickets already made. The run must
+    // narrow to what can still work, not die.
+    const epicId = await beads.create(repo, {
+      title: "Cascade",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nCascade",
+    });
+    await beads.approve(repo, epicId);
+    const mk = (title: string) => createTicket(repo, { title, parent: epicId });
+    const stalls = mk("Ticket that cannot converge");
+    const independent = mk("Ticket that owes the stalled one nothing");
+    const dependent = mk("Ticket that builds on the stalled one");
+    // `dependent` is blocked by `stalls` — an edge INSIDE the run, so it is ordering, not a gate:
+    // both are dispatchable, and only the timeout can change that.
+    await beads.link(repo, dependent, stalls, "blocks");
+
+    const invLog = join(sandbox, "cascade-inv.jsonl");
+    // Stalls the ONE ticket by id rather than by position, so the case measures the dependency edge
+    // and not the order the board happened to hand the tickets back in.
+    const claude = writeBin(
+      binDir,
+      "claude-hang-cascade",
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    // A `gh` that keeps the PR body it was invoked with — the delivered set is what that body lists.
+    const bodyDump = join(sandbox, "cascade-pr-body.txt");
+    const bodyGh = writeBin(
+      binDir,
+      "gh-body-cascade",
+      `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
+console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+
+    await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    process.env.ANTON_GH_BIN = bodyGh;
+    try {
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
+
+      // The dependent was NEVER dispatched — no agent ran on a branch that could not carry it.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toContain(stalls);
+      expect(invoked).toContain(independent);
+      expect(invoked).not.toContain(dependent);
+      expect(
+        (await tdb.db.select().from(schema.sessions)).filter((s) => s.beadId === dependent),
+      ).toHaveLength(0);
+
+      // The run SURVIVED: the independent work shipped and reached a human as a PR.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
+      expect(run.status).toBe("done");
+      expect((await beads.show(repo, independent)).status).toBe("closed");
+      const target = await beads.show(repo, epicId);
+      expect(beads.getPrRef(target) ?? null).not.toBeNull();
+      expect(target.labels ?? []).toContain("stage:in-review");
+
+      // The board says WHY it did not run, naming the ticket it was waiting on — and hands it back
+      // to the queue (open, unassigned) rather than leaving it reserved by a run that skipped it.
+      const skipped = await beads.show(repo, dependent);
+      expect(skipped.status).toBe("open");
+      expect(skipped.assignee ?? null).toBeNull();
+      expect(JSON.stringify(skipped)).toContain(stalls);
+      expect(JSON.stringify(skipped)).toMatch(/not dispatched/i);
+      // The target carries the same sentence, since that is what the founder reads at the merge gate.
+      expect(JSON.stringify(await beads.show(repo, epicId))).toContain("never dispatched");
+      expect(run.error).toContain(dependent);
+
+      // The PR advertises only what it actually contains: not the rolled-back ticket, and not the
+      // one that never ran.
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain(independent);
+      expect(body).not.toContain(dependent);
+      expect(body).not.toContain(stalls);
+      const files = filesOnBranch(run.branch!);
+      expect(files).toContain("AGENT_WORK.md");
+      expect(files).not.toContain("HALF_WRITTEN.md");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      process.env.ANTON_GH_BIN = okGh;
+      await patchSettings({ ticketTimeoutMinutes: undefined });
     }
   });
 });

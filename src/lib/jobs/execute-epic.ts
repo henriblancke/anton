@@ -1248,6 +1248,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // and the held tail parks the run after the loop rather than riding into the PR unrun.
       const held = live.filter((t) => gated.has(t.id));
       const dispatchable = live.filter((t) => !gated.has(t.id));
+      // What a ticket that ran out of time takes down with it (anton-67xj). `skipCause` is the
+      // graph verdict — every ticket transitively behind a rolled-back one — recomputed as each
+      // timeout lands; `skipped` records the ones this loop ACTUALLY passed over, so a dependent
+      // whose commit was already on the branch still counts as delivered.
+      let skipCause = new Map<string, SkipCause>();
+      const skipped = new Map<string, SkipCause>();
       for (const ticket of dispatchable) {
         assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
         // A ticket marked done on the board — a closed epic child, or a standalone target moved to
@@ -1271,6 +1277,31 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // leave a stale implementing label (making a reopened bead derive as in-progress).
             await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
           }
+          continue;
+        }
+        // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The
+        // rollback took the mechanism it was written against off the branch, so its agent can only
+        // report the absence and exit with a zero diff — which the no-delivery gate then reads as a
+        // failed run, poisoning the tickets that DID deliver. Checked after the done-on-board skip
+        // above (work already on this branch is delivered, whatever timed out later) and before the
+        // re-gates below, which must not park a run over a ticket that is no longer going to run.
+        const skipping = skipCause.get(ticket.id);
+        if (skipping) {
+          skipped.set(ticket.id, skipping);
+          // Closed on another machine but its commit never reached this branch, and now it will
+          // never be regenerated here — reopen it, or the board advertises work no PR contains.
+          if (doneOnBoard && ticket.status === "closed") {
+            await safe(() => beads.reopen(repo, ticket.id));
+          }
+          // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
+          // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
+          await safe(() => beads.unassign(repo, ticket.id));
+          await safe(() => beads.note(repo, ticket.id, skipNote(skipping)));
+          console.warn(
+            `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
+              `${skipping.waitingOn}, whose work was rolled back when ${skipping.stopped} ran out ` +
+              `of time`,
+          );
           continue;
         }
         // Done on the board but the commit is missing from this branch (cross-machine resume): the
@@ -1331,6 +1362,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           if (!(e instanceof TicketTimeoutError)) throw e;
           timedOut.push({ id: e.ticketId, committed: e.committed });
           console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
+          // Only a ROLLED-BACK timeout cascades (anton-67xj). One stopped after its commit left its
+          // work on the branch — the deadline landed on the bookkeeping, not the code — so the
+          // tickets behind it still have the mechanism they were written against and still run.
+          if (!e.committed) {
+            skipCause = skippedDependents(
+              timedOut.filter((t) => !t.committed).map((t) => t.id),
+              live,
+              all,
+            );
+          }
         }
         // A finished ticket is progress — reported here so the runner's no-progress timeout
         // measures a wedge rather than a long-but-healthy feature (anton-t1mo).
@@ -1353,7 +1394,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           blockedTailReason(epicBeadId, {
             blockers: freshReadiness.blockers,
             held: held.map((t) => t.id),
-            ran: dispatchable.filter((t) => !rolledBack.has(t.id)).map((t) => t.id),
+            ran: dispatchable
+              .filter((t) => !rolledBack.has(t.id) && !skipped.has(t.id))
+              .map((t) => t.id),
           }),
         );
       }
@@ -1368,7 +1411,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     is dropped for the same reason (anton-t1mo) — leaving it in would put it in the PR body
       //     as delivered and hand the reviewer a diff it isn't in. One stopped AFTER its commit
       //     stays: its code is in the diff, so dropping it would hide work the reviewer must read.
-      const delivered = live.filter((t) => !rolledBack.has(t.id));
+      //     A ticket SKIPPED behind a rolled-back one (anton-67xj) never ran at all, so it is out
+      //     for the same reason — the PR body must not claim work that has no diff.
+      const delivered = live.filter((t) => !rolledBack.has(t.id) && !skipped.has(t.id));
 
       // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is
       // only correct while SOMETHING landed — carrying on here would run the review gate over an
@@ -1378,7 +1423,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       if (timedOut.length > 0 && delivered.length === 0) {
         throw new PoisonEpic(
           `every ticket under ${epicBeadId} ran out of time ` +
-            `(${timedOut.map((t) => t.id).join(", ")}) — nothing was delivered. Re-scope them into ` +
+            `(${timedOut.map((t) => t.id).join(", ")})` +
+            (skipped.size > 0
+              ? ` or was skipped behind one that did (${[...skipped.keys()].join(", ")})`
+              : "") +
+            ` — nothing was delivered. Re-scope them into ` +
             `smaller tickets, or raise this project's ticketTimeoutMinutes, then resume the run`,
         );
       }
@@ -1568,13 +1617,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         : null;
       if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
 
+      // The tickets the timeout took down with it (anton-67xj) — the founder reads the TARGET at the
+      // merge gate, so the PR's missing half is named there too, not only on each skipped bead.
+      const skippedNotice = skipped.size
+        ? `${skipped.size} ticket(s) were never dispatched because the work they depend on was ` +
+          `rolled back — ` +
+          `${[...skipped].map(([id, c]) => `${id} (waiting on ${c.waitingOn})`).join(", ")}. ` +
+          `Each is open, unassigned and noted; run them once the tickets they wait on land.`
+        : null;
+      if (skippedNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${skippedNotice}`));
+
       // 5. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
       //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
       //    error rather than failing a delivery that landed.
       await updateRun(db, clock, runId, {
         status: "done",
         endedAt: clock.now(),
-        error: [timeoutNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
+        error: [timeoutNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
       });
       await safe(() => removeWorktree(worktree));
     } catch (e) {
@@ -2779,23 +2838,95 @@ export function ticketSetDrift(selected: Bead[], confirmed: Bead[]): string | un
 }
 
 /**
- * Topologically order tickets so a ticket runs after the tickets it depends on (`blocks` edges
- * among the epic's own members). Falls back to input order on a cycle.
+ * The run's INTERNAL dependency graph — `blocks` edges among the run's own tickets only, as
+ * blocker id → the tickets that depend on it. Edges to beads outside the run are another gate's
+ * business (`runReadiness` holds those tickets before the loop ever sees them).
+ *
+ * Shared by the two questions a run asks of that graph: what order to dispatch in
+ * ({@link orderTickets}) and, once a ticket fails to deliver, what can no longer run
+ * ({@link skippedDependents}). One reader, so the skip can never disagree with the order.
  */
-export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
+function dependentEdges(tickets: Bead[], all: Bead[]): Map<string, string[]> {
   const ids = new Set(tickets.map((t) => t.id));
-  const indeg = new Map<string, number>();
-  const adj = new Map<string, string[]>();
-  for (const t of tickets) {
-    indeg.set(t.id, 0);
-    adj.set(t.id, []);
-  }
+  const adj = new Map<string, string[]>(tickets.map((t) => [t.id, []]));
   for (const e of beads.edgesOf(all)) {
     if (e.type !== "blocks") continue;
     // e.from depends on e.to → e.to must come first.
     if (!ids.has(e.from) || !ids.has(e.to)) continue;
     adj.get(e.to)!.push(e.from);
-    indeg.set(e.from, (indeg.get(e.from) ?? 0) + 1);
+  }
+  return adj;
+}
+
+/** Why a ticket was never dispatched: the ticket it directly waits on, and the stopped ticket at
+ * the head of that chain (the same id when the dependency is direct). */
+export interface SkipCause {
+  waitingOn: string;
+  stopped: string;
+}
+
+/**
+ * Every ticket that transitively depends on a STOPPED ticket, and why (anton-67xj).
+ *
+ * A ticket whose budget ran out has its partial work rolled back, so the mechanism the tickets
+ * behind it were written against is not on the branch. Dispatching them anyway hands each agent a
+ * premise that does not exist — the same false-success shape a cross-run blocker is held for — and
+ * the zero diff that follows poisons the whole run, stranding the work its INDEPENDENT tickets
+ * already committed. So they are skipped instead, and the run narrows rather than dies.
+ *
+ * Breadth-first from the stopped set over the run's own `blocks` edges, so a chain a→b→c skips both
+ * b and c; a ticket already recorded is never revisited, which also makes a cycle terminate.
+ */
+export function skippedDependents(
+  stopped: string[],
+  tickets: Bead[],
+  all: Bead[],
+): Map<string, SkipCause> {
+  const ids = new Set(tickets.map((t) => t.id));
+  const adj = dependentEdges(tickets, all);
+  const stoppedSet = new Set(stopped.filter((id) => ids.has(id)));
+  const cause = new Map<string, SkipCause>();
+  const queue = [...stoppedSet];
+  while (queue.length) {
+    const id = queue.shift()!;
+    const root = stoppedSet.has(id) ? id : cause.get(id)!.stopped;
+    for (const dependent of adj.get(id) ?? []) {
+      if (stoppedSet.has(dependent) || cause.has(dependent)) continue;
+      cause.set(dependent, { waitingOn: id, stopped: root });
+      queue.push(dependent);
+    }
+  }
+  return cause;
+}
+
+/**
+ * Why a skipped dependent did not run, for its own bead — the board has to say this, or the ticket
+ * reads as work anton simply forgot. Names the ticket it waits on AND the stopped one at the head
+ * of the chain, since for a transitive dependent those differ and only the second is actionable.
+ */
+export function skipNote(cause: SkipCause): string {
+  const chain =
+    cause.waitingOn === cause.stopped
+      ? `${cause.stopped}, which ran out of time and had its work rolled back`
+      : `${cause.waitingOn}, which was itself skipped behind ${cause.stopped} — that ticket ran ` +
+        `out of time and had its work rolled back`;
+  return (
+    `anton: not dispatched — this ticket depends on ${chain}, so the work it builds on is not on ` +
+    `the run's branch and an agent could not have finished it. Left open and unassigned; the run ` +
+    `delivered the rest of the feature. Re-scope ${cause.stopped} (or raise ticketTimeoutMinutes), ` +
+    `run it, then run this ticket.`
+  );
+}
+
+/**
+ * Topologically order tickets so a ticket runs after the tickets it depends on (`blocks` edges
+ * among the epic's own members). Falls back to input order on a cycle.
+ */
+export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
+  const adj = dependentEdges(tickets, all);
+  const indeg = new Map<string, number>(tickets.map((t) => [t.id, 0]));
+  for (const dependents of adj.values()) {
+    for (const d of dependents) indeg.set(d, (indeg.get(d) ?? 0) + 1);
   }
   const queue = tickets.filter((t) => (indeg.get(t.id) ?? 0) === 0).map((t) => t.id);
   const order: string[] = [];

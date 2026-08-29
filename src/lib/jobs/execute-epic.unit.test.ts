@@ -12,9 +12,12 @@ import {
   continuationPrompt,
   inactiveAgentTickets,
   mergeGatePlan,
+  orderTickets,
   reviewParkMessage,
   runReadiness,
   runTargetDrift,
+  skipNote,
+  skippedDependents,
   splitFormulaPhases,
   ticketBlockNote,
   ticketSetDrift,
@@ -318,6 +321,75 @@ describe("runTargetDrift — the target's own shape in that same window (anton-e
     const board = [bead("f-1", { issue_type: "feature" }), bead("t-1", { parent: "f-1" })];
     expect(runTargetDrift("f-1", board)).toBeUndefined();
     expect(runTargetDrift("t-1", board)).toBe("it now hangs under f-1, whose run owns it as a ticket");
+  });
+});
+
+describe("orderTickets / skippedDependents — the run's own dependency graph (anton-67xj)", () => {
+  const dep = (from: string, to: string): BeadDep => ({
+    issue_id: from,
+    depends_on_id: to,
+    type: "blocks",
+  });
+  /** `c` depends on `b`, `b` depends on `a`; `d` is independent of all three. */
+  const chain = (): Bead[] => [
+    ticket("a"),
+    { ...ticket("b"), dependencies: [dep("b", "a")] } as Bead,
+    { ...ticket("c"), dependencies: [dep("c", "b")] } as Bead,
+    ticket("d"),
+  ];
+  const ids = (beads: Bead[]) => beads.map((b) => b.id);
+
+  it("dispatches a chain blocker-first, whatever order the board hands it back in", () => {
+    const board = chain();
+    const shuffled = [board[2], board[3], board[1], board[0]];
+    expect(ids(orderTickets(shuffled, board))).toEqual(["d", "a", "b", "c"]);
+  });
+
+  it("skips the whole chain behind a timed-out ticket, transitively", () => {
+    const board = chain();
+    const cause = skippedDependents(["a"], board, board);
+    expect([...cause.keys()].sort()).toEqual(["b", "c"]);
+    // The direct dependent names `a`; the transitive one names the sibling it queued behind — and
+    // both name the ticket a human has to act on.
+    expect(cause.get("b")).toEqual({ waitingOn: "a", stopped: "a" });
+    expect(cause.get("c")).toEqual({ waitingOn: "b", stopped: "a" });
+  });
+
+  it("leaves a ticket with no edge to the timed-out one alone — the run narrows, it does not halt", () => {
+    const board = chain();
+    expect(skippedDependents(["a"], board, board).has("d")).toBe(false);
+    // …and a timeout further down the chain takes only what is actually behind it.
+    expect([...skippedDependents(["b"], board, board).keys()]).toEqual(["c"]);
+  });
+
+  it("ignores `blocks` edges that leave the run, and non-blocking edges inside it", () => {
+    const outside = [
+      ticket("a"),
+      { ...ticket("b"), dependencies: [dep("b", "x-9")] } as Bead,
+      { ...ticket("c"), dependencies: [{ ...dep("c", "a"), type: "related" }] } as Bead,
+    ];
+    expect(skippedDependents(["a"], outside, outside).size).toBe(0);
+  });
+
+  it("terminates on a cycle instead of walking it forever", () => {
+    const cyclic = [
+      { ...ticket("a"), dependencies: [dep("a", "c")] } as Bead,
+      { ...ticket("b"), dependencies: [dep("b", "a")] } as Bead,
+      { ...ticket("c"), dependencies: [dep("c", "b")] } as Bead,
+    ];
+    expect([...skippedDependents(["a"], cyclic, cyclic).keys()].sort()).toEqual(["b", "c"]);
+    // orderTickets can't topologically sort a cycle either — it hands back the input order.
+    expect(ids(orderTickets(cyclic, cyclic))).toEqual(["a", "b", "c"]);
+  });
+
+  it("says on the bead which ticket it waited on and which one a human must re-scope", () => {
+    const direct = skipNote({ waitingOn: "a", stopped: "a" });
+    expect(direct).toContain("depends on a, which ran out of time");
+    expect(direct).toMatch(/Re-scope a/);
+
+    const transitive = skipNote({ waitingOn: "b", stopped: "a" });
+    expect(transitive).toContain("depends on b, which was itself skipped behind a");
+    expect(transitive).toMatch(/Re-scope a/);
   });
 });
 
