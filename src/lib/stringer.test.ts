@@ -1666,6 +1666,76 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // Python's commonest import spelling is `from package import name`, and the parenthesized list
+    // repeats across modules exactly as a TS specifier list does. Read as executable code, every one
+    // of those windows reaches triage.
+    it("reads Python from-imports as declarations, single-line and parenthesized", async () => {
+      const repo = writeRepo({
+        "src/single.py": [
+          "from os.path import join",
+          "from typing import Optional",
+          "from . import sibling",
+          "",
+        ].join("\n"),
+        "src/grouped.py": [
+          "from package.module import (",
+          "    parse_bd_version,",
+          "    preflight_bd,",
+          "    resolve_bd_bin,",
+          ")",
+          "",
+        ].join("\n"),
+        "src/work.py": ["total = compute(rows)", "report(total)", "flush(report)", ""].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/single.py", 1]], 3),
+        clone([["src/grouped.py", 1]], 5),
+        clone([["src/work.py", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/work.py" }]);
+      expect(result.duplication.dropped.map((d) => d.path)).toEqual([
+        "src/single.py",
+        "src/grouped.py",
+      ]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+      expect(result.duplication.dropped[1].reason).toContain("5 import");
+    });
+
+    // A block comment can open AFTER code — `value: string, /* why`. Left unread, the prose below it
+    // counts as syntax: its unmatched `(` holds the parameter list open past the real `)` and files
+    // every call in the body as more parameter list.
+    it("tracks a block comment that opens after code so the body below it stays executable", async () => {
+      const repo = writeRepo({
+        "src/mid-comment.ts": [
+          "export function render(",
+          "  value: string, /* the label, as resolve(theme",
+          "   * may hand back a raw ( of its own",
+          "   */",
+          "  size: number,",
+          ") {",
+          "  emit(value, size);",
+          "  flush(value);",
+          "  report(size);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/mid-comment.ts", 7]], 3),
+        clone([["src/mid-comment.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The body survives; the parameter-and-prose window above it is still read as a declaration.
+      expect(result.signals).toMatchObject([{ FilePath: "src/mid-comment.ts", Line: 7 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/mid-comment.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("2 comment");
+    });
+
     // A file rewritten SHORTER leaves a remnant where the block used to start. Reading the few lines
     // that survive would let two truncated comment tails outvote the one location that still holds
     // the clone — so a window the tree cannot serve in full does not vote at all.

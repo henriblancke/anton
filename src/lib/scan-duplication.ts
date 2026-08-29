@@ -95,6 +95,17 @@ const IMPORT_START =
   /^import\b(?!\s*(?:\(\s*\S|\.))|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
 
 /**
+ * Python's other import spelling — `from package import name`, `from . import sibling`, and the
+ * parenthesized `from package import (` list. It binds names exactly as `import os` does, so a
+ * window of specifiers declares; without it the commonest Python import form reads as executable
+ * code and its repeated specifier lists keep reaching triage.
+ *
+ * `from` is not a statement keyword in TS/JS, and the assignment forms that could start a line
+ * there (`from = resolve(x)`) carry no bare `import` after a dotted name, so this stays Python's.
+ */
+const FROM_IMPORT_START = /^from\s+[.\w]+\s+import\b/;
+
+/**
  * `interface X {`, `type X =`, and the ERASED enum forms — `declare enum`, `const enum`. A plain
  * `enum` emits runtime code and its members can compute (`Draft = label("draft")`), so it is read as
  * code rather than counted as a declaration.
@@ -388,6 +399,36 @@ function afterBlockComment(line: string): string | undefined {
 }
 
 /**
+ * Where a block comment OPENS on this line and is never closed on it — `value: string, /* why`.
+ * Quoted strings, templates and `//` notes are stepped over, so a `/*` inside any of them opens
+ * nothing, and a comment that closes is skipped past so a later opener is still found. `-1` when
+ * the line leaves no comment running.
+ *
+ * Without it the prose below such a line is read as syntax: an unmatched `(` inside the comment
+ * holds `statement` in `signature` or `import` past the real declaration, and every executable
+ * window under it classifies as declarative and is dropped unread.
+ */
+function unclosedBlockComment(line: string): number {
+  let i = 0;
+  while (i < line.length) {
+    const char = line[i];
+    if (char === "'" || char === '"' || char === "`") {
+      i = afterQuoted(line, i);
+      continue;
+    }
+    if (char === "/" && line[i + 1] === "/") return -1;
+    if (char === "/" && line[i + 1] === "*") {
+      const close = line.indexOf("*/", i + 2);
+      if (close < 0) return i;
+      i = close + 2;
+      continue;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+/**
  * Classify every line of a file in one forward pass. Whole-file, not just the reported window,
  * because the state that decides what a line IS — inside a block comment, inside a wrapped import,
  * inside an interface body — is only knowable from the lines above it. A bare `readFile,` is an
@@ -399,6 +440,9 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   // Backticks delimit a multiline literal only where the language has one — JS/TS and Go. In a
   // `#`-comment language the same character is shell substitution or prose, so it opens nothing.
   const templates = !opts.hashComments;
+  // Same boundary for `/* … */`: in a `#`-comment language a `/*` is a path or a glob (`rm /tmp/*`),
+  // and reading it as a comment opener would swallow the rest of the file.
+  const blockComments = !opts.hashComments;
   let inTemplate = false;
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
@@ -474,6 +518,21 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       }
     }
 
+    // A block comment can open ANYWHERE on a line — `value: string, /* why` — not only at its
+    // start. What precedes the opener is still what the line does; everything after it is prose the
+    // lines below inherit, so the state has to be raised here or their delimiters count as syntax.
+    if (blockComments) {
+      const opener = unclosedBlockComment(line);
+      if (opener >= 0) {
+        inComment = true;
+        line = line.slice(0, opener).trim();
+        if (line === "") {
+          classes.push("comment");
+          continue;
+        }
+      }
+    }
+
     if (statement) {
       if (statement === "signature") {
         // The parameter list, however it is spelled — a destructured props object, its inline type
@@ -546,7 +605,12 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       continue;
     }
 
-    const kind = IMPORT_START.test(line) ? "import" : TYPE_START.test(line) ? "type" : "code";
+    const kind =
+      IMPORT_START.test(line) || FROM_IMPORT_START.test(line)
+        ? "import"
+        : TYPE_START.test(line)
+          ? "type"
+          : "code";
     classes.push(kind);
     if (kind === "code") continue;
     depth = braceDelta(line);
