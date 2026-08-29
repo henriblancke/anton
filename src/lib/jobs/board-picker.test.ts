@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
+import { activeDisarm } from "../autopilot-disarm";
 import type { Bead } from "../beads/types";
 import { PoisonError } from "./errors";
 import type { Clock } from "./queue";
@@ -136,6 +137,35 @@ describe("makeBoardPickerHandler", () => {
     ).rejects.toThrow();
 
     expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
+  });
+
+  it("disarms the project when its recent runs are a streak of failures, and still ranks", async () => {
+    // The brake and the ranking are different jobs: the pass starts nothing, so the plan stays
+    // useful reading while the latch is what the arming step refuses on (R4.4 / R1.5).
+    board.current = [bead("t1")];
+    for (const [i, id] of ["r1", "r2", "r3"].entries()) {
+      const at = new Date(NOW - (3 - i) * 3_600_000);
+      t.db
+        .insert(schema.runs)
+        .values({
+          id,
+          projectId: "p1",
+          epicBeadId: `anton-${id}`,
+          status: "failed",
+          error: "verify gate failed",
+          startedAt: at,
+          endedAt: at,
+          updatedAt: at,
+        })
+        .run();
+    }
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const disarm = await activeDisarm(t.db, "p1");
+    expect(disarm?.reason).toBe("consecutive-failures");
+    expect(disarm?.evidence).toHaveLength(3);
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
   });
 
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {

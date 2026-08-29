@@ -443,6 +443,23 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect((await get.json()).settings).toMatchObject({ reviewMinScore: 0, reviewLowScoreRounds: 3 });
   });
 
+  it("PATCH persists the consecutive-failure streak, including 0 as the off switch (anton-rgso)", async () => {
+    const res = await PATCH(patchReq({ autopilotFailureStreak: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().autopilotFailureStreak).toBe(5);
+
+    // 0 is a VALUE here, not a clear: it is how the operator turns the breaker off.
+    const off = await PATCH(patchReq({ autopilotFailureStreak: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotFailureStreak).toBe(0);
+
+    for (const bad of [11, -1, 2.5, "three"]) {
+      const rejected = await PATCH(patchReq({ autopilotFailureStreak: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotFailureStreak/);
+    }
+    expect(persisted().autopilotFailureStreak).toBe(0);
+  });
+
   it("PATCH rejects out-of-range score-alarm thresholds", async () => {
     for (const bad of [11, -1, 4.5, "low"]) {
       const res = await PATCH(patchReq({ reviewMinScore: bad }), ctx("tmp"));

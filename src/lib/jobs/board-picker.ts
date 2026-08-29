@@ -20,9 +20,11 @@
  * signal "decided, nothing to start", not "never ran".
  */
 import { loadAllIssues } from "../beads/issues";
+import { describeFailureStreak } from "../autopilot-failure-streak";
 import { saveBoardPickerPlan } from "../board-picker-plan";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
+import { checkFailureStreak } from "./picker-failure-breaker";
 import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./picker-decision";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -56,6 +58,17 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // silently got a gate-less board would read every dangling gate edge as an open blocker and
     // record a plan that excludes half the board as `blocked`. A rejection retries the pass instead.
     const board = await loadAllIssues(project.repoPath, { strictGates: true });
+
+    // The brake before the ranking (R4.4). A project whose last N runs all stopped without
+    // delivering is disarmed here, on the same board read the plan is computed from — the plan is
+    // still recorded, because it is a ranking and not a start, and the latch is what the arming
+    // step (R1.5) refuses on.
+    const breaker = await checkFailureStreak(db, clock, { projectId, board });
+    if (breaker?.latched) {
+      console.warn(
+        `[board-picker] ${projectId}: disarmed — ${describeFailureStreak(breaker.streak)}`,
+      );
+    }
 
     const decision = decideBoardPickerPlan({
       board,

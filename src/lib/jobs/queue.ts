@@ -305,6 +305,45 @@ export async function resumableExecuteEpicId(
 }
 
 /**
+ * When an operator CANCELLED each of a project's execute-epic jobs, keyed by epic (anton-rgso).
+ *
+ * `cancelled` is the one terminal status that is a DECISION rather than an outcome — a person saying
+ * stop — so the consecutive-failure breaker has to be able to subtract it from what it counts. Runs
+ * carry no job id, so the epic plus the instant is the join the breaker matches a run against.
+ *
+ * Every cancel is returned rather than only the latest: an epic an operator stopped twice would
+ * otherwise leave the earlier run counted as a failure by the very reading that exists to excuse it.
+ * Rows whose payload names no epic are dropped — nothing can be matched to them.
+ */
+export async function cancelledExecuteEpicJobs(
+  db: AntonDb,
+  projectId: string,
+): Promise<Map<string, number[]>> {
+  const rows = await db
+    .select({
+      epicBeadId: sql<string | null>`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`,
+      updatedAt: schema.jobs.updatedAt,
+    })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "execute-epic"),
+        eq(schema.jobs.projectId, projectId),
+        eq(schema.jobs.status, "cancelled"),
+      ),
+    );
+  const byEpic = new Map<string, number[]>();
+  for (const row of rows) {
+    const at = toMs(row.updatedAt);
+    if (!row.epicBeadId || at === undefined) continue;
+    const seen = byEpic.get(row.epicBeadId);
+    if (seen) seen.push(at);
+    else byEpic.set(row.epicBeadId, [at]);
+  }
+  return byEpic;
+}
+
+/**
  * The most recent execute-epic job for this project + epic, whatever its status (anton-wvcy). The
  * unstick pass reads it to learn when a usage-limit park's window reopens: the runner records that
  * on the JOB (`runAt` + a `usage-limit: resumes at <ISO>` lastError), never on the run row, so the

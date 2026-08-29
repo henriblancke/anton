@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { discoverAgents } from "@/lib/agents-discovery";
 import {
+  AUTOPILOT_FAILURE_STREAK_RANGE,
   CONCURRENCY_RANGE,
   DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
   DEFAULT_REVIEW_MAX_ROUNDS,
@@ -66,7 +67,8 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
       | "maxRetries"
       | "reviewMaxRounds"
       | "reviewMinScore"
-      | "reviewLowScoreRounds";
+      | "reviewLowScoreRounds"
+      | "autopilotFailureStreak";
     range: { min: number; max: number };
   }[] = [
     { key: "concurrency", range: CONCURRENCY_RANGE },
@@ -78,6 +80,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     // off (anton-i98r). `null` / "" still clears back to the default threshold.
     { key: "reviewMinScore", range: REVIEW_MIN_SCORE_RANGE },
     { key: "reviewLowScoreRounds", range: REVIEW_LOW_SCORE_ROUNDS_RANGE },
+    // 0 is a real value here too: it is how the operator turns the consecutive-failure breaker off
+    // (anton-rgso). `null` / "" clears back to the default streak length.
+    { key: "autopilotFailureStreak", range: AUTOPILOT_FAILURE_STREAK_RANGE },
   ];
   for (const { key, range } of numericFields) {
     if (!(key in body)) continue;

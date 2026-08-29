@@ -80,6 +80,16 @@ export async function listRunsPaged(
   return rows.map(toSummary);
 }
 
+function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
+  return {
+    ...toSummary(row),
+    leaseExpiresAt: toEpoch(row.leaseExpiresAt),
+    error: row.error ?? undefined,
+    formula: row.formula ?? undefined,
+    formulaVariant: row.formulaVariant ?? undefined,
+  };
+}
+
 export async function getRunDetail(
   projectId: string,
   runId: string,
@@ -90,14 +100,7 @@ export async function getRunDetail(
     .where(and(eq(schema.runs.projectId, projectId), eq(schema.runs.id, runId)))
     .limit(1);
   const row = rows[0];
-  if (!row) return undefined;
-  return {
-    ...toSummary(row),
-    leaseExpiresAt: toEpoch(row.leaseExpiresAt),
-    error: row.error ?? undefined,
-    formula: row.formula ?? undefined,
-    formulaVariant: row.formulaVariant ?? undefined,
-  };
+  return row ? toDetail(row) : undefined;
 }
 
 // ── Write path (anton-dzh.5): db-injectable so the runner/tests share one connection ──
@@ -248,13 +251,34 @@ export async function listRecentRuns(
   projectId: string,
   limit: number,
 ): Promise<RunSummary[]> {
-  const rows = await db
+  return (await recentRunRows(db, projectId, limit)).map(toSummary);
+}
+
+function recentRunRows(
+  db: AntonDb,
+  projectId: string,
+  limit: number,
+): Promise<(typeof schema.runs.$inferSelect)[]> {
+  return db
     .select()
     .from(schema.runs)
     .where(eq(schema.runs.projectId, projectId))
     .orderBy(desc(schema.runs.updatedAt))
     .limit(limit);
-  return rows.map(toSummary);
+}
+
+/**
+ * {@link listRecentRuns} with each run's ERROR attached (anton-rgso). The consecutive-failure
+ * breaker compares failures BY their message — that is how it tells one broken environment from
+ * several hard tickets — so it needs the column the list view has no use for. db-injectable and
+ * read-only, like its sibling.
+ */
+export async function listRecentRunOutcomes(
+  db: AntonDb,
+  projectId: string,
+  limit: number,
+): Promise<RunDetail[]> {
+  return (await recentRunRows(db, projectId, limit)).map(toDetail);
 }
 
 /**
