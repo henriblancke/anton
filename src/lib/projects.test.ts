@@ -19,6 +19,7 @@ let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudget
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
 let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_BUDGET_POLICY;
 let updateProjectSettings: typeof import("./projects").updateProjectSettings;
+let getProjectSettingsBySlug: typeof import("./projects").getProjectSettingsBySlug;
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
 let resolveValueLabels: typeof import("./projects").resolveValueLabels;
 let valueLabelsSchema: typeof import("./projects").valueLabelsSchema;
@@ -50,6 +51,7 @@ beforeAll(async () => {
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
   DEFAULT_PROJECT_BUDGET_POLICY = mod.DEFAULT_PROJECT_BUDGET_POLICY;
   updateProjectSettings = mod.updateProjectSettings;
+  getProjectSettingsBySlug = mod.getProjectSettingsBySlug;
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
   resolveValueLabels = mod.resolveValueLabels;
   valueLabelsSchema = mod.valueLabelsSchema;
@@ -389,6 +391,29 @@ describe("updateProjectSettings runHealth deep-merge", () => {
     await updateProjectSettings(created.slug, { runHealth: { stalePrHours: 48 } });
     const settings = await updateProjectSettings(created.slug, { runHealth: undefined });
     expect(settings.runHealth).toBeUndefined();
+  });
+});
+
+/**
+ * Every settings writer rewrites the WHOLE settingsJson blob, and the settings page has several of
+ * them in flight independently — the global Save, the automation table, the work-policy panel. A
+ * read-modify-write that is not atomic loses one of them silently: both requests report success and
+ * the later write erases the earlier one's keys.
+ */
+describe("updateProjectSettings is atomic against a concurrent write", () => {
+  it("keeps both patches when two saves are in flight at once", async () => {
+    const created = await addProject({
+      name: "Concurrent Save",
+      repoPath: makeRepoDir("concurrent-save"),
+    });
+    // Started together, deliberately: this is the settings page with one PATCH per section.
+    await Promise.all([
+      updateProjectSettings(created.slug, { model: "claude-sonnet-5" }),
+      updateProjectSettings(created.slug, { pickerPolicy: { types: ["bug"] } }),
+    ]);
+    const settings = await getProjectSettingsBySlug(created.slug);
+    expect(settings.model).toBe("claude-sonnet-5");
+    expect(settings.pickerPolicy).toEqual({ types: ["bug"] });
   });
 });
 

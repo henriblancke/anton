@@ -27,7 +27,12 @@ import {
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
-import { POLICY_BOUND_MAX, POLICY_CRITERION_VALUES_MAX, type Policy } from "./policy/types";
+import {
+  POLICY_BOUND_MAX,
+  POLICY_CRITERION_VALUES_MAX,
+  POLICY_LABEL_CRITERIA_MAX,
+  type Policy,
+} from "./policy/types";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -601,7 +606,7 @@ export const pickerPolicySchema = z
             message: "a comparison needs a ranking that contains its bound",
           }),
       )
-      .max(16)
+      .max(POLICY_LABEL_CRITERIA_MAX)
       .refine((cs) => new Set(cs.map((c) => c.namespace)).size === cs.length, {
         message: "each namespace may be constrained once",
       }),
@@ -712,17 +717,23 @@ export function resolveRunHealthThresholds(
   return { ...DEFAULT_RUN_HEALTH_THRESHOLDS, ...(settings.runHealth ?? {}) };
 }
 
+/** A stored settings blob, or `{}` for a missing row and for one no longer parseable. */
+function parseSettings(settingsJson: string | undefined): ProjectSettings {
+  if (settingsJson === undefined) return {};
+  try {
+    return JSON.parse(settingsJson) as ProjectSettings;
+  } catch {
+    return {};
+  }
+}
+
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db
     .select({ settingsJson: schema.projects.settingsJson })
     .from(schema.projects)
     .where(eq(schema.projects.id, id))
     .limit(1);
-  try {
-    return rows[0] ? (JSON.parse(rows[0].settingsJson) as ProjectSettings) : {};
-  } catch {
-    return {};
-  }
+  return parseSettings(rows[0]?.settingsJson);
 }
 
 /** Read this project's settings via the shared anton.db (UI/API read path). */
@@ -771,15 +782,11 @@ export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
   return policies;
 }
 
-/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
-export async function updateProjectSettings(
-  slug: string,
+/** Apply a patch to a settings blob, key by key. Pure — the store's read/write is the caller's. */
+function mergeSettings(
+  current: ProjectSettings,
   patch: Partial<ProjectSettings>,
-): Promise<ProjectSettings> {
-  const db = getDb();
-  const p = await getProjectBySlug(slug);
-  if (!p) throw new Error(`Project not found: ${slug}`);
-  const current = await getProjectSettings(db, p.id);
+): ProjectSettings {
   // Drop keys explicitly set to undefined so "Default" clears rather than persists.
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
@@ -800,11 +807,46 @@ export async function updateProjectSettings(
     }
     else (next as Record<string, unknown>)[k] = v;
   }
-  await db
-    .update(schema.projects)
-    .set({ settingsJson: JSON.stringify(next) })
-    .where(eq(schema.projects.id, p.id));
   return next;
+}
+
+/**
+ * Merge a settings patch into the project's settingsJson. Returns the merged settings.
+ *
+ * The read, the merge and the write happen inside ONE immediate transaction, synchronously, because
+ * every writer here rewrites the WHOLE blob and the settings page has several of them: the global
+ * Save, the automation table (which saves on change) and the work-policy panel each PATCH on their
+ * own. Two in flight at once would otherwise both read the pre-save row, and the later write would
+ * silently erase the earlier one's keys while both requests reported success.
+ */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  const db = getDb();
+  const p = await getProjectBySlug(slug);
+  if (!p) throw new Error(`Project not found: ${slug}`);
+  return db.transaction(
+    (tx) => {
+      const row = tx
+        .select({ settingsJson: schema.projects.settingsJson })
+        .from(schema.projects)
+        .where(eq(schema.projects.id, p.id))
+        .limit(1)
+        .get();
+      const next = mergeSettings(parseSettings(row?.settingsJson), patch);
+      tx
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify(next) })
+        .where(eq(schema.projects.id, p.id))
+        .run();
+      return next;
+    },
+    // The write lock is taken up front: a deferred transaction would read first and only then try to
+    // upgrade, which is the shape that loses to SQLITE_BUSY under exactly the concurrency this
+    // guards against.
+    { behavior: "immediate" },
+  );
 }
 
 /** What the shared beads config path reports back — the one seam the log helpers below read. */

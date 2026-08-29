@@ -27,6 +27,7 @@ import {
   POLICY_BOUND_MAX,
   POLICY_CONTROL_NAMESPACES,
   POLICY_CRITERION_VALUES_MAX,
+  POLICY_LABEL_CRITERIA_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -180,9 +181,20 @@ export function PolicyDraftSection({
       return { ...p, labels: labels.length ? labels : undefined };
     });
 
+  /**
+   * The policy already constrains as many namespaces as the store will hold, so the next one is a
+   * criterion the accept can only come back from as a 400. Boards that expose more `ns:` groups than
+   * this are why the chips of an unconstrained namespace go dead rather than staying clickable.
+   */
+  const criteriaAtCeiling = (policy.labels ?? []).length >= POLICY_LABEL_CRITERIA_MAX;
+
   const toggleValue = (namespace: string, value: string) => {
     const current = criterionFor(namespace);
     const on = current?.values.includes(value) ?? false;
+    // Same reasoning one level up: the value that would OPEN a criterion past the namespace ceiling
+    // is refused, while every namespace the policy already names stays fully editable — including
+    // clearing one, which is how the operator makes room for another.
+    if (!on && !current && criteriaAtCeiling) return;
     // A namespace with more observed values than the store will hold is still authorable — the
     // operator selects the ones that matter — but the chip past the ceiling is refused here rather
     // than previewed as a valid policy the accept can only come back from as a 400.
@@ -495,6 +507,7 @@ export function PolicyDraftSection({
               key={group.namespace}
               group={group}
               criterion={criterionFor(group.namespace)}
+              locked={criteriaAtCeiling && !criterionFor(group.namespace)}
               scaleLike={scaleLike.has(group.namespace)}
               why={why(`labels:${group.namespace}`)}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
@@ -693,6 +706,7 @@ function MatchPanel({
 function NamespaceCriterion({
   group,
   criterion,
+  locked,
   scaleLike,
   why,
   onToggleValue,
@@ -702,6 +716,11 @@ function NamespaceCriterion({
 }: {
   group: LabelNamespace;
   criterion?: PolicyLabelCriterion;
+  /**
+   * The policy already names as many namespaces as the store holds, and this one is not among them —
+   * so it is shown (hiding it would hide why the board's other namespaces went quiet) and refused.
+   */
+  locked: boolean;
   /** Discovery read these values as a scale — a hint beside the control, never a gate on it. */
   scaleLike: boolean;
   why?: PolicyRationale;
@@ -732,7 +751,7 @@ function NamespaceCriterion({
             key={value}
             name={`${group.namespace}:${value}`}
             on={selected.includes(value)}
-            disabled={atCeiling && !selected.includes(value)}
+            disabled={(atCeiling || locked) && !selected.includes(value)}
             onClick={() => onToggleValue(value)}
           >
             {value}
@@ -740,8 +759,15 @@ function NamespaceCriterion({
         ))}
       </div>
 
-      {selected.length === 0 && (
+      {selected.length === 0 && !locked && (
         <p className="text-[11px] text-subtle">Not constrained — any value, or none, matches.</p>
+      )}
+
+      {locked && (
+        <p className="text-[11px] text-subtle">
+          A policy constrains at most {POLICY_LABEL_CRITERIA_MAX} namespaces — the store accepts no
+          more. Clear another namespace to constrain this one.
+        </p>
       )}
 
       {atCeiling && values.length > selected.length && (

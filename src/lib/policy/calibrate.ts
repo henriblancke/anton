@@ -27,6 +27,7 @@ import type { Bead } from "../beads/types";
 import {
   POLICY_CONTROL_NAMESPACES,
   POLICY_CRITERION_VALUES_MAX,
+  POLICY_LABEL_CRITERIA_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -66,7 +67,7 @@ const SCHEMA_LIMITS = {
   types: 16,
   priority: 4,
   criterionValues: POLICY_CRITERION_VALUES_MAX,
-  labelCriteria: 16,
+  labelCriteria: POLICY_LABEL_CRITERIA_MAX,
 } as const;
 
 export type { PolicyCriterionKey };

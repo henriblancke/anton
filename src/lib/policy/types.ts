@@ -151,6 +151,15 @@ export const POLICY_BOUND_MAX = {
 export const POLICY_CRITERION_VALUES_MAX = 32;
 
 /**
+ * How many discovered namespaces one policy may constrain at once, for the same reason as the
+ * ceiling above: a board can expose more `ns:` groups than the store will hold, and an editor that
+ * keeps offering criteria past this point spends the operator's accept on a 400 no control on the
+ * panel can undo. A policy naming this many namespaces is already narrower than anything a board
+ * routinely needs.
+ */
+export const POLICY_LABEL_CRITERIA_MAX = 16;
+
+/**
  * anton's OWN bookkeeping namespaces — where anton has already put a bead, not what an operator
  * judged worth starting. Excluded everywhere a criterion is authored (the calibrated draft and the
  * editor alike): a policy over `stage:` or `review-score:` is the machine quoting itself back, and

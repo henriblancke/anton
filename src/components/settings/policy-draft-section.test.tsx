@@ -21,7 +21,11 @@ import {
   type PolicyCandidate,
   type PolicyDraft,
 } from "@/components/settings/policy-draft-section";
-import { POLICY_BOUND_MAX, POLICY_CRITERION_VALUES_MAX } from "@/lib/policy/types";
+import {
+  POLICY_BOUND_MAX,
+  POLICY_CRITERION_VALUES_MAX,
+  POLICY_LABEL_CRITERIA_MAX,
+} from "@/lib/policy/types";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -896,6 +900,65 @@ describe("a criterion stays inside what the store accepts", () => {
     renderPanel({ stored: { labels: [{ namespace: "severity", values: ["critical"] }] } });
     expect((screen.getByRole("switch", { name: "severity:minor" }) as HTMLButtonElement).disabled).toBe(false);
     expect(screen.queryByText(/at most 32 values/)).toBeNull();
+  });
+});
+
+/**
+ * The store's other ceiling: how many namespaces one policy constrains. A board with more
+ * authorable `ns:` groups than that is a board where the editor offers a criterion the accept can
+ * only come back from as a 400 — so the chips go dead at the ceiling and say why.
+ */
+describe("a policy stays inside the namespace count the store accepts", () => {
+  /** One namespace more than a policy may constrain, each with one value. */
+  const MANY = Array.from({ length: POLICY_LABEL_CRITERIA_MAX + 1 }, (_, i) => ({
+    namespace: `ns${i}`,
+    labels: [{ label: `ns${i}:v`, count: 1 }],
+  }));
+  /** A policy already at the ceiling, leaving the last namespace of MANY unconstrained. */
+  const full = {
+    labels: Array.from({ length: POLICY_LABEL_CRITERIA_MAX }, (_, i) => ({
+      namespace: `ns${i}`,
+      values: ["v"],
+    })),
+  };
+  const spare = `ns${POLICY_LABEL_CRITERIA_MAX}:v`;
+
+  it("refuses the criterion past the ceiling instead of previewing a policy that cannot be saved", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: full, labelVocabulary: MANY });
+    const chip = screen.getByRole("switch", { name: spare }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    fireEvent.click(chip);
+    expect(checked(spare)).toBe("false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels).toHaveLength(POLICY_LABEL_CRITERIA_MAX);
+  });
+
+  it("says why, and keeps the namespaces already constrained editable", () => {
+    renderPanel({ stored: full, labelVocabulary: MANY });
+    expect(
+      screen.getByText(new RegExp(`at most ${POLICY_LABEL_CRITERIA_MAX} namespaces`)),
+    ).toBeTruthy();
+    // Clearing one is how the operator makes room, so nothing already named goes dead.
+    expect((screen.getByRole("switch", { name: "ns0:v" }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+  });
+
+  it("reopens the refused namespace once another is cleared", () => {
+    renderPanel({ stored: full, labelVocabulary: MANY });
+    fireEvent.click(screen.getByRole("switch", { name: "ns0:v" }));
+    const chip = screen.getByRole("switch", { name: spare }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(false);
+    fireEvent.click(chip);
+    expect(checked(spare)).toBe("true");
+  });
+
+  it("leaves a board under the ceiling fully authorable", () => {
+    renderPanel({ stored: { labels: [{ namespace: "severity", values: ["critical"] }] } });
+    expect(screen.queryByText(/at most 16 namespaces/)).toBeNull();
   });
 });
 
