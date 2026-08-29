@@ -12,8 +12,13 @@ import { HealthPill } from "@/components/board/health-pill";
 import type { HygieneFinding, HygieneReport, ReviewTrajectory, ScanHealth, ScanHealthPoint } from "@/lib/types";
 
 vi.mock("@/components/health/scan-trend", () => ({
-  ScanTrend: ({ points }: { points: ScanHealthPoint[] }) => (
-    <span data-testid="scan-trend" data-points={points.length} />
+  ScanTrend: ({ points, className }: { points: ScanHealthPoint[]; className?: string }) => (
+    <span
+      data-testid="scan-trend"
+      data-points={points.length}
+      data-ids={points.map((p) => p.id).join(",")}
+      className={className}
+    />
   ),
 }));
 
@@ -147,6 +152,34 @@ describe("HealthPill", () => {
     );
     expect(container.innerHTML).not.toBe("");
     expect(screen.getByText("0")).toBeTruthy();
+  });
+
+  it("caps the sparkline at the last six scans, and keeps the newest ones", () => {
+    // The board keeps a 14-scan window; `ScanTrend` floors each column at 6px and cannot shrink
+    // past it, so handing the pill the whole window paints ~136px of columns out through its right
+    // border. The cap is what keeps the chart inside the box — not a cosmetic trim.
+    const now = Math.floor(Date.now() / 1000);
+    const points = Array.from({ length: 14 }, (_, i) => point(`s${i}`, now - (14 - i) * 86400));
+    render(
+      <HealthPill
+        slug="anton"
+        hygiene={undefined}
+        trajectory={undefined}
+        scanHealth={scanHealth({ points })}
+      />,
+    );
+    const trend = screen.getByTestId("scan-trend");
+    expect(trend.getAttribute("data-points")).toBe("6");
+    expect(trend.getAttribute("data-ids")).toBe("s8,s9,s10,s11,s12,s13");
+  });
+
+  it("passes a box wide enough for the capped series, so the columns can't overflow it", () => {
+    // 6 columns * 6px (`min-w-1.5`) + 5 gaps * 4px (`gap-1`) = 56px = `w-14`. A narrower box is the
+    // bug this replaces, so the width and the cap have to stay in step.
+    render(
+      <HealthPill slug="anton" hygiene={undefined} trajectory={undefined} scanHealth={scanHealth()} />,
+    );
+    expect(screen.getByTestId("scan-trend").getAttribute("class")).toBe("h-4 w-14 shrink-0");
   });
 
   it("names only what actually exists in the title", () => {
