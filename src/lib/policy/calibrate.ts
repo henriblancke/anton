@@ -25,6 +25,8 @@
 import { LABELS } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import {
+  POLICY_CONTROL_NAMESPACES,
+  POLICY_CRITERION_VALUES_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -50,13 +52,6 @@ export const FALLBACK_POLICY: Policy = {
   requireUnblocked: true,
 };
 
-/**
- * anton's own bookkeeping namespaces, excluded from the discovered tier. `stage:` and `run-lease:`
- * describe where anton has already put a bead, not what an operator judged worth starting, and a
- * criterion over them would be the machine quoting itself back.
- */
-const CONTROL_NAMESPACES = new Set(["stage", "run-lease", "review-score", "source"]);
-
 /** How many approvals one rationale names. Enough to make the claim checkable, short enough to read. */
 const MAX_CITED = 4;
 
@@ -67,7 +62,12 @@ const MAX_CITED = 4;
  * proposal until it refused the very approvals it was read from, which is the one thing this
  * derivation promises never to do.
  */
-const SCHEMA_LIMITS = { types: 16, priority: 4, criterionValues: 32, labelCriteria: 16 } as const;
+const SCHEMA_LIMITS = {
+  types: 16,
+  priority: 4,
+  criterionValues: POLICY_CRITERION_VALUES_MAX,
+  labelCriteria: 16,
+} as const;
 
 export type { PolicyCriterionKey };
 
@@ -216,7 +216,7 @@ function labelCriteria(approvals: readonly Bead[], board: readonly Bead[]): Poli
   for (const bead of approvals) {
     for (const label of bead.labels ?? []) {
       const ns = namespaceOf(label);
-      if (ns && !CONTROL_NAMESPACES.has(ns) && valueOf(label)) namespaces.add(ns);
+      if (ns && !POLICY_CONTROL_NAMESPACES.has(ns) && valueOf(label)) namespaces.add(ns);
     }
   }
 

@@ -25,6 +25,8 @@ import { GripVerticalIcon } from "lucide-react";
 import type { Project } from "@/lib/types";
 import {
   POLICY_BOUND_MAX,
+  POLICY_CONTROL_NAMESPACES,
+  POLICY_CRITERION_VALUES_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -114,11 +116,16 @@ export function PolicyDraftSection({
   stored?: Policy;
   /** The issue types this board actually uses — anton ships no vocabulary, so it reads one. */
   issueTypes: string[];
-  /** The board's `ns:value` labels — the namespaces this editor's criteria are generated from. */
+  /**
+   * The board's `ns:value` labels — the namespaces this editor's criteria are generated from, less
+   * anton's own bookkeeping ones ({@link POLICY_CONTROL_NAMESPACES}), which describe anton's runs
+   * rather than the repo's judgement.
+   */
   labelVocabulary: LabelNamespace[];
   /**
-   * The namespaces whose values read as a SCALE (discovery's `rankingCandidate` hint) — the only
-   * ones offered a ranking control, since "rank these" means nothing on a `team:` or `component:`.
+   * The namespaces whose values read as a SCALE (discovery's `rankingCandidate` hint). A HINT beside
+   * the ranking control, never the gate on it: the scales discovery recognises are anton's own words,
+   * and a repo whose `severity:` runs showstopper → nice-to-have must still be rankable by hand.
    */
   rankingCandidates?: string[];
   /**
@@ -176,6 +183,10 @@ export function PolicyDraftSection({
   const toggleValue = (namespace: string, value: string) => {
     const current = criterionFor(namespace);
     const on = current?.values.includes(value) ?? false;
+    // A namespace with more observed values than the store will hold is still authorable — the
+    // operator selects the ones that matter — but the chip past the ceiling is refused here rather
+    // than previewed as a valid policy the accept can only come back from as a 400.
+    if (!on && (current?.values.length ?? 0) >= POLICY_CRITERION_VALUES_MAX) return;
     const values = on
       ? (current?.values ?? []).filter((v) => v !== value)
       : // A ranked namespace appends: sorting it would silently discard the order the operator
@@ -260,19 +271,26 @@ export function PolicyDraftSection({
 
   const unconstrained = useMemo(() => isUnconstrained(policy), [policy]);
 
-  // Which namespaces get a ranking control: the ones discovery read as a SCALE, plus any the stored
-  // policy already ranks — a ranking has to stay visible to be undoable, even on a namespace this
-  // board's values no longer look ordinal in.
-  const rankable = useMemo(() => {
-    const set = new Set(rankingCandidates);
-    for (const c of policy.labels ?? []) if (c.ranked) set.add(c.namespace);
-    return set;
-  }, [rankingCandidates, policy.labels]);
+  // Which namespaces discovery read as a SCALE. A HINT only: ranking is offered wherever the
+  // operator selected values to order, because the scales anton recognises are anton's vocabulary
+  // and a repo's own ordinal words (`showstopper` > `nice-to-have`) are not in it. Gating on this
+  // set would make an operator's declaration depend on anton knowing their words (R2.2, R2.3).
+  const scaleLike = useMemo(() => new Set(rankingCandidates), [rankingCandidates]);
 
   // Every namespace this board uses, plus any the policy names that the board no longer does — a
   // criterion left over from a renamed convention matches nothing, and hiding it would hide why.
+  //
+  // anton's own bookkeeping namespaces are not offered: `stage:` and `review-score:` say where anton
+  // has already put a bead, so a criterion over them is the machine quoting itself — and one anton
+  // rewrites mid-run admits a set that moves underneath the policy. A policy that already names one
+  // stays on screen, because a criterion nothing can un-set is a criterion nothing can remove.
   const namespaces = useMemo(() => {
-    const onBoard = labelVocabulary.filter((g) => g.namespace);
+    const constrained = new Set((policy.labels ?? []).map((c) => c.namespace));
+    const onBoard = labelVocabulary.filter(
+      (g) =>
+        g.namespace &&
+        (!POLICY_CONTROL_NAMESPACES.has(g.namespace) || constrained.has(g.namespace)),
+    );
     const known = new Set(onBoard.map((g) => g.namespace));
     const orphans = (policy.labels ?? [])
       .filter((c) => !known.has(c.namespace))
@@ -477,7 +495,7 @@ export function PolicyDraftSection({
               key={group.namespace}
               group={group}
               criterion={criterionFor(group.namespace)}
-              rankable={rankable.has(group.namespace)}
+              scaleLike={scaleLike.has(group.namespace)}
               why={why(`labels:${group.namespace}`)}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
               onRanked={(ranked) => setRanked(group.namespace, ranked)}
@@ -675,7 +693,7 @@ function MatchPanel({
 function NamespaceCriterion({
   group,
   criterion,
-  rankable,
+  scaleLike,
   why,
   onToggleValue,
   onRanked,
@@ -684,8 +702,8 @@ function NamespaceCriterion({
 }: {
   group: LabelNamespace;
   criterion?: PolicyLabelCriterion;
-  /** The board's values read as a scale, so an order is a thing an operator could mean here. */
-  rankable: boolean;
+  /** Discovery read these values as a scale — a hint beside the control, never a gate on it. */
+  scaleLike: boolean;
   why?: PolicyRationale;
   onToggleValue: (value: string) => void;
   onRanked: (ranked: boolean) => void;
@@ -700,6 +718,7 @@ function NamespaceCriterion({
   // that the board no longer carries — a stale value has to stay visible to be removable.
   const values = [...onBoard, ...selected.filter((v) => !onBoard.includes(v))];
   const ranked = criterion?.ranked ?? false;
+  const atCeiling = selected.length >= POLICY_CRITERION_VALUES_MAX;
 
   return (
     <Criterion
@@ -713,6 +732,7 @@ function NamespaceCriterion({
             key={value}
             name={`${group.namespace}:${value}`}
             on={selected.includes(value)}
+            disabled={atCeiling && !selected.includes(value)}
             onClick={() => onToggleValue(value)}
           >
             {value}
@@ -724,7 +744,14 @@ function NamespaceCriterion({
         <p className="text-[11px] text-subtle">Not constrained — any value, or none, matches.</p>
       )}
 
-      {rankable && selected.length > 1 && (
+      {atCeiling && values.length > selected.length && (
+        <p className="text-[11px] text-subtle">
+          A criterion admits at most {POLICY_CRITERION_VALUES_MAX} values — the store accepts no
+          more. Remove one to admit another.
+        </p>
+      )}
+
+      {selected.length > 1 && (
         <div className="flex items-center gap-2">
           <Toggle
             checked={ranked}
@@ -733,6 +760,7 @@ function NamespaceCriterion({
           />
           <span className="text-[11.5px] text-subtle">
             rank these values — drag to order them, most preferred first
+            {scaleLike && !ranked && " · these read as a scale"}
           </span>
         </div>
       )}
@@ -997,11 +1025,14 @@ function Bound({
 function Chip({
   on,
   name,
+  disabled = false,
   onClick,
   children,
 }: {
   on: boolean;
   name: string;
+  /** The criterion is full — the chip stays announced, so its ceiling is legible rather than silent. */
+  disabled?: boolean;
   onClick: () => void;
   children: React.ReactNode;
 }) {
@@ -1011,9 +1042,10 @@ function Chip({
       role="switch"
       aria-checked={on}
       aria-label={name}
+      disabled={disabled}
       onClick={onClick}
       className={cn(
-        "rounded-full border px-2.5 py-1 font-mono text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        "rounded-full border px-2.5 py-1 font-mono text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50",
         on
           ? "border-primary/60 bg-primary/10 text-foreground"
           : "border-border bg-background text-subtle hover:text-foreground",

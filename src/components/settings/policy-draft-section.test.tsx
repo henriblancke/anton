@@ -21,7 +21,7 @@ import {
   type PolicyCandidate,
   type PolicyDraft,
 } from "@/components/settings/policy-draft-section";
-import { POLICY_BOUND_MAX } from "@/lib/policy/types";
+import { POLICY_BOUND_MAX, POLICY_CRITERION_VALUES_MAX } from "@/lib/policy/types";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -618,10 +618,58 @@ describe("what it refuses to arm", () => {
   });
 });
 
-describe("ranking is offered where an order could mean something", () => {
-  it("offers no ranking on a namespace whose values are not a scale", () => {
+/**
+ * WHOSE vocabulary decides what can be ranked. Discovery recognises a handful of scales anton knows
+ * (`S/M/L`, `P0/P1`), and gating the ranking control on that set would make a repo's own ordinal
+ * words — `showstopper` over `nice-to-have` — unrankable because anton has never heard of them. The
+ * hint is offered; the declaration is the operator's.
+ */
+describe("ranking is the operator's declaration, not anton's recognition", () => {
+  /** A scale in the repo's own words: ordered, and in none of discovery's known families. */
+  const OWN_SCALE = [
+    {
+      namespace: "severity",
+      labels: [
+        { label: "severity:showstopper", count: 4 },
+        { label: "severity:normal", count: 6 },
+        { label: "severity:nice-to-have", count: 2 },
+      ],
+    },
+  ];
+
+  it("ranks a scale discovery does not recognise", async () => {
+    const fetchMock = stubFetch();
     renderPanel({
-      stored: { labels: [{ namespace: "team", values: ["payments", "growth"] }] },
+      stored: { labels: [{ namespace: "severity", values: ["showstopper", "normal"] }] },
+      labelVocabulary: OWN_SCALE,
+      // Discovery read nothing as a scale here — these are not words anton ships.
+      rankingCandidates: [],
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "Rank severity: values" }));
+    fireEvent.change(screen.getByLabelText("Bound severity: by rank"), { target: { value: "lte" } });
+    fireEvent.change(screen.getByLabelText("Bound severity: at"), {
+      target: { value: "showstopper" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels).toEqual([
+      {
+        namespace: "severity",
+        values: ["showstopper", "normal"],
+        ranked: true,
+        compare: { op: "lte", value: "showstopper" },
+      },
+    ]);
+  });
+
+  it("says which namespaces read as a scale rather than gating on it", () => {
+    renderPanel({
+      stored: {
+        labels: [
+          { namespace: "severity", values: ["critical", "major"] },
+          { namespace: "team", values: ["payments", "growth"] },
+        ],
+      },
       labelVocabulary: [
         ...VOCABULARY,
         {
@@ -632,10 +680,15 @@ describe("ranking is offered where an order could mean something", () => {
           ],
         },
       ],
+      rankingCandidates: ["severity"],
     });
-    // "Most preferred first" is meaningless over team names, and a control that does nothing is worse
-    // than no control.
-    expect(screen.queryByRole("switch", { name: "Rank team: values" })).toBeNull();
+    // Both are offered; only the one discovery read as a scale carries the hint.
+    const severity = screen.getByRole("group", { name: "severity:" });
+    const team = screen.getByRole("group", { name: "team:" });
+    expect(within(severity).getByRole("switch", { name: "Rank severity: values" })).toBeTruthy();
+    expect(within(team).getByRole("switch", { name: "Rank team: values" })).toBeTruthy();
+    expect(severity.textContent).toContain("these read as a scale");
+    expect(team.textContent).not.toContain("these read as a scale");
   });
 
   it("keeps a stored ranking editable even on a namespace discovery would not offer one for", () => {
@@ -651,8 +704,11 @@ describe("ranking is offered where an order could mean something", () => {
           ],
         },
       ],
+      rankingCandidates: [],
     });
-    expect(screen.getByRole("switch", { name: "Rank team: values" })).toBeTruthy();
+    // A ranking has to stay visible to be undoable — and draggable to be re-ordered.
+    expect(checked("Rank team: values")).toBe("true");
+    expect(screen.getByRole("button", { name: "Reorder team:payments" })).toBeTruthy();
   });
 
   it("says a ranking alone does not change what is admitted", () => {
@@ -788,5 +844,93 @@ describe("a stored comparison survives editing around it", () => {
     expect(sentPolicy(fetchMock).labels).toEqual([
       { namespace: "severity", values: ["critical", "major", "minor"] },
     ]);
+  });
+});
+
+/**
+ * The store's own ceiling on one criterion's membership set. The panel previews a policy as valid,
+ * so a selection the schema will reject is an operator spending their accept on a 400 the panel
+ * cannot explain — the same reason the numeric bounds clamp to their schema maximum.
+ */
+describe("a criterion stays inside what the store accepts", () => {
+  /** A namespace with one value more than a criterion may carry. */
+  const CROWDED = [
+    {
+      namespace: "component",
+      labels: Array.from({ length: POLICY_CRITERION_VALUES_MAX + 1 }, (_, i) => ({
+        label: `component:c${i}`,
+        count: 1,
+      })),
+    },
+  ];
+  const full = Array.from({ length: POLICY_CRITERION_VALUES_MAX }, (_, i) => `c${i}`);
+  const last = `component:c${POLICY_CRITERION_VALUES_MAX}`;
+
+  it("refuses the value past the ceiling instead of previewing a policy that cannot be saved", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({
+      stored: { labels: [{ namespace: "component", values: full }] },
+      labelVocabulary: CROWDED,
+    });
+    const chip = screen.getByRole("switch", { name: last }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    fireEvent.click(chip);
+    expect(checked(last)).toBe("false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels[0].values).toHaveLength(POLICY_CRITERION_VALUES_MAX);
+  });
+
+  it("says why the remaining values cannot be added", () => {
+    renderPanel({
+      stored: { labels: [{ namespace: "component", values: full }] },
+      labelVocabulary: CROWDED,
+    });
+    expect(
+      screen.getByText(new RegExp(`at most ${POLICY_CRITERION_VALUES_MAX} values`)),
+    ).toBeTruthy();
+  });
+
+  it("leaves a namespace under the ceiling fully selectable", () => {
+    renderPanel({ stored: { labels: [{ namespace: "severity", values: ["critical"] }] } });
+    expect((screen.getByRole("switch", { name: "severity:minor" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText(/at most 32 values/)).toBeNull();
+  });
+});
+
+/**
+ * anton's own bookkeeping is not this repo's vocabulary. Once a board has run anton, `stage:` and
+ * `review-score:` are among its most-used namespaces — and a criterion over them is anton quoting
+ * its own runs back, over a value anton itself rewrites mid-run.
+ */
+describe("anton's bookkeeping namespaces are not authorable criteria", () => {
+  const WITH_CONTROL = [
+    ...VOCABULARY,
+    { namespace: "stage", labels: [{ label: "stage:implementing", count: 7 }] },
+    { namespace: "review-score", labels: [{ label: "review-score:8", count: 5 }] },
+    { namespace: "source", labels: [{ label: "source:stringer", count: 3 }] },
+  ];
+
+  it("offers no criterion over stage:, review-score: or source:", () => {
+    renderPanel({ labelVocabulary: WITH_CONTROL });
+    expect(screen.getByRole("group", { name: "severity:" })).toBeTruthy();
+    for (const namespace of ["stage:", "review-score:", "source:"]) {
+      expect(screen.queryByRole("group", { name: namespace })).toBeNull();
+    }
+  });
+
+  it("keeps a policy that already names one visible, so it can be removed", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({
+      stored: { labels: [{ namespace: "stage", values: ["implementing"] }] },
+      labelVocabulary: WITH_CONTROL,
+    });
+    // Hiding it would leave a criterion refusing beads with no control to un-set it.
+    const group = screen.getByRole("group", { name: "stage:" });
+    fireEvent.click(within(group).getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels).toBeUndefined();
   });
 });

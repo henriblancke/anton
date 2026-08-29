@@ -27,7 +27,7 @@ import {
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
-import { POLICY_BOUND_MAX, type Policy } from "./policy/types";
+import { POLICY_BOUND_MAX, POLICY_CRITERION_VALUES_MAX, type Policy } from "./policy/types";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -585,7 +585,7 @@ export const pickerPolicySchema = z
             namespace: z.string().trim().min(1).max(60),
             // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
             // why nothing on this path sorts them.
-            values: z.array(z.string().trim().min(1).max(120)).min(1).max(32),
+            values: z.array(z.string().trim().min(1).max(120)).min(1).max(POLICY_CRITERION_VALUES_MAX),
             ranked: z.boolean().optional(),
             // A `≤`/`≥` over that ranking. Rejected without `ranked`, and rejected when it names a
             // value the ranking does not carry: the predicate fails such a criterion CLOSED against

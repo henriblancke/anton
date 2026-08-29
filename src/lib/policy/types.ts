@@ -141,3 +141,24 @@ export const POLICY_BOUND_MAX = {
   minAgeDays: 365,
   maxAgeDays: 3650,
 } as const;
+
+/**
+ * How many values one discovered-namespace criterion may carry, held beside the bounds above for the
+ * same reason: the editor must refuse the 33rd chip rather than spend an operator's accept on a 400
+ * the panel cannot explain. A namespace with more observed values than this is stated by selecting
+ * the ones that matter, not by admitting all of them.
+ */
+export const POLICY_CRITERION_VALUES_MAX = 32;
+
+/**
+ * anton's OWN bookkeeping namespaces — where anton has already put a bead, not what an operator
+ * judged worth starting. Excluded everywhere a criterion is authored (the calibrated draft and the
+ * editor alike): a policy over `stage:` or `review-score:` is the machine quoting itself back, and
+ * one over a namespace anton rewrites mid-run admits a set that moves under it.
+ */
+export const POLICY_CONTROL_NAMESPACES: ReadonlySet<string> = new Set([
+  "stage",
+  "run-lease",
+  "review-score",
+  "source",
+]);
