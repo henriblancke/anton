@@ -5,8 +5,9 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
 /**
- * The app's single failed-load affordance (anton-iquy) — every view that can fail a fetch renders
- * this, so wording, icon, retry and a11y change in one place instead of five.
+ * The failed-load affordance shared by the five surfaces extracted in anton-iquy — epic-detail,
+ * project-graph, run-detail, ticket-dialog and tickets-view — so wording, icon, retry and a11y
+ * change in one place instead of five. The board keeps its own dashed-border variant.
  *
  * `page` fills the view it replaces; `dialog` sits inside an already-padded dialog body, so it
  * neither claims page padding nor flexes to fill a column it does not own.
