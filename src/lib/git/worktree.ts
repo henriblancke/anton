@@ -44,6 +44,13 @@ async function git(repoPath: string, args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+/** Git's own first line for a failed command — what a one-line reaper log can carry. */
+function gitError(err: unknown): string {
+  const e = err as { stderr?: string; message?: string };
+  const text = e.stderr?.trim() || e.message || String(err);
+  return text.split("\n")[0].slice(0, 200);
+}
+
 /**
  * The directory anton creates this repo's run worktrees under. Also what the reaper scopes its sweep
  * to — a checkout outside it is not anton's to judge, whatever branch it holds.
@@ -364,6 +371,12 @@ export interface WorktreeRemoval {
   /** Why the checkout was left alone. Absent when it was removed (or was never there). */
   skipped?: string;
   branchDeleted: boolean;
+  /**
+   * Git's own words for a branch deletion that FAILED with the branch still present — a ref lock, or
+   * a checkout outside this sweep's scope holding it. Absent when the branch went, and absent when it
+   * was already gone: those two are the difference a reaper's log must not blur.
+   */
+  branchSkipped?: string;
 }
 
 /**
@@ -452,13 +465,17 @@ export async function removeWorktree(
   }
 
   let branchDeleted = false;
+  let branchSkipped: string | undefined;
   if (opts?.deleteBranch) {
     try {
       await git(wt.repoPath, ["branch", "-D", wt.branch]);
       branchDeleted = true;
-    } catch {
-      // branch already gone, or still checked out somewhere git won't let us delete from under
+    } catch (err) {
+      // A failure is not proof of absence. The branch may still be checked out somewhere git won't
+      // delete it from under, or held by a ref lock — and it then stays a candidate on every later
+      // sweep, so only git's own answer may decide whether the log says "gone" or "refused".
+      if (await branchExists(wt.repoPath, wt.branch)) branchSkipped = gitError(err);
     }
   }
-  return { removed: existed && !existsSync(wt.path), branchDeleted };
+  return { removed: existed && !existsSync(wt.path), branchDeleted, branchSkipped };
 }

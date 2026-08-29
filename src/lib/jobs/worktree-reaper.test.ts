@@ -16,6 +16,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { createWorktree, WORKTREES_ROOT_ENV } from "../git/worktree";
 import {
   beadStateOf,
+  makeRevalidator,
   makeWorktreeReaperHandler,
   readBoardOrFail,
   reapSummary,
@@ -178,6 +179,7 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
       clock: systemClock,
       readBoard: async () => board,
       lookupPr: async () => ({}),
+      showBead: async (_repo, id) => ({ status: board.find((b) => b.id === id)?.status ?? "open" }),
     });
 
     try {
@@ -299,6 +301,52 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
     await tdb.db.delete(schema.runs).where(eq(schema.runs.id, runId));
     execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
     execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+  });
+
+  it("re-reads run rows and the bead at deletion time — the sweep's snapshot is not the last word", async () => {
+    await tdb.db.delete(schema.runs).where(eq(schema.runs.projectId, projectId));
+    const candidate = {
+      branch: "anton/anton-race",
+      beadId: "anton-race",
+      runLive: false,
+      bead: "settled" as const,
+    };
+    const closed = async () => ({ status: "closed" });
+    const revalidate = makeRevalidator({ db: tdb.db, projectId, repoPath: repo, showBead: closed });
+
+    // Nothing live and the bead still closed: the plan the sweep made still holds.
+    expect(await revalidate(candidate)).toBeUndefined();
+
+    // The race the snapshot cannot see: a new run claims the branch while the `gh` lookup is in
+    // flight, and its checkout is the one the sweep was about to force-remove.
+    await tdb.db.insert(schema.runs).values({
+      id: randomUUID(),
+      projectId,
+      epicBeadId: "anton-race",
+      branch: candidate.branch,
+      status: "running",
+    });
+    expect(await revalidate(candidate)).toContain("a run started on it during the sweep");
+    await tdb.db.delete(schema.runs).where(eq(schema.runs.projectId, projectId));
+
+    const reopened = makeRevalidator({
+      db: tdb.db,
+      projectId,
+      repoPath: repo,
+      showBead: async () => ({ status: "open" }),
+    });
+    expect(await reopened(candidate)).toContain("was reopened during the sweep");
+
+    // Fail closed: a bead that cannot be re-read keeps its worktree and branch.
+    const unreadable = makeRevalidator({
+      db: tdb.db,
+      projectId,
+      repoPath: repo,
+      showBead: async () => {
+        throw new Error("bd is locked");
+      },
+    });
+    expect(await unreadable(candidate)).toContain("could not be re-read");
   });
 
   it("writes no session at all when there is no residue to account for", async () => {

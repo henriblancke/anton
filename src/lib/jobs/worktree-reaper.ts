@@ -23,8 +23,10 @@ import {
   reapCandidates,
   reapWorktrees,
   releaseRunWorktree,
+  type ReapCandidate,
   type ReapEntry,
   type ReapReport,
+  type Revalidate,
   type RunTeardown,
 } from "../git/worktree-reaper";
 import { getProjectById } from "../projects";
@@ -32,7 +34,7 @@ import { PoisonError } from "./errors";
 import { deferPassSession } from "./pass-preamble";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import * as schema from "../db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { JobContext, JobHandler } from "./runner";
 
 export interface WorktreeReaperPayload {
@@ -49,6 +51,8 @@ export interface WorktreeReaperDeps {
   readBoard?: (repoPath: string) => Promise<Bead[]>;
   /** How a branch's open PR is looked up. Injectable so a test needn't shell out to `gh`. */
   lookupPr?: typeof lookupOpenPullRequest;
+  /** How one bead is re-read at deletion time. Injectable so a test needn't stand up a bd repo. */
+  showBead?: (repoPath: string, beadId: string) => Promise<{ status: string }>;
 }
 
 /**
@@ -64,10 +68,15 @@ export function beadStateOf(board: Bead[]): (beadId: string) => "settled" | "ope
   };
 }
 
-/** The one-line summary the job logs when it changed something. */
+/**
+ * The one-line summary the job logs when it changed something. Counted over BOTH lists, off each
+ * entry's own flags: a candidate whose checkout went but whose branch git refused to delete is
+ * classified as skipped, and the worktree it did reclaim still has to show up in the count.
+ */
 export function reapSummary(report: ReapReport): string {
-  const worktrees = report.reaped.filter((e) => e.worktreeRemoved).length;
-  const branches = report.reaped.filter((e) => e.branchDeleted).length;
+  const all = [...report.reaped, ...report.skipped];
+  const worktrees = all.filter((e) => e.worktreeRemoved).length;
+  const branches = all.filter((e) => e.branchDeleted).length;
   return `reaped ${worktrees} worktree(s) and ${branches} branch(es); skipped ${report.skipped.length}`;
 }
 
@@ -146,11 +155,41 @@ export async function readBoardOrFail(
   return loadAllIssues(repo);
 }
 
+/**
+ * The last-moment proof that a candidate is still residue (anton-hrun.1). The board and run rows the
+ * plan was made from are already stale by the time the per-branch `gh` lookup returns, and a bead
+ * reopened in that window has a new run recreating this exact branch and checkout — which the sweep
+ * would then force-remove, uncommitted work and all. Both reads fail CLOSED: a bead that cannot be
+ * re-read keeps its resources.
+ */
+export function makeRevalidator(args: {
+  db: AntonDb;
+  projectId: string;
+  repoPath: string;
+  showBead: (repoPath: string, beadId: string) => Promise<{ status: string }>;
+}): Revalidate {
+  return async (candidate: ReapCandidate) => {
+    const rows = await args.db
+      .select({ status: schema.runs.status })
+      .from(schema.runs)
+      .where(and(eq(schema.runs.projectId, args.projectId), eq(schema.runs.branch, candidate.branch)));
+    if (rows.some((r) => r.status === "running" || r.status === "queued")) {
+      return "a run started on it during the sweep";
+    }
+    if (!candidate.beadId) return undefined;
+    const bead = await args.showBead(args.repoPath, candidate.beadId).catch(() => null);
+    if (!bead) return `${candidate.beadId} could not be re-read before deletion`;
+    if (bead.status !== "closed") return `${candidate.beadId} was reopened during the sweep`;
+    return undefined;
+  };
+}
+
 export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
   const branchPrefix = deps.branchPrefix ?? "anton";
   const readBoard = deps.readBoard ?? ((repo: string) => readBoardOrFail(repo));
+  const showBead = deps.showBead ?? beads.show;
 
   return async function worktreeReaper(ctx: JobContext): Promise<void> {
     const { projectId } = ctx.payload as WorktreeReaperPayload;
@@ -189,7 +228,12 @@ export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler 
 
     await ctx.heartbeat();
     const session = deferPassSession(db, clock, { ctx, projectId, kind: "worktree-reaper" });
-    const report = await reapWorktrees({ repoPath: repo, candidates, lookupPr: deps.lookupPr });
+    const report = await reapWorktrees({
+      repoPath: repo,
+      candidates,
+      lookupPr: deps.lookupPr,
+      revalidate: makeRevalidator({ db, projectId, repoPath: repo, showBead }),
+    });
     if (report.reaped.length === 0 && report.skipped.length === 0) return;
 
     await session.log(formatReapReport(report, `worktree-reaper: ${reapSummary(report)}`));

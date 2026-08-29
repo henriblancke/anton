@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   composeDescription,
+  canRunTicket,
   detailsSummary,
   diffTicketPatch,
   draftFromDetail,
   hasTicketChanges,
+  isStandaloneRunTarget,
   resolutionOf,
+  runToastMessage,
   stripContractSections,
   type TicketDraft,
 } from "@/components/ticket/ticket-dialog-utils";
@@ -265,5 +268,55 @@ describe("detailsSummary", () => {
 
   it("shows Snoozed as the status when deferred, regardless of the draft's raw status", () => {
     expect(detailsSummary(base, true)).toBe("Snoozed · P2 · nextjs · risk:low · size:M");
+  });
+});
+
+describe("isStandaloneRunTarget", () => {
+  it("admits a parentless task or bug — the shapes anton runs on their own", () => {
+    expect(isStandaloneRunTarget({ type: "task" })).toBe(true);
+    expect(isStandaloneRunTarget({ type: "bug" })).toBe(true);
+  });
+
+  it("refuses a child ticket, which runs via its epic's PR", () => {
+    expect(isStandaloneRunTarget({ type: "task", epicId: "ep-1" })).toBe(false);
+  });
+
+  it("refuses a parentless non-work type the approve/claim routes would 422", () => {
+    expect(isStandaloneRunTarget({ type: "learning" })).toBe(false);
+    expect(isStandaloneRunTarget({ type: "chore" })).toBe(false);
+  });
+});
+
+describe("canRunTicket", () => {
+  const target = { type: "task", stage: "backlog" as const, deferred: false };
+
+  it("offers the run on a still-runnable standalone target", () => {
+    expect(canRunTicket(target)).toBe(true);
+    expect(canRunTicket({ ...target, stage: "implementing" })).toBe(true);
+  });
+
+  it("withholds it once the target is done — its run already produced a PR", () => {
+    expect(canRunTicket({ ...target, stage: "done" })).toBe(false);
+  });
+
+  it("withholds it while snoozed — starting it now contradicts the snooze", () => {
+    expect(canRunTicket({ ...target, deferred: true })).toBe(false);
+  });
+
+  it("withholds it from anything that isn't a run target of its own", () => {
+    expect(canRunTicket({ ...target, epicId: "ep-1" })).toBe(false);
+  });
+});
+
+describe("runToastMessage", () => {
+  it("reports the board move when the approve applied a gardener proposal", () => {
+    expect(runToastMessage("Do the thing", false, "closed bd-9 as duplicate")).toBe(
+      "Applied — closed bd-9 as duplicate",
+    );
+  });
+
+  it("distinguishes a first approval from a force run", () => {
+    expect(runToastMessage("Do the thing", false, undefined)).toBe('Approved & running "Do the thing"');
+    expect(runToastMessage("Do the thing", true, undefined)).toBe('Re-running "Do the thing"');
   });
 });

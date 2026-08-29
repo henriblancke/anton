@@ -263,7 +263,7 @@ export function reapCandidates(input: {
 function actedLine(
   entry: { branch: string; path?: string },
   plan: ReapPlan,
-  outcome: { removed: boolean; branchDeleted: boolean },
+  outcome: { removed: boolean; branchDeleted: boolean; branchSkipped?: string },
 ): string {
   const parts: string[] = [];
   // Residue can be a branch alone, with no checkout ever recorded — such a line says nothing about
@@ -273,11 +273,15 @@ function actedLine(
       outcome.removed ? `released worktree ${entry.path}` : `worktree ${entry.path} was already gone`,
     );
   }
+  // "Refused" and "already gone" are opposite facts: a branch git would not delete is still there and
+  // still a candidate, so reporting it as absent would make every later sweep look like a no-op.
   parts.push(
     plan.deleteBranch
       ? outcome.branchDeleted
         ? `deleted branch ${entry.branch}`
-        : `branch ${entry.branch} was already gone`
+        : outcome.branchSkipped
+          ? `branch ${entry.branch} could not be deleted: ${outcome.branchSkipped}`
+          : `branch ${entry.branch} was already gone`
       : `kept branch ${entry.branch}`,
   );
   return `${parts.join("; ")} — ${plan.reason}`;
@@ -310,12 +314,23 @@ async function applyPlan(
   }
   return {
     ...base,
-    outcome: "acted",
+    // A branch git refused to delete leaves that half of the plan undone and the candidate back on
+    // the next sweep; the entry says so rather than being counted as fully reaped.
+    outcome: outcome.branchSkipped ? "refused" : "acted",
     reason: actedLine(entry, plan, outcome),
     worktreeRemoved: outcome.removed,
     branchDeleted: outcome.branchDeleted,
   };
 }
+
+/**
+ * A last look at a candidate, taken after the slow `gh` lookup and IMMEDIATELY before anything is
+ * deleted. Returns why the candidate must be left alone now, or undefined when it is still residue.
+ * The window it closes is real: the board and run rows the plan was made from are seconds to minutes
+ * old by then, and a bead reopened in that window already has a new run checking the same branch out
+ * again — into the very path the sweep is about to force-remove.
+ */
+export type Revalidate = (candidate: ReapCandidate) => Promise<string | undefined>;
 
 /** Reap what the sweep proved is finished; report everything it left alone and why. */
 export async function reapWorktrees(args: {
@@ -323,6 +338,8 @@ export async function reapWorktrees(args: {
   candidates: ReapCandidate[];
   /** Injectable so a test needn't shell out to `gh`. */
   lookupPr?: typeof lookupOpenPullRequest;
+  /** Re-read of the board and run rows, run only for a candidate about to be deleted. */
+  revalidate?: Revalidate;
 }): Promise<ReapReport> {
   const report: ReapReport = { reaped: [], skipped: [] };
   for (const candidate of args.candidates) {
@@ -334,6 +351,21 @@ export async function reapWorktrees(args: {
       ? await openPrNotice(args.repoPath, candidate.branch, args.lookupPr)
       : undefined;
     const plan = planReap(candidate, openPr);
+    // Same rule as the `gh` call: only a candidate something is about to happen to pays for it.
+    const stale =
+      plan.removeWorktree || plan.deleteBranch ? await args.revalidate?.(candidate) : undefined;
+    if (stale) {
+      report.skipped.push({
+        branch: candidate.branch,
+        path: candidate.path,
+        beadId: candidate.beadId,
+        outcome: "refused",
+        reason: `skipped ${candidate.path ?? candidate.branch}: ${stale}`,
+        worktreeRemoved: false,
+        branchDeleted: false,
+      });
+      continue;
+    }
     const entry = await applyPlan(args.repoPath, candidate, plan);
     // Classified on the outcome, never the plan: a checkout locked between planning and removal is
     // refused, and reporting that as reaped would claim work the sweep did not do.

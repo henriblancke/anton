@@ -268,6 +268,63 @@ suite("the sweep over real residue (real git)", () => {
     }
   });
 
+  it("re-reads a candidate immediately before deleting it, and spares one that came back to life", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-race" });
+    const candidates = [
+      { branch: wt.branch, path: wt.path, beadId: "anton-race", runLive: false, bead: "settled" as const },
+    ];
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates,
+        lookupPr: noPr,
+        // The window this closes: the bead was reopened and a new run checked this branch out again
+        // while the per-branch `gh` lookup was in flight.
+        revalidate: async () => "a run started on it during the sweep",
+      });
+
+      expect(report.reaped).toEqual([]);
+      expect(report.skipped.map((e) => e.reason)).toEqual([
+        expect.stringContaining("a run started on it during the sweep"),
+      ]);
+      expect(existsSync(wt.path)).toBe(true);
+      expect(branches()).toContain("anton/anton-race");
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+    }
+  });
+
+  it("reports a branch git REFUSED to delete as skipped, never as already gone", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-lok" });
+    // A ref lock is the everyday shape of "git would not delete it" — as is a branch checked out in
+    // a worktree outside this sweep. Either way the branch survives, and a log saying it was already
+    // gone would hide residue that comes back on every later sweep.
+    const refLock = join(repo, ".git", "refs", "heads", "anton", "anton-lok.lock");
+    writeFileSync(refLock, "");
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates: [
+          { branch: wt.branch, path: wt.path, beadId: "anton-lok", runLive: false, bead: "settled" as const },
+        ],
+        lookupPr: noPr,
+      });
+
+      expect(report.reaped).toEqual([]);
+      expect(report.skipped[0].reason).toContain(`branch ${wt.branch} could not be deleted`);
+      expect(report.skipped[0].reason).not.toContain("already gone");
+      // The half that DID happen is still recorded, so the pass's count stays true.
+      expect(report.skipped[0]).toMatchObject({ worktreeRemoved: true, branchDeleted: false });
+      expect(branches()).toContain("anton/anton-lok");
+    } finally {
+      rmSync(refLock, { force: true });
+      execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+    }
+  });
+
   it("scopes the sweep to anton's worktrees root — an agent checkout elsewhere is not a candidate", async () => {
     const outsideRoot = realpathSync(mkdtempSync(join(tmpdir(), "anton-reap-other-")));
     const outside = join(outsideRoot, "claude-worktree");
