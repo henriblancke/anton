@@ -27,6 +27,7 @@ import {
   formatScanSeverityPolicy,
 } from "../scan-severity";
 import { describeCouplingFilter } from "../scan-coupling";
+import { describeDuplicationFilter } from "../scan-duplication";
 import {
   buildBoardContext,
   formatBoardContext,
@@ -278,6 +279,12 @@ export function makeNightlyStringerHandler(deps: NightlyStringerDeps): JobHandle
       // log is the only place the drop and its proof still exist.
       const couplingLine = describeCouplingFilter(result.coupling);
       if (couplingLine) await appendSessionLog(logPath, `[stringer] ${couplingLine}\n`);
+
+      // 1e. Duplication signals over blocks that hold no statement (anton-vb2h). This filter can
+      // remove most of a scan, so it says so out loud: silence here would be indistinguishable from
+      // a duplication collector that found nothing.
+      const duplicationLine = describeDuplicationFilter(result.duplication);
+      if (duplicationLine) await appendSessionLog(logPath, `[stringer] ${duplicationLine}\n`);
 
       // 2. No new signals → nothing to triage. That's a success, not an error — and a real data
       // point: a clean pass is what a falling trend is made of, so it is recorded like any other.

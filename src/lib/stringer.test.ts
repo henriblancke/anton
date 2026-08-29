@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
+import { describeDuplicationFilter, filterDuplicationSignals } from "./scan-duplication";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
@@ -993,6 +994,249 @@ describe("scan", () => {
       expect(result.coupling).toEqual({ dropped: [], recounted: [] });
       expect((result.signals[2] as { Title: string }).Title).toBe(
         "High coupling: src/only-values imports 12 modules",
+      );
+    });
+  });
+
+  // anton-vb2h: the `duplication` collector matches token windows, so this repo's house doc
+  // comments, its import specifier lists and its interface field lists all read as clones. The
+  // 2026-08-19 scan spent 97 of its 121 signals on `duplication` and 42 of those named a window
+  // holding no statement at all; triage paid a full pass to throw them away.
+  describe("duplication signals over blocks that declare rather than compute", () => {
+    /** A source tree — no git, since nothing here is a claim about the index. */
+    function writeRepo(files: Record<string, string>): string {
+      const repo = join(dir, "dup-repo");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      return repo;
+    }
+
+    /** stringer's own phrasing: the block's size in the title, its locations listed in the body. */
+    function clone(locations: [string, number][], lines = 6) {
+      return {
+        Source: "duplication",
+        Kind: "code-clone",
+        FilePath: locations[0][0],
+        Line: locations[0][1],
+        Title: `Duplicated block (${lines} lines, ${locations.length} locations)`,
+        Description:
+          "Duplicated code found in:\n" +
+          locations.map(([path, line]) => `  - ${path}:${line}`).join("\n") +
+          "\n",
+        Tags: ["code-clone", "duplication"],
+      };
+    }
+
+    const DOC_BLOCK = [
+      "/**",
+      " * The single place anton runs stringer. It mines a repo for actionable signals and emits",
+      " * them as JSON; the nightly job then hands the scan file to claude to convert the few worth",
+      " * doing into beads.",
+      " *",
+      " * The binary is injectable so tests point it at a fake.",
+      " */",
+      "export const doc = 1;",
+      "",
+    ].join("\n");
+
+    const IMPORT_BLOCK = [
+      "import {",
+      "  parseBdVersion,",
+      "  parseSchemaVersion,",
+      "  preflightBd,",
+      "  resetBdBinCache,",
+      "  resolveBdBin,",
+      "} from './bd-bin';",
+      "export const used = [parseBdVersion, resolveBdBin];",
+      "",
+    ].join("\n");
+
+    const BODY_BLOCK = [
+      "export function arrange(sandbox: string) {",
+      "  const repo = join(sandbox, 'repo');",
+      "  mkdirSync(repo);",
+      "  execFileSync('git', ['init', '-q', repo]);",
+      "  g(['config', 'user.email', 't@example.com']);",
+      "  g(['config', 'user.name', 'anton-test']);",
+      "  writeFileSync(join(repo, 'README.md'), '# sandbox');",
+      "  return repo;",
+      "}",
+      "",
+    ].join("\n");
+
+    // The three shapes the 2026-08-19 scan was made of, side by side: only the one with statements
+    // in it survives, and the verdict comes from the SOURCE at each location — all three signals
+    // carry the same collector, kind, title shape and confidence.
+    it("drops a doc paragraph and an import list, keeps a function body, on both sides of the seam", async () => {
+      const repo = writeRepo({
+        "src/doc.ts": DOC_BLOCK,
+        "src/doc-twin.ts": DOC_BLOCK,
+        "src/imports.ts": IMPORT_BLOCK,
+        "src/imports-twin.ts": IMPORT_BLOCK,
+        "src/body.ts": BODY_BLOCK,
+        "src/body-twin.ts": BODY_BLOCK,
+      });
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [
+          clone([
+            ["src/doc.ts", 2],
+            ["src/doc-twin.ts", 2],
+          ]),
+          clone([
+            ["src/imports.ts", 2],
+            ["src/imports-twin.ts", 2],
+          ]),
+          clone([
+            ["src/body.ts", 2],
+            ["src/body-twin.ts", 2],
+          ]),
+        ],
+        metadata: { total_count: 3 },
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      // Not vacuous: the real clone rides through, so the drop is this filter rather than an empty read.
+      expect(result.signals).toMatchObject([{ FilePath: "src/body.ts", AntonSeverity: "low" }]);
+      expect(result.duplication.dropped).toMatchObject([
+        { path: "src/doc.ts", kind: "code-clone" },
+        { path: "src/imports.ts", kind: "code-clone" },
+      ]);
+      expect(result.duplication.dropped[0].reason).toContain("6 comment");
+      expect(result.duplication.dropped[1].reason).toContain("6 import");
+      // Counted out loud: a silent filter is indistinguishable from a collector that found nothing.
+      const described = describeDuplicationFilter(result.duplication);
+      expect(described).toContain("dropped 2 duplication signal(s)");
+      expect(described).toContain("src/doc.ts");
+      // Same set on both sides: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { FilePath: string }[] };
+      expect(written.signals.map((s) => s.FilePath)).toEqual(["src/body.ts"]);
+    });
+
+    // A window nobody can read is a window nobody can act on either: the file was rewritten under
+    // the baseline, so the block stringer measured is not there to check, extract, or verify.
+    it("drops a signal whose locations no longer exist on the tree", async () => {
+      const repo = writeRepo({ "src/body.ts": BODY_BLOCK });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([
+          ["src/deleted.ts", 2],
+          ["src/also-deleted.ts", 2],
+        ]),
+        clone([["src/body.ts", 9000]]),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped.map((d) => d.path)).toEqual([
+        "src/deleted.ts",
+        "src/body.ts",
+      ]);
+      for (const drop of result.duplication.dropped) {
+        expect(drop.reason).toContain("exist on the tree anymore");
+      }
+    });
+
+    // The other half of the class: an interface's field list, and a component's destructured props.
+    it("reads the source, not the title: a field list and a props list are not clones", async () => {
+      const repo = writeRepo({
+        "src/shape-draft.ts": [
+          "export interface ShapeDraft {",
+          "  title: string;",
+          "  goal: string;",
+          "  acceptance: string;",
+          "  context: string;",
+          "  outOfScope: string;",
+          "  verify: string;",
+          "}",
+          "",
+        ].join("\n"),
+        "src/card.tsx": [
+          "export function EpicCard({",
+          "  slug,",
+          "  epic,",
+          "  overlay,",
+          "  muted,",
+          "}: {",
+          "  slug: string;",
+          "  epic: Epic;",
+          "  overlay: boolean;",
+          "  muted?: boolean;",
+          "}) {",
+          "  return null;",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        // A near-duplicate: stringer's OTHER phrasing for the same class of window.
+        {
+          ...clone([["src/shape-draft.ts", 2]]),
+          Kind: "near-duplicate",
+          Title: "Near-duplicate block (6 lines, 44 locations, renamed identifiers)",
+        },
+        clone([["src/card.tsx", 2]]),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped[0]).toMatchObject({ kind: "near-duplicate" });
+      expect(result.duplication.dropped[0].reason).toContain("6 type");
+      expect(result.duplication.dropped[1].reason).toContain("6 signature");
+    });
+
+    // Under-filtering costs one triaged bead; over-filtering deletes a real clone nobody hears
+    // about again. So anything anton cannot read as a declaration rides through untouched.
+    it("keeps every signal it cannot disprove", async () => {
+      const repo = writeRepo({ "src/body.ts": BODY_BLOCK, "src/body-twin.ts": BODY_BLOCK });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        // A title anton can't read a block size out of — nothing to resolve, so nothing to judge.
+        { ...clone([["src/body.ts", 2]]), Title: "Duplicated block" },
+        // Half declaration, half statements: a tie goes to the signal.
+        clone([["src/body.ts", 1]], 3),
+        { Source: "todos", Kind: "todo", FilePath: "src/body.ts" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(3);
+      expect(result.duplication).toEqual({ dropped: [] });
+      expect(describeDuplicationFilter(result.duplication)).toBeUndefined();
+    });
+
+    // The regression the bead was filed on, replayed: the duplication half of scan d9eab116
+    // (2026-08-19), every signal exactly as stringer wrote it, judged against this repo's own tree.
+    // Sizes the filter against real evidence rather than a hand-built tree — and if the drop rate
+    // collapses, it collapsed on the corpus that justified the filter.
+    it("drops most of the 2026-08-19 scan's duplication half and keeps its real clones", async () => {
+      const signals = JSON.parse(
+        readFileSync(join(process.cwd(), "src/lib/scan-duplication.d9eab116.fixture.json"), "utf8"),
+      ) as { FilePath: string; Line: number }[];
+      expect(signals).toHaveLength(97);
+
+      const { kept, duplication } = await filterDuplicationSignals(process.cwd(), signals);
+
+      expect(duplication.dropped.length).toBeGreaterThanOrEqual(40);
+      expect(kept.length + duplication.dropped.length).toBe(97);
+      // The hand-verified non-code primaries from the bead — a JSDoc paragraph, an interface field
+      // list, an import specifier list, a doc block, two import statements.
+      const droppedAt = new Set(duplication.dropped.map((d) => d.path));
+      for (const path of [
+        "src/lib/approval-gate.ts",
+        "src/components/shape/shape-draft.ts",
+        "src/lib/beads/bd-bin.test.ts",
+        "src/lib/beads/contract-report.ts",
+        "src/lib/jobs/execute-epic.ts",
+      ]) {
+        expect(droppedAt).toContain(path);
+      }
+      // ...and the test arrange-block clones the bead names as REAL duplication still come through.
+      expect(kept).toContainEqual(
+        expect.objectContaining({ FilePath: "src/lib/git/ops.test.ts", Line: 318 }),
       );
     });
   });
