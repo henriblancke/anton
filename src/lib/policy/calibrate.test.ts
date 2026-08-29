@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import { pickerPolicySchema } from "../projects";
-import { POLICY_BOUND_MAX } from "./types";
+import { POLICY_BOUND_MAX, POLICY_TEXT_MAX } from "./types";
 import { boardIssueTypes, calibratePolicy, FALLBACK_POLICY, MIN_CALIBRATION_APPROVALS } from "./calibrate";
 import { namespaceOf, valueOf, type Policy } from "./types";
 
@@ -256,6 +256,37 @@ describe("calibratePolicy — the proposal is storable", () => {
     expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
   });
 
+  it("omits a namespace whose name is longer than the store keeps", () => {
+    const long = "n".repeat(POLICY_TEXT_MAX.namespace + 1);
+    const board = [
+      ...many(5, () => approved({ labels: [`${long}:a`, "severity:major"] })),
+      unapproved({ labels: [`${long}:z`, "severity:minor"] }),
+    ];
+    const { policy } = calibratePolicy(board);
+    expect(policy.labels?.map((c) => c.namespace)).toEqual(["severity"]);
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
+  it("omits a namespace carrying a value longer than the store keeps", () => {
+    // Dropping the value alone would narrow the criterion past the approvals that carried it, so the
+    // whole namespace goes.
+    const long = "v".repeat(POLICY_TEXT_MAX.value + 1);
+    const board = [
+      ...many(5, () => approved({ labels: [`kind:${long}`, "severity:major"] })),
+      unapproved({ labels: ["kind:other", "severity:minor"] }),
+    ];
+    const { policy } = calibratePolicy(board);
+    expect(policy.labels?.map((c) => c.namespace)).toEqual(["severity"]);
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
+  it("omits types when an approved issue type is longer than the store keeps", () => {
+    const board = many(5, () => approved({ issue_type: "t".repeat(POLICY_TEXT_MAX.type + 1) }));
+    const { policy } = calibratePolicy(board);
+    expect(policy.types).toBeUndefined();
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
   it("omits a priority floor bd's own scale does not carry", () => {
     const board = many(5, () => approved({ priority: 9 }));
     const { policy } = calibratePolicy(board);
@@ -279,6 +310,25 @@ describe("POLICY_BOUND_MAX is the schema's ceiling", () => {
   it.each(cases)("accepts %s at the ceiling and rejects one above it", (field, ceiling) => {
     expect(pickerPolicySchema.safeParse({ [field]: ceiling }).success).toBe(true);
     expect(pickerPolicySchema.safeParse({ [field]: ceiling + 1 }).success).toBe(false);
+  });
+});
+
+/**
+ * The string ceilings live beside the count ceilings for the same reason: the calibrator and the
+ * editor both author against them, and one that drifted from the schema's would put the panel back
+ * where it started — previewing a policy the accept can only come back from as a 400.
+ */
+describe("POLICY_TEXT_MAX is the schema's ceiling", () => {
+  const at = (n: number) => "x".repeat(n);
+  const cases = [
+    ["types", POLICY_TEXT_MAX.type, (v: string) => ({ types: [v] })],
+    ["a namespace", POLICY_TEXT_MAX.namespace, (v: string) => ({ labels: [{ namespace: v, values: ["a"] }] })],
+    ["a value", POLICY_TEXT_MAX.value, (v: string) => ({ labels: [{ namespace: "ns", values: [v] }] })],
+  ] as const;
+
+  it.each(cases)("accepts %s at the ceiling and rejects one above it", (_what, ceiling, build) => {
+    expect(pickerPolicySchema.safeParse(build(at(ceiling))).success).toBe(true);
+    expect(pickerPolicySchema.safeParse(build(at(ceiling + 1))).success).toBe(false);
   });
 });
 

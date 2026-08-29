@@ -173,6 +173,18 @@ export const POLICY_CRITERION_VALUES_MAX = 32;
 export const POLICY_LABEL_CRITERIA_MAX = 16;
 
 /**
+ * How long each authored string may be, for the same reason as the counts above: the schema bounds
+ * a type, a namespace and a value, and a draft or an editor that offers a longer one spends the
+ * operator's accept on a 400 the panel cannot explain. A board label past these lengths is a
+ * sentence, not a vocabulary.
+ */
+export const POLICY_TEXT_MAX = {
+  type: 40,
+  namespace: 60,
+  value: 120,
+} as const;
+
+/**
  * anton's OWN bookkeeping namespaces — where anton has already put a bead, not what an operator
  * judged worth starting. Excluded everywhere a criterion is authored (the calibrated draft and the
  * editor alike): a policy over `stage:` or `review-score:` is the machine quoting itself back, and

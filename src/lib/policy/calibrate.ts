@@ -29,6 +29,7 @@ import {
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
   POLICY_PRIORITY_MAX,
+  POLICY_TEXT_MAX,
   POLICY_TYPES_MAX,
   namespaceOf,
   valueOf,
@@ -59,19 +60,30 @@ export const FALLBACK_POLICY: Policy = {
 const MAX_CITED = 4;
 
 /**
- * The ceilings `pickerPolicySchema` enforces at the API boundary, every one of them read from the
- * shared constants the schema itself is built from — a limit copied here as a literal would drift the
- * day the schema's moved. A draft that crosses one is worse than no draft: the operator clicks accept
- * and gets a 400 they cannot resolve from the panel. So a criterion that would cross a ceiling is
- * OMITTED rather than clamped — clamping would narrow the proposal until it refused the very
- * approvals it was read from, which is the one thing this derivation promises never to do.
+ * The ceilings `pickerPolicySchema` enforces at the API boundary — counts AND string lengths, every
+ * one of them read from the shared constants the schema itself is built from, since a limit copied
+ * here as a literal would drift the day the schema's moved. A draft that crosses one is worse than
+ * no draft: the operator clicks accept and gets a 400 they cannot resolve from the panel. So a
+ * criterion that would cross a ceiling is OMITTED rather than clamped — clamping would narrow the
+ * proposal until it refused the very approvals it was read from, which is the one thing this
+ * derivation promises never to do.
  */
 const SCHEMA_LIMITS = {
   types: POLICY_TYPES_MAX,
   priority: POLICY_PRIORITY_MAX,
   criterionValues: POLICY_CRITERION_VALUES_MAX,
   labelCriteria: POLICY_LABEL_CRITERIA_MAX,
+  text: POLICY_TEXT_MAX,
 } as const;
+
+/**
+ * Whether the store would keep this string as written. Lengths are measured TRIMMED because the
+ * schema trims before it bounds, so that is the string the API actually judges.
+ */
+function storable(text: string, max: number): boolean {
+  const trimmed = text.trim();
+  return trimmed.length >= 1 && trimmed.length <= max;
+}
 
 export type { PolicyCriterionKey };
 
@@ -143,7 +155,10 @@ export function calibratePolicy(board: readonly Bead[]): PolicyDraft {
   const approvedTypes = approvals.map((b) => b.issue_type);
   if (approvedTypes.every((t): t is string => !!t)) {
     const types = [...new Set(approvedTypes)].sort();
-    if (types.length <= SCHEMA_LIMITS.types) {
+    // A type the store would not keep cannot be dropped from the membership set without excluding
+    // the approval that carried it, so the criterion goes instead (see SCHEMA_LIMITS).
+    const storableTypes = types.every((t) => storable(t, SCHEMA_LIMITS.text.type));
+    if (types.length <= SCHEMA_LIMITS.types && storableTypes) {
       policy.types = types;
       rationale.push({
         criterion: "types",
@@ -226,6 +241,7 @@ function labelCriteria(approvals: readonly Bead[], board: readonly Bead[]): Poli
 
   const criteria: PolicyLabelCriterion[] = [];
   for (const namespace of [...namespaces].sort()) {
+    if (!storable(namespace, SCHEMA_LIMITS.text.namespace)) continue;
     if (!approvals.every((b) => hasNamespace(b, namespace))) continue;
     const approved = valuesUnder(approvals, namespace);
     const onBoard = valuesUnder(board, namespace);
@@ -233,7 +249,11 @@ function labelCriteria(approvals: readonly Bead[], board: readonly Bead[]): Poli
     // More approved values than one criterion may carry: the namespace cannot be stated without
     // excluding an approval, so it is not stated (see SCHEMA_LIMITS).
     if (approved.size > SCHEMA_LIMITS.criterionValues) continue;
-    criteria.push({ namespace, values: [...approved].sort() });
+    // Same for a value the store would not keep: dropping it would narrow the criterion past an
+    // approval it was read from, so the whole namespace is omitted rather than stated short.
+    const values = [...approved].sort();
+    if (!values.every((v) => storable(v, SCHEMA_LIMITS.text.value))) continue;
+    criteria.push({ namespace, values });
   }
 
   if (criteria.length <= SCHEMA_LIMITS.labelCriteria) return criteria;

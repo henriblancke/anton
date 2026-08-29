@@ -32,6 +32,7 @@ import {
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
   POLICY_PRIORITY_MAX,
+  POLICY_TEXT_MAX,
   POLICY_TYPES_MAX,
   type Policy,
 } from "./policy/types";
@@ -573,7 +574,7 @@ export function resolveValueLabels(settings: ProjectSettings): string[] {
  */
 export const pickerPolicySchema = z
   .object({
-    types: z.array(z.string().trim().min(1).max(40)).min(1).max(POLICY_TYPES_MAX),
+    types: z.array(z.string().trim().min(1).max(POLICY_TEXT_MAX.type)).min(1).max(POLICY_TYPES_MAX),
     // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent, so `max` is
     // the floor and `min` the ceiling.
     maxPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
@@ -589,17 +590,23 @@ export const pickerPolicySchema = z
       .array(
         z
           .object({
-            namespace: z.string().trim().min(1).max(60),
+            namespace: z.string().trim().min(1).max(POLICY_TEXT_MAX.namespace),
             // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
             // why nothing on this path sorts them.
-            values: z.array(z.string().trim().min(1).max(120)).min(1).max(POLICY_CRITERION_VALUES_MAX),
+            values: z
+              .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.value))
+              .min(1)
+              .max(POLICY_CRITERION_VALUES_MAX),
             ranked: z.boolean().optional(),
             // A `≤`/`≥` over that ranking. Rejected without `ranked`, and rejected when it names a
             // value the ranking does not carry: the predicate fails such a criterion CLOSED against
             // every bead (R2.5), so persisting one would arm a policy that admits nothing and says
             // so only per bead.
             compare: z
-              .object({ op: z.enum(["lte", "gte"]), value: z.string().trim().min(1).max(120) })
+              .object({
+                op: z.enum(["lte", "gte"]),
+                value: z.string().trim().min(1).max(POLICY_TEXT_MAX.value),
+              })
               .strict()
               .optional(),
           })
