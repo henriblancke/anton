@@ -1484,6 +1484,61 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("2 signature");
     });
 
+    // A closing line may open AND close the body on the spot — `) { return execute(); }`. That body
+    // runs, so the line is code; an object RETURN TYPE brace on the same line still opens nothing.
+    it("counts an inline body on the closing parameter line as code, past a return type brace", async () => {
+      const repo = writeRepo({
+        "src/inline.ts": [
+          "export function inline(",
+          "  left: number,",
+          "  right: number,",
+          ") { return left + right; }",
+          "",
+        ].join("\n"),
+        "src/typed.ts": [
+          "export function typed(",
+          "  left: number,",
+          "  right: number,",
+          "): { ok: boolean } {",
+          "  return { ok: true };",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/inline.ts", 3]], 2),
+        clone([["src/typed.ts", 3]], 2),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/inline.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/typed.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("2 signature");
+    });
+
+    // A brace inside a TRAILING block comment is not nesting. Counting it would leave the import
+    // open over everything below, filing the file's real statements as specifier lines.
+    it("closes an import whose line ends in a block comment holding a brace", async () => {
+      const repo = writeRepo({
+        "src/trailing.ts": [
+          'import { join } from "node:path"; /* keep { aligned */',
+          "export function boot(root: string) {",
+          "  return join(root, 'anton');",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/trailing.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/trailing.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // An import that binds nothing is there for its side effect: it registers, patches, polyfills.
     // A window of those repeats real load-time work, so it is not filed with the specifier lists.
     it("keeps a window of side-effect imports and still drops one of bound specifiers", async () => {

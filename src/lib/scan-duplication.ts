@@ -127,14 +127,20 @@ const ARROW_START = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*
 const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+)?;$/;
 
 /**
- * Strip what would confuse brace counting: line comments and string bodies. Crude on purpose — the
- * only thing riding on it is where a multi-line import or type declaration ends, and an unbalanced
- * count there classifies a line as `type`/`import` rather than dropping anything on its own.
+ * Strip what would confuse brace counting: comments and string bodies. Block comments go too, and
+ * not only the ones a line opens with — a declaration closed by a trailing block comment holding a
+ * brace would otherwise have that brace counted, keeping the import open over every function below
+ * it. Strings are blanked first, so a comment opener inside one is not read as a comment. Crude on
+ * purpose — the only thing riding on it is where a multi-line import or type declaration ends, and
+ * an unbalanced count there classifies a line as `type`/`import` rather than dropping anything on
+ * its own.
  */
 function stripNoise(line: string): string {
   return line
     .replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/g, '""')
-    .replace(/\/\/.*$/, "");
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/.*$/, "")
+    .replace(/\/\*.*$/, "");
 }
 
 /** Net nesting a line opens, over the brackets given — `stripNoise`d, so a brace in a string is not one. */
@@ -237,6 +243,19 @@ function hasArrowBody(tail: string): boolean {
 }
 
 /**
+ * Whether the closing line of a parameter list also RUNS something — either as an expression body,
+ * or as a braced body opened and closed on the same line (`) { return execute(); }`). The brace read
+ * is the LAST one on the tail, so an object return type (`): { ok: boolean } {`) is passed over and
+ * the body it opens is the one measured.
+ */
+function hasInlineBody(tail: string): boolean {
+  if (hasArrowBody(tail)) return true;
+  const brace = tail.lastIndexOf("{");
+  if (brace < 0) return false;
+  return tail.slice(brace + 1).replace(/[});,\s]+$/, "").trim() !== "";
+}
+
+/**
  * What is left of a line once the block comments it OPENS are stripped — `""` when the line is
  * nothing but comment, `undefined` when the comment runs past it. A line that closes its comment
  * and then calls something still executes, so the suffix is classified rather than read as prose.
@@ -334,7 +353,7 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         classes.push(
           arrow === "absent" ||
             hasParameterDefault(line) ||
-            (closes && tail !== undefined && hasArrowBody(tail))
+            (closes && tail !== undefined && hasInlineBody(tail))
             ? "code"
             : "signature",
         );
