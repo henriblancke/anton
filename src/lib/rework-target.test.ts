@@ -139,12 +139,9 @@ describe("resolveReworkScope", () => {
       makeBead({ id: "feat", issue_type: "feature", parent: "container" }),
       ticketA(),
     );
-    await expect(resolveReworkScope(project, "container", "t1")).rejects.toBeInstanceOf(
-      ReworkNotAllowedError,
-    );
-    await expect(resolveReworkScope(project, "container", "t1")).rejects.toThrow(
-      /not a run target/,
-    );
+    const rejected = resolveReworkScope(project, "container", "t1");
+    await expect(rejected).rejects.toBeInstanceOf(ReworkNotAllowedError);
+    await expect(rejected).rejects.toThrow(/not a run target/);
   });
 
   it("422s a child ticket named as the target — its run is the feature above it", async () => {
@@ -153,12 +150,9 @@ describe("resolveReworkScope", () => {
 
   it("422s a ticket that belongs to another run target", async () => {
     board(feature(), ticketA(), makeBead({ id: "stranger" }));
-    await expect(resolveReworkScope(project, "feat", "stranger")).rejects.toBeInstanceOf(
-      ReworkNotAllowedError,
-    );
-    await expect(resolveReworkScope(project, "feat", "stranger")).rejects.toThrow(
-      /not part of feat's run/,
-    );
+    const rejected = resolveReworkScope(project, "feat", "stranger");
+    await expect(rejected).rejects.toBeInstanceOf(ReworkNotAllowedError);
+    await expect(rejected).rejects.toThrow(/not part of feat's run/);
   });
 
   it("409s once the pair is known good and a run holds the target", async () => {

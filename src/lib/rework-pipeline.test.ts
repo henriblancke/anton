@@ -253,12 +253,9 @@ describe("snapshotBeforeWrites", () => {
   it("refuses a 409 before ANY write when the PR stopped being open under the request", async () => {
     showMock.mockImplementation(async (_cwd, id) => makeBead({ id, metadata: { pr: "gh-42" } }));
     prStateMock.mockResolvedValue("merged");
-    await expect(snapshotBeforeWrites("/repo", feature(), ticket(), false)).rejects.toBeInstanceOf(
-      ReworkConflictError,
-    );
-    await expect(snapshotBeforeWrites("/repo", feature(), ticket(), false)).rejects.toThrow(
-      /nothing was written/,
-    );
+    const rejected = snapshotBeforeWrites("/repo", feature(), ticket(), false);
+    await expect(rejected).rejects.toBeInstanceOf(ReworkConflictError);
+    await expect(rejected).rejects.toThrow(/nothing was written/);
     for (const write of allWrites) expect(write).not.toHaveBeenCalled();
   });
 
