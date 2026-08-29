@@ -119,6 +119,23 @@ describe("finalizeMergedEpic", () => {
       { op: "close", id: "epic-1" },
     ]);
   });
+
+  it("closes a delivered dependent whose close write failed, repairing it", async () => {
+    // t1 timed out AFTER committing, so the run carried on and t2 ran and committed too — but t2's
+    // best-effort `beads.close` failed, leaving it claimed and `in_progress`. The merge is what
+    // repairs that, so t2 (and t3 behind it) must close rather than be read as never-dispatched.
+    await finalize(bead("epic-1"), [
+      bead("t1", "blocked"),
+      waitsOn("t2", "t1", "in_progress"),
+      waitsOn("t3", "t2"),
+    ]);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([
+      { op: "close", id: "t2" },
+      { op: "close", id: "t3" },
+      { op: "close", id: "epic-1" },
+    ]);
+  });
 });
 
 describe("undeliveredAtMerge", () => {
@@ -136,6 +153,19 @@ describe("undeliveredAtMerge", () => {
   it("stops at a closed dependent — its commit is on the branch whatever its blocker did", () => {
     // t2 committed before t1's budget ran out, so t3 has the mechanism it was written against.
     const children = [bead("t1", "blocked"), waitsOn("t2", "t1", "closed"), waitsOn("t3", "t2")];
+
+    expect(undeliveredAtMerge(children)).toEqual(new Set(["t1"]));
+  });
+
+  it("stops at an in_progress dependent — it committed, only its close write failed", () => {
+    // A blocker that timed out after its commit doesn't stop the run, so t2 was dispatched and
+    // committed; `beads.close` is best-effort, so a transient bd failure is all that stands between
+    // it and `closed`. Neither it nor t3 behind it is undelivered work.
+    const children = [
+      bead("t1", "blocked"),
+      waitsOn("t2", "t1", "in_progress"),
+      waitsOn("t3", "t2"),
+    ];
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1"]));
   });

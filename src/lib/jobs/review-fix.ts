@@ -473,6 +473,9 @@ async function notifyReReview(args: {
 
 // ── merge finalization (anton-ner.5) ──
 
+/** A child whose commit is on the branch — `in_progress` included, see {@link undeliveredAtMerge}. */
+const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
+
 /**
  * The children a merged target must NOT close — the tickets its run deliberately left for a human
  * (anton-67xj.1). A merge says the branch shipped, not that every ticket under the target ran, and
@@ -480,14 +483,20 @@ async function notifyReReview(args: {
  * reads as delivered.
  *
  * Two shapes, one rule. A ticket the run BLOCKED says so in its status — its budget ran out and its
- * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. A ticket that
- * merely WAITS on one of those was never dispatched (anton-67xj) and stays `open` so the board keeps
- * offering it, so nothing but the `blocks` edge distinguishes it from an ordinary open child. Hence
- * the transitive closure over the run's own `blocks` edges: work that builds on work no branch
- * carries cannot itself have shipped.
+ * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. Two narrower
+ * sub-shapes — a timeout that fired after the commit, and a post-commit failure — do leave work on
+ * the branch; they are held back for the same reason all the same, because their note asks a human
+ * to review and close by hand, not because nothing landed. A ticket that merely WAITS on a blocked
+ * one was never dispatched (anton-67xj) and stays `open` so the board keeps offering it, so nothing
+ * but the `blocks` edge distinguishes it from an ordinary open child. Hence the transitive closure
+ * over the run's own `blocks` edges.
  *
- * A CLOSED dependent stops the walk. Its commit is on the branch whatever its blocker did, so it
- * shipped — and the tickets behind it have the mechanism they were written against.
+ * A DELIVERED dependent stops the walk. Its commit is on the branch whatever its blocker did — the
+ * run carries on past a timeout, so a ticket behind one still gets dispatched — and the tickets
+ * behind IT have the mechanism they were written against. Delivery is `closed`, or `in_progress`:
+ * a child's close write is best-effort (execute-epic), so a transient bd failure leaves a ticket
+ * that committed claimed and mid-stage. Reading that bookkeeping failure as "never ran" would
+ * strand shipped work open, when the merge is precisely what repairs it.
  */
 export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const byId = new Map(children.map((c) => [c.id, c]));
@@ -502,7 +511,7 @@ export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const queue = [...keep];
   while (queue.length) {
     for (const dependent of dependents.get(queue.shift()!) ?? []) {
-      if (keep.has(dependent) || byId.get(dependent)?.status === "closed") continue;
+      if (keep.has(dependent) || DELIVERED_AT_MERGE.has(byId.get(dependent)?.status ?? "")) continue;
       keep.add(dependent); // never revisited, so a cycle terminates
       queue.push(dependent);
     }
