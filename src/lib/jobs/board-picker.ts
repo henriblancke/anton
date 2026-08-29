@@ -21,9 +21,10 @@
  */
 import { loadAllIssues } from "../beads/issues";
 import { saveBoardPickerPlan } from "../board-picker-plan";
-import { getProjectById } from "../projects";
+import { getProjectById, getProjectSettings, resolvePickerPolicy } from "../projects";
 import { PoisonError } from "./errors";
 import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./picker-decision";
+import { armedPickerPolicy } from "./picker-policy";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
 
@@ -57,9 +58,14 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // record a plan that excludes half the board as `blocked`. A rejection retries the pass instead.
     const board = await loadAllIssues(project.repoPath, { strictGates: true });
 
+    // The policy the operator accepted in settings, applied to the plan this pass records: a panel
+    // that says a policy is armed while the plan admits everything is advertising a boundary anton
+    // does not keep. An unarmed project keeps the structural default — the pass starts nothing, so
+    // an unnarrowed plan is a ranking, not an autopilot.
+    const armed = resolvePickerPolicy(await getProjectSettings(db, projectId));
     const decision = decideBoardPickerPlan({
       board,
-      policy: ADMIT_ALL_POLICY,
+      policy: armed ? armedPickerPolicy(armed, board, new Date(observedAtMs)) : ADMIT_ALL_POLICY,
       runtime: { observedAtMs },
     });
 

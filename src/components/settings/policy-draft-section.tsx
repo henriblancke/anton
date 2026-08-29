@@ -23,8 +23,14 @@ import { CSS } from "@dnd-kit/utilities";
 import { GripVerticalIcon } from "lucide-react";
 
 import type { Project } from "@/lib/types";
-import { namespaceOf, valueOf, type Policy, type PolicyLabelCriterion } from "@/lib/policy/types";
-import { partitionByPolicy, type PolicyCandidate } from "@/lib/policy/match";
+import {
+  namespaceOf,
+  valueOf,
+  type Policy,
+  type PolicyLabelCriterion,
+  type PolicyRankComparison,
+} from "@/lib/policy/types";
+import { admittedValues, partitionByPolicy, type PolicyCandidate } from "@/lib/policy/match";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
@@ -79,7 +85,7 @@ const MAX_LISTED = 40;
  *
  * And every edit answers itself. Criteria fail closed (R2.5), so a policy naming a label this board
  * does not use admits NOTHING — on screen indistinguishable from a broken pass unless the panel says
- * otherwise. So the count of matching open beads moves with the control being edited, "see them"
+ * otherwise. So the count of matching startable targets moves with the control being edited, "see them"
  * proves it, and every bead the policy refused can name the criterion that refused it (R2.6).
  *
  * The criteria themselves are GENERATED (R2.2): the bd-native fields, plus one group per `ns:`
@@ -97,6 +103,7 @@ export function PolicyDraftSection({
   labelVocabulary,
   rankingCandidates = [],
   candidates = [],
+  notStartable = 0,
   boardUnavailable = false,
 }: {
   project: Project;
@@ -113,8 +120,14 @@ export function PolicyDraftSection({
    * ones offered a ranking control, since "rank these" means nothing on a `team:` or `component:`.
    */
   rankingCandidates?: string[];
-  /** Every OPEN run target on the board, projected server-side, so the match count moves without a fetch. */
+  /**
+   * Every STARTABLE run target on the board, projected server-side, so the match count moves without
+   * a fetch. Startable rather than merely open: the picker refuses a claimed, blocked or unshaped
+   * target before any policy is consulted, so counting one here would claim work anton cannot start.
+   */
   candidates?: PolicyCandidate[];
+  /** Open run targets the structural gate refused — the rest of the board, explained, not hidden. */
+  notStartable?: number;
   /**
    * The board read FAILED — the vocabulary, the draft and the candidates below are all empty because
    * bd could not be read, not because the project is empty. Arming off that would store a policy
@@ -184,6 +197,23 @@ export function PolicyDraftSection({
       ...(current?.ranked ? { ranked: true } : {}),
       ...(keepsCompare ? { compare } : {}),
     });
+  };
+
+  /**
+   * The bound over a hand-ranking (R2.3) — `severity ≤ major`. Refused without a ranking to compare
+   * against: a comparison with no scale behind it refuses every bead (R2.5) and the store rejects
+   * it, so it is never a state this editor can reach.
+   */
+  const setCompare = (namespace: string, compare: PolicyRankComparison | undefined) => {
+    const current = criterionFor(namespace);
+    if (!current?.ranked) return;
+    if (compare && !current.values.includes(compare.value)) return;
+    putCriterion(
+      namespace,
+      compare
+        ? { ...current, compare }
+        : { namespace: current.namespace, values: current.values, ranked: true },
+    );
   };
 
   const setRanked = (namespace: string, ranked: boolean) => {
@@ -446,6 +476,7 @@ export function PolicyDraftSection({
               why={why(`labels:${group.namespace}`)}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
               onRanked={(ranked) => setRanked(group.namespace, ranked)}
+              onCompare={(compare) => setCompare(group.namespace, compare)}
               onClear={() => putCriterion(group.namespace, undefined)}
             />
           ))}
@@ -459,18 +490,27 @@ export function PolicyDraftSection({
               />
               <span className="text-[11.5px] text-subtle">skip targets with an unmet blocker</span>
             </div>
+            <p className="text-[11px] text-subtle">
+              A target held by an open blocker is already refused before the policy is applied, so
+              this states a rule anton keeps either way — the count below will not move with it.
+            </p>
           </Criterion>
         </div>
       </DndContext>
 
       {!boardUnavailable && (
-        <MatchPanel matched={matched} excluded={excluded} total={candidates.length} />
+        <MatchPanel
+          matched={matched}
+          excluded={excluded}
+          total={candidates.length}
+          notStartable={notStartable}
+        />
       )}
 
       {unconstrained && !boardUnavailable && (
         <p className="max-w-2xl rounded-[10px] border border-risk-med/28 bg-risk-med/10 px-3 py-2 text-[11.5px] leading-relaxed text-foreground">
-          This policy asserts no criteria — it admits every open run target on this board. Arming it
-          places no constraint on what anton starts.
+          This policy asserts no criteria — it admits every startable run target on this board. Arming
+          it places no constraint on what anton starts.
         </p>
       )}
 
@@ -511,6 +551,14 @@ function isUnconstrained(policy: Policy): boolean {
 }
 
 /**
+ * The open run targets the structural gate refused, said in the operator's terms. Named rather than
+ * silently dropped: a denominator smaller than the board reads as a board with less work on it.
+ */
+function withheld(count: number): string {
+  return `${count} more open run target${count === 1 ? " is" : "s are"} not startable right now — already claimed, held by a blocker, or short of the approve contract — so the policy is never asked about ${count === 1 ? "it" : "them"}.`;
+}
+
+/**
  * What the policy admits right now, and — the load-bearing half — what it refused and why (R2.6).
  *
  * A zero here is the expected first answer on a repo whose conventions anton has never seen, so it
@@ -520,25 +568,34 @@ function MatchPanel({
   matched,
   excluded,
   total,
+  notStartable,
 }: {
   matched: PolicyCandidate[];
   excluded: { candidate: PolicyCandidate; failed: { label: string; reason: string }[] }[];
   total: number;
+  notStartable: number;
 }) {
   if (total === 0) {
     return (
       <p className="max-w-2xl text-[11.5px] text-subtle">
-        No open beads on this board to match against yet.
+        Nothing on this board is startable right now, so there is nothing for the policy to match
+        against yet.
+        {notStartable > 0 && ` ${withheld(notStartable)}`}
       </p>
     );
   }
 
   return (
     <div className="flex max-w-2xl flex-col gap-2 rounded-[10px] border border-border bg-card px-3 py-2.5">
+      {/* The denominator is the STARTABLE set, not the open board: the picker never asks the policy
+          about a target it has already refused, so counting those would claim available work anton
+          has none of. */}
       <p className="text-[12.5px] text-foreground" role="status" aria-live="polite">
-        <span className="font-semibold">{matched.length}</span> of {total} open beads match this
-        policy
+        <span className="font-semibold">{matched.length}</span> of {total} startable run target
+        {total === 1 ? "" : "s"} match this policy
       </p>
+
+      {notStartable > 0 && <p className="text-[11px] text-subtle">{withheld(notStartable)}</p>}
 
       {matched.length === 0 && (
         <p className="text-[11px] leading-relaxed text-subtle">
@@ -617,6 +674,7 @@ function NamespaceCriterion({
   why,
   onToggleValue,
   onRanked,
+  onCompare,
   onClear,
 }: {
   group: LabelNamespace;
@@ -626,6 +684,7 @@ function NamespaceCriterion({
   why?: PolicyRationale;
   onToggleValue: (value: string) => void;
   onRanked: (ranked: boolean) => void;
+  onCompare: (compare: PolicyRankComparison | undefined) => void;
   onClear: () => void;
 }) {
   const selected = criterion?.values ?? [];
@@ -673,7 +732,7 @@ function NamespaceCriterion({
         </div>
       )}
 
-      {ranked && selected.length > 1 && (
+      {ranked && criterion && selected.length > 1 && (
         <>
           <SortableContext
             items={selected.map((v) => `${group.namespace}:${v}`)}
@@ -690,17 +749,78 @@ function NamespaceCriterion({
               ))}
             </ol>
           </SortableContext>
-          {/* Said out loud rather than implied: the order round-trips, but admission is still
-              membership until a bound over the ranking exists (R2.3). An operator who dragged
-              `critical` to the top would otherwise believe it now outranks the rest. */}
-          <p className="text-[11px] text-subtle">
-            The order is stored, but it does not yet change which beads are admitted — every selected
-            value still matches. A bound over your ranking (&ldquo;at or before major&rdquo;) is the
-            next step.
-          </p>
+          <RankBound namespace={group.namespace} criterion={criterion} onChange={onCompare} />
         </>
       )}
     </Criterion>
+  );
+}
+
+/**
+ * The bound over a hand-ranking — the ONE way a discovered namespace gains an order (R2.3), and only
+ * because the operator declared both the ranking and the bound. Offered only where a ranking exists,
+ * because a comparison without one can be evaluated against nothing and refuses every bead (R2.5).
+ *
+ * Choosing an op never narrows on its own: it lands on the end of the ranking that admits everything
+ * already selected, so the policy changes when the operator moves the bound rather than when they
+ * reach for the control.
+ */
+function RankBound({
+  namespace,
+  criterion,
+  onChange,
+}: {
+  namespace: string;
+  criterion: PolicyLabelCriterion;
+  onChange: (compare: PolicyRankComparison | undefined) => void;
+}) {
+  const values = criterion.values;
+  const compare = criterion.compare;
+  // Never undefined here: the criterion is ranked and its bound is one of its own values.
+  const admitted = admittedValues(criterion) ?? values;
+
+  const setOp = (op: string) => {
+    if (!op) return onChange(undefined);
+    const widest = op === "lte" ? values[values.length - 1] : values[0];
+    onChange({ op: op as PolicyRankComparison["op"], value: compare?.value ?? widest });
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap items-center gap-2 text-[11.5px] text-subtle">
+        admit
+        <select
+          aria-label={`Bound ${namespace}: by rank`}
+          value={compare?.op ?? ""}
+          onChange={(e) => setOp(e.target.value)}
+          className={BOUND_CLASS}
+        >
+          <option value="">every selected value</option>
+          <option value="lte">at or before</option>
+          <option value="gte">at or after</option>
+        </select>
+        {compare && (
+          <select
+            aria-label={`Bound ${namespace}: at`}
+            value={compare.value}
+            onChange={(e) => onChange({ op: compare.op, value: e.target.value })}
+            className={BOUND_CLASS}
+          >
+            {values.map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
+        )}
+        in this ranking
+      </div>
+      <p className="text-[11px] text-subtle">
+        {compare
+          ? `Admits ${namespace}:${admitted.join(`, ${namespace}:`)} — the rest of the ranking is left for a human.`
+          : "The order is stored, but every selected value still matches. Bound it to admit only part of the ranking."}
+      </p>
+    </div>
   );
 }
 

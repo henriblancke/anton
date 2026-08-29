@@ -73,10 +73,12 @@ export default async function ProjectSettingsPage({
   // rendered, never stored, until the operator accepts it.
   const policyDraft = calibratePolicy(beads);
   const issueTypes = boardIssueTypes(beads);
-  // Every open RUN TARGET, flattened to what the predicate reads, so the editor's match count and
-  // its per-bead "why not?" answer in the browser as the operator edits (anton-qsr1). Off the same
-  // snapshot — no extra board call.
-  const candidates = policyCandidates(beads);
+  // Every STARTABLE run target, flattened to what the predicate reads, so the editor's match count
+  // and its per-bead "why not?" answer in the browser as the operator edits (anton-qsr1). Startable
+  // is the picker's own gate, so the panel counts the set a policy actually chooses from; the rest
+  // of the open run targets arrive as a count the panel explains. Off the same snapshot — no extra
+  // board call.
+  const { candidates, notStartable } = policyCandidates(beads);
 
   // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
   // arming needs, and the one no setting lifts. Derived here rather than in the form because the
@@ -107,6 +109,7 @@ export default async function ProjectSettingsPage({
       issueTypes={issueTypes}
       policyDraft={policyDraft}
       policyCandidates={candidates}
+      policyNotStartable={notStartable}
       boardUnavailable={!board.ok}
       earned={earned}
     />

@@ -576,6 +576,7 @@ export function SettingsView({
   issueTypes,
   policyDraft,
   policyCandidates,
+  policyNotStartable,
   boardUnavailable,
   earned,
 }: {
@@ -607,11 +608,13 @@ export function SettingsView({
    */
   policyDraft: PolicyDraft;
   /**
-   * Every OPEN bead on this board, projected to what the policy predicate reads (anton-qsr1). Passed
-   * whole so the panel's match count and per-bead "why not?" recompute in the browser as criteria
-   * change — a fetch per edit would make the count lag the control that explains it.
+   * Every STARTABLE target on this board, projected to what the policy predicate reads (anton-qsr1).
+   * Passed whole so the panel's match count and per-bead "why not?" recompute in the browser as
+   * criteria change — a fetch per edit would make the count lag the control that explains it.
    */
   policyCandidates: PolicyCandidate[];
+  /** Open run targets refused before the policy, so the panel can explain its own denominator. */
+  policyNotStartable: number;
   /**
    * The board read failed, so everything derived from it above is empty by accident rather than by
    * fact. The work policy panel refuses to arm off that.
@@ -2056,6 +2059,7 @@ export function SettingsView({
               labelVocabulary={labelVocabulary}
               rankingCandidates={rankingCandidates}
               candidates={policyCandidates}
+              notStartable={policyNotStartable}
               boardUnavailable={boardUnavailable}
             />
           )}

@@ -3,63 +3,69 @@
  *
  * The split exists so the evaluator ({@link ./match}) can stay client-safe: it must run on every
  * criterion edit, which means it runs in the browser, which means it cannot reach the bd reader.
- * Everything that needs the board — the `blocks` graph above all — is resolved here, once, on the
- * server that already holds the snapshot.
+ * Everything that needs the board is resolved here, once, on the server that already holds the
+ * snapshot.
  *
- * OPEN RUN TARGETS only. A closed or in-flight bead is not work a policy could admit, and neither is
- * a container epic, a child ticket or pipeline plumbing — the picker can never start one, so counting
- * them would inflate the one number the panel exists to make honest. The gate is
- * {@link beads.isRunTarget}, the same predicate the approve route and execute-epic use, so the
- * panel's denominator is exactly the set a policy chooses from.
+ * The projected set is the STRUCTURALLY ELIGIBLE one — {@link eligibleTargets}, the same gate the
+ * board-picker narrows with the policy — not merely the open run targets. A target that is already
+ * claimed, abandoned, held by a blocker or short of the approve contract is refused before any
+ * policy is consulted, so counting it would inflate the one number the panel exists to make honest:
+ * the panel would claim available work where the picker has none. The rest of the open run targets
+ * are reported as {@link PolicyProjection.notStartable} instead, so the shrunken denominator is
+ * explained rather than silently smaller than the board.
  *
  * `now` is a PARAMETER because age is the one candidate field that is not a property of the board:
  * reading the clock inside the predicate would make it impure and its tests time-dependent, so the
  * clock is read once, here, and each bead carries the age it had when the board was projected.
  */
 import { beads } from "../beads/bd";
-import { computeEpicGraph, isUnit, standaloneBlockers } from "../epic-graph";
+import { eligibleTargets } from "../jobs/picker-targets";
 import type { Bead } from "../beads/types";
 import type { PolicyCandidate } from "./match";
+
+/** The startable set a policy chooses from, plus what never reaches it. */
+export interface PolicyProjection {
+  /** Exactly the targets the picker evaluates the policy over, in board order. */
+  candidates: PolicyCandidate[];
+  /**
+   * Open run targets refused before the policy: claimed, abandoned, blocked, or not shaped to run.
+   * A count rather than a list — the panel explains the denominator with it; the Up Next lane, which
+   * reads the recorded plan, is where each refusal is named.
+   */
+  notStartable: number;
+}
 
 /**
  * Pure over a board snapshot a caller already holds — no bd spawn.
  *
- * Blockedness is derived the way the approve route derives it, so the editor's "has an unmet
- * blocker" can never disagree with what will actually refuse to start. A unit (epic or feature) is
- * blocked when its rollup has ZERO dispatchable tickets — a blocker on one child holds that child,
- * not the whole target — while a standalone task/bug is gated on its own `blocks` edges via
- * {@link standaloneBlockers}. That rule walks the whole board per call, so it is asked only about
- * beads a `blocks` edge names: the difference between one pass and hundreds.
+ * Eligibility is derived the way the approve route and the picker derive it, through
+ * {@link eligibleTargets}, so the editor can never disagree with what will actually refuse to start.
+ * That gate already withholds every target held by an open blocker, which is why nothing here marks
+ * blockedness: within this set {@link PolicyCandidate.blocked} is false by construction.
  */
-export function policyCandidates(board: readonly Bead[], now: Date = new Date()): PolicyCandidate[] {
+export function policyCandidates(board: readonly Bead[], now: Date = new Date()): PolicyProjection {
   const all = board as Bead[];
-  const dependents = new Set(
-    beads.edgesOf(all).filter((e) => e.type === "blocks").map((e) => e.from),
-  );
   const byId = new Map(all.map((b) => [b.id, b]));
-  // One rollup for every unit on the board, so a feature held by a blocker on one of its own
-  // children reads blocked here exactly as it would at approve time.
-  const readiness = new Map(computeEpicGraph(all).epics.map((n) => [n.id, n.childReadiness]));
+  const { eligible } = eligibleTargets(all);
+  const openTargets = all.filter((b) => b.status === "open" && beads.isRunTarget(b, all));
 
-  return all
-    .filter((b) => b.status === "open" && beads.isRunTarget(b, all))
-    .map((b) => {
-      const blocked = isUnit(b)
-        ? readiness.get(b.id) === "blocked"
-        : dependents.has(b.id) && standaloneBlockers(all, b.id).length > 0;
-      const depth = parentDepth(b, byId);
-      const ageDays = ageInDays(b, now);
-      return {
-        id: b.id,
-        title: b.title,
-        ...(b.issue_type ? { type: b.issue_type } : {}),
-        ...(typeof b.priority === "number" ? { priority: b.priority } : {}),
-        ...(typeof depth === "number" ? { depth } : {}),
-        ...(typeof ageDays === "number" ? { ageDays } : {}),
-        labels: b.labels ?? [],
-        ...(blocked ? { blocked: true } : {}),
-      };
-    });
+  const candidates = eligible.map((b) => {
+    const depth = parentDepth(b, byId);
+    const ageDays = ageInDays(b, now);
+    return {
+      id: b.id,
+      title: b.title,
+      ...(b.issue_type ? { type: b.issue_type } : {}),
+      ...(typeof b.priority === "number" ? { priority: b.priority } : {}),
+      ...(typeof depth === "number" ? { depth } : {}),
+      ...(typeof ageDays === "number" ? { ageDays } : {}),
+      labels: b.labels ?? [],
+    };
+  });
+
+  // Eligibility is a subset of the open run targets, so the difference is exactly what the gate
+  // refused — no second walk of the exclusions to count them.
+  return { candidates, notStartable: openTargets.length - eligible.length };
 }
 
 /**

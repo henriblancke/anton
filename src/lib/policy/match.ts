@@ -34,7 +34,7 @@ import {
 
 /**
  * The slice of a bead the editor evaluates and lists. Deliberately flat and small: this is the whole
- * payload the panel ships to the browser, one entry per open bead on the board.
+ * payload the panel ships to the browser, one entry per startable target on the board.
  */
 export interface PolicyCandidate {
   id: string;
@@ -52,7 +52,11 @@ export interface PolicyCandidate {
   /** Whole days since the bead was filed. Absent when it carries no creation date. */
   ageDays?: number;
   labels: string[];
-  /** Carries at least one unmet blocker on the `blocks` graph. */
+  /**
+   * Carries at least one unmet blocker on the `blocks` graph. Never set by the startable projection
+   * ({@link ./candidates}) — a held target is refused structurally, before any policy is consulted —
+   * so a policy stating the rule restates a guarantee it already has.
+   */
   blocked?: boolean;
 }
 
@@ -96,7 +100,7 @@ function days(count: number): string {
  * bounded on a value the ranking does not carry. Neither may be softened into membership, because
  * the softening would admit beads the operator never wrote a rule for.
  */
-function admittedValues(criterion: PolicyLabelCriterion): string[] | undefined {
+export function admittedValues(criterion: PolicyLabelCriterion): string[] | undefined {
   const { compare, values } = criterion;
   if (!compare) return values;
   if (!criterion.ranked) return undefined;

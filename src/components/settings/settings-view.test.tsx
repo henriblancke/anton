@@ -87,6 +87,7 @@ function renderView(
       issueTypes={[]}
       policyDraft={FALLBACK_DRAFT}
       policyCandidates={[]}
+      policyNotStartable={0}
       boardUnavailable={false}
       earned={earned}
     />,

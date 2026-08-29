@@ -322,17 +322,17 @@ describe("an armed project", () => {
 describe("the boundary is legible (R2.6)", () => {
   it("counts the open beads the policy admits", () => {
     renderPanel({ candidates: CANDIDATES });
-    expect(matchCount()).toBe("2 of 5 open beads match this policy");
+    expect(matchCount()).toBe("2 of 5 startable run targets match this policy");
   });
 
   it("moves the count as a criterion changes", () => {
     renderPanel({ candidates: CANDIDATES });
     // Widen the namespace: the chore that only carries `severity:minor` comes in.
     fireEvent.click(screen.getByRole("switch", { name: "severity:minor" }));
-    expect(matchCount()).toBe("3 of 5 open beads match this policy");
+    expect(matchCount()).toBe("3 of 5 startable run targets match this policy");
     // Narrow a native field: both P2 beads fall out, leaving the one P1 bug.
     fireEvent.change(screen.getByLabelText("Minimum priority"), { target: { value: "1" } });
-    expect(matchCount()).toBe("1 of 5 open beads match this policy");
+    expect(matchCount()).toBe("1 of 5 startable run targets match this policy");
   });
 
   it("lists the matches behind 'See them'", () => {
@@ -352,6 +352,13 @@ describe("the boundary is legible (R2.6)", () => {
     expect(within(rest).getByText(/carries no `severity:` label/)).toBeTruthy();
   });
 
+  it("explains a denominator smaller than the board rather than hiding it", () => {
+    renderPanel({ candidates: CANDIDATES, notStartable: 3 });
+    // The picker refuses these before any policy is consulted, so counting them as matches would
+    // claim available work anton has none of — but dropping them silently reads as a smaller board.
+    expect(screen.getByText(/3 more open run targets are not startable right now/)).toBeTruthy();
+  });
+
   it("says a zero is the policy talking, not a broken pass", () => {
     // The day-one shape: a policy naming a namespace this board has never used matches nothing.
     renderPanel({
@@ -359,7 +366,7 @@ describe("the boundary is legible (R2.6)", () => {
       candidates: CANDIDATES,
       labelVocabulary: [...VOCABULARY, { namespace: "team", labels: [] }],
     });
-    expect(matchCount()).toBe("0 of 5 open beads match this policy");
+    expect(matchCount()).toBe("0 of 5 startable run targets match this policy");
     expect(screen.getByText(/Nothing matches — that is the policy, not a fault/)).toBeTruthy();
     expect(disclosure("Why not the rest?")).toBeTruthy();
   });
@@ -385,11 +392,11 @@ describe("the ordered native bounds (R2.3)", () => {
   it("withholds the urgent end of the scale from autopilot", async () => {
     const fetchMock = stubFetch();
     renderPanel(open);
-    expect(matchCount()).toBe("5 of 5 open beads match this policy");
+    expect(matchCount()).toBe("5 of 5 startable run targets match this policy");
 
     fireEvent.change(screen.getByLabelText("Maximum priority"), { target: { value: "1" } });
     // The P0 feature is the work an operator wants triaged by hand, not started by a rule.
-    expect(matchCount()).toBe("4 of 5 open beads match this policy");
+    expect(matchCount()).toBe("4 of 5 startable run targets match this policy");
     expect(screen.getByText(/more urgent than P1 is left for a human/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
@@ -403,12 +410,12 @@ describe("the ordered native bounds (R2.3)", () => {
 
     // "Parentless work only" — the three top-level beads.
     fireEvent.change(screen.getByLabelText("Maximum parent depth"), { target: { value: "0" } });
-    expect(matchCount()).toBe("3 of 5 open beads match this policy");
+    expect(matchCount()).toBe("3 of 5 startable run targets match this policy");
 
     // The other end: only work that sits under a parent.
     fireEvent.change(screen.getByLabelText("Maximum parent depth"), { target: { value: "" } });
     fireEvent.change(screen.getByLabelText("Minimum parent depth"), { target: { value: "1" } });
-    expect(matchCount()).toBe("2 of 5 open beads match this policy");
+    expect(matchCount()).toBe("2 of 5 startable run targets match this policy");
 
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -421,11 +428,11 @@ describe("the ordered native bounds (R2.3)", () => {
 
     // The soak: nothing filed inside the last two days, so the day-old and the same-day bead go.
     fireEvent.change(screen.getByLabelText("Minimum age in days"), { target: { value: "2" } });
-    expect(matchCount()).toBe("3 of 5 open beads match this policy");
+    expect(matchCount()).toBe("3 of 5 startable run targets match this policy");
 
     // And the stale end drops the 40-day-old chore the board has already ignored.
     fireEvent.change(screen.getByLabelText("Maximum age in days"), { target: { value: "30" } });
-    expect(matchCount()).toBe("2 of 5 open beads match this policy");
+    expect(matchCount()).toBe("2 of 5 startable run targets match this policy");
 
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -439,7 +446,7 @@ describe("the ordered native bounds (R2.3)", () => {
     fireEvent.change(screen.getByLabelText("Minimum age in days"), { target: { value: "" } });
     // A bound stored as 0 would still be asserted, and would fail closed on a bead carrying no
     // creation date — the opposite of what emptying the box means.
-    expect(matchCount()).toBe("5 of 5 open beads match this policy");
+    expect(matchCount()).toBe("5 of 5 startable run targets match this policy");
 
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -565,10 +572,10 @@ describe("what it refuses to arm", () => {
 
   it("says out loud when a policy asserts nothing at all", () => {
     renderPanel({ stored: {}, candidates: CANDIDATES });
-    expect(screen.getByText(/admits every open run target/)).toBeTruthy();
+    expect(screen.getByText(/admits every startable run target/)).toBeTruthy();
     // And stops saying it the moment a criterion is asserted.
     fireEvent.click(screen.getByRole("switch", { name: "bug" }));
-    expect(screen.queryByText(/admits every open run target/)).toBeNull();
+    expect(screen.queryByText(/admits every startable run target/)).toBeNull();
   });
 
   it("lets an armed project be disarmed again", async () => {
@@ -623,17 +630,96 @@ describe("ranking is offered where an order could mean something", () => {
     expect(screen.getByRole("switch", { name: "Rank team: values" })).toBeTruthy();
   });
 
-  it("says the order does not yet change what is admitted", () => {
+  it("says a ranking alone does not change what is admitted", () => {
     renderPanel({ stored: { labels: [{ namespace: "severity", values: ["critical", "major"] }] } });
     fireEvent.click(screen.getByRole("switch", { name: "Rank severity: values" }));
-    expect(screen.getByText(/does not yet change which beads are admitted/)).toBeTruthy();
+    expect(screen.getByText(/every selected value still matches/)).toBeTruthy();
   });
 });
 
 /**
- * A stored `compare` is the one criterion field this editor cannot author but must not destroy: it
- * NARROWS a ranked namespace, so losing it on an unrelated chip edit silently widens the policy into
- * membership over the whole ranking — admitting work the operator had excluded.
+ * The bound over a hand-ranking (R2.3) — the one ordering a discovered namespace ever gets, and only
+ * because the operator declared it. A ranking an operator can drag but never bound is a rule the
+ * schema and the predicate support and the panel refuses to author.
+ */
+describe("bounding a hand-ranked namespace (R2.3)", () => {
+  const ranked = {
+    labels: [{ namespace: "severity", values: ["critical", "major", "minor"], ranked: true }],
+  };
+
+  it("authors a bound over the operator's own ranking", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: ranked });
+    fireEvent.change(screen.getByLabelText("Bound severity: by rank"), {
+      target: { value: "lte" },
+    });
+    fireEvent.change(screen.getByLabelText("Bound severity: at"), { target: { value: "major" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels).toEqual([
+      {
+        namespace: "severity",
+        values: ["critical", "major", "minor"],
+        ranked: true,
+        compare: { op: "lte", value: "major" },
+      },
+    ]);
+  });
+
+  it("narrows nothing until the bound is moved", () => {
+    renderPanel({ stored: ranked, candidates: CANDIDATES });
+    // All three severities are selected, so membership over the ranking admits every labelled bead.
+    expect(matchCount()).toBe("4 of 5 startable run targets match this policy");
+    // Reaching for the control lands on the end of the ranking that admits what is already selected:
+    // the policy changes when the operator moves the bound, not when they open the select.
+    fireEvent.change(screen.getByLabelText("Bound severity: by rank"), {
+      target: { value: "lte" },
+    });
+    expect(matchCount()).toBe("4 of 5 startable run targets match this policy");
+  });
+
+  it("moves the live count with the bound, and says what it admits", () => {
+    renderPanel({ stored: ranked, candidates: CANDIDATES });
+    fireEvent.change(screen.getByLabelText("Bound severity: by rank"), {
+      target: { value: "lte" },
+    });
+    fireEvent.change(screen.getByLabelText("Bound severity: at"), { target: { value: "major" } });
+    // severity:minor is now outside the bound, so the chore drops out.
+    expect(matchCount()).toBe("3 of 5 startable run targets match this policy");
+    expect(screen.getByText(/Admits severity:critical, severity:major/)).toBeTruthy();
+  });
+
+  it("clears the bound back to membership over the whole ranking", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({
+      stored: {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major", "minor"],
+            ranked: true,
+            compare: { op: "lte" as const, value: "major" },
+          },
+        ],
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Bound severity: by rank"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels[0].compare).toBeUndefined();
+  });
+
+  it("offers no bound where there is no ranking to bound", () => {
+    renderPanel({ stored: { labels: [{ namespace: "severity", values: ["critical", "major"] }] } });
+    // A comparison with no scale behind it refuses every bead (R2.5) and the store rejects it.
+    expect(screen.queryByLabelText("Bound severity: by rank")).toBeNull();
+  });
+});
+
+/**
+ * A `compare` NARROWS a ranked namespace, so losing it on an edit that never mentioned it silently
+ * widens the policy into membership over the whole ranking — admitting work the operator had
+ * excluded. It survives every edit around it, and goes only when what it depends on does.
  */
 describe("a stored comparison survives editing around it", () => {
   const bounded = {

@@ -138,6 +138,34 @@ describe("makeBoardPickerHandler", () => {
     expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
   });
 
+  it("narrows the plan with the policy the operator armed", async () => {
+    // The settings panel says an accepted policy is what anton may start on; a plan that still
+    // admitted everything would advertise a boundary anton does not keep.
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerPolicy: { types: ["bug"] } }) })
+      .run();
+    board.current = [bead("t1", { issue_type: "bug" }), bead("t2", { issue_type: "task" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    // The refusal stays answerable: it is the policy's, not the board's, and it names the criterion.
+    const refused = plan?.exclusions.find((e) => e.beadId === "t2");
+    expect(refused?.reason).toBe("policy");
+    expect(refused?.detail).toContain("the policy admits only bug");
+  });
+
+  it("keeps the structural default on a project that has armed nothing", async () => {
+    board.current = [bead("t1", { issue_type: "task" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries).toEqual([{ beadId: "t1", rank: 1, rule: "any claimable run target" }]);
+  });
+
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {
     const handler = makeBoardPickerHandler({ db: t.db, clock });
     await expect(handler(fakeCtx({ payload: { projectId: "ghost" } }))).rejects.toThrow(PoisonError);
