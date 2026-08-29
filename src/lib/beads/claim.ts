@@ -46,8 +46,15 @@ export { ownerOf };
  * The outcome of a swap: `ok` when the assignee is now `next`, else the owner that beat us. A
  * successful swap carries the bead it verified — the post-write read on a real write, the read it
  * short-circuited on a no-op — so callers can answer with it instead of spawning `bd show` again.
+ *
+ * `wrote` separates the two ways a swap succeeds: it MOVED the assignee, or it found the end state
+ * already standing and skipped bd. A caller that unwinds its own claim when a later write fails must
+ * check it — the no-op's reservation was taken by somebody else's write (another process resolving
+ * to the same operator), and releasing it would cancel a claim this caller never made.
  */
-export type SwapResult = { ok: true; bead: Bead } | { ok: false; owner: string | undefined };
+export type SwapResult =
+  | { ok: true; bead: Bead; wrote: boolean }
+  | { ok: false; owner: string | undefined };
 
 /** The bd surface a swap needs, injectable so tests can drive it without a real board. */
 export interface AssigneeStore {
@@ -128,7 +135,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
       // winner sets the owner to exactly what the loser also wanted, so `before !== expectedOwner`
       // would otherwise turn the loser into a spurious 409 even though the end state it asked for
       // already holds.
-      if (before === next) return { ok: true, bead };
+      if (before === next) return { ok: true, bead, wrote: false };
       // A different owner landed in the window (a real steal by someone else) — lose here rather
       // than overwrite it, and name who holds the claim now.
       if (before !== expectedOwner) return { ok: false, owner: before };
@@ -138,7 +145,7 @@ export function createClaimGuard(store: AssigneeStore = beads): ClaimGuard {
 
       const written = await store.show(repoPath, id);
       const after = ownerOf(written);
-      return after === next ? { ok: true, bead: written } : { ok: false, owner: after };
+      return after === next ? { ok: true, bead: written, wrote: true } : { ok: false, owner: after };
     };
 
   // The lock itself lives in ./claim-lock, shared with beads.claimVerified: a worker's claim

@@ -1591,6 +1591,70 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(offer()).toBeNull();
   });
 
+  it("opens no offer for a job switched off while the arm was still in flight", async () => {
+    let finishArm: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = (row: Record<string, unknown>) =>
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...row } }));
+      if (patch.type !== "board-picker") return Promise.resolve(stored(patch));
+      return new Promise<Response>((resolve) => {
+        finishArm = () => resolve(stored({ cron: "*/10 * * * *", ...patch }));
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(finishArm).toBeTruthy());
+
+    // Switch product-master off with the arm still open. The offer is decided when the arm LANDS,
+    // and by then its premise is gone: asking how often a job that no longer runs should run.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    finishArm!();
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
+    expect(offer()).toBeNull();
+  });
+
+  it("does not put an answered offer back once its job was switched off mid-write", async () => {
+    let failOptOut: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      if (String(input).endsWith("/settings")) {
+        return new Promise<Response>((resolve) => {
+          failOptOut = () =>
+            resolve(new Response(JSON.stringify({ error: "disk full" }), { status: 500 }));
+        });
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+    await waitFor(() => expect(failOptOut).toBeTruthy());
+
+    // Switching product-master off does not withdraw an offer that is already off screen, so only
+    // re-reading the row catches it: the opt-out failed and is reverted, but the question it
+    // answered is dead on its own terms and must not come back.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    failOptOut!();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disk full"));
+    expect(offer()).toBeNull();
+  });
+
   it("withdraws the offer when the operator sets that cadence by hand instead", async () => {
     const fetchMock = stubPanelFetch();
     renderView({}, [], coupledSchedules());

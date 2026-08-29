@@ -672,11 +672,18 @@ export function SettingsView({
       }),
     ),
   );
-  // The pending cadence offer (anton-3xa9), and the operator's standing answer to it. `keepWeekly`
-  // is persisted the moment it is given — this panel saves immediately, and an opt-out that waited
-  // for the Save button would be re-asked on the next arm by anyone who navigated away.
+  // The live mirror of the rows above, written by every mutation through `updateAutomations`. A
+  // handler that resumes after an await still closes over the snapshot its own render captured, and
+  // the cadence offer is decided on what the coupled row says NOW — the operator can disable
+  // product-master or edit its time while a PATCH is open.
+  const automationsRef = useRef(automations);
+  // The pending cadence offer (anton-3xa9), and the operator's standing answer to it. The answer is
+  // persisted the moment it is given — this panel saves immediately, and an opt-out that waited for
+  // the Save button would be re-asked on the next arm by anyone who navigated away. It is a ref
+  // rather than state because nothing renders it and the reads that matter happen after an await:
+  // a decline landing while an arm's PATCH is open must not be re-asked by the offer that arm opens.
   const [cadenceOffer, setCadenceOffer] = useState<CadenceOffer | null>(null);
-  const [keepWeekly, setKeepWeekly] = useState(settings.keepProductMasterWeekly === true);
+  const keepWeekly = useRef(settings.keepProductMasterWeekly === true);
   // Counts the withdrawals — offers killed by a change rather than by an answer. An accept restores
   // its offer on a failed write, and only this tells that restore apart from one that would put back
   // a question the operator already invalidated while the PATCH was open.
@@ -807,13 +814,24 @@ export function SettingsView({
    * state: arming the picker offers a cadence change whose whole premise is that the picker is now
    * armed (see {@link toggleAutomation}).
    */
+  /**
+   * The one writer of the automation rows: the ref is the source of truth and the state mirrors it,
+   * so a read taken after an await sees what the last write left rather than the render's snapshot.
+   */
+  function updateAutomations(
+    next: (prev: Record<string, AutomationScheduleState>) => Record<string, AutomationScheduleState>,
+  ) {
+    automationsRef.current = next(automationsRef.current);
+    setAutomations(automationsRef.current);
+  }
+
   async function patchSchedule(
     id: string,
     patch: { cron?: string; enabled?: boolean },
     message: string,
   ): Promise<boolean> {
-    const prev = automations[id];
-    setAutomations((p) => ({ ...p, [id]: { ...prev, ...patch } }));
+    const prev = automationsRef.current[id];
+    updateAutomations((p) => ({ ...p, [id]: { ...prev, ...patch } }));
     schedulePatchesInFlight.current += 1;
     try {
       const res = await fetch(`/api/projects/${project.slug}/schedules`, {
@@ -827,7 +845,7 @@ export function SettingsView({
       }
       const { schedule } = await res.json().catch(() => ({ schedule: undefined }));
       if (schedule) {
-        setAutomations((p) => ({
+        updateAutomations((p) => ({
           ...p,
           [id]: {
             enabled: schedule.enabled,
@@ -843,7 +861,7 @@ export function SettingsView({
       // Undo only the fields this patch wrote. Restoring the whole `prev` snapshot would also roll
       // back a concurrent patch for the same automation (toggle while a cadence save is in flight),
       // leaving the row wrong until reload.
-      setAutomations((p) => ({
+      updateAutomations((p) => ({
         ...p,
         [id]: {
           ...p[id],
@@ -895,7 +913,7 @@ export function SettingsView({
       ) {
         return;
       }
-      setAutomations((p) => {
+      updateAutomations((p) => {
         const next = { ...p };
         for (const row of rows as AutomationSchedule[]) {
           const current = next[row.type];
@@ -950,10 +968,15 @@ export function SettingsView({
    * answered `keep weekly`; product-master is off, so its output feeds nothing and its cadence is
    * moot; or its cadence is not weekly — already daily-or-faster, or hand-written, and neither is
    * ours to rewrite (see {@link dailyEquivalentOf}).
+   *
+   * All three are asked of the refs, because the only caller asks AFTER awaiting the arm: the
+   * operator can disable product-master, retime it, or decline while that PATCH is open, and an
+   * offer built from the snapshot the arm started with would name a cadence for a job that is off —
+   * or, once accepted, overwrite the time they just set with one derived from the row it replaced.
    */
   function offerDailyProductMaster() {
-    if (keepWeekly) return;
-    const coupled = automations[CADENCE_COUPLED_AUTOMATION];
+    if (keepWeekly.current) return;
+    const coupled = automationsRef.current[CADENCE_COUPLED_AUTOMATION];
     if (coupled?.enabled !== true) return;
     const daily = dailyEquivalentOf(coupled.cron);
     if (!daily) return;
@@ -964,6 +987,20 @@ export function SettingsView({
       acceptLabel: "Raise to daily",
       declineLabel: "Keep weekly",
     });
+  }
+
+  /**
+   * Whether an offer taken off screen may be put back on it: nothing withdrew it while the write was
+   * open, and its premise still reads the same off the live rows — the job still enabled, still on
+   * the cadence the offered cron was derived from.
+   *
+   * The generation catches what this panel withdrew; the row check catches what it did not, because
+   * a withdrawal cannot fire for an offer that is already off screen while an answer is in flight.
+   */
+  function cadenceOfferRestorable(offer: CadenceOffer, generation: number): boolean {
+    if (cadenceOfferGeneration.current !== generation) return false;
+    const coupled = automationsRef.current[offer.automationId];
+    return coupled?.enabled === true && dailyEquivalentOf(coupled.cron) === offer.cron;
   }
 
   /**
@@ -982,9 +1019,10 @@ export function SettingsView({
    *
    * The question comes back if the write does not land. `patchSchedule` rolls the cadence back to
    * weekly, so an offer that stayed dismissed would leave an operator who chose daily sitting on
-   * weekly with nothing left to retry. It stays gone if something withdrew it while the PATCH was
-   * open — the picker disarmed, the row edited by hand — because that question is dead on its own
-   * terms and a failed write is no reason to resurrect it.
+   * weekly with nothing left to retry. It stays gone if the question stopped applying while the
+   * PATCH was open — the picker disarmed, the row edited by hand, product-master switched off —
+   * because that question is dead on its own terms and a failed write is no reason to resurrect it
+   * (see {@link cadenceOfferRestorable}).
    */
   async function acceptCadenceOffer() {
     const offer = cadenceOffer;
@@ -992,7 +1030,7 @@ export function SettingsView({
     const generation = cadenceOfferGeneration.current;
     setCadenceOffer(null);
     const stored = await setAutomationCron(offer.automationId, offer.cron);
-    if (!stored && cadenceOfferGeneration.current === generation) setCadenceOffer(offer);
+    if (!stored && cadenceOfferRestorable(offer, generation)) setCadenceOffer(offer);
   }
 
   /**
@@ -1003,11 +1041,15 @@ export function SettingsView({
    * The revert puts the QUESTION back too, not just the standing answer. An operator who declined,
    * got an error toast, and then watched the question vanish anyway has been told the write failed
    * and shown the outcome of it succeeding; the offer has to be back where they can answer it again.
+   * Only while it is still a live question, though — the picker can be disarmed and product-master
+   * disabled or retimed while this write is open, and none of those leave anything to re-ask
+   * (see {@link cadenceOfferRestorable}).
    */
   async function declineCadenceOffer() {
     const offer = cadenceOffer;
+    const generation = cadenceOfferGeneration.current;
     setCadenceOffer(null);
-    setKeepWeekly(true);
+    keepWeekly.current = true;
     try {
       const res = await fetch(`/api/projects/${project.slug}/settings`, {
         method: "PATCH",
@@ -1020,8 +1062,8 @@ export function SettingsView({
       }
       toast.success(`${CADENCE_COUPLED_AUTOMATION} stays weekly`);
     } catch (err) {
-      setKeepWeekly(false);
-      setCadenceOffer(offer);
+      keepWeekly.current = false;
+      if (offer && cadenceOfferRestorable(offer, generation)) setCadenceOffer(offer);
       toast.error(err instanceof Error ? err.message : "Failed to save your answer");
     }
   }

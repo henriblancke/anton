@@ -893,6 +893,29 @@ describe("the product master's moves", () => {
       ]);
     });
 
+    it("leaves a reservation this apply did not take, when the label write fails", async () => {
+      // The CAS's idempotent no-op: another anton process on this machine resolves to the SAME
+      // identity, and its claim lands between the fence's read and the swap. The end state is
+      // already what we asked for, so the swap writes nothing — and the rollback must not hand back
+      // a reservation it never took, which would cancel that other process's start.
+      failOn.set("approve:anton-a", 1);
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) {
+          liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+        }
+      };
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch((e) => e)) as Error;
+
+      expect(err.message).toContain("bd approve exploded");
+      // Neither half of the claim: nothing was assigned here, so nothing is unassigned either.
+      expect(calls.filter((c) => c.startsWith("assign anton-a"))).toEqual([]);
+      // And the failure is the approve's own — not the strand report, which would name a claim this
+      // apply is not holding.
+      expect(err.message).not.toMatch(/could not be released either/);
+    });
+
     it("names the stranded reservation when it cannot be handed back either", async () => {
       // The release is bounded by the same CAS, so a failure here leaves the board in a state only a
       // human can settle — and saying so is the whole point of failing loud.

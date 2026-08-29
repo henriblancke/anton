@@ -707,6 +707,12 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
  * `resolveOperator` is this machine's identity, memoized after its first read — the same one every
  * anton job claims under, so a shared board shows whose pipeline the start belongs to. With no
  * identity resolvable at all the swap is a verified no-op, exactly as it is on the route.
+ *
+ * Only a swap that actually WROTE is unwound. The same identity is shared by every anton process on
+ * this machine, so one of them can take the reservation between the fence's read and the CAS — and
+ * the CAS then reports success without writing, because the end state is already what we asked for.
+ * Releasing on that path would unassign a claim this apply never made, cancelling somebody else's
+ * start in the name of undoing ours.
  */
 async function grantApproval(repo: string, id: string): Promise<void> {
   const operator = await resolveOperator();
@@ -719,6 +725,7 @@ async function grantApproval(repo: string, id: string): Promise<void> {
   try {
     await beads.approve(repo, id);
   } catch (err) {
+    if (!swap.wrote) throw err;
     if (await releaseReservation(repo, id, operator)) throw err;
     throw new Error(
       `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
