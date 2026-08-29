@@ -88,11 +88,13 @@ const STRUCTURAL_LINE = /^(?:[[\](){}<>,;:]+|<\/[A-Za-z][\w.:-]*>[,;)]*|\/>[,;)]
 /** `import …`, `export { … } from …`, `export * from …` — the statement's first line. */
 const IMPORT_START = /^import\b|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
 
-/** `interface X {`, `type X =`, `enum X {`, with the usual modifiers in front. */
-const TYPE_START = /^(?:export\s+)?(?:declare\s+)?(?:const\s+)?(?:interface|type|enum)\s+[A-Za-z_$]/;
-
-/** A `from "…"` clause, which ends an import statement however many lines its bindings took. */
-const FROM_CLAUSE = /\bfrom\s*["'][^"']*["']/;
+/**
+ * `interface X {`, `type X =`, and the ERASED enum forms — `declare enum`, `const enum`. A plain
+ * `enum` emits runtime code and its members can compute (`Draft = label("draft")`), so it is read as
+ * code rather than counted as a declaration.
+ */
+const TYPE_START =
+  /^(?:export\s+)?(?:(?:declare\s+)?(?:interface|type)|declare\s+(?:const\s+)?enum|const\s+enum)\s+[A-Za-z_$]/;
 
 /** `function foo(` / `export async function foo(` — a declaration header, not a call. */
 const FUNCTION_START = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
@@ -128,6 +130,17 @@ function nestingDelta(line: string, open: string, close: string): number {
 const braceDelta = (line: string): number => nestingDelta(line, "{([", "})]");
 /** Parens alone: a signature ends when its PARAMETER list closes, not when its body brace opens. */
 const parenDelta = (line: string): number => nestingDelta(line, "(", ")");
+
+/**
+ * Whether a declaration statement runs past this line. An import ends when its bracket list closes
+ * and no other way: Python's `import os` and Go's `import (\n  "fmt"\n)` carry neither a `;` nor a
+ * quoted `from` clause, and reading one as unterminated would classify the whole rest of the file as
+ * an import. A `type X =` union opens no bracket at all, so it needs its terminator.
+ */
+function continues(kind: "import" | "type", line: string, depth: number): boolean {
+  if (depth > 0) return true;
+  return kind === "type" && !line.endsWith(";") && !line.endsWith("}");
+}
 
 /**
  * Classify every line of a file in one forward pass. Whole-file, not just the reported window,
@@ -176,7 +189,7 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         continue;
       }
       depth += braceDelta(line);
-      if (depth <= 0 && (line.endsWith(";") || FROM_CLAUSE.test(line) || line.endsWith("}"))) {
+      if (!continues(statement, line, depth)) {
         statement = undefined;
         depth = 0;
       }
@@ -209,10 +222,8 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     if (kind === "code") continue;
     depth = braceDelta(line);
     // A statement that closes on its own line opens nothing; otherwise its continuation lines
-    // inherit the same class until the braces balance and it terminates.
-    const closed =
-      depth <= 0 && (line.endsWith(";") || (kind === "import" && FROM_CLAUSE.test(line)));
-    if (!closed) statement = kind;
+    // inherit the same class until it terminates.
+    if (continues(kind, line, depth)) statement = kind;
     else depth = 0;
   }
   return classes;
@@ -338,11 +349,19 @@ function describeBlock(classes: LineClass[]): string {
  * closing brace is as at home in a clone of real logic as in a clone of an interface — so the
  * question is whether the block's CONTENT lines do work or merely declare. A tie goes to the
  * signal: a block half statements is a block triage can still act on.
+ *
+ * A window with NO content line at all — nothing but blanks and closers — is not code either, and
+ * is reported in those terms rather than as a block that declares.
  */
 function isCodeBlock(classes: LineClass[]): boolean {
   const code = classes.filter((cls) => cls === "code").length;
   const declarative = classes.filter((cls) => DECLARATIVE.has(cls)).length;
   return code > 0 && code >= declarative;
+}
+
+/** Nothing but blanks and closers: the window neither declares nor computes — it says nothing. */
+function isEmptyBlock(classes: LineClass[]): boolean {
+  return classes.every((cls) => cls === "blank" || cls === "structural");
 }
 
 /** A verdict on one signal: keep it, or drop it with the proof. */
@@ -385,11 +404,17 @@ async function judge(index: Index, signal: ScanSignal): Promise<Verdict> {
     };
   }
   if (declarative.length <= code) return KEEP;
+  // Two different diagnoses for the operator reading the drop: a block that declares, and a block
+  // that holds no content line to declare with.
+  const sample = declarative[0];
+  const verdict = isEmptyBlock(sample)
+    ? "holds nothing but blank and structural lines"
+    : "declares rather than computes";
   return {
     drop: true,
     reason:
-      `its ${lines}-line block declares rather than computes at ${declarative.length} of ` +
-      `${readable} readable location(s) — ${describeBlock(declarative[0])}`,
+      `its ${lines}-line block ${verdict} at ${declarative.length} of ` +
+      `${readable} readable location(s) — ${describeBlock(sample)}`,
   };
 }
 

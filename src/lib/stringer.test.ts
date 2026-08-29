@@ -1208,6 +1208,111 @@ describe("scan", () => {
       expect(describeDuplicationFilter(result.duplication)).toBeUndefined();
     });
 
+    // An import statement is not a JS import statement: Python and Go end one with the line, or
+    // with a paren block. Reading either as unterminated would classify the whole rest of the file
+    // as an import and drop every real clone under it.
+    it("ends an import the way Python and Go end one, not the way JS does", async () => {
+      const repo = writeRepo({
+        "src/report.py": [
+          "import os",
+          "import sys",
+          "",
+          "def build(path):",
+          "    total = os.stat(path).st_size",
+          "    total += len(sys.argv)",
+          "    return total",
+          "",
+        ].join("\n"),
+        "src/report.go": [
+          "package main",
+          "",
+          "import (",
+          '\t"fmt"',
+          '\t"os"',
+          ")",
+          "",
+          "func main() {",
+          "\tfmt.Println(len(os.Args))",
+          '\tfmt.Println("done")',
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/report.py", 4]], 4),
+        clone([["src/report.go", 8]], 4),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => (s as { FilePath: string }).FilePath)).toEqual([
+        "src/report.py",
+        "src/report.go",
+      ]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // `enum` is the one TYPE_START form that survives compilation: its members run at module init,
+    // so a duplicated enum body can hold real computation. Only the erased spellings declare.
+    it("reads a runtime enum body as code and an erased one as a declaration", async () => {
+      const repo = writeRepo({
+        "src/mode.ts": [
+          "export enum Mode {",
+          "  Draft = label('draft'),",
+          "  Ready = label('ready'),",
+          "  Done = label('done'),",
+          "}",
+          "",
+        ].join("\n"),
+        "src/kind.ts": [
+          "export const enum Kind {",
+          "  Draft = 'draft',",
+          "  Ready = 'ready',",
+          "  Done = 'done',",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/mode.ts", 1]], 5),
+        clone([["src/kind.ts", 1]], 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/mode.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/kind.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("5 type");
+    });
+
+    // A window of nothing but closers is dropped too — but "declares rather than computes" would be
+    // the wrong diagnosis to hand an operator, since there is nothing there that declares either.
+    it("says a block holds no content line rather than blaming its declarations", async () => {
+      const repo = writeRepo({
+        "src/panel.tsx": [
+          "export function Panel() {",
+          "  return (",
+          "    <section>",
+          "      <Card />",
+          "    </section>",
+          "  );",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/panel.tsx", 5]], 4),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      const [drop] = result.duplication.dropped;
+      expect(drop.reason).toContain("holds nothing but blank and structural lines");
+      expect(drop.reason).toContain("3 structural");
+      expect(drop.reason).not.toContain("declares rather than computes");
+    });
+
     // The regression the bead was filed on, replayed: the duplication half of scan d9eab116
     // (2026-08-19), every signal exactly as stringer wrote it, judged against this repo's own tree.
     // Sizes the filter against real evidence rather than a hand-built tree — and if the drop rate
@@ -1220,7 +1325,14 @@ describe("scan", () => {
 
       const { kept, duplication } = await filterDuplicationSignals(process.cwd(), signals);
 
-      expect(duplication.dropped.length).toBeGreaterThanOrEqual(40);
+      // A location the tree no longer has is repo drift, not a verdict this filter reached. Score
+      // the filter as a SHARE of the signals that still resolve: an absolute floor would erode
+      // silently as the sources under the fixture move on, until it failed for no reason of ours.
+      const drift = duplication.dropped.filter((d) =>
+        d.reason.includes("exist on the tree anymore"),
+      ).length;
+      const classified = duplication.dropped.length - drift;
+      expect(classified / (signals.length - drift)).toBeGreaterThanOrEqual(0.4); // 41 of 95 today
       expect(kept.length + duplication.dropped.length).toBe(97);
       // The hand-verified non-code primaries from the bead — a JSDoc paragraph, an interface field
       // list, an import specifier list, a doc block, two import statements.
