@@ -292,6 +292,18 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
     } else patch.conventionalCommits = conventionalCommits;
   }
 
+  if ("keepProductMasterWeekly" in body) {
+    const keep = body.keepProductMasterWeekly;
+    // "" / null → clear (not yet asked, so the next arm offers again). Otherwise strictly a boolean.
+    if (keep == null || keep === "") patch.keepProductMasterWeekly = undefined;
+    else if (typeof keep !== "boolean") {
+      return NextResponse.json(
+        { error: "keepProductMasterWeekly must be a boolean" },
+        { status: 400 },
+      );
+    } else patch.keepProductMasterWeekly = keep;
+  }
+
   if ("budgetAware" in body) {
     const budgetAware = body.budgetAware;
     // "" / null → clear (default: OFF). Otherwise strictly a boolean.

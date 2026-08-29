@@ -13,7 +13,7 @@ import {
 import { toast } from "sonner";
 
 import type { Project } from "@/lib/types";
-import { describeCron } from "@/lib/jobs/cadence";
+import { dailyEquivalentOf, describeCron } from "@/lib/jobs/cadence";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/atoms";
@@ -22,6 +22,7 @@ import {
   AutomationTable,
   type AutomationScheduleState,
   type AutomationSpec,
+  type CadenceOffer,
 } from "@/components/settings/automation-table";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
@@ -98,6 +99,8 @@ interface EditableSettings {
   };
   /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
   valueLabels?: string[];
+  /** The operator declined the daily product-master offer (anton-3xa9); absent = not yet asked. */
+  keepProductMasterWeekly?: boolean;
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -517,6 +520,20 @@ const AUTOMATIONS: AutomationSpec[] = [
 ];
 
 /**
+ * The cadence coupling arming the picker creates (anton-3xa9, design R7.1).
+ *
+ * The board-picker is what turns product-master's judgment from advisory into load-bearing: with it
+ * off, a stale priority is a stale opinion someone reads whenever; with it on, it is a stale
+ * DECISION about what anton does next. That is the only reason the offer exists — and the only
+ * automation it is offered for, because no other pair of schedules has that relationship.
+ */
+const AUTOPILOT_ARMING_AUTOMATION = "board-picker";
+const CADENCE_COUPLED_AUTOMATION = "product-master";
+const CADENCE_OFFER_REASON =
+  "product-master's judgment now feeds the board-picker — what it ranks is executed, not just read. " +
+  "A week-old priority is a week-old decision. Run it daily?";
+
+/**
  * How often the open Automation panel re-reads the schedule rows.
  *
  * The table's countdown ticks on its own clock, but a fire is a SERVER event: when a job runs, the
@@ -651,6 +668,11 @@ export function SettingsView({
       }),
     ),
   );
+  // The pending cadence offer (anton-3xa9), and the operator's standing answer to it. `keepWeekly`
+  // is persisted the moment it is given — this panel saves immediately, and an opt-out that waited
+  // for the Save button would be re-asked on the next arm by anyone who navigated away.
+  const [cadenceOffer, setCadenceOffer] = useState<CadenceOffer | null>(null);
+  const [keepWeekly, setKeepWeekly] = useState(settings.keepProductMasterWeekly === true);
   // A schedule PATCH and the schedule poll both write the same rows, and the PATCH is the one that
   // knows the truth — its response carries the server's recomputed nextRunAt. These two let a poll
   // recognise that it raced a write and drop its own (pre-write) answer rather than applying it on
@@ -884,7 +906,74 @@ export function SettingsView({
   }, [active, project.slug]);
 
   function toggleAutomation(id: string, next: boolean) {
+    // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs,
+    // so it is the one toggle that opens an offer — and only an offer. Disarming deliberately does
+    // nothing to the cadence: an operator who accepted daily keeps daily until they say otherwise,
+    // and a schedule that silently sprang back would make this table untrustworthy about the only
+    // thing it exists to report.
+    if (id === AUTOPILOT_ARMING_AUTOMATION) {
+      if (next) offerDailyProductMaster();
+      // Disarming withdraws the QUESTION, never the answer: with the picker off, nothing executes
+      // what product-master judges, so an unanswered offer has lost its reason to be on screen.
+      else setCadenceOffer(null);
+    }
     return patchSchedule(id, { enabled: next }, `${id} ${next ? "enabled" : "disabled"}`);
+  }
+
+  /**
+   * Offer to raise product-master from weekly to daily, if there is anything to offer.
+   *
+   * Silent in three cases, each of which would make the offer a lie or a nag: the operator already
+   * answered `keep weekly`; product-master is off, so its output feeds nothing and its cadence is
+   * moot; or its cadence is not weekly — already daily-or-faster, or hand-written, and neither is
+   * ours to rewrite (see {@link dailyEquivalentOf}).
+   */
+  function offerDailyProductMaster() {
+    if (keepWeekly) return;
+    const coupled = automations[CADENCE_COUPLED_AUTOMATION];
+    if (coupled?.enabled !== true) return;
+    const daily = dailyEquivalentOf(coupled.cron);
+    if (!daily) return;
+    setCadenceOffer({
+      automationId: CADENCE_COUPLED_AUTOMATION,
+      cron: daily,
+      reason: CADENCE_OFFER_REASON,
+      acceptLabel: "Raise to daily",
+      declineLabel: "Keep weekly",
+    });
+  }
+
+  /** Accept the offer — the ONLY path that changes the cadence, through the same PATCH as an edit. */
+  function acceptCadenceOffer() {
+    const offer = cadenceOffer;
+    if (!offer) return;
+    setCadenceOffer(null);
+    return setAutomationCron(offer.automationId, offer.cron);
+  }
+
+  /**
+   * Decline it, permanently. Persisted immediately and optimistically: a failed write is reverted so
+   * the offer returns on the next arm rather than being silently swallowed — an opt-out this panel
+   * only thinks it stored is how an operator gets asked the same question forever.
+   */
+  async function declineCadenceOffer() {
+    setCadenceOffer(null);
+    setKeepWeekly(true);
+    try {
+      const res = await fetch(`/api/projects/${project.slug}/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ keepProductMasterWeekly: true }),
+      });
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: "Update failed" }));
+        throw new Error(error ?? "Update failed");
+      }
+      toast.success(`${CADENCE_COUPLED_AUTOMATION} stays weekly`);
+    } catch (err) {
+      setKeepWeekly(false);
+      toast.error(err instanceof Error ? err.message : "Failed to save your answer");
+    }
   }
 
   function setAutomationCron(id: string, cron: string) {
@@ -1869,8 +1958,11 @@ export function SettingsView({
               automations={AUTOMATIONS}
               state={automations}
               defaultCrons={defaultCrons}
+              cadenceOffer={cadenceOffer}
               onCronChange={setAutomationCron}
               onToggle={toggleAutomation}
+              onAcceptCadenceOffer={acceptCadenceOffer}
+              onDeclineCadenceOffer={declineCadenceOffer}
             />
 
             {/* The one automation whose behaviour is a reasoning contract rather than a rule set:

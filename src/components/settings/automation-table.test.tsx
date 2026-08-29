@@ -15,6 +15,7 @@ import {
   AutomationTable,
   type AutomationScheduleState,
   type AutomationSpec,
+  type CadenceOffer,
 } from "@/components/settings/automation-table";
 
 afterEach(cleanup);
@@ -42,6 +43,12 @@ const AUTOMATIONS: AutomationSpec[] = [
     description: "ranks what could run next · records the plan · starts nothing yet",
     group: "Board maintenance",
   },
+  {
+    id: "product-master",
+    label: "product-master",
+    description: "product judgment",
+    group: "Board maintenance",
+  },
 ];
 
 const DEFAULT_CRONS: Record<string, string> = {
@@ -49,10 +56,14 @@ const DEFAULT_CRONS: Record<string, string> = {
   "run-health": "0 * * * *",
   unstick: "10 * * * *",
   "board-picker": "*/10 * * * *",
+  "product-master": "0 6 * * 1",
 };
 
 /** Every automation gets a row, so the table renders the same shape the settings page passes in. */
-function renderTable(overrides: Record<string, Partial<AutomationScheduleState>> = {}) {
+function renderTable(
+  overrides: Record<string, Partial<AutomationScheduleState>> = {},
+  cadenceOffer: CadenceOffer | null = null,
+) {
   const state: Record<string, AutomationScheduleState> = {};
   for (const automation of AUTOMATIONS) {
     state[automation.id] = {
@@ -63,16 +74,21 @@ function renderTable(overrides: Record<string, Partial<AutomationScheduleState>>
   }
   const onCronChange = vi.fn<(id: string, cron: string) => void>();
   const onToggle = vi.fn<(id: string, next: boolean) => void>();
+  const onAcceptCadenceOffer = vi.fn();
+  const onDeclineCadenceOffer = vi.fn();
   render(
     <AutomationTable
       automations={AUTOMATIONS}
       state={state}
       defaultCrons={DEFAULT_CRONS}
+      cadenceOffer={cadenceOffer}
       onCronChange={onCronChange}
       onToggle={onToggle}
+      onAcceptCadenceOffer={onAcceptCadenceOffer}
+      onDeclineCadenceOffer={onDeclineCadenceOffer}
     />,
   );
-  return { onCronChange, onToggle };
+  return { onCronChange, onToggle, onAcceptCadenceOffer, onDeclineCadenceOffer };
 }
 
 const cadenceButton = (id = "nightly-stringer") =>
@@ -253,5 +269,55 @@ describe("the automation rows", () => {
     const { onToggle } = renderTable({ "run-health": { enabled: false } });
     fireEvent.click(screen.getByRole("switch", { name: "run-health" }));
     expect(onToggle).toHaveBeenCalledWith("run-health", true);
+  });
+});
+
+/**
+ * The cadence offer (anton-3xa9). The claim under test is that it is an OFFER: it says why, it says
+ * which cadence would become which, and neither button is the one that already happened — the table
+ * changes nothing on its own.
+ */
+describe("the cadence offer", () => {
+  const OFFER: CadenceOffer = {
+    automationId: "product-master",
+    cron: "0 6 * * *",
+    reason: "product-master's judgment now feeds the board-picker — what it ranks is executed.",
+    acceptLabel: "Raise to daily",
+    declineLabel: "Keep weekly",
+  };
+
+  it("shows nothing at all when there is no offer", () => {
+    renderTable();
+    expect(screen.queryByRole("button", { name: "Raise to daily" })).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("states the reason and the cadence change, next to the row it would change", () => {
+    renderTable({}, OFFER);
+
+    const offer = screen.getByRole("status");
+    expect(offer.textContent).toContain("feeds the board-picker");
+    // Both sides, as phrases: the operator is deciding between two cadences, not two cron strings.
+    expect(offer.textContent).toContain("Weekly on Monday at 06:00");
+    expect(offer.textContent).toContain("Daily at 06:00");
+    // Under the automation it is about — the cadence cell is still the row's own, untouched.
+    expect(cadenceButton("product-master").textContent).toContain("Weekly on Monday at 06:00");
+  });
+
+  it("names both answers as decisions rather than as OK and Cancel", () => {
+    const { onAcceptCadenceOffer, onDeclineCadenceOffer } = renderTable({}, OFFER);
+
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+    expect(onAcceptCadenceOffer).toHaveBeenCalledTimes(1);
+    expect(onDeclineCadenceOffer).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+    expect(onDeclineCadenceOffer).toHaveBeenCalledTimes(1);
+  });
+
+  it("changes no cadence by itself — accepting is a callback, not a write", () => {
+    const { onCronChange } = renderTable({}, OFFER);
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+    expect(onCronChange).not.toHaveBeenCalled();
   });
 });

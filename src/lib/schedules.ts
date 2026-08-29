@@ -176,6 +176,9 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * proposal it files spends a founder's attention. It runs WEEKLY rather than nightly because that is
  * the natural cadence of the question — "what matters next" does not change between two Tuesdays on
  * a board a nightly pass would find identical, and re-asking it daily is how the pass becomes noise.
+ * Weekly is only the DEFAULT, not a rule: arming board-picker makes this judgment load-bearing
+ * rather than advisory, so the settings panel then offers to raise it to daily (anton-3xa9). The
+ * offer is an offer — nothing here moves a cadence an operator did not accept.
  *
  * board-picker (anton-albm) ships disabled for the gardener's reasons: an operator who never asked
  * for a pass should not find one running. Today it DECIDES ONLY — it ranks the claimable set and

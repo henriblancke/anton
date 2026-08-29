@@ -34,6 +34,7 @@ const DEFAULT_CRONS = {
   "gate-check": "*/10 * * * *",
   gardener: "0 5 * * *",
   "board-picker": "*/10 * * * *",
+  "product-master": "0 6 * * 1",
 };
 
 type Earned = Parameters<typeof SettingsView>[0]["earned"];
@@ -1308,5 +1309,199 @@ describe("SettingsView navigation (anton-ue90.3)", () => {
       await waitFor(() => expect(vi.mocked(toast.error)).toHaveBeenCalledWith("nope"));
       expect(save().disabled).toBe(false);
     });
+  });
+});
+
+/**
+ * The cadence coupling (anton-3xa9, design R7.1): arming the board-picker is what turns
+ * product-master's judgment from something a human reads into something anton executes, so it — and
+ * only it — offers to raise that cadence. What is under test is the whole contract of an offer: it
+ * appears on ARM, it says WHY, a refusal sticks, and nothing moves a schedule on its own.
+ */
+describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
+  showing("automation");
+
+  const WEEKLY = "0 6 * * 1";
+  const DAILY = "0 6 * * *";
+
+  /** Both coupled rows as the server would hand them in: picker off, product-master on and weekly. */
+  function coupledSchedules(
+    overrides: { picker?: Record<string, unknown>; pm?: Record<string, unknown> } = {},
+  ) {
+    return [
+      { type: "board-picker", enabled: false, cron: "*/10 * * * *", ...overrides.picker },
+      { type: "product-master", enabled: true, cron: WEEKLY, ...overrides.pm },
+    ];
+  }
+
+  /**
+   * One stub for both writes this panel makes — the schedules PATCH (echoing the row as stored, the
+   * way the route does) and the settings PATCH the opt-out goes through — plus the panel's own GET
+   * poll, which would otherwise reach for a relative URL jsdom cannot serve.
+   */
+  function stubPanelFetch() {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      (input, init) => {
+        const url = String(input);
+        if (init?.method !== "PATCH") {
+          return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+        }
+        if (!url.endsWith("/schedules")) {
+          return Promise.resolve(new Response(JSON.stringify({ settings: {} })));
+        }
+        const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+        const type = patch.type as keyof typeof DEFAULT_CRONS;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              schedule: { enabled: true, cron: DEFAULT_CRONS[type], ...patch },
+            }),
+          ),
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  const patchesTo = (fetchMock: ReturnType<typeof stubPanelFetch>, path: string) =>
+    fetchMock.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === "PATCH" && String(c[0]).endsWith(path),
+    );
+
+  const bodyOf = (call: unknown[]) => JSON.parse((call[1] as RequestInit).body as string);
+
+  const arm = () => fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+  const offer = () => screen.queryByRole("status");
+  const cadenceOf = (name: string) =>
+    screen.getByRole("button", { name: `${name} cadence` }).textContent;
+
+  it("offers the daily cadence on arm, and says why it is asking", async () => {
+    stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    expect(offer()).toBeNull();
+    arm();
+
+    const prompt = offer();
+    expect(prompt).toBeTruthy();
+    // The WHY, not the mechanism: the judgment is executed now, so its staleness costs something.
+    expect(prompt!.textContent).toMatch(/feeds the board-picker/);
+    expect(prompt!.textContent).toMatch(/executed, not just read/);
+    expect(prompt!.textContent).toContain("Weekly on Monday at 06:00");
+    expect(prompt!.textContent).toContain("Daily at 06:00");
+    // Asking is not doing — the cadence is untouched until the operator answers.
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+  });
+
+  it("raises the cadence only on an explicit accept, keeping the operator's time of day", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules({ pm: { cron: "30 22 * * 5" } }));
+
+    arm();
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
+    // The arm itself, then the cadence — 22:30 preserved, only the day-of-week dropped.
+    expect(bodyOf(patchesTo(fetchMock, "/schedules")[1])).toEqual({
+      type: "product-master",
+      cron: "30 22 * * *",
+    });
+    await waitFor(() => expect(cadenceOf("product-master")).toContain("Daily at 22:30"));
+    expect(offer()).toBeNull();
+  });
+
+  it("honours keep-weekly, persists it, and never asks again", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+
+    // The answer is stored, not just dismissed — otherwise the next arm asks it all over again.
+    await waitFor(() => expect(patchesTo(fetchMock, "/settings")).toHaveLength(1));
+    expect(bodyOf(patchesTo(fetchMock, "/settings")[0])).toEqual({
+      keepProductMasterWeekly: true,
+    });
+    expect(offer()).toBeNull();
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+
+    // Disarm, arm again: the question is answered, so it stays answered.
+    arm();
+    arm();
+    expect(offer()).toBeNull();
+    expect(patchesTo(fetchMock, "/schedules").every((c) => bodyOf(c).cron === undefined)).toBe(true);
+  });
+
+  it("does not re-ask an operator who already answered in a previous session", () => {
+    stubPanelFetch();
+    renderView({ keepProductMasterWeekly: true }, [], coupledSchedules());
+
+    arm();
+    expect(offer()).toBeNull();
+  });
+
+  it("puts the opt-out back when it could not be stored, rather than swallowing it", async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      (input, init) => {
+        if (init?.method !== "PATCH") {
+          return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+        }
+        if (String(input).endsWith("/settings")) {
+          return Promise.resolve(new Response(JSON.stringify({ error: "disk full" }), { status: 500 }));
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ schedule: { type: "board-picker", enabled: true, cron: "*/10 * * * *" } })),
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disk full"));
+    // Nothing was stored, so the operator gets asked again — silence would be the worse failure.
+    arm();
+    arm();
+    expect(offer()).toBeTruthy();
+  });
+
+  it("disarming changes no cadence and withdraws an unanswered question", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules({ picker: { enabled: true } }));
+
+    // Disarm: no offer, and above all no cadence PATCH — a schedule that sprang back on its own
+    // would make this table untrustworthy about the one thing it exists to report.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(1));
+    expect(bodyOf(patchesTo(fetchMock, "/schedules")[0])).toEqual({
+      type: "board-picker",
+      enabled: false,
+    });
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+
+    // Re-arm with the offer open, then disarm again: the question goes, the cadence stays.
+    arm();
+    expect(offer()).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    expect(offer()).toBeNull();
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+  });
+
+  it("stays quiet when there is nothing to raise", () => {
+    stubPanelFetch();
+    // Already daily — and a hand-written expression or an off product-master are the same silence:
+    // an offer that promised a change it would not make is worse than no offer.
+    const { unmount } = renderView({}, [], coupledSchedules({ pm: { cron: DAILY } }));
+    arm();
+    expect(offer()).toBeNull();
+    unmount();
+
+    renderView({}, [], coupledSchedules({ pm: { enabled: false } }));
+    arm();
+    expect(offer()).toBeNull();
   });
 });
