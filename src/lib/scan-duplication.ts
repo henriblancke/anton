@@ -14,7 +14,7 @@
  *
  * Conservative by construction, like the type-only coupling filter it sits beside: a signal is
  * dropped only when the locations that DECLARE outnumber the ones that compute, and a tie keeps it.
- * A block size it cannot parse, a file past the read budget, a window whose statements carry the
+ * A block size it cannot parse, a file it could not read, a window whose statements carry the
  * block — each leaves the signal exactly as stringer wrote it. Under-filtering costs one triaged
  * bead; over-filtering deletes a real clone nobody hears about.
  */
@@ -227,6 +227,21 @@ function hasArrowBody(tail: string): boolean {
 }
 
 /**
+ * What is left of a line once the block comments it OPENS are stripped — `""` when the line is
+ * nothing but comment, `undefined` when the comment runs past it. A line that closes its comment
+ * and then calls something still executes, so the suffix is classified rather than read as prose.
+ */
+function afterBlockComment(line: string): string | undefined {
+  let rest = line;
+  while (rest.startsWith("/*")) {
+    const close = rest.indexOf("*/", 2);
+    if (close < 0) return undefined;
+    rest = rest.slice(close + 2).trim();
+  }
+  return rest;
+}
+
+/**
  * Classify every line of a file in one forward pass. Whole-file, not just the reported window,
  * because the state that decides what a line IS — inside a block comment, inside a wrapped import,
  * inside an interface body — is only knowable from the lines above it. A bare `readFile,` is an
@@ -240,13 +255,21 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
 
   const lines = source.split("\n");
   for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index].trim();
+    let line = lines[index].trim();
     const next = lines[index + 1]?.trim() ?? "";
 
     if (inComment) {
-      classes.push("comment");
-      if (line.includes("*/")) inComment = false;
-      continue;
+      const close = line.indexOf("*/");
+      if (close < 0) {
+        classes.push("comment");
+        continue;
+      }
+      inComment = false;
+      line = line.slice(close + 2).trim();
+      if (line === "") {
+        classes.push("comment");
+        continue;
+      }
     }
     if (line === "") {
       classes.push("blank");
@@ -259,9 +282,18 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       continue;
     }
     if (line.startsWith("/*")) {
-      classes.push("comment");
-      if (!line.includes("*/")) inComment = true;
-      continue;
+      const rest = afterBlockComment(line);
+      if (rest === undefined) {
+        classes.push("comment");
+        inComment = true;
+        continue;
+      }
+      if (rest === "") {
+        classes.push("comment");
+        continue;
+      }
+      // The comment closed and something followed it: that suffix is what the line does.
+      line = rest;
     }
 
     if (statement) {
@@ -380,7 +412,20 @@ function insideRepo(repoPath: string, raw: string): string | undefined {
 type FileLines =
   | { status: "read"; lines: LineClass[] }
   | { status: "missing" }
+  | { status: "unreadable" }
   | { status: "budget" };
+
+/**
+ * The errno codes that mean the file is not on the tree. Every other read failure — `EACCES`,
+ * `EMFILE`, a flaky filesystem — proves nothing about the block, so it must not be read as absence:
+ * a signal whose locations all hit one would otherwise be dropped as rewritten away.
+ */
+const MISSING_FILE_CODES: ReadonlySet<string> = new Set(["ENOENT", "ENOTDIR"]);
+
+function isMissingFile(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && MISSING_FILE_CODES.has(code);
+}
 
 /** Line classifications for one repo, read once per file and shared across every signal. */
 function sourceIndex(repoPath: string) {
@@ -397,16 +442,22 @@ function sourceIndex(repoPath: string) {
     }
     if (read >= FILE_BUDGET) return { status: "budget" };
     read += 1;
-    const source = await readFile(join(repoPath, rel), "utf8").catch(() => undefined);
-    const result: FileLines =
-      source === undefined
+    let source: string;
+    try {
+      source = await readFile(join(repoPath, rel), "utf8");
+    } catch (error) {
+      const failed: FileLines = isMissingFile(error)
         ? { status: "missing" }
-        : {
-            status: "read",
-            lines: classifyLines(source, {
-              hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
-            }),
-          };
+        : { status: "unreadable" };
+      cache.set(path, failed);
+      return failed;
+    }
+    const result: FileLines = {
+      status: "read",
+      lines: classifyLines(source, {
+        hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+      }),
+    };
     cache.set(path, result);
     return result;
   };
@@ -422,7 +473,7 @@ type Window =
 
 async function readWindow(index: Index, loc: Location, lines: number): Promise<Window> {
   const file = await index(loc.path);
-  if (file.status === "budget") return { status: "unreadable" };
+  if (file.status === "budget" || file.status === "unreadable") return { status: "unreadable" };
   if (file.status === "missing") return { status: "gone" };
   const start = loc.line - 1;
   // A window that starts past the end of the file is a location the tree no longer has: the file
@@ -487,7 +538,7 @@ async function judge(index: Index, signal: ScanSignal): Promise<Verdict> {
   const declarative: LineClass[][] = [];
   for (const loc of locations) {
     const window = await readWindow(index, loc, lines);
-    if (window.status === "unreadable") return KEEP; // out of budget — not proven, so not dropped
+    if (window.status === "unreadable") return KEEP; // never read — not proven, so not dropped
     if (window.status === "gone") continue;
     if (isCodeBlock(window.classes)) code += 1;
     else declarative.push(window.classes);

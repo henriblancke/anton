@@ -1543,6 +1543,59 @@ describe("scan", () => {
       expect(drop.reason).not.toContain("declares rather than computes");
     });
 
+    // A block comment that closes mid-line does not make the line prose: what follows the closer
+    // runs on every pass, so a window of those lines is duplicated computation triage can act on.
+    it("classifies the code that follows a closed block comment on the same line", async () => {
+      const repo = writeRepo({
+        "src/inline.ts": [
+          "export function run(items: number[]) {",
+          "  /* warm the cache */ prime(items);",
+          "  /* then compute */ total(items);",
+          "  /* and flush */ flush(items);",
+          "}",
+          "",
+        ].join("\n"),
+        // The same suffix, reached the other way: a comment that spans lines and ends on one.
+        "src/tail.ts": [
+          "export function run(items: number[]) {",
+          "  /* a long",
+          "     explanation */ prime(items);",
+          "  total(items);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/inline.ts", 2]], 3),
+        clone([["src/tail.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/inline.ts", "src/tail.ts"]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // A file anton could not READ is not a file that is GONE: `EACCES`, `EMFILE` and the like say
+    // nothing about the block, so the signal keeps its place instead of being dropped as rewritten
+    // away. Here the unreadable path is a directory — an `EISDIR` that needs no permission games.
+    it("keeps a signal whose location could not be read, and drops one that is truly absent", async () => {
+      const repo = writeRepo({ "src/doc.ts": DOC_BLOCK });
+      mkdirSync(join(repo, "src/unreadable.ts"), { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([
+          ["src/unreadable.ts", 2],
+          ["src/doc.ts", 2],
+        ]),
+        clone([["src/deleted.ts", 2]]),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/unreadable.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deleted.ts" }]);
+    });
+
     // The regression the bead was filed on, replayed: the duplication half of scan d9eab116
     // (2026-08-19), every signal exactly as stringer wrote it, judged against this repo's own tree.
     // Sizes the filter against real evidence rather than a hand-built tree — and if the drop rate
