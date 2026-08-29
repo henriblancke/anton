@@ -271,6 +271,30 @@ describe("the `blocked` rule — no worker could start this yet", () => {
     const board = gatedBoard(["anton-t3"]);
     expect(of(find(board, "anton-fa"), board)).toEqual([]);
   });
+
+  it("falls back to the unattributed wording when the held tickets name no blocker it can print", () => {
+    // The one shape that reaches the fallback: a container epic NESTED under the target. A run's
+    // tickets are resolved to the nearest CARD ancestor (anton-t1 rides on anton-fa, since a
+    // container epic is no card), but blockers roll up to the nearest UNIT ancestor (anton-e) — so
+    // the readiness verdict is anton-fa's while the blocker belongs to anton-e, and neither
+    // `blockedBy` nor `epicStandaloneBlockers` can name it for anton-fa's refusal.
+    const board = [
+      feature("anton-fa"),
+      epic("anton-e", { parent: "anton-fa" }),
+      feature("anton-g", "anton-e"),
+      ticket("anton-t1", "anton-e", waitsOn("anton-t1", "anton-b1")),
+      feature("anton-fb"),
+      ticket("anton-b1", "anton-fb"),
+    ];
+    const gaps = of(find(board, "anton-fa"), board);
+
+    // The stranded ticket is a structure fault in its own right; the blocked gap is the second.
+    expect(rulesOf(gaps)).toEqual(["structure", "blocked"]);
+    expect(gaps[1].message).toBe(
+      "anton-fa → blocked: every ticket it would run is held by an open blocker — approval is the " +
+        "run trigger, and there is nothing here a worker could pick up",
+    );
+  });
 });
 
 /**
