@@ -559,12 +559,25 @@ export function resolveValueLabels(settings: ProjectSettings): string[] {
  * `values` may not be empty. An empty membership set matches NOTHING (criteria fail closed, R2.5),
  * so it is never what an operator meant — dropping the namespace is how you stop constraining it.
  * Bounded like every other operator list.
+ *
+ * Both ends of each ordered native field are accepted, but nothing here rejects a pair that crosses
+ * (`minPriority` above `maxPriority`): an empty window is a legible policy that admits nothing, and
+ * the editor's live match count already says so louder than a 400 would.
  */
 export const pickerPolicySchema = z
   .object({
     types: z.array(z.string().trim().min(1).max(40)).min(1).max(16),
-    // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent.
+    // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent, so `max` is
+    // the floor and `min` the ceiling.
     maxPriority: z.number().int().min(0).max(4),
+    minPriority: z.number().int().min(0).max(4),
+    // Parent hops above the bead — 0 is top-level. Bounded rather than open-ended because a board
+    // nests epic → feature → ticket, and a depth beyond that is a typo, not a policy.
+    maxParentDepth: z.number().int().min(0).max(8),
+    minParentDepth: z.number().int().min(0).max(8),
+    // Whole days. A year is the outer edge of a rule an operator could mean by "old".
+    minAgeDays: z.number().int().min(0).max(365),
+    maxAgeDays: z.number().int().min(0).max(3650),
     labels: z
       .array(
         z
@@ -574,8 +587,19 @@ export const pickerPolicySchema = z
             // why nothing on this path sorts them.
             values: z.array(z.string().trim().min(1).max(120)).min(1).max(32),
             ranked: z.boolean().optional(),
+            // A `≤`/`≥` over that ranking. Rejected without `ranked`, and rejected when it names a
+            // value the ranking does not carry: the predicate fails such a criterion CLOSED against
+            // every bead (R2.5), so persisting one would arm a policy that admits nothing and says
+            // so only per bead.
+            compare: z
+              .object({ op: z.enum(["lte", "gte"]), value: z.string().trim().min(1).max(120) })
+              .strict()
+              .optional(),
           })
-          .strict(),
+          .strict()
+          .refine((c) => !c.compare || (c.ranked && c.values.includes(c.compare.value)), {
+            message: "a comparison needs a ranking that contains its bound",
+          }),
       )
       .max(16)
       .refine((cs) => new Set(cs.map((c) => c.namespace)).size === cs.length, {

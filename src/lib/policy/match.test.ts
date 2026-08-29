@@ -9,8 +9,13 @@
  * The vocabularies below (`severity:`, `team:`) are deliberately ones anton ships nothing about.
  */
 import { describe, expect, it } from "vitest";
-import { explainPolicyMatch, partitionByPolicy, type PolicyCandidate } from "./match";
-import type { Policy } from "./types";
+import {
+  explainPolicyMatch,
+  matchesPolicy,
+  partitionByPolicy,
+  type PolicyCandidate,
+} from "./match";
+import type { Policy, PolicyCriterionKey } from "./types";
 
 let seq = 0;
 function bead(o: Partial<PolicyCandidate> = {}): PolicyCandidate {
@@ -136,5 +141,253 @@ describe("partitionByPolicy", () => {
 
   it("matches the whole board when the policy asserts nothing", () => {
     expect(partitionByPolicy(board, {}).matched).toHaveLength(3);
+  });
+});
+
+/**
+ * Every criterion in isolation, as a table (anton-hmyo): one policy asserting ONE thing, one bead,
+ * and the exact sentence the editor prints when it is refused. The reason is asserted rather than the
+ * boolean because on a board whose vocabulary the policy does not speak, the refusal IS the product —
+ * a bare `0 match` reads as a broken pass (R2.6).
+ */
+interface CriterionCase {
+  name: string;
+  policy: Policy;
+  candidate: Partial<PolicyCandidate>;
+  /** The criteria this bead must fail. Empty means the policy admits it. */
+  failed: PolicyCriterionKey[];
+  /** The sentence beside the bead, for the single-criterion refusals. */
+  reason?: string;
+}
+
+const SEVERITY_RANKING = ["critical", "major", "minor"];
+
+const CASES: CriterionCase[] = [
+  // type — native, but an ENUM: membership, because nothing ordered bd's issue types.
+  { name: "type: admits a listed type", policy: { types: ["bug"] }, candidate: {}, failed: [] },
+  {
+    name: "type: refuses an unlisted type",
+    policy: { types: ["bug"] },
+    candidate: { type: "feature" },
+    failed: ["types"],
+    reason: "is a feature, and the policy admits only bug",
+  },
+  {
+    name: "type: fails closed on a bead carrying none",
+    policy: { types: ["bug"] },
+    candidate: { type: undefined },
+    failed: ["types"],
+    reason: "carries no issue type",
+  },
+
+  // priority — ordered, so BOTH ends (R2.3). bd's number inverts: larger is less urgent.
+  { name: "priority: admits the floor itself", policy: { maxPriority: 2 }, candidate: { priority: 2 }, failed: [] },
+  {
+    name: "priority: refuses below the floor",
+    policy: { maxPriority: 2 },
+    candidate: { priority: 3 },
+    failed: ["priority"],
+    reason: "is P3, below the P2 floor",
+  },
+  {
+    name: "priority: refuses above the ceiling — the urgent end an operator withheld",
+    policy: { minPriority: 1 },
+    candidate: { priority: 0 },
+    failed: ["priority"],
+    reason: "is P0, above the P1 ceiling",
+  },
+  {
+    name: "priority: admits inside a two-ended window",
+    policy: { minPriority: 1, maxPriority: 2 },
+    candidate: { priority: 2 },
+    failed: [],
+  },
+  {
+    name: "priority: fails closed on a bead carrying none",
+    policy: { maxPriority: 2 },
+    candidate: { priority: undefined },
+    failed: ["priority"],
+    reason: "carries no priority",
+  },
+
+  // parentage — ordered as DEPTH, so `maxParentDepth: 0` is "parentless work only".
+  { name: "parentage: admits top-level under a 0 ceiling", policy: { maxParentDepth: 0 }, candidate: { depth: 0 }, failed: [] },
+  {
+    name: "parentage: refuses work nested deeper than the policy admits",
+    policy: { maxParentDepth: 0 },
+    candidate: { depth: 2 },
+    failed: ["parentage"],
+    reason: "sits 2 levels under a parent, and the policy admits nothing deeper than top-level",
+  },
+  {
+    name: "parentage: refuses work shallower than the policy requires",
+    policy: { minParentDepth: 1 },
+    candidate: { depth: 0 },
+    failed: ["parentage"],
+    reason: "is top-level, and the policy admits nothing shallower than 1 level under a parent",
+  },
+  {
+    name: "parentage: fails closed when the parent chain leaves the board",
+    policy: { maxParentDepth: 1 },
+    candidate: { depth: undefined },
+    failed: ["parentage"],
+    reason: "sits under a parent this board does not carry",
+  },
+
+  // age — ordered in days. The soak is the point: a rule must not start what a human was still editing.
+  { name: "age: admits a bead that has served the soak exactly", policy: { minAgeDays: 2 }, candidate: { ageDays: 2 }, failed: [] },
+  {
+    name: "age: refuses a bead still inside the soak",
+    policy: { minAgeDays: 2 },
+    candidate: { ageDays: 0 },
+    failed: ["age"],
+    reason: "was filed 0 days ago, inside the 2 days the policy waits before starting anything",
+  },
+  {
+    name: "age: refuses work the board has ignored for longer than the window",
+    policy: { maxAgeDays: 90 },
+    candidate: { ageDays: 400 },
+    failed: ["age"],
+    reason: "was filed 400 days ago, past the 90 days the policy admits",
+  },
+  {
+    name: "age: fails closed on a bead with no creation date",
+    policy: { maxAgeDays: 90 },
+    candidate: { ageDays: undefined },
+    failed: ["age"],
+    reason: "carries no creation date",
+  },
+
+  // blockers
+  {
+    name: "blockers: refuses a held target only when asked to",
+    policy: { requireUnblocked: true },
+    candidate: { blocked: true },
+    failed: ["blockers"],
+    reason: "has an unmet blocker on the `blocks` graph",
+  },
+
+  // discovered namespaces — membership, and fail closed (R2.5).
+  {
+    name: "namespace: admits a carried value",
+    policy: { labels: [{ namespace: "severity", values: ["critical", "major"] }] },
+    candidate: { labels: ["severity:major"] },
+    failed: [],
+  },
+  {
+    name: "namespace: refuses an unadmitted value",
+    policy: { labels: [{ namespace: "severity", values: ["critical", "major"] }] },
+    candidate: { labels: ["severity:minor"] },
+    failed: ["labels:severity"],
+    reason: "is severity:minor, and the policy admits only critical or major",
+  },
+  {
+    name: "namespace: refuses a bead that has never heard of it — the day-one case",
+    policy: { labels: [{ namespace: "severity", values: ["critical", "major"] }] },
+    candidate: { labels: ["team:payments"] },
+    failed: ["labels:severity"],
+    reason: "carries no `severity:` label, and the policy requires critical or major",
+  },
+
+  // …unless the OPERATOR ranked the namespace, which is the only order this module ever has.
+  {
+    name: "ranked ≤: admits everything at or before the bound",
+    policy: {
+      labels: [
+        { namespace: "severity", values: SEVERITY_RANKING, ranked: true, compare: { op: "lte", value: "major" } },
+      ],
+    },
+    candidate: { labels: ["severity:critical"] },
+    failed: [],
+  },
+  {
+    name: "ranked ≤: admits the bound itself",
+    policy: {
+      labels: [
+        { namespace: "severity", values: SEVERITY_RANKING, ranked: true, compare: { op: "lte", value: "major" } },
+      ],
+    },
+    candidate: { labels: ["severity:major"] },
+    failed: [],
+  },
+  {
+    name: "ranked ≤: refuses past the bound, quoting the operator's own ranking",
+    policy: {
+      labels: [
+        { namespace: "severity", values: SEVERITY_RANKING, ranked: true, compare: { op: "lte", value: "major" } },
+      ],
+    },
+    candidate: { labels: ["severity:minor"] },
+    failed: ["labels:severity"],
+    reason:
+      "is severity:minor, and the policy admits only at or before `major` in your `severity:` ranking (critical or major)",
+  },
+  {
+    name: "ranked ≥: the other direction along the same ranking",
+    policy: {
+      labels: [
+        { namespace: "severity", values: SEVERITY_RANKING, ranked: true, compare: { op: "gte", value: "major" } },
+      ],
+    },
+    candidate: { labels: ["severity:critical"] },
+    failed: ["labels:severity"],
+    reason:
+      "is severity:critical, and the policy admits only at or after `major` in your `severity:` ranking (major or minor)",
+  },
+  {
+    name: "ranked ≤: still fails closed on a bead missing the namespace",
+    policy: {
+      labels: [
+        { namespace: "severity", values: SEVERITY_RANKING, ranked: true, compare: { op: "lte", value: "major" } },
+      ],
+    },
+    candidate: { labels: [] },
+    failed: ["labels:severity"],
+    reason:
+      "carries no `severity:` label, and the policy requires at or before `major` in your `severity:` ranking (critical or major)",
+  },
+  {
+    name: "a comparison with no ranking behind it is never softened into membership",
+    policy: {
+      labels: [{ namespace: "severity", values: SEVERITY_RANKING, compare: { op: "lte", value: "major" } }],
+    },
+    candidate: { labels: ["severity:critical"] },
+    failed: ["labels:severity"],
+    reason: "cannot be judged: the policy compares `severity:` against a ranking it does not carry",
+  },
+  {
+    name: "a comparison bounded on a value the ranking lost refuses everything, and says so",
+    policy: {
+      labels: [
+        { namespace: "severity", values: SEVERITY_RANKING, ranked: true, compare: { op: "lte", value: "blocker" } },
+      ],
+    },
+    candidate: { labels: ["severity:critical"] },
+    failed: ["labels:severity"],
+    reason: "cannot be judged: the policy compares `severity:` against `blocker`, which is not in its ranking",
+  },
+];
+
+describe.each(CASES)("$name", ({ policy, candidate, failed, reason }) => {
+  const target = bead(candidate);
+
+  it("names exactly the criteria that refused it", () => {
+    expect(failedKeys(target, policy)).toEqual(failed);
+  });
+
+  it("agrees with the yes/no the picker reads", () => {
+    expect(matchesPolicy(target, policy)).toBe(failed.length === 0);
+  });
+
+  it("explains every refusal", () => {
+    const verdicts = explainPolicyMatch(target, policy);
+    for (const verdict of verdicts) {
+      expect(verdict.label).not.toBe("");
+      expect(verdict.reason).not.toBe("");
+    }
+    if (reason !== undefined) {
+      expect(verdicts).toHaveLength(1);
+      expect(verdicts[0].reason).toBe(reason);
+    }
   });
 });

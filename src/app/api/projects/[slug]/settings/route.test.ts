@@ -814,6 +814,30 @@ describe("settings route — work policy (anton-c7iv)", () => {
     expect(persisted().pickerPolicy).toEqual(ranked);
   });
 
+  it("round-trips the ordered native bounds and a ranked comparison (anton-hmyo)", async () => {
+    // Both ends of every ordered field, plus the one ordering a discovered namespace ever gets —
+    // the operator's own ranking, with the bound they set against it.
+    const ordered = {
+      minPriority: 1,
+      maxPriority: 3,
+      minParentDepth: 0,
+      maxParentDepth: 1,
+      minAgeDays: 1,
+      maxAgeDays: 180,
+      labels: [
+        {
+          namespace: "severity",
+          values: ["critical", "major", "minor"],
+          ranked: true,
+          compare: { op: "lte", value: "major" },
+        },
+      ],
+    };
+    const res = await PATCH(patchReq({ pickerPolicy: ordered }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().pickerPolicy).toEqual(ordered);
+  });
+
   it("rejects a malformed policy without disturbing what is stored", async () => {
     await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
     for (const value of [
@@ -831,6 +855,36 @@ describe("settings route — work policy (anton-c7iv)", () => {
       { maxPriority: "P2" },
       { requireUnblocked: "yes" },
       { labels: [{ namespace: "severity", values: ["major"], ranked: "yes" }] },
+      // A comparison the predicate could only ever fail closed on is a policy that admits nothing
+      // and says so one bead at a time — rejected here instead, where the operator can see it.
+      {
+        labels: [
+          { namespace: "severity", values: ["critical", "major"], compare: { op: "lte", value: "major" } },
+        ],
+      },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            compare: { op: "lte", value: "blocker" },
+          },
+        ],
+      },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            compare: { op: "under", value: "major" },
+          },
+        ],
+      },
+      { minPriority: 5 },
+      { maxParentDepth: -1 },
+      { minAgeDays: "a week" },
       { unknownCriterion: true },
       ["bug"],
     ]) {

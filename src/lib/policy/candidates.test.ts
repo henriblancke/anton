@@ -22,7 +22,7 @@ describe("policyCandidates", () => {
       bead({ id: "c", status: "in_progress" }),
     ];
     expect(policyCandidates(board)).toEqual([
-      { id: "a", title: "a", type: "bug", priority: 1, labels: ["severity:major"] },
+      { id: "a", title: "a", type: "bug", priority: 1, depth: 0, labels: ["severity:major"] },
     ]);
   });
 
@@ -50,5 +50,39 @@ describe("policyCandidates", () => {
 
   it("leaves a bead with no blocks edge unmarked", () => {
     expect(policyCandidates([bead({ id: "a" })])[0].blocked).toBeUndefined();
+  });
+
+  it("counts parent hops, so a policy can say `parentless work only` (anton-hmyo)", () => {
+    const board = [
+      bead({ id: "epic" }),
+      bead({ id: "feature", parent: "epic" }),
+      bead({ id: "ticket", parent: "feature" }),
+    ];
+    const depths = Object.fromEntries(policyCandidates(board).map((c) => [c.id, c.depth]));
+    expect(depths).toEqual({ epic: 0, feature: 1, ticket: 2 });
+  });
+
+  it("reports no depth when the chain leaves the board, rather than guessing top-level", () => {
+    // The predicate fails an asserted parentage criterion closed on this. Defaulting it to 0 would
+    // admit a nested bead as if it were parentless.
+    const [orphan] = policyCandidates([bead({ id: "a", parent: "gone" })]);
+    expect(orphan.depth).toBeUndefined();
+  });
+
+  it("survives a parent cycle a malformed board could hold", () => {
+    const board = [bead({ id: "a", parent: "b" }), bead({ id: "b", parent: "a" })];
+    expect(policyCandidates(board).map((c) => c.depth)).toEqual([undefined, undefined]);
+  });
+
+  it("ages a bead in whole days against the caller's clock, never its own", () => {
+    const now = new Date("2026-08-29T12:00:00Z");
+    const board = [
+      bead({ id: "fresh", created_at: "2026-08-29T02:00:00Z" }),
+      bead({ id: "soaked", created_at: "2026-08-27T13:00:00Z" }),
+      bead({ id: "undated", created_at: undefined }),
+    ];
+    const ages = Object.fromEntries(policyCandidates(board, now).map((c) => [c.id, c.ageDays]));
+    // Floored: "at least a day old" means a full day has passed, not that the hour rounded up.
+    expect(ages).toEqual({ fresh: 0, soaked: 1, undated: undefined });
   });
 });
