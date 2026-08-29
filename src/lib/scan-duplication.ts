@@ -85,8 +85,14 @@ interface Location {
 /** Lines that carry only nesting — closing braces, a lone `{`, a JSX closer. No statement. */
 const STRUCTURAL_LINE = /^(?:[[\](){}<>,;:]+|<\/[A-Za-z][\w.:-]*>[,;)]*|\/>[,;)]*)$/;
 
-/** `import …`, `export { … } from …`, `export * from …` — the statement's first line. */
-const IMPORT_START = /^import\b|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
+/**
+ * `import …`, `export { … } from …`, `export * from …` — the statement's first line. A dynamic
+ * `import("./plugin").then(register)` is excluded: it loads a module at runtime and drives whatever
+ * comes after it, so it computes. Go's `import (` block keeps its place — a paren with nothing after
+ * it opens a specifier list, not a call.
+ */
+const IMPORT_START =
+  /^import\b(?!\s*(?:\(\s*\S|\.))|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
 
 /**
  * `interface X {`, `type X =`, and the ERASED enum forms — `declare enum`, `const enum`. A plain
@@ -130,6 +136,28 @@ function nestingDelta(line: string, open: string, close: string): number {
 const braceDelta = (line: string): number => nestingDelta(line, "{([", "})]");
 /** Parens alone: a signature ends when its PARAMETER list closes, not when its body brace opens. */
 const parenDelta = (line: string): number => nestingDelta(line, "(", ")");
+
+/** An `=` that assigns, not `==`/`=>`/`<=` — the mark of a default value in a parameter list. */
+const PARAMETER_DEFAULT = /(?:^|[^=!<>])=(?!=|>)/;
+
+/**
+ * Whether a parameter line carries a default — `client = createClient()`, `{ limit = 10 }`. The
+ * names and type annotations around it declare, but an initializer RUNS on every call, so a window
+ * of them is real duplicated computation and the line votes as code.
+ */
+function hasParameterDefault(line: string): boolean {
+  return PARAMETER_DEFAULT.test(stripNoise(line));
+}
+
+/**
+ * The same question for a header line, where the `=` of `const f = (` is the binding rather than a
+ * default: only what follows the parameter list's opening paren counts.
+ */
+function headerHasParameterDefault(line: string): boolean {
+  const text = stripNoise(line);
+  const open = text.indexOf("(");
+  return open >= 0 && PARAMETER_DEFAULT.test(text.slice(open + 1));
+}
 
 /**
  * Whether a declaration statement runs past this line. An import ends when its bracket list closes
@@ -177,10 +205,10 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     }
 
     if (statement) {
-      classes.push(statement);
       if (statement === "signature") {
         // The parameter list, however it is spelled — a destructured props object, its inline type
-        // annotation, one name per line. None of it computes anything.
+        // annotation, one name per line. None of it computes anything, unless it defaults.
+        classes.push(hasParameterDefault(line) ? "code" : "signature");
         depth += parenDelta(line);
         if (depth <= 0) {
           statement = undefined;
@@ -188,6 +216,7 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         }
         continue;
       }
+      classes.push(statement);
       depth += braceDelta(line);
       if (!continues(statement, line, depth)) {
         statement = undefined;
@@ -208,8 +237,8 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     if (FUNCTION_START.test(line) || ARROW_START.test(line)) {
       const open = parenDelta(line);
       // Only a header whose parameter list runs on is a declaration BLOCK; one that closes on its
-      // own line is a single line of real code and is counted as such.
-      classes.push(open > 0 ? "signature" : "code");
+      // own line is a single line of real code and is counted as such — as is one that defaults.
+      classes.push(open > 0 && !headerHasParameterDefault(line) ? "signature" : "code");
       if (open > 0) {
         statement = "signature";
         depth = open;

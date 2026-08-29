@@ -1189,6 +1189,75 @@ describe("scan", () => {
       expect(result.duplication.dropped[1].reason).toContain("6 signature");
     });
 
+    // A dynamic `import()` is a call: it loads a module at runtime and drives whatever it resolves
+    // into. Reading it as an import declaration would drop a window of real module wiring.
+    it("reads a dynamic import() as the call it is, not as an import declaration", async () => {
+      const repo = writeRepo({
+        "src/plugins.ts": [
+          "export function load(register: (m: unknown) => void) {",
+          "  import('./alpha').then(register);",
+          "  import('./beta').then(register);",
+          "  import('./gamma').then(register);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/static.ts": [
+          "import { alpha } from './alpha';",
+          "import { beta } from './beta';",
+          "import { gamma } from './gamma';",
+          "export const all = [alpha, beta, gamma];",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/plugins.ts", 2]], 3),
+        clone([["src/static.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/plugins.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/static.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // A parameter NAME declares; a parameter DEFAULT runs on every call. A signature whose whole
+    // list is `x = build()` is duplicated computation, however much it looks like a props list.
+    it("counts a parameter list of defaults as code and one of bare names as a declaration", async () => {
+      const repo = writeRepo({
+        "src/connect.ts": [
+          "export function connect(",
+          "  client = createClient(),",
+          "  cache = createCache(),",
+          "  logger = createLogger(),",
+          ") {",
+          "  return client;",
+          "}",
+          "",
+        ].join("\n"),
+        "src/props.ts": [
+          "export function render(",
+          "  client: Client,",
+          "  cache: Cache,",
+          "  logger: Logger,",
+          ") {",
+          "  return client;",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/connect.ts", 2]], 3),
+        clone([["src/props.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/connect.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/props.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
     // Under-filtering costs one triaged bead; over-filtering deletes a real clone nobody hears
     // about again. So anything anton cannot read as a declaration rides through untouched.
     it("keeps every signal it cannot disprove", async () => {
