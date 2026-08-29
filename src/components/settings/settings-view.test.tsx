@@ -85,6 +85,7 @@ function renderView(
       labelVocabulary={labelVocabulary}
       issueTypes={[]}
       policyDraft={FALLBACK_DRAFT}
+      policyCandidates={[]}
       earned={earned}
     />,
   );

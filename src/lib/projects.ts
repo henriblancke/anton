@@ -570,7 +570,10 @@ export const pickerPolicySchema = z
         z
           .object({
             namespace: z.string().trim().min(1).max(60),
+            // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
+            // why nothing on this path sorts them.
             values: z.array(z.string().trim().min(1).max(120)).min(1).max(32),
+            ranked: z.boolean().optional(),
           })
           .strict(),
       )

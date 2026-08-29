@@ -800,6 +800,20 @@ describe("settings route — work policy (anton-c7iv)", () => {
     expect("pickerPolicy" in persisted()).toBe(false);
   });
 
+  it("round-trips a hand-ranked namespace in the operator's order (anton-qsr1)", async () => {
+    // The ORDER is the ranking (R2.3), so it must survive the write and the read back unsorted —
+    // a policy that re-alphabetised on save would silently discard what the operator dragged.
+    const ranked = {
+      labels: [{ namespace: "severity", values: ["major", "critical", "minor"], ranked: true }],
+    };
+    const res = await PATCH(patchReq({ pickerPolicy: ranked }), ctx("tmp"));
+    expect(res.status).toBe(200);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toEqual(ranked);
+    expect(persisted().pickerPolicy).toEqual(ranked);
+  });
+
   it("rejects a malformed policy without disturbing what is stored", async () => {
     await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
     for (const value of [
@@ -816,6 +830,7 @@ describe("settings route — work policy (anton-c7iv)", () => {
       { maxPriority: -1 },
       { maxPriority: "P2" },
       { requireUnblocked: "yes" },
+      { labels: [{ namespace: "severity", values: ["major"], ranked: "yes" }] },
       { unknownCriterion: true },
       ["bug"],
     ]) {

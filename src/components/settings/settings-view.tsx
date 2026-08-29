@@ -27,6 +27,7 @@ import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog
 import {
   PolicyDraftSection,
   type Policy,
+  type PolicyCandidate,
   type PolicyDraft,
 } from "@/components/settings/policy-draft-section";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
@@ -573,6 +574,7 @@ export function SettingsView({
   labelVocabulary,
   issueTypes,
   policyDraft,
+  policyCandidates,
   earned,
 }: {
   project: Project;
@@ -597,6 +599,12 @@ export function SettingsView({
    * which to render, and re-deriving it in the client would need a board read this module can't do.
    */
   policyDraft: PolicyDraft;
+  /**
+   * Every OPEN bead on this board, projected to what the policy predicate reads (anton-qsr1). Passed
+   * whole so the panel's match count and per-bead "why not?" recompute in the browser as criteria
+   * change — a fetch per edit would make the count lag the control that explains it.
+   */
+  policyCandidates: PolicyCandidate[];
   /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
@@ -2034,6 +2042,7 @@ export function SettingsView({
               stored={settings.pickerPolicy}
               issueTypes={issueTypes}
               labelVocabulary={labelVocabulary}
+              candidates={policyCandidates}
             />
           )}
 

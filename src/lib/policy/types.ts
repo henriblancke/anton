@@ -23,7 +23,22 @@ export interface PolicyLabelCriterion {
   namespace: string;
   /** Admitted values, BARE (`"eng"`, not `"domain:eng"`). Empty is meaningless and never emitted. */
   values: string[];
+  /**
+   * The operator ranked these values by hand, so {@link values} is ORDERED — most preferred first —
+   * and the order must survive a round trip through settings (R2.3).
+   *
+   * Ranking never changes what the criterion ADMITS: membership is still membership, and this is the
+   * only ordering a discovered namespace ever has, because a set a repo invented has none of its own
+   * and anton refuses to infer one. Absent means the values are an unordered set.
+   */
+  ranked?: boolean;
 }
+
+/**
+ * Which criterion a rationale explains or a verdict refuses — the key every surface anchors to its
+ * control, so a "why this?" and a "why not?" about the same criterion agree on its name.
+ */
+export type PolicyCriterionKey = "types" | "priority" | "blockers" | `labels:${string}`;
 
 export interface Policy {
   /**

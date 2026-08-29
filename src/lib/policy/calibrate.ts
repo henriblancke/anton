@@ -24,7 +24,13 @@
  */
 import { LABELS } from "../beads/bd";
 import type { Bead } from "../beads/types";
-import { namespaceOf, valueOf, type Policy, type PolicyLabelCriterion } from "./types";
+import {
+  namespaceOf,
+  valueOf,
+  type Policy,
+  type PolicyCriterionKey,
+  type PolicyLabelCriterion,
+} from "./types";
 
 /**
  * Below this many prior approvals the history is evidence of nothing and the fallback is proposed
@@ -54,8 +60,7 @@ const CONTROL_NAMESPACES = new Set(["stage", "run-lease", "review-score", "sourc
 /** How many approvals one rationale names. Enough to make the claim checkable, short enough to read. */
 const MAX_CITED = 4;
 
-/** Which criterion a rationale explains — the key a surface anchors its "why this?" to. */
-export type PolicyCriterionKey = "types" | "priority" | "blockers" | `labels:${string}`;
+export type { PolicyCriterionKey };
 
 /** One criterion and the evidence behind it, so a draft is never an unexplained suggestion. */
 export interface PolicyRationale {
