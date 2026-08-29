@@ -547,9 +547,35 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(reason(decide(REPARENT, [CARD, other, rehomed]))).toMatch(
         /now rides board card anton-other/,
       );
-      expect(reason(decide(CLUSTER, [CARD, other, rehomed, bead("anton-b")]))).toMatch(
-        /now rides board card anton-other/,
+    });
+
+    /**
+     * …but ONE answered member does not take the rest of a cluster down with it. A cluster's claim
+     * is its target now, not its membership (anton-9hpp), so the proposal standing open suppresses
+     * the fresh cluster the next patrol derives from the members nobody has answered — and refusing
+     * the whole plan over `anton-a` would leave that valid claim unapplyable until a human declined
+     * this bead by hand. The newer decision is still never written over: `anton-a` gets no step.
+     */
+    it("moves the members of a cluster nobody has answered, dropping the one somebody has", () => {
+      const other = bead("anton-other", { issue_type: "feature" });
+      const rehomed = child("anton-a", other.id);
+      const decision = decide(CLUSTER, [CARD, other, rehomed, bead("anton-b")]);
+
+      expect(decision.status).toBe("apply");
+      expect(decision.status === "apply" ? decision.steps.map((s) => s.id) : []).toEqual([
+        "anton-b",
+      ]);
+      expect(decision.status === "apply" ? decision.summary : "").toBe(
+        "re-parented anton-b under anton-card (1 member(s) already re-homed)",
       );
+    });
+
+    // Nothing left to write is not a settle: the ask never reached the target it names, and an
+    // approver told "already sit under anton-card" would be told the opposite of what happened.
+    it("refuses a cluster whose every member was answered elsewhere", () => {
+      const other = bead("anton-other", { issue_type: "feature" });
+      const board = [CARD, other, child("anton-a", other.id), child("anton-b", other.id)];
+      expect(reason(decide(CLUSTER, board))).toMatch(/now rides board card anton-other/);
     });
 
     // A move under another CONTAINER leaves the bead exactly as unreachable as the proposal says,

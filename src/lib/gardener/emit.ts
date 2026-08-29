@@ -31,6 +31,7 @@ import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { isClaimed, isOpenWork } from "./board-index";
 import {
+  canonicalFingerprintOf,
   concernedBeads,
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
@@ -91,13 +92,22 @@ export const MAX_APPLIES_PER_PASS = 3;
 /**
  * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
  * declined (abandoned). A plainly-closed proposal is absent deliberately — see the module header.
+ *
+ * A proposal answers for the claim its own PLAN makes as well as for the label it carries. The two
+ * are the same string for everything this emitter filed; they differ for a `parentless-cluster`
+ * filed before the claim moved to its target (anton-9hpp), and folding it onto the identity the
+ * detector now derives is what keeps the rollout from filing a fresh-format twin of an ask the
+ * board already carries.
  */
 export function suppressedFingerprints(board: Bead[]): Set<string> {
   const out = new Set<string>();
   for (const bead of board) {
     const fingerprint = fingerprintLabelOf(bead);
     if (!fingerprint) continue;
-    if (isOpenWork(bead) || beads.isAbandoned(bead)) out.add(fingerprint);
+    if (!isOpenWork(bead) && !beads.isAbandoned(bead)) continue;
+    out.add(fingerprint);
+    const canonical = canonicalFingerprintOf(bead);
+    if (canonical) out.add(canonical);
   }
   return out;
 }

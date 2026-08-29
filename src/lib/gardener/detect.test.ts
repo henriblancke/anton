@@ -198,6 +198,27 @@ describe("parentless clusters", () => {
     expect(detection.evidence.join("\n")).toContain('anton-esc states "escalation" too');
   });
 
+  /**
+   * Agreement is asked of a GROUP, not of every bead the anchor reaches. An unrelated bead that
+   * happens to carry "escalation" and nothing else drags the whole intersection down to that one
+   * word — so a detector that only ever intersected the full match set would drop a pair that does
+   * state a subject, for a reason that has nothing to do with either bead in it.
+   */
+  it("still finds a pair that agrees when an unrelated bead shares only the anchor", () => {
+    const detection = only(
+      detect([
+        ...homes,
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation banner retry" }),
+        bead("anton-p3", { title: "Escalation queue timeout" }),
+      ]),
+    );
+
+    expect(detection.subjects).toEqual(["anton-p1", "anton-p2"]);
+    expect(detection.target).toBe("anton-esc");
+    expect(detection.evidence.join("\n")).toContain('"banner", "escalation"');
+  });
+
   // The old rule counted a topic key as distinctive when exactly ONE open card carried it, which on
   // a board of a few dozen cards is nearly every word: nine of eleven proposals were declined on a
   // match like this one (anton-9hpp). One word two titles happen to share is not a subject.

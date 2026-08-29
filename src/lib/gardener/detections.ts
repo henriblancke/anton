@@ -140,7 +140,7 @@ const DETAIL_PATTERN: Record<DetailShape, RegExp> = { priority: /^P[0-4]$/ };
  * — "the loose work orbiting this card belongs under it" — and its subject list is whatever was
  * parentless and free at patrol time, so it changes whenever a member is claimed, closed, or joined
  * by a new loose bead. Hashing that list gave every patrol a fresh fingerprint for the same claim and
- * made suppression vacuous: five proposals naming anton-5ahy stood open at once (anton-9hpp). Kind
+ * made suppression vacuous: four proposals naming anton-5ahy stood open at once (anton-9hpp). Kind
  * plus target is the identity that holds still.
  */
 export type ClaimIdentity = "target";
@@ -350,7 +350,50 @@ export function detectionSubjectKey(
 ): string {
   const about =
     KINDS[kind].identity === "target" && target ? ANY_SUBJECTS : [...subjects].sort().join("+");
-  return `${kind}:${about}` + (target ? `>${target}` : "") + (detail ? `#${detail}` : "");
+  return subjectKey(kind, about, target, detail);
+}
+
+/** The readable identity itself, once the caller has decided what the claim is ABOUT. */
+const subjectKey = (
+  kind: GardenerDetectionKind,
+  about: string,
+  target?: string,
+  detail?: string,
+): string => `${kind}:${about}` + (target ? `>${target}` : "") + (detail ? `#${detail}` : "");
+
+/**
+ * The identity a kind used BEFORE its claim moved to the target (anton-9hpp): the membership,
+ * spelled out. Nothing emits one — it exists so a proposal already open when the identity changed
+ * still reads back. See {@link identityMatches}.
+ */
+const legacySubjectKey = (
+  kind: GardenerDetectionKind,
+  subjects: string[],
+  target?: string,
+  detail?: string,
+): string => subjectKey(kind, [...subjects].sort().join("+"), target, detail);
+
+/**
+ * Does this fingerprint stand for exactly these fields — the canonical identity, or the membership
+ * hash a proposal carries that was filed before its kind's claim moved to the target?
+ *
+ * The older form is accepted ON READ ALONE, and only for the kind whose identity actually moved.
+ * Without it the rollout strands every open `parentless-cluster`: it would parse as "no readable
+ * move" and refuse forever, while the next patrol filed a fresh-format duplicate beside it — the
+ * exact state target-identity exists to remove. Emission only ever writes the canonical form, and
+ * suppression folds a legacy proposal onto it (`canonicalFingerprintOf`), so no duplicate is filed.
+ */
+function identityMatches(
+  kind: GardenerDetectionKind,
+  subjects: string[],
+  target: string | undefined,
+  detail: string | undefined,
+  fingerprint: string,
+): boolean {
+  const canonical = proposalFingerprint(kind, detectionSubjectKey(kind, subjects, target, detail));
+  if (canonical === fingerprint) return true;
+  if (KINDS[kind].identity === undefined) return false;
+  return proposalFingerprint(kind, legacySubjectKey(kind, subjects, target, detail)) === fingerprint;
 }
 
 /**
@@ -525,16 +568,14 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
   if (canonical.move !== move || canonical.retireAs !== (move === "retire" ? retireAs : undefined)) {
     return undefined;
   }
-  const recomputed = proposalFingerprint(
+  const identity = identityMatches(
     kind as GardenerDetectionKind,
-    detectionSubjectKey(
-      kind as GardenerDetectionKind,
-      subjects as string[],
-      target as string | undefined,
-      detail as string | undefined,
-    ),
+    subjects as string[],
+    target as string | undefined,
+    detail as string | undefined,
+    fingerprint,
   );
-  if (recomputed !== fingerprint) return undefined;
+  if (!identity) return undefined;
 
   return {
     kind: kind as GardenerDetectionKind,
@@ -560,6 +601,27 @@ export function proposalPlanOf(bead: { labels?: string[]; metadata?: Record<stri
   const plan = parseGardenerPlan(bead.metadata?.[GARDENER_PLAN_KEY]);
   if (!plan) return undefined;
   return fingerprintLabelOf(bead) === plan.fingerprint ? plan : undefined;
+}
+
+/**
+ * The fingerprint this proposal's own plan hashes to TODAY, whatever label the bead carries — or
+ * undefined when it carries no readable plan.
+ *
+ * Equal to the label for everything the current emitter filed. It differs for exactly one bead: a
+ * `parentless-cluster` proposal filed before the claim moved to its target (anton-9hpp), whose label
+ * hashes the membership it happened to be found with. Suppression reads THIS, so such a proposal
+ * still answers for the target it names and the rollout files no duplicate beside it.
+ */
+export function canonicalFingerprintOf(bead: {
+  labels?: string[];
+  metadata?: Record<string, unknown>;
+}): string | undefined {
+  const plan = proposalPlanOf(bead);
+  if (!plan) return undefined;
+  return proposalFingerprint(
+    plan.kind,
+    detectionSubjectKey(plan.kind, plan.subjects, plan.target, plan.detail),
+  );
 }
 
 /**

@@ -304,7 +304,24 @@ function homeRefusal(
   return undefined;
 }
 
-/** One step per subject that still has to move — the whole cluster, or the first refusal it hits. */
+/** A subject no longer part of the claim: something gave it a card after the proposal was filed. */
+interface Answered {
+  answered: string;
+}
+
+/**
+ * One step per subject that still has to move — the whole cluster, or the first refusal it hits.
+ *
+ * A member the board has ANSWERED since the filing is dropped from the move rather than refusing it
+ * (see {@link Answered}). A cluster's membership is not its identity any more (anton-9hpp), so one
+ * stale member used to make the whole proposal unapplyable forever while its own fingerprint went on
+ * suppressing the fresh, valid cluster the next patrol derived. Dropping it preserves exactly the
+ * property the refusal was protecting — the newer decision is never written over — while leaving the
+ * members nobody has answered movable.
+ *
+ * When nothing is left to move, the answer itself is the refusal: no write happened, and an approver
+ * reading "settled" would be told the ask landed under a target it never reached.
+ */
 function reparentSteps(
   plan: GardenerPlan,
   home: Bead,
@@ -312,19 +329,26 @@ function reparentSteps(
   at: ApplyMoment,
 ): ApplyDecision {
   const steps: ApplyStep[] = [];
+  const answered: string[] = [];
   for (const id of plan.subjects) {
     const moved = reparentSubject(plan, id, home, index, at);
     if (typeof moved === "string") return { status: "refuse", reason: moved };
-    if (moved) steps.push(moved);
+    if (!moved) continue;
+    if ("answered" in moved) answered.push(moved.answered);
+    else steps.push(moved);
   }
-  return steps.length === 0
-    ? settledInPlace(plan)
-    : {
-        status: "apply",
-        steps,
-        summary: `re-parented ${list(steps.map((s) => s.id))} under ${home.id}`,
-      };
+  const [firstAnswer] = answered;
+  if (steps.length === 0) {
+    return firstAnswer ? { status: "refuse", reason: firstAnswer } : settledInPlace(plan);
+  }
+  const skipped = answered.length > 0 ? ` (${answered.length} member(s) already re-homed)` : "";
+  return {
+    status: "apply",
+    steps,
+    summary: `re-parented ${list(steps.map((s) => s.id))} under ${home.id}${skipped}`,
+  };
 }
+
 
 /**
  * What one member of a cluster resolves to: a refusal reason, the step that moves it, or undefined
@@ -336,11 +360,15 @@ function reparentSubject(
   home: Bead,
   index: BoardIndex,
   at: ApplyMoment,
-): string | ApplyStep | undefined {
+): string | ApplyStep | Answered | undefined {
   const subject = index.byId.get(id);
   if (!subject) return missing(id);
   const currentParent = beads.parentOf(subject) ?? "";
   if (currentParent === home.id) return undefined; // already where the proposal wants it
+  // Asked before every safety bar because it is not one: it decides whether this bead is still part
+  // of the claim at all, and a bead nothing will write to cannot be unsafe to leave alone.
+  const answered = reparentPremiseGone(plan, subject, index);
+  if (answered) return { answered };
   const barred = reparentBarred(plan, subject, home, index, at);
   if (barred) return barred;
   return {
@@ -381,7 +409,6 @@ function reparentBarred(
   const busy =
     subjectBusy(subject, at, DOING.reparent) ??
     ticketSetBusy(index, subject, at, movingTicket(subject.id)) ??
-    reparentPremiseGone(plan, subject, index) ??
     premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs) ??
     carrierMoved(plan, subject, home, index, at) ??
     premiseTouched(home, EVIDENCE_PREMISE[plan.kind]?.twin, at.observedAtMs);
@@ -958,6 +985,9 @@ function claimedSinceFiling(
  * its own `undoParent`, and the under-lock re-check compares against that same value. Judged on the
  * CARD rather than the raw parent because that is what the move is for — a bead moved under another
  * container is still as unreachable as the proposal says, and re-homing it is still the fix.
+ *
+ * The answer drops the bead from the move rather than refusing the plan; only a plan left with
+ * nothing to write reports it as a refusal (see {@link reparentSteps}).
  *
  * Asked of those two kinds ALONE. A `misfiled` subject rides a perfectly good card already — that is
  * the whole claim — so holding it to this bar would refuse every one of them; its premise is the

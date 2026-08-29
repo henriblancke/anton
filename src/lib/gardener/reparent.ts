@@ -235,6 +235,12 @@ interface TopicGroup {
  * keys to state subject matter means the group has to be about one thing before it is proposed as
  * one card's tickets.
  *
+ * Agreement is asked of a GROUP, not of everything the anchor happens to reach. Two beads that state
+ * "escalation banner" between them are a cluster whether or not an unrelated "escalation timeout"
+ * bead exists — but intersecting all three collapses to the bare anchor and would discard the pair,
+ * so a detector that only ever asked about the whole match set went silent for a reason that has
+ * nothing to do with the beads it was about ({@link agreeingSubsets}).
+ *
  * Anchors are walked in sorted order so a home hosting two groups yields them in the same order on
  * every patrol.
  */
@@ -243,15 +249,47 @@ function topicGroups(homeKeys: Set<string>, candidates: Candidate[]): TopicGroup
   for (const anchor of [...homeKeys].sort()) {
     const members = candidates.filter((c) => c.keys.has(anchor));
     if (members.length < MIN_CLUSTER_SIZE) continue;
-    const shared = intersectKeys(members.map((m) => m.keys));
-    if (!statesSubjectMatter(shared)) continue;
-    groups.push({
-      members: members.map((m) => m.bead),
-      shared: [...shared].sort(),
-      held: [...shared].filter((key) => homeKeys.has(key)).sort(),
-    });
+    for (const group of agreeingSubsets(members)) {
+      const shared = intersectKeys(group.map((m) => m.keys));
+      groups.push({
+        members: group.map((m) => m.bead),
+        shared: [...shared].sort(),
+        held: [...shared].filter((key) => homeKeys.has(key)).sort(),
+      });
+    }
   }
   return groups;
+}
+
+/**
+ * The subsets of one anchor's matches that state a subject between them: the whole set when it
+ * already agrees, and otherwise the sub-groups each further shared key forms.
+ *
+ * Partitioning by a key rather than searching for maximal agreeing subsets on purpose — the SUBJECT
+ * is what an approver checks, so a group is named by the two terms it holds ("escalation" plus
+ * "banner"), and every subset this yields carries at least those two by construction. Keys are
+ * walked sorted, and a subset reached through two of them is emitted once, so a patrol's groups do
+ * not depend on the order the board was read in.
+ */
+function agreeingSubsets(members: Candidate[]): Candidate[][] {
+  if (statesSubjectMatter(intersectKeys(members.map((m) => m.keys)))) return [members];
+
+  const subsets: Candidate[][] = [];
+  const seen = new Set<string>();
+  const secondary = new Set(members.flatMap((m) => [...m.keys]));
+  for (const key of [...secondary].sort()) {
+    const subset = members.filter((m) => m.keys.has(key));
+    if (subset.length < MIN_CLUSTER_SIZE) continue;
+    if (!statesSubjectMatter(intersectKeys(subset.map((m) => m.keys)))) continue;
+    const identity = subset
+      .map((m) => m.bead.id)
+      .sort()
+      .join("+");
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    subsets.push(subset);
+  }
+  return subsets;
 }
 
 /** Every key present in all of these sets. */

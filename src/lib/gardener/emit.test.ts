@@ -17,7 +17,9 @@ import { parseAcceptance, parseGoal, toStandaloneItem } from "../ticket-view";
 import { detectBoard } from "./detect";
 import {
   concernedBeads,
+  GARDENER_PLAN_KEY,
   makeDetection,
+  proposalFingerprint,
   proposalPlanOf,
   type DetectionInput,
   type GardenerDetection,
@@ -676,7 +678,7 @@ describe("a patrol pass", () => {
 
   /**
    * A cluster's membership is whatever was parentless and free when the patrol read the board, so
-   * hashing it gave the SAME claim a fresh fingerprint every night: five proposals naming anton-5ahy
+   * hashing it gave the SAME claim a fresh fingerprint every night: four proposals naming anton-5ahy
    * stood open at once, and the bead's own promise that "the patrol makes this claim no second time"
    * was false for this kind (anton-9hpp). One target, one open ask.
    */
@@ -698,6 +700,42 @@ describe("a patrol pass", () => {
     expect(second.created).toEqual([]);
     expect(second.suppressed).toBe(1);
     expect(createMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The rollout of that change (anton-9hpp). A cluster proposal already open when the identity moved
+   * carries the membership hash, which the detector no longer produces — so on label alone the next
+   * patrol would file a fresh-format twin of an ask the board already carries, the exact duplicate
+   * state target-identity exists to remove. Suppression reads the claim the bead's own PLAN makes.
+   */
+  it("suppresses a cluster proposal filed before the identity moved, rather than twinning it", async () => {
+    const [detection] = detect(CLUSTERED).filter((d) => d.kind === "parentless-cluster");
+    const legacy = proposalFingerprint(
+      "parentless-cluster",
+      `parentless-cluster:${[...detection.subjects].sort().join("+")}>${detection.target}`,
+    );
+    expect(legacy).not.toBe(detection.fingerprint);
+
+    const board = [
+      ...CLUSTERED,
+      proposal(legacy, {
+        metadata: {
+          [GARDENER_PLAN_KEY]: {
+            kind: detection.kind,
+            move: detection.move,
+            fingerprint: legacy,
+            subjects: detection.subjects,
+            target: detection.target,
+          },
+        },
+      }),
+    ];
+
+    const result = await emitProposals(REPO, { board, detections: detect(board) });
+
+    expect(result.created).toEqual([]);
+    expect(result.suppressed).toBe(1);
+    expect(createMock).not.toHaveBeenCalled();
   });
 
   it("files nothing at all once the proposal is declined", async () => {

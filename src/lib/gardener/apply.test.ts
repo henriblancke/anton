@@ -13,7 +13,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
-import { parseGardenerPlan } from "./detections";
+import { parseGardenerPlan, proposalFingerprint } from "./detections";
 import {
   apply,
   applyWith,
@@ -119,7 +119,7 @@ describe("the plan a proposal carries — read strictly, because it decides what
 
   // The one kind whose subject list the hash does NOT cover (anton-9hpp): a cluster's membership is
   // re-derived every patrol, so hashing it gave the same claim a fresh fingerprint each time and
-  // five proposals for one target stood open at once. The guard traded away is real — an edited
+  // four proposals for one target stood open at once. The guard traded away is real — an edited
   // subject list redirects the move rather than invalidating it — and what replaces it is apply's
   // own re-derivation of "no board card carries this" for every subject it is handed.
   it("accepts a cluster whose membership moved, because the target is its identity", () => {
@@ -141,6 +141,32 @@ describe("the plan a proposal carries — read strictly, because it decides what
   it("accepts subjects in any order — the identity is the set, not the listing", () => {
     const reordered = { ...CLUSTER, subjects: ["anton-b", "anton-a"] };
     expect(parseGardenerPlan(reordered)).toEqual(reordered);
+  });
+
+  /**
+   * The rollout (anton-9hpp): a cluster proposal filed BEFORE the claim moved to its target hashes
+   * the membership it was found with. Rejecting it would strand every one already open — apply would
+   * report "no readable proposal move" forever while the next patrol filed a fresh-format duplicate
+   * beside it, which is the duplicate state target-identity exists to remove. So the older identity
+   * is accepted on read, and only for the kind whose identity actually moved.
+   */
+  it("accepts the membership hash a cluster filed before the identity moved still carries", () => {
+    const legacy = {
+      ...CLUSTER,
+      fingerprint: proposalFingerprint(
+        "parentless-cluster",
+        `parentless-cluster:${[...CLUSTER.subjects].sort().join("+")}>${CLUSTER.target}`,
+      ),
+    };
+    expect(legacy.fingerprint).not.toBe(CLUSTER.fingerprint);
+    expect(parseGardenerPlan(legacy)).toEqual(legacy);
+
+    // The concession is that kind's alone: nothing else ever hashed anything but its own subjects.
+    const wrongKind = {
+      ...REPARENT,
+      fingerprint: proposalFingerprint("container-orphan", "container-orphan:*>anton-card"),
+    };
+    expect(parseGardenerPlan(wrongKind)).toBeUndefined();
   });
 });
 
