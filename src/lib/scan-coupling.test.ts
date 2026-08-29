@@ -215,7 +215,7 @@ describe("judgeCycle", () => {
     expect(await judgeCycle(graph, cycle(["src/x", "src/y"]))).toEqual({ drop: false });
   });
 
-  it("keeps a cycle whose walk never leaves the component, even when the tree has another", async () => {
+  it("drops a phantom cycle even when a real cycle sits next to it in the tree", async () => {
     // src/b imports src/outer for a value, and src/outer cycles with src/other. That cycle belongs
     // to someone else: a walk that wandered into it would keep every phantom alive.
     const graph = await graphOf({
