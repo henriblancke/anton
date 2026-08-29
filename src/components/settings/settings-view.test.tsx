@@ -83,9 +83,11 @@ function renderView(
       agents={agents}
       bundledIds={[]}
       labelVocabulary={labelVocabulary}
+      rankingCandidates={[]}
       issueTypes={[]}
       policyDraft={FALLBACK_DRAFT}
       policyCandidates={[]}
+      boardUnavailable={false}
       earned={earned}
     />,
   );

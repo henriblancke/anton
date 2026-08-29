@@ -60,6 +60,15 @@ const CONTROL_NAMESPACES = new Set(["stage", "run-lease", "review-score", "sourc
 /** How many approvals one rationale names. Enough to make the claim checkable, short enough to read. */
 const MAX_CITED = 4;
 
+/**
+ * The ceilings `pickerPolicySchema` enforces at the API boundary. A draft that crosses one is worse
+ * than no draft: the operator clicks accept and gets a 400 they cannot resolve from the panel. So a
+ * criterion that would cross a ceiling is OMITTED rather than clamped — clamping would narrow the
+ * proposal until it refused the very approvals it was read from, which is the one thing this
+ * derivation promises never to do.
+ */
+const SCHEMA_LIMITS = { types: 16, priority: 4, criterionValues: 32, labelCriteria: 16 } as const;
+
 export type { PolicyCriterionKey };
 
 /** One criterion and the evidence behind it, so a draft is never an unexplained suggestion. */
@@ -129,12 +138,15 @@ export function calibratePolicy(board: readonly Bead[]): PolicyDraft {
   // type at all, since `types` fails closed and would exclude that approval.
   const approvedTypes = approvals.map((b) => b.issue_type);
   if (approvedTypes.every((t): t is string => !!t)) {
-    policy.types = [...new Set(approvedTypes)].sort();
-    rationale.push({
-      criterion: "types",
-      summary: `${share(total, total)} were ${listing(policy.types)} — no other type has been approved here.`,
-      citedBeadIds: cite(approvals),
-    });
+    const types = [...new Set(approvedTypes)].sort();
+    if (types.length <= SCHEMA_LIMITS.types) {
+      policy.types = types;
+      rationale.push({
+        criterion: "types",
+        summary: `${share(total, total)} were ${listing(types)} — no other type has been approved here.`,
+        citedBeadIds: cite(approvals),
+      });
+    }
   }
 
   // Priority: the LEAST urgent priority ever approved, so the floor admits the whole sample. Omitted
@@ -142,15 +154,19 @@ export function calibratePolicy(board: readonly Bead[]): PolicyDraft {
   const priorities = approvals.map((b) => b.priority);
   if (priorities.every((p): p is number => typeof p === "number")) {
     const floor = Math.max(...priorities);
-    policy.maxPriority = floor;
-    const atFloor = priorities.filter((p) => p === floor).length;
-    rationale.push({
-      criterion: "priority",
-      summary:
-        `Nothing below P${floor} has ever been approved here` +
-        ` (${share(atFloor, total)} sat at P${floor}).`,
-      citedBeadIds: cite(approvals.filter((b) => b.priority === floor)),
-    });
+    // A floor off bd's own 0-4 scale is a priority no policy may state, so the criterion is dropped
+    // rather than clamped down onto the approval that produced it.
+    if (floor >= 0 && floor <= SCHEMA_LIMITS.priority) {
+      policy.maxPriority = floor;
+      const atFloor = priorities.filter((p) => p === floor).length;
+      rationale.push({
+        criterion: "priority",
+        summary:
+          `Nothing below P${floor} has ever been approved here` +
+          ` (${share(atFloor, total)} sat at P${floor}).`,
+        citedBeadIds: cite(approvals.filter((b) => b.priority === floor)),
+      });
+    }
   }
 
   // Discovered namespaces: a criterion is proposed only where the namespace is a real signal — every
@@ -210,9 +226,22 @@ function labelCriteria(approvals: readonly Bead[], board: readonly Bead[]): Poli
     const approved = valuesUnder(approvals, namespace);
     const onBoard = valuesUnder(board, namespace);
     if (approved.size >= onBoard.size) continue; // admits everything the board has — no signal
+    // More approved values than one criterion may carry: the namespace cannot be stated without
+    // excluding an approval, so it is not stated (see SCHEMA_LIMITS).
+    if (approved.size > SCHEMA_LIMITS.criterionValues) continue;
     criteria.push({ namespace, values: [...approved].sort() });
   }
-  return criteria;
+
+  if (criteria.length <= SCHEMA_LIMITS.labelCriteria) return criteria;
+  // Past the criterion ceiling, keep the most NARROWING namespaces — fewest admitted values. Dropping
+  // a criterion only widens the draft, so the proposal still admits every approval behind it.
+  const kept = new Set(
+    [...criteria]
+      .sort((a, b) => a.values.length - b.values.length || a.namespace.localeCompare(b.namespace))
+      .slice(0, SCHEMA_LIMITS.labelCriteria)
+      .map((c) => c.namespace),
+  );
+  return criteria.filter((c) => kept.has(c.namespace));
 }
 
 /**

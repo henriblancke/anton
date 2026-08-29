@@ -95,7 +95,9 @@ export function PolicyDraftSection({
   stored,
   issueTypes,
   labelVocabulary,
+  rankingCandidates = [],
   candidates = [],
+  boardUnavailable = false,
 }: {
   project: Project;
   /** What calibration proposes for a project that has never been armed. */
@@ -106,8 +108,19 @@ export function PolicyDraftSection({
   issueTypes: string[];
   /** The board's `ns:value` labels — the namespaces this editor's criteria are generated from. */
   labelVocabulary: LabelNamespace[];
-  /** Every OPEN bead on the board, projected server-side, so the match count moves without a fetch. */
+  /**
+   * The namespaces whose values read as a SCALE (discovery's `rankingCandidate` hint) — the only
+   * ones offered a ranking control, since "rank these" means nothing on a `team:` or `component:`.
+   */
+  rankingCandidates?: string[];
+  /** Every OPEN run target on the board, projected server-side, so the match count moves without a fetch. */
   candidates?: PolicyCandidate[];
+  /**
+   * The board read FAILED — the vocabulary, the draft and the candidates below are all empty because
+   * bd could not be read, not because the project is empty. Arming off that would store a policy
+   * fitted to a read failure, so acceptance is refused until the board answers again.
+   */
+  boardUnavailable?: boolean;
 }) {
   const router = useRouter();
   const armed = stored !== undefined;
@@ -159,13 +172,31 @@ export function PolicyDraftSection({
     // A criterion with no values fails closed against everything, so dropping the last value drops
     // the whole namespace — which is what "stop constraining this" means.
     if (!values.length) return putCriterion(namespace, undefined);
-    putCriterion(namespace, { namespace, values, ...(current?.ranked ? { ranked: true } : {}) });
+    // A stored comparison survives a chip edit: rebuilding the criterion without it would silently
+    // widen `severity ≤ major` into membership over the whole ranking, admitting work the operator
+    // had excluded. It goes only when its own bound leaves the ranking — the one state nothing can
+    // evaluate (R2.5), and one the store rejects outright.
+    const compare = current?.compare;
+    const keepsCompare = !!compare && !!current?.ranked && values.includes(compare.value);
+    putCriterion(namespace, {
+      namespace,
+      values,
+      ...(current?.ranked ? { ranked: true } : {}),
+      ...(keepsCompare ? { compare } : {}),
+    });
   };
 
   const setRanked = (namespace: string, ranked: boolean) => {
     const current = criterionFor(namespace);
     if (!current) return;
-    putCriterion(namespace, { ...current, ...(ranked ? { ranked: true } : { ranked: undefined }) });
+    // Un-ranking takes any comparison with it: a bound against a ranking that no longer exists
+    // refuses every bead (R2.5), so it must not survive the toggle it depended on.
+    putCriterion(
+      namespace,
+      ranked
+        ? { ...current, ranked: true }
+        : { namespace: current.namespace, values: current.values },
+    );
   };
 
   /**
@@ -196,6 +227,17 @@ export function PolicyDraftSection({
     [candidates, policy],
   );
 
+  const unconstrained = useMemo(() => isUnconstrained(policy), [policy]);
+
+  // Which namespaces get a ranking control: the ones discovery read as a SCALE, plus any the stored
+  // policy already ranks — a ranking has to stay visible to be undoable, even on a namespace this
+  // board's values no longer look ordinal in.
+  const rankable = useMemo(() => {
+    const set = new Set(rankingCandidates);
+    for (const c of policy.labels ?? []) if (c.ranked) set.add(c.namespace);
+    return set;
+  }, [rankingCandidates, policy.labels]);
+
   // Every namespace this board uses, plus any the policy names that the board no longer does — a
   // criterion left over from a renamed convention matches nothing, and hiding it would hide why.
   const namespaces = useMemo(() => {
@@ -207,24 +249,39 @@ export function PolicyDraftSection({
     return [...onBoard, ...orphans];
   }, [labelVocabulary, policy.labels]);
 
-  async function save() {
+  async function patchPolicy(next: Policy | null, done: string): Promise<boolean> {
     setSaving(true);
     try {
       const res = await fetch(`/api/projects/${project.slug}/settings`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ pickerPolicy: normalize(policy) }),
+        body: JSON.stringify({ pickerPolicy: next }),
       });
       const data = (await res.json().catch(() => null)) as { error?: string } | null;
       if (!res.ok) throw new Error(data?.error ?? `Save failed (${res.status})`);
-      toast.success(armed ? "Policy saved" : "Policy accepted");
+      toast.success(done);
       router.refresh();
+      return true;
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Save failed");
+      return false;
     } finally {
       setSaving(false);
     }
   }
+
+  const save = () => patchPolicy(normalize(policy), armed ? "Policy saved" : "Policy accepted");
+
+  /**
+   * Back to UNARMED — the only way out of a policy accepted by mistake, since an armed project
+   * starts work on its own and every other control here only edits which work. Storing `null`
+   * removes the setting rather than storing an empty policy, which would admit everything.
+   */
+  const remove = async () => {
+    // Back to the proposal, so a disarmed project reads as one that has never been armed rather than
+    // as a form still holding the policy it just removed.
+    if (await patchPolicy(null, "Policy removed")) setPolicy(draft.policy);
+  };
 
   return (
     <section className="flex flex-col gap-3.5">
@@ -242,7 +299,21 @@ export function PolicyDraftSection({
         what.
       </p>
 
-      {!armed && (
+      {boardUnavailable && (
+        <div
+          className="max-w-2xl rounded-[10px] border border-risk-high/30 bg-risk-high/10 px-3 py-2.5 text-[11.5px] leading-relaxed text-foreground"
+          role="alert"
+        >
+          <p className="font-medium">This board could not be read.</p>
+          <p className="mt-1 text-subtle">
+            The criteria and counts below are empty because bd did not answer, not because this
+            project has no work. A policy accepted from that would be fitted to a read failure, so
+            saving is disabled until the board answers again.
+          </p>
+        </div>
+      )}
+
+      {!armed && !boardUnavailable && (
         <div
           className="max-w-2xl rounded-[10px] border border-dashed border-primary/50 bg-primary/5 px-3 py-2.5 text-[11.5px] leading-relaxed text-foreground"
           role="note"
@@ -371,6 +442,7 @@ export function PolicyDraftSection({
               key={group.namespace}
               group={group}
               criterion={criterionFor(group.namespace)}
+              rankable={rankable.has(group.namespace)}
               why={why(`labels:${group.namespace}`)}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
               onRanked={(ranked) => setRanked(group.namespace, ranked)}
@@ -391,19 +463,50 @@ export function PolicyDraftSection({
         </div>
       </DndContext>
 
-      <MatchPanel matched={matched} excluded={excluded} total={candidates.length} />
+      {!boardUnavailable && (
+        <MatchPanel matched={matched} excluded={excluded} total={candidates.length} />
+      )}
 
-      <div className="flex max-w-2xl items-center gap-3">
-        <Button size="sm" onClick={save} disabled={saving}>
+      {unconstrained && !boardUnavailable && (
+        <p className="max-w-2xl rounded-[10px] border border-risk-med/28 bg-risk-med/10 px-3 py-2 text-[11.5px] leading-relaxed text-foreground">
+          This policy asserts no criteria — it admits every open run target on this board. Arming it
+          places no constraint on what anton starts.
+        </p>
+      )}
+
+      <div className="flex max-w-2xl flex-wrap items-center gap-3">
+        <Button size="sm" onClick={save} disabled={saving || boardUnavailable}>
           {saving ? "Saving…" : armed ? "Save policy" : "Use this policy"}
         </Button>
+        {armed && (
+          <Button size="sm" variant="ghost" onClick={remove} disabled={saving}>
+            Remove policy
+          </Button>
+        )}
         <span className="text-[11px] text-subtle">
-          {armed
-            ? "Applies on this machine only."
-            : "Until you accept, this project has no policy and anton starts nothing on its own."}
+          {boardUnavailable
+            ? "Nothing can be saved while the board is unreadable."
+            : armed
+              ? "Applies on this machine only. Removing it returns the project to starting nothing on its own."
+              : "Until you accept, this project has no policy and anton starts nothing on its own."}
         </span>
       </div>
     </section>
+  );
+}
+
+/**
+ * A policy that asserts NOTHING — every criterion cleared, so it admits every open run target. It is
+ * a legible state to pass through while editing and a dangerous one to arm, which is why it is named
+ * on screen rather than silently stored. Read off the normalized value, since that is what is sent.
+ *
+ * Field-agnostic on purpose: unset is `undefined`, an emptied list is dropped, and `requireUnblocked:
+ * false` is a toggle that constrains nothing — so a criterion added later is covered without an edit
+ * here.
+ */
+function isUnconstrained(policy: Policy): boolean {
+  return Object.values(normalize(policy)).every(
+    (value) => value === undefined || value === false || (Array.isArray(value) && !value.length),
   );
 }
 
@@ -510,6 +613,7 @@ function MatchPanel({
 function NamespaceCriterion({
   group,
   criterion,
+  rankable,
   why,
   onToggleValue,
   onRanked,
@@ -517,6 +621,8 @@ function NamespaceCriterion({
 }: {
   group: LabelNamespace;
   criterion?: PolicyLabelCriterion;
+  /** The board's values read as a scale, so an order is a thing an operator could mean here. */
+  rankable: boolean;
   why?: PolicyRationale;
   onToggleValue: (value: string) => void;
   onRanked: (ranked: boolean) => void;
@@ -554,7 +660,7 @@ function NamespaceCriterion({
         <p className="text-[11px] text-subtle">Not constrained — any value, or none, matches.</p>
       )}
 
-      {selected.length > 1 && (
+      {rankable && selected.length > 1 && (
         <div className="flex items-center gap-2">
           <Toggle
             checked={ranked}
@@ -568,21 +674,31 @@ function NamespaceCriterion({
       )}
 
       {ranked && selected.length > 1 && (
-        <SortableContext
-          items={selected.map((v) => `${group.namespace}:${v}`)}
-          strategy={verticalListSortingStrategy}
-        >
-          <ol className="flex flex-col gap-1">
-            {selected.map((value, i) => (
-              <RankedValue
-                key={value}
-                id={`${group.namespace}:${value}`}
-                rank={i + 1}
-                value={value}
-              />
-            ))}
-          </ol>
-        </SortableContext>
+        <>
+          <SortableContext
+            items={selected.map((v) => `${group.namespace}:${v}`)}
+            strategy={verticalListSortingStrategy}
+          >
+            <ol className="flex flex-col gap-1">
+              {selected.map((value, i) => (
+                <RankedValue
+                  key={value}
+                  id={`${group.namespace}:${value}`}
+                  rank={i + 1}
+                  value={value}
+                />
+              ))}
+            </ol>
+          </SortableContext>
+          {/* Said out loud rather than implied: the order round-trips, but admission is still
+              membership until a bound over the ranking exists (R2.3). An operator who dragged
+              `critical` to the top would otherwise believe it now outranks the rest. */}
+          <p className="text-[11px] text-subtle">
+            The order is stored, but it does not yet change which beads are admitted — every selected
+            value still matches. A bound over your ranking (&ldquo;at or before major&rdquo;) is the
+            next step.
+          </p>
+        </>
       )}
     </Criterion>
   );

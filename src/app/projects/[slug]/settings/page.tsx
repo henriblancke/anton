@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
+import { discoverVocabulary } from "@/lib/policy/vocabulary";
 import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
 import { policyCandidates } from "@/lib/policy/candidates";
 import { earnedAutonomyOfKind, emptyTrackRecord } from "@/lib/gardener/autonomy";
@@ -48,20 +49,32 @@ export default async function ProjectSettingsPage({
   // from this project's own namespaces rather than from labels anton assumed. Read alongside the
   // agents (the snapshot is usually warm from the board) and fail-soft: a board anton can't read
   // leaves the picker empty, where the editor still takes a typed label.
-  const [agents, bundledIds, beads] = await Promise.all([
+  const [agents, bundledIds, board] = await Promise.all([
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
-    allIssues(project.repoPath, { blockOnPendingWrite: false }).catch(() => []),
+    // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
+    // no work look identical downstream, and the work policy panel must not let an operator arm a
+    // fallback policy fitted to a read failure.
+    allIssues(project.repoPath, { blockOnPendingWrite: false }).then(
+      (issues) => ({ issues, ok: true }),
+      () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
+    ),
   ]);
+  const beads = board.issues;
   const labelVocabulary = boardLabelVocabulary(beads);
+  // Which of those namespaces read as a SCALE (anton-g631) — the only ones the policy editor offers a
+  // hand-ranking on, since "rank these" means nothing on a `team:` or `component:`.
+  const rankingCandidates = discoverVocabulary(beads)
+    .namespaces.filter((n) => n.rankingCandidate)
+    .map((n) => n.namespace);
   // What first arm proposes (anton-c7iv): the policy this project's OWN approvals would have
   // matched, so the panel is never a blank form and never speaks a vocabulary this board doesn't.
   // Pure over the snapshot already read above — no extra board call — and inert: the draft is only
   // rendered, never stored, until the operator accepts it.
   const policyDraft = calibratePolicy(beads);
   const issueTypes = boardIssueTypes(beads);
-  // Every open bead, flattened to what the predicate reads, so the editor's match count and its
-  // per-bead "why not?" answer in the browser as the operator edits (anton-qsr1). Off the same
+  // Every open RUN TARGET, flattened to what the predicate reads, so the editor's match count and
+  // its per-bead "why not?" answer in the browser as the operator edits (anton-qsr1). Off the same
   // snapshot — no extra board call.
   const candidates = policyCandidates(beads);
 
@@ -90,9 +103,11 @@ export default async function ProjectSettingsPage({
       agents={agents}
       bundledIds={bundledIds}
       labelVocabulary={labelVocabulary}
+      rankingCandidates={rankingCandidates}
       issueTypes={issueTypes}
       policyDraft={policyDraft}
       policyCandidates={candidates}
+      boardUnavailable={!board.ok}
       earned={earned}
     />
   );

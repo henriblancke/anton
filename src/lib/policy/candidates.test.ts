@@ -1,7 +1,8 @@
 /**
- * The board → candidate projection (anton-qsr1). Two claims worth pinning: the editor counts OPEN
- * work only, and its blockedness is the same verdict the approve route and the runner enforce —
- * a panel that disagreed with them about "has an unmet blocker" would explain the wrong refusal.
+ * The board → candidate projection (anton-qsr1). Two claims worth pinning: the editor counts the OPEN
+ * work anton could actually start — run targets, never container epics or child tickets — and its
+ * blockedness is the same verdict the approve route and the runner enforce, since a panel that
+ * disagreed with them about "has an unmet blocker" would explain the wrong refusal.
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/types";
@@ -26,9 +27,10 @@ describe("policyCandidates", () => {
     ]);
   });
 
-  it("omits a type or priority the bead does not carry, rather than inventing one", () => {
-    const [candidate] = policyCandidates([bead({ id: "a", issue_type: undefined })]);
-    expect("type" in candidate).toBe(false);
+  it("omits a priority the bead does not carry, rather than inventing one", () => {
+    // Type is never absent here — a bead with no issue_type is not a run target — but priority and
+    // labels are, and an asserted criterion has to fail closed on them rather than on a default.
+    const [candidate] = policyCandidates([bead({ id: "a", priority: undefined })]);
     expect("priority" in candidate).toBe(false);
     expect(candidate.labels).toEqual([]);
   });
@@ -54,23 +56,70 @@ describe("policyCandidates", () => {
 
   it("counts parent hops, so a policy can say `parentless work only` (anton-hmyo)", () => {
     const board = [
-      bead({ id: "epic" }),
-      bead({ id: "feature", parent: "epic" }),
-      bead({ id: "ticket", parent: "feature" }),
+      bead({ id: "epic", issue_type: "epic" }),
+      bead({ id: "sub", issue_type: "epic", parent: "epic" }),
+      bead({ id: "standalone" }),
     ];
     const depths = Object.fromEntries(policyCandidates(board).map((c) => [c.id, c.depth]));
-    expect(depths).toEqual({ epic: 0, feature: 1, ticket: 2 });
+    expect(depths).toEqual({ epic: 0, sub: 1, standalone: 0 });
+  });
+
+  it("projects only what the picker could start — no container epics, no child tickets", () => {
+    // The same isRunTarget gate the approve route enforces: an epic that groups features runs
+    // nothing itself, and a ticket under a feature runs as part of that feature's run.
+    const board = [
+      bead({ id: "container", issue_type: "epic" }),
+      bead({ id: "feature", issue_type: "feature", parent: "container" }),
+      bead({ id: "ticket", parent: "feature" }),
+      bead({ id: "chore", issue_type: "chore" }),
+      bead({ id: "standalone", issue_type: "bug" }),
+    ];
+    expect(policyCandidates(board).map((c) => c.id)).toEqual(["feature", "standalone"]);
+  });
+
+  it("marks a unit blocked by a blocker on one of its own children (anton-qsr1)", () => {
+    // The blocks edge names the CHILD, so a per-bead read of the edges would call the feature ready
+    // while the approve route refuses it — the panel's count has to agree with the gate.
+    const board = [
+      bead({ id: "feature", issue_type: "feature" }),
+      bead({
+        id: "ticket",
+        parent: "feature",
+        dependencies: [{ issue_id: "ticket", depends_on_id: "gate", type: "blocks" }],
+      }),
+      bead({ id: "gate", status: "open" }),
+    ];
+    const blocked = Object.fromEntries(policyCandidates(board).map((c) => [c.id, c.blocked]));
+    expect(blocked).toEqual({ feature: true, gate: undefined });
+  });
+
+  it("leaves a unit unblocked while one of its children can still run", () => {
+    const board = [
+      bead({ id: "feature", issue_type: "feature" }),
+      bead({
+        id: "held",
+        parent: "feature",
+        dependencies: [{ issue_id: "held", depends_on_id: "gate", type: "blocks" }],
+      }),
+      bead({ id: "free", parent: "feature" }),
+      bead({ id: "gate", status: "open" }),
+    ];
+    expect(policyCandidates(board).find((c) => c.id === "feature")?.blocked).toBeUndefined();
   });
 
   it("reports no depth when the chain leaves the board, rather than guessing top-level", () => {
     // The predicate fails an asserted parentage criterion closed on this. Defaulting it to 0 would
     // admit a nested bead as if it were parentless.
-    const [orphan] = policyCandidates([bead({ id: "a", parent: "gone" })]);
+    const [orphan] = policyCandidates([bead({ id: "a", issue_type: "feature", parent: "gone" })]);
     expect(orphan.depth).toBeUndefined();
   });
 
   it("survives a parent cycle a malformed board could hold", () => {
-    const board = [bead({ id: "a", parent: "b" }), bead({ id: "b", parent: "a" })];
+    // Features, so both stay run targets: a task with a parent is a child ticket and never projected.
+    const board = [
+      bead({ id: "a", issue_type: "feature", parent: "b" }),
+      bead({ id: "b", issue_type: "feature", parent: "a" }),
+    ];
     expect(policyCandidates(board).map((c) => c.depth)).toEqual([undefined, undefined]);
   });
 

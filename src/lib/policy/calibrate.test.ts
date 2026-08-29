@@ -14,6 +14,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
+import { pickerPolicySchema } from "../projects";
 import { boardIssueTypes, calibratePolicy, FALLBACK_POLICY, MIN_CALIBRATION_APPROVALS } from "./calibrate";
 import { namespaceOf, valueOf, type Policy } from "./types";
 
@@ -216,6 +217,49 @@ describe("calibratePolicy — a criterion it cannot state is not stated", () => 
       unapproved({ labels: ["stage:in-review", "source:gardener"] }),
     ];
     expect(calibratePolicy(board).policy.labels).toBeUndefined();
+  });
+});
+
+/**
+ * A draft the API will actually take. The panel's accept button PATCHes the proposal straight
+ * through `pickerPolicySchema`, so a criterion the schema rejects is an operator staring at a 400
+ * with no control to resolve it — the proposal has to stay inside the store's own ceilings.
+ */
+describe("calibratePolicy — the proposal is storable", () => {
+  it("omits a namespace with more approved values than a criterion may carry", () => {
+    // 40 distinct values, still a proper subset of the board's 41, so the narrowing check passes.
+    const board = [
+      ...many(40, (i) => approved({ labels: [`kind:v${i}`, "severity:major"] })),
+      unapproved({ labels: ["kind:v40", "severity:minor"] }),
+    ];
+    const { policy } = calibratePolicy(board);
+    expect(policy.labels?.map((c) => c.namespace)).toEqual(["severity"]);
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
+  it("keeps the most narrowing namespaces when a board offers more than the store holds", () => {
+    // 20 namespaces, each narrowing; only 16 criteria fit, and the narrowest ones are the ones worth
+    // keeping — dropping a criterion widens the draft, so it still admits every approval.
+    const labelsOf = (i: number) => (i < 4 ? [`ns${i}:a`, `ns${i}:b`] : [`ns${i}:a`]);
+    const history = many(5, () =>
+      approved({ labels: Array.from({ length: 20 }, (_, i) => labelsOf(i)).flat() }),
+    );
+    const board = [
+      ...history,
+      unapproved({ labels: Array.from({ length: 20 }, (_, i) => `ns${i}:z`) }),
+    ];
+    const { policy } = calibratePolicy(board);
+    expect(policy.labels).toHaveLength(16);
+    // The four two-value namespaces are the ones dropped.
+    expect(policy.labels?.some((c) => c.values.length > 1)).toBe(false);
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
+  it("omits a priority floor bd's own scale does not carry", () => {
+    const board = many(5, () => approved({ priority: 9 }));
+    const { policy } = calibratePolicy(board);
+    expect(policy.maxPriority).toBeUndefined();
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
   });
 });
 

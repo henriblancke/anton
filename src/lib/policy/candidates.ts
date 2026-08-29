@@ -6,26 +6,30 @@
  * Everything that needs the board — the `blocks` graph above all — is resolved here, once, on the
  * server that already holds the snapshot.
  *
- * OPEN beads only. A closed or in-flight bead is not work a policy could admit, and counting it
- * would inflate the one number the panel exists to make honest.
+ * OPEN RUN TARGETS only. A closed or in-flight bead is not work a policy could admit, and neither is
+ * a container epic, a child ticket or pipeline plumbing — the picker can never start one, so counting
+ * them would inflate the one number the panel exists to make honest. The gate is
+ * {@link beads.isRunTarget}, the same predicate the approve route and execute-epic use, so the
+ * panel's denominator is exactly the set a policy chooses from.
  *
  * `now` is a PARAMETER because age is the one candidate field that is not a property of the board:
  * reading the clock inside the predicate would make it impure and its tests time-dependent, so the
  * clock is read once, here, and each bead carries the age it had when the board was projected.
  */
 import { beads } from "../beads/bd";
-import { standaloneBlockers } from "../epic-graph";
+import { computeEpicGraph, isUnit, standaloneBlockers } from "../epic-graph";
 import type { Bead } from "../beads/types";
 import type { PolicyCandidate } from "./match";
 
 /**
  * Pure over a board snapshot a caller already holds — no bd spawn.
  *
- * Blockedness comes from {@link standaloneBlockers}, the same rule the approve route and the runner
- * gate on, so the editor's "has an unmet blocker" can never disagree with what will actually refuse
- * to start. It is asked only about beads a `blocks` edge names: that rule walks the whole board per
- * call, and on a board where a handful of beads carry edges, asking it about all of them is the
- * difference between one pass and hundreds.
+ * Blockedness is derived the way the approve route derives it, so the editor's "has an unmet
+ * blocker" can never disagree with what will actually refuse to start. A unit (epic or feature) is
+ * blocked when its rollup has ZERO dispatchable tickets — a blocker on one child holds that child,
+ * not the whole target — while a standalone task/bug is gated on its own `blocks` edges via
+ * {@link standaloneBlockers}. That rule walks the whole board per call, so it is asked only about
+ * beads a `blocks` edge names: the difference between one pass and hundreds.
  */
 export function policyCandidates(board: readonly Bead[], now: Date = new Date()): PolicyCandidate[] {
   const all = board as Bead[];
@@ -33,11 +37,16 @@ export function policyCandidates(board: readonly Bead[], now: Date = new Date())
     beads.edgesOf(all).filter((e) => e.type === "blocks").map((e) => e.from),
   );
   const byId = new Map(all.map((b) => [b.id, b]));
+  // One rollup for every unit on the board, so a feature held by a blocker on one of its own
+  // children reads blocked here exactly as it would at approve time.
+  const readiness = new Map(computeEpicGraph(all).epics.map((n) => [n.id, n.childReadiness]));
 
   return all
-    .filter((b) => b.status === "open")
+    .filter((b) => b.status === "open" && beads.isRunTarget(b, all))
     .map((b) => {
-      const blocked = dependents.has(b.id) && standaloneBlockers(all, b.id).length > 0;
+      const blocked = isUnit(b)
+        ? readiness.get(b.id) === "blocked"
+        : dependents.has(b.id) && standaloneBlockers(all, b.id).length > 0;
       const depth = parentDepth(b, byId);
       const ageDays = ageInDays(b, now);
       return {

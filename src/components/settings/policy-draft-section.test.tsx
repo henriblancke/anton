@@ -189,6 +189,8 @@ function renderPanel(props: Partial<Parameters<typeof PolicyDraftSection>[0]> = 
       draft={FITTED}
       issueTypes={["bug", "chore", "feature", "task"]}
       labelVocabulary={VOCABULARY}
+      // `severity:` reads as a scale, so it is the one namespace offered a hand-ranking.
+      rankingCandidates={["severity"]}
       {...props}
     />,
   );
@@ -541,5 +543,139 @@ describe("ranking a namespace's values (R2.3)", () => {
     // Order unchanged: rank 1 is still critical.
     const ranked = screen.getByRole("button", { name: "Reorder severity:critical" }).closest("li");
     expect(ranked?.textContent).toContain("1");
+  });
+});
+
+/**
+ * Every way this panel could arm something the operator did not mean. The board read is the first:
+ * an unreadable board and an empty one look identical downstream, and a policy accepted off the
+ * former is fitted to a failure. Then the two states an editor makes reachable in one click — a
+ * policy that constrains nothing, and no way back out of an armed one.
+ */
+describe("what it refuses to arm", () => {
+  it("refuses to save at all when the board could not be read", () => {
+    const fetchMock = stubFetch();
+    renderPanel({ boardUnavailable: true, draft: THIN });
+    expect(screen.getByRole("alert").textContent).toContain("could not be read");
+    // No proposal is offered either: a draft calibrated from zero beads is a read failure quoted back.
+    expect(screen.queryByRole("note")).toBeNull();
+    expect((screen.getByRole("button", { name: "Use this policy" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("says out loud when a policy asserts nothing at all", () => {
+    renderPanel({ stored: {}, candidates: CANDIDATES });
+    expect(screen.getByText(/admits every open run target/)).toBeTruthy();
+    // And stops saying it the moment a criterion is asserted.
+    fireEvent.click(screen.getByRole("switch", { name: "bug" }));
+    expect(screen.queryByText(/admits every open run target/)).toBeNull();
+  });
+
+  it("lets an armed project be disarmed again", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: { types: ["feature"] } });
+    fireEvent.click(screen.getByRole("button", { name: "Remove policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // null REMOVES the setting; an empty object would arm a policy that admits everything.
+    expect(sentPolicy(fetchMock)).toBeNull();
+  });
+
+  it("offers no removal before anything is armed", () => {
+    renderPanel();
+    expect(screen.queryByRole("button", { name: "Remove policy" })).toBeNull();
+  });
+});
+
+describe("ranking is offered where an order could mean something", () => {
+  it("offers no ranking on a namespace whose values are not a scale", () => {
+    renderPanel({
+      stored: { labels: [{ namespace: "team", values: ["payments", "growth"] }] },
+      labelVocabulary: [
+        ...VOCABULARY,
+        {
+          namespace: "team",
+          labels: [
+            { label: "team:payments", count: 3 },
+            { label: "team:growth", count: 2 },
+          ],
+        },
+      ],
+    });
+    // "Most preferred first" is meaningless over team names, and a control that does nothing is worse
+    // than no control.
+    expect(screen.queryByRole("switch", { name: "Rank team: values" })).toBeNull();
+  });
+
+  it("keeps a stored ranking editable even on a namespace discovery would not offer one for", () => {
+    renderPanel({
+      stored: { labels: [{ namespace: "team", values: ["payments", "growth"], ranked: true }] },
+      labelVocabulary: [
+        ...VOCABULARY,
+        {
+          namespace: "team",
+          labels: [
+            { label: "team:payments", count: 3 },
+            { label: "team:growth", count: 2 },
+          ],
+        },
+      ],
+    });
+    expect(screen.getByRole("switch", { name: "Rank team: values" })).toBeTruthy();
+  });
+
+  it("says the order does not yet change what is admitted", () => {
+    renderPanel({ stored: { labels: [{ namespace: "severity", values: ["critical", "major"] }] } });
+    fireEvent.click(screen.getByRole("switch", { name: "Rank severity: values" }));
+    expect(screen.getByText(/does not yet change which beads are admitted/)).toBeTruthy();
+  });
+});
+
+/**
+ * A stored `compare` is the one criterion field this editor cannot author but must not destroy: it
+ * NARROWS a ranked namespace, so losing it on an unrelated chip edit silently widens the policy into
+ * membership over the whole ranking — admitting work the operator had excluded.
+ */
+describe("a stored comparison survives editing around it", () => {
+  const bounded = {
+    labels: [
+      {
+        namespace: "severity",
+        values: ["critical", "major", "minor"],
+        ranked: true,
+        compare: { op: "lte" as const, value: "major" },
+      },
+    ],
+  };
+
+  it("keeps the bound when another value is toggled", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: bounded });
+    fireEvent.click(screen.getByRole("switch", { name: "severity:minor" })); // drop an unrelated value
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels).toEqual([
+      { namespace: "severity", values: ["critical", "major"], ranked: true, compare: { op: "lte", value: "major" } },
+    ]);
+  });
+
+  it("drops a bound whose own value the operator removed", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: bounded });
+    fireEvent.click(screen.getByRole("switch", { name: "severity:major" })); // the bound itself
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    // A bound the ranking no longer carries refuses every bead, and the store rejects it outright.
+    expect(sentPolicy(fetchMock).labels[0].compare).toBeUndefined();
+  });
+
+  it("drops a bound when the ranking under it is turned off", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: bounded });
+    fireEvent.click(screen.getByRole("switch", { name: "Rank severity: values" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).labels).toEqual([
+      { namespace: "severity", values: ["critical", "major", "minor"] },
+    ]);
   });
 });

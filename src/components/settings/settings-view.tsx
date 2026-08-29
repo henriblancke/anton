@@ -572,9 +572,11 @@ export function SettingsView({
   agents,
   bundledIds,
   labelVocabulary,
+  rankingCandidates,
   issueTypes,
   policyDraft,
   policyCandidates,
+  boardUnavailable,
   earned,
 }: {
   project: Project;
@@ -591,6 +593,11 @@ export function SettingsView({
   bundledIds: string[];
   /** The label namespaces this project's board actually uses — what value nominations pick from. */
   labelVocabulary: LabelNamespace[];
+  /**
+   * The namespaces whose values read as a scale (`src/lib/policy/vocabulary`), so the work policy
+   * offers a hand-ranking only where an order could mean something.
+   */
+  rankingCandidates: string[];
   /** The issue types this board actually uses — the type vocabulary the work policy is edited against. */
   issueTypes: string[];
   /**
@@ -605,6 +612,11 @@ export function SettingsView({
    * change — a fetch per edit would make the count lag the control that explains it.
    */
   policyCandidates: PolicyCandidate[];
+  /**
+   * The board read failed, so everything derived from it above is empty by accident rather than by
+   * fact. The work policy panel refuses to arm off that.
+   */
+  boardUnavailable: boolean;
   /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
@@ -2042,7 +2054,9 @@ export function SettingsView({
               stored={settings.pickerPolicy}
               issueTypes={issueTypes}
               labelVocabulary={labelVocabulary}
+              rankingCandidates={rankingCandidates}
               candidates={policyCandidates}
+              boardUnavailable={boardUnavailable}
             />
           )}
 
