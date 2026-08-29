@@ -323,8 +323,8 @@ async function applyReserved(
     return cancelled(walk, input.signal, rest.slice(1));
   }
 
-  const { record: outcome, stopped } = await applyOne(input, base);
-  const recorded = await record(walk, outcome);
+  const { record: attempt, stopped } = await applyOne(input, base);
+  const recorded = await record(walk, attempt);
   // A cancel that landed inside applyOne's board read. Nothing was written — its outcome line says
   // so — and the rest of the walk is the pass being STOPPED, never a walk that finished. Ahead of
   // the recording check below: a cancel is not an outcome, and a log that also failed does not turn
