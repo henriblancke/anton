@@ -343,14 +343,31 @@ function hasDeclarationArrow(tail: string): boolean {
 }
 
 /**
+ * Where the body a closing parameter line opens begins — the LAST brace it opens at the tail's own
+ * nesting level. Depth is tracked rather than taking the last brace outright, because braces nest
+ * both ways around the body: an object return type sits BEFORE it (`): { ok: boolean } {`) and an
+ * object the body itself builds sits INSIDE it (`) { return {}; }`). Only a level-0 brace opens a
+ * body, and the last one is it. `-1` when the tail opens no body at all.
+ */
+function bodyBrace(tail: string): number {
+  let depth = 0;
+  let brace = -1;
+  for (let i = 0; i < tail.length; i += 1) {
+    if (tail[i] === "{") {
+      if (depth === 0) brace = i;
+      depth += 1;
+    } else if (tail[i] === "}" && depth > 0) depth -= 1;
+  }
+  return brace;
+}
+
+/**
  * Whether the closing line of a parameter list also RUNS something — either as an expression body,
- * or as a braced body opened and closed on the same line (`) { return execute(); }`). The brace read
- * is the LAST one on the tail, so an object return type (`): { ok: boolean } {`) is passed over and
- * the body it opens is the one measured.
+ * or as a braced body opened and closed on the same line (`) { return execute(); }`).
  */
 function hasInlineBody(tail: string): boolean {
   if (hasArrowBody(tail)) return true;
-  const brace = tail.lastIndexOf("{");
+  const brace = bodyBrace(tail);
   if (brace < 0) return false;
   return tail.slice(brace + 1).replace(/[});,\s]+$/, "").trim() !== "";
 }

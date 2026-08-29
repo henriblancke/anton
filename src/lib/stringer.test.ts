@@ -1517,6 +1517,29 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("2 signature");
     });
 
+    // The body an inline closing line opens can hold braces of its own — `) { return {}; }`. Reading
+    // the LAST brace as the body's would measure the object literal instead, and file a return that
+    // runs on every call as a parameter list.
+    it("counts an inline body whose return builds an object as code", async () => {
+      const repo = writeRepo({
+        "src/empty.ts": [
+          "export function empty(",
+          "  left: number,",
+          "  right: number,",
+          ") { return {}; }",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/empty.ts", 3]], 2),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/empty.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // A brace inside a TRAILING block comment is not nesting. Counting it would leave the import
     // open over everything below, filing the file's real statements as specifier lines.
     it("closes an import whose line ends in a block comment holding a brace", async () => {
