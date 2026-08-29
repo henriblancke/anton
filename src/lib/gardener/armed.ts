@@ -344,9 +344,9 @@ async function applyReserved(
 }
 
 /** One outcome, kept by the walk and put on the record — reported as the log took it, or did not. */
-async function record(walk: ArmedWalk, outcome: ArmedRecord): Promise<boolean> {
-  walk.records.push(outcome);
-  return write(walk.input, lineOf(outcome));
+async function record(walk: ArmedWalk, entry: ArmedRecord): Promise<boolean> {
+  walk.records.push(entry);
+  return write(walk.input, lineOf(entry));
 }
 
 /**
