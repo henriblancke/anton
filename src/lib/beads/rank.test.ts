@@ -325,3 +325,71 @@ describe("unblockCounter", () => {
     expect(unblockCounter(board)("f1")).toBe(1);
   });
 });
+
+/**
+ * The refactoring guard (anton-jesm): one board wide enough to exercise every rule the walk has —
+ * a diamond, a dependent an unrelated blocker still holds, a deferred and a closed dead end, and an
+ * off-board bead — pinned to the exact queue and the exact counts it produced before the walk was
+ * extracted from the counting. The behaviour tests above say what each rule IS; this one says the
+ * whole ranking did not move, so a future rewrite of the walk that keeps every rule passing and
+ * still reorders the queue is caught here.
+ */
+describe("rankTargets — the fixed board ranks byte-identically", () => {
+  const GOLDEN_BOARD: Bead[] = [
+    bead({ id: "anton-aaa", priority: 1, created_at: "2026-03-01T00:00:00Z" }),
+    bead({ id: "anton-bbb", priority: 1, created_at: "2026-03-01T00:00:00Z" }),
+    bead({ id: "anton-ccc", priority: 0, created_at: "2026-07-01T00:00:00Z" }),
+    bead({ id: "anton-ddd", priority: 2, created_at: "2026-01-01T00:00:00Z" }),
+    bead({ id: "anton-eee", created_at: "2026-01-01T00:00:00Z" }),
+    bead({ id: "anton-fff", priority: 2 }),
+    // anton-aaa → left, right → tail: a diamond whose shared tail is released once.
+    bead({ id: "left", priority: 3, created_at: "2026-02-01T00:00:00Z", dependencies: [blocks("left", "anton-aaa")] }),
+    bead({ id: "right", priority: 3, created_at: "2026-02-01T00:00:00Z", dependencies: [blocks("right", "anton-aaa")] }),
+    bead({ id: "tail", status: "blocked", dependencies: [blocks("tail", "left"), blocks("tail", "right")] }),
+    // Held by two unrelated targets, so neither may claim it.
+    bead({ id: "shared", dependencies: [blocks("shared", "anton-bbb"), blocks("shared", "anton-ddd")] }),
+    // A deferred dead end and a closed one: both stop the walk short of what they block.
+    bead({ id: "snoozed", status: "deferred", dependencies: [blocks("snoozed", "anton-ccc")] }),
+    bead({ id: "beyond-snooze", status: "blocked", dependencies: [blocks("beyond-snooze", "snoozed")] }),
+    bead({ id: "done", status: "closed", dependencies: [blocks("done", "anton-ddd")] }),
+    // `ghost` is off the board: traversed, not counted, and `ghost-tail` behind it still is.
+    bead({ id: "ghost-tail", dependencies: [blocks("ghost-tail", "ghost")] }),
+    bead({
+      id: "anton-ggg",
+      priority: 4,
+      created_at: "2026-05-01T00:00:00Z",
+      dependencies: [blocks("ghost", "anton-ggg")],
+    }),
+  ];
+
+  it("produces the queue and the counts it produced before the walk was extracted", () => {
+    const ranked = rankTargets(GOLDEN_BOARD, GOLDEN_BOARD);
+
+    expect(ranked.map((t) => [t.bead.id, t.priority ?? null, t.unblocks, t.createdAt])).toEqual([
+      ["anton-ccc", 0, 0, "2026-07-01T00:00:00Z"],
+      ["anton-aaa", 1, 3, "2026-03-01T00:00:00Z"],
+      ["anton-bbb", 1, 0, "2026-03-01T00:00:00Z"],
+      ["anton-ddd", 2, 0, "2026-01-01T00:00:00Z"],
+      ["anton-fff", 2, 0, ""],
+      ["left", 3, 0, "2026-02-01T00:00:00Z"],
+      ["right", 3, 0, "2026-02-01T00:00:00Z"],
+      ["anton-ggg", 4, 1, "2026-05-01T00:00:00Z"],
+      ["snoozed", null, 1, ""],
+      ["anton-eee", null, 0, "2026-01-01T00:00:00Z"],
+      ["beyond-snooze", null, 0, ""],
+      ["done", null, 0, ""],
+      ["ghost-tail", null, 0, ""],
+      ["shared", null, 0, ""],
+      ["tail", null, 0, ""],
+    ]);
+  });
+
+  it("ranks the same board the same way however the read is shuffled", () => {
+    const expected = JSON.stringify(rankTargets(GOLDEN_BOARD, GOLDEN_BOARD));
+
+    for (let seed = 1; seed <= 25; seed++) {
+      const scrambled = shuffled(GOLDEN_BOARD, seed);
+      expect(JSON.stringify(rankTargets(scrambled, shuffled(GOLDEN_BOARD, seed * 17)))).toEqual(expected);
+    }
+  });
+});

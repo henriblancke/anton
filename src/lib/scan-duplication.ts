@@ -259,6 +259,21 @@ function hasArrowBody(tail: string): boolean {
 }
 
 /**
+ * Whether the tail of a closing parameter list carries the arrow that DECLARES a function. Only an
+ * arrow the list hands to directly (`) => x`) or across a return type (`): number => x`) declares.
+ * An arrow reached any other way belongs to something else — `) as (value: string) => string`
+ * asserts the TYPE of an expression that already ran — and reading it as a declaration would file a
+ * window of live calls as a parameter list.
+ */
+function hasDeclarationArrow(tail: string): boolean {
+  const text = tail.trim();
+  if (text.startsWith("=>")) return true;
+  // Past a `:` the tail IS the return type, so an arrow anywhere in it is still the signature's own
+  // — `): (item: Item) => void {` declares as surely as `): number => x` does.
+  return text.startsWith(":") && text.includes("=>");
+}
+
+/**
  * Whether the closing line of a parameter list also RUNS something — either as an expression body,
  * or as a braced body opened and closed on the same line (`) { return execute(); }`). The brace read
  * is the LAST one on the tail, so an object return type (`): { ok: boolean } {`) is passed over and
@@ -351,15 +366,17 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         // The parameter list, however it is spelled — a destructured props object, its inline type
         // annotation, one name per line. None of it computes anything, unless it defaults — or
         // unless the line that closes the list carries the arrow body with it.
+        // Closure is read off the tail, never off the line's net paren depth: an expression body
+        // that opens a call on the same line (`) => combine(`) leaves the net positive while the
+        // parameter list has plainly ended, and the calls below it would inherit `signature`.
         const tail = closingTail(line, depth);
-        depth += parenDelta(line);
-        const closes = depth <= 0;
+        if (tail === undefined) depth += parenDelta(line);
         // The paren closed: settle what it was. An arrow's `=>` cannot be pushed to the next line —
         // the grammar forbids the break — so its absence here proves the construct was a
         // parenthesized EXPRESSION, and every line it swallowed (`computeA(),`) runs. Hand them back
         // as code rather than letting a window of calls read as a declaration.
         if (tail !== undefined && arrow === "owed") {
-          arrow = tail.includes("=>") ? "settled" : "absent";
+          arrow = hasDeclarationArrow(tail) ? "settled" : "absent";
           if (arrow === "absent") {
             for (let i = signatureStart; i < classes.length; i += 1) {
               if (classes[i] === "signature") classes[i] = "code";
@@ -367,13 +384,11 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
           }
         }
         classes.push(
-          arrow === "absent" ||
-            hasParameterDefault(line) ||
-            (closes && tail !== undefined && hasInlineBody(tail))
+          arrow === "absent" || hasParameterDefault(line) || (tail !== undefined && hasInlineBody(tail))
             ? "code"
             : "signature",
         );
-        if (closes) {
+        if (tail !== undefined) {
           statement = undefined;
           depth = 0;
         }

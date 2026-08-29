@@ -1635,6 +1635,56 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 signature");
     });
 
+    // The `)` that ends a parameter list ends it whatever the body opens next: `) => combine(` is
+    // net-zero on parens, and reading closure off that net depth would leave the runtime calls
+    // under it inheriting `signature` — dropping a clone of live work.
+    it("ends the parameter list at its closing paren even when the body opens a call", async () => {
+      const repo = writeRepo({
+        "src/total.ts": [
+          "export const total = (",
+          "  seed: number,",
+          ") => combine(",
+          "  computeAlpha(seed),",
+          "  computeBeta(seed),",
+          "  computeGamma(seed),",
+          ");",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/total.ts", 4]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/total.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // Only the arrow the parameter list HANDS TO declares. One inside an asserted function type —
+    // `) as (value: string) => string` — belongs to the type, and mistaking it for a declaration
+    // would file the calls it wraps as a parameter list.
+    it("reads an arrow inside a type assertion as the type's, not as a declaration", async () => {
+      const repo = writeRepo({
+        "src/assert.ts": [
+          "export const label = (",
+          "  computeAlpha(),",
+          "  computeBeta(),",
+          "  computeGamma()",
+          ") as (value: string) => string;",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/assert.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/assert.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // A regex literal is not syntax: an unmatched `(` inside one would hold the parameter list open
     // past its real `)`, and every statement below it would read as more parameter list — dropping
     // a genuine clone. Division is left alone, so `a / b(c) / d` keeps the parens it spans.

@@ -133,7 +133,7 @@ function parseEdges(source: string): RawEdge[] {
 }
 
 /** A `"@/*": ["./src/*"]`-shaped tsconfig path mapping, the only form anton resolves. */
-interface AliasRule {
+export interface AliasRule {
   prefix: string;
   targets: string[];
 }
@@ -143,7 +143,7 @@ interface AliasRule {
  * tsconfig anton can't read costs alias edges (which only ever ADD proof of a real cycle, so the
  * signal is kept), never a wrong drop.
  */
-async function readAliases(repoPath: string): Promise<AliasRule[]> {
+export async function readAliases(repoPath: string): Promise<AliasRule[]> {
   let config: { compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> } };
   try {
     config = JSON.parse(await readFile(join(repoPath, "tsconfig.json"), "utf8"));
@@ -171,91 +171,129 @@ function insideRepo(path: string): string | undefined {
 }
 
 /**
+ * The state one filter pass shares across every signal in the scan: resolutions and file reads are
+ * cached so a module named by two signals is read once, and `parsed` is the single budget that
+ * bounds the whole pass.
+ */
+interface GraphState {
+  repoPath: string;
+  aliases: AliasRule[];
+  edges: Map<string, ResolvedEdge[]>;
+  files: Map<string, string | undefined>;
+  exists: Map<string, boolean>;
+  parsed: number;
+}
+
+async function isFile(state: GraphState, rel: string): Promise<boolean> {
+  const hit = state.exists.get(rel);
+  if (hit !== undefined) return hit;
+  const found = await stat(join(state.repoPath, rel))
+    .then((s) => s.isFile())
+    .catch(() => false);
+  state.exists.set(rel, found);
+  return found;
+}
+
+/** The spellings a module path can have on disk — `x.ts`, `x/index.ts`, or the file itself. */
+function candidateFiles(base: string): string[] {
+  const candidates: string[] = [];
+  if (SOURCE_EXTENSIONS.some((ext) => base.endsWith(ext))) candidates.push(base);
+  // A `./x.js` specifier under an ESM resolver is `x.ts` on disk — check both spellings.
+  const stem = base.replace(/\.(js|jsx|mjs|cjs)$/, "");
+  for (const ext of SOURCE_EXTENSIONS) candidates.push(`${stem}${ext}`, `${stem}/index${ext}`);
+  return candidates;
+}
+
+/** The source file a module path names; undefined when no spelling of it is a file in the repo. */
+async function resolveFile(state: GraphState, base: string): Promise<string | undefined> {
+  if (state.files.has(base)) return state.files.get(base);
+  let found: string | undefined;
+  for (const candidate of candidateFiles(base)) {
+    const rel = insideRepo(candidate);
+    if (rel && (await isFile(state, rel))) {
+      found = rel;
+      break;
+    }
+  }
+  state.files.set(base, found);
+  return found;
+}
+
+/** Where a `@/…`-style specifier lands, or undefined when no alias rule claims it. */
+async function resolveAlias(state: GraphState, spec: string): Promise<string | undefined> {
+  for (const rule of state.aliases) {
+    if (!spec.startsWith(rule.prefix)) continue;
+    for (const target of rule.targets) {
+      const file = await resolveFile(state, normalize(join(target, spec.slice(rule.prefix.length))));
+      if (file) return file;
+    }
+  }
+  return undefined;
+}
+
+/** Where a specifier points, or undefined when it isn't a module in this repo (an npm package). */
+function resolveSpec(
+  state: GraphState,
+  fromFile: string,
+  spec: string,
+): Promise<string | undefined> {
+  return spec.startsWith(".")
+    ? resolveFile(state, normalize(join(dirname(fromFile), spec)))
+    : resolveAlias(state, spec);
+}
+
+/** Every import in a file's source, resolved onto the repo; source anton can't read has no edges. */
+async function buildEdges(state: GraphState, file: string): Promise<ResolvedEdge[]> {
+  const source = await readFile(join(state.repoPath, file), "utf8").catch(() => undefined);
+  const resolved: ResolvedEdge[] = [];
+  for (const edge of source ? parseEdges(source) : []) {
+    const target = await resolveSpec(state, file, edge.spec);
+    if (target) {
+      resolved.push({ file: target, typeOnly: edge.typeOnly, relative: edge.spec.startsWith(".") });
+    }
+  }
+  return resolved;
+}
+
+/** Every import of a file, resolved; `undefined` once the pass has spent its parse budget. */
+async function edgesOf(state: GraphState, file: string): Promise<ResolvedEdge[] | undefined> {
+  const cached = state.edges.get(file);
+  if (cached) return cached;
+  if (state.parsed >= MODULE_BUDGET) return undefined;
+  state.parsed += 1;
+  const resolved = await buildEdges(state, file);
+  state.edges.set(file, resolved);
+  return resolved;
+}
+
+/** The modules a file imports AT RUNTIME; undefined when the budget ran out mid-walk. */
+async function valueTargetsOf(state: GraphState, file: string): Promise<Set<string> | undefined> {
+  const edges = await edgesOf(state, file);
+  if (!edges) return undefined;
+  return new Set(edges.filter((edge) => !edge.typeOnly).map((edge) => edge.file));
+}
+
+/**
  * The import graph of one repo, as anton can prove it: file reads and resolutions are cached across
  * every signal in the scan, and the shared parse budget bounds the whole pass.
  */
-function importGraph(repoPath: string, aliases: AliasRule[]) {
-  const edgeCache = new Map<string, ResolvedEdge[]>();
-  const fileCache = new Map<string, string | undefined>();
-  const exists = new Map<string, boolean>();
-  let parsed = 0;
-
-  async function isFile(rel: string): Promise<boolean> {
-    const hit = exists.get(rel);
-    if (hit !== undefined) return hit;
-    const found = await stat(join(repoPath, rel))
-      .then((s) => s.isFile())
-      .catch(() => false);
-    exists.set(rel, found);
-    return found;
-  }
-
-  /** The source file a module path names — `x.ts`, `x/index.ts`, or the file itself. */
-  async function resolveFile(base: string): Promise<string | undefined> {
-    if (fileCache.has(base)) return fileCache.get(base);
-    const candidates: string[] = [];
-    if (SOURCE_EXTENSIONS.some((ext) => base.endsWith(ext))) candidates.push(base);
-    // A `./x.js` specifier under an ESM resolver is `x.ts` on disk — check both spellings.
-    const stem = base.replace(/\.(js|jsx|mjs|cjs)$/, "");
-    for (const ext of SOURCE_EXTENSIONS) candidates.push(`${stem}${ext}`, `${stem}/index${ext}`);
-    let found: string | undefined;
-    for (const candidate of candidates) {
-      const rel = insideRepo(candidate);
-      if (rel && (await isFile(rel))) {
-        found = rel;
-        break;
-      }
-    }
-    fileCache.set(base, found);
-    return found;
-  }
-
-  /** Where a specifier points, or undefined when it isn't a module in this repo (an npm package). */
-  async function resolveSpec(fromFile: string, spec: string): Promise<string | undefined> {
-    if (spec.startsWith(".")) return resolveFile(normalize(join(dirname(fromFile), spec)));
-    for (const rule of aliases) {
-      if (!spec.startsWith(rule.prefix)) continue;
-      for (const target of rule.targets) {
-        const file = await resolveFile(normalize(join(target, spec.slice(rule.prefix.length))));
-        if (file) return file;
-      }
-    }
-    return undefined;
-  }
-
-  /** Every import of a file, resolved; `undefined` once the pass has spent its parse budget. */
-  async function edgesOf(file: string): Promise<ResolvedEdge[] | undefined> {
-    const cached = edgeCache.get(file);
-    if (cached) return cached;
-    if (parsed >= MODULE_BUDGET) return undefined;
-    parsed += 1;
-    const source = await readFile(join(repoPath, file), "utf8").catch(() => undefined);
-    const resolved: ResolvedEdge[] = [];
-    for (const edge of source ? parseEdges(source) : []) {
-      const target = await resolveSpec(file, edge.spec);
-      if (target) {
-        resolved.push({ file: target, typeOnly: edge.typeOnly, relative: edge.spec.startsWith(".") });
-      }
-    }
-    edgeCache.set(file, resolved);
-    return resolved;
-  }
-
-  /** The modules a file imports AT RUNTIME; undefined when the budget ran out mid-walk. */
-  async function valueTargetsOf(file: string): Promise<Set<string> | undefined> {
-    const edges = await edgesOf(file);
-    if (!edges) return undefined;
-    return new Set(edges.filter((edge) => !edge.typeOnly).map((edge) => edge.file));
-  }
-
+export function importGraph(repoPath: string, aliases: AliasRule[]) {
+  const state: GraphState = {
+    repoPath,
+    aliases,
+    edges: new Map(),
+    files: new Map(),
+    exists: new Map(),
+    parsed: 0,
+  };
   return {
-    resolveModule: (name: string) => resolveFile(normalize(name)),
-    edgesOf,
-    valueTargetsOf,
+    resolveModule: (name: string) => resolveFile(state, normalize(name)),
+    edgesOf: (file: string) => edgesOf(state, file),
+    valueTargetsOf: (file: string) => valueTargetsOf(state, file),
   };
 }
 
-type Graph = ReturnType<typeof importGraph>;
+export type Graph = ReturnType<typeof importGraph>;
 
 /**
  * Whether the reported component still holds a cycle once erased edges come out — the question the
@@ -333,8 +371,13 @@ function kindOf(signal: ScanSignal): string {
   return typeof raw === "string" && raw ? raw : COUPLING_COLLECTOR;
 }
 
-/** A verdict on one signal: keep it (corrected, perhaps), or drop it with the proof. */
-type Verdict =
+/**
+ * A verdict on one signal: keep it (corrected, perhaps), or drop it with the proof.
+ *
+ * This type and the two judges below are exported for the unit tests, which weigh one signal
+ * against a fixture tree; production reads them through {@link filterCouplingSignals}.
+ */
+export type Verdict =
   | { drop: false; recounted?: RecountedCoupling }
   | { drop: true; reason: string };
 
@@ -345,7 +388,7 @@ const KEEP: Verdict = { drop: false };
  * component's MEMBERS, not a path (see {@link erasedEdges}), so the question asked of the source is
  * whether any cycle at all survives among them once the erased edges come out.
  */
-async function judgeCycle(graph: Graph, signal: ScanSignal): Promise<Verdict> {
+export async function judgeCycle(graph: Graph, signal: ScanSignal): Promise<Verdict> {
   const modules = parseCycleModules(titleOf(signal));
   if (modules.length < 2) return KEEP; // nothing to check — stringer said something anton can't read
   // The title has to spell the WHOLE component: a cycle can run through a member it left out.
@@ -406,7 +449,7 @@ async function erasedEdges(graph: Graph, files: string[]): Promise<string | unde
  * module below the fan-out it really has, so anton's own runtime count is the floor no correction
  * may go under — and a module whose runtime edges alone clear the threshold is never dropped.
  */
-async function judgeFanOut(graph: Graph, signal: ScanSignal): Promise<Verdict> {
+export async function judgeFanOut(graph: Graph, signal: ScanSignal): Promise<Verdict> {
   const path = filePathOf(signal);
   const reported = reportedImports(signal);
   if (!path || reported === undefined) return KEEP;

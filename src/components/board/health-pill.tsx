@@ -13,6 +13,26 @@ function iso(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toISOString();
 }
 
+/**
+ * How many of the scan series' most recent columns the toolbar sparkline draws. The board carries
+ * the whole `SCAN_HEALTH_WINDOW` (14) and the Health page's rail draws all of it; only this pill caps.
+ *
+ * A cap, not a style choice: `ScanTrend` floors every column at `min-w-1.5` so a single signal is
+ * still visible, which means the chart has a hard minimum width of `n*6px + (n-1)*4px` that `flex-1`
+ * cannot shrink past. Handed the full 14-point window, that is 136px of columns painting straight
+ * out through this pill's right border. Fourteen discrete nightly columns are not legible at toolbar
+ * size anyway, so the honest fix is to show the last week and let the click reach the rest.
+ */
+const TREND_POINTS = 6;
+
+/**
+ * Sized to fit {@link TREND_POINTS} columns exactly at that floor: 6*6px + 5*4px of gap. Derived
+ * from the cap rather than picked — a width narrower than the columns' own minimum is precisely the
+ * overflow this replaces, so the two numbers have to move together. `shrink-0` because a toolbar
+ * that squeezes this box does not squeeze the columns inside it: they would overflow again.
+ */
+const TREND_BOX = "h-4 w-14 shrink-0";
+
 /** "3 worth a look · 12 housekeeping · 6 new signals · patrolled 6h ago" — named in the order the
  * Health page itself is organized, and only when the underlying data actually exists: a claim this
  * pill can't back up with a real number does not get a clause. */
@@ -99,7 +119,12 @@ export function HealthPill({
       <span>
         Health <span className="font-mono text-foreground">{count}</span>
       </span>
-      {scanHealth ? <ScanTrend points={scanHealth.points} className="h-4 w-8" /> : null}
+      {/* The tail, not the whole series — and so this chart's scale is the last week's peak, not the
+          window's. Deliberate: at six columns the pill answers "is it getting worse lately", and the
+          Health page's full-window rail is one click away for the longer arc. */}
+      {scanHealth ? (
+        <ScanTrend points={scanHealth.points.slice(-TREND_POINTS)} className={TREND_BOX} />
+      ) : null}
     </Link>
   );
 }

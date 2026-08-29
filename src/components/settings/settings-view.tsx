@@ -16,7 +16,7 @@ import type { Project } from "@/lib/types";
 import { describeCron } from "@/lib/jobs/cadence";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Toggle } from "@/components/atoms";
+import { PageHeader, Toggle } from "@/components/atoms";
 import { agentDotClass } from "@/components/board/board-utils";
 import {
   AutomationTable,
@@ -1022,12 +1022,7 @@ export function SettingsView({
 
   return (
     <div className="flex flex-1 flex-col">
-      <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
-        <div className="flex items-center gap-2 text-[13px]">
-          <span className="text-muted-foreground">{project.name}</span>
-          <span className="text-subtle">/</span>
-          <span className="font-medium text-foreground">Settings</span>
-        </div>
+      <PageHeader project={project.name} section="Settings">
         {/* The count is the point, not the button: it names what a save will actually submit, from
             anywhere in the page. Automation is absent from it on purpose — it saves on change. */}
         <span className="ml-auto flex items-center gap-2.5">
@@ -1048,7 +1043,7 @@ export function SettingsView({
             {saving ? "Saving…" : "Save changes"}
           </Button>
         </span>
-      </header>
+      </PageHeader>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[192px_1fr]">
         {/* subnav — switches which panel renders, so every section is one click deep and none of
