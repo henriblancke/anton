@@ -1635,6 +1635,46 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 signature");
     });
 
+    // A regex literal is not syntax: an unmatched `(` inside one would hold the parameter list open
+    // past its real `)`, and every statement below it would read as more parameter list — dropping
+    // a genuine clone. Division is left alone, so `a / b(c) / d` keeps the parens it spans.
+    it("does not count the delimiters inside a regex literal as syntax", async () => {
+      const repo = writeRepo({
+        "src/match.ts": [
+          "export function match(",
+          "  input: string,",
+          "  pattern = /\\(/,",
+          ") {",
+          "  doAlpha(input);",
+          "  doBeta(input);",
+          "  doGamma(input);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/ratio.ts": [
+          "export function ratio(",
+          "  numerator: number,",
+          "  denominator: number,",
+          ") {",
+          "  return numerator / scale(denominator) / 2;",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/match.ts", 5]], 3),
+        clone([["src/ratio.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The statements below the regex default are code, so their clone survives...
+      expect(result.signals).toMatchObject([{ FilePath: "src/match.ts" }]);
+      // ...while the parameter list above them still reads as one, division and all.
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/ratio.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
     // A window of nothing but closers is dropped too — but "declares rather than computes" would be
     // the wrong diagnosis to hand an operator, since there is nothing there that declares either.
     it("says a block holds no content line rather than blaming its declarations", async () => {

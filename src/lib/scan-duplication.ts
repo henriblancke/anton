@@ -127,20 +127,36 @@ const ARROW_START = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*
 const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+)?;$/;
 
 /**
- * Strip what would confuse brace counting: comments and string bodies. Block comments go too, and
- * not only the ones a line opens with — a declaration closed by a trailing block comment holding a
- * brace would otherwise have that brace counted, keeping the import open over every function below
- * it. Strings are blanked first, so a comment opener inside one is not read as a comment. Crude on
- * purpose — the only thing riding on it is where a multi-line import or type declaration ends, and
- * an unbalanced count there classifies a line as `type`/`import` rather than dropping anything on
- * its own.
+ * A regex literal, and only where a `/` can BEGIN one: at the start of a line, or after an opener,
+ * a separator, an operator or `return`. After a value — `)`, `]`, an identifier — the same `/`
+ * divides, and blanking `a / b(c) / d` would eat the parens it spans. The prefix is captured rather
+ * than looked behind so the scan resumes after it, and the body admits an escape or a character
+ * class so `/[/]/` and `/\(/` both close where they actually close.
+ *
+ * Without this a parameter default like `pattern = /\(/` leaves an unmatched `(` for `parenDelta`
+ * to count, the signature never closes on its real `)`, and every statement below it reads as more
+ * parameter list — turning a genuine clone of runtime work into a declaration and dropping it.
+ */
+const REGEX_LITERAL =
+  /(^|=>|[([{,;:=!&|?]|\breturn|\bcase|\btypeof)(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*/g;
+
+/**
+ * Strip what would confuse brace counting: comments, string bodies and regex literals. Block
+ * comments go too, and not only the ones a line opens with — a declaration closed by a trailing
+ * block comment holding a brace would otherwise have that brace counted, keeping the import open
+ * over every function below it. Strings are blanked first, so a comment opener inside one is not
+ * read as a comment; regexes go LAST, so prose that happens to hold a `/…/` is already gone and
+ * cannot be read as one. Crude on purpose — the only thing riding on it is where a multi-line
+ * import or type declaration ends, and an unbalanced count there classifies a line as
+ * `type`/`import` rather than dropping anything on its own.
  */
 function stripNoise(line: string): string {
   return line
     .replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/g, '""')
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/\/\/.*$/, "")
-    .replace(/\/\*.*$/, "");
+    .replace(/\/\*.*$/, "")
+    .replace(REGEX_LITERAL, (_match, prefix: string, space: string) => `${prefix}${space}""`);
 }
 
 /** Net nesting a line opens, over the brackets given — `stripNoise`d, so a brace in a string is not one. */
