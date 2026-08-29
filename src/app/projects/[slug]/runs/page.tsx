@@ -7,6 +7,7 @@ import { countRuns, listRunsPaged, type RunStatus, type RunSummary } from "@/lib
 import { countJobs } from "@/lib/jobs-view";
 import { cn } from "@/lib/utils";
 import { PAGE_SIZE, resolvePage } from "@/lib/pagination";
+import { PageHeader } from "@/components/atoms";
 import { fmtDuration, isActiveRun } from "@/components/runs/run-view-utils";
 import { SectionTabs } from "@/components/runs/section-tabs";
 import { Pagination } from "@/components/runs/pagination";
@@ -52,13 +53,7 @@ export default async function ProjectRunsPage({
 
   return (
     <div className="flex flex-1 flex-col">
-      <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
-        <div className="flex items-center gap-2 text-[13px]">
-          <span className="text-muted-foreground">{project.name}</span>
-          <span className="text-subtle">/</span>
-          <span className="font-medium text-foreground">Runs</span>
-        </div>
-      </header>
+      <PageHeader project={project.name} section="Runs" />
 
       <SectionTabs slug={slug} active="runs" runsCount={total} jobsCount={jobsCount} />
 

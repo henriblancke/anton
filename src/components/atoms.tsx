@@ -234,3 +234,29 @@ export function RelativeTime({ iso, className }: { iso: string | null | undefine
     </time>
   );
 }
+
+/**
+ * The project breadcrumb bar every project section renders above its tabs — `<project> / <section>`.
+ * `children` is an optional trailing slot (settings hangs its unsaved-count and Save button there),
+ * so a section with extra header controls no longer has to re-copy the bar and drift from the rest.
+ */
+export function PageHeader({
+  project,
+  section,
+  children,
+}: {
+  project: string;
+  section: string;
+  children?: ReactNode;
+}) {
+  return (
+    <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
+      <div className="flex items-center gap-2 text-[13px]">
+        <span className="text-muted-foreground">{project}</span>
+        <span className="text-subtle">/</span>
+        <span className="font-medium text-foreground">{section}</span>
+      </div>
+      {children}
+    </header>
+  );
+}
