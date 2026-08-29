@@ -145,70 +145,108 @@ export function parsePmReport(text: string | undefined): PmReportResult {
 
   const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
   for (let i = blocks.length - 1; i >= 0; i--) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(blocks[i][1]);
-    } catch {
-      // A block that tried to be the report and failed IS the report — a malformed one.
-      if (/"proposals"\s*:/.test(blocks[i][1])) {
-        return { ok: false, violation: "malformed-proposals" };
-      }
-      continue;
-    }
-    if (typeof parsed !== "object" || parsed === null || !("proposals" in parsed)) continue;
-
-    const block = blocks[i];
-    if (text.slice((block.index ?? 0) + block[0].length).trim()) {
-      return { ok: false, violation: "trailing-content" };
-    }
-
-    const raw = (parsed as { proposals: unknown }).proposals;
-    if (!Array.isArray(raw)) return { ok: false, violation: "malformed-proposals" };
-    const claims = raw.map(toClaim);
-    if (claims.some((c) => c === undefined)) return { ok: false, violation: "malformed-proposals" };
-    return { ok: true, claims: claims as PmClaim[] };
+    const result = reportIn(text, blocks[i]);
+    if (result) return result;
   }
   return { ok: false, violation: "no-report" };
 }
+
+/**
+ * The report this block holds, or undefined when it is not one and the scan should keep looking.
+ * Distinguishing the two is the whole job: "not a report" walks past an unrelated json block, while
+ * a violation STOPS the scan, so an earlier draft can never stand in for a report just withdrawn.
+ */
+function reportIn(text: string, block: RegExpExecArray): PmReportResult | undefined {
+  const parsed = jsonIn(block[1]);
+  if (parsed === undefined) {
+    // A block that tried to be the report and failed IS the report — a malformed one.
+    return /"proposals"\s*:/.test(block[1]) ? { ok: false, violation: "malformed-proposals" } : undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || !("proposals" in parsed)) return undefined;
+  if (text.slice((block.index ?? 0) + block[0].length).trim()) {
+    return { ok: false, violation: "trailing-content" };
+  }
+  return claimsIn((parsed as { proposals: unknown }).proposals);
+}
+
+/** The block's body as json, or undefined when it does not parse — `null` parses, so it is a hit. */
+function jsonIn(body: string): unknown {
+  try {
+    return JSON.parse(body) ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The claims a report block carries, or the violation that stops it standing in for a healthy board. */
+function claimsIn(proposals: unknown): PmReportResult {
+  if (!Array.isArray(proposals)) return { ok: false, violation: "malformed-proposals" };
+  const claims = proposals.map(toClaim);
+  return claims.every((claim) => claim !== undefined)
+    ? { ok: true, claims: claims as PmClaim[] }
+    : { ok: false, violation: "malformed-proposals" };
+}
+
+/**
+ * The one field each kind adds to {@link PmClaimBase}, as data: the wire contract
+ * `pmReportFormatSection` documents, in the shape the parser reads it back with.
+ *
+ * A table rather than a switch of inline checks because the per-kind field IS the claim — every
+ * entry here is a line of the format section, and the two drifting apart is how a session ends up
+ * emitting a claim anton silently drops. Each reader is checked against its own kind's fields, so a
+ * new claim kind cannot be added to {@link CLAIM_KINDS} without a reader that produces its field.
+ */
+type ClaimFields<K extends ClaimKind> = Omit<
+  Extract<PmClaim, { kind: K }>,
+  keyof PmClaimBase | "kind"
+>;
+
+/** Reads the field kind `K` adds, or undefined when the entry cannot carry that claim at all. */
+type FieldReader<K extends ClaimKind> = (raw: Record<string, unknown>) => ClaimFields<K> | undefined;
+
+const CLAIM_FIELDS: { [K in ClaimKind]: FieldReader<K> } = {
+  reprioritize: (raw) => {
+    const priority = str(raw.priority);
+    return priority && /^P[0-4]$/.test(priority) ? { priority } : undefined;
+  },
+  order: (raw) => {
+    const blockedBy = str(raw.blockedBy);
+    return blockedBy ? { blockedBy } : undefined;
+  },
+  // A home claim names two beads, and the second is the whole content of the ask: "this is
+  // misfiled" with no home to move it to has nothing anton could ever write.
+  rehome: (raw) => {
+    const home = str(raw.home);
+    return home ? { home } : undefined;
+  },
+  split: (raw) => {
+    const pieces = lines(raw.pieces);
+    // Two is the smallest decomposition there is; one "piece" is the ticket restated.
+    return pieces && pieces.length >= 2 ? { pieces } : undefined;
+  },
+  // `kill`: the ask is the bead itself, so the base fields are the whole claim.
+  kill: () => ({}),
+};
 
 /** One wire entry as a claim, or undefined when it is not a usable one. */
 function toClaim(entry: unknown): PmClaim | undefined {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
   const raw = entry as Record<string, unknown>;
-  const kind = raw.kind;
-  if (typeof kind !== "string" || !(kind in CLAIM_KINDS)) return undefined;
+  if (typeof raw.kind !== "string" || !(raw.kind in CLAIM_KINDS)) return undefined;
+  const kind = raw.kind as ClaimKind;
 
+  const base = claimBase(raw);
+  const fields = (CLAIM_FIELDS[kind] as FieldReader<ClaimKind>)(raw);
+  // The kind is checked above, so the cast only re-states which table entry produced `fields`.
+  return base && fields ? ({ ...base, kind, ...fields } as PmClaim) : undefined;
+}
+
+/** What every entry must carry whatever its kind, or undefined when it carries less. */
+function claimBase(raw: Record<string, unknown>): PmClaimBase | undefined {
   const bead = str(raw.bead);
   const summary = str(raw.summary);
-  if (!bead || !summary) return undefined;
   const evidence = lines(raw.evidence);
-  if (!evidence?.length) return undefined;
-
-  const base: PmClaimBase = { bead, summary, evidence };
-  switch (kind as ClaimKind) {
-    case "reprioritize": {
-      const priority = str(raw.priority);
-      if (!priority || !/^P[0-4]$/.test(priority)) return undefined;
-      return { ...base, kind: "reprioritize", priority };
-    }
-    case "order": {
-      const blockedBy = str(raw.blockedBy);
-      return blockedBy ? { ...base, kind: "order", blockedBy } : undefined;
-    }
-    case "rehome": {
-      // A home claim names two beads, and the second is the whole content of the ask: "this is
-      // misfiled" with no home to move it to has nothing anton could ever write.
-      const home = str(raw.home);
-      return home ? { ...base, kind: "rehome", home } : undefined;
-    }
-    case "split": {
-      const pieces = lines(raw.pieces);
-      // Two is the smallest decomposition there is; one "piece" is the ticket restated.
-      return pieces && pieces.length >= 2 ? { ...base, kind: "split", pieces } : undefined;
-    }
-    case "kill":
-      return { ...base, kind: "kill" };
-  }
+  return bead && summary && evidence?.length ? { bead, summary, evidence } : undefined;
 }
 
 const str = (value: unknown): string | undefined =>

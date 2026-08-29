@@ -20,7 +20,14 @@ import {
   type BoardIndex,
 } from "../gardener/board-index";
 import { isProposalBead, makeDetection, type GardenerDetection } from "../gardener/detections";
-import { CLAIM_KINDS, type PmClaim, type PmClaimOrder, type PmClaimRehome } from "./report";
+import {
+  CLAIM_KINDS,
+  type PmClaim,
+  type PmClaimKill,
+  type PmClaimOrder,
+  type PmClaimRehome,
+  type PmClaimReprioritize,
+} from "./report";
 
 /** A claim the board refused, with the reason — reported, never silently dropped. */
 export interface RejectedClaim {
@@ -85,6 +92,36 @@ function subjectChecked(
   return { subject };
 }
 
+/**
+ * One bar a claim of kind `C` must clear: the refusal it earns, or undefined to hand the claim on.
+ *
+ * The bars are held as ORDERED LISTS of these rather than as one nested chain because the order is
+ * the behaviour. Several of them describe the same board state from different angles, and a weaker
+ * bar placed ahead of a stronger one would mask the fault the stronger one exists to report — so the
+ * ordering has to be data somebody can read and a test can pin, not a shape nesting happens to have.
+ */
+type Guard<C extends PmClaim> = (
+  claim: C,
+  subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+) => string | undefined;
+
+/** The first bar this claim fails, in list order, or undefined when it clears all of them. */
+function firstRefusal<C extends PmClaim>(
+  guards: readonly Guard<C>[],
+  claim: C,
+  subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+): string | undefined {
+  for (const guard of guards) {
+    const refusal = guard(claim, subject, index, nowMs);
+    if (refusal) return refusal;
+  }
+  return undefined;
+}
+
 /** Why this claim's own move cannot stand, or undefined. */
 function kindRefusal(
   claim: PmClaim,
@@ -94,24 +131,33 @@ function kindRefusal(
 ): string | undefined {
   switch (claim.kind) {
     case "reprioritize":
-      return subject.priority !== undefined && `P${subject.priority}` === claim.priority
-        ? `${claim.bead} is already at ${claim.priority}`
-        : undefined;
+      return priorityUnchanged(claim, subject);
     case "order":
-      return orderRefusal(claim, index);
+      return orderRefusal(claim, subject, index, nowMs);
     case "rehome":
       return rehomeRefusal(claim, subject, index, nowMs);
-    // A deferred bead is still OPEN work, so `subjectChecked` waves it through — but a kill applies as
-    // `defer`, and `planRetire` settles an already-deferred subject without writing anything. Left
-    // unchecked the ask reaches the board, costs a founder a decision, and settles as a no-op. The
-    // gardener's stale detector excludes deferred beads for this exact reason (gardener/retire.ts).
     case "kill":
-      return beads.isDeferred(subject)
-        ? `${claim.bead} is already deferred — killing it again would change nothing`
-        : undefined;
+      return alreadyDeferred(claim, subject);
     default:
       return undefined;
   }
+}
+
+/** A priority "change" to the value the bead already carries is an ask with no content. */
+function priorityUnchanged(claim: PmClaimReprioritize, subject: Bead): string | undefined {
+  return subject.priority !== undefined && `P${subject.priority}` === claim.priority
+    ? `${claim.bead} is already at ${claim.priority}`
+    : undefined;
+}
+
+// A deferred bead is still OPEN work, so `subjectChecked` waves it through — but a kill applies as
+// `defer`, and `planRetire` settles an already-deferred subject without writing anything. Left
+// unchecked the ask reaches the board, costs a founder a decision, and settles as a no-op. The
+// gardener's stale detector excludes deferred beads for this exact reason (gardener/retire.ts).
+function alreadyDeferred(claim: PmClaimKill, subject: Bead): string | undefined {
+  return beads.isDeferred(subject)
+    ? `${claim.bead} is already deferred — killing it again would change nothing`
+    : undefined;
 }
 
 /**
@@ -121,30 +167,96 @@ function kindRefusal(
  * no ask: it sits on the board asking a founder to approve something anton will refuse, until
  * somebody declines it by hand (the anton-wsap failure mode).
  */
-function orderRefusal(claim: PmClaimOrder, index: BoardIndex): string | undefined {
-  const blockerId = claim.blockedBy;
-  if (blockerId === claim.bead) return `${claim.bead} cannot block itself`;
-  const blocker = index.byId.get(blockerId);
-  if (!blocker) return `${blockerId} is not on the board`;
-  // A proposal is open work, so `isOpenWork` waves it through — but it closes when the founder
-  // approves or declines it, and the `blocks` edge outlives it. The subject would sit queue-blocked
-  // behind an ask that no longer exists, with nothing left to land and unblock it.
-  if (isProposalBead(blocker)) {
-    return `${blockerId} is a proposal, not work — the edge would outlive it and leave ${claim.bead} blocked forever`;
-  }
-  if (!isOpenWork(blocker)) return `${blockerId} has already landed, so the edge would constrain nothing`;
-  if (index.hasBlocksEdge(claim.bead, blockerId)) {
-    return `the board already records an ordering between ${claim.bead} and ${blockerId}`;
-  }
-  // bd keeps ONE edge per directed pair and refuses a second type over it rather than replacing it.
-  if (index.recordsDiscovery(claim.bead, blockerId) || index.recordsDiscovery(blockerId, claim.bead)) {
-    return `${claim.bead} and ${blockerId} already carry a discovered-from edge, and bd keeps one edge per pair`;
-  }
-  if (index.isBlockedBy(blockerId, claim.bead)) {
-    return `${blockerId} is already blocked by ${claim.bead} through other beads — the edge would close a cycle`;
-  }
-  return undefined;
+function orderRefusal(
+  claim: PmClaimOrder,
+  subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+): string | undefined {
+  return firstRefusal(ORDER_GUARDS, claim, subject, index, nowMs);
 }
+
+function blocksItself(claim: PmClaimOrder): string | undefined {
+  return claim.blockedBy === claim.bead ? `${claim.bead} cannot block itself` : undefined;
+}
+
+function blockerMissing(claim: PmClaimOrder, _subject: Bead, index: BoardIndex): string | undefined {
+  return index.byId.has(claim.blockedBy) ? undefined : `${claim.blockedBy} is not on the board`;
+}
+
+// A proposal is open work, so `isOpenWork` waves it through — but it closes when the founder
+// approves or declines it, and the `blocks` edge outlives it. The subject would sit queue-blocked
+// behind an ask that no longer exists, with nothing left to land and unblock it.
+function blockerIsProposal(
+  claim: PmClaimOrder,
+  _subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return isProposalBead(blockerIn(index, claim))
+    ? `${claim.blockedBy} is a proposal, not work — the edge would outlive it and leave ${claim.bead} blocked forever`
+    : undefined;
+}
+
+function blockerSettled(claim: PmClaimOrder, _subject: Bead, index: BoardIndex): string | undefined {
+  return isOpenWork(blockerIn(index, claim))
+    ? undefined
+    : `${claim.blockedBy} has already landed, so the edge would constrain nothing`;
+}
+
+function edgeAlreadyRecorded(
+  claim: PmClaimOrder,
+  _subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return index.hasBlocksEdge(claim.bead, claim.blockedBy)
+    ? `the board already records an ordering between ${claim.bead} and ${claim.blockedBy}`
+    : undefined;
+}
+
+// bd keeps ONE edge per directed pair and refuses a second type over it rather than replacing it.
+function pairCarriesDiscovery(
+  claim: PmClaimOrder,
+  _subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return index.recordsDiscovery(claim.bead, claim.blockedBy) ||
+    index.recordsDiscovery(claim.blockedBy, claim.bead)
+    ? `${claim.bead} and ${claim.blockedBy} already carry a discovered-from edge, and bd keeps one edge per pair`
+    : undefined;
+}
+
+function edgeWouldCloseCycle(
+  claim: PmClaimOrder,
+  _subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return index.isBlockedBy(claim.blockedBy, claim.bead)
+    ? `${claim.blockedBy} is already blocked by ${claim.bead} through other beads — the edge would close a cycle`
+    : undefined;
+}
+
+/**
+ * The blocker `blockerMissing` proved is on the board. Every guard after it holds that bead rather
+ * than re-asserting the lookup, which is the whole reason the order is fixed.
+ */
+function blockerIn(index: BoardIndex, claim: PmClaimOrder): Bead {
+  return index.byId.get(claim.blockedBy) as Bead;
+}
+
+/**
+ * The bars an ordering claim clears, in the order they run. Exported so a test can pin that order:
+ * `blockerMissing` is what lets every guard after it read the blocker at all, and the graph checks
+ * sit last so a plain contradiction is never reported as a cycle.
+ */
+export const ORDER_GUARDS: readonly Guard<PmClaimOrder>[] = [
+  blocksItself,
+  blockerMissing,
+  blockerIsProposal,
+  blockerSettled,
+  edgeAlreadyRecorded,
+  pairCarriesDiscovery,
+  edgeWouldCloseCycle,
+];
 
 /**
  * Why this bead cannot be hung under the home the claim names, or undefined — every reason apply
@@ -162,82 +274,184 @@ function rehomeRefusal(
   index: BoardIndex,
   nowMs: number,
 ): string | undefined {
-  const homeId = claim.home;
-  if (homeId === claim.bead) return `${claim.bead} cannot be its own home`;
-  const currentHome = beads.parentOf(subject);
-  if (currentHome === homeId) {
-    return `${claim.bead} already hangs under ${homeId} — the move would write nothing`;
-  }
-  // The same no-op one tier out, and the one the context now invites: bd nesting runs to any depth,
-  // so under `feature → task → subtask` the subtask already ships in the FEATURE's run and its PR,
-  // and its line names that feature as `shipped by`. A claim citing that line proposes the card the
-  // work already rides — which moves nothing between runs and only flattens nesting somebody meant.
-  // A `rehome` is a claim that the work would ship in the WRONG card; here nothing is misfiled.
-  const owner = ticketOwnerOf(index, subject);
-  if (owner?.id === homeId) {
-    return `${claim.bead} already ships under ${homeId} — it hangs inside that run's ticket set today, so the move would flatten nesting somebody meant rather than change what ships it`;
-  }
-  // The subject's half of "a run owns it". `subjectChecked` asks only `isInFlight`, which cannot see
-  // a claim: a run working a ticket writes the assignee and `in_progress` onto it while the run-lease
-  // lives on the CARD above, so the ticket reads as free work there. Moved out of that run's ticket
-  // set, its commit lands in the old card's PR while the bead hangs off the new one, open and unrun.
-  if (isClaimed(subject)) {
-    return `${claim.bead} is held by ${runClaimOf(subject)} — that run is shipping it under its current home, so moving it now would leave the bead and the work it ships in two different places`;
-  }
-  // The rest of that half, and the one no per-bead signal can reach: a grouped run publishes ONE
-  // lease, on the CARD its tickets hang under, and cascades an assignee only to the tickets it has
-  // already reached. So a ticket that run has SELECTED but not yet started carries no lease and no
-  // claim — both bars above read it as free work. Moving it out of that set now takes a bead out of
-  // a set the run already chose, and the run aborts when its claim reaches it.
-  if (owner && (isInFlight(owner, nowMs) || isClaimed(owner))) {
-    return `${claim.bead} rides ${owner.id}'s ticket set and a run owns ${owner.id} — that run has already selected the tickets it will work through, so moving one out from under it now would abort it or strand the work it ships`;
-  }
-  const home = index.byId.get(homeId);
-  if (!home) return `${homeId} is not on the board`;
-  // A proposal is open work, so `isOpenWork` waves it through — but it is a bead ABOUT the board,
-  // not part of its shape, and it closes the moment the founder answers it. Work hung under one
-  // would be left beneath a settled ask nothing will ever run.
-  if (isProposalBead(home)) return `${homeId} is a proposal, not a home`;
-  if (!isOpenWork(home)) {
-    return `${homeId} is already settled — hanging work under it would leave it riding a home nothing will run`;
-  }
-  // Both halves of "a run owns it": a published lease, and the pickup window before one exists. A run
-  // that already selected the tickets it will work through would carry the newcomer along unrun.
-  if (isInFlight(home, nowMs)) {
-    return `${homeId} is mid-run — hanging work under it would race the run that owns it`;
-  }
-  if (isClaimed(home)) {
-    return `${homeId} is held by ${runClaimOf(home)} — that run has already selected the tickets it will work through, so work hung under it now would ride along unrun`;
-  }
-  if (index.isAncestor(claim.bead, homeId)) {
-    return `${homeId} sits under ${claim.bead} — the move would make the subtree its own ancestor`;
-  }
-  const wrongTier = homeWrongTier(subject, home, index, HOME_STANDING.snapshot);
-  if (wrongTier) return wrongTier;
-  // Last, so it never masks a stronger fault: a container epic and a `learning` are both naturally
-  // parentless, and each is refused above for the reason it will still be refused for once somebody
-  // gives it a home — the taxonomy names no home for it at all.
-  //
-  // A `rehome` is a claim about a home that is WRONG; a FIRST home is the gardener's mechanical ask,
-  // and this pass is told to leave it alone. The context's "no run target carries this" section says
-  // so for the work IT covers — but a parentless task/bug is a RUN TARGET and renders as one, so
-  // nothing else here stops a claim that demotes a standalone run (often the most urgent bead on the
-  // board) into somebody else's child ticket, cancelling the run it would have had.
-  if (!currentHome) {
-    return `${claim.bead} hangs under nothing — giving homeless work its first home is the gardener's proposal, not this pass's`;
-  }
-  // The rest of that ask, for work whose home is present but runs nothing: a ticket under a
-  // CONTAINER epic has a parent, so the bar above waves it through, yet no run target carries it —
-  // the loose section renders it under "work no run target carries" and tells the pass not to move
-  // it, because `detectContainerOrphans` proposes this exact move already. Filing it here too gives
-  // one move two fingerprints, so the founder who declined the gardener's ask meets it again under a
-  // pm id. Asked through `isRunTarget` — the same split the context was built on — so a card, whose
-  // owner is legitimately absent because it IS the run, still moves.
-  if (!owner && !beads.isRunTarget(subject, index.all)) {
-    return `no run target carries ${claim.bead} — it hangs under ${currentHome}, which runs nothing, so putting it where a run can reach it is the gardener's proposal, not this pass's`;
-  }
-  return undefined;
+  return firstRefusal(REHOME_GUARDS, claim, subject, index, nowMs);
 }
+
+function homeIsSubject(claim: PmClaimRehome): string | undefined {
+  return claim.home === claim.bead ? `${claim.bead} cannot be its own home` : undefined;
+}
+
+function homeIsCurrentParent(claim: PmClaimRehome, subject: Bead): string | undefined {
+  return beads.parentOf(subject) === claim.home
+    ? `${claim.bead} already hangs under ${claim.home} — the move would write nothing`
+    : undefined;
+}
+
+// The same no-op one tier out, and the one the context now invites: bd nesting runs to any depth,
+// so under `feature → task → subtask` the subtask already ships in the FEATURE's run and its PR,
+// and its line names that feature as `shipped by`. A claim citing that line proposes the card the
+// work already rides — which moves nothing between runs and only flattens nesting somebody meant.
+// A `rehome` is a claim that the work would ship in the WRONG card; here nothing is misfiled.
+function homeAlreadyShipsSubject(
+  claim: PmClaimRehome,
+  subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return ticketOwnerOf(index, subject)?.id === claim.home
+    ? `${claim.bead} already ships under ${claim.home} — it hangs inside that run's ticket set today, so the move would flatten nesting somebody meant rather than change what ships it`
+    : undefined;
+}
+
+// The subject's half of "a run owns it". `subjectChecked` asks only `isInFlight`, which cannot see
+// a claim: a run working a ticket writes the assignee and `in_progress` onto it while the run-lease
+// lives on the CARD above, so the ticket reads as free work there. Moved out of that run's ticket
+// set, its commit lands in the old card's PR while the bead hangs off the new one, open and unrun.
+function subjectHeldByRun(claim: PmClaimRehome, subject: Bead): string | undefined {
+  return isClaimed(subject)
+    ? `${claim.bead} is held by ${runClaimOf(subject)} — that run is shipping it under its current home, so moving it now would leave the bead and the work it ships in two different places`
+    : undefined;
+}
+
+// The rest of that half, and the one no per-bead signal can reach: a grouped run publishes ONE
+// lease, on the CARD its tickets hang under, and cascades an assignee only to the tickets it has
+// already reached. So a ticket that run has SELECTED but not yet started carries no lease and no
+// claim — both bars above read it as free work. Moving it out of that set now takes a bead out of
+// a set the run already chose, and the run aborts when its claim reaches it.
+function subjectRidesOwnedCard(
+  claim: PmClaimRehome,
+  subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+): string | undefined {
+  const owner = ticketOwnerOf(index, subject);
+  return owner && (isInFlight(owner, nowMs) || isClaimed(owner))
+    ? `${claim.bead} rides ${owner.id}'s ticket set and a run owns ${owner.id} — that run has already selected the tickets it will work through, so moving one out from under it now would abort it or strand the work it ships`
+    : undefined;
+}
+
+function homeMissing(claim: PmClaimRehome, _subject: Bead, index: BoardIndex): string | undefined {
+  return index.byId.has(claim.home) ? undefined : `${claim.home} is not on the board`;
+}
+
+// A proposal is open work, so `isOpenWork` waves it through — but it is a bead ABOUT the board,
+// not part of its shape, and it closes the moment the founder answers it. Work hung under one
+// would be left beneath a settled ask nothing will ever run.
+function homeIsProposal(
+  claim: PmClaimRehome,
+  _subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return isProposalBead(homeIn(index, claim)) ? `${claim.home} is a proposal, not a home` : undefined;
+}
+
+function homeSettled(claim: PmClaimRehome, _subject: Bead, index: BoardIndex): string | undefined {
+  return isOpenWork(homeIn(index, claim))
+    ? undefined
+    : `${claim.home} is already settled — hanging work under it would leave it riding a home nothing will run`;
+}
+
+// Both halves of "a run owns it": a published lease, and the pickup window before one exists. A run
+// that already selected the tickets it will work through would carry the newcomer along unrun.
+function homeInFlight(
+  claim: PmClaimRehome,
+  _subject: Bead,
+  index: BoardIndex,
+  nowMs: number,
+): string | undefined {
+  return isInFlight(homeIn(index, claim), nowMs)
+    ? `${claim.home} is mid-run — hanging work under it would race the run that owns it`
+    : undefined;
+}
+
+function homeClaimed(claim: PmClaimRehome, _subject: Bead, index: BoardIndex): string | undefined {
+  const home = homeIn(index, claim);
+  return isClaimed(home)
+    ? `${claim.home} is held by ${runClaimOf(home)} — that run has already selected the tickets it will work through, so work hung under it now would ride along unrun`
+    : undefined;
+}
+
+function homeUnderSubject(
+  claim: PmClaimRehome,
+  _subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return index.isAncestor(claim.bead, claim.home)
+    ? `${claim.home} sits under ${claim.bead} — the move would make the subtree its own ancestor`
+    : undefined;
+}
+
+function homeWrongTierForSubject(
+  claim: PmClaimRehome,
+  subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  return homeWrongTier(subject, homeIn(index, claim), index, HOME_STANDING.snapshot);
+}
+
+// Last, so it never masks a stronger fault: a container epic and a `learning` are both naturally
+// parentless, and each is refused above for the reason it will still be refused for once somebody
+// gives it a home — the taxonomy names no home for it at all.
+//
+// A `rehome` is a claim about a home that is WRONG; a FIRST home is the gardener's mechanical ask,
+// and this pass is told to leave it alone. The context's "no run target carries this" section says
+// so for the work IT covers — but a parentless task/bug is a RUN TARGET and renders as one, so
+// nothing else here stops a claim that demotes a standalone run (often the most urgent bead on the
+// board) into somebody else's child ticket, cancelling the run it would have had.
+function subjectHasNoHome(claim: PmClaimRehome, subject: Bead): string | undefined {
+  return beads.parentOf(subject)
+    ? undefined
+    : `${claim.bead} hangs under nothing — giving homeless work its first home is the gardener's proposal, not this pass's`;
+}
+
+// The rest of that ask, for work whose home is present but runs nothing: a ticket under a
+// CONTAINER epic has a parent, so the bar above waves it through, yet no run target carries it —
+// the loose section renders it under "work no run target carries" and tells the pass not to move
+// it, because `detectContainerOrphans` proposes this exact move already. Filing it here too gives
+// one move two fingerprints, so the founder who declined the gardener's ask meets it again under a
+// pm id. Asked through `isRunTarget` — the same split the context was built on — so a card, whose
+// owner is legitimately absent because it IS the run, still moves.
+function noRunTargetCarriesSubject(
+  claim: PmClaimRehome,
+  subject: Bead,
+  index: BoardIndex,
+): string | undefined {
+  const owner = ticketOwnerOf(index, subject);
+  return !owner && !beads.isRunTarget(subject, index.all)
+    ? `no run target carries ${claim.bead} — it hangs under ${beads.parentOf(subject)}, which runs nothing, so putting it where a run can reach it is the gardener's proposal, not this pass's`
+    : undefined;
+}
+
+/**
+ * The home `homeMissing` proved is on the board — held by every guard after it rather than looked
+ * up again, for the same reason {@link subjectChecked} returns the bead it proved exists.
+ */
+function homeIn(index: BoardIndex, claim: PmClaimRehome): Bead {
+  return index.byId.get(claim.home) as Bead;
+}
+
+/**
+ * The bars a home claim clears, IN THE ORDER THEY RUN — the order is the behaviour, so it is pinned
+ * by a test. Two properties it encodes: the subject's own bars come before the home's, so a claim
+ * anton would refuse whatever home it named says so; and `homeMissing` precedes every guard that
+ * reads the home, which is what lets those hold it rather than re-assert the lookup. The two
+ * "which pass owns this ask" bars sit LAST so they never mask a stronger fault.
+ */
+export const REHOME_GUARDS: readonly Guard<PmClaimRehome>[] = [
+  homeIsSubject,
+  homeIsCurrentParent,
+  homeAlreadyShipsSubject,
+  subjectHeldByRun,
+  subjectRidesOwnedCard,
+  homeMissing,
+  homeIsProposal,
+  homeSettled,
+  homeInFlight,
+  homeClaimed,
+  homeUnderSubject,
+  homeWrongTierForSubject,
+  subjectHasNoHome,
+  noRunTargetCarriesSubject,
+];
 
 /** The detection one accepted claim becomes — the shape both emission and apply already speak. */
 function detectionFor(claim: PmClaim): GardenerDetection {
