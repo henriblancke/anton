@@ -1121,6 +1121,45 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
     });
 
+    // A block comment's continuation lines carry no marker of their own, so judging a hit by its
+    // own text alone reads prose as a call — and deletes a finding that was right.
+    it("does not count a name inside an open block comment as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts":
+          "/*\nneverCalled was removed later.\n*/\nexport const kept = 1;\n",
+        "scripts/notes.py": '"""\nneverCalled ran the old nightly.\n"""\nkept = 1\n',
+        "public/notes.html": "<!--\nneverCalled used to run here.\n-->\n<p>kept</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // ...and the tracking has to end where the block does, or a caller written under a docblock
+    // stops counting and the filter goes blind to exactly the case it was built for.
+    it("counts a call written below a block comment that mentions the symbol", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.ts":
+          "/*\nneverCalled is called below.\n*/\nimport { neverCalled } from './orphan';\nneverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+    });
+
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
       const repo = initRepo({
         "src/lib/types.ts": "export type ScanPass = { id: string };\n",
