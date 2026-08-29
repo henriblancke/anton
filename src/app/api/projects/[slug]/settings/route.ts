@@ -13,6 +13,7 @@ import {
   REVIEW_MIN_SCORE_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
+  pickerPolicySchema,
   proposalAutonomySchema,
   runHealthThresholdsSchema,
   scanSeverityPolicySchema,
@@ -412,6 +413,25 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         return NextResponse.json({ error: `Invalid valueLabels: ${detail}` }, { status: 400 });
       }
       patch.valueLabels = parsed.data;
+    }
+  }
+
+  if ("pickerPolicy" in body) {
+    const raw = (body as Record<string, unknown>).pickerPolicy;
+    // "" / null → clear, which puts the project back to NEVER ARMED: the panel proposes a fresh
+    // calibrated draft and the picker starts nothing until one is accepted. Otherwise validate
+    // strictly and replace WHOLESALE, never merged — dropping a criterion is how a policy is
+    // widened, and a merge would make that edit silently impossible.
+    if (raw == null || raw === "") {
+      patch.pickerPolicy = undefined;
+    } else {
+      const parsed = pickerPolicySchema.safeParse(raw);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        const detail = issue ? `${issue.path.join(".") || "policy"}: ${issue.message}` : "invalid";
+        return NextResponse.json({ error: `Invalid pickerPolicy: ${detail}` }, { status: 400 });
+      }
+      patch.pickerPolicy = parsed.data;
     }
   }
 

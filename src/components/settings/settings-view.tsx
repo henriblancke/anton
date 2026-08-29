@@ -24,6 +24,11 @@ import {
   type AutomationSpec,
 } from "@/components/settings/automation-table";
 import { DeleteProjectDialog } from "@/components/settings/delete-project-dialog";
+import {
+  PolicyDraftSection,
+  type Policy,
+  type PolicyDraft,
+} from "@/components/settings/policy-draft-section";
 import { PruneBeadsSection } from "@/components/settings/prune-beads-section";
 
 /**
@@ -98,6 +103,9 @@ interface EditableSettings {
   };
   /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
   valueLabels?: string[];
+  /** The armed work policy (anton-c7iv). Absent = never armed, which is what makes the panel
+   *  propose a calibrated draft instead of an empty form. */
+  pickerPolicy?: Policy;
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -399,6 +407,10 @@ const SECTIONS = [
     group: "On a schedule",
     dirtyKeys: ["proposalAutonomy"],
   },
+  // Self-contained: the policy panel owns its own accept/save (like the danger zone's prune
+  // command), because "nothing is applied until you accept" reads as a deliberate act, not as one
+  // more field folded into a shared Save bar.
+  { id: "policy", label: "Work policy", group: "On a schedule", dirtyKeys: [] },
   { id: "danger", label: "Danger zone", group: "Irreversible", dirtyKeys: [] },
 ] as const;
 
@@ -559,6 +571,8 @@ export function SettingsView({
   agents,
   bundledIds,
   labelVocabulary,
+  issueTypes,
+  policyDraft,
   earned,
 }: {
   project: Project;
@@ -575,6 +589,14 @@ export function SettingsView({
   bundledIds: string[];
   /** The label namespaces this project's board actually uses — what value nominations pick from. */
   labelVocabulary: LabelNamespace[];
+  /** The issue types this board actually uses — the type vocabulary the work policy is edited against. */
+  issueTypes: string[];
+  /**
+   * The policy calibration proposes at first arm (anton-c7iv), computed on the server off this
+   * project's own approval history. Passed in even when a policy is already stored: the panel picks
+   * which to render, and re-deriving it in the client would need a board read this module can't do.
+   */
+  policyDraft: PolicyDraft;
   /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
@@ -2003,6 +2025,16 @@ export function SettingsView({
               </div>
             ))}
           </section>
+          )}
+
+          {active === "policy" && (
+            <PolicyDraftSection
+              project={project}
+              draft={policyDraft}
+              stored={settings.pickerPolicy}
+              issueTypes={issueTypes}
+              labelVocabulary={labelVocabulary}
+            />
           )}
 
           {/* Danger zone */}

@@ -27,6 +27,7 @@ import {
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
+import type { Policy } from "./policy/types";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -301,6 +302,16 @@ export interface ProjectSettings {
    * nominate more than two tiers. Validated with {@link valueLabelsSchema} at the API boundary.
    */
   valueLabels?: string[];
+  /**
+   * The standing policy narrowing what anton may start on its own (anton-c7iv, R2.1). MACHINE-LOCAL:
+   * it lives here rather than on the board because two machines on one repo may legitimately hold
+   * different policies, and bd's claim protocol — not a shared setting — resolves the race.
+   *
+   * Absent is load-bearing: it means the operator has never armed this project, which is what makes
+   * first arm propose a calibrated draft (`policy/calibrate.ts`) instead of a blank form. Nothing
+   * writes it but an explicit accept. Validated with {@link pickerPolicySchema} at the API boundary.
+   */
+  pickerPolicy?: Policy;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -538,6 +549,43 @@ export const valueLabelsSchema = z
 /** The project's nominations, in band order — empty when it has nominated none (the default). */
 export function resolveValueLabels(settings: ProjectSettings): string[] {
   return settings.valueLabels ?? [];
+}
+
+/**
+ * The standing work policy (anton-c7iv). Strict on every field, because a policy that fails to parse
+ * is a policy that silently admits everything: absent means "never armed", and the picker treats
+ * that as "start nothing", so a malformed store must 400 at the boundary rather than round-trip.
+ *
+ * `values` may not be empty. An empty membership set matches NOTHING (criteria fail closed, R2.5),
+ * so it is never what an operator meant — dropping the namespace is how you stop constraining it.
+ * Bounded like every other operator list.
+ */
+export const pickerPolicySchema = z
+  .object({
+    types: z.array(z.string().trim().min(1).max(40)).min(1).max(16),
+    // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent.
+    maxPriority: z.number().int().min(0).max(4),
+    labels: z
+      .array(
+        z
+          .object({
+            namespace: z.string().trim().min(1).max(60),
+            values: z.array(z.string().trim().min(1).max(120)).min(1).max(32),
+          })
+          .strict(),
+      )
+      .max(16)
+      .refine((cs) => new Set(cs.map((c) => c.namespace)).size === cs.length, {
+        message: "each namespace may be constrained once",
+      }),
+    requireUnblocked: z.boolean(),
+  })
+  .partial()
+  .strict();
+
+/** The armed policy, or undefined when this project has never been armed (the first-arm case). */
+export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefined {
+  return settings.pickerPolicy;
 }
 
 /**

@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
+import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
 import { earnedAutonomyOfKind, emptyTrackRecord } from "@/lib/gardener/autonomy";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import { proposalTrackRecord } from "@/lib/gardener/track-record";
@@ -52,6 +53,12 @@ export default async function ProjectSettingsPage({
     allIssues(project.repoPath, { blockOnPendingWrite: false }).catch(() => []),
   ]);
   const labelVocabulary = boardLabelVocabulary(beads);
+  // What first arm proposes (anton-c7iv): the policy this project's OWN approvals would have
+  // matched, so the panel is never a blank form and never speaks a vocabulary this board doesn't.
+  // Pure over the snapshot already read above — no extra board call — and inert: the draft is only
+  // rendered, never stored, until the operator accepts it.
+  const policyDraft = calibratePolicy(beads);
+  const issueTypes = boardIssueTypes(beads);
 
   // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
   // arming needs, and the one no setting lifts. Derived here rather than in the form because the
@@ -78,6 +85,8 @@ export default async function ProjectSettingsPage({
       agents={agents}
       bundledIds={bundledIds}
       labelVocabulary={labelVocabulary}
+      issueTypes={issueTypes}
+      policyDraft={policyDraft}
       earned={earned}
     />
   );

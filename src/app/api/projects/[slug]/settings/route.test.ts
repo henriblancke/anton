@@ -748,3 +748,81 @@ describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
     expect("proposalAutonomy" in persisted()).toBe(false);
   });
 });
+
+/**
+ * The standing work policy (anton-c7iv). Absent is the load-bearing state — it means the project was
+ * never armed, which is what makes first arm propose a calibrated draft — so the round trip has to
+ * keep "no key" and "no key" distinguishable from an empty policy, and a criterion the operator drops
+ * has to actually leave the store.
+ */
+describe("settings route — work policy (anton-c7iv)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  const policy = {
+    types: ["bug", "chore"],
+    maxPriority: 2,
+    labels: [{ namespace: "severity", values: ["critical", "major"] }],
+    requireUnblocked: true,
+  };
+
+  it("persists no key for a project nobody has armed", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toBeUndefined();
+    expect("pickerPolicy" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists an accepted policy, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pickerPolicy).toEqual(policy);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toEqual(policy);
+  });
+
+  it("replaces rather than merges — widening a policy means dropping a criterion", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    await PATCH(patchReq({ pickerPolicy: { types: ["bug"] } }), ctx("tmp"));
+    expect(persisted().pickerPolicy).toEqual({ types: ["bug"] });
+  });
+
+  it("clears on null — the project is unarmed again, not armed with nothing", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    await PATCH(patchReq({ pickerPolicy: null }), ctx("tmp"));
+    expect("pickerPolicy" in persisted()).toBe(false);
+  });
+
+  it("rejects a malformed policy without disturbing what is stored", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    for (const value of [
+      // An empty membership set fails closed against every bead — never what an operator meant.
+      { types: [] },
+      { labels: [{ namespace: "severity", values: [] }] },
+      // One namespace, one criterion: a second entry could never be reached.
+      {
+        labels: [
+          { namespace: "severity", values: ["major"] },
+          { namespace: "severity", values: ["minor"] },
+        ],
+      },
+      { maxPriority: -1 },
+      { maxPriority: "P2" },
+      { requireUnblocked: "yes" },
+      { unknownCriterion: true },
+      ["bug"],
+    ]) {
+      const res = await PATCH(patchReq({ pickerPolicy: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/pickerPolicy/);
+    }
+    expect(persisted().pickerPolicy).toEqual(policy);
+  });
+});

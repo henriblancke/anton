@@ -55,6 +55,17 @@ const EARNED: Earned = Object.fromEntries(
   GARDENER_DETECTION_KINDS.map((kind) => [kind, { applied: 30, settled: 30, eligible: true }]),
 );
 
+/**
+ * The first-arm proposal the server computes (anton-c7iv). The thin-history fallback is the default
+ * here because it is what a board with no approvals yields, and the panel is its own suite.
+ */
+const FALLBACK_DRAFT: Parameters<typeof SettingsView>[0]["policyDraft"] = {
+  policy: { types: ["bug", "chore"], maxPriority: 2, requireUnblocked: true },
+  basis: "fallback",
+  approvals: 0,
+  rationale: [],
+};
+
 function renderView(
   settings: Parameters<typeof SettingsView>[0]["settings"] = {},
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
@@ -72,6 +83,8 @@ function renderView(
       agents={agents}
       bundledIds={[]}
       labelVocabulary={labelVocabulary}
+      issueTypes={[]}
+      policyDraft={FALLBACK_DRAFT}
       earned={earned}
     />,
   );
