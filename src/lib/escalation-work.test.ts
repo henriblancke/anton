@@ -359,4 +359,13 @@ describe("actOnJob", () => {
 
     expect(await actOnJob("p1", "abandon", "j-1")).toBe("job-already-settled");
   });
+
+  // A job deleted between the refusal and the status read is not live work, so the operator gets
+  // the settled answer rather than an exception out of the explaining branch.
+  it("says a refused cancel hit a job that no longer exists", async () => {
+    cancelJob.mockResolvedValue({ ok: false });
+    getJob.mockResolvedValue(undefined);
+
+    expect(await actOnJob("p1", "abandon", "j-1")).toBe("job-already-settled");
+  });
 });
