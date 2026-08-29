@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { conflictBody, createClaimGuard, ownerOf, type AssigneeStore } from "./claim";
+import { conflictBody, createClaimGuard, ownerOf, stealRefused, type AssigneeStore } from "./claim";
 import type { Bead } from "./bd";
 
 /** The guard's one-shot CAS, bound to a fake board — what most of these tests exercise. */
@@ -264,5 +264,25 @@ describe("conflictBody", () => {
     const body = conflictBody("bd-1", undefined);
     expect(body.owner).toBeUndefined();
     expect(body.error).toContain("bd-1");
+  });
+});
+
+describe("stealRefused", () => {
+  it("carries the caller's message and the owner at 409", async () => {
+    const res = stealRefused("bd-1 is claimed by bob — pass { steal: true }", "bob");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: "bd-1 is claimed by bob — pass { steal: true }",
+      owner: "bob",
+    });
+  });
+
+  it("adds the stage only when a live run is what blocked the take-over", async () => {
+    const res = stealRefused("bd-1 is already implementing", "bob", "implementing");
+    expect(await res.json()).toEqual({
+      error: "bd-1 is already implementing",
+      owner: "bob",
+      stage: "implementing",
+    });
   });
 });
