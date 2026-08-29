@@ -2,12 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { GitPullRequestIcon, TriangleAlertIcon } from "lucide-react";
+import { GitPullRequestIcon } from "lucide-react";
 
 import type { TicketDetail } from "@/lib/types";
 import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { readAppliedSummary } from "@/components/board/proposal-applied";
@@ -228,15 +229,11 @@ function TicketDialogBody({
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
-        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-        </span>
-        <p className="text-sm text-risk-high">{error}</p>
-        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        message={error}
+        onRetry={() => setAttempt((n) => n + 1)}
+        layout="dialog"
+      />
     );
   }
 
