@@ -11,7 +11,9 @@
  *   • `board-context.ts` / `bead-line.ts` — the board as the session must see it, and one bead's
  *     own line within it;
  *   • `report.ts` — the wire format it must answer in, and the parser that reads it back;
- *   • `refusals.ts` — every bar a claim clears before anton files it as a proposal.
+ *   • `refusals.ts` — the bars every claim clears before anton files it as a proposal, with the
+ *     per-kind ones held beside their kind (`order-guards.ts`, `home-guards.ts`) over the shape they
+ *     share (`guard.ts`), and `claim-detection.ts` — what an accepted claim becomes.
  */
 import { loadSkill } from "../claude/prompt";
 import { resolveProductMasterConfig, type ProjectSettings } from "../projects";

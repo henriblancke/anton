@@ -14,7 +14,9 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
-import { detectionsFor, ORDER_GUARDS, REHOME_GUARDS } from "./refusals";
+import { REHOME_GUARDS } from "./home-guards";
+import { ORDER_GUARDS } from "./order-guards";
+import { detectionsFor } from "./refusals";
 import type { PmClaim } from "./report";
 
 function bead(id: string, o: Partial<Bead> = {}): Bead {
