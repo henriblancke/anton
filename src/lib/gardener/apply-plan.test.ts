@@ -593,6 +593,16 @@ describe("planApply — what an approval means against the board as it now is", 
         expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
       });
 
+      // `bd delete` is the third way a member leaves, and the only one that leaves no bead behind to
+      // read the departure from — so it used to refuse the plan before the answered path was reached.
+      it("drops a member deleted since the filing", () => {
+        const decision = decide(THREE, rest);
+        expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
+        expect(decision.status === "apply" ? decision.summary : "").toContain(
+          "(1 member(s) no longer in the cluster)",
+        );
+      });
+
       it("drops a member a run has picked up since the filing", () => {
         for (const live of [leased("anton-a", NOW), inReview("anton-a")]) {
           expect(moved(decide(THREE, [...rest, live], NOW))).toEqual(["anton-b", "anton-c"]);

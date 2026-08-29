@@ -399,7 +399,12 @@ function reparentSubject(
   at: ApplyMoment,
 ): string | ApplyStep | Answered | undefined {
   const subject = index.byId.get(id);
-  if (!subject) return missing(id);
+  // A DELETED member left the cluster as surely as a closed or re-homed one, so for the kind whose
+  // claim is its target it is answered rather than fatal — refusing here would hold the members
+  // nobody touched hostage to a bead that no longer exists, while the proposal's own fingerprint
+  // suppressed the fresh cluster the survivors form. Every other kind names the bead its move is
+  // ABOUT, so a missing subject is still the board changing out from under the ask.
+  if (!subject) return clusterMemberDeleted(plan, id) ?? missing(id);
   const currentParent = beads.parentOf(subject) ?? "";
   if (currentParent === home.id) return undefined; // already where the proposal wants it
   // Asked before every safety bar because they are not ones: they decide whether this bead is still
@@ -1060,6 +1065,16 @@ function clusterMemberGone(plan: GardenerPlan, subject: Bead, at: ApplyMoment): 
     return `${subject.id} is ${settledWord(subject)} — it left the cluster after this proposal was filed`;
   }
   return subjectBusy(subject, at, DOING.reparent);
+}
+
+/**
+ * The same answer as {@link clusterMemberGone} for the member that is not on the board at all —
+ * `bd delete` is the third way one leaves a cluster, and the only one no bead is left to read it
+ * from. Returned already wrapped, because the caller has no subject to hand the other checks.
+ */
+function clusterMemberDeleted(plan: GardenerPlan, id: string): Answered | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  return { answered: `${missing(id)} — it left the cluster after this proposal was filed` };
 }
 
 /**

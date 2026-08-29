@@ -232,6 +232,32 @@ describe("parentless clusters", () => {
     ).toEqual([]);
   });
 
+  /**
+   * A card's keys overlap, so two anchors can reach one pair — "escalation" finds p1/p2 on its own,
+   * and "settle" finds all four and then splits them back into the same two pairs. The subject list
+   * de-dupes ids, but the evidence is a line per group, so a founder would read each pair's case
+   * twice in the same proposal.
+   */
+  it("spells a membership two of the card's keys both reach out once", () => {
+    const detection = only(
+      detect([
+        ...carrying("anton-hub", "Escalation docker settle", {
+          title: "Escalation docker settle smoke",
+        }),
+        bead("anton-p1", { title: "Escalation settle banner" }),
+        bead("anton-p2", { title: "Escalation settle retry" }),
+        bead("anton-p3", { title: "Docker settle cache" }),
+        bead("anton-p4", { title: "Docker settle warmup" }),
+      ]),
+    );
+
+    expect(detection.subjects).toEqual(["anton-p1", "anton-p2", "anton-p3", "anton-p4"]);
+    const evidence = detection.evidence.join("\n");
+    for (const pair of ["anton-p1, anton-p2 all state", "anton-p3, anton-p4 all state"]) {
+      expect(evidence.split(pair)).toHaveLength(2);
+    }
+  });
+
   // A leaf feature is one PR's worth of work. Hanging a cluster off it turns somebody's card into
   // somebody else's epic; a card the board ALREADY files this kind of work under is the real signal.
   it("says nothing when the matching card carries no tickets of its own", () => {
