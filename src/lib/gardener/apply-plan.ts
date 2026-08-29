@@ -32,6 +32,7 @@ import {
   type GardenerPlan,
 } from "./detections";
 import { impliesOrdering } from "./relink";
+import { MIN_CLUSTER_SIZE } from "./reparent";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -304,7 +305,7 @@ function homeRefusal(
   return undefined;
 }
 
-/** A subject no longer part of the claim: something gave it a card after the proposal was filed. */
+/** A subject no longer part of the claim: the board answered it after the proposal was filed. */
 interface Answered {
   answered: string;
 }
@@ -330,10 +331,16 @@ function reparentSteps(
 ): ApplyDecision {
   const steps: ApplyStep[] = [];
   const answered: string[] = [];
+  // Members that already sit under the home. They are written to by nobody, but they ARE the cluster
+  // the proposal asked for, so they count towards {@link clusterTooSmall}'s floor.
+  let inPlace = 0;
   for (const id of plan.subjects) {
     const moved = reparentSubject(plan, id, home, index, at);
     if (typeof moved === "string") return { status: "refuse", reason: moved };
-    if (!moved) continue;
+    if (!moved) {
+      inPlace += 1;
+      continue;
+    }
     if ("answered" in moved) answered.push(moved.answered);
     else steps.push(moved);
   }
@@ -341,7 +348,10 @@ function reparentSteps(
   if (steps.length === 0) {
     return firstAnswer ? { status: "refuse", reason: firstAnswer } : settledInPlace(plan);
   }
-  const skipped = answered.length > 0 ? ` (${answered.length} member(s) already re-homed)` : "";
+  const tooSmall = clusterTooSmall(plan, home, steps, inPlace);
+  if (tooSmall) return { status: "refuse", reason: tooSmall };
+  const skipped =
+    answered.length > 0 ? ` (${answered.length} member(s) no longer in the cluster)` : "";
   return {
     status: "apply",
     steps,
@@ -349,6 +359,33 @@ function reparentSteps(
   };
 }
 
+/**
+ * Why what is LEFT of a cluster is no longer a cluster, or undefined.
+ *
+ * `detectParentlessClusters` needs {@link MIN_CLUSTER_SIZE} loose beads agreeing on a home before it
+ * will call one obvious, because a single loose bead sharing a topic with a card is the weak evidence
+ * this whole detector was rebuilt to stop proposing on (anton-9hpp). Dropping answered members must
+ * not smuggle that below the detector's own bar: a two-member cluster with one member re-homed
+ * elsewhere is one loose bead, and the re-home may well be the newer decision that broke the grouping
+ * in the first place.
+ *
+ * Members already sitting under the home count — the approval's outcome for them is the board's state
+ * already, so a cluster half-applied by hand is still a cluster.
+ *
+ * Asked of `parentless-cluster` alone: it is the only kind whose claim rests on a GROUP, and the only
+ * one whose fingerprint stops guarding the subject list (see detections.ts `detectionSubjectKey`), so
+ * it is also the only kind whose list can be edited down to a singleton after emission.
+ */
+function clusterTooSmall(
+  plan: GardenerPlan,
+  home: Bead,
+  steps: ApplyStep[],
+  inPlace: number,
+): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  if (steps.length + inPlace >= MIN_CLUSTER_SIZE) return undefined;
+  return `${list(steps.map((s) => s.id))} is all that is left of this cluster — it takes ${MIN_CLUSTER_SIZE} beads agreeing on a home before one is obvious, and whatever answered the other members is the newer reading of where this work belongs; decline it, and re-parent by hand if ${home.id} is still the right home`;
+}
 
 /**
  * What one member of a cluster resolves to: a refusal reason, the step that moves it, or undefined
@@ -365,9 +402,9 @@ function reparentSubject(
   if (!subject) return missing(id);
   const currentParent = beads.parentOf(subject) ?? "";
   if (currentParent === home.id) return undefined; // already where the proposal wants it
-  // Asked before every safety bar because it is not one: it decides whether this bead is still part
-  // of the claim at all, and a bead nothing will write to cannot be unsafe to leave alone.
-  const answered = reparentPremiseGone(plan, subject, index);
+  // Asked before every safety bar because they are not ones: they decide whether this bead is still
+  // part of the claim at all, and a bead nothing will write to cannot be unsafe to leave alone.
+  const answered = reparentPremiseGone(plan, subject, index) ?? clusterMemberGone(plan, subject, at);
   if (answered) return { answered };
   const barred = reparentBarred(plan, subject, home, index, at);
   if (barred) return barred;
@@ -1002,6 +1039,27 @@ function reparentPremiseGone(
   const card = index.cards.cardOf(subject);
   if (!card) return undefined;
   return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
+}
+
+/**
+ * Why this member is no longer one of the loose beads the cluster was derived from, or undefined.
+ *
+ * `detectParentlessClusters` builds only from beads that are parentless, still wanted, and held by
+ * nobody (reparent.ts `isClusterCandidate`). A card answers the first of those and
+ * {@link reparentPremiseGone} reads it; this reads the other two — a member closed since the filing,
+ * or picked up by a run since it — which are just as much the board answering that bead, and just as
+ * much a reason to leave it alone rather than to refuse everyone else.
+ *
+ * Asked of `parentless-cluster` alone, because only a GROUP claim survives losing a member. The same
+ * facts about a single-subject re-parent are what {@link reparentBarred} refuses the plan over, which
+ * is the honest answer when the plan is that one bead.
+ */
+function clusterMemberGone(plan: GardenerPlan, subject: Bead, at: ApplyMoment): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  if (!isOpenWork(subject)) {
+    return `${subject.id} is ${settledWord(subject)} — it left the cluster after this proposal was filed`;
+  }
+  return subjectBusy(subject, at, DOING.reparent);
 }
 
 /**
