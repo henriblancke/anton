@@ -12,9 +12,13 @@ import { schema } from "@/lib/db";
 import {
   activeDisarm,
   disarmAutopilot,
+  disarmWithEscalation,
+  lastReArmAt,
   listDisarms,
   reArmAutopilot,
+  settledAfterReArm,
 } from "@/lib/autopilot-disarm";
+import { listOpenEscalations, toEscalationView } from "@/lib/escalations";
 import type { Clock } from "@/lib/jobs/queue";
 
 const PROJECT = "p-brake";
@@ -142,6 +146,83 @@ describe("reArmAutopilot", () => {
     expect(again.created).toBe(true);
     expect((await activeDisarm(test.db, PROJECT))?.reason).toBe("consecutive-failures");
     expect(await listDisarms(test.db, PROJECT)).toHaveLength(2);
+  });
+});
+
+describe("disarmWithEscalation", () => {
+  const input = {
+    projectId: PROJECT,
+    reason: "consecutive-failures" as const,
+    detail: "3 runs in a row ended without delivering.",
+    evidence: ["r-1 · anton-a · failed", "r-2 · anton-b · parked"],
+  };
+
+  it("latches the freeze and puts the same case in the Needs-you strip", async () => {
+    const { disarm, created } = await disarmWithEscalation(test.db, clock, input);
+    expect(created).toBe(true);
+
+    const [escalation] = (await listOpenEscalations(test.db, PROJECT)).map(toEscalationView);
+    expect(escalation?.kind).toBe("autopilot-disarm");
+    expect(escalation?.reason).toBe(input.detail);
+    expect(escalation?.evidence).toEqual(input.evidence);
+    // The header and the strip are two views of one decision, joined by this id.
+    expect(disarm.escalationId).toBe(escalation?.id);
+    expect((await activeDisarm(test.db, PROJECT))?.escalationId).toBe(escalation?.id);
+  });
+
+  it("adds neither a second freeze nor a second strip row while latched", async () => {
+    await disarmWithEscalation(test.db, clock, input);
+    ticks = 60_000;
+
+    const second = await disarmWithEscalation(test.db, clock, {
+      ...input,
+      reason: "score-regression",
+      detail: "scores fell below the floor",
+    });
+
+    expect(second.created).toBe(false);
+    expect(await listDisarms(test.db, PROJECT)).toHaveLength(1);
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(1);
+  });
+
+  it("settles the escalation when the operator re-arms — nothing else ever would", async () => {
+    await disarmWithEscalation(test.db, clock, input);
+    ticks = 3_600_000;
+
+    await reArmAutopilot(test.db, clock, { projectId: PROJECT, actor: "Henri Blancke" });
+
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(0);
+  });
+});
+
+describe("the re-arm floor", () => {
+  it("is undefined until the project has been re-armed", async () => {
+    await scoreRegression();
+    expect(await lastReArmAt(test.db, PROJECT)).toBeUndefined();
+  });
+
+  it("is the most recent re-arm, not the first", async () => {
+    await scoreRegression();
+    await reArmAutopilot(test.db, clock, { projectId: PROJECT, actor: "Henri" });
+    ticks = 3_600_000;
+    await disarmAutopilot(test.db, clock, {
+      projectId: PROJECT,
+      reason: "consecutive-failures",
+      detail: "again",
+    });
+    ticks = 7_200_000;
+    await reArmAutopilot(test.db, clock, { projectId: PROJECT, actor: "Henri" });
+
+    expect(await lastReArmAt(test.db, PROJECT)).toBe(Math.floor((T0 + 7_200_000) / 1000));
+  });
+
+  it("counts only what settled after it — evidence older than a re-arm was already judged", () => {
+    const floor = 1_000;
+    expect(settledAfterReArm({ endedAt: 1_001, updatedAt: 0 }, floor)).toBe(true);
+    expect(settledAfterReArm({ endedAt: 1_000, updatedAt: 9_999 }, floor)).toBe(false);
+    // Still in flight: judged on when it last moved, so it joins the window once it settles.
+    expect(settledAfterReArm({ updatedAt: 999 }, floor)).toBe(false);
+    expect(settledAfterReArm({ updatedAt: 999 }, undefined)).toBe(true);
   });
 });
 

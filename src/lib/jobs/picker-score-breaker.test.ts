@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { activeDisarm, disarmAutopilot } from "../autopilot-disarm";
+import { activeDisarm, disarmAutopilot, reArmAutopilot } from "../autopilot-disarm";
+import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Bead } from "../beads/types";
 import type { Clock } from "./queue";
 import { checkScoreSlide } from "./picker-score-breaker";
@@ -168,6 +169,53 @@ describe("checkScoreSlide", () => {
     expect((await activeDisarm(t.db, PROJECT))?.detail).toBe(
       "2 consecutive runs scored below 9/10 (8, 8)",
     );
+  });
+
+  it("raises one escalation carrying the same series, and stamps it on the disarm", async () => {
+    await project();
+    const board = await threeLowRuns();
+
+    await checkScoreSlide(t.db, clock, { projectId: PROJECT, board });
+
+    const open = (await listOpenEscalations(t.db, PROJECT)).map(toEscalationView);
+    expect(open).toHaveLength(1);
+    expect(open[0]?.kind).toBe("autopilot-disarm");
+    expect(open[0]?.reason).toBe("3 consecutive runs scored below 7/10 (6, 5, 4)");
+    expect(open[0]?.evidence).toEqual([
+      "r1 · anton-a · 6/10",
+      "r2 · anton-b · 5/10",
+      "r3 · anton-c · 4/10",
+    ]);
+    expect((await activeDisarm(t.db, PROJECT))?.escalationId).toBe(open[0]?.id);
+  });
+
+  it("stays armed after a re-arm — those scores are the ones the operator overruled", async () => {
+    await project();
+    const board = await threeLowRuns();
+    expect((await checkScoreSlide(t.db, clock, { projectId: PROJECT, board }))?.latched).toBe(true);
+    await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
+
+    // Nothing new has been reviewed, so the same three low scores are still the whole series.
+    // Re-latching here would revert the human decision within one picker cadence.
+    expect(await checkScoreSlide(t.db, clock, { projectId: PROJECT, board })).toBeUndefined();
+    expect(await activeDisarm(t.db, PROJECT)).toBeUndefined();
+  });
+
+  it("disarms again once NEW runs score below the floor after the re-arm", async () => {
+    await project();
+    const board = await threeLowRuns();
+    await checkScoreSlide(t.db, clock, { projectId: PROJECT, board });
+    await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
+
+    // Three fresh deliveries, all settled after the re-arm, all still under the floor.
+    await run({ id: "r4", epic: "anton-d", atMinutes: 70 });
+    await run({ id: "r5", epic: "anton-e", atMinutes: 85 });
+    await run({ id: "r6", epic: "anton-f", atMinutes: 100 });
+    const next = [...board, target("anton-d", 6), target("anton-e", 5), target("anton-f", 4)];
+
+    const again = await checkScoreSlide(t.db, clock, { projectId: PROJECT, board: next });
+    expect(again?.latched).toBe(true);
+    expect(again?.slide.runs.map((r) => r.id)).toEqual(["r4", "r5", "r6"]);
   });
 
   it("abstains while the project is already disarmed", async () => {

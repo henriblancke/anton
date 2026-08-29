@@ -47,7 +47,11 @@ export interface AutopilotDisarm {
    * Shown in full: a disarm asks for a judgment, and a judgment needs what it was made on.
    */
   evidence: string[];
-  /** The escalation this disarm raised (R4.6) — where `Investigate` lands. */
+  /**
+   * The escalation this disarm raised (R4.6): the same detail and evidence, in the "Needs you"
+   * strip, for the operator who scans that band and never reads a lane header. Settled by the
+   * re-arm, since nothing else ever would.
+   */
   escalationId?: string;
   /** Unix seconds the disarm latched. */
   since?: number;

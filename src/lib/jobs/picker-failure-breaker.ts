@@ -14,6 +14,11 @@
  * Getting those two wrong in opposite directions is the failure mode worth the extra reads: counting
  * a cancel would disarm a project whose operator was simply tidying up, and skipping an abandon
  * would let a run of give-ups look like an idle week.
+ *
+ * And a third fact, off the disarm table: WHEN the operator last re-armed. Runs that settled before
+ * that instant were the case they already read and overruled, so the streak starts again from the
+ * re-arm — otherwise the next pass would re-latch the identical disarm off the identical runs and
+ * quietly revert the human decision.
  */
 import { beads } from "../beads/bd";
 import type { Bead } from "../beads/types";
@@ -25,7 +30,12 @@ import {
   type FailureWeight,
   type RunOutcome,
 } from "../autopilot-failure-streak";
-import { activeDisarm, disarmAutopilot } from "../autopilot-disarm";
+import {
+  activeDisarm,
+  disarmWithEscalation,
+  lastReArmAt,
+  settledAfterReArm,
+} from "../autopilot-disarm";
 import { getProjectSettings, resolveFailureBreaker } from "../projects";
 import { listRecentRunOutcomes, type RunDetail } from "../runs";
 import { cancelledExecuteEpicJobs, type AntonDb, type Clock } from "./queue";
@@ -93,11 +103,12 @@ export async function checkFailureStreak(
   if (!config) return undefined;
   if (await activeDisarm(db, projectId)) return undefined;
 
-  const outcomes = await readRunOutcomes(db, projectId, input.board, config.threshold);
+  const since = await lastReArmAt(db, projectId);
+  const outcomes = await readRunOutcomes(db, projectId, input.board, config.threshold, since);
   const streak = detectFailureStreak(outcomes, { ...config, weigh: input.weigh });
   if (!streak) return undefined;
 
-  const { disarm, created } = await disarmAutopilot(db, clock, {
+  const { disarm, created } = await disarmWithEscalation(db, clock, {
     projectId,
     reason: "consecutive-failures",
     detail: describeFailureStreak(streak),
@@ -106,12 +117,16 @@ export async function checkFailureStreak(
   return { streak, latched: created, disarmId: disarm.id };
 }
 
-/** The project's recent runs as the breaker reads them, newest first. */
+/**
+ * The project's recent runs as the breaker reads them, newest first — nothing from before
+ * `reArmedAt`, which is the evidence the operator already adjudicated.
+ */
 async function readRunOutcomes(
   db: AntonDb,
   projectId: string,
   board: readonly Bead[],
   threshold: number,
+  reArmedAt: number | undefined,
 ): Promise<RunOutcome[]> {
   const window = Math.max(MIN_STREAK_WINDOW, threshold * 3);
   const [runs, cancels] = await Promise.all([
@@ -119,16 +134,20 @@ async function readRunOutcomes(
     cancelledExecuteEpicJobs(db, projectId),
   ]);
   const abandoned = abandonedIds(board);
-  return runs.map((run) => ({
-    id: run.id,
-    epicBeadId: run.epicBeadId,
-    status: run.status,
-    error: run.error,
-    cancelled: wasCancelled(run, cancels.get(run.epicBeadId)),
-    // The ticket counts as well as the target: abandoning a child kills the run executing it, and
-    // that run ended on work somebody gave up on however its own row reads.
-    abandoned:
-      abandoned.has(run.epicBeadId) ||
-      (run.ticketBeadId !== undefined && abandoned.has(run.ticketBeadId)),
-  }));
+  // Filtered after the read, never before it: the floor only ever drops the OLDEST rows, so the
+  // window still holds the newest `window` runs it was sized to hold.
+  return runs
+    .filter((run) => settledAfterReArm(run, reArmedAt))
+    .map((run) => ({
+      id: run.id,
+      epicBeadId: run.epicBeadId,
+      status: run.status,
+      error: run.error,
+      cancelled: wasCancelled(run, cancels.get(run.epicBeadId)),
+      // The ticket counts as well as the target: abandoning a child kills the run executing it, and
+      // that run ended on work somebody gave up on however its own row reads.
+      abandoned:
+        abandoned.has(run.epicBeadId) ||
+        (run.ticketBeadId !== undefined && abandoned.has(run.ticketBeadId)),
+    }));
 }

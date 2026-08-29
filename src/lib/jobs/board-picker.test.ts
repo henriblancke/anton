@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
-import { activeDisarm } from "../autopilot-disarm";
+import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
+import { listOpenEscalations } from "../escalations";
 import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
@@ -47,6 +48,26 @@ function bead(id: string, o: Partial<Bead> = {}): Bead {
 /** Just the pass's hold lines — other modules log to console.info too. */
 function holdLines(spy: MockInstance<typeof console.info>): string[] {
   return spy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes("holding"));
+}
+
+/** Three failed runs, an hour apart and all settled before `NOW` — a streak at the default 3. */
+function threeFailedRuns(t: TestDb): void {
+  for (const [i, id] of ["r1", "r2", "r3"].entries()) {
+    const at = new Date(NOW - (3 - i) * 3_600_000);
+    t.db
+      .insert(schema.runs)
+      .values({
+        id,
+        projectId: "p1",
+        epicBeadId: `anton-${id}`,
+        status: "failed",
+        error: "verify gate failed",
+        startedAt: at,
+        endedAt: at,
+        updatedAt: at,
+      })
+      .run();
+  }
 }
 
 /** A `gh pr view` stand-in for the WIP hold's PR confirmation. */
@@ -155,22 +176,7 @@ describe("makeBoardPickerHandler", () => {
     // The brake and the ranking are different jobs: the pass starts nothing, so the plan stays
     // useful reading while the latch is what the arming step refuses on (R4.4 / R1.5).
     board.current = [bead("t1")];
-    for (const [i, id] of ["r1", "r2", "r3"].entries()) {
-      const at = new Date(NOW - (3 - i) * 3_600_000);
-      t.db
-        .insert(schema.runs)
-        .values({
-          id,
-          projectId: "p1",
-          epicBeadId: `anton-${id}`,
-          status: "failed",
-          error: "verify gate failed",
-          startedAt: at,
-          endedAt: at,
-          updatedAt: at,
-        })
-        .run();
-    }
+    threeFailedRuns(t);
 
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
 
@@ -178,6 +184,29 @@ describe("makeBoardPickerHandler", () => {
     expect(disarm?.reason).toBe("consecutive-failures");
     expect(disarm?.evidence).toHaveLength(3);
     expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    // The freeze is also in the "Needs you" strip, carrying the same case (R4.6).
+    expect(await listOpenEscalations(t.db, "p1")).toHaveLength(1);
+  });
+
+  it("leaves the project armed on the next pass once the operator re-arms it", async () => {
+    // The other half of "a disarmed picker stays disarmed until re-armed": a re-arm has to STICK.
+    // Nothing new has run, so the same three failures are still the most recent evidence — a pass
+    // that re-read them would re-latch within one cadence and silently overrule the operator.
+    board.current = [bead("t1")];
+    threeFailedRuns(t);
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(await reArmAutopilot(t.db, clock, { projectId: "p1", actor: "ops" })).toMatchObject({
+      ok: true,
+    });
+
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeUndefined();
+    // One freeze in the whole history, and no second row in the strip to clear.
+    expect(await listDisarms(t.db, "p1")).toHaveLength(1);
+    expect(await listOpenEscalations(t.db, "p1")).toHaveLength(0);
   });
 
   it("disarms the project when its delivered runs keep scoring below the floor", async () => {

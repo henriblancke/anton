@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { activeDisarm, disarmAutopilot } from "../autopilot-disarm";
+import { activeDisarm, disarmAutopilot, reArmAutopilot } from "../autopilot-disarm";
+import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Bead } from "../beads/types";
 import type { Clock } from "./queue";
 import { checkFailureStreak } from "./picker-failure-breaker";
@@ -193,6 +194,56 @@ describe("checkFailureStreak", () => {
 
     expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
     expect((await activeDisarm(t.db, PROJECT))?.reason).toBe("score-regression");
+  });
+
+  it("raises one escalation carrying the same evidence, and stamps it on the disarm", async () => {
+    await project();
+    await threeFailures();
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+
+    const open = (await listOpenEscalations(t.db, PROJECT)).map(toEscalationView);
+    expect(open).toHaveLength(1);
+    expect(open[0]?.kind).toBe("autopilot-disarm");
+    expect(open[0]?.reason).toContain("3 runs in a row ended without delivering");
+    expect(open[0]?.evidence).toEqual([
+      "r1 · anton-a · failed · boom",
+      "r2 · anton-b · failed · boom",
+      "r3 · anton-c · failed · boom",
+    ]);
+    // The strip row and the lane header are two views of ONE decision, joined by this id.
+    expect((await activeDisarm(t.db, PROJECT))?.escalationId).toBe(open[0]?.id);
+    expect(outcome?.disarmId).toBeDefined();
+  });
+
+  it("stays armed after a re-arm — the runs it read were the ones the operator overruled", async () => {
+    await project();
+    await threeFailures();
+    expect((await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] }))?.latched).toBe(
+      true,
+    );
+    await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
+
+    // The very next pass: nothing new has finished, so the same three runs are still the most
+    // recent ones. Re-latching here would revert the human decision within one picker cadence.
+    expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
+    expect(await activeDisarm(t.db, PROJECT)).toBeUndefined();
+  });
+
+  it("disarms again once NEW runs fail after the re-arm", async () => {
+    await project();
+    await threeFailures();
+    await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
+
+    // Three fresh failures, all settled after the re-arm — the toolchain was not fixed after all.
+    await run({ id: "r4", epic: "anton-d", status: "failed", startedMinutes: 60, error: "boom" });
+    await run({ id: "r5", epic: "anton-e", status: "failed", startedMinutes: 75, error: "boom" });
+    await run({ id: "r6", epic: "anton-f", status: "failed", startedMinutes: 90, error: "boom" });
+
+    const again = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    expect(again?.latched).toBe(true);
+    expect(again?.streak.runs.map((r) => r.id)).toEqual(["r4", "r5", "r6"]);
   });
 
   it("counts a failure double under the caller's weigher", async () => {

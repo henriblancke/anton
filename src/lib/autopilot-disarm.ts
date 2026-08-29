@@ -14,8 +14,9 @@
  * the UI read path goes through the shared anton.db via {@link currentDisarm}.
  */
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { raiseEscalation, settleEscalation } from "./escalations";
 import type { AutopilotDisarm, DisarmReason } from "./autopilot-breaker";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -128,6 +129,46 @@ export async function disarmAutopilot(
   }
 }
 
+/**
+ * Latch the disarm AND put it where the operator actually scans (R4.6).
+ *
+ * The freeze is written FIRST and the escalation second: the latch is the safety property — it is
+ * what stops the next pass starting work — and it must not depend on a second write landing. The
+ * escalation is then stamped onto the row, so the strip and the lane header are two views of one
+ * decision rather than two independent claims.
+ *
+ * Both writes are idempotent on their own keys, so a pass re-deciding the same signal adds neither a
+ * second freeze nor a second strip row. Nothing is raised when the project was ALREADY disarmed:
+ * that disarm carries its own escalation, and a second one would ask the operator to settle a
+ * decision they have already been asked about.
+ */
+export async function disarmWithEscalation(
+  db: AntonDb,
+  clock: Clock,
+  input: DisarmAutopilotInput,
+): Promise<DisarmAutopilotResult> {
+  const result = await disarmAutopilot(db, clock, input);
+  if (!result.created) return result;
+
+  const { escalation } = await raiseEscalation(db, clock, {
+    projectId: input.projectId,
+    finding: {
+      kind: "autopilot-disarm",
+      key: `autopilot-disarm:${input.reason}`,
+      reason: input.detail,
+      since: clock.now(),
+      ageMs: 0,
+      evidence: input.evidence ?? [],
+    },
+  });
+  const stamped = await db
+    .update(schema.autopilotDisarms)
+    .set({ escalationId: escalation.id })
+    .where(eq(schema.autopilotDisarms.id, result.disarm.id))
+    .returning();
+  return { disarm: stamped[0] ?? result.disarm, created: true };
+}
+
 /** Is this project's autopilot disarmed, and by what? db-injectable; read-only. */
 export async function activeDisarm(
   db: AntonDb,
@@ -167,12 +208,55 @@ export async function reArmAutopilot(
     .returning();
   const row = updated[0];
   if (!row) return { ok: false, failure: "not-disarmed" };
+  // The strip row is the disarm's other half (R4.6), so the re-arm settles it too. Left open, the
+  // "Needs you" band would keep asking for a decision the operator has just made — and nothing else
+  // would ever close it: a disarm is raised on the latch, and this project no longer has one.
+  if (row.escalationId) await settleEscalation(db, clock, row.escalationId, "resumed");
   return {
     ok: true,
     reason: row.reason as DisarmReason,
     actor: row.rearmedBy ?? input.actor,
     at: toEpoch(row.rearmedAt) ?? Math.floor(at.getTime() / 1000),
   };
+}
+
+/**
+ * Unix seconds of the project's most recent re-arm, or undefined if it has never been re-armed.
+ *
+ * The floor every breaker judges evidence against. A re-arm is an operator ADJUDICATING the runs
+ * that tripped the latch — "I read those, I fixed it, judge me on what happens next" — so a detector
+ * that could still see them would re-latch the identical disarm on its very next pass and silently
+ * revert the decision. Nothing new has to fail for that: the same settled runs are still the most
+ * recent ones.
+ */
+export async function lastReArmAt(db: AntonDb, projectId: string): Promise<number | undefined> {
+  const rows = await db
+    .select({ rearmedAt: schema.autopilotDisarms.rearmedAt })
+    .from(schema.autopilotDisarms)
+    .where(
+      and(
+        eq(schema.autopilotDisarms.projectId, projectId),
+        isNotNull(schema.autopilotDisarms.rearmedAt),
+      ),
+    )
+    .orderBy(desc(schema.autopilotDisarms.rearmedAt))
+    .limit(1);
+  return toEpoch(rows[0]?.rearmedAt);
+}
+
+/**
+ * Did this run settle after the project was last re-armed? Evidence older than the floor was already
+ * adjudicated (see {@link lastReArmAt}) and counts for nothing.
+ *
+ * A run still in flight is judged on when it last moved, which keeps it out of the window until it
+ * settles — exactly what "judge me on what happens next" means for work that straddles the re-arm.
+ */
+export function settledAfterReArm(
+  run: { endedAt?: number; updatedAt: number },
+  floor: number | undefined,
+): boolean {
+  if (floor === undefined) return true;
+  return (run.endedAt ?? run.updatedAt) > floor;
 }
 
 /**

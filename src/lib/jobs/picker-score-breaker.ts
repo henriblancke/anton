@@ -14,6 +14,11 @@
  * which is what lets this sit on a ten-minute cadence. The per-round comment thread is the richer
  * record, but reading it is one bd spawn per target, and the label carries the number this breaker
  * actually judges.
+ *
+ * The series also STARTS at the last re-arm. Those scores are the case an operator read and
+ * overruled; a window that could still reach back past them would re-latch the identical disarm on
+ * the next pass — off runs that have not changed and cannot change — and revert the human decision
+ * before anything new had been scored at all.
  */
 import { reviewScoreOf } from "../ticket-view";
 import type { Bead } from "../beads/types";
@@ -24,7 +29,12 @@ import {
   type ScoreSlide,
   type ScoredRun,
 } from "../autopilot-score-slide";
-import { activeDisarm, disarmAutopilot } from "../autopilot-disarm";
+import {
+  activeDisarm,
+  disarmWithEscalation,
+  lastReArmAt,
+  settledAfterReArm,
+} from "../autopilot-disarm";
 import { getProjectSettings, resolveScoreBreaker } from "../projects";
 import { listRecentRuns } from "../runs";
 import type { AntonDb, Clock } from "./queue";
@@ -69,11 +79,12 @@ export async function checkScoreSlide(
   if (!config) return undefined;
   if (await activeDisarm(db, projectId)) return undefined;
 
-  const series = await readScoreSeries(db, projectId, input.board, config.window);
+  const since = await lastReArmAt(db, projectId);
+  const series = await readScoreSeries(db, projectId, input.board, config.window, since);
   const slide = detectScoreSlide(series, config);
   if (!slide) return undefined;
 
-  const { disarm, created } = await disarmAutopilot(db, clock, {
+  const { disarm, created } = await disarmWithEscalation(db, clock, {
     projectId,
     reason: "score-regression",
     detail: describeScoreSlide(slide),
@@ -82,14 +93,21 @@ export async function checkScoreSlide(
   return { slide, latched: created, disarmId: disarm.id };
 }
 
-/** The project's finished runs with each one's score attached, newest first. */
+/**
+ * The project's finished runs with each one's score attached, newest first — nothing from before
+ * `reArmedAt`, whose scores the operator already read and overruled.
+ */
 async function readScoreSeries(
   db: AntonDb,
   projectId: string,
   board: readonly Bead[],
   window: number,
+  reArmedAt: number | undefined,
 ): Promise<ScoredRun[]> {
-  const runs = await listRecentRuns(db, projectId, Math.max(MIN_SCORE_WINDOW, window * 3));
+  const read = await listRecentRuns(db, projectId, Math.max(MIN_SCORE_WINDOW, window * 3));
+  // Filtered after the read, never before it: the floor only ever drops the OLDEST rows, so the
+  // window still holds the newest `window` runs it was sized to hold.
+  const runs = read.filter((run) => settledAfterReArm(run, reArmedAt));
   const scores = scoresByTarget(board);
   const seen = new Set<string>();
   return runs.flatMap((run): ScoredRun[] => {
