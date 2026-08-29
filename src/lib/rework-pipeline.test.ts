@@ -169,10 +169,9 @@ describe("resolvePipeline", () => {
 
   it("refuses an unreadable PR rather than picking one of two opposite answers", async () => {
     prStateMock.mockResolvedValue("unknown");
-    await expect(resolvePipeline("/repo", withPr(), "reopen")).rejects.toBeInstanceOf(
-      ReworkUnavailableError,
-    );
-    await expect(resolvePipeline("/repo", withPr(), "reopen")).rejects.toThrow(/gh-42/);
+    const rejected = resolvePipeline("/repo", withPr(), "reopen");
+    await expect(rejected).rejects.toBeInstanceOf(ReworkUnavailableError);
+    await expect(rejected).rejects.toThrow(/gh-42/);
   });
 });
 
