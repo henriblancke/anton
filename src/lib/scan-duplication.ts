@@ -107,11 +107,22 @@ const TYPE_START =
  * load: registering a plugin, installing a polyfill. That runs, so the line computes rather than
  * declares, and a window of them is duplicated setup triage can act on.
  *
+ * Go spells the same intent `import _ "net/http/pprof"`: the blank name exists precisely to run the
+ * package's `init()` and bind nothing. A named alias (`import fmt2 "fmt"`) binds and stays a
+ * declaration.
+ *
  * The trailing comment is part of the idiom — `import "./register"; // install hooks` is how the
  * side effect gets named at all, and rejecting it would file the window with the specifier lists.
  * It is matched after the quoted specifier, so a `//` inside a URL import stays inside the string.
  */
-const SIDE_EFFECT_IMPORT = /^import\s+["'][^"']+["']\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
+const SIDE_EFFECT_IMPORT = /^import\s+(?:_\s+)?["'][^"']+["']\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
+
+/**
+ * One blank specifier inside Go's grouped `import (` list — `_ "github.com/lib/pq"`. Same side
+ * effect as the single-line form, so it must not inherit the enclosing list's `import` class: a
+ * window of driver registrations is executable setup, not a specifier list.
+ */
+const BLANK_IMPORT_SPEC = /^_\s+["'][^"']+["']\s*(?:\/\/.*|\/\*.*)?$/;
 
 /** `function foo(` / `export async function foo(` — a declaration header, not a call. */
 const FUNCTION_START = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
@@ -479,7 +490,7 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         }
         continue;
       }
-      classes.push(statement);
+      classes.push(statement === "import" && BLANK_IMPORT_SPEC.test(line) ? "code" : statement);
       depth += braceDelta(line);
       if (!continues(statement, line, depth, next)) {
         statement = undefined;
@@ -646,9 +657,11 @@ async function readWindow(index: Index, loc: Location, lines: number): Promise<W
   if (file.status === "budget" || file.status === "unreadable") return { status: "unreadable" };
   if (file.status === "missing") return { status: "gone" };
   const start = loc.line - 1;
-  // A window that starts past the end of the file is a location the tree no longer has: the file
-  // was rewritten under the baseline and the block stringer measured is not there to check.
-  if (start < 0 || start >= file.lines.length) return { status: "gone" };
+  // The tree must still hold the WHOLE window for the location to have a vote. One that starts past
+  // the end is plainly gone; one that runs off the end is a remnant of a file rewritten shorter, and
+  // letting the surviving lines vote would let two truncated comment tails outvote a location that
+  // still holds the real clone.
+  if (start < 0 || start + lines > file.lines.length) return { status: "gone" };
   return { status: "block", classes: file.lines.slice(start, start + lines) };
 }
 

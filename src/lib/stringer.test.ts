@@ -1601,6 +1601,83 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // Go spells the side-effect import `_ "pkg"` — the blank name exists to run the package's
+    // `init()` and bind nothing. Both spellings of it register drivers on load, so a repeated window
+    // of them is duplicated setup; only the list that actually binds names is a declaration.
+    it("keeps Go blank imports, single-line and grouped, and still drops a bound import list", async () => {
+      const repo = writeRepo({
+        "src/blank.go": [
+          "package main",
+          'import _ "github.com/lib/pq"',
+          'import _ "net/http/pprof"',
+          'import _ "gocloud.dev/blob/s3blob"',
+          "",
+        ].join("\n"),
+        "src/grouped.go": [
+          "import (",
+          '\t_ "github.com/lib/pq"',
+          '\t_ "net/http/pprof"',
+          '\t_ "gocloud.dev/blob/s3blob"',
+          ")",
+          "",
+        ].join("\n"),
+        "src/bound.go": [
+          "import (",
+          '\t"fmt"',
+          '\t"net/http"',
+          '\t"os"',
+          ")",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/blank.go", 2]], 3),
+        clone([["src/grouped.go", 2]], 3),
+        clone([["src/bound.go", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/blank.go", "src/grouped.go"]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/bound.go" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // A file rewritten SHORTER leaves a remnant where the block used to start. Reading the few lines
+    // that survive would let two truncated comment tails outvote the one location that still holds
+    // the clone — so a window the tree cannot serve in full does not vote at all.
+    it("ignores a window that runs off the end of a file rather than voting on the remnant", async () => {
+      const repo = writeRepo({
+        "src/live.ts": [
+          "export function arrange(sandbox: string) {",
+          "  const repo = join(sandbox, 'repo');",
+          "  mkdirSync(repo);",
+          "  execFileSync('git', ['init', '-q', repo]);",
+          "  writeFileSync(join(repo, 'README.md'), '# sandbox');",
+          "  return repo;",
+          "}",
+          "",
+        ].join("\n"),
+        "src/remnant-a.ts": ["// what is left of the block", "// after the rewrite", ""].join("\n"),
+        "src/remnant-b.ts": ["// what is left of the block", "// after the rewrite", ""].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone(
+          [
+            ["src/live.ts", 1],
+            ["src/remnant-a.ts", 1],
+            ["src/remnant-b.ts", 1],
+          ],
+          6,
+        ),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/live.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // `const x = (` opens a parameter list or a parenthesized expression, and only the closing line
     // says which: a `=>` cannot be pushed past it. Without that check a window of calls reads as a
     // props list and a real duplicate of runtime work is thrown away unread.
