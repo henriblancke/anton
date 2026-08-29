@@ -31,6 +31,7 @@ import {
   POLICY_PRIORITY_MAX,
   POLICY_TEXT_MAX,
   POLICY_TYPES_MAX,
+  isStorableText,
   namespaceOf,
   valueOf,
   type Policy,
@@ -75,15 +76,6 @@ const SCHEMA_LIMITS = {
   labelCriteria: POLICY_LABEL_CRITERIA_MAX,
   text: POLICY_TEXT_MAX,
 } as const;
-
-/**
- * Whether the store would keep this string as written. Lengths are measured TRIMMED because the
- * schema trims before it bounds, so that is the string the API actually judges.
- */
-function storable(text: string, max: number): boolean {
-  const trimmed = text.trim();
-  return trimmed.length >= 1 && trimmed.length <= max;
-}
 
 export type { PolicyCriterionKey };
 
@@ -157,7 +149,7 @@ export function calibratePolicy(board: readonly Bead[]): PolicyDraft {
     const types = [...new Set(approvedTypes)].sort();
     // A type the store would not keep cannot be dropped from the membership set without excluding
     // the approval that carried it, so the criterion goes instead (see SCHEMA_LIMITS).
-    const storableTypes = types.every((t) => storable(t, SCHEMA_LIMITS.text.type));
+    const storableTypes = types.every((t) => isStorableText(t, SCHEMA_LIMITS.text.type));
     if (types.length <= SCHEMA_LIMITS.types && storableTypes) {
       policy.types = types;
       rationale.push({
@@ -241,7 +233,7 @@ function labelCriteria(approvals: readonly Bead[], board: readonly Bead[]): Poli
 
   const criteria: PolicyLabelCriterion[] = [];
   for (const namespace of [...namespaces].sort()) {
-    if (!storable(namespace, SCHEMA_LIMITS.text.namespace)) continue;
+    if (!isStorableText(namespace, SCHEMA_LIMITS.text.namespace)) continue;
     if (!approvals.every((b) => hasNamespace(b, namespace))) continue;
     const approved = valuesUnder(approvals, namespace);
     const onBoard = valuesUnder(board, namespace);
@@ -252,7 +244,7 @@ function labelCriteria(approvals: readonly Bead[], board: readonly Bead[]): Poli
     // Same for a value the store would not keep: dropping it would narrow the criterion past an
     // approval it was read from, so the whole namespace is omitted rather than stated short.
     const values = [...approved].sort();
-    if (!values.every((v) => storable(v, SCHEMA_LIMITS.text.value))) continue;
+    if (!values.every((v) => isStorableText(v, SCHEMA_LIMITS.text.value))) continue;
     criteria.push({ namespace, values });
   }
 

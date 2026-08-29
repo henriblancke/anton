@@ -28,10 +28,13 @@ import {
   POLICY_CONTROL_NAMESPACES,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
+  POLICY_TEXT_MAX,
   POLICY_TYPES_MAX,
+  isStorableText,
   namespaceOf,
   valueOf,
   type Policy,
+  type PolicyCriterionKey,
   type PolicyLabelCriterion,
   type PolicyRankComparison,
 } from "@/lib/policy/types";
@@ -47,7 +50,7 @@ export type { Policy, PolicyLabelCriterion, PolicyCandidate };
 
 /** One criterion's evidence, mirrored from the server's PolicyRationale. */
 export interface PolicyRationale {
-  criterion: string;
+  criterion: PolicyCriterionKey;
   summary: string;
   citedBeadIds: string[];
 }
@@ -170,18 +173,42 @@ export function PolicyDraftSection({
     useSensor(KeyboardSensor),
   );
 
-  // Rationale is evidence for the PROPOSAL. Once a policy is the operator's own, quoting the
-  // approvals anton once read would be explaining a decision nobody asked it to make.
-  const why = (criterion: string): PolicyRationale | undefined =>
-    armed ? undefined : draft.rationale.find((r) => r.criterion === criterion);
+  /**
+   * Rationale is evidence for the PROPOSAL, so it holds for exactly as long as the criterion beside
+   * it is still the one anton proposed.
+   *
+   * Two ways it stops holding, and both leave the sentence attributing an operator's policy to
+   * anton's reading. Once a policy is the operator's own, quoting the approvals anton once read
+   * would be explaining a decision nobody asked it to make. And a proposed criterion the operator
+   * EDITED is no longer the criterion the approvals were read off — deselecting a type or a label
+   * value narrows the policy past the very approvals the summary claims it covers, and Save persists
+   * that edit. So the evidence goes with the edit it no longer describes.
+   */
+  const why = (criterion: PolicyCriterionKey): PolicyRationale | undefined => {
+    if (armed) return undefined;
+    const rationale = draft.rationale.find((r) => r.criterion === criterion);
+    if (!rationale) return undefined;
+    return sameCriterion(policy, draft.policy, criterion) ? rationale : undefined;
+  };
+
+  // Whether ANY criterion has moved off the proposal — what the banner's claim about admitting every
+  // prior approval depends on, and a claim the edited policy no longer makes.
+  const editedFromDraft = useMemo(
+    () => !armed && fingerprint(normalize(policy)) !== fingerprint(normalize(draft.policy)),
+    [armed, policy, draft.policy],
+  );
 
   const types = policy.types ?? [];
   // A board can expose more issue types than the store will hold, and a 17th chip previews a policy
   // the accept can only come back from as a 400 — the same ceiling the namespace controls keep.
   const typesAtCeiling = types.length >= POLICY_TYPES_MAX;
+  // A board can also expose an issue type LONGER than the store will hold. Same failure, different
+  // ceiling: previewing it as a selected chip spends the operator's accept on a 400 the panel cannot
+  // explain, so it is refused here and announced dead below.
+  const typeStorable = (type: string) => isStorableText(type, POLICY_TEXT_MAX.type);
   const toggleType = (type: string) => {
     const on = types.includes(type);
-    if (!on && typesAtCeiling) return;
+    if (!on && (typesAtCeiling || !typeStorable(type))) return;
     setPolicy((p) => {
       const next = on ? types.filter((t) => t !== type) : [...types, type].sort();
       // Empty means "not asserted", never "match nothing" — an operator clearing every chip is
@@ -208,6 +235,9 @@ export function PolicyDraftSection({
    */
   const criteriaAtCeiling = (policy.labels ?? []).length >= POLICY_LABEL_CRITERIA_MAX;
 
+  const namespaceStorable = (namespace: string) =>
+    isStorableText(namespace, POLICY_TEXT_MAX.namespace);
+
   const toggleValue = (namespace: string, value: string) => {
     const current = criterionFor(namespace);
     const on = current?.values.includes(value) ?? false;
@@ -219,6 +249,10 @@ export function PolicyDraftSection({
     // operator selects the ones that matter — but the chip past the ceiling is refused here rather
     // than previewed as a valid policy the accept can only come back from as a 400.
     if (!on && (current?.values.length ?? 0) >= POLICY_CRITERION_VALUES_MAX) return;
+    // The same refusal one ceiling over: a board is free to write a namespace or a value longer than
+    // the store will keep, and adding one previews a policy only the accept can discover is a 400.
+    if (!on && !namespaceStorable(namespace)) return;
+    if (!on && !isStorableText(value, POLICY_TEXT_MAX.value)) return;
     const values = on
       ? (current?.values ?? []).filter((v) => v !== value)
       : // A ranked namespace appends: sorting it would silently discard the order the operator
@@ -410,15 +444,22 @@ export function PolicyDraftSection({
           className="max-w-2xl rounded-[10px] border border-dashed border-primary/50 bg-primary/5 px-3 py-2.5 text-[11.5px] leading-relaxed text-foreground"
           role="note"
         >
+          {/* The claim is about the PROPOSAL. An edited policy admits a different set, so once any
+              criterion moves the banner stops crediting anton's reading for the operator's policy —
+              the same reason the per-criterion evidence below goes with the criterion it explained. */}
           <p className="font-medium">
-            {draft.basis === "history"
-              ? `Proposed from this project's own history — the policy that would have admitted all ${draft.approvals} of its approvals.`
-              : "Proposed from anton's conservative default."}
+            {editedFromDraft
+              ? "Edited — this is your policy, no longer the one anton proposed."
+              : draft.basis === "history"
+                ? `Proposed from this project's own history — the policy that would have admitted all ${draft.approvals} of its approvals.`
+                : "Proposed from anton's conservative default."}
           </p>
           <p className="mt-1 text-subtle">
-            {draft.basis === "history"
-              ? "Written in this board's own words, because it was read off this board. Edit anything below."
-              : `Only ${draft.approvals} prior approval${draft.approvals === 1 ? "" : "s"} here — too few to read a pattern from, so anton proposes bd-native fields only.`}{" "}
+            {editedFromDraft
+              ? "It may admit or refuse work the proposal did not, so the approvals behind a criterion are shown only where that criterion is still the one anton proposed."
+              : draft.basis === "history"
+                ? "Written in this board's own words, because it was read off this board. Edit anything below."
+                : `Only ${draft.approvals} prior approval${draft.approvals === 1 ? "" : "s"} here — too few to read a pattern from, so anton proposes bd-native fields only.`}{" "}
             Nothing is armed until you accept it.
           </p>
         </div>
@@ -438,7 +479,9 @@ export function PolicyDraftSection({
                   key={type}
                   name={type}
                   on={types.includes(type)}
-                  disabled={typesAtCeiling && !types.includes(type)}
+                  disabled={
+                    !types.includes(type) && (typesAtCeiling || !typeStorable(type))
+                  }
                   onClick={() => toggleType(type)}
                 >
                   {type}
@@ -454,6 +497,13 @@ export function PolicyDraftSection({
               <p className="text-[11px] text-subtle">
                 A policy admits at most {POLICY_TYPES_MAX} issue types — the store accepts no more.
                 Remove one to admit another.
+              </p>
+            )}
+            {typeVocabulary.some((t) => !typeStorable(t)) && (
+              <p className="text-[11px] text-subtle">
+                A stored issue type is at most {POLICY_TEXT_MAX.type} characters, so the longer ones
+                this board uses cannot be admitted — they are shown dead rather than hidden, so it is
+                clear why no criterion can name them.
               </p>
             )}
           </Criterion>
@@ -545,7 +595,15 @@ export function PolicyDraftSection({
               key={group.namespace}
               group={group}
               criterion={criterionFor(group.namespace)}
-              locked={criteriaAtCeiling && !criterionFor(group.namespace)}
+              locked={
+                criterionFor(group.namespace)
+                  ? undefined
+                  : !namespaceStorable(group.namespace)
+                    ? "unstorable"
+                    : criteriaAtCeiling
+                      ? "ceiling"
+                      : undefined
+              }
               scaleLike={scaleLike.has(group.namespace)}
               why={why(`labels:${group.namespace}`)}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
@@ -606,6 +664,54 @@ export function PolicyDraftSection({
         </span>
       </div>
     </section>
+  );
+}
+
+/**
+ * The comparable value of ONE criterion — the slice of the policy the control beside it edits, so
+ * "has this criterion moved off the proposal?" is asked of the criterion rather than of the policy.
+ * Tuples rather than object slices: a rebuilt criterion carries the same facts in whatever key order
+ * the editor happened to construct it in, and evidence must not vanish over that.
+ */
+function criterionSlice(policy: Policy, criterion: PolicyCriterionKey): unknown {
+  switch (criterion) {
+    case "types":
+      return policy.types ?? [];
+    case "priority":
+      return [policy.maxPriority, policy.minPriority];
+    case "parentage":
+      return [policy.maxParentDepth, policy.minParentDepth];
+    case "age":
+      return [policy.minAgeDays, policy.maxAgeDays];
+    case "blockers":
+      return policy.requireUnblocked ?? false;
+    default: {
+      const namespace = criterion.slice("labels:".length);
+      const c = (policy.labels ?? []).find((l) => l.namespace === namespace);
+      // The ranking IS part of what a criterion asserts once a bound is set, so the order is
+      // compared, not just the membership.
+      return c && [c.namespace, c.values, c.ranked ?? false, c.compare?.op, c.compare?.value];
+    }
+  }
+}
+
+/** Whether one criterion still says exactly what the other policy says it does. */
+function sameCriterion(a: Policy, b: Policy, criterion: PolicyCriterionKey): boolean {
+  return fingerprint(criterionSlice(a, criterion)) === fingerprint(criterionSlice(b, criterion));
+}
+
+/**
+ * A value as a stable string. Key order is normalized because the editor rebuilds criteria rather
+ * than mutating them, and an equality that depended on construction order would report an edit
+ * where the operator made none.
+ */
+function fingerprint(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(
+          Object.entries(v as Record<string, unknown>).sort(([x], [y]) => x.localeCompare(y)),
+        )
+      : v,
   );
 }
 
@@ -755,10 +861,12 @@ function NamespaceCriterion({
   group: LabelNamespace;
   criterion?: PolicyLabelCriterion;
   /**
-   * The policy already names as many namespaces as the store holds, and this one is not among them —
-   * so it is shown (hiding it would hide why the board's other namespaces went quiet) and refused.
+   * This namespace cannot be constrained, and why — `ceiling` when the policy already names as many
+   * namespaces as the store holds, `unstorable` when the board writes a namespace longer than the
+   * store will keep. Either way it is SHOWN and refused: hiding it would hide why one of the board's
+   * own namespaces is missing from an editor that promises to generate its criteria from the board.
    */
-  locked: boolean;
+  locked?: "ceiling" | "unstorable";
   /** Discovery read these values as a scale — a hint beside the control, never a gate on it. */
   scaleLike: boolean;
   why?: PolicyRationale;
@@ -776,6 +884,7 @@ function NamespaceCriterion({
   const values = [...onBoard, ...selected.filter((v) => !onBoard.includes(v))];
   const ranked = criterion?.ranked ?? false;
   const atCeiling = selected.length >= POLICY_CRITERION_VALUES_MAX;
+  const valueStorable = (value: string) => isStorableText(value, POLICY_TEXT_MAX.value);
 
   return (
     <Criterion
@@ -789,7 +898,9 @@ function NamespaceCriterion({
             key={value}
             name={`${group.namespace}:${value}`}
             on={selected.includes(value)}
-            disabled={(atCeiling || locked) && !selected.includes(value)}
+            disabled={
+              !selected.includes(value) && (atCeiling || !!locked || !valueStorable(value))
+            }
             onClick={() => onToggleValue(value)}
           >
             {value}
@@ -801,10 +912,17 @@ function NamespaceCriterion({
         <p className="text-[11px] text-subtle">Not constrained — any value, or none, matches.</p>
       )}
 
-      {locked && (
+      {locked === "ceiling" && (
         <p className="text-[11px] text-subtle">
           A policy constrains at most {POLICY_LABEL_CRITERIA_MAX} namespaces — the store accepts no
           more. Clear another namespace to constrain this one.
+        </p>
+      )}
+
+      {locked === "unstorable" && (
+        <p className="text-[11px] text-subtle">
+          A stored namespace is at most {POLICY_TEXT_MAX.namespace} characters, and this board writes
+          a longer one — so no criterion can name it.
         </p>
       )}
 
@@ -812,6 +930,13 @@ function NamespaceCriterion({
         <p className="text-[11px] text-subtle">
           A criterion admits at most {POLICY_CRITERION_VALUES_MAX} values — the store accepts no
           more. Remove one to admit another.
+        </p>
+      )}
+
+      {!locked && values.some((v) => !valueStorable(v)) && (
+        <p className="text-[11px] text-subtle">
+          A stored value is at most {POLICY_TEXT_MAX.value} characters, so the longer ones under this
+          namespace cannot be admitted.
         </p>
       )}
 

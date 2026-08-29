@@ -25,6 +25,7 @@ import {
   POLICY_BOUND_MAX,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
+  POLICY_TEXT_MAX,
   POLICY_TYPES_MAX,
 } from "@/lib/policy/types";
 import type { Project } from "@/lib/types";
@@ -1126,5 +1127,145 @@ describe("anton's bookkeeping namespaces are not authorable criteria", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(sentPolicy(fetchMock).labels).toBeUndefined();
+  });
+});
+
+/**
+ * The other half of "offer only what the store will keep". The count ceilings above are one way a
+ * board can out-run the schema; its own STRING LENGTHS are the other. A board is free to write an
+ * issue type, a namespace or a value longer than `pickerPolicySchema` bounds, and an editor that
+ * previews one lets the operator build a whole policy out of offered controls and then discover, on
+ * accept, a 400 no control on the panel can undo.
+ */
+describe("vocabulary the store would reject is never offered", () => {
+  const LONG_TYPE = "t".repeat(POLICY_TEXT_MAX.type + 1);
+  const LONG_NAMESPACE = "n".repeat(POLICY_TEXT_MAX.namespace + 1);
+  const LONG_VALUE = "v".repeat(POLICY_TEXT_MAX.value + 1);
+
+  it("refuses an issue type longer than the store will keep", async () => {
+    const fetchMock = stubFetch();
+    renderPanel({ stored: { types: ["bug"] }, issueTypes: ["bug", LONG_TYPE] });
+    const chip = screen.getByRole("switch", { name: LONG_TYPE }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    fireEvent.click(chip);
+    expect(checked(LONG_TYPE)).toBe("false");
+    expect(
+      screen.getByText(new RegExp(`at most ${POLICY_TEXT_MAX.type} characters`)),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).types).toEqual(["bug"]);
+  });
+
+  it("refuses a value longer than the store will keep, leaving the rest of its namespace live", () => {
+    renderPanel({
+      labelVocabulary: [
+        {
+          namespace: "severity",
+          labels: [
+            { label: "severity:critical", count: 4 },
+            { label: `severity:${LONG_VALUE}`, count: 1 },
+          ],
+        },
+      ],
+    });
+    const chip = screen.getByRole("switch", { name: `severity:${LONG_VALUE}` }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    fireEvent.click(chip);
+    expect(checked(`severity:${LONG_VALUE}`)).toBe("false");
+    // The ceiling is per-value: the namespace stays authorable out of the words that fit.
+    expect(
+      (screen.getByRole("switch", { name: "severity:critical" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(
+      screen.getByText(new RegExp(`at most ${POLICY_TEXT_MAX.value} characters`)),
+    ).toBeTruthy();
+  });
+
+  it("refuses a namespace longer than the store will keep, and says why rather than hiding it", () => {
+    renderPanel({
+      draft: { ...FITTED, policy: {}, rationale: [] },
+      labelVocabulary: [
+        { namespace: LONG_NAMESPACE, labels: [{ label: `${LONG_NAMESPACE}:v`, count: 2 }] },
+      ],
+    });
+    // Shown, because a board namespace missing from an editor generated FROM the board reads as a
+    // bug rather than as a limit.
+    expect(screen.getByRole("group", { name: `${LONG_NAMESPACE}:` })).toBeTruthy();
+    const chip = screen.getByRole("switch", { name: `${LONG_NAMESPACE}:v` }) as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    fireEvent.click(chip);
+    expect(checked(`${LONG_NAMESPACE}:v`)).toBe("false");
+    expect(
+      screen.getByText(new RegExp(`at most ${POLICY_TEXT_MAX.namespace} characters`)),
+    ).toBeTruthy();
+  });
+
+  it("leaves a board whose words all fit entirely authorable", () => {
+    renderPanel();
+    expect(screen.queryByText(/characters/)).toBeNull();
+  });
+});
+
+/**
+ * Evidence belongs to the criterion it was read off. The draft's rationale explains what anton
+ * PROPOSED — so the moment an operator edits a criterion, the sentence beside it is describing a
+ * policy that is no longer on screen, and (since Save persists the edit) crediting anton's reading
+ * for the operator's decision. Deselecting a type or a label value can make the policy refuse the
+ * very approvals the summary claims it covers.
+ */
+describe("draft evidence goes with the criterion it explained", () => {
+  /** The rationale summary for a criterion, as it is matched on screen. */
+  const evidence = (criterion: string) => {
+    const summary = FITTED.rationale.find((r) => r.criterion === criterion)!.summary;
+    return new RegExp(summary.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  };
+
+  it("drops the evidence for an edited criterion and keeps it for the untouched ones", () => {
+    renderPanel();
+    expect(screen.getByText(evidence("types"))).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("switch", { name: "chore" }));
+
+    expect(screen.queryByText(evidence("types"))).toBeNull();
+    // The criteria the operator left alone are still anton's proposal, so their evidence stands.
+    expect(screen.getByText(evidence("priority"))).toBeTruthy();
+    expect(screen.getByText(evidence("labels:severity"))).toBeTruthy();
+  });
+
+  it("drops the evidence for a narrowed namespace criterion", () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole("switch", { name: "severity:major" }));
+
+    expect(screen.queryByText(evidence("labels:severity"))).toBeNull();
+    expect(screen.getByText(evidence("types"))).toBeTruthy();
+  });
+
+  it("restores the evidence when the criterion is put back as proposed", () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole("switch", { name: "chore" }));
+    expect(screen.queryByText(evidence("types"))).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "chore" }));
+    expect(screen.getByText(evidence("types"))).toBeTruthy();
+  });
+
+  it("stops claiming the policy admits every prior approval once it is edited", () => {
+    renderPanel();
+    expect(screen.getByRole("note").textContent).toContain("all 8 of its approvals");
+
+    fireEvent.change(screen.getByLabelText("Minimum priority"), { target: { value: "1" } });
+
+    const note = screen.getByRole("note").textContent ?? "";
+    expect(note).not.toContain("all 8 of its approvals");
+    expect(note).toContain("no longer the one anton proposed");
+    // Still inert: an edited proposal arms nothing either.
+    expect(note).toContain("Nothing is armed until you accept it.");
+  });
+
+  it("quotes no evidence at all once the policy is the operator's own", () => {
+    renderPanel({ stored: FITTED.policy });
+    expect(screen.queryByText(evidence("types"))).toBeNull();
+    expect(screen.queryByRole("note")).toBeNull();
   });
 });

@@ -185,6 +185,17 @@ export const POLICY_TEXT_MAX = {
 } as const;
 
 /**
+ * Whether the store would keep this string as written — the one place the length question is
+ * answered, so the calibrated draft and the editor's chips agree on which of a board's own words are
+ * authorable. Lengths are measured TRIMMED because the schema trims before it bounds, so that is the
+ * string the API actually judges.
+ */
+export function isStorableText(text: string, max: number): boolean {
+  const trimmed = text.trim();
+  return trimmed.length >= 1 && trimmed.length <= max;
+}
+
+/**
  * anton's OWN bookkeeping namespaces — where anton has already put a bead, not what an operator
  * judged worth starting. Excluded everywhere a criterion is authored (the calibrated draft and the
  * editor alike): a policy over `stage:` or `review-score:` is the machine quoting itself back, and
