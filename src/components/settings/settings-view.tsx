@@ -677,6 +677,10 @@ export function SettingsView({
   // for the Save button would be re-asked on the next arm by anyone who navigated away.
   const [cadenceOffer, setCadenceOffer] = useState<CadenceOffer | null>(null);
   const [keepWeekly, setKeepWeekly] = useState(settings.keepProductMasterWeekly === true);
+  // Counts the withdrawals — offers killed by a change rather than by an answer. An accept restores
+  // its offer on a failed write, and only this tells that restore apart from one that would put back
+  // a question the operator already invalidated while the PATCH was open.
+  const cadenceOfferGeneration = useRef(0);
   // A schedule PATCH and the schedule poll both write the same rows, and the PATCH is the one that
   // knows the truth — its response carries the server's recomputed nextRunAt. These two let a poll
   // recognise that it raced a write and drop its own (pre-write) answer rather than applying it on
@@ -917,9 +921,13 @@ export function SettingsView({
 
   async function toggleAutomation(id: string, next: boolean) {
     // Disarming withdraws the QUESTION, never the answer: with the picker off, nothing executes what
-    // product-master judges, so an unanswered offer has lost its reason to be on screen. Done ahead
-    // of the write because it takes something OFF screen — nothing can be accepted in the meantime.
-    if (id === AUTOPILOT_ARMING_AUTOMATION && !next) setCadenceOffer(null);
+    // product-master judges, so an unanswered offer has lost its reason to be on screen. Toggling the
+    // offered automation itself withdraws it too — a cadence offer for a job the operator just turned
+    // off is asking about a schedule that no longer fires. Done ahead of the write because it takes
+    // something OFF screen — nothing can be accepted in the meantime.
+    if ((id === AUTOPILOT_ARMING_AUTOMATION && !next) || id === cadenceOffer?.automationId) {
+      withdrawCadenceOffer();
+    }
     const stored = await patchSchedule(
       id,
       { enabled: next },
@@ -958,12 +966,33 @@ export function SettingsView({
     });
   }
 
-  /** Accept the offer — the ONLY path that changes the cadence, through the same PATCH as an edit. */
-  function acceptCadenceOffer() {
+  /**
+   * Withdraw the pending question because something invalidated it, rather than because it was
+   * answered. Every such path goes through here so the generation moves with it — that is what lets
+   * an accept still in flight tell a failed write from a question that stopped applying underneath
+   * it (see {@link acceptCadenceOffer}).
+   */
+  function withdrawCadenceOffer() {
+    cadenceOfferGeneration.current += 1;
+    setCadenceOffer(null);
+  }
+
+  /**
+   * Accept the offer — the ONLY path that changes the cadence, through the same PATCH as an edit.
+   *
+   * The question comes back if the write does not land. `patchSchedule` rolls the cadence back to
+   * weekly, so an offer that stayed dismissed would leave an operator who chose daily sitting on
+   * weekly with nothing left to retry. It stays gone if something withdrew it while the PATCH was
+   * open — the picker disarmed, the row edited by hand — because that question is dead on its own
+   * terms and a failed write is no reason to resurrect it.
+   */
+  async function acceptCadenceOffer() {
     const offer = cadenceOffer;
     if (!offer) return;
+    const generation = cadenceOfferGeneration.current;
     setCadenceOffer(null);
-    return setAutomationCron(offer.automationId, offer.cron);
+    const stored = await setAutomationCron(offer.automationId, offer.cron);
+    if (!stored && cadenceOfferGeneration.current === generation) setCadenceOffer(offer);
   }
 
   /**
@@ -999,6 +1028,16 @@ export function SettingsView({
 
   function setAutomationCron(id: string, cron: string) {
     return patchSchedule(id, { cron }, `${id} · ${describeCron(cron)}`);
+  }
+
+  /**
+   * A cadence chosen by hand in the row's own editor. It supersedes a pending offer for that same
+   * row: the offer's cron was derived from the cadence being replaced, so accepting it afterwards
+   * would overwrite the time the operator just picked with one computed from a row that is gone.
+   */
+  function editAutomationCron(id: string, cron: string) {
+    if (id === cadenceOffer?.automationId) withdrawCadenceOffer();
+    return setAutomationCron(id, cron);
   }
 
   function patchVariant(id: string, patch: Partial<FormulaVariant>) {
@@ -1980,7 +2019,7 @@ export function SettingsView({
               state={automations}
               defaultCrons={defaultCrons}
               cadenceOffer={cadenceOffer}
-              onCronChange={setAutomationCron}
+              onCronChange={editAutomationCron}
               onToggle={toggleAutomation}
               onAcceptCadenceOffer={acceptCadenceOffer}
               onDeclineCadenceOffer={declineCadenceOffer}

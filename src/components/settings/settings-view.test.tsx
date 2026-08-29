@@ -1524,6 +1524,104 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
   });
 
+  it("puts the offer back when the cadence write failed, so the answer can be given again", async () => {
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      if (patch.cron !== undefined) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: "invalid cron" }), { status: 500 }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: "*/10 * * * *", ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("invalid cron"));
+    // The cadence rolled back to weekly, so the question is true again — and an operator who chose
+    // daily and landed back on weekly with the offer gone would have no way to say it a second time.
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+    expect(offer()).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Raise to daily" })).toBeTruthy();
+  });
+
+  it("does not resurrect a question the operator killed while the accept was in flight", async () => {
+    let failCadence: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      if (patch.cron === undefined) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ schedule: { enabled: patch.enabled, cron: "*/10 * * * *", ...patch } }),
+          ),
+        );
+      }
+      return new Promise<Response>((resolve) => {
+        failCadence = () =>
+          resolve(new Response(JSON.stringify({ error: "invalid cron" }), { status: 500 }));
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+    await waitFor(() => expect(failCadence).toBeTruthy());
+
+    // Disarm with the cadence PATCH still open. The offer's premise is gone, so the failure must
+    // restore nothing: an offer to speed up a pass whose output feeds nothing is a question about
+    // a picker that is now off.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    failCadence!();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("invalid cron"));
+    expect(offer()).toBeNull();
+  });
+
+  it("withdraws the offer when the operator sets that cadence by hand instead", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    // A hand edit answers the question by superseding it. Leaving the offer up would let an accept
+    // afterwards overwrite the cadence just chosen with one computed from the row it replaced.
+    fireEvent.click(screen.getByRole("button", { name: "product-master cadence" }));
+    fireEvent.click(screen.getByRole("button", { name: "Daily" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set cadence" }));
+
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
+    expect(bodyOf(patchesTo(fetchMock, "/schedules")[1]).type).toBe("product-master");
+    expect(offer()).toBeNull();
+  });
+
+  it("withdraws the offer when product-master itself is switched off", async () => {
+    stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    // Its cadence is moot once it is off — the offer would be asking how often a job that no longer
+    // runs should run.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    expect(offer()).toBeNull();
+  });
+
   it("stays quiet when there is nothing to raise", () => {
     stubPanelFetch();
     // Already daily — and a hand-written expression or an off product-master are the same silence:
