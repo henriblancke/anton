@@ -42,6 +42,89 @@ describe("formatPmBoardContext", () => {
     expect(text).toContain("30d since last write");
   });
 
+  // Every other test here asserts one fact or one section in isolation, which leaves the ASSEMBLY
+  // unlocked — the order the sections come in, their preambles, the blank lines between blocks. The
+  // pass reads this prompt whole and gets no second look at the board, so a silently reordered or
+  // unspaced render is a different input than the one every other test was written against.
+  it("assembles those sections into one stable prompt", () => {
+    const whole = [
+      ...board,
+      bead("anton-cont", { issue_type: "epic", title: "Billing" }),
+      bead("anton-child", { issue_type: "feature", parent: "anton-cont" }),
+      bead("anton-orphan", { parent: "anton-cont" }),
+      bead("anton-p1", { title: "an open ask", labels: ["pm:low-value:0123456789ab"] }),
+      bead("anton-p2", {
+        title: "an answered ask",
+        status: "closed",
+        labels: ["pm:oversized:0123456789ab", LABELS.abandoned],
+      }),
+    ];
+    const text = formatPmBoardContext({
+      board: whole,
+      scores: new Map([["anton-feat", [7, 4]]]),
+      runs: [{ id: "run-1", epicBeadId: "anton-feat", status: "failed", attempts: 2, updatedAt: NOW }],
+      now: NOW,
+    });
+    expect(text).toMatchInlineSnapshot(`
+      "## Board context
+
+      Everything below is anton's own read of this project's board, taken just now. It is the only
+      board you have — you cannot run \`bd\`, and nothing you write reaches it. Judge from this.
+
+      ### Run targets
+
+      Each block is one run target — the unit anton actually runs — followed by the tickets it
+      carries. A block with no tickets under it runs as a single ticket, itself. \`blocked by\` is a
+      \`blocks\` edge the graph already records; \`under\` is the bead's parent — the home it hangs off
+      today — and \`shipped by\` names the run target that carries it when that is not the same bead.
+      Nesting runs to any depth here: a ticket filed under another ticket ships in the same run and
+      the same PR, so it is filed legitimately, not misfiled.
+
+      \`goal:\` is what the bead states about itself, in its own words, cut at 240 characters — the
+      rest of its contract (Context, Acceptance, Verify) is NOT in this prompt, so never read a cut
+      line as the whole of what a bead is for. It is also the only evidence a home judgment may rest
+      on: a bead with no \`goal:\` line has stated nothing to match, however suggestive its title.
+
+      - anton-other [feature] · P0 · under nothing (no home to be the wrong one) — anton-other
+      - anton-feat [feature] · P1 · size:L · under nothing (no home to be the wrong one) · blocked by anton-other · review scores 7,4 — anton-feat
+        - anton-tick [task] · P2 · size:S · 30d since last write · under anton-feat "anton-feat" — anton-tick
+      - anton-child [feature] · P2 · under anton-cont "Billing" — anton-child
+      - anton-epic [epic] · P2 · under nothing (no home to be the wrong one) — anton-epic
+
+      ### Container epics
+
+      These GROUP run targets rather than being one, so anton never runs them directly and they carry
+      no tickets of their own. They are the homes the work above hangs off — judge them as groupings,
+      not as work to rank.
+
+      - anton-cont [epic] · P2 · under nothing (no home to be the wrong one) · 1 open run target(s) beneath it — Billing
+
+      ### Work no run target carries
+
+      These ride no run target, so nothing will ship them as they stand. Giving homeless work its
+      first home is the gardener pass's proposal, not yours — do not \`rehome\` them; rank, split or
+      kill them only on their own merits.
+
+      - anton-orphan [task] · P2 · under anton-cont "Billing" — anton-orphan
+
+      ### Asks already on the board
+
+      Do not report a claim that repeats one of these. A DECLINED one is a human's answer, not an
+      oversight — raising it again is how this pass earns being ignored.
+
+      - OPEN anton-p1 — an open ask
+      - DECLINED anton-p2 — an answered ask
+
+      ### Recent runs
+
+      anton's own execution record, newest first — what has actually been attempted lately and how it
+      ended.
+
+      - anton-feat — failed
+      "
+    `);
+  });
+
   /** One `### ` block of the rendered context, so a section's CONTENTS can be asserted on. */
   const sectionOf = (text: string, heading: string): string =>
     text.split(`### ${heading}\n`)[1]?.split("\n### ")[0] ?? "";

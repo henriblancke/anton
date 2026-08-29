@@ -232,7 +232,9 @@ const CLAIM_FIELDS: { [K in ClaimKind]: FieldReader<K> } = {
 function toClaim(entry: unknown): PmClaim | undefined {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
   const raw = entry as Record<string, unknown>;
-  if (typeof raw.kind !== "string" || !(raw.kind in CLAIM_KINDS)) return undefined;
+  // Own keys only: `in` would let an inherited `Object.prototype` name ("constructor", "toString")
+  // pass as a kind and dispatch to whatever the prototype holds, admitting a claim with no fields.
+  if (typeof raw.kind !== "string" || !Object.hasOwn(CLAIM_KINDS, raw.kind)) return undefined;
   const kind = raw.kind as ClaimKind;
 
   const base = claimBase(raw);

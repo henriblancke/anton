@@ -46,6 +46,10 @@ describe("parsePmReport", () => {
     ["a null list", report(`{"proposals":null}`)],
     ["one garbled entry", report(`{"proposals":[{"kind":"kill","bead":"anton-a"}]}`)],
     ["an unknown kind", report(`{"proposals":[{"kind":"rewrite","bead":"a","summary":"s","evidence":["e"]}]}`)],
+    // An inherited `Object.prototype` name is not a kind: read with `in` it would dispatch to
+    // whatever the prototype holds and file a claim carrying none of that kind's fields.
+    ["an inherited kind", report(`{"proposals":[{"kind":"constructor","bead":"a","summary":"s","evidence":["e"]}]}`)],
+    ["a prototype kind", report(`{"proposals":[{"kind":"__proto__","bead":"a","summary":"s","evidence":["e"]}]}`)],
     ["a reprioritize with no priority", report(`{"proposals":[{"kind":"reprioritize","bead":"a","summary":"s","evidence":["e"]}]}`)],
     ["a reprioritize with a bogus priority", report(`{"proposals":[{"kind":"reprioritize","bead":"a","priority":"P9","summary":"s","evidence":["e"]}]}`)],
     ["a split with a single piece", report(`{"proposals":[{"kind":"split","bead":"a","pieces":["one"],"summary":"s","evidence":["e"]}]}`)],

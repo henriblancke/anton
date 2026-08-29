@@ -2,9 +2,9 @@
  * One bead as the product-master pass reads it (anton-d2sx): the facts a ranking, sizing or value
  * judgment rests on, rendered as one line plus the bead's own goal.
  *
- * Apart from the sections that arrange them (`board-context.ts`) because this is where the pass's
- * EVIDENCE is decided — which facts a claim may rest on, and which are deliberately withheld — and
- * every one of those calls is argued at its own site.
+ * Kept apart from the sections that arrange them (`board-context.ts`) because this is where the
+ * pass's EVIDENCE is decided — which facts a claim may rest on, and which are deliberately withheld
+ * — and every one of those calls is argued at its own site.
  */
 import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { goalBody, isAuthoredBody, preambleOf } from "../beads/contract";
@@ -100,9 +100,9 @@ const goalOf = (bead: Bead): string | undefined => {
 
 /**
  * "A run owns this", in both halves — a published lease, and the claim a lease has not caught up to
- * yet. Shown because a proposal against either is refused at filing time (`subjectChecked` and
- * `rehomeRefusal` in refusals.ts); a session that cannot see the claim spends its judgment on asks
- * the board will throw away.
+ * yet. Shown because a proposal against either is refused at filing time (`subjectChecked` in
+ * `refusals.ts`, `rehomeRefusal` in `home-guards.ts`); a session that cannot see the claim spends
+ * its judgment on asks the board will throw away.
  */
 const ownedBy = (bead: Bead, nowMs: number): string | undefined => {
   if (isInFlight(bead, nowMs)) return "IN FLIGHT — a run owns it, do not propose against it";
