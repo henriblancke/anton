@@ -272,6 +272,51 @@ describe("the automation rows", () => {
     expect(screen.queryByText("nothing to do")).toBeNull();
   });
 
+  // `lastRunAt` is stamped at enqueue, `lastRun` is the newest SETTLED job — so for the whole length
+  // of a fire the outcome beside it belongs to the PREVIOUS one. Reading last night's green result
+  // as the verdict on a run that started two minutes ago is the failure this guards.
+  it("does not credit a still-running fire with the previous fire's result", () => {
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: { outcome: "ok", at: NOW_SEC() - 3 * 3600 - 60, note: "triaged 4 signal(s)" },
+      },
+    });
+
+    expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.queryByText("triaged 4 signal(s)")).toBeNull();
+    // The older result is not hidden, it is dated to the run it came from.
+    expect(screen.getByText("in progress · ok 3h ago")).toBeTruthy();
+  });
+
+  it("does not blame a running fire for yesterday's failure", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: { outcome: "failed", at: NOW_SEC() - 26 * 3600, note: "gh: not authenticated" },
+      },
+    });
+
+    expect(screen.queryByText("gh: not authenticated")).toBeNull();
+    expect(screen.queryByText("failed —")).toBeNull();
+    expect(screen.getByText(/^in progress · failed 1d ago$/)).toBeTruthy();
+  });
+
+  // The mirror check: a settled fire always settles at or after it was enqueued, so the in-flight
+  // reading must never swallow a real outcome.
+  it("shows the outcome of a fire that settled after it was enqueued", () => {
+    const firedAt = NOW_SEC() - 3 * 3600 - 60;
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: firedAt,
+        lastRun: { outcome: "ok", at: firedAt + 90, note: "triaged 4 signal(s)" },
+      },
+    });
+
+    expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
   // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
   // and without saying so the row reads as a failure.
   it("says which automations are idle because the one that feeds them is off", () => {

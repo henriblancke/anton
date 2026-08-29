@@ -51,6 +51,13 @@ const OUTCOME_STYLES: Record<ScheduleRunOutcome, { dot: string; label: string; t
   cancelled: { dot: "bg-risk-med", label: "cancelled", text: "text-muted-foreground" },
 };
 
+/**
+ * A fire that has been enqueued but has not settled. Amber — the colour work in flight wears
+ * everywhere else here — and deliberately not the last settled fire's colour, because that verdict
+ * belongs to an older run.
+ */
+const IN_FLIGHT_STYLE = { dot: "bg-stage-implementing", text: "text-muted-foreground" };
+
 /** What one automation is, and what makes it inert. */
 export interface AutomationSpec {
   id: string;
@@ -308,19 +315,43 @@ function AutomationTableRow({
  * words ("closed 2 gate(s)", "no gate closed") rather than a status vocabulary an operator has to
  * learn. A fire that predates the outcome column, or whose handler reports no effect, says "ok" and
  * claims nothing more.
+ *
+ * The two halves come from different places and can describe different fires: `lastRunAt` is
+ * stamped when the scheduler ENQUEUES (jobs/scheduler.ts), `lastRun` is the newest job that has
+ * SETTLED (lib/schedule-runs.ts). While a fire is running — minutes, for the long passes — the
+ * outcome beside it is the PREVIOUS fire's, so pinning it to a two-minute-old timestamp reads as
+ * "it just succeeded" (or just failed). An outcome is only the newest fire's when it settled at or
+ * after that fire was enqueued; otherwise the fire is still in flight and says so, and the older
+ * result is dated to its own run.
  */
 function LastRunCell({ state, now }: { state: AutomationScheduleState; now: number }) {
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;
 
-  const style = state.lastRun ? OUTCOME_STYLES[state.lastRun.outcome] : undefined;
-  const detail = state.lastRun?.note ?? style?.label;
+  const previous = state.lastRun;
+  const settled = previous !== undefined && previous.at >= state.lastRunAt;
+  const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
+
+  const detail = settled
+    ? (previous.note ?? style?.label)
+    : previous
+      ? `in progress · ${OUTCOME_STYLES[previous.outcome].label} ${formatRelativeTime(
+          new Date(previous.at * 1000).toISOString(),
+          now,
+        )}`
+      : undefined;
+  // The failure note is an error message and can outrun the column; the tooltip keeps it, including
+  // for the older fire whose note the in-flight line has no room to spell out.
+  const title = settled ? detail : previous?.note ? `${detail} — ${previous.note}` : detail;
 
   return (
     <span className="flex flex-col gap-0.5">
       <span className="flex items-center gap-1.5">
-        {style ? (
+        {style || previous ? (
           <span
-            className={cn("size-1.5 shrink-0 rounded-full", style.dot)}
+            className={cn(
+              "size-1.5 shrink-0 rounded-full",
+              style?.dot ?? IN_FLIGHT_STYLE.dot,
+            )}
             aria-hidden="true"
           />
         ) : null}
@@ -330,9 +361,11 @@ function LastRunCell({ state, now }: { state: AutomationScheduleState; now: numb
       </span>
       {detail ? (
         <span
-          className={cn("max-w-[15rem] truncate text-[10.5px]", style?.text ?? "text-subtle")}
-          // The failure note is an error message and can outrun the column; the tooltip keeps it.
-          title={detail}
+          className={cn(
+            "max-w-[15rem] truncate text-[10.5px]",
+            style?.text ?? (previous ? IN_FLIGHT_STYLE.text : "text-subtle"),
+          )}
+          title={title}
         >
           {/* Screen readers get the outcome named, not just the note that happens to imply it. */}
           <span className="sr-only">{style ? `${style.label} — ` : ""}</span>
