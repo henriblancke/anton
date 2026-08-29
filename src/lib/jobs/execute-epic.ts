@@ -37,7 +37,8 @@ import {
   type WorktreeState,
 } from "../git/ops";
 import { prNumberFromRef } from "../git/pr";
-import { createWorktree, findWorktree, removeWorktree } from "../git/worktree";
+import { createWorktree, findWorktree, removeWorktree, type Worktree } from "../git/worktree";
+import { releaseRunResources } from "./worktree-reaper";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
   getProjectById,
@@ -391,6 +392,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // the try took — and only that — so the set has to outlive the block that took it. Null until the
     // claim gate runs, so every gate that parks before it releases nothing.
     let childCascade: { actor: string; ids: string[] } | null = null;
+    // The worktree this attempt warmed, hoisted for the same reason as the two above: EVERY terminal
+    // outcome owes it back (anton-hrun.1), and the stopping paths live in the `catch`, outside the
+    // block that created it. Null until step 2, so a run that parked before warming releases nothing.
+    let runWorktree: Worktree | null = null;
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -1032,6 +1037,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // it out, holding the run's concurrency slot the whole time.
         signal: ctx.signal,
       });
+      runWorktree = worktree;
       await updateRun(db, clock, runId, {
         worktreePath: worktree.path,
         branch: worktree.branch,
@@ -1576,7 +1582,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         endedAt: clock.now(),
         error: [timeoutNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
       });
-      await safe(() => removeWorktree(worktree));
+      // The branch and its PR carry the work now, so the checkout is residue; the branch survives
+      // because the target is still open in review (anton-hrun.1).
+      await safe(() =>
+        releaseRunResources({
+          db,
+          clock,
+          ctx,
+          projectId,
+          repoPath: repo,
+          worktree,
+          beadId: epicBeadId,
+          status: "done",
+        }),
+      );
     } catch (e) {
       // Give the children back before settling the row (anton-0d85). This attempt has stopped —
       // parked on a blocking review, killed by an abandon, backed off after losing the lease race, or
@@ -1614,9 +1633,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
+      let settledAs: "parked" | "failed";
       if (isUsageLimitError(e)) {
+        settledAs = "parked";
         await updateRun(db, clock, runId, { status: "parked", error: `usage-limit${orphanNotice}` });
       } else if (isRunAlreadyLiveError(e)) {
+        settledAs = "parked";
         // The notice rides along here too: a lease that merely lapsed still reconciles the branch's
         // orphan PR, and what that found (a PR drafted, or a `gh` lookup that failed) has nowhere
         // else to be reported — this run opens no PR and composes no park message.
@@ -1625,21 +1647,49 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           error: `run-live-elsewhere${orphanNotice}`,
         });
       } else if (e instanceof BlockedTailError) {
+        settledAs = "parked";
         // Parked, not failed, for the same reason as a blocked review below: this run delivered the
         // tickets it could and is waiting on work outside it, so the row must stay open for the
         // resume to continue in (findOpenRunForEpic) rather than read as a crashed attempt.
         await updateRun(db, clock, runId, { status: "parked", error: e.message });
       } else if (e instanceof ReviewBlockedError) {
+        settledAs = "parked";
         // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
         // gate refused on and resume it — the run history must not read like a crash. Resuming reuses
         // THIS row (findOpenRunForEpic), so the resumed attempt continues in the same worktree/branch.
         await updateRun(db, clock, runId, { status: "parked", error: e.message });
       } else {
+        settledAs = "failed";
         await updateRun(db, clock, runId, {
           status: "failed",
           error: `${e instanceof Error ? e.message : String(e)}${orphanNotice}`,
           endedAt: clock.now(),
         });
+      }
+      // Hand back the worktree this attempt warmed (anton-hrun.1). Delivery is not the only outcome
+      // that owes it: a failure, a kill and an abandon all leave the same checkout and the same
+      // branch behind, and before this every one of them tore down nothing. A park keeps both — it
+      // resumes in this very worktree — unless its bead was settled underneath it, which is exactly
+      // what a kill or an abandon does, and `releaseRunResources` re-reads the bead to see it.
+      // Best-effort: a cleanup must never mask the run's own error, and what it misses the scheduled
+      // reaper reclaims.
+      const stoppedWorktree = runWorktree;
+      if (stoppedWorktree) {
+        await safe(() =>
+          releaseRunResources({
+            db,
+            clock,
+            ctx,
+            projectId,
+            repoPath: repo,
+            worktree: stoppedWorktree,
+            beadId: epicBeadId,
+            status: settledAs,
+            // Another machine owns this branch's run; neither its worktree nor its branch is ours
+            // to reclaim on the strength of a lease we merely could not keep.
+            foreign: isRunAlreadyLiveError(e),
+          }),
+        );
       }
       throw e; // let the runner apply job-level durability
     } finally {

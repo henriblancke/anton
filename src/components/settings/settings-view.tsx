@@ -491,6 +491,13 @@ const AUTOMATIONS: AutomationSpec[] = [
     group: "Run health",
   },
   {
+    id: "worktree-reaper",
+    label: "worktree-reaper",
+    description:
+      "reclaims finished runs' worktrees + branches · never a locked checkout or an open PR",
+    group: "Run health",
+  },
+  {
     id: "gate-check",
     label: "gate-check",
     description: "resumes runs whose gate closed · human gates never auto-close",

@@ -10,12 +10,13 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { beads } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
+import { findWorktree } from "../git/worktree";
 import { epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
@@ -139,12 +140,24 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
 
     // Two execute sessions recorded + logged.
     const sessions = await tdb.db.select().from(schema.sessions);
-    expect(sessions).toHaveLength(2);
-    expect(sessions.every((s) => s.status === "done" && s.kind === "execute")).toBe(true);
-    for (const s of sessions) {
+    const executeSessions = sessions.filter((s) => s.kind === "execute");
+    expect(executeSessions).toHaveLength(2);
+    expect(executeSessions.every((s) => s.status === "done")).toBe(true);
+    for (const s of executeSessions) {
       expect(existsSync(s.logPath!)).toBe(true);
       expect(readFileSync(s.logPath!, "utf8")).toContain("[result]");
     }
+
+    // …and the run's teardown accounted for what it handed back (anton-hrun.1): the worktree is
+    // released, the branch is kept because the PR is built on it, and the log says both.
+    const teardown = sessions.filter((s) => s.kind === "worktree-reaper");
+    expect(teardown).toHaveLength(1);
+    const teardownLog = readFileSync(teardown[0].logPath!, "utf8");
+    expect(teardownLog).toContain(
+      `released worktree ${join(realpathSync(sandbox), "worktrees", `anton-${epicId}`)}`,
+    );
+    expect(teardownLog).toContain(`kept branch anton/${epicId}`);
+    expect(await findWorktree(repo, `anton/${epicId}`)).toBeNull();
 
     // Composed system prompt reached claude for BOTH tickets: locked base + operator seed on
     // every invocation, and the agent layer only for the agent-tagged ticket (t1: agent:nextjs).
@@ -279,6 +292,17 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
         (s) => s.beadId === bugId,
       );
       expect(sessionsAfter1).toHaveLength(1);
+
+      // anton-hrun.1: a run that FAILS releases its worktree exactly like one that delivers —
+      // before this, only the success path tore anything down and every failure leaked a checkout.
+      // The branch stays: the bead is still open, so the work is not finished with it.
+      expect(await findWorktree(repo, `anton/${bugId}`)).toBeNull();
+      expect(existsSync(join(sandbox, "worktrees", `anton-${bugId}`))).toBe(false);
+      expect(
+        execFileSync("git", ["-C", repo, "branch", "--list", `anton/${bugId}`], {
+          encoding: "utf8",
+        }).trim(),
+      ).not.toBe("");
 
       // Resume with a working gh. The retry must skip the already-committed ticket (resume marker)
       // and pick up at the PR step — no second claude session, one PR opened.

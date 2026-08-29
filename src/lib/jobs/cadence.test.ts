@@ -32,6 +32,7 @@ describe("describeCron", () => {
       gardener: "Daily at 05:00",
       "product-master": "Weekly on Monday at 06:00",
       "board-picker": "Every 10 minutes",
+      "worktree-reaper": "Daily at 04:30",
     });
   });
 

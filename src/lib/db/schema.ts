@@ -52,7 +52,7 @@ export const jobs = sqliteTable(
   {
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health |
-    // unstick | gate-check | gardener
+    // unstick | gate-check | gardener | product-master | board-picker | worktree-reaper
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),

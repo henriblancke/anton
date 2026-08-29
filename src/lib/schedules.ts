@@ -25,6 +25,7 @@ export type ScheduledJobType = Extract<
   | "gardener"
   | "product-master"
   | "board-picker"
+  | "worktree-reaper"
 >;
 
 export type ScheduleRow = typeof schema.schedules.$inferSelect;
@@ -184,6 +185,13 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * and lands behind its own switch. Ten minutes because the pass is mechanical — a board read and a
  * ranking, no Claude session — so the cadence is only how stale the recorded plan may get.
  *
+ * worktree-reaper (anton-hrun.1) is armed by default despite deleting things, because what it
+ * deletes is anton's OWN residue and nobody else's: a checkout under `.anton-worktrees/` whose bead
+ * is closed, and the run branch beside it once no open PR needs it. It writes nothing to the board,
+ * never touches a locked checkout or an in-flight run, and an operator who never asked for it is the
+ * one most likely to end up with dozens of stale run branches. Daily, off-peak: residue accrues one
+ * run at a time, so a nightly pass is as timely as the problem is.
+ *
  * gate-check (anton-286r) is armed by default and runs often, because it is the ONLY thing that
  * resumes a run parked on a gate: shipping it off would strand gated work indefinitely, and its
  * idle cost is two bd reads per slot on a project with no gates. The cadence is the wait's
@@ -203,6 +211,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "gardener", cron: "0 5 * * *", enabled: false }, // board hygiene patrol daily 05:00; opt-in
   { type: "product-master", cron: "0 6 * * 1", enabled: false }, // product judgment weekly, Mon 06:00; opt-in
   { type: "board-picker", cron: "*/10 * * * *", enabled: false }, // rank the board, record a plan; opt-in
+  { type: "worktree-reaper", cron: "30 4 * * *" }, // reclaim finished runs' worktrees + branches, daily 04:30
 ];
 
 /**

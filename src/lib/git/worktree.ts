@@ -44,12 +44,20 @@ async function git(repoPath: string, args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+/**
+ * The directory anton creates this repo's run worktrees under. Also what the reaper scopes its sweep
+ * to — a checkout outside it is not anton's to judge, whatever branch it holds.
+ */
+export function worktreesRootFor(repoPath: string): string {
+  return (
+    process.env[WORKTREES_ROOT_ENV] ??
+    join(dirname(repoPath), ".anton-worktrees", basenameOf(repoPath))
+  );
+}
+
 /** Where a worktree for `branch` should live. Outside the main working tree to avoid bd noise. */
 export function worktreePathFor(repoPath: string, branch: string): string {
-  const root =
-    process.env[WORKTREES_ROOT_ENV] ??
-    join(dirname(repoPath), ".anton-worktrees", basenameOf(repoPath));
-  return join(root, sanitizeBranch(branch));
+  return join(worktreesRootFor(repoPath), sanitizeBranch(branch));
 }
 
 function basenameOf(p: string): string {
@@ -289,34 +297,88 @@ async function stampWarmed(worktreePath: string, label: string): Promise<void> {
   }
 }
 
-/** Return the existing worktree for `branch`, or null. Parses `git worktree list --porcelain`. */
-export async function findWorktree(repoPath: string, branch: string): Promise<Worktree | null> {
+/** One registered checkout, as `git worktree list --porcelain` reports it. */
+export interface WorktreeRecord {
+  path: string;
+  /** The checked-out branch; absent for a detached or bare checkout. */
+  branch?: string;
+  /** Locked — by whichever tool created it. A locked checkout is never anton's to remove. */
+  locked: boolean;
+  /** The lock's reason when git carries one (`git worktree lock --reason`). */
+  lockReason?: string;
+  /** The repo's own working tree, which is never a run worktree. */
+  isMain: boolean;
+}
+
+/** Every checkout git has registered for `repoPath`, main worktree first. */
+export async function listWorktrees(repoPath: string): Promise<WorktreeRecord[]> {
   const out = await git(repoPath, ["worktree", "list", "--porcelain"]);
-  const blocks = out.split(/\n\n+/);
-  const refName = `refs/heads/${branch}`;
-
-  for (const block of blocks) {
-    const lines = block.split("\n");
-    const pathLine = lines.find((l) => l.startsWith("worktree "));
-    const branchLine = lines.find((l) => l.startsWith("branch "));
-    if (!pathLine || !branchLine) continue;
-    if (branchLine.slice("branch ".length) !== refName) continue;
-
-    const path = pathLine.slice("worktree ".length);
-    return { path, branch, baseBranch: branch, repoPath };
+  const records: WorktreeRecord[] = [];
+  for (const block of out.split(/\n\n+/)) {
+    const lines = block.split("\n").filter(Boolean);
+    const path = lines.find((l) => l.startsWith("worktree "))?.slice("worktree ".length);
+    if (!path) continue;
+    const ref = lines.find((l) => l.startsWith("branch "))?.slice("branch ".length);
+    // git writes a bare `locked` line, or `locked <reason>` when one was given.
+    const lock = lines.find((l) => l === "locked" || l.startsWith("locked "));
+    records.push({
+      path,
+      branch: ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined,
+      locked: lock !== undefined,
+      lockReason: lock?.slice("locked ".length).trim() || undefined,
+      isMain: records.length === 0,
+    });
   }
-  return null;
+  return records;
+}
+
+/** Return the existing worktree for `branch`, or null. */
+export async function findWorktree(repoPath: string, branch: string): Promise<Worktree | null> {
+  const record = (await listWorktrees(repoPath)).find((w) => w.branch === branch);
+  return record ? { path: record.path, branch, baseBranch: branch, repoPath } : null;
+}
+
+/** What {@link removeWorktree} actually did — the evidence a reaper's log is written from. */
+export interface WorktreeRemoval {
+  /**
+   * True only when a checkout that WAS there is now gone. A path that was already absent reports
+   * false: a report that counts it as reclaimed inflates every sweep with residue nobody removed.
+   */
+  removed: boolean;
+  /** Why the checkout was left alone. Absent when it was removed (or was never there). */
+  skipped?: string;
+  branchDeleted: boolean;
+}
+
+/**
+ * Why `wt` must be left alone, or undefined when it is anton's to remove. Today that is exactly one
+ * case: another tool locked the checkout. `git worktree remove --force` refuses a locked worktree,
+ * and the orphan fallback below would then delete a directory another owner is working in — the lock
+ * is precisely the statement that it must not. Fail OPEN on an unreadable listing: that is the
+ * moved/deleted-repo case the fallback exists to serve, and no lock can be proven either way.
+ */
+async function removalBlocker(wt: Worktree): Promise<string | undefined> {
+  const target = resolve(wt.path);
+  const records = await listWorktrees(wt.repoPath).catch(() => [] as WorktreeRecord[]);
+  const record = records.find((r) => resolve(r.path) === target);
+  if (!record?.locked) return undefined;
+  return `locked by another owner (${record.lockReason ?? "no reason given"})`;
 }
 
 /**
  * Remove the worktree (force, so dirty state is discarded) and prune. If `deleteBranch` is set,
- * also delete the branch. Safe to call when the worktree is already gone (idempotent).
+ * also delete the branch. Safe to call when the worktree is already gone (idempotent), and a no-op
+ * that REPORTS itself when the checkout is locked by another owner.
  */
 export async function removeWorktree(
   wt: Worktree,
   opts?: { deleteBranch?: boolean },
-): Promise<void> {
-  if (existsSync(wt.path)) {
+): Promise<WorktreeRemoval> {
+  const blocker = await removalBlocker(wt);
+  if (blocker) return { removed: false, skipped: blocker, branchDeleted: false };
+
+  const existed = existsSync(wt.path);
+  if (existed) {
     try {
       await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
     } catch {
@@ -344,11 +406,14 @@ export async function removeWorktree(
     // best-effort
   }
 
+  let branchDeleted = false;
   if (opts?.deleteBranch) {
     try {
       await git(wt.repoPath, ["branch", "-D", wt.branch]);
+      branchDeleted = true;
     } catch {
-      // branch already gone
+      // branch already gone, or still checked out somewhere git won't let us delete from under
     }
   }
+  return { removed: existed && !existsSync(wt.path), branchDeleted };
 }

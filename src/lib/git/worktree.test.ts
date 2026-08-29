@@ -19,6 +19,7 @@ import { join } from "node:path";
 import {
   createWorktree,
   findWorktree,
+  listWorktrees,
   removeWorktree,
   resolveWarmCommand,
   WARM_COMMAND_ENV,
@@ -205,7 +206,8 @@ suite("worktree manager (real git)", () => {
     const wt = await createWorktree({ repoPath: repo, branch });
     expect(existsSync(wt.path)).toBe(true);
 
-    await removeWorktree(wt, { deleteBranch: true });
+    const removal = await removeWorktree(wt, { deleteBranch: true });
+    expect(removal).toEqual({ removed: true, branchDeleted: true });
     expect(existsSync(wt.path)).toBe(false);
 
     const branchList = execFileSync(
@@ -215,7 +217,55 @@ suite("worktree manager (real git)", () => {
     );
     expect(branchList.trim()).toBe("");
 
-    await expect(removeWorktree(wt, { deleteBranch: true })).resolves.toBeUndefined();
+    // Idempotent: the second pass finds nothing to remove and no branch left to delete — and says
+    // so, rather than counting an already-absent checkout as one it reclaimed.
+    expect(await removeWorktree(wt, { deleteBranch: true })).toEqual({
+      removed: false,
+      branchDeleted: false,
+    });
+  });
+
+  it("listWorktrees reports each checkout's branch and whether another owner locked it", async () => {
+    const branch = "anton/run-listed";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    execFileSync("git", ["-C", repo, "worktree", "lock", "--reason", "supacode", wt.path]);
+
+    try {
+      const records = await listWorktrees(repo);
+      expect(records[0].isMain).toBe(true);
+      const listed = records.find((r) => r.branch === branch)!;
+      expect(listed.locked).toBe(true);
+      expect(listed.lockReason).toBe("supacode");
+      expect(records.filter((r) => r.locked && r.branch !== branch)).toEqual([]);
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+      await removeWorktree(wt, { deleteBranch: true });
+    }
+  });
+
+  it("SKIPS a checkout another owner locked — never force-removed, and the branch survives", async () => {
+    // anton-hrun.1: 5 of this repo's own leaked checkouts are locked by `supacode`. Force-removing
+    // one would delete a directory another tool is working in — and `git worktree remove --force`
+    // refuses it anyway, which used to drop the removal into the orphan `rm -rf` fallback.
+    const branch = "anton/run-locked";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    writeFileSync(join(wt.path, "in-progress.txt"), "another tool's work\n");
+    execFileSync("git", ["-C", repo, "worktree", "lock", "--reason", "supacode", wt.path]);
+
+    try {
+      const removal = await removeWorktree(wt, { deleteBranch: true });
+
+      expect(removal.removed).toBe(false);
+      expect(removal.branchDeleted).toBe(false);
+      expect(removal.skipped).toMatch(/locked by another owner \(supacode\)/);
+      expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+      expect(
+        execFileSync("git", ["-C", repo, "branch", "--list", branch], { encoding: "utf8" }).trim(),
+      ).not.toBe("");
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+      await removeWorktree(wt, { deleteBranch: true });
+    }
   });
 
   it("removes a verified orphan when the main repository metadata is gone", async () => {
