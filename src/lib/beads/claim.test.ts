@@ -285,4 +285,11 @@ describe("stealRefused", () => {
       stage: "implementing",
     });
   });
+
+  it("serializes the owner away when the claim was released mid-flight", async () => {
+    const res = stealRefused("bd-1's claim changed in flight", undefined);
+    const body = await res.json();
+    expect(body).toEqual({ error: "bd-1's claim changed in flight" });
+    expect("owner" in body).toBe(false); // absent, not a null the client would have to special-case
+  });
 });
