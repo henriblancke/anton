@@ -250,6 +250,29 @@ describe("a premise the board has since falsified", () => {
     expect(record.detail).toBe(refusal.status === "refuse" ? refusal.reason : undefined);
   });
 
+  // The shadow holds the pass's RAW wall-clock reading, which still carries milliseconds, while bd
+  // stamps beads at whole seconds. Unfloored, this fence orders a same-second write as "before the
+  // observation" and promises an apply the armed path — which floors the stamp it reads off the
+  // proposal bead — fails closed on. Sub-second `observedAtMs` is the only input that can tell the
+  // two grids apart, so it is the only input that proves the flooring is load-bearing.
+  it("floors its fence to bd's stamp grid, so a write in the observed second refuses", async () => {
+    const sameSecond = bead("anton-a", { updated_at: "2026-08-02T00:00:00Z" });
+    serve([sameSecond]);
+
+    const record = only(await shadow(oneAsk(), { observedAtMs: OBSERVED + 500 }));
+
+    expect(record.outcome).toBe("refuse");
+    expect(record.detail).toContain(
+      "carries no write stamp this proposal's filing can be ordered against",
+    );
+    // Same grid, same verdict: verbatim what the armed path decides off its floored stamp.
+    const armed = realPlanApply(planOf(staleAsk("anton-a")), [sameSecond], {
+      nowMs: NOW,
+      observedAtMs: OBSERVED,
+    });
+    expect(record.detail).toBe(armed.status === "refuse" ? armed.reason : undefined);
+  });
+
   // The same board, shadowed as of the moment the pass READ it, is the ask the founder was shown.
   it("would have applied the very same ask against the board the pass observed", async () => {
     serve([bead("anton-a")]);
@@ -319,6 +342,24 @@ describe("a shadow that cannot run", () => {
     expect(await shadow(oneAsk(), { signal: AbortSignal.abort() })).toEqual([]);
     expect(loadMock).not.toHaveBeenCalled();
     expect(recorded()).toBe("");
+  });
+
+  // The mid-loop check, which the pre-read one cannot stand in for: a pass cancelled once it has
+  // started shadowing stops where it stands rather than deciding and logging every proposal left.
+  it("stops where it stands when the pass is cancelled mid-shadow", async () => {
+    const controller = new AbortController();
+    log.mockImplementationOnce(async () => {
+      controller.abort();
+    });
+    serve([bead("anton-a"), bead("anton-b")]);
+
+    const records = await shadow(
+      [filed(staleAsk("anton-a"), "anton-p1"), filed(staleAsk("anton-b"), "anton-p2")],
+      { signal: controller.signal },
+    );
+
+    expect(records.map((r) => r.proposal)).toEqual(["anton-p1"]);
+    expect(readPassRecords(recorded()).records).toHaveLength(1);
   });
 
   // Best-effort, never silent: a log store that will not take a write must not fail the pass it
