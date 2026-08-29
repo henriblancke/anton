@@ -26,6 +26,7 @@ import {
   type MoveRequest,
   type Stage,
 } from "@/lib/types";
+import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { EpicCard } from "@/components/board/epic-card";
 import { BoardColumn } from "@/components/board/board-column";
 import { BoardSkeleton } from "@/components/board/board-skeleton";
@@ -45,6 +46,7 @@ import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
+import { AutopilotBreakerHeader } from "@/components/board/autopilot-breaker-header";
 import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -62,6 +64,7 @@ export function EpicBoard({
   slug,
   initialBoard,
   escalations = [],
+  breaker,
   budgetAware = false,
 }: {
   slug: string;
@@ -73,6 +76,12 @@ export function EpicBoard({
    * need the board's poll.
    */
   escalations?: EscalationView[];
+  /**
+   * Why the autopilot has stopped filling the queue, if it has (anton-5c8h). Server-rendered by the
+   * page like the escalations beside it: a disarm is cleared by an action that reloads, and a hold
+   * changes only when a PR moves — neither is worth a place on the board's 30s poll.
+   */
+  breaker?: AutopilotBreaker;
   /** Project budget-aware flag (anton-y2ue): when on, cards offer Approve (immediate) vs Queue (paced). */
   budgetAware?: boolean;
 }) {
@@ -323,6 +332,9 @@ export function EpicBoard({
       {/* The one band that still needs a DECISION about a card below it, not just a look. Escalations
           come from the page's server render — they are answered by an action that reloads, not by a
           poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}
+      {/* Above the escalations, because it outranks them: an escalation is one stalled card, a
+          breaker is every card that would have started. */}
+      <AutopilotBreakerHeader slug={slug} breaker={breaker} />
       <EscalationStrip slug={slug} escalations={escalations} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the

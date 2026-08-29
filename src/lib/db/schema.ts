@@ -192,6 +192,52 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
 });
 
 /**
+ * The autopilot's DISARM latch, per project (anton-5c8h / R4.6). A disarm is the half of the brake
+ * that does not clear itself: a score regression or a run of failures freezes the picker until a
+ * human looks at the evidence and re-arms it, and this row is both the freeze and the audit trail of
+ * who lifted it.
+ *
+ * Only the disarm is stored. A HOLD (the WIP limit) is derived from live run/PR state on every pass
+ * and clears the moment that state changes — persisting it would create a second, staler answer to a
+ * question the board can already answer, and a stale hold is a stopped autopilot nobody can explain.
+ *
+ * Append-only rather than one row per project: `rearmed_at` closes a disarm instead of deleting it,
+ * so "this project was disarmed for score regression twice last week, and Henri re-armed it both
+ * times" survives. The partial unique index is what keeps at most ONE latched at a time, the same
+ * shape `escalations_open_unique` uses for the same reason.
+ */
+export const autopilotDisarms = sqliteTable(
+  "autopilot_disarms",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** `DisarmReason` (src/lib/autopilot-breaker.ts): score-regression | consecutive-failures. */
+    reason: text("reason").notNull(),
+    /** Why, in the detector's own words — the sentence the lane header prints under the heading. */
+    detail: text("detail").notNull(),
+    /** `string[]`: the score series or the failed runs. The operator's whole case for re-arming. */
+    evidenceJson: text("evidence_json").notNull().default("[]"),
+    /** The escalation this disarm raised (R4.6), so the header's `Investigate` lands on it. */
+    escalationId: text("escalation_id"),
+    disarmedAt: ts("disarmed_at").notNull().default(now),
+    /** Null while the breaker is latched. Set by an explicit human re-arm, never by a pass. */
+    rearmedAt: ts("rearmed_at"),
+    /** WHO re-armed it (`resolveOperator`) — a re-arm is a decision, and decisions have an author. */
+    rearmedBy: text("rearmed_by"),
+  },
+  (table) => [
+    // At most one LATCHED disarm per project: a second detector tripping while the first is unlifted
+    // must not stack a second freeze the operator has to clear twice.
+    uniqueIndex("autopilot_disarms_latched_unique")
+      .on(table.projectId)
+      .where(sql`${table.rearmedAt} is null`),
+    index("autopilot_disarms_project_idx").on(table.projectId, table.disarmedAt),
+  ],
+);
+
+/**
  * One gardener patrol's hygiene report (anton-3nv7). Unlike `run_health_reports` this is one row PER
  * RUN, not per project: the patrol WRITES to the board (it closes eligible epics and repairs the
  * blocked flag), so the row is the durable record of what a given patrol actually did — keyed to the
