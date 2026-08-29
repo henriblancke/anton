@@ -1461,6 +1461,60 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("2 signature");
     });
 
+    // The `=>` a closing line carries may belong to its RETURN TYPE, where nothing runs. Reading it
+    // as an expression body would count the line as code and keep a signal over a bare signature.
+    it("reads a return type carrying `=>` as a signature, not as an expression body", async () => {
+      const repo = writeRepo({
+        "src/handler.ts": [
+          "export function handler(",
+          "  items: string[],",
+          "): (item: string) => void {",
+          "  return () => {};",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/handler.ts", 2]], 2),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped[0].reason).toContain("2 signature");
+    });
+
+    // An import that binds nothing is there for its side effect: it registers, patches, polyfills.
+    // A window of those repeats real load-time work, so it is not filed with the specifier lists.
+    it("keeps a window of side-effect imports and still drops one of bound specifiers", async () => {
+      const repo = writeRepo({
+        "src/register.ts": [
+          'import "./register-plugin";',
+          'import "./polyfill";',
+          'import "./telemetry";',
+          "export const ready = true;",
+          "",
+        ].join("\n"),
+        "src/bound.ts": [
+          'import { parseBdVersion } from "./bd-bin";',
+          'import { resolveBdBin } from "./bd-bin";',
+          'import { preflightBd } from "./bd-bin";',
+          "export const used = [parseBdVersion, resolveBdBin, preflightBd];",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/register.ts", 1]], 3),
+        clone([["src/bound.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/register.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/bound.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // A window of nothing but closers is dropped too — but "declares rather than computes" would be
     // the wrong diagnosis to hand an operator, since there is nothing there that declares either.
     it("says a block holds no content line rather than blaming its declarations", async () => {

@@ -102,6 +102,13 @@ const IMPORT_START =
 const TYPE_START =
   /^(?:export\s+)?(?:(?:declare\s+)?(?:interface|type)|declare\s+(?:const\s+)?enum|const\s+enum)\s+[A-Za-z_$]/;
 
+/**
+ * `import "./register-plugin";` — an import that binds NOTHING is there for what the module does on
+ * load: registering a plugin, installing a polyfill. That runs, so the line computes rather than
+ * declares, and a window of them is duplicated setup triage can act on.
+ */
+const SIDE_EFFECT_IMPORT = /^import\s+["'][^"']+["']\s*;?$/;
+
 /** `function foo(` / `export async function foo(` — a declaration header, not a call. */
 const FUNCTION_START = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
 
@@ -207,12 +214,16 @@ function closingTail(line: string, depth: number): string {
   return "";
 }
 
-/** Whether that tail holds an expression body rather than an opening brace or a return type. */
+/**
+ * Whether that tail holds an expression body rather than an opening brace or a return type. A tail
+ * ending in `{` opens a BODY however it got there — including `): (item: Item) => void {`, where the
+ * `=>` belongs to the return type and nothing on the line runs.
+ */
 function hasArrowBody(tail: string): boolean {
   const arrow = tail.indexOf("=>");
   if (arrow < 0) return false;
   const body = tail.slice(arrow + 2).replace(/[;,]+$/, "").trim();
-  return body !== "" && body !== "{";
+  return body !== "" && !body.endsWith("{");
 }
 
 /**
@@ -297,6 +308,11 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         statement = "signature";
         depth = open;
       }
+      continue;
+    }
+
+    if (SIDE_EFFECT_IMPORT.test(line)) {
+      classes.push("code");
       continue;
     }
 
