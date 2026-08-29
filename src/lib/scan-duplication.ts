@@ -160,14 +160,59 @@ function headerHasParameterDefault(line: string): boolean {
 }
 
 /**
+ * A type line left mid-expression — `type X =`, a trailing union bar, an open generic. The alias
+ * cannot have ended here whatever the next line says.
+ */
+const TYPE_UNFINISHED = /(?:[=|&,<(:?]|\bextends)$/;
+
+/** The next line picking that alias back up — a leading `| member`, `& Other`, `extends X`. */
+const TYPE_RESUMED = /^(?:[|&?:]|extends\b)/;
+
+/**
  * Whether a declaration statement runs past this line. An import ends when its bracket list closes
  * and no other way: Python's `import os` and Go's `import (\n  "fmt"\n)` carry neither a `;` nor a
  * quoted `from` clause, and reading one as unterminated would classify the whole rest of the file as
- * an import. A `type X =` union opens no bracket at all, so it needs its terminator.
+ * an import.
+ *
+ * A `type X =` union opens no bracket at all, so it is read off the expression instead of off a
+ * terminator: a repo that writes no semicolons ends `type Status = "ready" | "done"` with the line,
+ * and a union of inline objects (`| { mode: "dev" }`) closes a brace on every member without ending
+ * anything. Only an unfinished line, or one the NEXT line continues, keeps the alias open.
  */
-function continues(kind: "import" | "type", line: string, depth: number): boolean {
+function continues(
+  kind: "import" | "type",
+  line: string,
+  depth: number,
+  next: string,
+): boolean {
   if (depth > 0) return true;
-  return kind === "type" && !line.endsWith(";") && !line.endsWith("}");
+  if (kind === "import" || line.endsWith(";")) return false;
+  return TYPE_UNFINISHED.test(line) || TYPE_RESUMED.test(next);
+}
+
+/**
+ * What a signature line carries once its parameter list closes. `) {` and `): Promise<void> {`
+ * open a body — nothing runs on that line; `) => left * right` IS the body and runs on every call.
+ */
+function closingTail(line: string, depth: number): string {
+  const text = stripNoise(line);
+  let open = depth;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "(") open += 1;
+    else if (text[i] === ")") {
+      open -= 1;
+      if (open <= 0) return text.slice(i + 1);
+    }
+  }
+  return "";
+}
+
+/** Whether that tail holds an expression body rather than an opening brace or a return type. */
+function hasArrowBody(tail: string): boolean {
+  const arrow = tail.indexOf("=>");
+  if (arrow < 0) return false;
+  const body = tail.slice(arrow + 2).replace(/[;,]+$/, "").trim();
+  return body !== "" && body !== "{";
 }
 
 /**
@@ -182,8 +227,10 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
 
-  for (const raw of source.split("\n")) {
-    const line = raw.trim();
+  const lines = source.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    const next = lines[index + 1]?.trim() ?? "";
 
     if (inComment) {
       classes.push("comment");
@@ -194,7 +241,9 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       classes.push("blank");
       continue;
     }
-    if (line.startsWith("//") || line.startsWith("*") || (opts.hashComments && line.startsWith("#"))) {
+    // A leading `*` is NOT read as comment text here: every line of a block comment is already
+    // claimed by the `inComment` branch above, so outside one it is a multiplication continuation.
+    if (line.startsWith("//") || (opts.hashComments && line.startsWith("#"))) {
       classes.push("comment");
       continue;
     }
@@ -207,10 +256,15 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     if (statement) {
       if (statement === "signature") {
         // The parameter list, however it is spelled — a destructured props object, its inline type
-        // annotation, one name per line. None of it computes anything, unless it defaults.
-        classes.push(hasParameterDefault(line) ? "code" : "signature");
+        // annotation, one name per line. None of it computes anything, unless it defaults — or
+        // unless the line that closes the list carries the arrow body with it.
+        const tail = closingTail(line, depth);
         depth += parenDelta(line);
-        if (depth <= 0) {
+        const closes = depth <= 0;
+        classes.push(
+          hasParameterDefault(line) || (closes && hasArrowBody(tail)) ? "code" : "signature",
+        );
+        if (closes) {
           statement = undefined;
           depth = 0;
         }
@@ -218,7 +272,7 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       }
       classes.push(statement);
       depth += braceDelta(line);
-      if (!continues(statement, line, depth)) {
+      if (!continues(statement, line, depth, next)) {
         statement = undefined;
         depth = 0;
       }
@@ -252,7 +306,7 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     depth = braceDelta(line);
     // A statement that closes on its own line opens nothing; otherwise its continuation lines
     // inherit the same class until it terminates.
-    if (continues(kind, line, depth)) statement = kind;
+    if (continues(kind, line, depth, next)) statement = kind;
     else depth = 0;
   }
   return classes;

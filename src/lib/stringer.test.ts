@@ -1354,6 +1354,113 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("5 type");
     });
 
+    // A `type X =` alias opens no bracket, so a repo that writes no semicolons ends one with the
+    // line. Reading it as unterminated would classify every function under it as a type declaration
+    // and drop the real clones among them.
+    it("ends a type alias in a repo that writes no semicolons, not at the next stray brace", async () => {
+      const repo = writeRepo({
+        "src/status.ts": [
+          'export type Status = "ready" | "done"',
+          "",
+          "export function tally(items: string[]) {",
+          "  let ready = 0",
+          "  for (const item of items) ready += item.length",
+          "  return ready",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/status.ts", 3]], 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/status.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // Each member of a union of inline objects closes a brace without ending the alias. Cutting the
+    // statement there would classify the members after the first as code and keep a signal over a
+    // block that only declares.
+    it("carries a type alias across union members that close their own braces", async () => {
+      const repo = writeRepo({
+        "src/config.ts": [
+          "export type Config =",
+          '  | { mode: "dev"; port: number }',
+          '  | { mode: "prod"; port: number }',
+          '  | { mode: "test"; port: number };',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/config.ts", 1]], 4),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped[0].reason).toContain("4 type");
+    });
+
+    // A leading `*` only reads as comment text INSIDE a block comment — the branch above already
+    // claims every line of one. Outside it, the operator continues an expression and computes.
+    it("reads a leading `*` as multiplication, not as a comment, outside a block comment", async () => {
+      const repo = writeRepo({
+        "src/scale.ts": [
+          "export function scale(a: number, b: number, c: number) {",
+          "  return a",
+          "    * b",
+          "    * c",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/scale.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/scale.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // The line that closes a parameter list declares nothing when it opens a body — but an
+    // expression-bodied arrow puts the whole body on it, and that body runs on every call.
+    it("counts the arrow body on a closing parameter line as code, and a `) {` as a signature", async () => {
+      const repo = writeRepo({
+        "src/multiply.ts": [
+          "export const multiply = (",
+          "  left: number,",
+          "  right: number,",
+          ") => left * right;",
+          "",
+        ].join("\n"),
+        "src/describe.ts": [
+          "export function describe(",
+          "  left: number,",
+          "  right: number,",
+          ") {",
+          "  return left;",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      // Both windows are the tail of the parameter list plus the line that closes it — the same
+      // shape, told apart only by what that closing line carries.
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/multiply.ts", 3]], 2),
+        clone([["src/describe.ts", 3]], 2),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/multiply.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/describe.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("2 signature");
+    });
+
     // A window of nothing but closers is dropped too — but "declares rather than computes" would be
     // the wrong diagnosis to hand an operator, since there is nothing there that declares either.
     it("says a block holds no content line rather than blaming its declarations", async () => {
