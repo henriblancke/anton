@@ -289,27 +289,81 @@ export function PolicyDraftSection({
           </Criterion>
 
           <Criterion label="Priority" why={why("priority")}>
-            <label className="flex items-center gap-2 text-[11.5px] text-subtle">
-              at least
-              <select
-                value={policy.maxPriority ?? ""}
-                aria-label="Minimum priority"
-                onChange={(e) =>
-                  setPolicy((p) => ({
-                    ...p,
-                    maxPriority: e.target.value === "" ? undefined : Number(e.target.value),
-                  }))
-                }
-                className="rounded-lg border border-border bg-background px-2 py-1 font-mono text-[12px] text-foreground outline-none focus:border-primary/60"
-              >
-                <option value="">any priority</option>
-                {PRIORITIES.map((p) => (
-                  <option key={p} value={p}>
-                    P{p}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
+              <label className="flex items-center gap-2">
+                at least
+                <PrioritySelect
+                  name="Minimum priority"
+                  value={policy.maxPriority}
+                  onChange={(next) => setPolicy((p) => ({ ...p, maxPriority: next }))}
+                />
+              </label>
+              <label className="flex items-center gap-2">
+                and no more urgent than
+                <PrioritySelect
+                  name="Maximum priority"
+                  value={policy.minPriority}
+                  onChange={(next) => setPolicy((p) => ({ ...p, minPriority: next }))}
+                />
+              </label>
+            </div>
+            {typeof policy.minPriority === "number" && policy.minPriority > 0 && (
+              <p className="text-[11px] text-subtle">
+                Anything more urgent than P{policy.minPriority} is left for a human to start.
+              </p>
+            )}
+          </Criterion>
+
+          <Criterion label="Parentage" why={why("parentage")}>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
+              <label className="flex items-center gap-2">
+                at least
+                <Bound
+                  name="Minimum parent depth"
+                  value={policy.minParentDepth}
+                  onChange={(next) => setPolicy((p) => ({ ...p, minParentDepth: next }))}
+                />
+              </label>
+              <label className="flex items-center gap-2">
+                and at most
+                <Bound
+                  name="Maximum parent depth"
+                  value={policy.maxParentDepth}
+                  onChange={(next) => setPolicy((p) => ({ ...p, maxParentDepth: next }))}
+                />
+                parent levels
+              </label>
+            </div>
+            <p className="text-[11px] text-subtle">
+              Depth 0 is top-level, so &ldquo;at most 0&rdquo; admits only parentless work.
+            </p>
+          </Criterion>
+
+          <Criterion label="Age" why={why("age")}>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
+              <label className="flex items-center gap-2">
+                filed at least
+                <Bound
+                  name="Minimum age in days"
+                  value={policy.minAgeDays}
+                  onChange={(next) => setPolicy((p) => ({ ...p, minAgeDays: next }))}
+                />
+              </label>
+              <label className="flex items-center gap-2">
+                and at most
+                <Bound
+                  name="Maximum age in days"
+                  value={policy.maxAgeDays}
+                  onChange={(next) => setPolicy((p) => ({ ...p, maxAgeDays: next }))}
+                />
+                days ago
+              </label>
+            </div>
+            <p className="text-[11px] text-subtle">
+              The soak is the guard against starting work a human filed minutes ago and is still
+              editing; the far end keeps a widened policy from reaching back into work the board has
+              ignored for a year.
+            </p>
           </Criterion>
 
           {namespaces.map((group) => (
@@ -615,6 +669,75 @@ function Criterion({
         </p>
       )}
     </div>
+  );
+}
+
+/** Shared chrome, so both ends of an ordered bound read as the same kind of control. */
+const BOUND_CLASS =
+  "rounded-lg border border-border bg-background px-2 py-1 font-mono text-[12px] text-foreground outline-none focus:border-primary/60";
+
+/**
+ * One end of the priority bound. The scale is printed the way an operator says it — P0 is the most
+ * urgent — while the policy holds bd's number, so the two ends read as "at least" and "no more
+ * urgent than" even though the comparison underneath them inverts.
+ */
+function PrioritySelect({
+  name,
+  value,
+  onChange,
+}: {
+  name: string;
+  value?: number;
+  onChange: (next: number | undefined) => void;
+}) {
+  return (
+    <select
+      aria-label={name}
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value === "" ? undefined : Number(e.target.value))}
+      className={BOUND_CLASS}
+    >
+      <option value="">any priority</option>
+      {PRIORITIES.map((p) => (
+        <option key={p} value={p}>
+          P{p}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * One end of a whole-unit native bound — parent hops, or days.
+ *
+ * Empty is UNSET, never 0: an asserted criterion still fails closed on a bead that cannot answer it,
+ * so an operator clearing the box has to stop asserting it rather than assert zero.
+ */
+function Bound({
+  name,
+  value,
+  onChange,
+}: {
+  name: string;
+  value?: number;
+  onChange: (next: number | undefined) => void;
+}) {
+  return (
+    <input
+      type="number"
+      inputMode="numeric"
+      min={0}
+      step={1}
+      placeholder="any"
+      aria-label={name}
+      value={value ?? ""}
+      onChange={(e) => {
+        const parsed = Number(e.target.value);
+        const unset = e.target.value === "" || !Number.isFinite(parsed) || parsed < 0;
+        onChange(unset ? undefined : Math.floor(parsed));
+      }}
+      className={cn(BOUND_CLASS, "w-16")}
+    />
   );
 }
 

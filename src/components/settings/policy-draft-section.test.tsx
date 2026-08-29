@@ -135,17 +135,51 @@ function stubFetch() {
  * reason would be visible.
  */
 const CANDIDATES: PolicyCandidate[] = [
-  { id: "anton-1", title: "crash on save", type: "bug", priority: 1, labels: ["severity:critical"] },
-  { id: "anton-2", title: "flaky import", type: "bug", priority: 2, labels: ["severity:major"] },
-  { id: "anton-3", title: "tidy the docs", type: "chore", priority: 2, labels: ["severity:minor"] },
+  {
+    id: "anton-1",
+    title: "crash on save",
+    type: "bug",
+    priority: 1,
+    depth: 0,
+    ageDays: 10,
+    labels: ["severity:critical"],
+  },
+  {
+    id: "anton-2",
+    title: "flaky import",
+    type: "bug",
+    priority: 2,
+    depth: 1,
+    ageDays: 1,
+    labels: ["severity:major"],
+  },
+  {
+    id: "anton-3",
+    title: "tidy the docs",
+    type: "chore",
+    priority: 2,
+    depth: 0,
+    ageDays: 40,
+    labels: ["severity:minor"],
+  },
   {
     id: "anton-4",
     title: "new billing flow",
     type: "feature",
     priority: 0,
+    depth: 2,
+    ageDays: 3,
     labels: ["severity:critical"],
   },
-  { id: "anton-5", title: "unlabelled work", type: "bug", priority: 1, labels: [] },
+  {
+    id: "anton-5",
+    title: "unlabelled work",
+    type: "bug",
+    priority: 1,
+    depth: 0,
+    ageDays: 0,
+    labels: [],
+  },
 ];
 
 function renderPanel(props: Partial<Parameters<typeof PolicyDraftSection>[0]> = {}) {
@@ -334,6 +368,106 @@ describe("the boundary is legible (R2.6)", () => {
     expect(
       screen.getByText(/never shared with another machine running this repo/),
     ).toBeTruthy();
+  });
+});
+
+/**
+ * The ordered native fields (R2.3), which is the half of the editor an operator cannot express any
+ * other way: a namespace criterion is membership, so parentage, age and the urgent end of the
+ * priority scale exist only as controls here. Each bound is driven against a policy that asserts
+ * nothing else, so a count that moved did so for the reason under test.
+ */
+describe("the ordered native bounds (R2.3)", () => {
+  const open = { stored: {}, candidates: CANDIDATES };
+
+  it("withholds the urgent end of the scale from autopilot", async () => {
+    const fetchMock = stubFetch();
+    renderPanel(open);
+    expect(matchCount()).toBe("5 of 5 open beads match this policy");
+
+    fireEvent.change(screen.getByLabelText("Maximum priority"), { target: { value: "1" } });
+    // The P0 feature is the work an operator wants triaged by hand, not started by a rule.
+    expect(matchCount()).toBe("4 of 5 open beads match this policy");
+    expect(screen.getByText(/more urgent than P1 is left for a human/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock).minPriority).toBe(1);
+  });
+
+  it("bounds parentage at both ends", async () => {
+    const fetchMock = stubFetch();
+    renderPanel(open);
+
+    // "Parentless work only" — the three top-level beads.
+    fireEvent.change(screen.getByLabelText("Maximum parent depth"), { target: { value: "0" } });
+    expect(matchCount()).toBe("3 of 5 open beads match this policy");
+
+    // The other end: only work that sits under a parent.
+    fireEvent.change(screen.getByLabelText("Maximum parent depth"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Minimum parent depth"), { target: { value: "1" } });
+    expect(matchCount()).toBe("2 of 5 open beads match this policy");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock)).toEqual({ minParentDepth: 1 });
+  });
+
+  it("soaks new work and ignores stale work", async () => {
+    const fetchMock = stubFetch();
+    renderPanel(open);
+
+    // The soak: nothing filed inside the last two days, so the day-old and the same-day bead go.
+    fireEvent.change(screen.getByLabelText("Minimum age in days"), { target: { value: "2" } });
+    expect(matchCount()).toBe("3 of 5 open beads match this policy");
+
+    // And the stale end drops the 40-day-old chore the board has already ignored.
+    fireEvent.change(screen.getByLabelText("Maximum age in days"), { target: { value: "30" } });
+    expect(matchCount()).toBe("2 of 5 open beads match this policy");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock)).toEqual({ minAgeDays: 2, maxAgeDays: 30 });
+  });
+
+  it("clears a bound to unasserted rather than to zero", async () => {
+    const fetchMock = stubFetch();
+    renderPanel(open);
+    fireEvent.change(screen.getByLabelText("Minimum age in days"), { target: { value: "2" } });
+    fireEvent.change(screen.getByLabelText("Minimum age in days"), { target: { value: "" } });
+    // A bound stored as 0 would still be asserted, and would fail closed on a bead carrying no
+    // creation date — the opposite of what emptying the box means.
+    expect(matchCount()).toBe("5 of 5 open beads match this policy");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock)).toEqual({});
+  });
+
+  it("round-trips every stored bound back into its control", async () => {
+    const fetchMock = stubFetch();
+    const stored = {
+      maxPriority: 3,
+      minPriority: 1,
+      minParentDepth: 0,
+      maxParentDepth: 2,
+      minAgeDays: 1,
+      maxAgeDays: 30,
+    };
+    renderPanel({ stored });
+
+    const value = (name: string) =>
+      (screen.getByLabelText(name) as HTMLInputElement | HTMLSelectElement).value;
+    expect(value("Minimum priority")).toBe("3");
+    expect(value("Maximum priority")).toBe("1");
+    expect(value("Minimum parent depth")).toBe("0");
+    expect(value("Maximum parent depth")).toBe("2");
+    expect(value("Minimum age in days")).toBe("1");
+    expect(value("Maximum age in days")).toBe("30");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock)).toEqual(stored);
   });
 });
 
