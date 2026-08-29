@@ -528,16 +528,21 @@ const AUTOMATIONS: AutomationSpec[] = [
 /**
  * The cadence coupling arming the picker creates (anton-3xa9, design R7.1).
  *
- * The board-picker is what turns product-master's judgment from advisory into load-bearing: with it
- * off, a stale priority is a stale opinion someone reads whenever; with it on, it is a stale
- * DECISION about what anton does next. That is the only reason the offer exists — and the only
+ * The board-picker is the only automation that CONSUMES product-master's output: with it off, a
+ * stale priority is a stale opinion someone reads whenever; with it on, it is the input to a
+ * ranking recomputed every few minutes. That is the only reason the offer exists — and the only
  * automation it is offered for, because no other pair of schedules has that relationship.
+ *
+ * The offer states the picker's effect TODAY — it records a plan, it starts nothing (see
+ * `src/lib/jobs/board-picker.ts`). Overstating that would buy a daily claude session on a promise
+ * the build does not keep; when the arming feature lands and the plan is executed, the reason gets
+ * stronger, not different.
  */
 const AUTOPILOT_ARMING_AUTOMATION = "board-picker";
 const CADENCE_COUPLED_AUTOMATION = "product-master";
 const CADENCE_OFFER_REASON =
-  "product-master's judgment now feeds the board-picker — what it ranks is executed, not just read. " +
-  "A week-old priority is a week-old decision. Run it daily?";
+  "board-picker now ranks what could run next off these priorities and records that plan — it " +
+  "starts nothing yet. A week-old priority makes a week-old ranking. Run it daily?";
 
 /**
  * How often the open Automation panel re-reads the schedule rows.
@@ -1021,8 +1026,8 @@ export function SettingsView({
     }
     // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs, so
     // it is the one toggle that opens an offer — and only an offer. Asked only once the arm LANDED:
-    // the offer's entire premise is that the picker now executes what product-master ranks, so a
-    // failed PATCH must not leave a question standing on a condition that never happened. Disarming
+    // the offer's entire premise is that the picker is now ranking off product-master's priorities,
+    // so a failed PATCH must not leave a question standing on a condition that never happened. Disarming
     // deliberately does nothing to the cadence: an operator who accepted daily keeps daily until
     // they say otherwise, and a schedule that silently sprang back would make this table
     // untrustworthy about the only thing it exists to report.
@@ -1033,7 +1038,7 @@ export function SettingsView({
    * Offer to raise product-master from weekly to daily, if there is anything to offer.
    *
    * Silent in four cases, each of which would make the offer a lie or a nag: the operator already
-   * answered `keep weekly`; they have since asked for the picker to be off, so nothing executes what
+   * answered `keep weekly`; they have since asked for the picker to be off, so nothing consumes what
    * product-master judges; product-master is off, so its output feeds nothing and its cadence is
    * moot; or its cadence is not weekly — already daily-or-faster, or hand-written, and neither is
    * ours to rewrite (see {@link dailyEquivalentOf}).

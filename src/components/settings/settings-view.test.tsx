@@ -1387,9 +1387,12 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(offer()).toBeNull();
     await waitFor(() => expect(offer()).toBeTruthy());
     const prompt = offer();
-    // The WHY, not the mechanism: the judgment is executed now, so its staleness costs something.
-    expect(prompt!.textContent).toMatch(/feeds the board-picker/);
-    expect(prompt!.textContent).toMatch(/executed, not just read/);
+    // The WHY, not the mechanism: the picker consumes these priorities now, so staleness costs
+    // something. And only what the build actually does — the picker records a plan, it starts
+    // nothing — because the offer buys a daily claude session and must not sell an absent feature.
+    expect(prompt!.textContent).toMatch(/ranks what could run next/);
+    expect(prompt!.textContent).toMatch(/starts nothing yet/);
+    expect(prompt!.textContent).not.toMatch(/executed/);
     expect(prompt!.textContent).toContain("Weekly on Monday at 06:00");
     expect(prompt!.textContent).toContain("Daily at 06:00");
     // Asking is not doing — the cadence is untouched until the operator answers.
