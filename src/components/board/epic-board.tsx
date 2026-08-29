@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { TriangleAlertIcon } from "lucide-react";
@@ -46,7 +46,7 @@ import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
-import { AutopilotBreakerHeader } from "@/components/board/autopilot-breaker-header";
+import { AutopilotBreakerBand } from "@/components/board/autopilot-breaker-header";
 import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -80,8 +80,11 @@ export function EpicBoard({
    * Why the autopilot has stopped filling the queue, if it has (anton-5c8h). Server-rendered by the
    * page like the escalations beside it: a disarm is cleared by an action that reloads, and a hold
    * changes only when a PR moves — neither is worth a place on the board's 30s poll.
+   *
+   * A PROMISE, not a value: deciding the hold reads GitHub, and the cards must not wait on that.
+   * It streams into its own Suspense boundary below.
    */
-  breaker?: AutopilotBreaker;
+  breaker?: Promise<AutopilotBreaker | undefined>;
   /** Project budget-aware flag (anton-y2ue): when on, cards offer Approve (immediate) vs Queue (paced). */
   budgetAware?: boolean;
 }) {
@@ -334,7 +337,11 @@ export function EpicBoard({
           poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}
       {/* Above the escalations, because it outranks them: an escalation is one stalled card, a
           breaker is every card that would have started. */}
-      <AutopilotBreakerHeader slug={slug} breaker={breaker} />
+      {/* Its own boundary, and a null fallback: the band is late context, not a placeholder the
+          operator should watch a skeleton for. */}
+      <Suspense fallback={null}>
+        <AutopilotBreakerBand slug={slug} breaker={breaker} />
+      </Suspense>
       <EscalationStrip slug={slug} escalations={escalations} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the

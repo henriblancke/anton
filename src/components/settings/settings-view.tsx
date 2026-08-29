@@ -98,6 +98,15 @@ interface EditableSettings {
   };
   /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
   valueLabels?: string[];
+  /**
+   * The autopilot brakes (anton-nmy7): when anton stops STARTING work. `autopilotWipLimit` is a
+   * self-clearing hold; the other three latch a disarm only a human re-arms. Each absent value
+   * falls back to its shipped default.
+   */
+  autopilotWipLimit?: number;
+  autopilotFailureStreak?: number;
+  autopilotScoreFloor?: number;
+  autopilotScoreWindow?: number;
 }
 
 // Defaults mirror the server (src/lib/projects.ts DEFAULT_*); duplicated so this client module
@@ -117,6 +126,21 @@ const REVIEW_MIN_SCORE_MAX = 10;
 const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
 const REVIEW_LOW_SCORE_ROUNDS_MIN = 1;
 const REVIEW_LOW_SCORE_ROUNDS_MAX = 5;
+// Autopilot brakes (anton-nmy7). 0 is the OFF switch on three of the four — a limit, a streak or a
+// floor of zero can never be reached — which is why those ranges start at 0 rather than 1.
+const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
+const AUTOPILOT_WIP_LIMIT_MIN = 0;
+const AUTOPILOT_WIP_LIMIT_MAX = 20;
+const DEFAULT_AUTOPILOT_FAILURE_STREAK = 3;
+const AUTOPILOT_FAILURE_STREAK_MIN = 0;
+const AUTOPILOT_FAILURE_STREAK_MAX = 10;
+const DEFAULT_AUTOPILOT_SCORE_FLOOR = 7;
+const AUTOPILOT_SCORE_FLOOR_MIN = 0;
+const AUTOPILOT_SCORE_FLOOR_MAX = 10;
+const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
+const AUTOPILOT_SCORE_WINDOW_MIN = 1;
+const AUTOPILOT_SCORE_WINDOW_MAX = 10;
+
 // Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
 const DEFAULT_DAYTIME_RESERVE_PCT = 15;
 const DEFAULT_WEEKLY_TARGET_PCT = 90;
@@ -367,6 +391,12 @@ const SECTIONS = [
       "conventionalCommits",
       "budget",
     ],
+  },
+  {
+    id: "autopilot",
+    label: "Autopilot brakes",
+    group: "While a run works",
+    dirtyKeys: ["autopilot"],
   },
   {
     id: "value",
@@ -621,6 +651,20 @@ export function SettingsView({
     settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES,
   );
   const [maxRetries, setMaxRetries] = useState(settings.maxRetries ?? DEFAULT_MAX_RETRIES);
+  // The autopilot brakes (anton-nmy7), held resolved like every other numeric knob: the control has
+  // to render a number, and "absent" is not one.
+  const [autopilotWipLimit, setAutopilotWipLimit] = useState(
+    settings.autopilotWipLimit ?? DEFAULT_AUTOPILOT_WIP_LIMIT,
+  );
+  const [autopilotFailureStreak, setAutopilotFailureStreak] = useState(
+    settings.autopilotFailureStreak ?? DEFAULT_AUTOPILOT_FAILURE_STREAK,
+  );
+  const [autopilotScoreFloor, setAutopilotScoreFloor] = useState(
+    settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR,
+  );
+  const [autopilotScoreWindow, setAutopilotScoreWindow] = useState(
+    settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW,
+  );
   const [autonomy, setAutonomy] = useState(settings.autonomy ?? true);
   const [conventionalCommits, setConventionalCommits] = useState(
     settings.conventionalCommits ?? false,
@@ -739,6 +783,12 @@ export function SettingsView({
     ticketTimeoutMinutes:
       ticketTimeoutMinutes !== (baseline.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES),
     maxRetries: maxRetries !== (baseline.maxRetries ?? DEFAULT_MAX_RETRIES),
+    autopilot:
+      autopilotWipLimit !== (baseline.autopilotWipLimit ?? DEFAULT_AUTOPILOT_WIP_LIMIT) ||
+      autopilotFailureStreak !==
+        (baseline.autopilotFailureStreak ?? DEFAULT_AUTOPILOT_FAILURE_STREAK) ||
+      autopilotScoreFloor !== (baseline.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR) ||
+      autopilotScoreWindow !== (baseline.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW),
     autonomy: autonomy !== (baseline.autonomy ?? true),
     conventionalCommits: conventionalCommits !== (baseline.conventionalCommits ?? false),
     budget:
@@ -981,6 +1031,13 @@ export function SettingsView({
           jobTimeoutMinutes,
           ticketTimeoutMinutes,
           maxRetries,
+          // The autopilot brakes (anton-nmy7). Sent as concrete numbers, including the 0 that turns
+          // one off: null would clear the override back to the shipped default, which is the exact
+          // opposite of what an operator disabling a breaker asked for.
+          autopilotWipLimit,
+          autopilotFailureStreak,
+          autopilotScoreFloor,
+          autopilotScoreWindow,
           // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
           // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather
           // than re-persisted, so user agents never leak into the bundled allowlist.
@@ -1694,6 +1751,115 @@ export function SettingsView({
                     min={1}
                   />
                 </div>
+              </div>
+            </section>
+          </div>
+          )}
+
+          {active === "autopilot" && (
+          <div className="grid max-w-3xl grid-cols-1 gap-7">
+            <section className="flex flex-col gap-3.5">
+              <div className="flex items-baseline gap-2.5">
+                <h2 className="text-[15px] font-semibold">Autopilot brakes</h2>
+                <span className="text-xs text-subtle">
+                  when anton stops starting new work — and what it takes to start again
+                </span>
+              </div>
+              <span className="text-[11px] text-subtle">
+                Work already running is never affected — only starting new work is stopped. Whichever
+                brake is on says so on the board, with what would release it, so none of this has to
+                be read back from here.
+              </span>
+
+              {/* The HOLD first, and worded as pacing rather than as a fault. It is the one brake
+                  that clears itself, and an operator who reads it as a failure turns it off. */}
+              <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-background/40 px-3 py-2.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-[12.5px] font-medium">Review queue limit</span>
+                  <span className="text-[11px] text-subtle">
+                    {autopilotWipLimit === AUTOPILOT_WIP_LIMIT_MIN
+                      ? "off · anton starts work however many PRs are waiting on you"
+                      : `hold once ${autopilotWipLimit} PR${autopilotWipLimit === 1 ? " is" : "s are"} open in review`}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <CountField
+                    label="Open PRs in review"
+                    value={autopilotWipLimit}
+                    onChange={setAutopilotWipLimit}
+                    min={AUTOPILOT_WIP_LIMIT_MIN}
+                    max={AUTOPILOT_WIP_LIMIT_MAX}
+                    fallback={DEFAULT_AUTOPILOT_WIP_LIMIT}
+                    hint={`0 turns the hold off · default ${DEFAULT_AUTOPILOT_WIP_LIMIT}`}
+                  />
+                </div>
+                <span className="text-[11px] text-subtle">
+                  A hold, not a disarm: it releases itself the moment one of those PRs merges or
+                  closes, and asks nothing of you in the meantime.
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-background/40 px-3 py-2.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-[12.5px] font-medium">Consecutive-failure breaker</span>
+                  <span className="text-[11px] text-subtle">
+                    {autopilotFailureStreak === AUTOPILOT_FAILURE_STREAK_MIN
+                      ? "off · anton keeps starting runs however many fail"
+                      : `disarm after ${autopilotFailureStreak} run${autopilotFailureStreak === 1 ? "" : "s"} failing in a row`}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <CountField
+                    label="Failed runs in a row"
+                    value={autopilotFailureStreak}
+                    onChange={setAutopilotFailureStreak}
+                    min={AUTOPILOT_FAILURE_STREAK_MIN}
+                    max={AUTOPILOT_FAILURE_STREAK_MAX}
+                    fallback={DEFAULT_AUTOPILOT_FAILURE_STREAK}
+                    hint={`0 turns the breaker off · default ${DEFAULT_AUTOPILOT_FAILURE_STREAK}`}
+                  />
+                </div>
+                <span className="text-[11px] text-subtle">
+                  Runs you cancelled, and work you abandoned, do not count toward the streak. A
+                  disarm stays off until you re-arm it from the board — no pass ever lifts one.
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-2.5 rounded-[10px] border border-border bg-background/40 px-3 py-2.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-[12.5px] font-medium">Score-regression breaker</span>
+                  <span className="text-[11px] text-subtle">
+                    {autopilotScoreFloor === AUTOPILOT_SCORE_FLOOR_MIN
+                      ? "off · anton keeps starting runs however they score"
+                      : `disarm after ${autopilotScoreWindow} run${autopilotScoreWindow === 1 ? "" : "s"} scoring below ${autopilotScoreFloor}/10`}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <CountField
+                    label="Score floor"
+                    value={autopilotScoreFloor}
+                    onChange={setAutopilotScoreFloor}
+                    min={AUTOPILOT_SCORE_FLOOR_MIN}
+                    max={AUTOPILOT_SCORE_FLOOR_MAX}
+                    fallback={DEFAULT_AUTOPILOT_SCORE_FLOOR}
+                    hint={`0 turns the breaker off · default ${DEFAULT_AUTOPILOT_SCORE_FLOOR}`}
+                  />
+                  <CountField
+                    label="Consecutive runs below it"
+                    value={autopilotScoreWindow}
+                    onChange={setAutopilotScoreWindow}
+                    min={AUTOPILOT_SCORE_WINDOW_MIN}
+                    max={AUTOPILOT_SCORE_WINDOW_MAX}
+                    fallback={DEFAULT_AUTOPILOT_SCORE_WINDOW}
+                    disabled={autopilotScoreFloor === AUTOPILOT_SCORE_FLOOR_MIN}
+                    hint={`a run at or above the floor restarts the series · default ${DEFAULT_AUTOPILOT_SCORE_WINDOW}`}
+                  />
+                </div>
+                <span className="text-[11px] text-subtle">
+                  Judged on the self-review score each finished run was given — the series the Health
+                  page charts. Not the same knob as the score-regression alarm under Self-review:
+                  that one parks a single run mid-review, this one stops the project.
+                </span>
               </div>
             </section>
           </div>

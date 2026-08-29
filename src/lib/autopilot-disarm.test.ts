@@ -6,11 +6,12 @@
  *   • the re-arm has an AUTHOR — lifting a frozen policy is the most consequential click on the
  *     board, and "who decided the scores were fine again" is the question asked afterwards.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import { schema } from "@/lib/db";
 import {
   activeDisarm,
+  activeDisarmForPass,
   disarmAutopilot,
   disarmWithEscalation,
   lastReArmAt,
@@ -191,6 +192,65 @@ describe("disarmWithEscalation", () => {
 
     await reArmAutopilot(test.db, clock, { projectId: PROJECT, actor: "Henri Blancke" });
 
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(0);
+  });
+
+  it("lifts the latch even when settling its escalation fails", async () => {
+    // The UPDATE has already committed by the time the settle runs, so the autopilot IS armed
+    // again. Reporting the settle's failure as the re-arm's would tell the operator their project
+    // is still frozen while it is running — the one direction this must never fail in.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await disarmWithEscalation(test.db, clock, input);
+    test.sqlite.prepare("DROP TABLE escalations").run();
+
+    const result = await reArmAutopilot(test.db, clock, { projectId: PROJECT, actor: "Henri" });
+
+    expect(result.ok).toBe(true);
+    expect(await activeDisarm(test.db, PROJECT)).toBeUndefined();
+  });
+});
+
+/**
+ * The latch and its strip row are two writes, and only the first is the safety property. A crash
+ * between them used to be permanent: every breaker returns early once a disarm exists, so the
+ * escalation write got no second chance and the freeze stayed invisible to the "Needs you" band.
+ */
+describe("a latch whose escalation write never landed", () => {
+  const halfWritten = {
+    projectId: PROJECT,
+    reason: "consecutive-failures" as const,
+    detail: "3 runs in a row ended without delivering.",
+    evidence: ["r-1 · anton-a · failed", "r-2 · anton-b · parked"],
+  };
+
+  it("is repaired by the next pass, out of the latch's own case", async () => {
+    await disarmAutopilot(test.db, clock, halfWritten);
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(0);
+    ticks = 600_000;
+
+    const view = await activeDisarmForPass(test.db, clock, PROJECT);
+
+    const [escalation] = (await listOpenEscalations(test.db, PROJECT)).map(toEscalationView);
+    expect(escalation?.kind).toBe("autopilot-disarm");
+    expect(escalation?.reason).toBe(halfWritten.detail);
+    expect(escalation?.evidence).toEqual(halfWritten.evidence);
+    // Stamped back onto the row, so the header and the strip are one decision again.
+    expect(view?.escalationId).toBe(escalation?.id);
+  });
+
+  it("is repaired once — later passes add no second strip row", async () => {
+    await disarmAutopilot(test.db, clock, halfWritten);
+    await activeDisarmForPass(test.db, clock, PROJECT);
+    ticks = 600_000;
+
+    await activeDisarmForPass(test.db, clock, PROJECT);
+
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(1);
+    expect(await listDisarms(test.db, PROJECT)).toHaveLength(1);
+  });
+
+  it("raises nothing for an armed project", async () => {
+    expect(await activeDisarmForPass(test.db, clock, PROJECT)).toBeUndefined();
     expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(0);
   });
 });

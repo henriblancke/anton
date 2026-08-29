@@ -76,12 +76,16 @@ describe("POST /autopilot/re-arm", () => {
   it("refuses when anton cannot tell who is asking", async () => {
     // An unattributed re-arm is worse than no re-arm: it resumes autonomous work and leaves the
     // record claiming nobody decided it.
+    //
+    // A 500 and not the 409 the already-armed refusal uses: nothing about the request conflicts
+    // with the server's state, anton's own environment is missing an identity — and a client that
+    // branches on the status code has to be able to tell the two refusals apart.
     await latch();
     operator.mockResolvedValue(undefined);
 
     const res = await POST(req(), ctx("tmp"));
 
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(500);
     expect(row()!.rearmedAt).toBeNull();
   });
 

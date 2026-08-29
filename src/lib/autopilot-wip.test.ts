@@ -86,7 +86,7 @@ describe("toAutopilotHold", () => {
     // The two sentences the operator actually acts on: the band says a limit is being respected and
     // promises the release needs nothing from them.
     expect(BREAKER_REASON_LABEL[breaker.reason]).toBe("Review queue is full");
-    expect(clearingCondition(breaker)).toContain("Releases itself when one PR merges");
+    expect(clearingCondition(breaker)).toContain("Releases itself when one PR merges or closes");
     expect(breaker.detail).not.toMatch(/error|fail|broke/i);
   });
 });

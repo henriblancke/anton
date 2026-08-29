@@ -340,6 +340,89 @@ describe("SettingsView self-review section (anton-of1m)", () => {
   });
 });
 
+/**
+ * The autopilot brakes (anton-nmy7). These four decide when anton stops STARTING work, and one of
+ * them latches a freeze only a human lifts — so an operator who cannot reach them here has to hand
+ * craft an API request to tune or disable a brake that is already holding their project.
+ */
+describe("SettingsView autopilot brakes (anton-nmy7)", () => {
+  showing("autopilot");
+
+  it("falls back to the shipped defaults when nothing is persisted", () => {
+    renderView({});
+    expect((screen.getByLabelText("Open PRs in review") as HTMLInputElement).value).toBe("3");
+    expect((screen.getByLabelText("Failed runs in a row") as HTMLInputElement).value).toBe("3");
+    expect((screen.getByLabelText("Score floor") as HTMLInputElement).value).toBe("7");
+    expect((screen.getByLabelText("Consecutive runs below it") as HTMLInputElement).value).toBe("3");
+  });
+
+  it("seeds every knob from persisted settings (round-trip in)", () => {
+    renderView({
+      autopilotWipLimit: 5,
+      autopilotFailureStreak: 4,
+      autopilotScoreFloor: 8,
+      autopilotScoreWindow: 2,
+    });
+    expect((screen.getByLabelText("Open PRs in review") as HTMLInputElement).value).toBe("5");
+    expect((screen.getByLabelText("Failed runs in a row") as HTMLInputElement).value).toBe("4");
+    expect((screen.getByLabelText("Score floor") as HTMLInputElement).value).toBe("8");
+    expect((screen.getByLabelText("Consecutive runs below it") as HTMLInputElement).value).toBe("2");
+  });
+
+  it("PATCHes the edited brakes on Save (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.change(screen.getByLabelText("Open PRs in review"), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText("Score floor"), { target: { value: "9" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body).toMatchObject({
+      autopilotWipLimit: 6,
+      autopilotFailureStreak: 3,
+      autopilotScoreFloor: 9,
+      autopilotScoreWindow: 3,
+    });
+  });
+
+  it("sends a disabling 0 as a real value, not as a cleared override", () => {
+    // null would reset the knob to the shipped default — the exact opposite of what an operator
+    // turning a brake off asked for.
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.change(screen.getByLabelText("Failed runs in a row"), { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.autopilotFailureStreak).toBe(0);
+  });
+
+  it("says which brakes are off, rather than showing a 0 that reads as 'immediately'", () => {
+    renderView({ autopilotWipLimit: 0, autopilotFailureStreak: 0, autopilotScoreFloor: 0 });
+    expect(screen.getByText(/off · anton starts work however many PRs are waiting on you/)).toBeTruthy();
+    expect(screen.getByText(/off · anton keeps starting runs however many fail/)).toBeTruthy();
+    expect(screen.getByText(/off · anton keeps starting runs however they score/)).toBeTruthy();
+    // The window is meaningless with no floor — disabled, never silently reset.
+    expect((screen.getByLabelText("Consecutive runs below it") as HTMLInputElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("clamps an out-of-range knob to the range the API would have rejected", () => {
+    renderView({});
+    const floor = screen.getByLabelText("Score floor") as HTMLInputElement;
+    fireEvent.change(floor, { target: { value: "99" } });
+    expect(floor.value).toBe("10");
+  });
+
+  it("names the hold's release condition — the one brake nobody has to clear", () => {
+    renderView({});
+    expect(screen.getByText(/releases itself the moment one of those PRs merges or closes/i)).toBeTruthy();
+  });
+});
+
 describe("SettingsView pipeline variants (anton-aa3m)", () => {
   showing("variants");
 

@@ -31,7 +31,7 @@ import {
   type RunOutcome,
 } from "../autopilot-failure-streak";
 import {
-  activeDisarm,
+  activeDisarmForPass,
   disarmWithEscalation,
   lastReArmAt,
   settledAfterReArm,
@@ -101,7 +101,8 @@ export async function checkFailureStreak(
   const { projectId } = input;
   const config = resolveFailureBreaker(await getProjectSettings(db, projectId));
   if (!config) return undefined;
-  if (await activeDisarm(db, projectId)) return undefined;
+  // Repairs a latch whose escalation write never landed — no later pass would (see activeDisarmForPass).
+  if (await activeDisarmForPass(db, clock, projectId)) return undefined;
 
   const since = await lastReArmAt(db, projectId);
   const outcomes = await readRunOutcomes(db, projectId, input.board, config.threshold, since);

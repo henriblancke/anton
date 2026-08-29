@@ -130,6 +130,38 @@ export async function disarmAutopilot(
 }
 
 /**
+ * Give a latched disarm the strip row it is missing (R4.6), reconstructed from the latch itself.
+ *
+ * A no-op for a disarm that already carries one, and idempotent on the escalation's own key even
+ * when it does not — so every path that meets a latch can call this rather than assume.
+ */
+async function withEscalation(
+  db: AntonDb,
+  clock: Clock,
+  row: AutopilotDisarmRow,
+): Promise<AutopilotDisarmRow> {
+  if (row.escalationId) return row;
+  const sinceMs = (toEpoch(row.disarmedAt) ?? Math.floor(clock.now() / 1000)) * 1000;
+  const { escalation } = await raiseEscalation(db, clock, {
+    projectId: row.projectId,
+    finding: {
+      kind: "autopilot-disarm",
+      key: `autopilot-disarm:${row.reason}`,
+      reason: row.detail,
+      since: sinceMs,
+      ageMs: Math.max(0, clock.now() - sinceMs),
+      evidence: parseEvidence(row.evidenceJson),
+    },
+  });
+  const stamped = await db
+    .update(schema.autopilotDisarms)
+    .set({ escalationId: escalation.id })
+    .where(eq(schema.autopilotDisarms.id, row.id))
+    .returning();
+  return stamped[0] ?? row;
+}
+
+/**
  * Latch the disarm AND put it where the operator actually scans (R4.6).
  *
  * The freeze is written FIRST and the escalation second: the latch is the safety property — it is
@@ -138,9 +170,8 @@ export async function disarmAutopilot(
  * decision rather than two independent claims.
  *
  * Both writes are idempotent on their own keys, so a pass re-deciding the same signal adds neither a
- * second freeze nor a second strip row. Nothing is raised when the project was ALREADY disarmed:
- * that disarm carries its own escalation, and a second one would ask the operator to settle a
- * decision they have already been asked about.
+ * second freeze nor a second strip row — and an ALREADY-disarmed project gets its existing latch
+ * back rather than a second one to clear.
  */
 export async function disarmWithEscalation(
   db: AntonDb,
@@ -148,25 +179,7 @@ export async function disarmWithEscalation(
   input: DisarmAutopilotInput,
 ): Promise<DisarmAutopilotResult> {
   const result = await disarmAutopilot(db, clock, input);
-  if (!result.created) return result;
-
-  const { escalation } = await raiseEscalation(db, clock, {
-    projectId: input.projectId,
-    finding: {
-      kind: "autopilot-disarm",
-      key: `autopilot-disarm:${input.reason}`,
-      reason: input.detail,
-      since: clock.now(),
-      ageMs: 0,
-      evidence: input.evidence ?? [],
-    },
-  });
-  const stamped = await db
-    .update(schema.autopilotDisarms)
-    .set({ escalationId: escalation.id })
-    .where(eq(schema.autopilotDisarms.id, result.disarm.id))
-    .returning();
-  return { disarm: stamped[0] ?? result.disarm, created: true };
+  return { disarm: await withEscalation(db, clock, result.disarm), created: result.created };
 }
 
 /** Is this project's autopilot disarmed, and by what? db-injectable; read-only. */
@@ -176,6 +189,25 @@ export async function activeDisarm(
 ): Promise<AutopilotDisarm | undefined> {
   const row = latchedRow(db, projectId);
   return row ? toDisarmView(row) : undefined;
+}
+
+/**
+ * The same question a DETECTOR asks before it stops deciding — repairing a half-written latch on
+ * the way.
+ *
+ * The freeze and its escalation are two writes, and only the first is the safety property. A crash
+ * between them leaves a frozen policy that the "Needs you" band never mentions, and nothing would
+ * ever finish the job: every breaker returns early once a disarm exists, so the escalation write
+ * gets no natural second chance. This is that second chance — the one call every breaker already
+ * makes on every pass.
+ */
+export async function activeDisarmForPass(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+): Promise<AutopilotDisarm | undefined> {
+  const row = latchedRow(db, projectId);
+  return row ? toDisarmView(await withEscalation(db, clock, row)) : undefined;
 }
 
 export type ReArmResult =
@@ -211,7 +243,17 @@ export async function reArmAutopilot(
   // The strip row is the disarm's other half (R4.6), so the re-arm settles it too. Left open, the
   // "Needs you" band would keep asking for a decision the operator has just made — and nothing else
   // would ever close it: a disarm is raised on the latch, and this project no longer has one.
-  if (row.escalationId) await settleEscalation(db, clock, row.escalationId, "resumed");
+  //
+  // Best-effort, and deliberately so: the UPDATE above has already committed, so the latch IS
+  // lifted. Propagating a settle failure would answer a successful re-arm with "Failed to re-arm
+  // autopilot" and leave the operator believing the autopilot is still frozen when it is running.
+  if (row.escalationId) {
+    try {
+      await settleEscalation(db, clock, row.escalationId, "resumed");
+    } catch (e) {
+      console.error(`[autopilot] re-arm could not settle escalation ${row.escalationId}:`, e);
+    }
+  }
   return {
     ok: true,
     reason: row.reason as DisarmReason,

@@ -1,3 +1,6 @@
+"use client";
+
+import { use } from "react";
 import { PauseIcon, TriangleAlertIcon } from "lucide-react";
 import Link from "next/link";
 
@@ -40,6 +43,25 @@ import { cn } from "@/lib/utils";
  * A hold carries no buttons at all, for the same reason. Every affordance on a self-clearing state
  * is an invitation to override a limit the operator set for themselves.
  */
+/**
+ * The band as the board mounts it: the breaker read, resolved HERE rather than in the page.
+ *
+ * Deciding the WIP hold spawns a `gh pr view` per in-review PR, and that read is network-bound —
+ * awaiting it in the page's own render would put every card on the board behind GitHub's latency.
+ * The page hands over the unresolved promise instead and this component suspends on it alone, so a
+ * slow GitHub costs a late band and nothing else.
+ */
+export function AutopilotBreakerBand({
+  slug,
+  breaker,
+}: {
+  slug: string;
+  /** Resolves to undefined when the autopilot is running. Absent when there is no project at all. */
+  breaker?: Promise<AutopilotBreaker | undefined>;
+}) {
+  return <AutopilotBreakerHeader slug={slug} breaker={breaker ? use(breaker) : undefined} />;
+}
+
 export function AutopilotBreakerHeader({
   slug,
   breaker,

@@ -109,6 +109,14 @@ export async function checkWipLimit(
 }
 
 /**
+ * How long a PAGE's read may wait on `gh`. A pass has all the time gh gives it (two minutes per
+ * spawn); a render does not — an unreachable GitHub would otherwise leave a subprocess hanging for
+ * that whole window on every board load. Timing out counts the PR as still in review, exactly as
+ * any other unreadable answer does (see {@link occupiesQueue}), so the fast answer is the safe one.
+ */
+const UI_PR_READ_TIMEOUT_MS = 5_000;
+
+/**
  * The hold as a surface shows it, over the shared anton.db and the cached board snapshot — the read
  * path for the lane header, mirroring `currentDisarm`.
  *
@@ -121,6 +129,7 @@ export async function currentWipHold(project: Project): Promise<AutopilotHold | 
     projectId: project.id,
     repoPath: project.repoPath,
     board,
+    signal: AbortSignal.timeout(UI_PR_READ_TIMEOUT_MS),
   });
   return hold ? toAutopilotHold(hold) : undefined;
 }

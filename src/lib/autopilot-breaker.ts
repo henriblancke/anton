@@ -86,9 +86,14 @@ export const BREAKER_REASON_LABEL: Record<BreakerReason, string> = {
  * The clause that completes "Releases when …" for each hold — the operator's ONE next fact, and the
  * reason a hold needs no buttons. Written as an action they already take, not as a system state:
  * "one PR merges" tells them to go do the review they were going to do anyway.
+ *
+ * Closing is named alongside merging because the detector releases the slot on either
+ * (picker-wip-hold.ts drops MERGED *and* CLOSED). A PR closed without merging keeps its bead
+ * labelled in review, so a hold that promised only merges would vanish with nothing on screen ever
+ * having said why.
  */
 const HOLD_RELEASED_BY: Record<HoldReason, string> = {
-  "wip-limit": "one PR merges",
+  "wip-limit": "one PR merges or closes",
 };
 
 /**

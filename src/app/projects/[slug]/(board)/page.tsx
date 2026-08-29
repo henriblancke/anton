@@ -22,15 +22,26 @@ export default async function ProjectBoardPage({
   //   • settings — whether this project paces autonomous work (anton-y2ue), which drives the
   //     per-card approval affordance (Approve immediate vs Queue paced).
   //   • escalations — stalls the unstick pass could not safely restart (anton-wvcy).
-  //   • breaker — whether the autopilot has stopped, and which kind: a quality disarm that needs a
-  //     human (anton-5c8h) or the self-clearing WIP hold (anton-wy9y). Stated in the board's own
-  //     band rather than making the operator open settings to find out.
-  const [board, settings, escalations, breaker] = await Promise.all([
+  const [board, settings, escalations] = await Promise.all([
     project ? getBoard(project) : null,
     getProjectSettingsBySlug(slug),
     project ? openEscalations(project.id) : [],
-    project ? currentBreaker(project) : undefined,
   ]);
+
+  // Whether the autopilot has stopped, and which kind: a quality disarm that needs a human
+  // (anton-5c8h) or the self-clearing WIP hold (anton-wy9y).
+  //
+  // Deliberately NOT awaited here. Confirming the hold spawns a `gh pr view` per in-review PR, so
+  // a slow or unreachable GitHub would hold the entire board behind a network read — for a band
+  // that is one line of context beside cards that were ready to render. The promise is handed to
+  // the board and unwrapped inside its own Suspense boundary instead. Failure degrades to no band
+  // for the same reason: the cards are the page, and they must not go down with it.
+  const breaker = project
+    ? currentBreaker(project).catch((err) => {
+        console.error(`[board] autopilot breaker read failed for ${slug}`, err);
+        return undefined;
+      })
+    : undefined;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

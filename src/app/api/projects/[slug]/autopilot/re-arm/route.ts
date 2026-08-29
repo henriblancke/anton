@@ -19,13 +19,17 @@ export const dynamic = "force-dynamic";
  * 409 when nothing is latched — a second click, or a header rendered before someone else re-armed.
  * The state is returned either way so the board settles on the server's answer instead of the one
  * the operator was looking at.
+ *
+ * An unresolvable operator is a 500, not a 409: nothing about the request conflicts with the
+ * server's state, anton's own environment is simply missing the identity every authored write
+ * needs — and a client that reads status codes must be able to tell the two apart.
  */
 export const POST = withProject<{ slug: string }>(async (_request, { project }) => {
   const actor = await resolveOperator();
   if (!actor) {
     return NextResponse.json(
       { error: "anton could not tell who you are — set ANTON_OPERATOR or a global git user.name" },
-      { status: 409 },
+      { status: 500 },
     );
   }
 
