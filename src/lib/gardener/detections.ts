@@ -130,6 +130,21 @@ export type DetailShape = "priority";
 
 const DETAIL_PATTERN: Record<DetailShape, RegExp> = { priority: /^P[0-4]$/ };
 
+/**
+ * What a kind's fingerprint stands for — which fields are the CLAIM and which are only how it is
+ * carried out. Absent (the default) means the subject list is the claim: "retire this bead", "order
+ * this pair", "move this bead there" are each about the beads they name, so two subject sets are two
+ * asks and both belong on the board.
+ *
+ * `target` is the exception a MEMBERSHIP-derived kind needs. A `parentless-cluster` asks one question
+ * — "the loose work orbiting this card belongs under it" — and its subject list is whatever was
+ * parentless and free at patrol time, so it changes whenever a member is claimed, closed, or joined
+ * by a new loose bead. Hashing that list gave every patrol a fresh fingerprint for the same claim and
+ * made suppression vacuous: five proposals naming anton-5ahy stood open at once (anton-9hpp). Kind
+ * plus target is the identity that holds still.
+ */
+export type ClaimIdentity = "target";
+
 /** What one detection kind IS: who files it, what it applies as, and what parameter it carries. */
 export interface KindSpec {
   namespace: ProposalNamespace;
@@ -137,6 +152,8 @@ export interface KindSpec {
   retireAs?: RetireVerb;
   /** Set exactly when the move takes a non-bead parameter; absent means `detail` is forbidden. */
   detail?: DetailShape;
+  /** Set when the subject list is not the claim's identity — see {@link ClaimIdentity}. */
+  identity?: ClaimIdentity;
 }
 
 /**
@@ -155,7 +172,7 @@ export interface KindSpec {
  */
 export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   "container-orphan": { namespace: "gardener", move: "reparent" },
-  "parentless-cluster": { namespace: "gardener", move: "reparent" },
+  "parentless-cluster": { namespace: "gardener", move: "reparent", identity: "target" },
   "implied-order": { namespace: "gardener", move: "link" },
   superseded: { namespace: "gardener", move: "retire", retireAs: "supersede" },
   stale: { namespace: "gardener", move: "retire", retireAs: "defer" },
@@ -205,9 +222,9 @@ export interface GardenerDetection {
   move: GardenerMove;
   /**
    * Stable dedup key, label-safe: `<namespace>:<kind>:<hash of subjectKey>`. Hashed rather than
-   * spelled out because a cluster's key spans every member — an id list grows past what belongs in a
-   * bd label. Mirrors the `stringer:<collector>:<hash>` fingerprint /scan-triage already tags with,
-   * so the board has one convention for "this proposal was already made" (anton-9qwq).
+   * spelled out because a subject key spells out ids and grows past what belongs in a bd label.
+   * Mirrors the `stringer:<collector>:<hash>` fingerprint /scan-triage already tags with, so the
+   * board has one convention for "this proposal was already made" (anton-9qwq).
    */
   fingerprint: string;
   /** The readable key the fingerprint hashes — kept for debugging and for tests to assert against. */
@@ -305,11 +322,25 @@ function detailViolation(kind: GardenerDetectionKind, detail: string | undefined
 }
 
 /**
+ * The stand-in a {@link ClaimIdentity} of `target` puts where the subject list would go. Not a legal
+ * bead id, so it can never collide with a kind whose subjects ARE its identity.
+ */
+const ANY_SUBJECTS = "*";
+
+/**
  * What a detection is ABOUT, as one readable string: the kind, its subjects (sorted, so two patrols
  * that walk the board in different orders agree), whatever it points at, and the move's parameter
  * when it takes one. The identity the fingerprint hashes — and the thing apply RECOMPUTES from a
  * proposal's own fields, so a bead whose subjects, target or detail were edited after emission no
  * longer matches its label.
+ *
+ * …except where the KIND says the subjects are not the claim ({@link ClaimIdentity}), which today is
+ * `parentless-cluster` alone: its subject list is a membership the next patrol re-derives, so it
+ * hashes as {@link ANY_SUBJECTS} and one open proposal per target answers for every membership. That
+ * kind pays for it by losing the hash's guard on its subject list — an edit there redirects the move
+ * rather than invalidating it — which is why apply re-derives the whole "no board card carries this"
+ * premise for each subject from the fresh board (apply-plan.ts `reparentPremiseGone`) instead of
+ * trusting the list it was handed.
  */
 export function detectionSubjectKey(
   kind: GardenerDetectionKind,
@@ -317,10 +348,9 @@ export function detectionSubjectKey(
   target?: string,
   detail?: string,
 ): string {
-  const sorted = [...subjects].sort();
-  return (
-    `${kind}:${sorted.join("+")}` + (target ? `>${target}` : "") + (detail ? `#${detail}` : "")
-  );
+  const about =
+    KINDS[kind].identity === "target" && target ? ANY_SUBJECTS : [...subjects].sort().join("+");
+  return `${kind}:${about}` + (target ? `>${target}` : "") + (detail ? `#${detail}` : "");
 }
 
 /**
@@ -448,7 +478,8 @@ const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
  * one ask and have another execute:
  *   • the fingerprint is RECOMPUTED from the parsed kind/subjects/target and must match the field
  *     carried alongside them — editing the subjects or the target of a proposal now invalidates it
- *     rather than silently redirecting the move;
+ *     rather than silently redirecting the move (for the one kind whose subjects are not its
+ *     identity, the target still is — see {@link ClaimIdentity});
  *   • the move and retirement verb must be the ones {@link CANONICAL_MOVE} pairs with the kind,
  *     which is what covers the two fields the hash can't (a `stale` bead reads as a defer, so it
  *     must not execute a close).

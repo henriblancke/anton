@@ -165,17 +165,25 @@ describe("container orphans (the anton-do0q class)", () => {
 });
 
 describe("parentless clusters", () => {
+  /** A card only counts as a home once the board already files tickets under it. */
+  const carrying = (
+    id: string,
+    title: string,
+    ticket: { title: string; labels?: string[] },
+    over: Partial<Bead> = {},
+  ) => [feature(id, { title, ...over }), bead(`${id}-t`, { parent: id, ...ticket })];
+
   const homes = [
-    feature("anton-esc", { title: "Escalation settle route" }),
-    feature("anton-dock", { title: "Docker image cache" }),
+    ...carrying("anton-esc", "Escalation settle route", { title: "Escalation settle route smoke test" }),
+    ...carrying("anton-dock", "Docker image cache", { title: "Docker image cache warmup" }),
   ];
 
-  it("groups parentless beads that point at exactly one open card", () => {
+  it("groups parentless beads that state one subject their card states too", () => {
     const detection = only(
       detect([
         ...homes,
-        bead("anton-p1", { title: "Escalation panel copy" }),
-        bead("anton-p2", { title: "Escalation retry banner" }),
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation banner retry" }),
         bead("anton-p3", { title: "Roadmap zoom controls" }),
       ]),
     );
@@ -184,13 +192,41 @@ describe("parentless clusters", () => {
     expect(detection.move).toBe("reparent");
     expect(detection.subjects).toEqual(["anton-p1", "anton-p2"]);
     expect(detection.target).toBe("anton-esc");
-    expect(detection.evidence.join("\n")).toContain('"escalation"');
+    // The claim an approver checks: the subject the pair holds between them, and the part of it the
+    // card holds too.
+    expect(detection.evidence.join("\n")).toContain('"banner", "escalation"');
+    expect(detection.evidence.join("\n")).toContain('anton-esc states "escalation" too');
+  });
+
+  // The old rule counted a topic key as distinctive when exactly ONE open card carried it, which on
+  // a board of a few dozen cards is nearly every word: nine of eleven proposals were declined on a
+  // match like this one (anton-9hpp). One word two titles happen to share is not a subject.
+  it("says nothing when the members agree on a single word", () => {
+    expect(
+      detect([
+        ...homes,
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation retry timeout" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  // A leaf feature is one PR's worth of work. Hanging a cluster off it turns somebody's card into
+  // somebody else's epic; a card the board ALREADY files this kind of work under is the real signal.
+  it("says nothing when the matching card carries no tickets of its own", () => {
+    expect(
+      detect([
+        feature("anton-leaf", { title: "Escalation banner settle route" }),
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation banner retry" }),
+      ]),
+    ).toEqual([]);
   });
 
   it("clusters on a shared area label when titles have nothing in common", () => {
     const detection = only(
       detect([
-        feature("anton-home", { title: "Weekly digest", labels: ["area:reports"] }),
+        ...carrying("anton-home", "Weekly digest", { title: "Digest header" }, { labels: ["area:reports"] }),
         bead("anton-a1", { title: "Backfill csv exporter", labels: ["area:reports"] }),
         bead("anton-a2", { title: "Timezone handling", labels: ["area:reports"] }),
       ]),
@@ -201,28 +237,28 @@ describe("parentless clusters", () => {
   });
 
   it("says nothing about a single parentless bead — one bead is not a cluster", () => {
-    expect(detect([...homes, bead("anton-p1", { title: "Escalation panel copy" })])).toEqual([]);
+    expect(detect([...homes, bead("anton-p1", { title: "Escalation banner copy" })])).toEqual([]);
   });
 
   it("says nothing when the shared topic points at two cards", () => {
     expect(
       detect([
         ...homes,
-        feature("anton-esc2", { title: "Escalation timeline" }),
-        bead("anton-p1", { title: "Escalation panel copy" }),
-        bead("anton-p2", { title: "Escalation retry banner" }),
+        ...carrying("anton-esc2", "Escalation banner timeline", { title: "Escalation banner timeline test" }),
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation banner retry" }),
       ]),
     ).toEqual([]);
   });
 
   it("says nothing when a bead's topics point at two different cards", () => {
-    // "escalation" belongs to one card and "docker" to another: each key is distinctive, but the
-    // bead carrying both has no obvious home — and a coin flip is not a proposal.
+    // The pair states one subject, but two cards state part of it — and a coin flip dressed as a
+    // suggestion is worse than saying nothing.
     expect(
       detect([
         ...homes,
-        bead("anton-p1", { title: "Escalation docker retry" }),
-        bead("anton-p2", { title: "Escalation docker banner" }),
+        bead("anton-p1", { title: "Escalation banner docker retry" }),
+        bead("anton-p2", { title: "Escalation banner docker cache" }),
       ]),
     ).toEqual([]);
   });
@@ -232,9 +268,11 @@ describe("parentless clusters", () => {
   it("says nothing when the only matching card is mid-run", () => {
     expect(
       detect([
-        feature("anton-esc", { title: "Escalation settle route", labels: ["stage:in-review"] }),
-        bead("anton-p1", { title: "Escalation panel copy" }),
-        bead("anton-p2", { title: "Escalation retry banner" }),
+        ...carrying("anton-esc", "Escalation settle route", { title: "Escalation smoke test" }, {
+          labels: ["stage:in-review"],
+        }),
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation banner retry" }),
       ]),
     ).toEqual([]);
   });
@@ -246,9 +284,9 @@ describe("parentless clusters", () => {
     expect(
       detect([
         ...homes,
-        bead("anton-p1", { title: "Escalation panel copy" }),
+        bead("anton-p1", { title: "Escalation banner copy" }),
         bead("anton-p2", {
-          title: "Escalation retry banner",
+          title: "Escalation banner retry",
           status: "in_progress",
           assignee: "box-2",
         }),
@@ -259,13 +297,12 @@ describe("parentless clusters", () => {
   it("says nothing when the only matching card is claimed but not yet leased", () => {
     expect(
       detect([
-        feature("anton-esc", {
-          title: "Escalation settle route",
+        ...carrying("anton-esc", "Escalation settle route", { title: "Escalation smoke test" }, {
           status: "in_progress",
           assignee: "box-2",
         }),
-        bead("anton-p1", { title: "Escalation panel copy" }),
-        bead("anton-p2", { title: "Escalation retry banner" }),
+        bead("anton-p1", { title: "Escalation banner copy" }),
+        bead("anton-p2", { title: "Escalation banner retry" }),
       ]),
     ).toEqual([]);
   });
@@ -274,8 +311,8 @@ describe("parentless clusters", () => {
     expect(
       detect([
         ...homes,
-        bead("anton-p1", { title: "Escalation panel copy", parent: "anton-esc" }),
-        bead("anton-p2", { title: "Escalation retry banner", parent: "anton-esc" }),
+        bead("anton-p1", { title: "Escalation banner copy", parent: "anton-esc" }),
+        bead("anton-p2", { title: "Escalation banner retry", parent: "anton-esc" }),
       ]),
     ).toEqual([]);
   });

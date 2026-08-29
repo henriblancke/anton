@@ -235,6 +235,36 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(refusal(decide(REPARENT, abandoned))).toMatch(/anton-a is abandoned/);
     });
 
+    /**
+     * The home is validated when the PATROL runs and then read by a human days later. Two cluster
+     * proposals (anton-a7hp, anton-z5jn) named targets that had CLOSED by the time they were read;
+     * approving either would have parented open work under a shipped feature (anton-9hpp). So the
+     * target's freedom is re-asked here, against the board the writes would actually land on.
+     */
+    it("refuses a target that settled or was picked up since the proposal was filed", () => {
+      const settled = [{ ...CARD, status: "closed" }, bead("anton-a"), bead("anton-b")];
+      expect(refusal(decide(CLUSTER, settled))).toMatch(
+        /anton-card is closed — re-parenting work under it would hang it off a card nothing will run/,
+      );
+
+      const claimed = [
+        warm(CARD.id, { issue_type: "feature", status: "in_progress", assignee: "runner-7" }),
+        bead("anton-a"),
+        bead("anton-b"),
+      ];
+      expect(refusal(decide(CLUSTER, claimed))).toMatch(
+        /anton-card is held by runner-7 and it was claimed since this proposal was filed/,
+      );
+
+      // …and the same for a run that got as far as publishing its lease.
+      const leasedHome = [
+        { ...leased(CARD.id, NOW), issue_type: "feature" },
+        bead("anton-a"),
+        bead("anton-b"),
+      ];
+      expect(refusal(decide(CLUSTER, leasedHome))).toMatch(/anton-card/);
+    });
+
     it("refuses a home that is not a board card — the state the proposal exists to fix", () => {
       // An epic WITH a feature child is a container: work parented to it rides no card.
       const container = bead("anton-card", { issue_type: "epic" });

@@ -107,6 +107,17 @@ const MISPARENTED: Bead[] = [
   bead("anton-lost", { title: "Loose ticket", parent: "anton-cont" }),
 ];
 
+/**
+ * The parentless-cluster fixture: a card the board already files tickets under, and two loose beads
+ * that state its subject between them — what `detectParentlessClusters` needs to speak at all.
+ */
+const CLUSTERED: Bead[] = [
+  bead("anton-card", { issue_type: "feature", title: "Escalation settle route" }),
+  bead("anton-card-t", { title: "Escalation settle route smoke test", parent: "anton-card" }),
+  bead("anton-l1", { title: "Escalation banner copy" }),
+  bead("anton-l2", { title: "Escalation banner retry" }),
+];
+
 const detect = (board: Bead[], findings: HygieneFinding[] = []): GardenerDetection[] =>
   detectBoard({ board, hygiene: { findings }, now: NOW });
 
@@ -658,6 +669,32 @@ describe("a patrol pass", () => {
     // The next patrol reads the board the first one wrote to — proposal included.
     const board = [...MISPARENTED, ...createdBeads];
     const second = await emitProposals(REPO, { board, detections: detect(board) });
+    expect(second.created).toEqual([]);
+    expect(second.suppressed).toBe(1);
+    expect(createMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A cluster's membership is whatever was parentless and free when the patrol read the board, so
+   * hashing it gave the SAME claim a fresh fingerprint every night: five proposals naming anton-5ahy
+   * stood open at once, and the bead's own promise that "the patrol makes this claim no second time"
+   * was false for this kind (anton-9hpp). One target, one open ask.
+   */
+  it("files one cluster proposal per target, whatever membership the next patrol finds", async () => {
+    const first = await emitProposals(REPO, { board: CLUSTERED, detections: detect(CLUSTERED) });
+    expect(first.created).toHaveLength(1);
+
+    // The next patrol finds a third loose bead on the same subject: a different cluster, one claim.
+    const grown = [
+      ...CLUSTERED,
+      ...createdBeads,
+      bead("anton-l3", { title: "Escalation banner timeout" }),
+    ];
+    const detections = detect(grown).filter((d) => d.kind === "parentless-cluster");
+    expect(detections[0].subjects).toEqual(["anton-l1", "anton-l2", "anton-l3"]);
+
+    const second = await emitProposals(REPO, { board: grown, detections });
+
     expect(second.created).toEqual([]);
     expect(second.suppressed).toBe(1);
     expect(createMock).toHaveBeenCalledTimes(1);

@@ -88,14 +88,35 @@ export function detectContainerOrphans(index: BoardIndex, nowMs: number): Garden
 /** How many parentless beads must agree on a home before "obvious" is a claim worth making. */
 export const MIN_CLUSTER_SIZE = 2;
 
+/**
+ * How many INFERRED title terms a cluster and its home must hold in common before the match counts
+ * as subject matter.
+ *
+ * Two, because one is a coincidence. This detector used to accept ONE term and call it distinctive
+ * whenever exactly one open card carried it — but a board of a few dozen cards makes almost every
+ * word unique to one of them, so rarity there measured nothing about topic. `epic`, `instead`,
+ * `three`, `copy`, `block`, `route` and `ticket` all cleared that bar, and nine of eleven proposals
+ * were declined on sight (anton-9hpp). Two terms every member states is a subject, not a word.
+ */
+export const MIN_SHARED_TERMS = 2;
+
 /** Shorter tokens carry no topic (`the`, `add`, `api` matches everything a board is about). */
 const MIN_TOKEN_LENGTH = 4;
 
+/** The label namespace a human uses to say what a bead is ABOUT, rather than what it says. */
+const AREA_PREFIX = "area:";
+
 /**
- * Function words and process nouns that appear in half the titles on any engineering board. They
- * would make every cluster share a "topic" with every card, so they never count as a signal.
- * Deliberately short: the distinctiveness rule below does the real filtering, and a long stopword
- * list is a second place for the vocabulary to drift.
+ * Words that can never be evidence two beads share a SUBJECT, in two families.
+ *
+ * Function words and process nouns, first — they appear in half the titles on any engineering board.
+ * Then the WORKPIECE nouns: `epic`, `feature`, `ticket`, `bead`, `card`, `board`. Every row on a
+ * project-management board is one of those, so two rows agreeing on one have agreed about nothing.
+ * They are the same category as `task` and `issue`, which this list already held, and leaving them
+ * out is how "epic" — the most generic word here — came to drive four proposals at one target.
+ *
+ * Still deliberately short. The agreement rule below does the real filtering; a list can never
+ * encode which words carry topic, which is why it is not asked to.
  */
 const STOPWORDS: ReadonlySet<string> = new Set([
   "that",
@@ -127,18 +148,32 @@ const STOPWORDS: ReadonlySet<string> = new Set([
   "never",
   "always",
   "work",
+  "thing",
+  "stuff",
   "task",
   "tasks",
   "issue",
   "issues",
-  "thing",
-  "stuff",
+  "bead",
+  "beads",
+  "board",
+  "card",
+  "cards",
+  "epic",
+  "epics",
+  "feature",
+  "features",
+  "ticket",
+  "tickets",
+  "runs",
+  "proposal",
+  "proposals",
 ]);
 
 /**
  * A bead's topic keys: significant title tokens plus its `area:` labels. The two are one namespace
- * on purpose — `area:reports` can't collide with a word — so the distinctiveness rule below applies
- * to a curated label and an inferred word alike.
+ * on purpose — `area:reports` can't collide with a word — but they are not worth the same, and
+ * {@link statesSubjectMatter} is where that difference is priced.
  *
  * Trailing plurals are folded so `report` and `reports` are the same topic.
  */
@@ -151,9 +186,100 @@ export function topicKeys(bead: Bead): Set<string> {
     keys.add(token);
   }
   for (const label of bead.labels ?? []) {
-    if (label.startsWith("area:")) keys.add(label);
+    if (label.startsWith(AREA_PREFIX)) keys.add(label);
   }
   return keys;
+}
+
+/** A curated `area:` label — the one topic key a person WROTE rather than one we inferred. */
+const isCuratedKey = (key: string): boolean => key.startsWith(AREA_PREFIX);
+
+/**
+ * Does this set of keys amount to shared SUBJECT MATTER, or is it just words two titles happen to
+ * have in common? The whole difference between a proposal a founder acts on and one they close
+ * unread, so it is stated once, here.
+ *
+ * A curated `area:` label is a person's own answer to "what is this about", so one carries the claim
+ * by itself. An inferred title term is a guess, and a single guess is noise at board scale — hence
+ * {@link MIN_SHARED_TERMS} of them.
+ */
+function statesSubjectMatter(shared: ReadonlySet<string>): boolean {
+  const keys = [...shared];
+  return keys.some(isCuratedKey) || keys.length >= MIN_SHARED_TERMS;
+}
+
+/** A parentless bead the cluster rule considers, with its topic read once. */
+interface Candidate {
+  bead: Bead;
+  keys: Set<string>;
+}
+
+/**
+ * One group of loose beads that state the same subject, formed around a key their prospective home
+ * states too.
+ */
+interface TopicGroup {
+  members: Bead[];
+  /** Every key EVERY member carries — what the group agrees it is about. */
+  shared: string[];
+  /** The part of that subject the home states as well. Never empty: the anchor is always in it. */
+  held: string[];
+}
+
+/**
+ * The topic groups a home can host: for each key the home states, the loose beads that state it too,
+ * kept only when those beads AGREE with each other about the subject.
+ *
+ * Agreement is the whole fix. Matching each bead against the home on its own private word let five
+ * beads sharing nothing but `epic` read as one cluster; requiring the intersection of the members'
+ * keys to state subject matter means the group has to be about one thing before it is proposed as
+ * one card's tickets.
+ *
+ * Anchors are walked in sorted order so a home hosting two groups yields them in the same order on
+ * every patrol.
+ */
+function topicGroups(homeKeys: Set<string>, candidates: Candidate[]): TopicGroup[] {
+  const groups: TopicGroup[] = [];
+  for (const anchor of [...homeKeys].sort()) {
+    const members = candidates.filter((c) => c.keys.has(anchor));
+    if (members.length < MIN_CLUSTER_SIZE) continue;
+    const shared = intersectKeys(members.map((m) => m.keys));
+    if (!statesSubjectMatter(shared)) continue;
+    groups.push({
+      members: members.map((m) => m.bead),
+      shared: [...shared].sort(),
+      held: [...shared].filter((key) => homeKeys.has(key)).sort(),
+    });
+  }
+  return groups;
+}
+
+/** Every key present in all of these sets. */
+function intersectKeys(sets: Set<string>[]): Set<string> {
+  const [first, ...rest] = sets;
+  const shared = new Set(first);
+  for (const other of rest) {
+    for (const key of shared) if (!other.has(key)) shared.delete(key);
+  }
+  return shared;
+}
+
+/**
+ * How many tickets each board card carries, counted through the board's OWN card attribution
+ * (`boardCards.cardOf`), so "rides this card" means here what it means on the board itself.
+ *
+ * Closed tickets count. The question is what ROLE the card plays — does the board already file work
+ * of this kind under it — and a card whose eight tickets all shipped answered that question just as
+ * clearly as one whose eight are open.
+ */
+function ticketsPerCard(index: BoardIndex): Map<string, number> {
+  const carried = new Map<string, number>();
+  for (const bead of index.all) {
+    if (!isRunTicket(bead, index.cards)) continue;
+    const card = index.cards.cardOf(bead);
+    if (card) carried.set(card, (carried.get(card) ?? 0) + 1);
+  }
+  return carried;
 }
 
 /**
@@ -162,60 +288,62 @@ export function topicKeys(bead: Bead): Set<string> {
  * a HANDFUL of them orbiting the same feature, which means the board is showing a pile of chips
  * where it should be showing one card's worth of tickets.
  *
- * "Obvious" is defined narrowly, because a wrong regroup is worse than a missed one: a shared topic
- * key counts only if EXACTLY ONE open card carries it, and a bead pointing at two different cards is
- * dropped as ambiguous. A key half the board shares says nothing about where work belongs.
+ * "Obvious" is three things, and a claim needs all three (anton-9hpp — the rule this replaced needed
+ * none of them and was declined nine times in eleven):
+ *
+ *   • THE GROUP AGREES. The loose beads state one subject BETWEEN THEM ({@link statesSubjectMatter}),
+ *     not a different word each against the card. Rarity is not topic: a board of a few dozen cards
+ *     makes almost every word unique to one, which is how `epic` became a home signal.
+ *   • THE CARD IS A CONTAINER. It already carries tickets. A leaf feature is one PR's worth of work,
+ *     and hanging a cluster off it turns somebody's card into somebody else's epic; "already files
+ *     work of this kind" is the far stronger home signal, and the same index answers it.
+ *   • NOBODY ELSE CLAIMS THEM. A bead two cards can each host is dropped, because a coin flip
+ *     dressed as a suggestion is worse than saying nothing.
  */
 export function detectParentlessClusters(index: BoardIndex, nowMs: number): GardenerDetection[] {
+  const carried = ticketsPerCard(index);
   // Mid-run cards are not homes: their run has already chosen its tickets, so beads moved under one
   // now would never be dispatched and would strand when the run settles the card (apply refuses one
   // for the same reason).
-  const homes = index.all.filter((b) => index.cards.ids.has(b.id) && isFree(b, nowMs));
-  const homeKeys = new Map(homes.map((h) => [h.id, topicKeys(h)]));
+  const homes = index.all.filter(
+    (b) => index.cards.ids.has(b.id) && isFree(b, nowMs) && (carried.get(b.id) ?? 0) > 0,
+  );
+  const candidates: Candidate[] = index.all
+    .filter((b) => isClusterCandidate(b, nowMs))
+    .map((bead) => ({ bead, keys: topicKeys(bead) }));
 
-  const keyOwners = new Map<string, number>();
-  for (const keys of homeKeys.values()) {
-    for (const key of keys) keyOwners.set(key, (keyOwners.get(key) ?? 0) + 1);
-  }
-
-  const members = new Map<string, Array<{ bead: Bead; shared: string[] }>>();
-  for (const bead of index.all) {
-    if (!isClusterCandidate(bead, nowMs)) continue;
-    const keys = topicKeys(bead);
-
-    const matches: Array<{ homeId: string; shared: string[] }> = [];
-    for (const home of homes) {
-      const shared = [...keys]
-        .filter((key) => keyOwners.get(key) === 1 && homeKeys.get(home.id)?.has(key))
-        .sort();
-      if (shared.length > 0) matches.push({ homeId: home.id, shared });
-    }
-    // Two candidate homes is not an obvious home. Say nothing rather than pick one.
-    if (matches.length !== 1) continue;
-
-    const [match] = matches;
-    const group = members.get(match.homeId);
-    if (group) group.push({ bead, shared: match.shared });
-    else members.set(match.homeId, [{ bead, shared: match.shared }]);
+  const hosted = new Map<string, TopicGroup[]>();
+  for (const home of homes) {
+    const groups = topicGroups(topicKeys(home), candidates);
+    if (groups.length > 0) hosted.set(home.id, groups);
   }
 
   const detections: GardenerDetection[] = [];
-  for (const [homeId, group] of members) {
-    if (group.length < MIN_CLUSTER_SIZE) continue;
+  const contested = contestedMembers(hosted);
+  for (const [homeId, groups] of hosted) {
     const home = index.byId.get(homeId);
     if (!home) continue;
+    const settled = groups
+      .map((g) => ({ ...g, members: g.members.filter((m) => !contested.has(m.id)) }))
+      .filter((g) => g.members.length >= MIN_CLUSTER_SIZE);
+    // Ids in fingerprint order, and each bead named once however many groups reached it.
+    const subjects = [...new Set(settled.flatMap((g) => g.members.map((m) => m.id)))].sort();
+    if (subjects.length < MIN_CLUSTER_SIZE) continue;
+
     detections.push(
       makeDetection({
         kind: "parentless-cluster",
         move: "reparent",
-        subjects: group.map((m) => m.bead.id),
+        subjects,
         target: homeId,
-        summary: `${group.length} parentless beads share an obvious home in ${homeId} — re-parent them under it`,
+        summary: `${subjects.length} parentless beads share an obvious home in ${homeId} — re-parent them under it`,
         evidence: [
-          `${homeId} ("${home.title}") is the only open board card matching their topic`,
-          ...group.map(
-            (m) => `${m.bead.id} ("${m.bead.title}") shares ${quoteList(m.shared)} with ${homeId}`,
-          ),
+          `${homeId} ("${home.title}") is an open board card that already carries ${carried.get(homeId) ?? 0} ticket(s), so the board already files work of this kind under it`,
+          ...settled.flatMap((group) => [
+            `${idList(group.members)} all state ${quoteList(group.shared)} — one subject the whole group holds, not a word each happens to share with the card`,
+            ...group.members.map((m) => `  ${m.id}: "${m.title}"`),
+            `${homeId} states ${quoteList(group.held)} too`,
+          ]),
           `each is parentless today, so the board shows them as loose chips instead of ${homeId}'s tickets`,
         ],
       }),
@@ -223,6 +351,25 @@ export function detectParentlessClusters(index: BoardIndex, nowMs: number): Gard
   }
 
   return detections;
+}
+
+/**
+ * Loose beads more than one home can host. Their topic points two ways, so no home is OBVIOUS — and
+ * this detector's whole licence is obviousness. Collected across every home before any detection is
+ * built, because which homes want a bead is not knowable while walking one of them.
+ */
+function contestedMembers(hosted: Map<string, TopicGroup[]>): Set<string> {
+  const homesOf = new Map<string, Set<string>>();
+  for (const [homeId, groups] of hosted) {
+    for (const group of groups) {
+      for (const member of group.members) {
+        const claimants = homesOf.get(member.id);
+        if (claimants) claimants.add(homeId);
+        else homesOf.set(member.id, new Set([homeId]));
+      }
+    }
+  }
+  return new Set([...homesOf].filter(([, homes]) => homes.size > 1).map(([id]) => id));
 }
 
 /**

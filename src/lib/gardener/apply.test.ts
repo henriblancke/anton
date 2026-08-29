@@ -111,9 +111,20 @@ describe("the plan a proposal carries — read strictly, because it decides what
   it.each([
     ["subjects swapped under a kept fingerprint", { ...REPARENT, subjects: ["anton-zzz"] }],
     ["a target redirected under a kept fingerprint", { ...REPARENT, target: "anton-elsewhere" }],
-    ["a subject appended under a kept fingerprint", { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] }],
+    ["a subject appended under a kept fingerprint", { ...REPARENT, subjects: ["anton-a", "anton-b"] }],
+    ["a cluster's target redirected under a kept fingerprint", { ...CLUSTER, target: "anton-elsewhere" }],
   ])("rejects %s", (_case, value) => {
     expect(parseGardenerPlan(value)).toBeUndefined();
+  });
+
+  // The one kind whose subject list the hash does NOT cover (anton-9hpp): a cluster's membership is
+  // re-derived every patrol, so hashing it gave the same claim a fresh fingerprint each time and
+  // five proposals for one target stood open at once. The guard traded away is real — an edited
+  // subject list redirects the move rather than invalidating it — and what replaces it is apply's
+  // own re-derivation of "no board card carries this" for every subject it is handed.
+  it("accepts a cluster whose membership moved, because the target is its identity", () => {
+    const grown = { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] };
+    expect(parseGardenerPlan(grown)).toEqual(grown);
   });
 
   // `move` and `retireAs` are the two fields the hash can't cover, so the kind→verb pairing is what
