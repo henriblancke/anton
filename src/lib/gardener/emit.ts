@@ -677,10 +677,13 @@ function appliedState(detection: GardenerDetection): string {
       // that is sound again (see apply.ts `planUnapprove`).
       return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
     case "approve":
-      // What the move WRITES, not what a later feature will do with it: the apply step grants the
-      // gate and takes anton's reservation, and nothing here enqueues a run (anton-qlci). An
-      // acceptance box promising a started run is one the approver cannot check off.
-      return `${subjects} ${is} approved and reserved for anton — the gate is granted and the target claimed, which is the state a run starts from`;
+      // What the move WRITES, not what a later feature will do with it: the gate, and nothing here
+      // enqueues a run (anton-qlci). An acceptance box promising a started run is one the approver
+      // cannot check off — and so is one promising the RESERVATION anton's own grant takes with it,
+      // because a human (or a concurrent pass) granting the label first settles this ask without
+      // one, and no claim is written over their write (apply-plan.ts `planApprove`). The gate alone
+      // is what every applied outcome guarantees, so the gate alone is what the box asserts.
+      return `${subjects} ${is} approved — the gate is granted, which is the state a run starts from`;
   }
 }
 

@@ -337,8 +337,11 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // board's state, so there is no write to make — and no second note to leave on a bead whose
   // approval is already gone.
   if (step.verb === "unapprove") return !beads.isApproved(subject);
-  // Its mirror: somebody granted the approval by hand, or a concurrent approve landed it. The ask is
-  // answered, so there is nothing to write — and nothing to auto-claim over their reservation.
+  // Its mirror: somebody granted the approval by hand, or a concurrent approve landed it. The GATE
+  // is the whole ask, so there is nothing to write — and no claim to take over their grant, whether
+  // or not they reserved the target with it. An unreserved grant leaves the bead exactly where the
+  // picker's own pool expects it (approved and unassigned), which is why the proposal's acceptance
+  // asserts the gate alone and never a reservation (emit.ts `appliedState`).
   if (step.verb === "approve") return beads.isApproved(subject);
   return false;
 }

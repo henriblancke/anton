@@ -695,6 +695,10 @@ export function SettingsView({
   // inside the poll's request window, which a plain in-flight check would miss entirely.
   const schedulePatchesInFlight = useRef(0);
   const schedulePatchesCompleted = useRef(0);
+  // The tail of this panel's settings PATCHes and how many are still open — together they run one
+  // at a time without deferring a lone write (see {@link patchSettings}).
+  const settingsWrites = useRef<Promise<void>>(Promise.resolve());
+  const settingsWritesOpen = useRef(0);
 
   const [model, setModel] = useState(settings.model ?? "");
   const [seedPrompt, setSeedPrompt] = useState(settings.seedPrompt ?? "");
@@ -1034,6 +1038,35 @@ export function SettingsView({
   }
 
   /**
+   * A settings PATCH, queued behind every other one this panel has open.
+   *
+   * The route read-modify-writes the whole settings JSON, so two requests in flight against it are a
+   * lost update: both read the stored row, and whichever writes last drops the other's fields. This
+   * panel has two writers to that row — "Save changes" and the cadence opt-out below, which appears
+   * over a form the operator may be halfway through saving — so the answer that came back with a
+   * success toast could be the one silently discarded. Ordering them end to end is what makes each
+   * PATCH read a row that already carries the one before it.
+   */
+  function patchSettings(body: object): Promise<Response> {
+    const send = () =>
+      fetch(`/api/projects/${project.slug}/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    // Straight through when nothing else is open — the queue exists to order concurrent writes, not
+    // to defer a lone one behind a microtask. Chained on SETTLE rather than success, so a write that
+    // threw still lets the next one run and the tail never carries a rejection nothing awaits.
+    const sent = settingsWritesOpen.current === 0 ? send() : settingsWrites.current.then(send, send);
+    settingsWritesOpen.current += 1;
+    const settled = () => {
+      settingsWritesOpen.current -= 1;
+    };
+    settingsWrites.current = sent.then(settled, settled);
+    return sent;
+  }
+
+  /**
    * Decline it, permanently. Persisted immediately and optimistically: a failed write is reverted so
    * the offer returns rather than being silently swallowed — an opt-out this panel only thinks it
    * stored is how an operator gets asked the same question forever.
@@ -1051,11 +1084,7 @@ export function SettingsView({
     setCadenceOffer(null);
     keepWeekly.current = true;
     try {
-      const res = await fetch(`/api/projects/${project.slug}/settings`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ keepProductMasterWeekly: true }),
-      });
+      const res = await patchSettings({ keepProductMasterWeekly: true });
       if (!res.ok) {
         const { error } = await res.json().catch(() => ({ error: "Update failed" }));
         throw new Error(error ?? "Update failed");
@@ -1131,62 +1160,58 @@ export function SettingsView({
   async function save() {
     setSaving(true);
     try {
-      const res = await fetch(`/api/projects/${project.slug}/settings`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        // "" clears the override → driver runs with no --model / no seed / the default review-fix prompt.
-        body: JSON.stringify({
-          model: model || null,
-          seedPrompt: seedPrompt.trim() || null,
-          reviewFixPrompt: reviewFixPrompt.trim() || null,
-          productMasterPrompt: productMasterPrompt.trim() || null,
-          // Self-review gate (anton-3apm). "" clears the reviewer swap / prompt override → the
-          // shipped review contract. The knobs are sent even while the gate is off, so turning it
-          // back on restores the operator's reviewer instead of silently resetting it.
-          reviewEnabled,
-          // A stored reviewer whose agent has since been deleted is shown but NOT resubmitted: the
-          // PATCH rejects unknown ids, which would fail every unrelated save until someone noticed.
-          // Omitting the key leaves the stored id untouched — runtime already falls back on its own.
-          ...(reviewerMissing(reviewAgent, agents) ? {} : { reviewAgent: reviewAgent || null }),
-          reviewPrompt: reviewPrompt.trim() || null,
-          reviewMaxRounds,
-          reviewMinScore,
-          reviewLowScoreRounds,
-          // "" clears a verify gate → it's skipped (no behavior change).
-          testCommand: testCommand.trim() || null,
-          lintCommand: lintCommand.trim() || null,
-          typecheckCommand: typecheckCommand.trim() || null,
-          buildCommand: buildCommand.trim() || null,
-          // Per-label pipeline variants (anton-aa3m), in the order shown — that order is the
-          // precedence. A half-filled row is scaffolding, not a mapping, so it's dropped rather
-          // than 400ing the whole save; [] clears the map (every run walks the project's default).
-          formulaVariants: variantRows
-            .map((v) => ({ label: v.label.trim(), formula: v.formula.trim() }))
-            .filter((v) => v.label && v.formula),
-          // Nominated value labels (anton-prng), in the order shown — that order is the band order.
-          // Blank scaffolding rows and a repeat nomination (unreachable by definition — the first
-          // match wins) are dropped rather than 400ing the whole save; [] clears the nominations,
-          // which puts ranking back on native fields alone.
-          valueLabels: nominatedLabels(valueLabelRows),
-          concurrency,
-          jobTimeoutMinutes,
-          ticketTimeoutMinutes,
-          maxRetries,
-          // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
-          // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather
-          // than re-persisted, so user agents never leak into the bundled allowlist.
-          agents: bundledAgents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
-          autonomy,
-          conventionalCommits,
-          budgetAware,
-          // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs
-          // set via the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
-          budgetPolicy: { daytimeReservePct, weeklyTargetPct },
-          // Every kind this build renders, at its resolved level. Explicit `propose` entries and
-          // not omissions: the server merges per kind, so an omitted kind keeps whatever it held —
-          // which is how disarming one would silently fail to persist.
-          proposalAutonomy,
-        }),
+      // "" clears the override → driver runs with no --model / no seed / the default review-fix prompt.
+      const res = await patchSettings({
+        model: model || null,
+        seedPrompt: seedPrompt.trim() || null,
+        reviewFixPrompt: reviewFixPrompt.trim() || null,
+        productMasterPrompt: productMasterPrompt.trim() || null,
+        // Self-review gate (anton-3apm). "" clears the reviewer swap / prompt override → the
+        // shipped review contract. The knobs are sent even while the gate is off, so turning it
+        // back on restores the operator's reviewer instead of silently resetting it.
+        reviewEnabled,
+        // A stored reviewer whose agent has since been deleted is shown but NOT resubmitted: the
+        // PATCH rejects unknown ids, which would fail every unrelated save until someone noticed.
+        // Omitting the key leaves the stored id untouched — runtime already falls back on its own.
+        ...(reviewerMissing(reviewAgent, agents) ? {} : { reviewAgent: reviewAgent || null }),
+        reviewPrompt: reviewPrompt.trim() || null,
+        reviewMaxRounds,
+        reviewMinScore,
+        reviewLowScoreRounds,
+        // "" clears a verify gate → it's skipped (no behavior change).
+        testCommand: testCommand.trim() || null,
+        lintCommand: lintCommand.trim() || null,
+        typecheckCommand: typecheckCommand.trim() || null,
+        buildCommand: buildCommand.trim() || null,
+        // Per-label pipeline variants (anton-aa3m), in the order shown — that order is the
+        // precedence. A half-filled row is scaffolding, not a mapping, so it's dropped rather
+        // than 400ing the whole save; [] clears the map (every run walks the project's default).
+        formulaVariants: variantRows
+          .map((v) => ({ label: v.label.trim(), formula: v.formula.trim() }))
+          .filter((v) => v.label && v.formula),
+        // Nominated value labels (anton-prng), in the order shown — that order is the band order.
+        // Blank scaffolding rows and a repeat nomination (unreachable by definition — the first
+        // match wins) are dropped rather than 400ing the whole save; [] clears the nominations,
+        // which puts ranking back on native fields alone.
+        valueLabels: nominatedLabels(valueLabelRows),
+        concurrency,
+        jobTimeoutMinutes,
+        ticketTimeoutMinutes,
+        maxRetries,
+        // The enabled BUNDLED ids, in discovered order. Only bundled ids we actually rendered — a
+        // stale id from a since-deleted or user agent (still in the seeded set) is pruned rather
+        // than re-persisted, so user agents never leak into the bundled allowlist.
+        agents: bundledAgents.filter((a) => activeAgents.has(a.id)).map((a) => a.id),
+        autonomy,
+        conventionalCommits,
+        budgetAware,
+        // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs
+        // set via the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.
+        budgetPolicy: { daytimeReservePct, weeklyTargetPct },
+        // Every kind this build renders, at its resolved level. Explicit `propose` entries and
+        // not omissions: the server merges per kind, so an omitted kind keeps whatever it held —
+        // which is how disarming one would silently fail to persist.
+        proposalAutonomy,
       });
       const body = (await res.json().catch(() => null)) as {
         settings?: EditableSettings;

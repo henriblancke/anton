@@ -1655,6 +1655,55 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(offer()).toBeNull();
   });
 
+  /**
+   * The opt-out and "Save changes" write the SAME settings row, and the route read-modify-writes the
+   * whole of it — so two in flight at once is a lost update, and the loser is whichever replies
+   * first, with a success toast either way.
+   */
+  it("queues the opt-out behind an open save, so neither PATCH drops the other's fields", async () => {
+    let finishSave: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      if (String(input).endsWith("/settings")) {
+        // The form save is held open; the opt-out answers immediately if it ever gets sent.
+        if ((init.body as string).includes("keepProductMasterWeekly")) {
+          return Promise.resolve(new Response(JSON.stringify({ settings: {} })));
+        }
+        return new Promise<Response>((resolve) => {
+          finishSave = () => resolve(new Response(JSON.stringify({ settings: {} })));
+        });
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    // Stage an edit in another section so Save is offered at all, then come back and raise the offer.
+    fireEvent.click(screen.getByRole("button", { name: "Execution prompt" }));
+    fireEvent.change(screen.getByLabelText("Seed prompt"), { target: { value: "prefer RSC" } });
+    fireEvent.click(screen.getByRole("button", { name: "Automation" }));
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(finishSave).toBeTruthy());
+
+    // Answered with the save still open: the second PATCH must not be sent yet, or it reads a row
+    // the save has not written and rewrites it without the staged prompt.
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+    expect(patchesTo(fetchMock, "/settings")).toHaveLength(1);
+
+    finishSave!();
+    await waitFor(() => expect(patchesTo(fetchMock, "/settings")).toHaveLength(2));
+    expect(bodyOf(patchesTo(fetchMock, "/settings")[1])).toEqual({ keepProductMasterWeekly: true });
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master stays weekly"));
+  });
+
   it("withdraws the offer when the operator sets that cadence by hand instead", async () => {
     const fetchMock = stubPanelFetch();
     renderView({}, [], coupledSchedules());
