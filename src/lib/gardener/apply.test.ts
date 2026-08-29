@@ -874,6 +874,40 @@ describe("the product master's moves", () => {
       // Neither write: the reservation was not stolen and the label never went on.
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
+
+    it("hands the reservation back when the label write fails, so the retry sees what we saw", async () => {
+      // The one order this pair is unsafe to half-apply in. A claim standing without `approved` is a
+      // target the picker's own eligibility bars from EVERY holder, this machine's included — so
+      // nothing retries it and nothing picks it up until a human unassigns it.
+      failOn.set("approve:anton-a", 1);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.message).toContain("bd approve exploded");
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        "assign anton-a ",
+      ]);
+    });
+
+    it("names the stranded reservation when it cannot be handed back either", async () => {
+      // The release is bounded by the same CAS, so a failure here leaves the board in a state only a
+      // human can settle — and saying so is the whole point of failing loud.
+      failOn.set("approve:anton-a", 1);
+      failOn.set("assign:anton-a", 2);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.message).toMatch(
+        /anton-a could not be approved \(bd approve exploded\) and the reservation taken for that start could not be released either/,
+      );
+      expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+    });
   });
 
   it("refuses a split with an answer, because anton will not write new contracts on its own", async () => {

@@ -798,12 +798,16 @@ export function SettingsView({
    * reverted with a toast if the PATCH fails. A missing row is created server-side. The response
    * carries the row as stored, so the next-run readout is the server's recomputed nextRunAt rather
    * than a guess made here.
+   *
+   * Answers whether the write LANDED, because one caller acts on that and not on the optimistic
+   * state: arming the picker offers a cadence change whose whole premise is that the picker is now
+   * armed (see {@link toggleAutomation}).
    */
   async function patchSchedule(
     id: string,
     patch: { cron?: string; enabled?: boolean },
     message: string,
-  ) {
+  ): Promise<boolean> {
     const prev = automations[id];
     setAutomations((p) => ({ ...p, [id]: { ...prev, ...patch } }));
     schedulePatchesInFlight.current += 1;
@@ -830,6 +834,7 @@ export function SettingsView({
         }));
       }
       toast.success(message);
+      return true;
     } catch (err) {
       // Undo only the fields this patch wrote. Restoring the whole `prev` snapshot would also roll
       // back a concurrent patch for the same automation (toggle while a cadence save is in flight),
@@ -843,6 +848,7 @@ export function SettingsView({
         },
       }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
+      return false;
     } finally {
       // In `finally` so a rejected patch also clears the in-flight count — otherwise one network
       // failure would leave the counter above zero and silently stop the poll for the whole session.
@@ -909,19 +915,24 @@ export function SettingsView({
     };
   }, [active, project.slug]);
 
-  function toggleAutomation(id: string, next: boolean) {
-    // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs,
-    // so it is the one toggle that opens an offer — and only an offer. Disarming deliberately does
-    // nothing to the cadence: an operator who accepted daily keeps daily until they say otherwise,
-    // and a schedule that silently sprang back would make this table untrustworthy about the only
-    // thing it exists to report.
-    if (id === AUTOPILOT_ARMING_AUTOMATION) {
-      if (next) offerDailyProductMaster();
-      // Disarming withdraws the QUESTION, never the answer: with the picker off, nothing executes
-      // what product-master judges, so an unanswered offer has lost its reason to be on screen.
-      else setCadenceOffer(null);
-    }
-    return patchSchedule(id, { enabled: next }, `${id} ${next ? "enabled" : "disabled"}`);
+  async function toggleAutomation(id: string, next: boolean) {
+    // Disarming withdraws the QUESTION, never the answer: with the picker off, nothing executes what
+    // product-master judges, so an unanswered offer has lost its reason to be on screen. Done ahead
+    // of the write because it takes something OFF screen — nothing can be accepted in the meantime.
+    if (id === AUTOPILOT_ARMING_AUTOMATION && !next) setCadenceOffer(null);
+    const stored = await patchSchedule(
+      id,
+      { enabled: next },
+      `${id} ${next ? "enabled" : "disabled"}`,
+    );
+    // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs, so
+    // it is the one toggle that opens an offer — and only an offer. Asked only once the arm LANDED:
+    // the offer's entire premise is that the picker now executes what product-master ranks, so a
+    // failed PATCH must not leave a question standing on a condition that never happened. Disarming
+    // deliberately does nothing to the cadence: an operator who accepted daily keeps daily until
+    // they say otherwise, and a schedule that silently sprang back would make this table
+    // untrustworthy about the only thing it exists to report.
+    if (stored && id === AUTOPILOT_ARMING_AUTOMATION && next) offerDailyProductMaster();
   }
 
   /**
@@ -957,10 +968,15 @@ export function SettingsView({
 
   /**
    * Decline it, permanently. Persisted immediately and optimistically: a failed write is reverted so
-   * the offer returns on the next arm rather than being silently swallowed — an opt-out this panel
-   * only thinks it stored is how an operator gets asked the same question forever.
+   * the offer returns rather than being silently swallowed — an opt-out this panel only thinks it
+   * stored is how an operator gets asked the same question forever.
+   *
+   * The revert puts the QUESTION back too, not just the standing answer. An operator who declined,
+   * got an error toast, and then watched the question vanish anyway has been told the write failed
+   * and shown the outcome of it succeeding; the offer has to be back where they can answer it again.
    */
   async function declineCadenceOffer() {
+    const offer = cadenceOffer;
     setCadenceOffer(null);
     setKeepWeekly(true);
     try {
@@ -976,6 +992,7 @@ export function SettingsView({
       toast.success(`${CADENCE_COUPLED_AUTOMATION} stays weekly`);
     } catch (err) {
       setKeepWeekly(false);
+      setCadenceOffer(offer);
       toast.error(err instanceof Error ? err.message : "Failed to save your answer");
     }
   }

@@ -693,8 +693,11 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
  * The order is the route's and only it is safe to fail between. `approved` is what locks the
  * reservation — the claim route refuses to touch an approved target — so a label that landed ahead
  * of the claim leaves a window in which a teammate's steal is still legal, on work anton is about to
- * run. A claim that lands without the label is a reserved target nothing picks up, which the retry
- * converges on: the swap reads owner→owner and writes nothing, then the label follows.
+ * run. The other order strands the bead instead, which is why the label write is UNWOUND: a claim
+ * standing without `approved` is a reservation nothing picks up and no retry can clear, because
+ * every re-apply re-asks {@link startBarred}, and the picker's eligibility bars any holder — this
+ * machine's own operator included. Releasing it puts the board back where the proposal found it, so
+ * the next pass decides the same question from the same state.
  *
  * The CAS is redundant against this process and not against the board: the fence above already
  * re-read the subject under this very lock, so a claim from another anton write queues behind us —
@@ -713,7 +716,36 @@ async function grantApproval(repo: string, id: string): Promise<void> {
       `${id} was claimed by ${swap.owner ?? "another writer"} since this proposal was decided — approving it now would start a run on work somebody else has reserved`,
     );
   }
-  await beads.approve(repo, id);
+  try {
+    await beads.approve(repo, id);
+  } catch (err) {
+    if (await releaseReservation(repo, id, operator)) throw err;
+    throw new Error(
+      `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+    );
+  }
+}
+
+/**
+ * Hand back the reservation the failed start took, and say whether the board took it back. Bounded
+ * by the same CAS as the claim, so it releases OUR claim and only ours: a target somebody has since
+ * taken over is theirs, and unassigning it would steal it in the name of an undo.
+ *
+ * Never throws — the caller is already reporting a failure, and a rollback that raised a second one
+ * would replace the reason the start failed with the reason the undo did.
+ */
+async function releaseReservation(
+  repo: string,
+  id: string,
+  operator: string | undefined,
+): Promise<boolean> {
+  // No identity resolved means the swap was a verified no-op, so there is no reservation to unwind.
+  if (!operator) return true;
+  try {
+    return (await swapUnderLock(repo, id)(operator, undefined)).ok;
+  } catch {
+    return false;
+  }
 }
 
 // ── rollback ──

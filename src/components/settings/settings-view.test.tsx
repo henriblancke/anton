@@ -1376,15 +1376,17 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
   const cadenceOf = (name: string) =>
     screen.getByRole("button", { name: `${name} cadence` }).textContent;
 
-  it("offers the daily cadence on arm, and says why it is asking", async () => {
+  it("offers the daily cadence once the arm lands, and says why it is asking", async () => {
     stubPanelFetch();
     renderView({}, [], coupledSchedules());
 
     expect(offer()).toBeNull();
     arm();
 
+    // Not before the write: the offer's premise is that the picker IS armed.
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(offer()).toBeTruthy());
     const prompt = offer();
-    expect(prompt).toBeTruthy();
     // The WHY, not the mechanism: the judgment is executed now, so its staleness costs something.
     expect(prompt!.textContent).toMatch(/feeds the board-picker/);
     expect(prompt!.textContent).toMatch(/executed, not just read/);
@@ -1399,6 +1401,7 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     renderView({}, [], coupledSchedules({ pm: { cron: "30 22 * * 5" } }));
 
     arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
 
     await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
@@ -1416,6 +1419,7 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     renderView({}, [], coupledSchedules());
 
     arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
 
     // The answer is stored, not just dismissed — otherwise the next arm asks it all over again.
@@ -1429,6 +1433,7 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     // Disarm, arm again: the question is answered, so it stays answered.
     arm();
     arm();
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(3));
     expect(offer()).toBeNull();
     expect(patchesTo(fetchMock, "/schedules").every((c) => bodyOf(c).cron === undefined)).toBe(true);
   });
@@ -1442,30 +1447,58 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
   });
 
   it("puts the opt-out back when it could not be stored, rather than swallowing it", async () => {
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((input, init) => {
+      if (init?.method === "PATCH" && String(input).endsWith("/settings")) {
+        return Promise.resolve(new Response(JSON.stringify({ error: "disk full" }), { status: 500 }));
+      }
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { cron: WEEKLY, ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disk full"));
+    // Nothing was stored, so the question comes straight back on screen: an operator told the write
+    // failed and then shown the outcome of it succeeding has to trust two contradictory things.
+    expect(offer()).toBeTruthy();
+
+    // And the standing answer went back with it, so a later arm asks again too.
+    arm();
+    expect(offer()).toBeNull();
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+  });
+
+  it("opens no offer when the arm itself failed — the condition it names never happened", async () => {
     const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
-      (input, init) => {
-        if (init?.method !== "PATCH") {
-          return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
-        }
-        if (String(input).endsWith("/settings")) {
-          return Promise.resolve(new Response(JSON.stringify({ error: "disk full" }), { status: 500 }));
-        }
-        return Promise.resolve(
-          new Response(JSON.stringify({ schedule: { type: "board-picker", enabled: true, cron: "*/10 * * * *" } })),
-        );
-      },
+      (_input, init) =>
+        Promise.resolve(
+          init?.method === "PATCH"
+            ? new Response(JSON.stringify({ error: "schedule store down" }), { status: 500 })
+            : new Response(JSON.stringify({ schedules: [] })),
+        ),
     );
     vi.stubGlobal("fetch", fetchMock);
     renderView({}, [], coupledSchedules());
 
     arm();
-    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disk full"));
-    // Nothing was stored, so the operator gets asked again — silence would be the worse failure.
-    arm();
-    arm();
-    expect(offer()).toBeTruthy();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("schedule store down"));
+    // The toggle rolled back, so nothing on screen claims the picker is armed — and nothing offers
+    // to raise a cadence because it is.
+    expect(offer()).toBeNull();
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
   });
 
   it("disarming changes no cadence and withdraws an unanswered question", async () => {
@@ -1485,7 +1518,7 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
 
     // Re-arm with the offer open, then disarm again: the question goes, the cadence stays.
     arm();
-    expect(offer()).toBeTruthy();
+    await waitFor(() => expect(offer()).toBeTruthy());
     fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
     expect(offer()).toBeNull();
     expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");

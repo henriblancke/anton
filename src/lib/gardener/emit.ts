@@ -677,7 +677,10 @@ function appliedState(detection: GardenerDetection): string {
       // that is sound again (see apply.ts `planUnapprove`).
       return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
     case "approve":
-      return `${subjects} ${is} approved, so anton starts a run on ${pronoun(detection)} — the approval IS the start`;
+      // What the move WRITES, not what a later feature will do with it: the apply step grants the
+      // gate and takes anton's reservation, and nothing here enqueues a run (anton-qlci). An
+      // acceptance box promising a started run is one the approver cannot check off.
+      return `${subjects} ${is} approved and reserved for anton — the gate is granted and the target claimed, which is the state a run starts from`;
   }
 }
 
