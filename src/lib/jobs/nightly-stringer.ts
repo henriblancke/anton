@@ -76,6 +76,9 @@ async function runNightlyPass(db: AntonDb, clock: Clock, ctx: JobContext): Promi
       logPath: pass.logPath,
       signal: ctx.signal,
     });
+    // Only now that the window handle is in hand: these are log writes, and one failing must reach
+    // the catch below with `scanned` set rather than stranding a consumed --delta window.
+    await scanned.reportDiagnostics();
     await ctx.heartbeat();
     await triageScan(pass, scanned, ctx);
     await pass.end("done");

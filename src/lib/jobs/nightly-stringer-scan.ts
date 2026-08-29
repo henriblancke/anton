@@ -34,6 +34,13 @@ export interface ScanPass {
   deltaState: DeltaState;
   /** Put the `--delta` baseline back where this scan found it (see {@link restoreScanWindow}). */
   restoreBaseline: () => Promise<string | undefined>;
+  /**
+   * Say what the scan dropped or lost. Deliberately NOT run inside {@link scanShippedTree}: these
+   * are session-log writes, and a log write can fail (a full disk, a session dir removed mid-pass)
+   * long after the scan consumed its `--delta` window. Called by the caller once it holds this
+   * handle, so such a failure lands in a catch that can still hand the window back.
+   */
+  reportDiagnostics: () => Promise<void>;
 }
 
 /** Where a scan file lands — under anton's own dir, disposable with anton.db. */
@@ -79,6 +86,9 @@ export async function bringCheckoutForward(project: Project, logPath: string): P
  * Everything the scan silently lost or dropped, said on the session BEFORE the no-signals early
  * return: a pass whose collector died, or whose only findings were phantoms, must read as a damaged
  * or filtered scan rather than as a clean nothing-to-do.
+ *
+ * Reached through {@link ScanPass.reportDiagnostics}, never from the scan itself — see there for
+ * why the window handle must escape first.
  */
 async function reportScanDiagnostics(
   result: ScanResult,
@@ -142,8 +152,9 @@ export async function scanShippedTree(opts: {
   const scanFile = scanFilePath(opts.sessionId);
   await appendSessionLog(logPath, `[stringer] scan --delta ${project.repoPath} @ ${scannedSha}\n`);
   const result = await scan({ repoPath: project.repoPath, scanFile, signal: opts.signal });
-  await reportScanDiagnostics(result, project, logPath);
 
+  // Nothing that can throw may run between the scan and this return: the scan has already consumed
+  // the --delta window, and only this handle can give it back.
   return {
     scanFile: result.scanFile,
     scannedSha,
@@ -154,6 +165,7 @@ export async function scanShippedTree(opts: {
     collectorFailures: result.collectorFailures.length,
     deltaState: result.deltaState,
     restoreBaseline: result.restoreBaseline,
+    reportDiagnostics: () => reportScanDiagnostics(result, project, logPath),
   };
 }
 

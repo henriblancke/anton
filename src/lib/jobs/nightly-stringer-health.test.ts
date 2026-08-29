@@ -53,6 +53,7 @@ function pass(total: number): ScanPass {
     collectorFailures: 1,
     deltaState: { before: "state-1", after: "state-2" },
     restoreBaseline: async () => undefined,
+    reportDiagnostics: async () => {},
   };
 }
 
