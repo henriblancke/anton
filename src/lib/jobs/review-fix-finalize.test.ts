@@ -9,6 +9,7 @@ import type { Bead } from "../beads/bd";
 
 const batchMock = vi.fn();
 const untagMock = vi.fn();
+const noteMock = vi.fn();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -18,6 +19,7 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       batch: (...args: unknown[]) => batchMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      note: (...args: unknown[]) => noteMock(...args),
     },
   };
 });
@@ -36,7 +38,8 @@ vi.mock("../runs", () => ({
 
 const { finalizeMergedEpic } = await import("./review-fix");
 
-const bead = (id: string, status = "open"): Bead => ({ id, title: id, status }) as Bead;
+const bead = (id: string, status = "open", labels: string[] = []): Bead =>
+  ({ id, title: id, status, labels }) as Bead;
 
 const finalize = (epic: Bead, children: Bead[]) =>
   finalizeMergedEpic({
@@ -53,6 +56,7 @@ describe("finalizeMergedEpic", () => {
   beforeEach(() => {
     batchMock.mockReset().mockResolvedValue(undefined);
     untagMock.mockReset().mockResolvedValue(undefined);
+    noteMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("closes the still-open children and the target in one batch, children first", async () => {
@@ -74,6 +78,27 @@ describe("finalizeMergedEpic", () => {
 
     expect(batchMock.mock.calls[0][1]).toEqual([]); // nothing left to close (the seam spawns no bd)
     expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+  });
+
+  it("leaves a `not-delivered` child open — a merged PR does not contain it", async () => {
+    // The run that opened this PR absorbed a ticket timeout: `t2` was rolled back and `t3` was
+    // skipped behind it, so neither is in the merged diff. Closing them here would file work that
+    // was never done as shipped and lose it silently.
+    await finalize(bead("epic-1"), [
+      bead("t1"),
+      bead("t2", "blocked", ["not-delivered"]),
+      bead("t3", "open", ["not-delivered"]),
+    ]);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([
+      { op: "close", id: "t1" },
+      { op: "close", id: "epic-1" },
+    ]);
+    // The target still closes — the PR it points at is merged and terminal — so the preserved
+    // tickets say for themselves why they outlived it.
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(noteMock.mock.calls.map((c) => c[1])).toEqual(["t2", "t3"]);
+    expect(noteMock.mock.calls[0][2]).toContain("merged WITHOUT this ticket");
   });
 
   it("keeps stage:in-review when the transaction fails, so the next sweep retries", async () => {

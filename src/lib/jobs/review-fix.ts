@@ -474,8 +474,9 @@ async function notifyReReview(args: {
 // ── merge finalization (anton-ner.5) ──
 
 /**
- * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
- * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
+ * Finalize an epic whose PR merged: close the epic + any still-open child tickets (bar the ones a
+ * run marked `not-delivered`, which are in no diff and stay open), drop the `stage:in-review`
+ * label, remove the merged branch + its worktree, and finalize the run row.
  *
  * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
  * next review-fix sweep no longer treats the epic as in-review (inReviewEpics filters it out), so it
@@ -505,13 +506,38 @@ export async function finalizeMergedEpic(args: {
   //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
   //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
   //    orphaning a still-open ticket/epic behind a run already marked done.
+  //
+  //    A merged PR does NOT mean every child shipped in it (anton-67xj). A run that absorbed a
+  //    ticket timeout opens its PR for the work that DID land and marks the rest `not-delivered` —
+  //    those beads are in no diff, so closing them here would file work that was never done as
+  //    shipped and lose it silently, against the note on the bead telling the operator to run it.
+  //    They are left open and named on the target instead; the target itself still closes, since
+  //    the PR it points at is merged and terminal.
+  const preserved = children.filter((b) => b.status !== "closed" && beads.isNotDelivered(b));
+  const skip = new Set(preserved.map((b) => b.id));
   const stillOpen = new Map(
-    [...children, epic].filter((b) => b.status !== "closed").map((b) => [b.id, b]),
+    [...children, epic]
+      .filter((b) => b.status !== "closed" && !skip.has(b.id))
+      .map((b) => [b.id, b]),
   ); // by id: a leaf run target is its own ticket, so it can appear on both sides
   const closed = await safe(() =>
     beads.batch(repo, [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id }))),
   );
   if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+
+  // 1b. Say on each preserved bead that the feature shipped without it — the operator meets this
+  //     ticket long after the run that skipped it, under a target that now reads as done.
+  for (const bead of preserved) {
+    await safe(() =>
+      beads.note(
+        repo,
+        bead.id,
+        `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
+          `deliver it (see the note above), so none of its work is in that diff. Left open on ` +
+          `purpose: closing it here would file work that was never done as shipped.`,
+      ),
+    );
+  }
 
   // 2. Remove the merged branch and its worktree. If the worktree is already gone (the common case),
   //    removeWorktree still prunes and deletes the local branch off a synthetic descriptor.

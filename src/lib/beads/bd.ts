@@ -36,6 +36,15 @@ export const LABELS = {
    */
   abandoned: "abandoned",
   /**
+   * Work a run reserved but did NOT deliver (anton-67xj): a ticket skipped behind a timed-out one
+   * whose partial work was rolled back, or the timed-out ticket itself. Nothing from it is on the
+   * run's branch, so it is in no PR — which is exactly what merge finalization cannot see for
+   * itself: `bd` has no "this bead is not in that diff" fact, and a still-open child otherwise
+   * reads as one the run merely forgot to close. Cleared the moment a run dispatches the ticket
+   * again. See beads.isNotDelivered.
+   */
+  notDelivered: "not-delivered",
+  /**
    * Cross-machine run-liveness lease (anton-jz1): `run-lease:<expiresAtEpochMs>[:<ownerRunId>]` on
    * the run target. Present + unexpired ⇒ a run is actively executing this epic on SOME machine, so
    * a Force run started elsewhere must not spawn a second concurrent run. This is the shared
@@ -2781,6 +2790,9 @@ export const beads = {
 
   /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
   isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
+
+  /** A bead a run reserved but never delivered (see LABELS.notDelivered) — open, and in no PR. */
+  isNotDelivered: (b: Bead) => b.labels?.includes(LABELS.notDelivered) ?? false,
 
   setStatus: (cwd: string, id: string, status: string) =>
     bdWrite(cwd, ["update", id, "--status", status]),

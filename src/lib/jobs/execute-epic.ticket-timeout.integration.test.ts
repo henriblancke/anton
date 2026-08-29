@@ -182,6 +182,8 @@ process.exit(0);`),
       expect(stalled.status).toBe("blocked");
       expect(stalled.assignee ?? null).toBeNull();
       expect(stalled.labels ?? []).not.toContain("stage:implementing");
+      // Its work was rolled back, so it is in no PR either — same mark, same merge-time meaning.
+      expect(stalled.labels ?? []).toContain("not-delivered");
       expect(JSON.stringify(stalled)).toMatch(/outlived its budget/i);
 
       // The other ticket ran to completion, exactly as it would have without the stall.
@@ -370,6 +372,9 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       const skipped = await beads.show(repo, dependent);
       expect(skipped.status).toBe("open");
       expect(skipped.assignee ?? null).toBeNull();
+      // …and it is marked as work this PR does not contain, so the merge that closes the rest of
+      // the feature leaves it open (finalizeMergedEpic) instead of filing it as shipped.
+      expect(skipped.labels ?? []).toContain("not-delivered");
       expect(JSON.stringify(skipped)).toContain(stalls);
       expect(JSON.stringify(skipped)).toMatch(/not dispatched/i);
       // The target carries the same sentence, since that is what the founder reads at the merge gate.

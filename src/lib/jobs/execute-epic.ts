@@ -1296,6 +1296,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
           // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
           await safe(() => beads.unassign(repo, ticket.id));
+          // …and mark it as work this run did NOT deliver, which is what stops merge finalization
+          // from closing it as shipped when the PR for the rest of the feature lands (anton-67xj).
+          await safe(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]));
           await safe(() => beads.note(repo, ticket.id, skipNote(skipping)));
           console.warn(
             `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
@@ -1362,16 +1365,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           if (!(e instanceof TicketTimeoutError)) throw e;
           timedOut.push({ id: e.ticketId, committed: e.committed });
           console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
-          // Only a ROLLED-BACK timeout cascades (anton-67xj). One stopped after its commit left its
-          // work on the branch — the deadline landed on the bookkeeping, not the code — so the
-          // tickets behind it still have the mechanism they were written against and still run.
-          if (!e.committed) {
-            skipCause = skippedDependents(
-              timedOut.filter((t) => !t.committed).map((t) => t.id),
-              live,
-              all,
-            );
-          }
+          // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
+          // that landed AFTER its commit takes nothing down with it (anton-67xj).
+          skipCause = skippedDependents(timedOut, live, all);
         }
         // A finished ticket is progress — reported here so the runner's no-progress timeout
         // measures a wedge rather than a long-but-healthy feature (anton-t1mo).
@@ -1767,6 +1763,12 @@ async function runTicket(args: {
   // Announce the stage + nudge a sync so the claim reaches teammates within a heartbeat
   // (fire-and-forget; the end-of-run sync is the backstop).
   await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
+  // A previous run marked this ticket as undelivered (timed out, or skipped behind one that did).
+  // It is being run now, so that verdict is stale — leaving it would keep a ticket this run DOES
+  // deliver out of its own merge finalization (anton-67xj).
+  if (beads.isNotDelivered(ticket)) {
+    await safe(() => beads.untag(repo, ticket.id, [LABELS.notDelivered]));
+  }
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
@@ -1977,6 +1979,10 @@ async function runTicket(args: {
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       await safe(() => beads.unassign(repo, ticket.id));
       await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+      // Rolled back ⇒ nothing from this ticket is on the branch, so it is in no PR: mark it, or
+      // merge finalization closes it as shipped when the rest of the feature lands (anton-67xj).
+      // A ticket stopped AFTER its commit is NOT marked — its work is in the diff a human merges.
+      if (!committed) await safe(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]));
       await safe(() =>
         beads.note(
           repo,
@@ -2865,8 +2871,16 @@ export interface SkipCause {
   stopped: string;
 }
 
+/** One entry in a run's timeout ledger: the ticket the budget stopped, and whether its work had
+ * already been committed when it did. */
+export interface TicketTimeoutOutcome {
+  id: string;
+  committed: boolean;
+}
+
 /**
- * Every ticket that transitively depends on a STOPPED ticket, and why (anton-67xj).
+ * Every ticket that transitively depends on a ticket whose work was ROLLED BACK, and why
+ * (anton-67xj).
  *
  * A ticket whose budget ran out has its partial work rolled back, so the mechanism the tickets
  * behind it were written against is not on the branch. Dispatching them anyway hands each agent a
@@ -2874,17 +2888,24 @@ export interface SkipCause {
  * the zero diff that follows poisons the whole run, stranding the work its INDEPENDENT tickets
  * already committed. So they are skipped instead, and the run narrows rather than dies.
  *
+ * Only a rolled-back timeout cascades, which is why this reads the ledger rather than a list of
+ * ids: a ticket stopped AFTER its commit left its work on the branch — the deadline landed on the
+ * bookkeeping, not the code — so the tickets behind it still have what they were written against
+ * and still run.
+ *
  * Breadth-first from the stopped set over the run's own `blocks` edges, so a chain a→b→c skips both
  * b and c; a ticket already recorded is never revisited, which also makes a cycle terminate.
  */
 export function skippedDependents(
-  stopped: string[],
+  timedOut: readonly TicketTimeoutOutcome[],
   tickets: Bead[],
   all: Bead[],
 ): Map<string, SkipCause> {
   const ids = new Set(tickets.map((t) => t.id));
   const adj = dependentEdges(tickets, all);
-  const stoppedSet = new Set(stopped.filter((id) => ids.has(id)));
+  const stoppedSet = new Set(
+    timedOut.filter((t) => !t.committed && ids.has(t.id)).map((t) => t.id),
+  );
   const cause = new Map<string, SkipCause>();
   const queue = [...stoppedSet];
   while (queue.length) {

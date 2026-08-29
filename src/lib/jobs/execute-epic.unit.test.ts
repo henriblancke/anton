@@ -338,6 +338,8 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     ticket("d"),
   ];
   const ids = (beads: Bead[]) => beads.map((b) => b.id);
+  /** A ticket the budget stopped BEFORE its commit — the only kind whose skip cascades. */
+  const rolledBack = (...tickets: string[]) => tickets.map((id) => ({ id, committed: false }));
 
   it("dispatches a chain blocker-first, whatever order the board hands it back in", () => {
     const board = chain();
@@ -347,7 +349,7 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
 
   it("skips the whole chain behind a timed-out ticket, transitively", () => {
     const board = chain();
-    const cause = skippedDependents(["a"], board, board);
+    const cause = skippedDependents(rolledBack("a"), board, board);
     expect([...cause.keys()].sort()).toEqual(["b", "c"]);
     // The direct dependent names `a`; the transitive one names the sibling it queued behind — and
     // both name the ticket a human has to act on.
@@ -357,9 +359,9 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
 
   it("leaves a ticket with no edge to the timed-out one alone — the run narrows, it does not halt", () => {
     const board = chain();
-    expect(skippedDependents(["a"], board, board).has("d")).toBe(false);
+    expect(skippedDependents(rolledBack("a"), board, board).has("d")).toBe(false);
     // …and a timeout further down the chain takes only what is actually behind it.
-    expect([...skippedDependents(["b"], board, board).keys()]).toEqual(["c"]);
+    expect([...skippedDependents(rolledBack("b"), board, board).keys()]).toEqual(["c"]);
   });
 
   it("ignores `blocks` edges that leave the run, and non-blocking edges inside it", () => {
@@ -368,7 +370,7 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
       { ...ticket("b"), dependencies: [dep("b", "x-9")] } as Bead,
       { ...ticket("c"), dependencies: [{ ...dep("c", "a"), type: "related" }] } as Bead,
     ];
-    expect(skippedDependents(["a"], outside, outside).size).toBe(0);
+    expect(skippedDependents(rolledBack("a"), outside, outside).size).toBe(0);
   });
 
   it("terminates on a cycle instead of walking it forever", () => {
@@ -377,9 +379,30 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
       { ...ticket("b"), dependencies: [dep("b", "a")] } as Bead,
       { ...ticket("c"), dependencies: [dep("c", "b")] } as Bead,
     ];
-    expect([...skippedDependents(["a"], cyclic, cyclic).keys()].sort()).toEqual(["b", "c"]);
+    const cause = skippedDependents(rolledBack("a"), cyclic, cyclic);
+    expect([...cause.keys()].sort()).toEqual(["b", "c"]);
     // orderTickets can't topologically sort a cycle either — it hands back the input order.
     expect(ids(orderTickets(cyclic, cyclic))).toEqual(["a", "b", "c"]);
+  });
+
+  it("does NOT cascade a timeout that landed after the ticket committed", () => {
+    const board = chain();
+    // The deadline hit the bookkeeping, not the code: `a`'s work is on the branch, so everything
+    // written against it still has what it needs and must still run. Deleting the committed-ness
+    // check turns this into the whole chain being skipped for work that actually shipped.
+    expect(skippedDependents([{ id: "a", committed: true }], board, board).size).toBe(0);
+    // …and in a run where BOTH happen, only the rolled-back one takes its dependents down: `a`
+    // committed, so `b` still ran; `b` did not, so only `c` behind it is skipped.
+    const mixed = skippedDependents(
+      [
+        { id: "a", committed: true },
+        { id: "b", committed: false },
+      ],
+      board,
+      board,
+    );
+    expect([...mixed.keys()]).toEqual(["c"]);
+    expect(mixed.get("c")).toEqual({ waitingOn: "b", stopped: "b" });
   });
 
   it("says on the bead which ticket it waited on and which one a human must re-scope", () => {
