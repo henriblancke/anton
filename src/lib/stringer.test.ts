@@ -1725,6 +1725,92 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 signature");
     });
 
+    // A template literal that runs past its line is raw text, and a `(` in that text is not syntax.
+    // Counting it would hold the parameter list open past its real `)` — filing every statement
+    // below the signature as more parameter list and dropping a clone of live work.
+    it("does not count the delimiters inside a multiline template literal as syntax", async () => {
+      const repo = writeRepo({
+        "src/banner.ts": [
+          "export function banner(",
+          "  input: string,",
+          "  prefix = `raw (",
+          "  more raw text`,",
+          ") {",
+          "  doAlpha(input);",
+          "  doBeta(input);",
+          "  doGamma(input);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/label.ts": [
+          "export function label(",
+          "  prefix = `raw (",
+          "  more raw text`,",
+          "  suffix: string,",
+          "  trailer: string,",
+          ") {",
+          "  return join(prefix, suffix, trailer);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/banner.ts", 6]], 3),
+        clone([["src/label.ts", 4]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The statements below the template default are code, so their clone survives...
+      expect(result.signals).toMatchObject([{ FilePath: "src/banner.ts" }]);
+      // ...while the parameter list holding the template still reads as one.
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/label.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
+    // A backtick opens a template only where one can open. Inside a quoted string or a trailing
+    // comment it is text, and reading it as an opener would file every line below it as template
+    // text — turning whole parameter lists into code and keeping the windows this filter is for.
+    it("reads a backtick inside a string or a comment as text, not as a template opener", async () => {
+      const repo = writeRepo({
+        "src/quoted.ts": [
+          "export function quoted(",
+          '  label = "a ` backtick",',
+          "  prefix: string,",
+          "  suffix: string,",
+          ") {",
+          "  return join(label, prefix, suffix);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/noted.ts": [
+          "export function noted(",
+          "  prefix: string, // a ` note",
+          "  suffix: string,",
+          "  trailer: string,",
+          ") {",
+          "  return join(prefix, suffix, trailer);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/quoted.ts", 3]], 3),
+        clone([["src/noted.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped.map((d) => d.path)).toEqual([
+        "src/quoted.ts",
+        "src/noted.ts",
+      ]);
+      for (const drop of result.duplication.dropped) {
+        expect(drop.reason).toContain("3 signature");
+      }
+    });
+
     // A window of nothing but closers is dropped too — but "declares rather than computes" would be
     // the wrong diagnosis to hand an operator, since there is nothing there that declares either.
     it("says a block holds no content line rather than blaming its declarations", async () => {

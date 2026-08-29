@@ -149,6 +149,9 @@ const REGEX_LITERAL =
  * cannot be read as one. Crude on purpose — the only thing riding on it is where a multi-line
  * import or type declaration ends, and an unbalanced count there classifies a line as
  * `type`/`import` rather than dropping anything on its own.
+ *
+ * It matches quotes PAIRWISE within one line, so a template literal that runs past its line is
+ * beyond it — `maskTemplate` carries that state across lines before this ever sees the text.
  */
 function stripNoise(line: string): string {
   return line
@@ -157,6 +160,61 @@ function stripNoise(line: string): string {
     .replace(/\/\/.*$/, "")
     .replace(/\/\*.*$/, "")
     .replace(REGEX_LITERAL, (_match, prefix: string, space: string) => `${prefix}${space}""`);
+}
+
+/** Where a quoted string ends, escapes and all; the line's end when it never closes. */
+function afterQuoted(line: string, start: number): number {
+  const quote = line[start];
+  for (let i = start + 1; i < line.length; i += 1) {
+    if (line[i] === "\\") i += 1;
+    else if (line[i] === quote) return i + 1;
+  }
+  return line.length;
+}
+
+/**
+ * Blank the template literals a line carries, INCLUDING the one it leaves open. A multiline
+ * template is raw text, but `stripNoise` can only pair quotes within a line, so a parameter default
+ * whose template opens with `raw (` hands that `(` to `parenDelta` as syntax: the parameter list
+ * never closes on its real `)`, and every statement below it inherits `signature` — dropping a
+ * genuine clone of runtime work.
+ *
+ * Quoted strings and comments are stepped over rather than parsed, so a backtick sitting inside a
+ * quoted string or a trailing `//` note opens nothing. Crude like its neighbours: an interpolation
+ * holding its own template closes the outer one early, which costs a stray word of text and
+ * nothing else.
+ */
+function maskTemplate(line: string, open: boolean): { text: string; open: boolean } {
+  let text = open ? '""' : "";
+  let inTemplate = open;
+  let i = 0;
+  while (i < line.length) {
+    const char = line[i];
+    if (inTemplate) {
+      if (char === "\\") i += 2;
+      else {
+        if (char === "`") inTemplate = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (char === "`") {
+      inTemplate = true;
+      text += '""';
+      i += 1;
+      continue;
+    }
+    let end = i + 1;
+    if (char === "'" || char === '"') end = afterQuoted(line, i);
+    else if (char === "/" && line[i + 1] === "/") end = line.length;
+    else if (char === "/" && line[i + 1] === "*") {
+      const close = line.indexOf("*/", i + 2);
+      end = close < 0 ? line.length : close + 2;
+    }
+    text += line.slice(i, end);
+    i = end;
+  }
+  return { text, open: inTemplate };
 }
 
 /** Net nesting a line opens, over the brackets given — `stripNoise`d, so a brace in a string is not one. */
@@ -310,6 +368,10 @@ function afterBlockComment(line: string): string | undefined {
 function classifyLines(source: string, opts: { hashComments: boolean }): LineClass[] {
   const classes: LineClass[] = [];
   let inComment = false;
+  // Backticks delimit a multiline literal only where the language has one — JS/TS and Go. In a
+  // `#`-comment language the same character is shell substitution or prose, so it opens nothing.
+  const templates = !opts.hashComments;
+  let inTemplate = false;
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
   // Where the open signature started, and whether its arrow is still owed. `const x = (` reads as a
@@ -336,6 +398,19 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         continue;
       }
     }
+    // Inside an open template the line is raw text: it declares nothing and its delimiters are not
+    // syntax, so it never reaches the delta counters and votes as code — the side that keeps the
+    // signal. Read before the comment and blank tests, since a line of template text that happens
+    // to start with `//` is not prose.
+    if (inTemplate) {
+      const masked = maskTemplate(line, true);
+      inTemplate = masked.open;
+      line = masked.text.trim();
+      if (inTemplate || line === "") {
+        classes.push("code");
+        continue;
+      }
+    }
     if (line === "") {
       classes.push("blank");
       continue;
@@ -359,6 +434,16 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       }
       // The comment closed and something followed it: that suffix is what the line does.
       line = rest;
+    }
+
+    // A template this line OPENS and does not close: blank its text now, so the delimiters inside it
+    // never reach `parenDelta`. One that closes on its own line needs nothing — `stripNoise` pairs it.
+    if (templates) {
+      const masked = maskTemplate(line, false);
+      if (masked.open) {
+        inTemplate = true;
+        line = masked.text.trim();
+      }
     }
 
     if (statement) {
