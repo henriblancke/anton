@@ -15,19 +15,28 @@ const recordHealth = vi.fn(async () => {});
 const scanShippedTree = vi.fn();
 const restoreScanWindow = vi.fn(async (err: unknown) => err);
 const runTriage = vi.fn(async () => ({}));
+const syncBoard = vi.fn(async () => {});
 
 vi.mock("./nightly-stringer-pass", () => ({
-  openPass: async () => ({
-    project: { slug: "sandbox", repoPath: "/repo", defaultBranch: "main" },
-    settings: {},
-    sessionId: "sess-1",
-    logPath: "/tmp/sess-1.log",
-    onEvent: () => {},
-    log: async () => {},
-    end: async () => {},
-    recordHealth,
-    triaged: false,
-  }),
+  openPass: async () => {
+    let triaged = false;
+    return {
+      project: { slug: "sandbox", repoPath: "/repo", defaultBranch: "main" },
+      settings: {},
+      sessionId: "sess-1",
+      logPath: "/tmp/sess-1.log",
+      onEvent: () => {},
+      log: async () => {},
+      end: async () => {},
+      recordHealth,
+      get triaged() {
+        return triaged;
+      },
+      markTriaged: () => {
+        triaged = true;
+      },
+    };
+  },
 }));
 
 vi.mock("./nightly-stringer-scan", () => ({
@@ -36,7 +45,7 @@ vi.mock("./nightly-stringer-scan", () => ({
 }));
 
 vi.mock("./nightly-stringer-triage", () => ({ runTriage: () => runTriage() }));
-vi.mock("./nightly-stringer-board", () => ({ syncBoard: async () => {} }));
+vi.mock("./nightly-stringer-board", () => ({ syncBoard: () => syncBoard() }));
 
 function scanPass(overrides: Partial<ScanPass> = {}): ScanPass {
   return {
@@ -92,4 +101,27 @@ it("leaves the window alone when nothing was scanned", async () => {
 
   expect(restoreScanWindow).not.toHaveBeenCalled();
   expect(recordHealth).not.toHaveBeenCalled();
+});
+
+it("leaves the window spent when the pass completes", async () => {
+  const pass = scanPass({ counts: { ...emptyScanCounts(), total: 3 } });
+  scanShippedTree.mockResolvedValue(pass);
+
+  await run();
+
+  expect(runTriage).toHaveBeenCalled();
+  expect(restoreScanWindow).not.toHaveBeenCalled();
+  expect(recordHealth).toHaveBeenCalledWith(pass, {});
+});
+
+it("keeps the window spent when a step after triage fails", async () => {
+  // The half `markTriaged` exists for: triage already read these signals and wrote its beads, so a
+  // later failure must NOT hand the window back and have the retry re-triage them.
+  const pass = scanPass({ counts: { ...emptyScanCounts(), total: 3 } });
+  scanShippedTree.mockResolvedValue(pass);
+  syncBoard.mockRejectedValue(new Error("dolt push rejected"));
+
+  await expect(run()).rejects.toThrow("dolt push rejected");
+
+  expect(restoreScanWindow).not.toHaveBeenCalled();
 });

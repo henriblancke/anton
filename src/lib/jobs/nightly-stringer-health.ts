@@ -39,8 +39,8 @@ export function makeHealthRecorder(opts: {
         sessionId: opts.sessionId,
         counts: pass.counts,
         collectorFailures: pass.collectorFailures,
-        ...(pass.scannedSha ? { scannedSha: pass.scannedSha } : {}),
-        ...(pass.deltaState ? { deltaState: pass.deltaState } : {}),
+        scannedSha: pass.scannedSha,
+        deltaState: pass.deltaState,
         ...(triage ? { triage } : {}),
       });
       await appendSessionLog(opts.logPath, `[stringer] health: ${summarizeScanLine(summary)}\n`);

@@ -26,10 +26,12 @@ export interface NightlyPass {
   /** Land this pass's point on the scan-health trend — at most once, and never fatally. */
   recordHealth: HealthRecorder;
   /**
-   * Flips once triage has READ the scan's signals — from then the consumed `--delta` window is
+   * True once triage has READ the scan's signals — from then the consumed `--delta` window is
    * legitimately spent, and the failure path owes it nothing (see `restoreScanWindow`).
    */
-  triaged: boolean;
+  readonly triaged: boolean;
+  /** Record that triage read the signals. The only way to flip {@link NightlyPass.triaged}. */
+  markTriaged: () => void;
 }
 
 /**
@@ -56,6 +58,9 @@ export async function openPass(
   // the in-flight session. It runs claude directly in the project repo — no worktree.
   ctx.report({ sessionId, cwd: project.repoPath });
 
+  // Closure-held so the window rule cannot be defeated by a caller assigning the field directly.
+  let triaged = false;
+
   return {
     project,
     settings,
@@ -73,6 +78,11 @@ export async function openPass(
       logPath,
       slug: project.slug,
     }),
-    triaged: false,
+    get triaged() {
+      return triaged;
+    },
+    markTriaged: () => {
+      triaged = true;
+    },
   };
 }

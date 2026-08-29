@@ -53,7 +53,7 @@ async function triageScan(pass: NightlyPass, scanned: ScanPass, ctx: JobContext)
     onEvent: pass.onEvent,
   });
   // Triage read the signals; from here the consumed --delta window is legitimately spent.
-  pass.triaged = true;
+  pass.markTriaged();
 
   await pass.recordHealth(scanned, triage);
   // The triage session wrote its beads via `bd`; push them to the Dolt remote.
