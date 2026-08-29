@@ -71,6 +71,18 @@ const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
 const project = { id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" } as Project;
 
+/** A promise the test releases by hand, so a step can be held mid-flight and observed there. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Drains the microtask queue, so everything not blocked on a held promise has run. */
+const settle = () => new Promise((r) => setImmediate(r));
+
 const view = (o: Partial<EscalationView> = {}): EscalationView =>
   ({
     id: "esc-abcdef12-0000",
@@ -180,14 +192,19 @@ describe("answerGateWait — abandon closes the gate LAST", () => {
 });
 
 describe("answerGateWait — resume closes the gate FIRST", () => {
+  // The pull is held OPEN rather than resolved on call: a call order alone would also be produced
+  // by starting the pull, reading the board while it is still in flight, and awaiting it after —
+  // which decides on exactly the stale board the pull exists to replace.
   it("closes the gate before re-reading the board and re-queueing", async () => {
     const order: string[] = [];
+    const pull = deferred();
     gateResolve.mockImplementation(async () => {
       order.push("gate");
       return "ok";
     });
     beadsPull.mockImplementation(async () => {
       order.push("pull");
+      await pull.promise;
     });
     loadAllIssues.mockImplementation(async () => {
       order.push("board");
@@ -198,10 +215,15 @@ describe("answerGateWait — resume closes the gate FIRST", () => {
       return "enqueued";
     });
 
-    const applied = await answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+    const answering = answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+    await settle();
 
     // The pull sits BETWEEN the close and the read: pulling before the close can miss the very
-    // write being answered, and reading before the pull decides on a stale board.
+    // write being answered, and the board must not be read until the pull has LANDED.
+    expect(order).toEqual(["gate", "pull"]);
+    pull.resolve();
+
+    const applied = await answering;
     expect(order).toEqual(["gate", "pull", "board", "resume"]);
     expect(applied).toEqual({ detail: "enqueued" });
     expect(gateResolve.mock.calls[0]![2]).toContain("resolved");

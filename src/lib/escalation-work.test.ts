@@ -71,6 +71,18 @@ const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
 const project = { id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" } as Project;
 
+/** A promise the test releases by hand, so a step can be held mid-flight and observed there. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Drains the microtask queue, so everything not blocked on a held promise has run. */
+const settle = () => new Promise((r) => setImmediate(r));
+
 const bead = (o: Partial<Bead> = {}): Bead =>
   ({ id: "anton-e1", title: "epic", status: "open", labels: [LABELS.approved], ...o }) as Bead;
 
@@ -142,17 +154,29 @@ describe("readBead", () => {
 });
 
 describe("readTargetState — the order the checks are applied in", () => {
+  // The pull is held OPEN rather than resolved on call: a call order alone would also be produced
+  // by starting the pull, reading the bead while it is still in flight, and awaiting it after —
+  // which decides from exactly the pre-pull mirror the pull exists to replace.
   it("pulls the shared board BEFORE reading it, so a foreign write can be seen at all", async () => {
     const order: string[] = [];
-    beadsPull.mockImplementation(async () => void order.push("pull"));
+    const pull = deferred();
+    beadsPull.mockImplementation(async () => {
+      order.push("pull");
+      await pull.promise;
+    });
     beadsShow.mockImplementation(async () => {
       order.push("show");
       return bead();
     });
 
-    await readTargetState(project, view(), "anton-e1", true);
+    const reading = readTargetState(project, view(), "anton-e1", true);
+    await settle();
 
-    expect(order[0]).toBe("pull");
+    expect(order).toEqual(["pull"]);
+    pull.resolve();
+
+    await reading;
+    expect(order[1]).toBe("show");
   });
 
   it("answers `clear` when the board landed and nothing holds the work", async () => {
