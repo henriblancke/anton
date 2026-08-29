@@ -140,9 +140,16 @@ export async function openPrNotice(
 }
 
 /**
- * The residue this project's runs left behind: every checkout registered under anton's worktrees
- * root, plus every branch its run rows recorded — a branch outlives its checkout, so the 9 stale
- * `anton/*` branches this ticket was filed for have no worktree left to find them by.
+ * The residue this project's runs left behind, from the two places it can still EXIST — a checkout
+ * registered under anton's worktrees root, or a local branch under anton's prefix. A run row is
+ * consulted for what it knows (the bead behind a branch, the path it checked out) but is never on
+ * its own evidence of residue: a settled row outlives both resources it names, so treating every row
+ * as a candidate would make each finished run a permanent `gh` call on every sweep, and a project's
+ * sweep cost would grow with its lifetime run count.
+ *
+ * Branches are the reason a run row is not the third source either: a branch whose row is gone — the
+ * shape a recreated `anton.db` leaves — is exactly the residue this sweep exists to reclaim, and it
+ * is visible only in git.
  *
  * Pure: the caller does the git/db/board reads. Scoping to the worktrees root is what keeps the
  * sweep off `.claude/worktrees` and off the operator's own checkouts, and the main working tree is
@@ -151,7 +158,9 @@ export async function openPrNotice(
 export function reapCandidates(input: {
   repoPath: string;
   worktrees: WorktreeRecord[];
-  /** This project's run rows — every status, since a settled row still names its residue. */
+  /** Every local branch under `branchPrefix/`, as `listBranches` reports it. */
+  branches: string[];
+  /** This project's run rows — every status, since a live row still names what it is using. */
   runs: ReadonlyArray<{
     branch: string | null;
     worktreePath: string | null;
@@ -165,6 +174,12 @@ export function reapCandidates(input: {
 }): ReapCandidate[] {
   const { repoPath, worktrees, runs, beadStatus, branchPrefix } = input;
   const root = resolve(worktreesRootFor(repoPath)) + sep;
+  const scoped = worktrees.filter(
+    (wt) => !wt.isMain && wt.branch && (resolve(wt.path) + sep).startsWith(root),
+  );
+  // What still exists, and therefore what may be a candidate at all.
+  const checkedOut = new Set(scoped.map((wt) => wt.branch));
+  const existingBranches = new Set(input.branches);
   // A run row is the only place a branch's bead id is recorded; a checkout found on disk falls back
   // to parsing it out of the branch name, which is how anton composes it in the first place.
   const beadIdOf = (branch: string): string | undefined =>
@@ -190,7 +205,9 @@ export function reapCandidates(input: {
   };
 
   for (const r of runs) {
-    if (!r.branch) continue;
+    // A row whose checkout and branch are both gone has nothing left to reap — the run already
+    // handed them back — so it contributes its bead and path only while one of them survives.
+    if (!r.branch || !(checkedOut.has(r.branch) || existingBranches.has(r.branch))) continue;
     add({
       branch: r.branch,
       path: r.worktreePath ?? undefined,
@@ -199,16 +216,25 @@ export function reapCandidates(input: {
       bead: beadStatus(r.epicBeadId),
     });
   }
-  for (const wt of worktrees) {
-    if (wt.isMain || !wt.branch) continue;
-    if (!(resolve(wt.path) + sep).startsWith(root)) continue;
-    const beadId = beadIdOf(wt.branch);
+  for (const wt of scoped) {
+    const branch = wt.branch as string;
+    const beadId = beadIdOf(branch);
     add({
-      branch: wt.branch,
+      branch,
       path: wt.path,
       beadId,
       lock: wt.locked ? (wt.lockReason ?? "") : undefined,
-      runLive: liveBranches.has(wt.branch),
+      runLive: liveBranches.has(branch),
+      bead: beadId ? beadStatus(beadId) : "unknown",
+    });
+  }
+  for (const branch of input.branches) {
+    if (candidates.has(branch)) continue;
+    const beadId = beadIdOf(branch);
+    add({
+      branch,
+      beadId,
+      runLive: liveBranches.has(branch),
       bead: beadId ? beadStatus(beadId) : "unknown",
     });
   }

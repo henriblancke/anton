@@ -18,7 +18,7 @@ import {
   releaseRunWorktree,
   type ReapCandidate,
 } from "./worktree-reaper";
-import { createWorktree, listWorktrees, WORKTREES_ROOT_ENV } from "./worktree";
+import { createWorktree, listBranches, listWorktrees, WORKTREES_ROOT_ENV } from "./worktree";
 
 function candidate(over: Partial<ReapCandidate> = {}): ReapCandidate {
   return { branch: "anton/anton-0oi", beadId: "anton-0oi", runLive: false, bead: "settled", ...over };
@@ -202,6 +202,7 @@ suite("the sweep over real residue (real git)", () => {
     const candidates = reapCandidates({
       repoPath: repo,
       worktrees: await listWorktrees(repo),
+      branches: await listBranches(repo, "anton"),
       runs: [
         { branch: closed.branch, worktreePath: closed.path, status: "done", epicBeadId: "anton-0oi" },
         { branch: open.branch, worktreePath: open.path, status: "parked", epicBeadId: "anton-287p" },
@@ -251,6 +252,7 @@ suite("the sweep over real residue (real git)", () => {
       const candidates = reapCandidates({
         repoPath: repo,
         worktrees: await listWorktrees(repo),
+        branches: await listBranches(repo, "anton"),
         runs: [],
         beadStatus: () => "settled",
         branchPrefix: "anton",
@@ -263,6 +265,38 @@ suite("the sweep over real residue (real git)", () => {
       execFileSync("git", ["-C", repo, "branch", "-D", "claude/scratch"]);
       rmSync(outsideRoot, { recursive: true, force: true });
     }
+  });
+
+  it("drops a settled run row whose checkout and branch are both already gone", async () => {
+    const candidates = reapCandidates({
+      repoPath: repo,
+      worktrees: [],
+      branches: [],
+      // The shape every finished run leaves behind forever: the row outlives what it named.
+      runs: [
+        { branch: "anton/anton-old", worktreePath: "/gone/anton-old", status: "done", epicBeadId: "anton-old" },
+      ],
+      beadStatus: () => "settled",
+      branchPrefix: "anton",
+    });
+
+    expect(candidates).toEqual([]);
+  });
+
+  it("finds a branch with no run row at all — the residue a recreated anton.db leaves", () => {
+    const candidates = reapCandidates({
+      repoPath: repo,
+      worktrees: [],
+      branches: ["anton/anton-orph"],
+      runs: [],
+      beadStatus: (id) => (id === "anton-orph" ? "settled" : "unknown"),
+      branchPrefix: "anton",
+    });
+
+    // The bead id is derived from the branch name, which is how anton composed it in the first place.
+    expect(candidates).toEqual([
+      { branch: "anton/anton-orph", beadId: "anton-orph", path: undefined, lock: undefined, runLive: false, bead: "settled" },
+    ]);
   });
 
   it("releaseRunWorktree reads the bead at teardown — an abandon that landed mid-run takes the branch", async () => {

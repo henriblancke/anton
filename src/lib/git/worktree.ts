@@ -144,6 +144,22 @@ async function currentBranch(repoPath: string): Promise<string> {
   }
 }
 
+/**
+ * Every local branch under `prefix/`. This is the reaper's proof that a branch still EXISTS: a run
+ * row outlives the branch it names, so without it every settled run this project ever ran stays a
+ * sweep candidate — and a permanent `gh` call — forever. It is also the only way branch-only residue
+ * is seen at all, since a branch whose run row is gone (a recreated `anton.db`) has nothing else
+ * pointing at it.
+ */
+export async function listBranches(repoPath: string, prefix: string): Promise<string[]> {
+  const out = await git(repoPath, [
+    "for-each-ref",
+    "--format=%(refname:short)",
+    `refs/heads/${prefix}/`,
+  ]);
+  return out.split("\n").filter(Boolean);
+}
+
 async function branchExists(repoPath: string, branch: string): Promise<boolean> {
   try {
     await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);

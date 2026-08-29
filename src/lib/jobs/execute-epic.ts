@@ -37,7 +37,7 @@ import {
   type WorktreeState,
 } from "../git/ops";
 import { prNumberFromRef } from "../git/pr";
-import { createWorktree, findWorktree, removeWorktree, type Worktree } from "../git/worktree";
+import { createWorktree, findWorktree, type Worktree } from "../git/worktree";
 import { releaseRunResources } from "./worktree-reaper";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
@@ -563,12 +563,29 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // Clean up any worktree a prior attempt left behind before short-circuiting (anton-jz1). A
           // resume that crashed AFTER the worktree-warm step (step 2 stamps `worktreePath` on the run
           // row) leaves the git worktree registered/on disk; this idempotent return skips the normal
-          // `removeWorktree` finalization (step 6), so without this the run is marked done yet its
-          // worktree lingers. Locate it by branch and remove it best-effort — a no-op when this resume
-          // never created one.
+          // teardown at the tail of the try, so without this the run is marked done yet its worktree
+          // lingers. Locate it by branch — this attempt never warmed one, so `runWorktree` is null and
+          // the `catch`'s teardown could not see it either.
+          //
+          // Routed through the same teardown as every other terminal exit (anton-hrun.1) rather than a
+          // bare removal: this is a `done` outcome like any other, so it owes the same branch policy (a
+          // merged PR on a closed bead takes the branch with it) and the same session account.
+          // Best-effort — a run whose PR is already open must not fail over a cleanup.
           await safe(async () => {
             const staleWorktree = await findWorktree(repo, branch);
-            if (staleWorktree) await removeWorktree(staleWorktree);
+            if (staleWorktree) {
+              await releaseRunResources({
+                db,
+                clock,
+                ctx,
+                projectId,
+                runId,
+                repoPath: repo,
+                worktree: staleWorktree,
+                beadId: epicBeadId,
+                status: "done",
+              });
+            }
           });
           await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
           return;
@@ -1590,6 +1607,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           clock,
           ctx,
           projectId,
+          runId,
           repoPath: repo,
           worktree,
           beadId: epicBeadId,
@@ -1681,6 +1699,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             clock,
             ctx,
             projectId,
+            runId,
             repoPath: repo,
             worktree: stoppedWorktree,
             beadId: epicBeadId,

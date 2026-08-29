@@ -5,8 +5,10 @@
  *
  * Teardown at the end of a run (see `releaseRunWorktree`) is what stops residue accruing; this pass
  * is what reclaims what accrued before it, and what a crash, a kill -9 or a moved repo leaves behind
- * afterwards. It runs deterministically — a board read, a `git worktree list`, and one `gh` lookup
- * per otherwise-reapable branch — with no Claude session and nothing written to the board.
+ * afterwards. It runs deterministically — a board read, a `git worktree list`, one `for-each-ref` over
+ * anton's branch prefix, and one `gh` lookup per otherwise-reapable branch — with no Claude session
+ * and nothing written to the board. The two git reads are also what BOUNDS the pass: only a resource
+ * that still exists is a candidate, so a project's sweep cost tracks its residue, not its run count.
  *
  * Every decision is conservative and reported: only a settled bead's residue is touched, a checkout
  * another tool locked is skipped by name, and a branch still carrying an open PR is kept. The pass
@@ -15,7 +17,7 @@
 import { beads, type Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { lookupOpenPullRequest } from "../git/ops";
-import { listWorktrees, type Worktree } from "../git/worktree";
+import { listBranches, listWorktrees, type Worktree } from "../git/worktree";
 import {
   formatReapReport,
   reapCandidates,
@@ -88,6 +90,8 @@ export async function releaseRunResources(args: {
   projectId: string;
   repoPath: string;
   worktree: Worktree;
+  /** The run being torn down — the teardown account belongs on ITS timeline, not the job's. */
+  runId: string;
   beadId: string;
   status: RunTeardown["status"];
   /** The run stopped on ANOTHER machine's live lease — this machine touches neither resource. */
@@ -107,6 +111,7 @@ export async function releaseRunResources(args: {
   const session = deferPassSession(args.db, args.clock, {
     ctx: args.ctx,
     projectId: args.projectId,
+    runId: args.runId,
     kind: "worktree-reaper",
   });
   await session.log(
@@ -153,9 +158,15 @@ export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler 
       .from(schema.runs)
       .where(eq(schema.runs.projectId, projectId));
 
+    // Both reads are what proves a resource still EXISTS, and neither depends on the other.
+    const [worktrees, branches] = await Promise.all([
+      listWorktrees(repo),
+      listBranches(repo, branchPrefix),
+    ]);
     const candidates = reapCandidates({
       repoPath: repo,
-      worktrees: await listWorktrees(repo),
+      worktrees,
+      branches,
       runs,
       beadStatus: beadStateOf(board),
       branchPrefix,

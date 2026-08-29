@@ -14,7 +14,12 @@ import type { Bead } from "../beads/bd";
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { createWorktree, WORKTREES_ROOT_ENV } from "../git/worktree";
-import { beadStateOf, makeWorktreeReaperHandler, reapSummary } from "./worktree-reaper";
+import {
+  beadStateOf,
+  makeWorktreeReaperHandler,
+  reapSummary,
+  releaseRunResources,
+} from "./worktree-reaper";
 import { systemClock } from "./queue";
 import type { JobContext } from "./runner";
 
@@ -191,6 +196,55 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
       execFileSync("git", ["-C", repo, "worktree", "remove", "--force", locked.path]);
       execFileSync("git", ["-C", repo, "branch", "-D", locked.branch]);
     }
+  });
+
+  it("puts a run's teardown account on the RUN's timeline, not on the job's stream", async () => {
+    await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-tdn" });
+    const runId = randomUUID();
+    await tdb.db.insert(schema.runs).values({
+      id: runId,
+      projectId,
+      epicBeadId: "anton-tdn",
+      branch: wt.branch,
+      worktreePath: wt.path,
+      status: "done",
+    });
+
+    const jobId = await jobRow();
+    const entry = await releaseRunResources({
+      db: tdb.db,
+      clock: systemClock,
+      ctx: ctx(jobId),
+      projectId,
+      runId,
+      repoPath: repo,
+      worktree: wt,
+      beadId: "anton-tdn",
+      status: "done",
+    });
+
+    // No bd repo here, so the bead read fails and reads as unsettled: the checkout goes, the branch
+    // stays. That is the teardown's own fail-closed rule, asserted in the git-layer suite.
+    expect(entry).toMatchObject({ worktreeRemoved: true, branchDeleted: false });
+
+    const sessions = await tdb.db
+      .select()
+      .from(schema.sessions)
+      .where(eq(schema.sessions.projectId, projectId));
+    expect(sessions).toHaveLength(1);
+    // The link is the whole point: job-linked sessions are the jobs page's stream for a job, and a
+    // two-line cleanup must not become the execute-epic job's headline output.
+    expect(sessions[0].runId).toBe(runId);
+    expect(sessions[0].jobId).toBeNull();
+    expect(readFileSync(sessions[0].logPath!, "utf8")).toContain(
+      "worktree-reaper: run anton-tdn settled as done",
+    );
+
+    await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+    await tdb.db.delete(schema.runs).where(eq(schema.runs.id, runId));
+    // The kept branch is real residue the next test's sweep would find, so this one hands it back.
+    execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
   });
 
   it("writes no session at all when there is no residue to account for", async () => {
