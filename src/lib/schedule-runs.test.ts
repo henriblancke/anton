@@ -109,6 +109,8 @@ describe("lastRunsBySchedule", () => {
     outcomeNote?: string | null;
     lastError?: string | null;
     updatedAt: number;
+    /** When the scheduler ENQUEUED it. Defaults to its settlement time. */
+    createdAt?: number;
     projectId?: string;
   }) {
     const id = `j-${(seq += 1)}`;
@@ -127,7 +129,7 @@ describe("lastRunsBySchedule", () => {
         outcome: over.outcome ?? null,
         outcomeNote: over.outcomeNote ?? null,
         lastError: over.lastError ?? null,
-        createdAt: new Date(over.updatedAt * 1000),
+        createdAt: new Date((over.createdAt ?? over.updatedAt) * 1000),
         updatedAt: new Date(over.updatedAt * 1000),
       });
     return id;
@@ -151,6 +153,34 @@ describe("lastRunsBySchedule", () => {
       outcome: "failed",
       at: NOW - 10,
       note: "gh: not authenticated",
+    });
+  });
+
+  // A parked fire an operator resumes settles LATER than every fire since, so ordering on the
+  // settlement time would let last week's result displace this hour's. The fire is picked by when
+  // it was enqueued; only its date on screen comes from when it settled.
+  it("picks the newest fire by enqueue time, not by which settled last", async () => {
+    await job({
+      scheduleId: "s-resumed",
+      status: "failed",
+      lastError: "bd exited 1",
+      createdAt: NOW - 7 * 86_400,
+      updatedAt: NOW, // resumed by hand today, long after the fire below
+    });
+    await job({
+      scheduleId: "s-resumed",
+      status: "done",
+      outcome: "ok",
+      outcomeNote: "closed 1 gate(s)",
+      createdAt: NOW - 3600,
+      updatedAt: NOW - 3500,
+    });
+
+    const byId = await runs.lastRunsBySchedule(PROJECT_ID);
+    expect(byId["s-resumed"]).toEqual({
+      outcome: "ok",
+      at: NOW - 3500,
+      note: "closed 1 gate(s)",
     });
   });
 

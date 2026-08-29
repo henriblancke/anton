@@ -260,15 +260,19 @@ export async function surfaceStalls(
 /**
  * 4a. APPLY — re-dispatch the work whose gated step is ready again. `resumeEpic` decides the verb
  * (resume a parked job, or enqueue a fresh one) and refuses anything an active job already covers,
- * which is what makes an overlapping pass a no-op instead of a second run.
+ * which is what makes an overlapping pass a no-op instead of a second run. Returns how many runs it
+ * actually put back in flight — a refusal is not work, and must not be counted as any.
  */
-export async function dispatchUngated(pass: PassContext, targets: Bead[]): Promise<void> {
+export async function dispatchUngated(pass: PassContext, targets: Bead[]): Promise<number> {
+  let resumed = 0;
   for (const target of targets) {
     const outcome = await resumeEpic(pass.db, pass.clock, pass.projectId, target.id);
     if (outcome === "resumed-job" || outcome === "enqueued") {
+      resumed += 1;
       console.log(`[gate-check] ${pass.projectId}: ${target.id} ungated — ${outcome}`);
     }
   }
+  return resumed;
 }
 
 /**
@@ -304,13 +308,16 @@ export async function dispatchReleased(
  * it always has; only its trigger moved. Deduped against a live job for the same target, and
  * re-dispatched every pass until the finalize actually lands, so a half-done finalize heals itself.
  */
-export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<void> {
+export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<number> {
+  let finalized = 0;
   for (const target of merged) {
     const jobId = enqueueReviewFixIfAbsent(pass.db, pass.clock, pass.projectId, target.id);
     if (jobId) {
+      finalized += 1;
       console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix`);
     }
   }
+  return finalized;
 }
 
 /**
@@ -331,6 +338,35 @@ export function unmatchedGatedReport(plan: ResumePlan): string | undefined {
  */
 export function wroteToBoard(resolved: number, surfaced: number, handedBack: number): boolean {
   return resolved > 0 || surfaced > 0 || handedBack > 0;
+}
+
+/** Everything one pass can have done, counted per phase. */
+export interface GatePassCounts {
+  resolved: number;
+  surfaced: number;
+  handedBack: number;
+  resumed: number;
+  finalized: number;
+}
+
+/**
+ * What the pass DID, named action by action. Every count earns a clause, because the board write and
+ * the queue write are different work and either alone is a pass that changed something: a gate
+ * resolved on another machine leaves this pass resuming runs with nothing of its own to push, and
+ * reporting that as "nothing to do" hides the one slot where the queue moved.
+ */
+export function gatePassEffect(counts: GatePassCounts): JobEffect {
+  const did = [
+    counts.resolved > 0 && `closed ${counts.resolved} gate(s)`,
+    counts.surfaced > 0 && `surfaced ${counts.surfaced} stall(s)`,
+    counts.handedBack > 0 && `handed back ${counts.handedBack} gate(s)`,
+    counts.resumed > 0 && `resumed ${counts.resumed} run(s)`,
+    counts.finalized > 0 && `finalized ${counts.finalized} run(s)`,
+  ].filter((clause): clause is string => clause !== false);
+
+  return did.length > 0
+    ? { changed: true, note: did.join(", ") }
+    : { changed: false, note: "no gate closed" };
 }
 
 /**
@@ -377,9 +413,9 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     // is machine-local, and `resumeEpic`'s dedupe only sees the local job table (anton-zoh).
     const operator = await resolveOperator();
     const plan = planResumes(board, await beads.readyGated(pass.repo), nowMs, operator);
-    await dispatchUngated(pass, plan.targets);
+    const resumed = await dispatchUngated(pass, plan.targets);
     const handedBack = await dispatchReleased(pass, plan.released);
-    await dispatchMerged(pass, plan.merged);
+    const finalized = await dispatchMerged(pass, plan.merged);
 
     const unmatched = unmatchedGatedReport(plan);
     if (unmatched) console.log(`[gate-check] ${projectId}: ${unmatched}`);
@@ -393,8 +429,12 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     // A slot where every gate is still open is the NORMAL case for a job that runs every ten
     // minutes; it has to read as "nothing to do", or the column is a wall of green that means
     // nothing.
-    return wroteToBoard(evaluation.resolved, surfaced, handedBack)
-      ? { changed: true, note: `closed ${evaluation.resolved} gate(s)` }
-      : { changed: false, note: "no gate closed" };
+    return gatePassEffect({
+      resolved: evaluation.resolved,
+      surfaced,
+      handedBack,
+      resumed,
+      finalized,
+    });
   };
 }

@@ -264,11 +264,13 @@ describe("the automation rows", () => {
     expect(screen.getByText("failed —")).toBeTruthy();
   });
 
-  // A row that fired before the outcome column existed, or whose handler reports no effect, knows
-  // only that it ran and did not fail — and must not claim more than that.
-  it("falls back to the time alone when the fire reported no outcome", () => {
+  // A schedule's FIRST fire has been enqueued and has settled nothing, so there is no previous
+  // result to date it against. Without saying "in progress" the row is a bare timestamp, and the
+  // automation's first execution looks like one that reported nothing at all.
+  it("shows a first fire with no settled result as in progress", () => {
     renderTable({ "run-health": { lastRunAt: NOW_SEC() - 120 } });
     expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.getByText("in progress")).toBeTruthy();
     expect(screen.queryByText("nothing to do")).toBeNull();
   });
 

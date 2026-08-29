@@ -178,10 +178,17 @@ export function makeGardenerHandler(deps: GardenerDeps): JobHandler {
       // `actions`, not this attempt's `applied`: the safe verbs are idempotent, so a retry after a
       // report-verb failure sweeps nothing and would report "nothing to do" for a patrol that closed
       // work — the same misreport the report row exists to prevent.
+      // Every count that made this `changed` earns its own clause — a sweep that repaired blocked
+      // rows and closed nothing must not report "closed 0 epic(s)" beside a dot saying work landed.
       const closed = actions.closedEpics.length;
+      const did = [
+        closed > 0 && `closed ${closed} epic(s)`,
+        actions.rowsRecomputed > 0 && `recomputed ${actions.rowsRecomputed} blocked row(s)`,
+        findings.length > 0 && `${findings.length} finding(s)`,
+      ].filter((clause): clause is string => clause !== false);
       effect =
-        closed > 0 || actions.rowsRecomputed > 0 || findings.length > 0
-          ? { changed: true, note: `closed ${closed} epic(s), ${findings.length} finding(s)` }
+        did.length > 0
+          ? { changed: true, note: did.join(", ") }
           : { changed: false, note: "board clean" };
     } catch (e) {
       await session.end("failed");

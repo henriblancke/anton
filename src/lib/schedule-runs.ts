@@ -70,6 +70,11 @@ const SCHEDULE_ID = sql<string>`json_extract(${schema.jobs.payloadJson}, '$.sche
  * `max()`, the bare columns beside it come from the row that produced that maximum — so this picks
  * the newest settled job per schedule and its status/outcome in a single pass, instead of scanning
  * every job row into memory to sort in JS.
+ *
+ * "Newest" is measured on `created_at`, the immutable ENQUEUE time, not on `updated_at`: an operator
+ * resuming a long-parked fire re-stamps its `updated_at`, so ordering by settlement would let a
+ * fire from last week displace the one that ran an hour ago. The settlement time is still what the
+ * column dates, so it rides along as a bare column of the row `max()` chose.
  */
 export async function lastRunsBySchedule(
   projectId: string,
@@ -81,7 +86,8 @@ export async function lastRunsBySchedule(
       outcome: schema.jobs.outcome,
       outcomeNote: schema.jobs.outcomeNote,
       lastError: schema.jobs.lastError,
-      at: sql<number>`max(${schema.jobs.updatedAt})`,
+      enqueuedAt: sql<number>`max(${schema.jobs.createdAt})`,
+      at: sql<number>`${schema.jobs.updatedAt}`,
     })
     .from(schema.jobs)
     .where(

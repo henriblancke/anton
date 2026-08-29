@@ -313,8 +313,7 @@ function AutomationTableRow({
  * "3h ago" alone reads as healthy whether the pass filed three beads, found nothing, or parked on a
  * bd failure — so the time is the headline and the outcome is the line under it, in the row's own
  * words ("closed 2 gate(s)", "no gate closed") rather than a status vocabulary an operator has to
- * learn. A fire that predates the outcome column, or whose handler reports no effect, says "ok" and
- * claims nothing more.
+ * learn. A fire whose handler reports no effect says "ok" and claims nothing more.
  *
  * The two halves come from different places and can describe different fires: `lastRunAt` is
  * stamped when the scheduler ENQUEUES (jobs/scheduler.ts), `lastRun` is the newest job that has
@@ -322,7 +321,9 @@ function AutomationTableRow({
  * outcome beside it is the PREVIOUS fire's, so pinning it to a two-minute-old timestamp reads as
  * "it just succeeded" (or just failed). An outcome is only the newest fire's when it settled at or
  * after that fire was enqueued; otherwise the fire is still in flight and says so, and the older
- * result is dated to its own run.
+ * result is dated to its own run. A FIRST fire has no older result to date, and still says it is in
+ * flight — otherwise the automation's very first execution is indistinguishable from a bare
+ * timestamp with nothing behind it.
  */
 function LastRunCell({ state, now }: { state: AutomationScheduleState; now: number }) {
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;
@@ -338,7 +339,7 @@ function LastRunCell({ state, now }: { state: AutomationScheduleState; now: numb
           new Date(previous.at * 1000).toISOString(),
           now,
         )}`
-      : undefined;
+      : "in progress";
   // The failure note is an error message and can outrun the column; the tooltip keeps it, including
   // for the older fire whose note the in-flight line has no room to spell out.
   const title = settled ? detail : previous?.note ? `${detail} — ${previous.note}` : detail;
@@ -346,15 +347,10 @@ function LastRunCell({ state, now }: { state: AutomationScheduleState; now: numb
   return (
     <span className="flex flex-col gap-0.5">
       <span className="flex items-center gap-1.5">
-        {style || previous ? (
-          <span
-            className={cn(
-              "size-1.5 shrink-0 rounded-full",
-              style?.dot ?? IN_FLIGHT_STYLE.dot,
-            )}
-            aria-hidden="true"
-          />
-        ) : null}
+        <span
+          className={cn("size-1.5 shrink-0 rounded-full", style?.dot ?? IN_FLIGHT_STYLE.dot)}
+          aria-hidden="true"
+        />
         <span title={formatInstant(state.lastRunAt)}>
           {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString(), now)}
         </span>
@@ -363,7 +359,7 @@ function LastRunCell({ state, now }: { state: AutomationScheduleState; now: numb
         <span
           className={cn(
             "max-w-[15rem] truncate text-[10.5px]",
-            style?.text ?? (previous ? IN_FLIGHT_STYLE.text : "text-subtle"),
+            style?.text ?? IN_FLIGHT_STYLE.text,
           )}
           title={title}
         >
