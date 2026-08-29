@@ -127,3 +127,17 @@ export function valueOf(label: string): string | undefined {
   const sep = label.indexOf(":");
   return sep === -1 ? undefined : label.slice(sep + 1);
 }
+
+/**
+ * The ceilings the API boundary enforces on the whole-unit ordered bounds, held here so the editor
+ * constrains what it accepts to exactly what the schema will store: a control that lets an operator
+ * type a depth of 40 spends their click on a 400 they cannot resolve from the panel.
+ *
+ * A board nests epic → feature → ticket, so a depth beyond a few hops is a typo rather than a
+ * policy; a year is the outer edge of a soak, and a decade the outer edge of "stale".
+ */
+export const POLICY_BOUND_MAX = {
+  parentDepth: 8,
+  minAgeDays: 365,
+  maxAgeDays: 3650,
+} as const;

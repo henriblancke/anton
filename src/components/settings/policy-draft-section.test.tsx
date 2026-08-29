@@ -21,6 +21,7 @@ import {
   type PolicyCandidate,
   type PolicyDraft,
 } from "@/components/settings/policy-draft-section";
+import { POLICY_BOUND_MAX } from "@/lib/policy/types";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -451,6 +452,30 @@ describe("the ordered native bounds (R2.3)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(sentPolicy(fetchMock)).toEqual({});
+  });
+
+  it("clamps a bound to the ceiling the store will accept", async () => {
+    const fetchMock = stubFetch();
+    renderPanel(open);
+
+    // Above the schema's ceiling the panel would otherwise show a live match count for a policy the
+    // settings route answers with a 400 — so the control holds the operator at the ceiling instead.
+    fireEvent.change(screen.getByLabelText("Maximum parent depth"), { target: { value: "40" } });
+    fireEvent.change(screen.getByLabelText("Minimum age in days"), { target: { value: "9999" } });
+    fireEvent.change(screen.getByLabelText("Maximum age in days"), { target: { value: "9999" } });
+
+    const value = (name: string) => (screen.getByLabelText(name) as HTMLInputElement).value;
+    expect(value("Maximum parent depth")).toBe(String(POLICY_BOUND_MAX.parentDepth));
+    expect(value("Minimum age in days")).toBe(String(POLICY_BOUND_MAX.minAgeDays));
+    expect(value("Maximum age in days")).toBe(String(POLICY_BOUND_MAX.maxAgeDays));
+
+    fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock)).toEqual({
+      maxParentDepth: POLICY_BOUND_MAX.parentDepth,
+      minAgeDays: POLICY_BOUND_MAX.minAgeDays,
+      maxAgeDays: POLICY_BOUND_MAX.maxAgeDays,
+    });
   });
 
   it("round-trips every stored bound back into its control", async () => {

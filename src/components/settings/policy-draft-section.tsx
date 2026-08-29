@@ -24,6 +24,7 @@ import { GripVerticalIcon } from "lucide-react";
 
 import type { Project } from "@/lib/types";
 import {
+  POLICY_BOUND_MAX,
   namespaceOf,
   valueOf,
   type Policy,
@@ -421,6 +422,7 @@ export function PolicyDraftSection({
                 at least
                 <Bound
                   name="Minimum parent depth"
+                  max={POLICY_BOUND_MAX.parentDepth}
                   value={policy.minParentDepth}
                   onChange={(next) => setPolicy((p) => ({ ...p, minParentDepth: next }))}
                 />
@@ -429,6 +431,7 @@ export function PolicyDraftSection({
                 and at most
                 <Bound
                   name="Maximum parent depth"
+                  max={POLICY_BOUND_MAX.parentDepth}
                   value={policy.maxParentDepth}
                   onChange={(next) => setPolicy((p) => ({ ...p, maxParentDepth: next }))}
                 />
@@ -446,6 +449,7 @@ export function PolicyDraftSection({
                 filed at least
                 <Bound
                   name="Minimum age in days"
+                  max={POLICY_BOUND_MAX.minAgeDays}
                   value={policy.minAgeDays}
                   onChange={(next) => setPolicy((p) => ({ ...p, minAgeDays: next }))}
                 />
@@ -454,6 +458,7 @@ export function PolicyDraftSection({
                 and at most
                 <Bound
                   name="Maximum age in days"
+                  max={POLICY_BOUND_MAX.maxAgeDays}
                   value={policy.maxAgeDays}
                   onChange={(next) => setPolicy((p) => ({ ...p, maxAgeDays: next }))}
                 />
@@ -948,14 +953,20 @@ function PrioritySelect({
  *
  * Empty is UNSET, never 0: an asserted criterion still fails closed on a bead that cannot answer it,
  * so an operator clearing the box has to stop asserting it rather than assert zero.
+ *
+ * `max` is the field's own schema ceiling, and typed input is clamped to it rather than passed on:
+ * the settings route rejects anything above it, so accepting the value here would show a live match
+ * count for a policy that can only ever come back as a 400 the operator cannot resolve.
  */
 function Bound({
   name,
   value,
+  max,
   onChange,
 }: {
   name: string;
   value?: number;
+  max: number;
   onChange: (next: number | undefined) => void;
 }) {
   return (
@@ -963,6 +974,7 @@ function Bound({
       type="number"
       inputMode="numeric"
       min={0}
+      max={max}
       step={1}
       placeholder="any"
       aria-label={name}
@@ -970,7 +982,7 @@ function Bound({
       onChange={(e) => {
         const parsed = Number(e.target.value);
         const unset = e.target.value === "" || !Number.isFinite(parsed) || parsed < 0;
-        onChange(unset ? undefined : Math.floor(parsed));
+        onChange(unset ? undefined : Math.min(Math.floor(parsed), max));
       }}
       className={cn(BOUND_CLASS, "w-16")}
     />

@@ -27,7 +27,7 @@ import {
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
-import type { Policy } from "./policy/types";
+import { POLICY_BOUND_MAX, type Policy } from "./policy/types";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -573,11 +573,11 @@ export const pickerPolicySchema = z
     minPriority: z.number().int().min(0).max(4),
     // Parent hops above the bead — 0 is top-level. Bounded rather than open-ended because a board
     // nests epic → feature → ticket, and a depth beyond that is a typo, not a policy.
-    maxParentDepth: z.number().int().min(0).max(8),
-    minParentDepth: z.number().int().min(0).max(8),
+    maxParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),
+    minParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),
     // Whole days. A year is the outer edge of a rule an operator could mean by "old".
-    minAgeDays: z.number().int().min(0).max(365),
-    maxAgeDays: z.number().int().min(0).max(3650),
+    minAgeDays: z.number().int().min(0).max(POLICY_BOUND_MAX.minAgeDays),
+    maxAgeDays: z.number().int().min(0).max(POLICY_BOUND_MAX.maxAgeDays),
     labels: z
       .array(
         z

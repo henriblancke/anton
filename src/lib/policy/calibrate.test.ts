@@ -15,6 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import { pickerPolicySchema } from "../projects";
+import { POLICY_BOUND_MAX } from "./types";
 import { boardIssueTypes, calibratePolicy, FALLBACK_POLICY, MIN_CALIBRATION_APPROVALS } from "./calibrate";
 import { namespaceOf, valueOf, type Policy } from "./types";
 
@@ -260,6 +261,24 @@ describe("calibratePolicy — the proposal is storable", () => {
     const { policy } = calibratePolicy(board);
     expect(policy.maxPriority).toBeUndefined();
     expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+});
+
+/**
+ * The editor clamps its numeric controls to {@link POLICY_BOUND_MAX}, so a ceiling that drifted away
+ * from the schema's would put the panel back where it started: accepting a value the store 400s on.
+ */
+describe("POLICY_BOUND_MAX is the schema's ceiling", () => {
+  const cases = [
+    ["maxParentDepth", POLICY_BOUND_MAX.parentDepth],
+    ["minParentDepth", POLICY_BOUND_MAX.parentDepth],
+    ["minAgeDays", POLICY_BOUND_MAX.minAgeDays],
+    ["maxAgeDays", POLICY_BOUND_MAX.maxAgeDays],
+  ] as const;
+
+  it.each(cases)("accepts %s at the ceiling and rejects one above it", (field, ceiling) => {
+    expect(pickerPolicySchema.safeParse({ [field]: ceiling }).success).toBe(true);
+    expect(pickerPolicySchema.safeParse({ [field]: ceiling + 1 }).success).toBe(false);
   });
 });
 
