@@ -94,11 +94,12 @@ describe("isEscalationAction", () => {
     expect(["resume", "abandon", "dismiss"].every(isEscalationAction)).toBe(true);
   });
 
-  it("rejects anything else a direct POST could carry", () => {
-    for (const value of ["", "RESUME", "close", null, undefined, 1, {}, ["resume"]]) {
+  it.each([[""], ["RESUME"], ["close"], [null], [undefined], [1], [{}], [["resume"]]])(
+    "rejects %s, which a direct POST could carry",
+    (value) => {
       expect(isEscalationAction(value)).toBe(false);
-    }
-  });
+    },
+  );
 });
 
 describe("actOnEscalation — the row it may act on", () => {

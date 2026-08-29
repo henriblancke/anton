@@ -16,7 +16,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "./beads/bd";
 import type { EscalationView } from "./escalations";
-import type { Project } from "./types";
+import { MAX_ABANDON_REASON_CHARS, type Project } from "./types";
 
 const abandonTicket = vi.fn<(...args: unknown[]) => Promise<unknown>>();
 const beadsPull = vi.fn<(repoPath: string) => Promise<void>>();
@@ -285,7 +285,6 @@ describe("actOnBead", () => {
   });
 
   it("records the escalation's own evidence as the reason, capped at bd's limit", async () => {
-    const { MAX_ABANDON_REASON_CHARS } = await import("./types");
     await actOnBead(project, "abandon", view({ reason: "x".repeat(2000) }), "anton-t9");
 
     const reason = abandonTicket.mock.calls[0]![2] as string;
