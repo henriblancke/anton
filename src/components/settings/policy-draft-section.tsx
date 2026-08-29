@@ -150,11 +150,13 @@ export function PolicyDraftSection({
   const [policy, setPolicy] = useState<Policy>(stored ?? draft.policy);
   const [saving, setSaving] = useState(false);
 
-  // A first render off a FAILED board read seeds the controls from the empty-board fallback. React
-  // keeps client state across the `router.refresh()` that later delivers a real read, so without
-  // this the panel would arm the failure-derived policy while the banner and rationale beside it
-  // describe the recovered one. Nothing is lost by re-seeding: saving is disabled while the board is
-  // unreadable, and every criterion is authored against a vocabulary that read returned none of.
+  // Whether what the controls currently hold was seeded off a FAILED board read — either the first
+  // render, or a later disarm that fell back to the draft while the board was still unreadable.
+  // React keeps client state across the `router.refresh()` that eventually delivers a real read, so
+  // without this the panel would arm the failure-derived policy while the banner and rationale
+  // beside it describe the recovered one. Nothing is lost by re-seeding: saving is disabled while
+  // the board is unreadable, and every criterion is authored against a vocabulary that read
+  // returned none of.
   const [seededBlind, setSeededBlind] = useState(boardUnavailable);
   if (seededBlind && !boardUnavailable) {
     setSeededBlind(false);
@@ -364,9 +366,13 @@ export function PolicyDraftSection({
    * removes the setting rather than storing an empty policy, which would admit everything.
    */
   const remove = async () => {
+    if (!(await patchPolicy(null, "Policy removed"))) return;
     // Back to the proposal, so a disarmed project reads as one that has never been armed rather than
-    // as a form still holding the policy it just removed.
-    if (await patchPolicy(null, "Policy removed")) setPolicy(draft.policy);
+    // as a form still holding the policy it just removed. Disarming stays available while the board
+    // is unreadable — it removes rather than stores — but the proposal it falls back to is then the
+    // failure-derived one, so the re-seed above must know to replace it when the board answers.
+    setPolicy(draft.policy);
+    setSeededBlind(boardUnavailable);
   };
 
   return (

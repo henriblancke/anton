@@ -658,6 +658,42 @@ describe("a recovered board read re-seeds the controls", () => {
     expect((screen.getByRole("button", { name: "Use this policy" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("drops a fallback seeded by disarming while the board was still unreadable", async () => {
+    const fetchMock = stubFetch();
+    // Armed, then the board goes dark on a later refresh — so the blind seed did NOT happen at mount.
+    const { rerender } = renderPanel({ stored: { types: ["feature"] } });
+    rerender(
+      <PolicyDraftSection
+        project={project}
+        draft={THIN}
+        stored={{ types: ["feature"] }}
+        issueTypes={[]}
+        labelVocabulary={[]}
+        boardUnavailable
+      />,
+    );
+
+    // Disarming stays available while the board is unreadable — it removes rather than stores.
+    fireEvent.click(screen.getByRole("button", { name: "Remove policy" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(sentPolicy(fetchMock)).toBeNull();
+
+    // The board answers again with a real draft. What the controls hold came from the failed read,
+    // so it must be replaced — otherwise the now-enabled accept arms a fallback the rationale
+    // beside it never proposed.
+    rerender(
+      <PolicyDraftSection
+        project={project}
+        draft={FITTED_WITHOUT_TYPES}
+        issueTypes={["bug", "chore", "feature", "task"]}
+        labelVocabulary={VOCABULARY}
+      />,
+    );
+    expect(checked("bug")).toBe("false");
+    expect(checked("chore")).toBe("false");
+    expect((screen.getByRole("button", { name: "Use this policy" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("leaves an operator's edits alone when the board was readable all along", () => {
     const { rerender } = renderPanel({ candidates: CANDIDATES });
     fireEvent.click(screen.getByRole("switch", { name: "feature" }));
