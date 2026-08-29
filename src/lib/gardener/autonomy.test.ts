@@ -118,7 +118,7 @@ describe("the earned floor — a kind is armable only once its proposals have a 
   ): ProposalTrackRecord => ({ ...NO_RECORD, [kind]: { settled, applied } });
 
   it("keeps an apply-policy kind at propose while it has no record at all", () => {
-    // The board as it stands: eleven of twelve kinds have never had a proposal settled.
+    // The board as it stands: no kind has ever had a proposal settled.
     for (const kind of GARDENER_DETECTION_KINDS) {
       expect(autonomyFor(kind, planFor(kind), ALL_APPLY, NO_RECORD)).toBe("propose");
     }
@@ -167,6 +167,9 @@ describe("the earned floor — a kind is armable only once its proposals have a 
     expect(autonomyTierOf({ move: "retire", retireAs: "defer" })).toBe("dequeued");
     expect(autonomyTierOf({ move: "retire", retireAs: "close" })).toBe("history");
     expect(autonomyTierOf({ move: "retire", retireAs: "supersede" })).toBe("history");
+    // An approve releases a run that spends what it spends — withdrawing the label afterwards does
+    // not un-run it, which is the dearest tier's whole property (anton-1ivg).
+    expect(autonomyTierOf({ move: "approve" })).toBe("history");
 
     const { reversible, dequeued, history } = EARNED_AUTONOMY_BARS;
     expect(reversible.minSettled).toBeLessThan(dequeued.minSettled);
@@ -200,6 +203,21 @@ describe("the earned floor — a kind is armable only once its proposals have a 
 
   it("prices a split at the dearest tier, so a fall-through can never be the cheapest", () => {
     expect(autonomyTierOf({ move: "split" })).toBe("history");
+  });
+
+  it("ships the approve move at propose, and arms it only on a record that earned the dearest bar", () => {
+    // The verb that STARTS work joins the ladder at the bottom rung like every other kind: adding it
+    // arms nothing, and it clears at the close's bar rather than the link's.
+    expect(DEFAULT_PROPOSAL_AUTONOMY_POLICY["withheld-approval"]).toBe("propose");
+
+    const dequeuedCounts = EARNED_AUTONOMY_BARS.dequeued.minSettled;
+    const short = recordOf("withheld-approval", dequeuedCounts, dequeuedCounts);
+    expect(autonomyFor("withheld-approval", planFor("withheld-approval"), ALL_APPLY, short)).toBe(
+      "propose",
+    );
+    expect(autonomyFor("withheld-approval", planFor("withheld-approval"), ALL_APPLY, EARNED)).toBe(
+      "apply",
+    );
   });
 
   it("reads the record for the plan's OWN move, not just the kind's name", () => {

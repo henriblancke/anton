@@ -629,7 +629,14 @@ function moveClause(detection: GardenerDetection): string {
       return `split ${subjects} into separate tickets`;
     case "unapprove":
       return `fix ${subjects} or withdraw its approval`;
+    case "approve":
+      return `approve ${subjects} so a run can start on ${pronoun(detection)}`;
   }
+}
+
+/** How the subjects read once named — one bead is an "it", several are a "them". */
+function pronoun(detection: GardenerDetection): string {
+  return detection.subjects.length === 1 ? "it" : "them";
 }
 
 /** Ids up to a pair; past that a count, so a cluster's title stays a title. */
@@ -669,6 +676,8 @@ function appliedState(detection: GardenerDetection): string {
       // answer, and approving after a repair records that rather than stripping the label off work
       // that is sound again (see apply.ts `planUnapprove`).
       return `${subjects} either meets the approve gate again, or no longer carries \`approved\` — with a note on the bead naming the gaps that withdrew it`;
+    case "approve":
+      return `${subjects} ${is} approved, so anton starts a run on ${pronoun(detection)} — the approval IS the start`;
   }
 }
 
@@ -691,7 +700,7 @@ const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> 
 function acceptanceOf(detection: GardenerDetection): string {
   return [
     `- [ ] ${appliedState(detection)}`,
-    "- [ ] no other bead is re-parented, linked, reprioritized, retired or unapproved — the move above is the whole change",
+    "- [ ] no other bead is re-parented, linked, reprioritized, retired, approved or unapproved — the move above is the whole change",
     isManualProposal(detection)
       ? "- [ ] this proposal is DECLINED once the move is made by hand — approving it is refused, so declining is what settles it"
       : "- [ ] this proposal is closed with a note naming what changed",

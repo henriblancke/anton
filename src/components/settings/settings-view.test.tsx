@@ -1075,7 +1075,7 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
       ),
     ).toBeTruthy();
     expect(
-      within(groupBox("Writes history")).getByText(/the claim it writes outlives the undo/),
+      within(groupBox("Writes history")).getByText(/what it writes outlives the undo/),
     ).toBeTruthy();
   });
 

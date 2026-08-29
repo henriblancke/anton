@@ -263,14 +263,18 @@ const AUTONOMY_GROUPS: {
   {
     id: "history",
     title: "Writes history",
-    does: "Closes the bead — and a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it”.",
-    undo: "Reopening is one write, but the close stays in the board's history and in every report already taken from it.",
+    does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — or starts a run on it, which is work that happened.",
+    undo: "Reopening or withdrawing is one write, but the close stays in the board's history and in every report already taken from it, and a run that started has already spent what it spent.",
     armed:
-      "Armed, a pass closes beads with nobody watching, and the claim it writes outlives the undo. " +
-      "Arm this last, on a project whose shadow record you have actually read.",
+      "Armed, a pass closes beads and starts runs with nobody watching, and what it writes outlives " +
+      "the undo. Arm this last, on a project whose shadow record you have actually read.",
     kinds: [
       { id: "superseded", does: "closes a bead as superseded, pointing at the twin that landed" },
       { id: "shipped-orphan", does: "closes a bead a commit already shipped" },
+      {
+        id: "withheld-approval",
+        does: "approves work the board ranks next that nothing has approved, so a run can start on it",
+      },
     ],
   },
   {

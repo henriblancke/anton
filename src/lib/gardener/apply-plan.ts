@@ -247,6 +247,15 @@ export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): A
         status: "refuse",
         reason: `splitting ${list(plan.subjects)} means writing new contracts, which anton will not do on its own — decompose it with \`/shape\` (the proposal's sketch is the starting point) and decline this proposal`,
       };
+    case "approve":
+      // The move exists in the vocabulary before its write does (anton-1ivg): the step that grants
+      // the gate lands with its own evidence fence in anton-gmbz. Refusing until then is the honest
+      // answer — granting an approval without re-reading the target under the write lock is exactly
+      // the race that step is being built to close.
+      return {
+        status: "refuse",
+        reason: `approving ${list(plan.subjects)} is not a move anton can apply yet — grant the approval yourself if you agree, then decline this proposal`,
+      };
   }
 }
 
@@ -1136,6 +1145,13 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
   // from the fresh board; fencing it would refuse the repair the proposal is half asking for, since
   // repairing a bead is itself a write since the filing.
   "degraded-approval": undefined,
+  // Fenced, unlike its mirror: clearing the gate is re-derivable, but "this is the work worth
+  // starting next" is a judgment about the bead's contract, and starting a run on a rescoped one
+  // spends the pass's dearest write on a target nobody judged.
+  "withheld-approval": {
+    still: "the bead whose contract this start was judged from",
+    harm: "approving it now would set a run loose on work somebody has since rewritten",
+  },
 };
 
 /**
