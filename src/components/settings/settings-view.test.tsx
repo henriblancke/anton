@@ -1524,6 +1524,53 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
   });
 
+  it("puts the question back when the toggle that withdrew it never landed", async () => {
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      // Only the disables refuse, so the arm that opens the question still lands. Each names its own
+      // row, so the two failures below are told apart by their message.
+      if (patch.enabled === false) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: `${patch.type} store down` }), { status: 500 }),
+        );
+      }
+      const type = patch.type as keyof typeof DEFAULT_CRONS;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ schedule: { enabled: true, cron: DEFAULT_CRONS[type], ...patch } }),
+        ),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    // Disarming withdraws the question ahead of the write — but the write refused, so the picker is
+    // armed after all and the question is true again. Left withdrawn, an operator would have to
+    // cycle the toggle until a write succeeded before they could answer it.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("board-picker store down"));
+    expect(offer()).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "true",
+    );
+
+    // The same for the job the question is ABOUT: a product-master disable that refused leaves it
+    // enabled and weekly, which is the premise the offer names.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("product-master store down"));
+    expect(offer()).toBeTruthy();
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+    expect(screen.getByRole("button", { name: "Raise to daily" })).toBeTruthy();
+  });
+
   it("puts the offer back when the cadence write failed, so the answer can be given again", async () => {
     const fetchMock = stubPanelFetch();
     fetchMock.mockImplementation((_input, init) => {
@@ -1649,12 +1696,16 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     // about a picker they have already turned off — and accepting it would raise product-master to
     // daily for a picker that executes nothing.
     fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
-    await waitFor(() => expect(finishDisarm).toBeTruthy());
+    // The disarm is QUEUED, not sent: same row, and the route read-modify-writes it (see
+    // `scheduleWrites`). Its PATCH goes out only once the arm's response has landed.
+    expect(finishDisarm).toBeUndefined();
+    expect(patchesTo(fetchMock, "/schedules")).toHaveLength(1);
 
     finishArm!();
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
     expect(offer()).toBeNull();
 
+    await waitFor(() => expect(finishDisarm).toBeTruthy());
     finishDisarm!();
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker disabled"));
     expect(offer()).toBeNull();

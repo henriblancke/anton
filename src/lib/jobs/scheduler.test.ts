@@ -161,6 +161,31 @@ describe("Scheduler.tickOnce", () => {
     expect(await sched.tickOnce()).toBe(1);
   });
 
+  /**
+   * The settings panel has two writers to one schedule row — an accepted cadence and the row's
+   * toggle — and each patch sends only its own field, so `updateSchedule` fills the other in from
+   * what it read. With the read and the write settled as one unit, the second patch reads what the
+   * first committed; interleaved, both read the same row and the loser's intent is quietly restored.
+   */
+  it("keeps both intents when a cron patch and an enabled patch race the same row", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "product-master",
+      cron: "0 6 * * 1", // weekly
+    });
+
+    await Promise.all([
+      updateSchedule(tdb.db, clock, id, { cron: "0 6 * * *" }), // raise to daily
+      updateSchedule(tdb.db, clock, id, { enabled: false }), // and switch the job off
+    ]);
+
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect(row.cron).toBe("0 6 * * *");
+    expect(row.enabled).toBe(false);
+    // Whichever order they settled in, a disabled row carries no next fire.
+    expect(row.nextRunAt).toBeNull();
+  });
+
   it("collapses missed slots — one enqueue after a long sleep, not one per slot", async () => {
     await createSchedule(tdb.db, clock, {
       projectId: "p1",

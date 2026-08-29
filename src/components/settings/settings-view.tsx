@@ -263,17 +263,19 @@ const AUTONOMY_GROUPS: {
   {
     id: "history",
     title: "Writes history",
-    does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — or starts a run on it, which is work that happened.",
-    undo: "Reopening or withdrawing is one write, but the close stays in the board's history and in every report already taken from it, and a run that started has already spent what it spent.",
+    does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — or grants the approve gate on one, which records the decision a run starts from in your name.",
+    undo: "Reopening, or withdrawing an approval and releasing the reservation it took, is one write — but the close or the grant stays in the board's history and in every report already taken from it.",
     armed:
-      "Armed, a pass closes beads and starts runs with nobody watching, and what it writes outlives " +
-      "the undo. Arm this last, on a project whose shadow record you have actually read.",
+      "Armed, a pass closes beads and grants approvals with nobody watching, and what it writes " +
+      "outlives the undo. Arm this last, on a project whose shadow record you have actually read.",
     kinds: [
       { id: "superseded", does: "closes a bead as superseded, pointing at the twin that landed" },
       { id: "shipped-orphan", does: "closes a bead a commit already shipped" },
       {
         id: "withheld-approval",
-        does: "approves work the board ranks next that nothing has approved, so a run can start on it",
+        // The gate and the reservation are the whole write — nothing here enqueues a run
+        // (anton-qlci), and a tier that promised one would promise spend that never happens.
+        does: "grants the approve gate to work the board ranks next that nothing has approved, and reserves it for anton — the state a run starts from, not the run itself",
       },
     ],
   },
@@ -700,6 +702,12 @@ export function SettingsView({
   // inside the poll's request window, which a plain in-flight check would miss entirely.
   const schedulePatchesInFlight = useRef(0);
   const schedulePatchesCompleted = useRef(0);
+  // The tail of this panel's PATCHes against each schedule row, so it never has two open on one row
+  // — a cadence accept and a toggle land on the same automation, and each carries only its own
+  // field. The route settles them in arrival order and answers with the row as stored; two in flight
+  // means the reply the panel applies LAST can be the one describing the older state, leaving the
+  // table reporting a cadence or an enabled flag the server has already moved past.
+  const scheduleWrites = useRef(new Map<string, Promise<void>>());
   // The tail of this panel's settings PATCHes and how many are still open — together they run one
   // at a time without deferring a lone write (see {@link patchSettings}).
   const settingsWrites = useRef<Promise<void>>(Promise.resolve());
@@ -834,6 +842,29 @@ export function SettingsView({
     setAutomations(automationsRef.current);
   }
 
+  /** Drop a settled write from its row's queue — only while it is still that row's tail. */
+  function releaseScheduleWrite(id: string, entry: Promise<void>) {
+    if (scheduleWrites.current.get(id) === entry) scheduleWrites.current.delete(id);
+  }
+
+  /**
+   * Send one schedule PATCH, queued behind every other one this panel has open against the SAME row
+   * (see {@link scheduleWrites}). Rows are independent, so two automations still write in parallel.
+   */
+  function queueScheduleWrite(id: string, send: () => Promise<Response>): Promise<Response> {
+    const tail = scheduleWrites.current.get(id);
+    // Straight through when nothing else is open on this row — the queue exists to order concurrent
+    // writes, not to defer a lone one behind a microtask. Chained on SETTLE, so a write that threw
+    // still lets the next one run.
+    const sent = tail ? tail.then(send, send) : send();
+    const entry: Promise<void> = sent.then(
+      () => releaseScheduleWrite(id, entry),
+      () => releaseScheduleWrite(id, entry),
+    );
+    scheduleWrites.current.set(id, entry);
+    return sent;
+  }
+
   async function patchSchedule(
     id: string,
     patch: { cron?: string; enabled?: boolean },
@@ -841,13 +872,17 @@ export function SettingsView({
   ): Promise<boolean> {
     const prev = automationsRef.current[id];
     updateAutomations((p) => ({ ...p, [id]: { ...prev, ...patch } }));
+    // Counted at the CALL, not at the send: a patch waiting on the row's queue is still a write this
+    // panel owns, and a poll that landed in that window would answer with pre-write times.
     schedulePatchesInFlight.current += 1;
     try {
-      const res = await fetch(`/api/projects/${project.slug}/schedules`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ type: id, ...patch }),
-      });
+      const res = await queueScheduleWrite(id, () =>
+        fetch(`/api/projects/${project.slug}/schedules`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ type: id, ...patch }),
+        }),
+      );
       if (!res.ok) {
         const { error } = await res.json().catch(() => ({ error: "Update failed" }));
         throw new Error(error ?? "Update failed");
@@ -952,17 +987,38 @@ export function SettingsView({
     // offered automation itself withdraws it too — a cadence offer for a job the operator just turned
     // off is asking about a schedule that no longer fires. Done ahead of the write because it takes
     // something OFF screen — nothing can be accepted in the meantime.
-    if ((id === AUTOPILOT_ARMING_AUTOMATION && !next) || id === cadenceOffer?.automationId) {
-      withdrawCadenceOffer();
-    }
+    const invalidates =
+      (id === AUTOPILOT_ARMING_AUTOMATION && !next) || id === cadenceOffer?.automationId;
+    // The withdrawal fires on the invalidating CLICK, never on there being a question on screen: an
+    // answer already in flight reads the generation to know its premise died (see
+    // {@link cadenceOfferRestorable}), so skipping the bump for an empty screen would let a failed
+    // accept put back an offer this toggle just killed.
+    const withdrawn = invalidates ? cadenceOffer : null;
+    if (invalidates) withdrawCadenceOffer();
+    // Captured AFTER our own withdrawal moved it, so restorability below asks only whether something
+    // ELSE withdrew the question while this write was open.
+    const generation = cadenceOfferGeneration.current;
     // Recorded with the withdrawal, not after the write: a disable can only take the arm's offer off
     // screen if it is on record before that arm's response gets to open one.
+    const priorIntent = armingIntent.current;
     if (id === AUTOPILOT_ARMING_AUTOMATION) armingIntent.current = next;
     const stored = await patchSchedule(
       id,
       { enabled: next },
       `${id} ${next ? "enabled" : "disabled"}`,
     );
+    // A toggle that did not land invalidated nothing. `patchSchedule` put the row back, so the
+    // premise the withdrawal was taken on — picker armed, product-master running weekly — is the
+    // live one again, and an operator left with the question gone could only get it back by cycling
+    // the toggle until a write succeeds. The intent goes back with it, or a later arm refuses to
+    // re-ask on the strength of a disarm that never happened. Both are skipped when a later toggle
+    // has since asked for something else: that click is the current premise, not this failure.
+    if (!stored) {
+      if (id === AUTOPILOT_ARMING_AUTOMATION && armingIntent.current === next) {
+        armingIntent.current = priorIntent;
+      }
+      if (withdrawn && cadenceOfferRestorable(withdrawn, generation)) setCadenceOffer(withdrawn);
+    }
     // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs, so
     // it is the one toggle that opens an offer — and only an offer. Asked only once the arm LANDED:
     // the offer's entire premise is that the picker now executes what product-master ranks, so a

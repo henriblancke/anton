@@ -111,8 +111,22 @@ export interface UpdateSchedulePatch {
 }
 
 /**
+ * `immediate` takes the write lock at BEGIN rather than upgrading to it after the read: anton.db is
+ * shared with the scheduler process, and a deferred transaction that upgrades mid-way fails the
+ * write outright instead of waiting out `busy_timeout`.
+ */
+const TAKE_WRITE_LOCK = { behavior: "immediate" } as const;
+
+/**
  * Patch a schedule's cron/enabled. Recomputes `nextRunAt` whenever the cron changes or a disabled
  * schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it.
+ *
+ * The read and the write are ONE synchronous transaction, because this is a read-modify-write over a
+ * row two callers reach at once: the settings panel patches `enabled` on the same row a cadence
+ * accept is patching `cron` (settings-view.tsx), and each write carries the field it did NOT send at
+ * the value it read. Awaiting between the read and the update let both patches read the same row and
+ * the loser's intent vanish — the weekly cron restored, or a disabled job switched back on — with a
+ * success response for both. Serialized, the second patch reads what the first committed.
  */
 export async function updateSchedule(
   db: AntonDb,
@@ -120,23 +134,29 @@ export async function updateSchedule(
   id: string,
   patch: UpdateSchedulePatch,
 ): Promise<void> {
-  const rows = await db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).limit(1);
-  const current = rows[0];
-  if (!current) throw new Error(`schedule not found: ${id}`);
-
-  const cron = patch.cron ?? current.cron;
   if (patch.cron !== undefined && !isValidCron(patch.cron)) {
     throw new Error(`invalid cron expression: "${patch.cron}"`);
   }
-  const enabled = patch.enabled ?? current.enabled;
+  db.transaction((tx) => {
+    const current = tx
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .limit(1)
+      .get();
+    if (!current) throw new Error(`schedule not found: ${id}`);
 
-  const set: Partial<ScheduleRow> = { cron, enabled };
-  if (!enabled) {
-    set.nextRunAt = null;
-  } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
-    set.nextRunAt = secDate(nextRun(cron, clock.now()));
-  }
-  await db.update(schema.schedules).set(set).where(eq(schema.schedules.id, id));
+    const cron = patch.cron ?? current.cron;
+    const enabled = patch.enabled ?? current.enabled;
+
+    const set: Partial<ScheduleRow> = { cron, enabled };
+    if (!enabled) {
+      set.nextRunAt = null;
+    } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
+      set.nextRunAt = secDate(nextRun(cron, clock.now()));
+    }
+    tx.update(schema.schedules).set(set).where(eq(schema.schedules.id, id)).run();
+  }, TAKE_WRITE_LOCK);
 }
 
 /** All schedules for a project (UI read path via shared anton.db). */
