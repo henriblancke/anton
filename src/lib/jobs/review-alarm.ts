@@ -75,10 +75,19 @@ export function formatScoreSeries(rounds: ScoredRound[]): string {
     .join(" · ");
 }
 
-/** Why the alarm fired, in one clause — shared by the park note and the run row's error. */
-export function describeScoreRegression(regression: ScoreRegression): string {
+/**
+ * Why the alarm fired, in one clause — shared by the park note and the run row's error.
+ *
+ * `unit` is what the streak is counted IN. It defaults to the rounds this module watches; the
+ * project-level breaker (lib/autopilot-score-slide.ts) counts the same streak over finished RUNS,
+ * and passes its own noun rather than restating the sentence.
+ */
+export function describeScoreRegression(
+  regression: ScoreRegression,
+  unit = "review round(s)",
+): string {
   return (
-    `${regression.streak.length} consecutive review round(s) scored below ` +
+    `${regression.streak.length} consecutive ${unit} scored below ` +
     `${regression.minScore}/10 (${regression.streak.join(", ")})`
   );
 }

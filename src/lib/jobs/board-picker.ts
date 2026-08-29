@@ -21,10 +21,12 @@
  */
 import { loadAllIssues } from "../beads/issues";
 import { describeFailureStreak } from "../autopilot-failure-streak";
+import { describeScoreSlide } from "../autopilot-score-slide";
 import { saveBoardPickerPlan } from "../board-picker-plan";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import { checkFailureStreak } from "./picker-failure-breaker";
+import { checkScoreSlide } from "./picker-score-breaker";
 import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./picker-decision";
 import { systemClock, type AntonDb, type Clock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
@@ -68,6 +70,15 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
       console.warn(
         `[board-picker] ${projectId}: disarmed — ${describeFailureStreak(breaker.streak)}`,
       );
+    }
+
+    // The second quality brake (R4.3): runs that DELIVER but keep scoring below the floor. It runs
+    // after the failure breaker rather than beside it because both latch the same single disarm —
+    // whichever fires first owns the freeze, and the other reads it as already-disarmed and abstains
+    // rather than stacking a second thing for the operator to clear.
+    const slide = await checkScoreSlide(db, clock, { projectId, board });
+    if (slide?.latched) {
+      console.warn(`[board-picker] ${projectId}: disarmed — ${describeScoreSlide(slide.slide)}`);
     }
 
     const decision = decideBoardPickerPlan({

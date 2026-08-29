@@ -168,6 +168,41 @@ describe("makeBoardPickerHandler", () => {
     expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
   });
 
+  it("disarms the project when its delivered runs keep scoring below the floor", async () => {
+    // The other quality brake (R4.3): these runs all DELIVERED, so the failure breaker sees nothing
+    // — what stops the picker is the trend in what they shipped.
+    const targets = ["anton-a", "anton-b", "anton-c"];
+    board.current = [
+      bead("t1"),
+      ...targets.map((id, i) =>
+        bead(id, { status: "closed", labels: [`review-score:${4 + i}`] }),
+      ),
+    ];
+    for (const [i, id] of targets.entries()) {
+      const at = new Date(NOW - (3 - i) * 3_600_000);
+      t.db
+        .insert(schema.runs)
+        .values({
+          id: `r${i}`,
+          projectId: "p1",
+          epicBeadId: id,
+          status: "done",
+          startedAt: at,
+          endedAt: at,
+          updatedAt: at,
+        })
+        .run();
+    }
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const disarm = await activeDisarm(t.db, "p1");
+    expect(disarm?.reason).toBe("score-regression");
+    expect(disarm?.evidence).toHaveLength(3);
+    // The brake and the ranking remain different jobs, exactly as for the failure streak.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+  });
+
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {
     const handler = makeBoardPickerHandler({ db: t.db, clock });
     await expect(handler(fakeCtx({ payload: { projectId: "ghost" } }))).rejects.toThrow(PoisonError);
