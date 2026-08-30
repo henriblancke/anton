@@ -2,6 +2,11 @@
 
 # dependencies
 /node_modules
+# bun.lock is the ONLY lockfile: CI and release both run `bun install --frozen-lockfile`, so a
+# lockfile from another package manager is never validated and can drift from what ships.
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
 /.pnp
 .pnp.*
 .yarn/*

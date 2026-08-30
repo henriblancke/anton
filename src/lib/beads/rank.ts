@@ -62,72 +62,98 @@ function blocksGraph(board: Bead[]): { blocks: Map<string, string[]>; heldBy: Ma
 }
 
 /**
+ * What each bead's status means to the walk.
+ *
+ * `waiting` is the work an unblocking count may credit. A closed dependent was never waiting, and a
+ * `deferred` one is work a human pushed away — counting it would let a target whose whole value is
+ * snoozed work outrank one that releases live work. `blocked` and `in_progress` DO wait: a
+ * transitively blocked dependent is exactly the work being released, and bd reports it under those
+ * statuses, not `open`.
+ *
+ * `halted` is where the walk STOPS rather than merely declining to count, so the chain only
+ * propagates through beads the target actually holds. Finishing the target cannot release whatever
+ * a deferred bead blocks — the deferral still does — and whatever a closed bead blocked, it stopped
+ * blocking when it closed. Crediting either downstream would let a target whose reach dead-ends
+ * outrank one that releases live work, which is the very thing excluding them from the count is for.
+ */
+function walkStates(board: Bead[]): { waiting: Set<string>; halted: Set<string> } {
+  const waiting = new Set<string>();
+  const halted = new Set<string>();
+  for (const bead of board) {
+    if (bead.status === "closed" || bead.status === "deferred") halted.add(bead.id);
+    else waiting.add(bead.id);
+  }
+  return { waiting, halted };
+}
+
+/**
+ * `heldBy` narrowed to the blockers that STILL hold: a closed one let go when it closed, and one
+ * absent from this `--status all` snapshot does not exist to hold. A `deferred` blocker keeps its
+ * grip — the deferral is a human's "not now", and finishing the target does not lift it.
+ */
+function stillHeldBy(heldBy: Map<string, string[]>, board: Bead[]): Map<string, string[]> {
+  const gripping = new Set(board.filter((b) => b.status !== "closed").map((b) => b.id));
+  const still = new Map<string, string[]>();
+  for (const [dependent, blockers] of heldBy) {
+    const holding = blockers.filter((blocker) => gripping.has(blocker));
+    if (holding.length) still.set(dependent, holding);
+  }
+  return still;
+}
+
+/**
+ * The closure of a target: the target itself plus every bead finishing it releases.
+ *
+ * A bead held by two blockers is freed by neither alone, so a dependent enters the closure only
+ * once EVERY blocker still gripping it is already inside — reachability is not release. A dependent
+ * whose blockers are not all released yet is simply left for the pass that follows the last of
+ * them; every released blocker is itself enqueued, so the check runs again after each.
+ *
+ * The closure set is also what makes the walk terminate: a `blocks` cycle is a malformed board, not
+ * an impossible one, and a picker that hung on one would take the whole pass down with it. Each
+ * bead enters at most once, so each is enqueued at most once — which is equally why the two arms of
+ * a diamond meeting again release their shared tail once.
+ */
+function releaseClosure(
+  target: string,
+  blocks: Map<string, string[]>,
+  heldBy: Map<string, string[]>,
+  halted: Set<string>,
+): Set<string> {
+  const released = new Set<string>([target]);
+  const queue = [target];
+  while (queue.length) {
+    for (const next of blocks.get(queue.shift() as string) ?? []) {
+      if (released.has(next) || halted.has(next)) continue;
+      if (!(heldBy.get(next) ?? []).every((holder) => released.has(holder))) continue;
+      released.add(next);
+      queue.push(next);
+    }
+  }
+  return released;
+}
+
+/**
  * `id → how many still-waiting beads it transitively unblocks`, built once per board.
  *
  * A `blocks` edge is (from = dependent, to = blocker), so the dependents of a target are what its
- * completion could release. "Could" is the whole difficulty: reachability is not release. A bead
- * held by two blockers is freed by neither alone, so the walk credits a dependent only once EVERY
- * blocker still holding it is inside the target's own closure — the target plus what finishing the
- * target releases. Counting on reachability instead inflates a target that shares a dependent with
- * unrelated open work, and the inflated number outranks a target that genuinely frees something.
+ * completion releases — `releaseClosure` above decides which ones, and this only counts them.
+ * Counting on reachability instead would inflate a target that shares a dependent with unrelated
+ * open work, and the inflated number outranks a target that genuinely frees something.
  *
- * A blocker that is closed, or absent from this `--status all` snapshot, holds nothing and is
- * dropped from that check. A `deferred` blocker still holds: the deferral is a human's "not now",
- * and finishing the target does not lift it.
- *
- * The count is restricted to dependents that are still WAITING. A closed dependent was never
- * waiting, and a `deferred` one is work a human pushed away — counting it would let a target whose
- * whole value is snoozed work outrank one that releases live work. `blocked` and `in_progress` DO
- * count: a transitively blocked dependent is exactly the work being released, and bd reports it
- * under those statuses, not `open`. A bead reached twice — the two arms of a diamond meeting again
- * — is counted once, because finishing the target releases it once.
- *
- * The walk STOPS at a closed or deferred dependent rather than merely declining to count it, so
- * the chain only propagates through beads the target actually holds. Finishing the target cannot
- * release whatever a deferred bead blocks — the deferral still does — and whatever a closed bead
- * blocked, it stopped blocking when it closed. Crediting either downstream would let a target
- * whose reach dead-ends outrank one that releases live work, which is the very thing excluding
- * them from the count is for.
- *
- * `released` is what makes the walk terminate: a `blocks` cycle is a malformed board, not an
- * impossible one, and a picker that hung on one would take the whole pass down with it. Each bead
- * enters it at most once, so each is enqueued at most once. A dependent whose blockers are not all
- * released yet is simply left for the pass that follows the last of them — every released blocker
- * is itself enqueued, so the check runs again after each. A dependent that isn't on the board is
+ * The target itself is dropped from its own closure: a target does not unblock itself. What is left
+ * is counted only where the board says it waits, so a bead that isn't on the board at all is
  * traversed but not counted — it is evidence of an edge, not of open work.
  */
 export function unblockCounter(board: Bead[]): (id: string) => number {
   const { blocks, heldBy } = blocksGraph(board);
-  const waitingIds = new Set<string>();
-  const haltIds = new Set<string>();
-  const deferredIds = new Set<string>();
-  for (const b of board) {
-    if (b.status === "deferred") deferredIds.add(b.id);
-    if (b.status === "closed" || b.status === "deferred") haltIds.add(b.id);
-    else waitingIds.add(b.id);
-  }
-
-  // Only the blockers that still hold: a closed one let go when it closed, and one absent from a
-  // `--status all` read does not exist to hold. A deferred one keeps its grip.
-  const stillHeldBy = new Map<string, string[]>();
-  for (const [dependent, blockers] of heldBy) {
-    const holding = blockers.filter((b) => waitingIds.has(b) || deferredIds.has(b));
-    if (holding.length) stillHeldBy.set(dependent, holding);
-  }
+  const { waiting, halted } = walkStates(board);
+  const gripped = stillHeldBy(heldBy, board);
 
   return (id: string): number => {
-    const released = new Set<string>([id]);
-    const queue = [id];
     let count = 0;
-    while (queue.length) {
-      for (const next of blocks.get(queue.shift() as string) ?? []) {
-        if (released.has(next) || haltIds.has(next)) continue;
-        const holders = stillHeldBy.get(next);
-        if (holders && !holders.every((holder) => released.has(holder))) continue;
-        released.add(next);
-        queue.push(next);
-        if (waitingIds.has(next)) count++;
-      }
+    for (const released of releaseClosure(id, blocks, gripped, halted)) {
+      if (released !== id && waiting.has(released)) count++;
     }
     return count;
   };

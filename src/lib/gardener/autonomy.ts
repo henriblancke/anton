@@ -98,7 +98,7 @@ export function resolveProposalAutonomyPolicy(overrides?: unknown): ProposalAuto
 
 /**
  * What a wrong move COSTS — the reversibility grouping the settings control already presents to the
- * founder (settings-view.tsx `AUTONOMY_GROUPS`), reused here because a bar is a price and these are
+ * founder (settings-autonomy.ts `AUTONOMY_GROUPS`), reused here because a bar is a price and these are
  * the three prices this board knows how to name:
  *
  *   • `reversible` — the graph moves; one bd write puts it back and nothing is recorded as having

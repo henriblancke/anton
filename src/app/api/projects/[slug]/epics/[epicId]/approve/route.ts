@@ -6,7 +6,7 @@ import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, stealRefused, withClaimLock } from "@/lib/beads/claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
@@ -329,12 +329,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
     // explicit steal to take it over, mirroring the claim route's 409.
     if (!steal) {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
-          owner,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
+        owner,
       );
     }
     // A steal only moves the reservation; it does not stop a run already executing under the current
@@ -346,13 +343,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // can't bypass it. Derive from the fresh `target` read above.
     const stage = deriveStage(target);
     if (stage !== "backlog") {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
-          owner,
-          stage,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+        owner,
+        stage,
       );
     }
     // Steal requested, but no operator identity resolves (no ANTON_OPERATOR, no global git user.name),
@@ -360,12 +354,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // reservation while leaving them as assignee — a half-steal that breaks the soft-lock the response
     // text and DESIGN.md promise. Reject until an operator identity is set to take ownership.
     if (!operator) {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
-          owner,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
+        owner,
       );
     }
   }
@@ -444,13 +435,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     return NextResponse.json({ error: swap.refused }, { status: 422 });
   }
   if ("moved" in swap) {
-    return NextResponse.json(
-      {
-        error: `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
-        owner,
-        stage: swap.moved,
-      },
-      { status: 409 },
+    return stealRefused(
+      `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+      owner,
+      swap.moved,
     );
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
