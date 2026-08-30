@@ -473,8 +473,64 @@ async function notifyReReview(args: {
 
 // ── merge finalization (anton-ner.5) ──
 
+/** A child whose commit is on the branch — `in_progress` included, see {@link undeliveredAtMerge}. */
+const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
+
 /**
- * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
+ * Delivery evidence: a status that means a commit landed, and no won't-do decision on top of it.
+ * An abandoned child is closed but explicitly undelivered (execute-epic drops it from `live` for
+ * the same reason), so it carries no mechanism for the tickets behind it.
+ */
+const deliveredAtMerge = (b: Bead | undefined): boolean =>
+  !!b && DELIVERED_AT_MERGE.has(b.status) && !beads.isAbandoned(b);
+
+/**
+ * The children a merged target must NOT close — the tickets its run deliberately left for a human
+ * (anton-67xj.1). A merge says the branch shipped, not that every ticket under the target ran, and
+ * closing one that never ran turns the bd note it carries into a pointer at work the board now
+ * reads as delivered.
+ *
+ * Two shapes, one rule. A ticket the run BLOCKED says so in its status — its budget ran out and its
+ * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. Two narrower
+ * sub-shapes — a timeout that fired after the commit, and a post-commit failure — do leave work on
+ * the branch; they are held back for the same reason all the same, because their note asks a human
+ * to review and close by hand, not because nothing landed. A ticket that merely WAITS on a blocked
+ * one was never dispatched (anton-67xj) and stays `open` so the board keeps offering it, so nothing
+ * but the `blocks` edge distinguishes it from an ordinary open child. Hence the transitive closure
+ * over the run's own `blocks` edges.
+ *
+ * A DELIVERED dependent stops the walk. Its commit is on the branch whatever its blocker did — the
+ * run carries on past a timeout, so a ticket behind one still gets dispatched — and the tickets
+ * behind IT have the mechanism they were written against. Delivery is `closed`, or `in_progress`:
+ * a child's close write is best-effort (execute-epic), so a transient bd failure leaves a ticket
+ * that committed claimed and mid-stage. Reading that bookkeeping failure as "never ran" would
+ * strand shipped work open, when the merge is precisely what repairs it. An ABANDONED child is the
+ * exception (deliveredAtMerge): closed on a human's won't-do, with no commit behind it, so the walk
+ * passes straight through to whatever waited on it.
+ */
+export function undeliveredAtMerge(children: Bead[]): Set<string> {
+  const byId = new Map(children.map((c) => [c.id, c]));
+  const keep = new Set(children.filter((c) => c.status === "blocked").map((c) => c.id));
+  // blocker id → the run's own tickets waiting on it; edges leaving the run are another gate's
+  // business (a ticket held on an outside blocker was never in this run's dispatch set).
+  const dependents = new Map<string, string[]>();
+  for (const e of beads.edgesOf(children)) {
+    if (e.type !== "blocks" || !byId.has(e.from) || !byId.has(e.to)) continue;
+    dependents.set(e.to, [...(dependents.get(e.to) ?? []), e.from]);
+  }
+  const queue = [...keep];
+  while (queue.length) {
+    for (const dependent of dependents.get(queue.shift()!) ?? []) {
+      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent))) continue;
+      keep.add(dependent); // never revisited, so a cycle terminates
+      queue.push(dependent);
+    }
+  }
+  return keep;
+}
+
+/**
+ * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, drop the
  * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
  *
  * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
@@ -492,7 +548,10 @@ export async function finalizeMergedEpic(args: {
   repo: string;
   projectId: string;
   epic: Bead;
-  /** The run target's whole ticket subtree (runTickets); open ones close alongside the epic. */
+  /**
+   * The run target's whole ticket subtree (runTickets), carrying its inline `blocks` edges. Open
+   * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
+   */
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;
@@ -505,8 +564,13 @@ export async function finalizeMergedEpic(args: {
   //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
   //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
   //    orphaning a still-open ticket/epic behind a run already marked done.
+  //    The target itself always closes — its PR merged — but the children its run never delivered
+  //    are held back (undeliveredAtMerge), or the board loses the work a human still has to run.
+  const undelivered = undeliveredAtMerge(children);
   const stillOpen = new Map(
-    [...children, epic].filter((b) => b.status !== "closed").map((b) => [b.id, b]),
+    [...children.filter((b) => !undelivered.has(b.id)), epic]
+      .filter((b) => b.status !== "closed")
+      .map((b) => [b.id, b]),
   ); // by id: a leaf run target is its own ticket, so it can appear on both sides
   const closed = await safe(() =>
     beads.batch(repo, [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id }))),

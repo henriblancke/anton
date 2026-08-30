@@ -70,147 +70,221 @@ interface Classified {
   definition?: StepDefinition;
 }
 
-/**
- * Check a cooked formula against the floor. Pure — no filesystem, no bd, no run state — so the
- * whole table of rejections is unit-testable without execute-epic, and a caller may pass a registry
- * of its own. The registry is a required argument on purpose: the classes are what the floor is made
- * of, and a default would let a call site validate against something other than the steps anton can
- * actually run.
- */
-export function checkFormulaFloor(cooked: CookedFormula, registry: StepRegistry): FloorCheckResult {
-  const steps = cooked.steps ?? [];
-  const classified: Classified[] = steps.map((step) => {
+/** The formula as the floor reads it: steps in EXECUTION order, addressable by step name. */
+interface Pipeline {
+  steps: Classified[];
+  /** Execution index of the first step resolving to `name`, or -1 when the formula has none. */
+  indexOf(name: string): number;
+}
+
+/** One floor condition: given the pipeline, the steps it refuses. Empty when the condition holds. */
+type FloorCheck = (pipeline: Pipeline, registry: StepRegistry) => FloorViolation[];
+
+function classify(cooked: CookedFormula, registry: StepRegistry): Pipeline {
+  const steps: Classified[] = (cooked.steps ?? []).map((step) => {
     const name = stepName(step);
     return { step, definition: name ? registry[name] : undefined };
   });
-  const violations: FloorViolation[] = [];
+  return { steps, indexOf: (name) => steps.findIndex((c) => c.definition?.name === name) };
+}
 
-  // Resolution first: an unresolved step has no class and no diff behaviour, so every later check
-  // would have to guess what it is. Collected rather than thrown — the loader (anton-hrql) already
-  // parks on this with a fuller message; here it only has to keep the floor's own report honest.
-  for (const { step, definition } of classified) {
-    if (definition) continue;
+/**
+ * Refuses a step anton cannot classify. Resolution comes first: an unresolved step has no class and
+ * no diff behaviour, so every later check would have to guess what it is. Collected rather than
+ * thrown — the loader (anton-hrql) already parks on this with a fuller message; here it only has to
+ * keep the floor's own report honest.
+ */
+const refuseUnclassifiableSteps: FloorCheck = ({ steps }) =>
+  steps.flatMap(({ step, definition }) => {
+    if (definition) return [];
     const name = stepName(step);
-    violations.push({
-      kind: "unresolved-step",
-      step: step.id,
-      detail: name
-        ? `step "${step.id}" names \`${STEP_LABEL_PREFIX}:${name}\`, which maps to no anton handler — ` +
-          `anton cannot tell whether it satisfies the floor, so the run is parked rather than skipping it`
-        : `step "${step.id}" carries no \`${STEP_LABEL_PREFIX}:<name>\` label, so anton cannot tell what ` +
-          `it should run`,
-    });
-  }
+    return [
+      {
+        kind: "unresolved-step" as const,
+        step: step.id,
+        detail: name
+          ? `step "${step.id}" names \`${STEP_LABEL_PREFIX}:${name}\`, which maps to no anton handler — ` +
+            `anton cannot tell whether it satisfies the floor, so the run is parked rather than skipping it`
+          : `step "${step.id}" carries no \`${STEP_LABEL_PREFIX}:<name>\` label, so anton cannot tell what ` +
+            `it should run`,
+      },
+    ];
+  });
 
+/** Refuses an id used twice: ids are how `needs` addresses a step and how the run log names one. */
+const refuseDuplicateStepIds: FloorCheck = ({ steps }) => {
   const timesById = new Map<string, number>();
-  for (const { step } of classified) timesById.set(step.id, (timesById.get(step.id) ?? 0) + 1);
-  for (const [id, times] of timesById) {
-    if (times < 2) continue;
-    violations.push({
-      kind: "duplicate-step-id",
+  for (const { step } of steps) timesById.set(step.id, (timesById.get(step.id) ?? 0) + 1);
+
+  return [...timesById]
+    .filter(([, times]) => times > 1)
+    .map(([id, times]) => ({
+      kind: "duplicate-step-id" as const,
       step: id,
       detail:
         `step id "${id}" is declared ${times} times — ids are how \`needs\` addresses a step and how ` +
         `the run log names one, so a repeated id makes the pipeline ambiguous`,
-    });
-  }
+    }));
+};
 
-  // Presence and singularity of the required steps, read from the registry's classes rather than a
-  // list held here — adding a required step is then a one-line registry change, not two.
-  for (const definition of Object.values(registry)) {
-    if (definition.class !== "required") continue;
-    const found = classified.filter((c) => c.definition?.name === definition.name);
+/**
+ * Refuses a required step that is missing or repeated. Read from the registry's classes rather than
+ * a list held here — adding a required step is then a one-line registry change, not two.
+ */
+const refuseRequiredStepNotDeclaredExactlyOnce: FloorCheck = ({ steps }, registry) =>
+  Object.values(registry).flatMap((definition): FloorViolation[] => {
+    if (definition.class !== "required") return [];
+    const found = steps.filter((c) => c.definition?.name === definition.name);
+    if (found.length === 1) return [];
+
     if (found.length === 0) {
-      violations.push({
-        kind: "missing-required-step",
-        step: `${STEP_LABEL_PREFIX}:${definition.name}`,
-        detail:
-          `no step is labelled \`${STEP_LABEL_PREFIX}:${definition.name}\` — the floor requires one, to ` +
-          `${definition.summary}. A run without it has no evidence of record or no way to reach a human`,
-      });
-    } else if (found.length > 1) {
-      violations.push({
+      return [
+        {
+          kind: "missing-required-step",
+          step: `${STEP_LABEL_PREFIX}:${definition.name}`,
+          detail:
+            `no step is labelled \`${STEP_LABEL_PREFIX}:${definition.name}\` — the floor requires one, to ` +
+            `${definition.summary}. A run without it has no evidence of record or no way to reach a human`,
+        },
+      ];
+    }
+    return [
+      {
         kind: "duplicate-required-step",
         step: found.map((f) => f.step.id).join(", "),
         detail:
           `\`${STEP_LABEL_PREFIX}:${definition.name}\` is declared ${found.length} times ` +
           `(${found.map((f) => `"${f.step.id}"`).join(", ")}) — a run is one worktree, one commit point ` +
           `and one PR, so each required step runs exactly once`,
-      });
-    }
-  }
+      },
+    ];
+  });
 
-  const indexOf = (name: string) => classified.findIndex((c) => c.definition?.name === name);
+/**
+ * Refuses a PR opened before the commit: it would be opened on a branch carrying none of the run's
+ * work, and the commit that followed would land where no reviewer is looking.
+ */
+const refusePrBeforeCommit: FloorCheck = ({ steps, indexOf }) => {
   const commitAt = indexOf(COMMIT_STEP);
   const prAt = indexOf(PR_STEP);
-  const reviewAt = indexOf(REVIEW_STEP);
+  if (commitAt < 0 || prAt < 0 || prAt > commitAt) return [];
 
-  if (commitAt >= 0 && prAt >= 0 && prAt < commitAt) {
-    violations.push({
+  return [
+    {
       kind: "pr-before-commit",
-      step: classified[prAt].step.id,
+      step: steps[prAt].step.id,
       detail:
-        `step "${classified[prAt].step.id}" opens the PR before "${classified[commitAt].step.id}" ` +
+        `step "${steps[prAt].step.id}" opens the PR before "${steps[commitAt].step.id}" ` +
         `commits — the PR would be opened on a branch carrying none of the run's work, and the commit ` +
         `that followed would land where no reviewer is looking. The floor requires \`` +
         `${STEP_LABEL_PREFIX}:${COMMIT_STEP}\` to precede \`${STEP_LABEL_PREFIX}:${PR_STEP}\``,
-    });
-  }
+    },
+  ];
+};
 
-  // The PR is the run's TERMINUS, not merely its last required step. anton stamps the PR ref on the
-  // target the moment `pr` returns, and a resumed run reads a live ref as proof the run finished
-  // (execute-epic step 0a) — so a step placed after the PR that failed would be skipped by the next
-  // attempt, which would settle the run `done` with that step never having run. Requiring `pr` last
-  // is what makes the completion marker honest.
-  //
-  // Reported only when the PR is otherwise well placed: a `pr` before the commit is already named by
-  // `pr-before-commit`, and a second `pr` step by `duplicate-required-step`. Repeating them here
-  // would tell the operator to move the wrong step.
-  if (prAt >= 0 && (commitAt < 0 || commitAt < prAt)) {
-    for (const { step, definition } of classified.slice(prAt + 1)) {
-      if (definition?.name === PR_STEP) continue;
-      violations.push({
-        kind: "step-after-pr",
-        step: step.id,
-        detail:
-          `step "${step.id}" runs after "${classified[prAt].step.id}" opens the run's pull request — ` +
-          `the PR ref anton stamps there is what a resumed run reads as proof the run FINISHED, so a ` +
-          `step that failed after it would be silently skipped on the next attempt and the run would ` +
-          `settle as done anyway. The floor requires \`${STEP_LABEL_PREFIX}:${PR_STEP}\` to be the ` +
-          `pipeline's LAST step — move this one before it`,
-      });
-    }
-  }
+/**
+ * Refuses any step placed after the PR. The PR is the run's TERMINUS, not merely its last required
+ * step: anton stamps the PR ref on the target the moment `pr` returns, and a resumed run reads a live
+ * ref as proof the run finished (execute-epic step 0a) — so a step placed after the PR that failed
+ * would be skipped by the next attempt, which would settle the run `done` with that step never having
+ * run. Requiring `pr` last is what makes the completion marker honest.
+ *
+ * Reported only when the PR is otherwise well placed: a `pr` before the commit is already named by
+ * `pr-before-commit`, and a second `pr` step by `duplicate-required-step`. Repeating them here would
+ * tell the operator to move the wrong step.
+ */
+const refuseStepsAfterPr: FloorCheck = ({ steps, indexOf }) => {
+  const commitAt = indexOf(COMMIT_STEP);
+  const prAt = indexOf(PR_STEP);
+  if (prAt < 0 || (commitAt >= 0 && commitAt > prAt)) return [];
 
-  // The self-review reads the run's COMMITTED diff (`merge-base..HEAD`). Before the commit that diff
-  // is empty, so the gate would review nothing, find nothing, and report clean — a silent pass, which
-  // is worse than a rejected run. Rejected rather than reordered for the operator: a formula that
-  // asks to review before it commits is asking for a gate that cannot see the work.
-  if (reviewAt >= 0 && commitAt >= 0 && reviewAt < commitAt) {
-    violations.push({
-      kind: "review-before-commit",
-      step: classified[reviewAt].step.id,
+  return steps
+    .slice(prAt + 1)
+    .filter(({ definition }) => definition?.name !== PR_STEP)
+    .map(({ step }) => ({
+      kind: "step-after-pr" as const,
+      step: step.id,
       detail:
-        `step "${classified[reviewAt].step.id}" self-reviews before "${classified[commitAt].step.id}" ` +
+        `step "${step.id}" runs after "${steps[prAt].step.id}" opens the run's pull request — ` +
+        `the PR ref anton stamps there is what a resumed run reads as proof the run FINISHED, so a ` +
+        `step that failed after it would be silently skipped on the next attempt and the run would ` +
+        `settle as done anyway. The floor requires \`${STEP_LABEL_PREFIX}:${PR_STEP}\` to be the ` +
+        `pipeline's LAST step — move this one before it`,
+    }));
+};
+
+/**
+ * Refuses a self-review placed before the commit. The gate reads the run's COMMITTED diff
+ * (`merge-base..HEAD`); before the commit that diff is empty, so the gate would review nothing, find
+ * nothing, and report clean — a silent pass, which is worse than a rejected run. Rejected rather than
+ * reordered for the operator: a formula that asks to review before it commits is asking for a gate
+ * that cannot see the work.
+ */
+const refuseReviewBeforeCommit: FloorCheck = ({ steps, indexOf }) => {
+  const commitAt = indexOf(COMMIT_STEP);
+  const reviewAt = indexOf(REVIEW_STEP);
+  if (reviewAt < 0 || commitAt < 0 || reviewAt > commitAt) return [];
+
+  return [
+    {
+      kind: "review-before-commit",
+      step: steps[reviewAt].step.id,
+      detail:
+        `step "${steps[reviewAt].step.id}" self-reviews before "${steps[commitAt].step.id}" ` +
         `commits — the gate reads the run's committed diff (\`merge-base..HEAD\`), which is empty ` +
         `until the commit lands, so it would review nothing and pass on nothing. The floor requires ` +
         `\`${STEP_LABEL_PREFIX}:${REVIEW_STEP}\` to run after \`${STEP_LABEL_PREFIX}:${COMMIT_STEP}\``,
-    });
-  }
+    },
+  ];
+};
 
-  if (commitAt >= 0) {
-    for (const [i, { step, definition }] of classified.entries()) {
-      if (i <= commitAt || !definition?.producesDiff) continue;
-      violations.push({
+/** Refuses a step that writes to the worktree after the commit — its work would never be committed. */
+const refuseDiffAfterCommit: FloorCheck = ({ steps, indexOf }) => {
+  const commitAt = indexOf(COMMIT_STEP);
+  if (commitAt < 0) return [];
+
+  return steps.slice(commitAt + 1).flatMap(({ step, definition }): FloorViolation[] => {
+    if (!definition?.producesDiff) return [];
+    return [
+      {
         kind: "diff-after-commit",
         step: step.id,
         detail:
           `step "${step.id}" (\`${STEP_LABEL_PREFIX}:${definition.name}\`) writes to the worktree but ` +
-          `runs after "${classified[commitAt].step.id}" — its work would never be committed, so the run ` +
+          `runs after "${steps[commitAt].step.id}" — its work would never be committed, so the run ` +
           `would report success on changes no one can see. Move it before the commit`,
-      });
-    }
-  }
+      },
+    ];
+  });
+};
+
+/**
+ * The floor, in reporting order: what a step IS before where it sits, so an operator reads the
+ * unclassifiable step before the ordering faults derived from classes it does not have.
+ */
+const FLOOR_CHECKS: readonly FloorCheck[] = [
+  refuseUnclassifiableSteps,
+  refuseDuplicateStepIds,
+  refuseRequiredStepNotDeclaredExactlyOnce,
+  refusePrBeforeCommit,
+  refuseStepsAfterPr,
+  refuseReviewBeforeCommit,
+  refuseDiffAfterCommit,
+];
+
+/**
+ * Check a cooked formula against the floor. Pure — no filesystem, no bd, no run state — so the
+ * whole table of rejections is unit-testable without execute-epic, and a caller may pass a registry
+ * of its own. The registry is a required argument on purpose: the classes are what the floor is made
+ * of, and a default would let a call site validate against something other than the steps anton can
+ * actually run.
+ *
+ * Every check runs: the result is the FULL list of violations, so an operator fixes the file once
+ * instead of a round trip per problem.
+ */
+export function checkFormulaFloor(cooked: CookedFormula, registry: StepRegistry): FloorCheckResult {
+  const pipeline = classify(cooked, registry);
+  const violations = FLOOR_CHECKS.flatMap((check) => check(pipeline, registry));
 
   return { ok: violations.length === 0, violations };
 }

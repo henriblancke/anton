@@ -10,6 +10,7 @@ import { countRuns } from "@/lib/runs";
 import { passRecordsByJob } from "@/lib/jobs/pass-records";
 import { sessionsByJob } from "@/lib/sessions";
 import { PAGE_SIZE, resolvePage } from "@/lib/pagination";
+import { PageHeader } from "@/components/atoms";
 import { SectionTabs } from "@/components/runs/section-tabs";
 import { Pagination } from "@/components/runs/pagination";
 import { JobList } from "@/components/runs/job-list";
@@ -73,13 +74,7 @@ export default async function ProjectJobsPage({
 
   return (
     <div className="flex flex-1 flex-col">
-      <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
-        <div className="flex items-center gap-2 text-[13px]">
-          <span className="text-muted-foreground">{project.name}</span>
-          <span className="text-subtle">/</span>
-          <span className="font-medium text-foreground">Jobs</span>
-        </div>
-      </header>
+      <PageHeader project={project.name} section="Jobs" />
 
       <SectionTabs slug={slug} active="jobs" runsCount={runsCount} jobsCount={total} />
 

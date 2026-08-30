@@ -288,7 +288,7 @@ export const scanSummaries = sqliteTable(
      * when there was none anton could read (a whole-repo pass, or a state it could not identify).
      *
      * Kept beside the one it left because a retried job's rescan is only legible against both. When
-     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer.ts),
+     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer-scan.ts),
      * so the retry measures from this value again: it REPLAYED the row's own window rather than
      * continuing past it, and its counts supersede rather than fold. A retry measuring from
      * `delta_state` instead scanned the next window along, and folds in. Written once, at insert —

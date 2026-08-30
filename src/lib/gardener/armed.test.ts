@@ -17,13 +17,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Bead } from "../beads/bd";
+import type { ArmedRecord } from "./armed";
 import { makeDetection, type GardenerDetection } from "./detections";
 import {
   emptyTrackRecord,
   resolveProposalAutonomyPolicy,
   type ProposalTrackRecord,
 } from "./autonomy";
-import type { EmittedProposal } from "./emit";
+import { MAX_APPLIES_PER_PASS, type EmittedProposal } from "./emit";
 import { passRecordCounts, readPassRecords } from "./record";
 
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
@@ -67,7 +68,18 @@ vi.mock("./apply", async () => {
   };
 });
 
-const { applyArmedProposals, movedTheBoard } = await import("./armed");
+const {
+  applyArmedProposals,
+  armedTargets,
+  heldBackNote,
+  movedTheBoard,
+  outcomeOf,
+  stopNote,
+  stranding,
+  summaryOf,
+  unpublishedNote,
+  verdictOf,
+} = await import("./armed");
 /** The real class — the mock above spreads the actual module, so `changed` behaves as it ships. */
 const { ProposalApplyError } = await import("./apply");
 
@@ -97,6 +109,31 @@ function shippedOrphan(subject: string): GardenerDetection {
   });
 }
 
+/** An ask of a kind this policy left at `propose` — what the armed selection must NOT take. */
+function staleAsk(subject: string): GardenerDetection {
+  return makeDetection({
+    kind: "stale",
+    move: "retire",
+    retireAs: "defer",
+    subjects: [subject],
+    summary: `${subject} has not moved in 90 days`,
+    evidence: [`${subject} last updated 90 days ago`],
+  });
+}
+
+/** One outcome, as the walk records it — the shape the verdict and summary helpers read. */
+const armedRecord = (
+  over: Partial<ArmedRecord> & Pick<ArmedRecord, "proposal" | "outcome">,
+): ArmedRecord => ({
+  kind: "shipped-orphan",
+  move: "retire",
+  retireAs: "close",
+  subjects: ["t-1"],
+  detail: "closed the subject as shipped",
+  changed: [],
+  ...over,
+});
+
 /** What the pass filed, in the order it filed it — proposal `p-1` about `t-1`, and so on. */
 const filed = (n: number): EmittedProposal[] =>
   Array.from({ length: n }, (_, i) => {
@@ -108,6 +145,9 @@ const log = vi.fn<(chunk: string) => Promise<void>>();
 const nudge = vi.fn();
 /** Everything the pass recorded, as one string — the record a founder reads on the jobs page. */
 const recorded = (): string => log.mock.calls.map(([chunk]) => chunk).join("");
+/** The stops, which go to the console even when the log that would have carried them is broken. */
+const consoleStops = (): string =>
+  vi.mocked(console.error).mock.calls.map((args) => args.join(" ")).join("\n");
 /** The walk's console line — the OTHER surface, and the one an operator greps after a 03:00 pass. */
 const consoleSummary = (): string =>
   vi.mocked(console.log).mock.calls.map((args) => args.join(" ")).join("\n");
@@ -772,5 +812,222 @@ describe("armed walk · a sync failure the note must carry whole", () => {
     const note = readPassRecords(recorded()).notes.find((n) => n.includes("could not be pulled"));
     expect(note).toContain("bd dolt pull failed diverged from origin/main hint: pull before pushing");
     expect(note).toContain("(p-1, p-2)");
+  });
+});
+
+/**
+ * The walk's decisions, each on its own (anton-ser8).
+ *
+ * The suites above drive them through a whole pass, which is the only way to prove the ORDER they
+ * run in — but it is a poor way to prove what any one of them says. These reach each decision
+ * directly: which asks are armed, what the cap holds back, what a stop and an unpublished write tell
+ * a founder, and which verdict a failure earns. A reworded refusal that the walk's own assertions
+ * would never notice fails here.
+ */
+describe("armedTargets", () => {
+  it("takes the kinds the policy armed, in the order the pass filed them", () => {
+    const created = filed(2);
+
+    expect(armedTargets(created, policy, record).map((t) => t.proposal.id)).toEqual(["p-1", "p-2"]);
+  });
+
+  it("leaves a kind the policy did not arm to the shadow walk", () => {
+    const detection = staleAsk("t-9");
+    const created = [{ id: "p-9", fingerprint: detection.fingerprint, detection }];
+
+    expect(armedTargets(created, policy, record)).toEqual([]);
+  });
+
+  it("refuses an armed kind whose record has not earned it (anton-m29g)", () => {
+    expect(armedTargets(filed(1), policy, emptyTrackRecord())).toEqual([]);
+  });
+
+  it("carries the plan beside the proposal, so no step re-derives the move", () => {
+    const [target] = armedTargets(filed(1), policy, record);
+
+    expect(target.plan.move).toBe("retire");
+    expect(target.plan.retireAs).toBe("close");
+    expect(target.plan.subjects).toEqual(["t-1"]);
+  });
+});
+
+describe("heldBackNote", () => {
+  it("says nothing when the cap held nothing back", () => {
+    expect(heldBackNote([], MAX_APPLIES_PER_PASS)).toBeUndefined();
+  });
+
+  it("names the count, the pass cap and every ask it holds back", () => {
+    const note = heldBackNote(["p-4", "p-5"], MAX_APPLIES_PER_PASS);
+
+    expect(note).toContain("held back 2 armed proposal(s)");
+    expect(note).toContain(`one pass applies at most ${MAX_APPLIES_PER_PASS}`);
+    expect(note).toContain("stay open as ordinary asks (p-4, p-5)");
+  });
+
+  it("names what an earlier tier of the same pass already spent, so the cap reads right", () => {
+    expect(heldBackNote(["p-4"], MAX_APPLIES_PER_PASS - 2)).toContain(
+      "2 of those were already spent earlier in this pass",
+    );
+  });
+
+  it("leaves the spend clause out for a pass that had spent nothing", () => {
+    expect(heldBackNote(["p-4"], MAX_APPLIES_PER_PASS)).not.toContain("already spent");
+  });
+});
+
+describe("stopNote", () => {
+  it("names the reason and the asks left standing behind it", () => {
+    const note = stopNote("the pass was cancelled", ["p-2", "p-3"]);
+
+    expect(note).toBe(
+      "APPLY stopped — the pass was cancelled; 2 armed proposal(s) stay open as ordinary asks " +
+        "(p-2, p-3)",
+    );
+  });
+
+  it("is just the reason when the stop left nothing untried", () => {
+    expect(stopNote("the pass was cancelled", [])).toBe("APPLY stopped — the pass was cancelled");
+  });
+});
+
+describe("unpublishedNote", () => {
+  it("names the moves that are on this machine only, by id", () => {
+    const note = unpublishedNote(["p-1", "p-2"], "bd dolt push failed");
+
+    expect(note).toContain("the 2 move(s) recorded above (p-1, p-2) are on this machine only");
+    expect(note).toContain("bd dolt push failed");
+  });
+
+  it("claims no moves for a pass whose asks the board all refused", () => {
+    const note = unpublishedNote([], "bd dolt push failed");
+
+    expect(note).toContain("what this pass wrote is on this machine only");
+    expect(note).not.toContain("move(s) recorded above");
+  });
+});
+
+describe("stranding", () => {
+  it("fails nothing when the pass moved nothing — an unpublished refusal is not a lie", () => {
+    expect(stranding([], "bd dolt push failed")).toBeUndefined();
+  });
+
+  it("says the record claims moves the shared board never received", () => {
+    const failure = stranding(["p-1"], "bd dolt push failed");
+
+    expect(failure).toContain("applied 1 proposal(s) (p-1)");
+    expect(failure).toContain("bd dolt push failed");
+    expect(failure).toContain("claims moves the shared board has not received");
+  });
+});
+
+describe("outcomeOf", () => {
+  it("calls a throw that was not an apply failure anton's own error", () => {
+    expect(outcomeOf(undefined)).toBe("error");
+  });
+
+  it("keeps a move the board holds under an ask nobody closed apart from a failure", () => {
+    expect(outcomeOf(new ProposalApplyError("unsettled", "could not close the proposal"))).toBe(
+      "unsettled",
+    );
+  });
+
+  it("reads a rolled-back write as anton failing, never as the board refusing", () => {
+    expect(outcomeOf(new ProposalApplyError("failed", "bd close failed"))).toBe("error");
+  });
+
+  it.each(["refused", "unusable"] as const)("reads %s as the board declining", (failure) => {
+    expect(outcomeOf(new ProposalApplyError(failure, "the subject moved since we asked"))).toBe(
+      "refused",
+    );
+  });
+});
+
+describe("verdictOf", () => {
+  it.each([
+    ["applied", "APPLIED"],
+    ["unsettled", "APPLIED BUT NOT SETTLED"],
+    ["refused", "REFUSED"],
+    ["error", "COULD NOT APPLY"],
+  ] as const)("writes a clean %s record under %s", (outcome, verdict) => {
+    expect(verdictOf(armedRecord({ proposal: "p-1", outcome }))).toBe(verdict);
+  });
+
+  it("never promises an untouched board for a rollback that left beads moved", () => {
+    expect(verdictOf(armedRecord({ proposal: "p-1", outcome: "error", changed: ["t-1"] }))).toBe(
+      "COULD NOT ROLL BACK",
+    );
+  });
+});
+
+describe("summaryOf", () => {
+  it("leaves 'applied 0' out — a pass the board refused is the armed path working", () => {
+    const summary = summaryOf([armedRecord({ proposal: "p-1", outcome: "refused" })]);
+
+    expect(summary).toBe("1 refused");
+  });
+
+  it("spells out the applied and unsettled asks by id, and counts the refusals", () => {
+    const summary = summaryOf([
+      armedRecord({ proposal: "p-1", outcome: "applied", changed: ["t-1"] }),
+      armedRecord({ proposal: "p-2", outcome: "unsettled", changed: ["t-2"] }),
+      armedRecord({ proposal: "p-3", outcome: "refused" }),
+    ]);
+
+    expect(summary).toContain("applied 1 proposal(s) unattended (p-1)");
+    expect(summary).toContain("could NOT settle 1 proposal(s) whose move the board now holds");
+    expect(summary).toContain("(p-2)");
+    expect(summary).toContain("1 refused");
+  });
+
+  it("counts a part-moved board apart from a failure nothing landed from", () => {
+    const summary = summaryOf([
+      armedRecord({ proposal: "p-1", outcome: "error", changed: ["t-1"] }),
+      armedRecord({ proposal: "p-2", outcome: "error" }),
+    ]);
+
+    expect(summary).toContain("could NOT roll back 1 proposal(s)");
+    expect(summary).toContain("(p-1)");
+    expect(summary).toContain("1 could not be applied");
+  });
+});
+
+/**
+ * A record that will not take the walk's own accounting.
+ *
+ * The spend is written BEFORE the write it pays for (jobs/pass-budget.ts reconstructs the cap from
+ * these very lines), so a log that refuses is not a cosmetic failure: an attempt anton cannot account
+ * for is one it must not make, and one whose outcome it cannot record is the last it may reserve.
+ * Both stops go to the console, because the surface that would have carried them is what failed.
+ */
+describe("armed walk · a record that will not take the spend", () => {
+  const running = (): AbortSignal => new AbortController().signal;
+
+  it("never applies an attempt whose reservation could not be recorded", async () => {
+    log.mockImplementation(async (chunk) => {
+      if (chunk.includes("APPLYING")) throw new Error("the log store is full");
+    });
+
+    const result = await walk(filed(2), running());
+
+    expect(applyMock).not.toHaveBeenCalled();
+    expect(result.records).toEqual([]);
+    // Both stay open: the walk cannot account for the first, and the log is no healthier for the
+    // second.
+    expect(result.deferred).toEqual(["p-1", "p-2"]);
+    expect(consoleStops()).toContain("can no longer account for what it spends");
+  });
+
+  it("stops after an apply whose outcome could not be recorded, rather than reserving again", async () => {
+    log.mockImplementation(async (chunk) => {
+      if (chunk.includes("APPLIED")) throw new Error("the log store is full");
+    });
+
+    const result = await walk(filed(2), running());
+
+    // The first apply happened and is kept — what was lost is the line saying what it did.
+    expect(applyMock).toHaveBeenCalledTimes(1);
+    expect(result.records.map((r) => r.proposal)).toEqual(["p-1"]);
+    expect(result.deferred).toEqual(["p-2"]);
+    expect(consoleStops()).toContain("the outcome of p-1 could not be recorded");
   });
 });
