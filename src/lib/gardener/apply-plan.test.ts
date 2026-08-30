@@ -74,6 +74,10 @@ describe("planApply — what an approval means against the board as it now is", 
           parentClaim: "",
           kind: "parentless-cluster",
           observedAtMs: Date.parse(FILED),
+          // The two premises the WRITE re-asks under its locks: the ids to keep out of the home's
+          // carried-ticket count, and the membership to re-group (apply-steps.ts
+          // `assertClusterHolds`). Neither is readable from the step's two ends alone.
+          cluster: { named: ["anton-a", "anton-b"], members: ["anton-a", "anton-b"] },
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
         {
@@ -85,6 +89,7 @@ describe("planApply — what an approval means against the board as it now is", 
           parentClaim: "",
           kind: "parentless-cluster",
           observedAtMs: Date.parse(FILED),
+          cluster: { named: ["anton-a", "anton-b"], members: ["anton-a", "anton-b"] },
         },
       ],
     });
@@ -680,6 +685,41 @@ describe("planApply — what an approval means against the board as it now is", 
             /anton-b is all that is left of this cluster/,
           );
         }
+      });
+
+      /**
+       * …and once what already sits under the home is a cluster in its own right, the ask is DONE.
+       * Two members filed there by hand are the outcome this proposal wanted, so a third that closed
+       * or moved on leaves nothing to write — reporting its refusal instead left a proposal no
+       * approval could ever settle, because every later approve reached the same refusal while the
+       * valid cluster sat on the board.
+       */
+      it("settles a cluster the board already holds, whatever became of the other members", () => {
+        const board = [
+          CARD,
+          CARRIED,
+          child("anton-a", CARD.id),
+          child("anton-b", CARD.id),
+          bead("anton-c", { status: "closed" }),
+        ];
+        expect(decide(THREE, board)).toEqual({
+          status: "settled",
+          // Named from the members that ARE there: anton-c never reached the target.
+          summary: "anton-a, anton-b already sit under anton-card",
+        });
+      });
+
+      // …but two in-place members that no longer agree about anything are not a cluster, so the
+      // departure that unravelled it is still the answer the approver gets.
+      it("does not settle on in-place members that no longer state one subject", () => {
+        const board = [
+          CARD,
+          CARRIED,
+          child("anton-a", CARD.id, { title: "anton-a: docker image cache" }),
+          child("anton-b", CARD.id),
+          bead("anton-c", { status: "closed" }),
+        ];
+        expect(reason(decide(THREE, board))).toMatch(/anton-c is closed/);
       });
 
       /**

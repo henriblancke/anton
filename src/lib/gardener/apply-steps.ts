@@ -23,9 +23,11 @@ import {
 } from "./board-index";
 import {
   blockerUnusable,
+  clusterMemberUngrouped,
   DOING,
   EVIDENCE_PREMISE,
   home,
+  homeCarriesNothing,
   homeClaimed,
   HOME_STANDING,
   homeUnusable,
@@ -42,6 +44,7 @@ import {
   unapproveNote,
   type ApplyStep,
   type EvidenceFence,
+  type ReparentStep,
   type TicketOwner,
 } from "./apply-plan";
 import { impliesOrdering } from "./relink";
@@ -144,18 +147,20 @@ function lockedBeads(step: ApplyStep): string[] {
  * holds it too: handing a ticket to another card takes it out of that set exactly as retiring it
  * does, and leaves the run's commit landing in a PR for a bead that now belongs elsewhere.
  *
- * The body is the checks in the order they have to run, each named for what it refuses. Four of them
+ * The body is the checks in the order they have to run, each named for what it refuses. Five of them
  * buy a whole board read rather than trusting the snapshot: whether the subject still rides the
  * TICKET SET the step captured ({@link assertOwnerUnchanged}), whether a bead about to be SETTLED
  * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still
- * the TIER its subject demands ({@link assertHomeFitsSubject}), and whether the board still STATES
- * the ordering a link rests on ({@link assertOrderingStated}). All four earn it the same way — the
- * write that flips the answer is itself a locked write on a bead this step holds. Attaching work
- * under a bead, and moving a bead onto another card, are both re-parents, which take those beads'
- * locks as subject and home; an epic's tier turns entirely on its feature children — it stops being
- * a card, or stops being a container, the moment one lands under it or leaves it, that same locked
- * write; and a link's evidence sits on the PAIR, whose bodies are edited under these very locks
- * (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
+ * the TIER its subject demands ({@link assertHomeFitsSubject}), whether a cluster's home still
+ * CARRIES work and its members still state one subject ({@link assertClusterHolds}), and whether the
+ * board still STATES the ordering a link rests on ({@link assertOrderingStated}). All five earn it
+ * the same way — the write that flips the answer is itself a locked write on a bead this step holds.
+ * Attaching work under a bead, and moving a bead onto another card, are both re-parents, which take
+ * those beads' locks as subject, home and ticket owner; an epic's tier turns entirely on its feature
+ * children — it stops being a card, or stops being a container, the moment one lands under it or
+ * leaves it, that same locked write; and a link's evidence, like a cluster's grouping, sits on beads
+ * whose bodies and labels are edited under these very locks (`ticket-detail.ts` `updateTicket`). So
+ * those writes genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
@@ -238,13 +243,53 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
 
 /**
  * What a RE-PARENT owes the two run targets it sits between: the home it is about to hang work
- * under, and the ticket set it is taking that work out of.
+ * under, and the ticket set it is taking that work out of — plus, for a cluster, the premises its
+ * home was chosen on.
  */
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
   const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`);
   assertOwnerUnchanged(step, board);
   assertHomeFitsSubject(step, board);
+  assertClusterHolds(step, board);
+}
+
+/**
+ * What a CLUSTER re-parent owes the two premises its home was chosen on — the card already filing
+ * work of this kind under it (reparent.ts `MIN_CARRIED_TICKETS`) and the members stating one subject
+ * between them ({@link clusterMemberUngrouped}) — judged from a board read taken INSIDE the locks and
+ * through the same helpers the decision used. Absent on the re-parents that make no such claim.
+ *
+ * `planReparent` asks both of the snapshot, and nothing else here restates either: every check above
+ * asks whether the beads are open, unclaimed, unmoved and the right tier, all of which the writes
+ * that falsify these leave untouched.
+ *
+ * Both order against locks this step holds. The home's last ticket leaves by a RE-PARENT, which
+ * takes the home's own lock as the ticket's ticket owner (see {@link ownerOf}), so either that move
+ * lands first and this read finds the card a leaf, or it queues behind this write. The grouping is
+ * read from titles and `area:` labels, edited under the bead's own lock (`ticket-detail.ts`
+ * `updateTicket`) — held here for the subject and the home, which is where a rename does the damage:
+ * it lands work under a card it no longer shares a subject with. An edit to ANOTHER member is
+ * outside these locks and caught only as the fresh read happens to see it, the same bargain
+ * {@link assertOwnerUnchanged} strikes.
+ *
+ * The count ignores every id the ask NAMED rather than the members left to move: an earlier step of
+ * this same cluster has already landed under the home, and letting it count would let the ask prove
+ * its own premise with the very move it is asking for.
+ */
+function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
+  const cluster = step.cluster;
+  if (!cluster) return;
+  const target = board.byId.get(step.parent);
+  if (!target) throw new SubjectMovedError(missing(step.parent));
+  const leaf = homeCarriesNothing(target, board, new Set(cluster.named));
+  if (leaf) throw new SubjectMovedError(leaf);
+  const members = cluster.members.flatMap((id) => {
+    const member = board.byId.get(id);
+    return member ? [member] : [];
+  });
+  const ungrouped = clusterMemberUngrouped(step.id, target, members);
+  if (ungrouped) throw new SubjectMovedError(ungrouped);
 }
 
 /**

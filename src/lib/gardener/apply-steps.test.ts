@@ -191,6 +191,65 @@ describe("under the write lock — what a decided step re-asks before it lands",
     ]);
   });
 
+  /**
+   * The CONTAINER half of a cluster's "obvious home" (reparent.ts `MIN_CARRIED_TICKETS`), and the
+   * write that revokes it takes this same lock: the home's last ticket leaves by a re-parent, whose
+   * ticket owner IS this card. Left with the snapshot, both approvals pass and the cluster lands on
+   * a leaf feature — one PR's worth of work turned into somebody else's epic.
+   */
+  it("refuses a cluster whose home lost its last ticket since the snapshot", async () => {
+    const proposal = proposalFor(CLUSTER);
+    // The ticket that made anton-card an obvious home is detached between the snapshot and the write.
+    liveBeads.set(CARRIED.id, bead(CARRIED.id));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card carries no tickets of its own any more — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  // …and the cluster's own members may not stand in for the ticket that left — not even the ones
+  // THIS apply has already moved. Counting them would let the ask prove its own premise with the
+  // very writes it is making, so the last member lands on a card whose only work is the cluster.
+  it("never lets a member it has already moved stand in for the home's own ticket", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    // The home's own ticket leaves the instant the first member lands under it.
+    onWrite((call) => {
+      if (call === "reparent anton-a anton-card") liveBeads.set(CARRIED.id, bead(CARRIED.id));
+    });
+
+    await expect(apply(proposal, board)).rejects.toThrow(/carries no tickets of its own any more/);
+
+    expect(calls.slice(0, 2)).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-a anton-old", // rolled back: the cluster never had a home to land on
+    ]);
+    expect(calls.some((c) => c.startsWith("reparent anton-b"))).toBe(false);
+  });
+
+  /**
+   * The MEMBERS' half of the same claim. A title or `area:` edit takes the bead's own lock
+   * (`ticket-detail.ts` `updateTicket`), which this step holds for the subject and the home — and it
+   * is invisible to every other bar here: the bead stays open, unclaimed, unmoved and the right
+   * tier. Without the re-check the move lands work under a card it no longer shares a subject with.
+   */
+  it("refuses a member retitled out of its cluster since the snapshot", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set("anton-a", bead("anton-a", { title: "anton-a: docker image cache" }));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a no longer states a subject the rest of this cluster and anton-card hold in common — a title or \`area:\` label was edited since this proposal was decided, and it takes 2 beads stating one subject anton-card states too before a home is obvious`,
+    ]);
+  });
+
   it("refuses a blocker that landed, and a survivor that reopened, under the write lock", async () => {
     const link = proposalFor(LINK);
     liveBeads.set("anton-bb", bead("anton-bb", { status: "closed" }));
