@@ -9,6 +9,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
+import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
@@ -84,8 +85,9 @@ export function sanitizeBranch(branch: string): string {
  * the removal and recreates what it needs.
  *
  * Per branch, so unrelated runs and sweeps still overlap, and in-process only: anton's runs and its
- * sweeps share one job runner, which is the whole population racing here. A second anton over the
- * same repo is still held off by git's own worktree locks and by that same re-read.
+ * sweeps share one job runner, which is the whole population racing here. A SECOND anton process
+ * over the same repo does not see this map at all — what holds it off is the git worktree lock
+ * {@link withWorktreeClaim} takes, plus each destructive caller's last-moment re-read.
  */
 const branchLocks = new Map<string, Promise<void>>();
 
@@ -123,16 +125,75 @@ export async function withBranchLock<T>(
  * that follows. A claim is the missing evidence, and the only thing teardown and the sweep re-read
  * for a checkout no run row names.
  *
- * In-process only, like {@link withBranchLock}: one job runner owns every job that touches these
- * checkouts, and a second anton over the same repo is still held off by git's own worktree locks.
+ * This map is only the IN-PROCESS half of the claim; the durable half is a real `git worktree lock`
+ * on the checkout (see {@link withWorktreeClaim}), which is what a second anton process — whose
+ * teardown would otherwise force-remove the directory this one is fixing in — can actually see.
  */
 const worktreeClaims = new Map<string, string[]>();
+
+/** Marks a `git worktree lock` reason as anton's claim rather than another tool's lock. */
+const CLAIM_LOCK_PREFIX = "anton-claim";
+
+/** A claim lock's payload, parsed back out of git's lock reason. */
+export interface ClaimLock {
+  owner: string;
+  pid: number;
+  host: string;
+}
+
+/** The lock reason a claim writes. The pid and host are what makes a crashed claim recognizable. */
+function claimLockReason(owner: string): string {
+  return `${CLAIM_LOCK_PREFIX} ${owner.replace(/\s+/g, "-")} pid=${process.pid} host=${hostname()}`;
+}
+
+/** The claim a lock reason encodes, or undefined when the lock is not anton's to reason about. */
+export function parseClaimLock(reason: string | undefined): ClaimLock | undefined {
+  const m = reason?.trim().match(new RegExp(`^${CLAIM_LOCK_PREFIX} (\\S+) pid=(\\d+) host=(\\S+)$`));
+  return m ? { owner: m[1], pid: Number(m[2]), host: m[3] } : undefined;
+}
+
+/** Whether a pid is still running. EPERM means it exists but belongs to another user. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * The still-live claim a lock reason names, or undefined when the reason is not a claim at all or
+ * names a process on THIS machine that has since died. A crashed anton leaves its lock behind, and a
+ * lock nothing may ever break turns one crash into a checkout and branch that leak forever. A claim
+ * recorded on another host is never judged — its pid means nothing here — so it is honoured as-is.
+ */
+export function liveClaimLock(
+  reason: string | undefined,
+  alive: (pid: number) => boolean = pidAlive,
+  host: string = hostname(),
+): ClaimLock | undefined {
+  const claim = parseClaimLock(reason);
+  if (!claim) return undefined;
+  return claim.host === host && !alive(claim.pid) ? undefined : claim;
+}
+
+/** How a live claim reads in a refusal log. */
+export function describeClaimLock(claim: ClaimLock): string {
+  return `${claim.owner} is using the checkout (pid ${claim.pid} on ${claim.host})`;
+}
 
 /**
  * Hold `branch`'s checkout for as long as `fn` runs. The claim is taken UNDER the branch lock, so it
  * either lands before a removal starts or waits for that removal to finish — a claim can never be
  * taken in the window a reaper has already decided to delete in. `fn` itself runs outside the lock:
  * it drives a claude session for minutes, which no other run's teardown may be blocked on.
+ *
+ * The claim is recorded twice, because one anton process is not the whole population: in the map
+ * above for this process's own reaper, and as a `git worktree lock` on the checkout for every other
+ * process. Nothing about a checkout being in use is implicit to git — a second anton's teardown
+ * force-removes whatever its own rows say is residue — so without that lock a concurrent process
+ * deletes the directory this claim exists to protect, uncommitted fix and all.
  */
 export async function withWorktreeClaim<T>(
   repoPath: string,
@@ -143,20 +204,76 @@ export async function withWorktreeClaim<T>(
   const key = branchKey(repoPath, branch);
   await withBranchLock(repoPath, branch, async () => {
     worktreeClaims.set(key, [...(worktreeClaims.get(key) ?? []), owner]);
+    await lockClaimedWorktree(repoPath, branch, owner);
   });
   try {
     return await fn();
   } finally {
-    const held = worktreeClaims.get(key) ?? [];
-    const rest = held.filter((_, i) => i !== held.indexOf(owner));
-    if (rest.length > 0) worktreeClaims.set(key, rest);
-    else worktreeClaims.delete(key);
+    // Under the branch lock again, so the git lock is lifted and the map cleared as one step no
+    // teardown can read halfway through.
+    await withBranchLock(repoPath, branch, async () => {
+      const held = worktreeClaims.get(key) ?? [];
+      const rest = held.filter((_, i) => i !== held.indexOf(owner));
+      if (rest.length > 0) {
+        worktreeClaims.set(key, rest);
+        return;
+      }
+      worktreeClaims.delete(key);
+      await releaseClaimLock(repoPath, branch);
+    });
+  }
+}
+
+/**
+ * Put the claim on the checkout itself, where another process can see it. Best-effort by shape: at
+ * claim time the checkout usually does not exist yet (review-fix claims the branch, then
+ * materializes it), and {@link createWorktree} takes the lock for the live claim the moment it does.
+ */
+async function lockClaimedWorktree(repoPath: string, branch: string, owner: string): Promise<void> {
+  const record = (await listWorktrees(repoPath).catch(() => [])).find(
+    (r) => !r.isMain && r.branch === branch,
+  );
+  if (!record) return; // not materialized yet — createWorktree locks it when it is
+  if (record.locked) {
+    // Another tool's lock is never ours to break, and a live claim already says what we want said.
+    if (!parseClaimLock(record.lockReason) || liveClaimLock(record.lockReason)) return;
+    await unlockWorktree(repoPath, record.path); // a dead claim's leftovers
+  }
+  try {
+    await git(repoPath, ["worktree", "lock", "--reason", claimLockReason(owner), record.path]);
+  } catch (err) {
+    console.warn(
+      `[worktree] could not lock ${record.path} for ${owner}'s claim, so a second anton process ` +
+        `cannot see it and may remove the checkout: ${gitError(err)}`,
+    );
+  }
+}
+
+/** Lift only THIS process's own claim lock: another anton may since have taken the checkout over. */
+async function releaseClaimLock(repoPath: string, branch: string): Promise<void> {
+  const record = (await listWorktrees(repoPath).catch(() => [])).find(
+    (r) => !r.isMain && r.branch === branch && r.locked,
+  );
+  const claim = parseClaimLock(record?.lockReason);
+  if (record && claim?.pid === process.pid && claim.host === hostname()) {
+    await unlockWorktree(repoPath, record.path);
+  }
+}
+
+/** Best-effort `git worktree unlock` — a lock that outlives its holder must not be permanent. */
+async function unlockWorktree(repoPath: string, path: string): Promise<void> {
+  try {
+    await git(repoPath, ["worktree", "unlock", path]);
+  } catch {
+    // Already unlocked, or the record is gone; the caller's removal reports the real outcome.
   }
 }
 
 /**
  * The job holding this branch's checkout, or undefined when nothing is. Read under the branch lock
- * by anything about to delete the checkout — outside it the answer is already stale.
+ * by anything about to delete the checkout — outside it the answer is already stale. In-process
+ * only: a claim held by ANOTHER anton is seen at the moment of removal instead, as the git worktree
+ * lock {@link removeWorktree} refuses on.
  */
 export function worktreeClaimHolder(repoPath: string, branch: string): string | undefined {
   return worktreeClaims.get(branchKey(repoPath, branch))?.[0];
@@ -182,12 +299,18 @@ export async function createWorktree(opts: {
   // outside it. A cold install runs for minutes, and by the time it starts the checkout exists and
   // the run row already names the branch, which is what the sweep re-reads before deleting anything.
   const wt = await withBranchLock(repoPath, branch, async (): Promise<Worktree> => {
+    // A claim can be held before the checkout exists (review-fix claims, then materializes), and the
+    // git lock that makes it visible to another anton process can only be taken once it does.
+    const claimed = worktreeClaims.get(branchKey(repoPath, branch))?.[0];
     const existing = await findWorktree(repoPath, branch);
     // A registration can outlive its checkout: `git worktree list` reports an administrative record,
     // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
     // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
     // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
-    if (existing && existsSync(existing.path)) return existing;
+    if (existing && existsSync(existing.path)) {
+      if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
+      return existing;
+    }
     // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
     if (existing) await forgetStaleWorktree(repoPath, existing.path);
 
@@ -200,6 +323,8 @@ export async function createWorktree(opts: {
     } else {
       await git(repoPath, ["worktree", "add", path, "-b", branch, baseBranch]);
     }
+
+    if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
 
     // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
     // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
@@ -468,29 +593,58 @@ export interface WorktreeRemoval {
 }
 
 /**
- * Whether the checkout is locked, read from the `locked` file in the admin directory its own `.git`
- * marker points at. This needs neither the repo's index nor `git worktree list`, so it is what still
- * settles the question when the listing itself is unreadable. Undefined means "cannot tell" — never
- * "not locked".
+ * Whether the checkout is locked and with what reason, read from the `locked` file in the admin
+ * directory its own `.git` marker points at. This needs neither the repo's index nor `git worktree
+ * list`, so it is what still settles the question when the listing itself is unreadable. Undefined
+ * means "cannot tell" — never "not locked".
  */
-async function lockedInAdminDir(wt: Worktree): Promise<boolean | undefined> {
+async function lockedInAdminDir(
+  wt: Worktree,
+): Promise<{ locked: boolean; reason?: string } | undefined> {
   try {
     const marker = await readFile(join(wt.path, ".git"), "utf8");
     const gitDir = marker.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+    if (!gitDir) return undefined;
     // Resolved against the CHECKOUT, not the process cwd: git writes an absolute gitdir today, but a
     // relative one (an older git, a moved repo) would otherwise be looked up under wherever anton
     // happens to be running — and a lock that can't be found reads as "not locked".
-    return gitDir ? existsSync(join(resolve(wt.path, gitDir.trim()), "locked")) : undefined;
+    const lockFile = join(resolve(wt.path, gitDir.trim()), "locked");
+    if (!existsSync(lockFile)) return { locked: false };
+    const reason = await readFile(lockFile, "utf8").catch(() => "");
+    return { locked: true, reason: reason.trim() || undefined };
   } catch {
     return undefined;
   }
 }
 
+/** What {@link removalBlocker} concluded about a checkout it was asked to remove. */
+interface RemovalGuard {
+  /** Why the checkout must be left alone; absent when it is anton's to remove. */
+  blocker?: string;
+  /** A crashed anton's own claim lock is still on it — break that lock before removing. */
+  staleClaimLock?: boolean;
+}
+
 /**
- * Why `wt` must be left alone, or undefined when it is anton's to remove. Two cases, both read from
- * git at the moment of removal rather than trusted from a caller's snapshot.
+ * How a lock on the checkout is judged. Another tool's lock always blocks. anton's own claim lock
+ * blocks while the process holding it is alive — that is the whole point of it, and the one signal a
+ * concurrent anton has that the checkout is in use — but a claim whose process died on this machine
+ * is leftovers, not evidence, and is broken rather than honoured forever.
+ */
+function judgeLock(reason: string | undefined, source?: string): RemovalGuard {
+  const live = liveClaimLock(reason);
+  if (live) return { blocker: source ? `${describeClaimLock(live)} — ${source}` : describeClaimLock(live) };
+  if (parseClaimLock(reason)) return { staleClaimLock: true };
+  const detail = reason ?? "no reason given";
+  return { blocker: `locked by another owner (${source ? `${detail} — ${source}` : detail})` };
+}
+
+/**
+ * Why `wt` must be left alone, or an empty guard when it is anton's to remove. Two cases, both read
+ * from git at the moment of removal rather than trusted from a caller's snapshot.
  *
- * Another tool LOCKED the checkout: `git worktree remove --force` refuses a locked worktree, and the
+ * Someone LOCKED the checkout — another tool, or another anton process holding a claim on it (see
+ * {@link withWorktreeClaim}): `git worktree remove --force` refuses a locked worktree, and the
  * orphan fallback below would then delete a directory another owner is working in — the lock is
  * precisely the statement that it must not.
  *
@@ -506,63 +660,79 @@ async function lockedInAdminDir(wt: Worktree): Promise<boolean | undefined> {
  * pruning and branch deletion still proceed — that is the moved/deleted-repo case the fallback below
  * exists to serve.
  */
-async function removalBlocker(wt: Worktree): Promise<string | undefined> {
+async function removalBlocker(wt: Worktree): Promise<RemovalGuard> {
   const target = resolve(wt.path);
   const records = await listWorktrees(wt.repoPath).catch(() => null);
   if (records === null) {
-    if (!existsSync(wt.path)) return undefined;
-    const locked = await lockedInAdminDir(wt);
-    if (locked === false) return undefined;
-    return locked
-      ? "locked by another owner (its lock file, read directly — git's worktree list was unreadable)"
-      : "git's worktree list is unreadable, so another owner's lock cannot be ruled out";
+    if (!existsSync(wt.path)) return {};
+    const lock = await lockedInAdminDir(wt);
+    if (lock === undefined) {
+      return { blocker: "git's worktree list is unreadable, so another owner's lock cannot be ruled out" };
+    }
+    if (!lock.locked) return {};
+    return judgeLock(lock.reason, "its lock file, read directly — git's worktree list was unreadable");
   }
   const record = records.find((r) => resolve(r.path) === target);
-  if (record?.locked) return `locked by another owner (${record.lockReason ?? "no reason given"})`;
+  if (record?.locked) return judgeLock(record.lockReason);
   if (wt.branch && record?.branch && record.branch !== wt.branch) {
-    return `git registers ${record.branch} at that checkout now, not ${wt.branch}`;
+    return { blocker: `git registers ${record.branch} at that checkout now, not ${wt.branch}` };
   }
-  return undefined;
+  return {};
 }
 
 /**
  * Remove the worktree (force, so dirty state is discarded) and prune. If `deleteBranch` is set,
  * also delete the branch. Safe to call when the worktree is already gone (idempotent), and a no-op
- * that REPORTS itself when the checkout is locked by another owner or the path has since been
- * registered to a different branch (see {@link removalBlocker}).
+ * that REPORTS itself when the checkout is locked by another owner — including another anton process
+ * holding a claim on it — or the path has since been registered to a different branch (see
+ * {@link removalBlocker}).
  */
 export async function removeWorktree(
   wt: Worktree,
   opts?: { deleteBranch?: boolean },
 ): Promise<WorktreeRemoval> {
-  const blocker = await removalBlocker(wt);
-  if (blocker) return { removed: false, skipped: blocker, branchDeleted: false };
+  const guard = await removalBlocker(wt);
+  if (guard.blocker) return { removed: false, skipped: guard.blocker, branchDeleted: false };
 
   const existed = existsSync(wt.path);
   if (existed) {
+    // A crashed anton's claim lock still sits on the checkout, and `git worktree remove --force`
+    // refuses a locked worktree — break the dead claim rather than leaking the checkout forever.
+    if (guard.staleClaimLock) await unlockWorktree(wt.repoPath, wt.path);
     try {
       await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
     } catch {
-      // git refuses a checkout another tool locked in exactly the same way it fails on a moved repo,
+      // git refuses a checkout another owner locked in exactly the same way it fails on a moved repo,
       // and a lock taken after the pre-check above lands here. Re-read it before the fallback: the
       // recursive delete is for a STALE registration, never for a checkout someone just claimed —
       // that owner's uncommitted work is precisely what the lock says must not be destroyed.
       const raced = await removalBlocker(wt);
-      if (raced) return { removed: false, skipped: raced, branchDeleted: false };
+      if (raced.blocker) return { removed: false, skipped: raced.blocker, branchDeleted: false };
+      if (raced.staleClaimLock) {
+        // A dead claim's lock appearing only now is the one refusal a retry can clear.
+        await unlockWorktree(wt.repoPath, wt.path);
+        try {
+          await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
+        } catch {
+          // Still refused — fall through to the orphan check, which proves ownership before deleting.
+        }
+      }
       // The main repository may have been moved or partially deleted before anton is asked to
       // forget it. In that case git cannot remove the worktree, but the checkout is still ours if
       // its .git file points into this repo's worktree administration directory. Remove only that
       // narrowly verified orphan; never recursively delete an arbitrary path from a database row.
-      try {
-        const gitFile = await readFile(join(wt.path, ".git"), "utf8");
-        const adminRoot = resolve(wt.repoPath, ".git", "worktrees") + sep;
-        const gitDir = gitFile.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
-        if (gitDir && resolve(wt.path, gitDir.trim()).startsWith(adminRoot)) {
-          await rm(wt.path, { recursive: true, force: true });
+      if (existsSync(wt.path)) {
+        try {
+          const gitFile = await readFile(join(wt.path, ".git"), "utf8");
+          const adminRoot = resolve(wt.repoPath, ".git", "worktrees") + sep;
+          const gitDir = gitFile.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+          if (gitDir && resolve(wt.path, gitDir.trim()).startsWith(adminRoot)) {
+            await rm(wt.path, { recursive: true, force: true });
+          }
+        } catch {
+          // Missing/unreadable marker means ownership cannot be proven; leave it for residue
+          // verification to report instead of risking user data.
         }
-      } catch {
-        // Missing/unreadable marker means ownership cannot be proven; leave it for residue
-        // verification to report instead of risking user data.
       }
     }
   }

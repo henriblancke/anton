@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   openPrNotice,
@@ -27,6 +27,9 @@ import {
   WORKTREES_ROOT_ENV,
 } from "./worktree";
 
+/** Above every platform's pid_max, so `process.kill(pid, 0)` is guaranteed to report it gone. */
+const DEAD_PID = 4_194_305;
+
 function candidate(over: Partial<ReapCandidate> = {}): ReapCandidate {
   return { branch: "anton/anton-0oi", beadId: "anton-0oi", runLive: false, bead: "settled", ...over };
 }
@@ -42,6 +45,21 @@ describe("planReap — what the janitor sweep may reclaim", () => {
     const plan = planReap(candidate({ path: "/wt/x", lock: "supacode" }), undefined);
     expect(plan).toMatchObject({ removeWorktree: false, deleteBranch: false });
     expect(plan.reason).toContain("locked by another owner (supacode)");
+  });
+
+  it("SKIPS a checkout another anton process has claimed, naming the job that holds it", () => {
+    const lock = `anton-claim review-fix pid=${process.pid} host=${hostname()}`;
+    const plan = planReap(candidate({ path: "/wt/x", lock }), undefined);
+    expect(plan).toMatchObject({ removeWorktree: false, deleteBranch: false });
+    expect(plan.reason).toContain("review-fix is using the checkout");
+  });
+
+  it("reclaims a checkout whose claim lock was left by a process that has since died", () => {
+    // Otherwise one crashed anton leaks that checkout and its branch permanently: nothing else ever
+    // breaks the lock, and every later sweep reads the leftovers as an owner still at work.
+    const lock = `anton-claim review-fix pid=${DEAD_PID} host=${hostname()}`;
+    const plan = planReap(candidate({ path: "/wt/x", lock }), undefined);
+    expect(plan).toMatchObject({ removeWorktree: true, deleteBranch: true });
   });
 
   it("names a lock with no reason rather than reading it as unlocked", () => {

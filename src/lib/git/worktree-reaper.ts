@@ -20,6 +20,9 @@
  */
 import { lookupOpenPullRequest, type OpenPullRequestLookup } from "./ops";
 import {
+  describeClaimLock,
+  liveClaimLock,
+  parseClaimLock,
   removeWorktree,
   withBranchLock,
   worktreeClaimHolder,
@@ -82,7 +85,10 @@ export interface ReapCandidate {
   branch: string;
   path?: string;
   beadId?: string;
-  /** Git's lock reason, when another owner locked the checkout ("" when locked without one). */
+  /**
+   * Git's lock reason, when the checkout is locked ("" when locked without one). Another tool's lock
+   * is final; an anton claim lock is honoured only while the process that took it is alive.
+   */
   lock?: string;
   /** A run is EXECUTING on this branch right now (queued or running) — off limits. */
   runLive: boolean;
@@ -103,7 +109,14 @@ export function planReap(candidate: ReapCandidate, openPr: OpenPrNotice): ReapPl
   const bead = candidate.beadId ?? "its bead";
 
   if (candidate.lock !== undefined) {
-    return keep(`locked by another owner (${candidate.lock || "no reason given"})`);
+    const claim = liveClaimLock(candidate.lock);
+    if (claim) return keep(describeClaimLock(claim));
+    // A dead anton claim's lock is leftovers, not another owner: honouring it would turn one crashed
+    // process into a checkout and branch that leak forever. Only that case falls through — and
+    // `removeWorktree` breaks that lock and no other.
+    if (!parseClaimLock(candidate.lock)) {
+      return keep(`locked by another owner (${candidate.lock || "no reason given"})`);
+    }
   }
   if (candidate.runLive) return keep("a run is executing on it");
   if (candidate.bead === "open") return keep(`${bead} is still open`);

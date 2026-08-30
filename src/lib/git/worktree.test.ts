@@ -14,7 +14,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
   createWorktree,
@@ -29,7 +29,11 @@ import {
   worktreeClaimHolder,
   worktreePathFor,
   WORKTREES_ROOT_ENV,
+  type Worktree,
 } from "./worktree";
+
+/** Above every platform's pid_max, so `process.kill(pid, 0)` is guaranteed to report it gone. */
+const DEAD_PID = 4_194_305;
 
 function has(cmd: string): boolean {
   try {
@@ -445,6 +449,107 @@ suite("worktree manager (real git)", () => {
     done();
     await claiming;
     expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
+  });
+
+  it("backs the claim with a real git worktree lock, so a SECOND anton process can see it", async () => {
+    // The in-memory claim map is invisible across processes, and git locks nothing on its own: a
+    // concurrent anton's teardown would force-remove the checkout review-fix is writing in.
+    const branch = "anton/run-claim-lock";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    writeFileSync(join(wt.path, "in-progress.txt"), "the review fix\n");
+    let done!: () => void;
+    const using = new Promise<void>((r) => (done = r));
+    let active!: () => void;
+    // `fn` runs only once the claim (map entry AND git lock) is in place, so this is exact.
+    const claimTaken = new Promise<void>((r) => (active = r));
+
+    const claiming = withWorktreeClaim(repo, branch, "review-fix", () => {
+      active();
+      return using;
+    });
+    await claimTaken;
+
+    const locked = (await listWorktrees(repo)).find((r) => r.branch === branch);
+    expect(locked?.locked).toBe(true);
+    expect(locked?.lockReason).toBe(`anton-claim review-fix pid=${process.pid} host=${hostname()}`);
+
+    // What the other process would do: removeWorktree consults git, never this process's map.
+    const refused = await removeWorktree(wt, { deleteBranch: true });
+    expect(refused).toMatchObject({ removed: false, branchDeleted: false });
+    expect(refused.skipped).toContain("review-fix is using the checkout");
+    expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+
+    done();
+    await claiming;
+
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(false);
+    expect(await removeWorktree(wt, { deleteBranch: true })).toMatchObject({ removed: true });
+  });
+
+  it("locks a checkout the claim was taken BEFORE — review-fix claims, then materializes", async () => {
+    const branch = "anton/run-claim-then-create";
+    let done!: () => void;
+    const using = new Promise<void>((r) => (done = r));
+    let created!: (wt: Worktree) => void;
+    const materialized = new Promise<Worktree>((r) => (created = r));
+
+    const claiming = withWorktreeClaim(repo, branch, "review-fix", async () => {
+      created(await createWorktree({ repoPath: repo, branch }));
+      await using;
+    });
+    const wt = await materialized;
+
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.lockReason).toContain(
+      "anton-claim review-fix",
+    );
+
+    done();
+    await claiming;
+    await removeWorktree(wt, { deleteBranch: true });
+  });
+
+  it("BREAKS a claim lock left behind by a process that has since died", async () => {
+    // A durable lock that nothing may ever break turns one crashed anton into a checkout and a
+    // branch that leak forever. Only a dead claim from THIS host is broken — never another tool's.
+    const branch = "anton/run-claim-crashed";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    execFileSync("git", [
+      "-C",
+      repo,
+      "worktree",
+      "lock",
+      "--reason",
+      `anton-claim review-fix pid=${DEAD_PID} host=${hostname()}`,
+      wt.path,
+    ]);
+
+    const removal = await removeWorktree(wt, { deleteBranch: true });
+
+    expect(removal).toMatchObject({ removed: true, branchDeleted: true });
+    expect(existsSync(wt.path)).toBe(false);
+  });
+
+  it("honours a claim lock recorded on ANOTHER host, whose pid says nothing here", async () => {
+    const branch = "anton/run-claim-elsewhere";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    execFileSync("git", [
+      "-C",
+      repo,
+      "worktree",
+      "lock",
+      "--reason",
+      `anton-claim review-fix pid=${DEAD_PID} host=some-other-box`,
+      wt.path,
+    ]);
+
+    try {
+      const removal = await removeWorktree(wt, { deleteBranch: true });
+      expect(removal.removed).toBe(false);
+      expect(removal.skipped).toContain("review-fix is using the checkout");
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+      await removeWorktree(wt, { deleteBranch: true });
+    }
   });
 
   it("leaves an arbitrary directory untouched when orphan ownership cannot be proven", async () => {
