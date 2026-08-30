@@ -1786,6 +1786,12 @@ async function runTicket(args: {
     // run's own error.
     const noDelivery = e instanceof NoDeliveryError;
     const agentBlocked = e instanceof BlockedByAgentError;
+    // The ask is the RUN's wait, never the ticket's state (anton-287p.3). The run parks behind a
+    // human gate and resumes THIS row once a person resolves it — and a `blocked` ticket is not
+    // claimable, so blocking it below would make that resume impossible: the resumed run dies on
+    // `bd update --claim` and the park becomes permanent. Left open and unassigned instead, which
+    // is what the resumed run re-claims. What a human owes is on the gate, not on this bead.
+    const needsHuman = e instanceof NeedsHumanError;
     if (noDelivery) {
       await appendSessionLog(logPath, `[no-delivery] ${e.message}\n`).catch(() => {});
     } else if (agentBlocked) {
@@ -1885,10 +1891,11 @@ async function runTicket(args: {
     // intact. Two states must NOT silently re-queue the ticket open: work already landed on the
     // branch (commits exist), OR the agent delivered nothing at all (zero diff). Both are
     // human-review states — block with an operator-facing note. Resetting a no-delivery ticket to
-    // open would silently re-queue it into the ready pool and hide the false-success. All
+    // open would silently re-queue it into the ready pool and hide the false-success. A
+    // `needs-human` ask is the exception to that rule and is excused above. All
     // best-effort: never mask the run's error; the epic-level finally sync pushes the release.
     if (!isUsageLimitError(e)) {
-      if (committed || noDelivery || agentBlocked) {
+      if ((committed || noDelivery || agentBlocked) && !needsHuman) {
         await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
         // The tip this ticket's work landed on — the operator's route from the note straight to the
         // diff. Best-effort and only when something was committed: an unreadable worktree costs the
