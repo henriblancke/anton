@@ -87,8 +87,16 @@ interface CommentSyntax {
 const COMMENT_SYNTAX: CommentSyntax[] = [
   {
     files:
-      /\.(?:[cm]?[jt]sx?|go|rs|java|kt|kts|scala|swift|c|h|cc|cpp|hpp|cs|php|css|scss|less|dart|proto)$/i,
+      /\.(?:[cm]?[jt]sx?|go|rs|java|kt|kts|scala|swift|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
     line: ["//"],
+    block: [["/*", "*/"]],
+  },
+  {
+    // PHP takes `#` as well as `//`, so it can't ride with the C-like languages, where `#` opens a
+    // preprocessor directive rather than a comment. A PHP 8 attribute (`#[Route]`) reads as a
+    // comment under this — the conservative direction, which keeps a signal rather than deleting it.
+    files: /\.(?:php|phtml)$/i,
+    line: ["//", "#"],
     block: [["/*", "*/"]],
   },
   {

@@ -1178,6 +1178,27 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
     });
 
+    // PHP takes `#` as a line comment on top of `//`, so it reads neither like C nor like a file
+    // anton has no grammar for: prose after `#` must not prove a caller, and a real call must still
+    // count.
+    it("reads both PHP comment markers as prose and still counts a PHP caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/legacy/notes.php": "<?php\n# neverCalled was removed\n// neverCalled went with it\n",
+        "src/legacy/caller.php": "<?php\nneverCalled(); # neverCalled was here\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/legacy/caller.php");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/legacy/notes.php");
+    });
+
     // `;` opens a comment in Lisp and guards ASI in TypeScript. Reading every marker in every file
     // leaves a symbol with a real caller counted as dead — the phantom this filter exists to stop.
     it("counts a caller whose line opens with a marker its own language does not have", async () => {
