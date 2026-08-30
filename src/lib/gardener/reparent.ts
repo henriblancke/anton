@@ -327,16 +327,34 @@ function intersectKeys(sets: Set<string>[]): Set<string> {
 }
 
 /**
+ * How many tickets a board card must already carry before "obvious home" is a claim worth making.
+ *
+ * One, because the question is whether the card is a CONTAINER at all: a leaf feature is one PR's
+ * worth of work, and hanging a cluster off it turns somebody's card into somebody else's epic.
+ * Stated as a constant because approving a cluster re-asks it against the board as it now is
+ * (apply-plan.ts `homeStoppedCarrying`) — a card can lose its last ticket between the two reads.
+ */
+export const MIN_CARRIED_TICKETS = 1;
+
+/**
  * How many tickets each board card carries, counted through the board's OWN card attribution
  * (`boardCards.cardOf`), so "rides this card" means here what it means on the board itself.
  *
  * Closed tickets count. The question is what ROLE the card plays — does the board already file work
  * of this kind under it — and a card whose eight tickets all shipped answered that question just as
  * clearly as one whose eight are open.
+ *
+ * `ignore` drops ids from the count. It is how the approval re-asks the bar without letting the
+ * cluster's own members — which somebody may have filed under the home by hand since the proposal —
+ * stand in for the pre-existing tickets that made the home obvious in the first place.
  */
-function ticketsPerCard(index: BoardIndex): Map<string, number> {
+export function ticketsPerCard(
+  index: BoardIndex,
+  ignore?: ReadonlySet<string>,
+): Map<string, number> {
   const carried = new Map<string, number>();
   for (const bead of index.all) {
+    if (ignore?.has(bead.id)) continue;
     if (!isRunTicket(bead, index.cards)) continue;
     const card = index.cards.cardOf(bead);
     if (card) carried.set(card, (carried.get(card) ?? 0) + 1);
@@ -368,7 +386,8 @@ export function detectParentlessClusters(index: BoardIndex, nowMs: number): Gard
   // now would never be dispatched and would strand when the run settles the card (apply refuses one
   // for the same reason).
   const homes = index.all.filter(
-    (b) => index.cards.ids.has(b.id) && isFree(b, nowMs) && (carried.get(b.id) ?? 0) > 0,
+    (b) =>
+      index.cards.ids.has(b.id) && isFree(b, nowMs) && (carried.get(b.id) ?? 0) >= MIN_CARRIED_TICKETS,
   );
   const candidates: Candidate[] = index.all
     .filter((b) => isClusterCandidate(b, nowMs))

@@ -24,6 +24,7 @@ import {
   CARD,
   child,
   CLOSE,
+  CARRIED,
   CLUSTER,
   cold,
   DEFER,
@@ -569,7 +570,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // locks, and restoring the old parent over it would clobber a move that is now the board's truth.
   it("leaves a rolled-back subject alone when another write has since moved it", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
     // Somebody else re-parents anton-a the moment this apply moves on to anton-b.
     onWrite((call) => {
@@ -590,7 +591,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // and a later member failing must not restore `undoParent` over the other writer's move.
   it("never rolls back a member the board already satisfied — that write was not ours", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     // Another approval lands anton-a's move between the snapshot and this apply's per-step lock.
     liveBeads.set("anton-a", child("anton-a", CARD.id));
     failOn.set("reparent:anton-b", 1);
@@ -609,7 +610,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
     liveBeads.set("anton-b", leased("anton-b", Date.now()));
 
     await expect(
-      apply(proposal, [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal]),
+      apply(proposal, [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal]),
     ).rejects.toMatchObject({ failure: "failed" });
 
     expect(calls).toEqual([
@@ -622,7 +623,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
 
   it("rolls back a half-applied cluster and leaves the proposal OPEN with the error attached", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
 
     await expect(apply(proposal, board)).rejects.toThrow(/rolled back/);
@@ -639,7 +640,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
 
   it("says so loudly when the rollback ITSELF fails — a board a human has to look at", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
     // The SECOND write to anton-a is its undo — fail that too, and the board is left half-moved.
     failOn.set("reparent:anton-a", 2);
@@ -658,7 +659,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
 
   it("reports no surviving write when the rollback put every one of them back", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
 
     const err = await apply(proposal, board).catch((e) => e);
@@ -674,7 +675,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // home's lock as well as the subject's.
   it("leaves a rolled-back subject under a home a run has since started on", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     // The run picks the card up the instant the first member lands under it.
     onWrite((call) => {
       if (call === "reparent anton-a anton-card") {
@@ -698,7 +699,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // so the step is named for a human instead.
   it("strands a rolled-back subject whose ownership read fails, rather than restoring blind", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
     // anton-a becomes unreadable the moment its move lands, so the rollback can't prove it owns it.
     onWrite((call) => {
@@ -729,6 +730,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
     const proposal = proposalFor(plan);
     const board = [
       CARD,
+      CARRIED,
       child("anton-a", "anton-old"),
       child("anton-b", "anton-old"),
       child("anton-c", "anton-old"),

@@ -23,6 +23,7 @@ import {
   CARD,
   child,
   CLOSE,
+  CARRIED,
   CLUSTER,
   cold,
   DEFER,
@@ -377,7 +378,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const result = await apply(
       proposal,
-      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal],
       "policy",
       controller.signal,
     );
@@ -394,7 +395,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const result = await apply(
       proposal,
-      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal],
       "policy",
       controller.signal,
     );
@@ -411,7 +412,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // only half holds.
   it("serializes two approvals of one cluster — the loser writes nothing", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, bead("anton-a"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal];
     setSnapshot(board); // the winner's close lands on this board, and is what the loser then reads
 
     const [winner, loser] = await Promise.allSettled([
@@ -434,7 +435,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(CLUSTER);
     liveBeads.set("anton-a", child("anton-a", CARD.id));
 
-    const result = await apply(proposal, [CARD, bead("anton-a"), bead("anton-b"), proposal]);
+    const result = await apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]);
 
     expect(result.changed).toEqual(["anton-b"]);
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-b anton-card"]);

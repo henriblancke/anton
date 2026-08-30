@@ -289,8 +289,18 @@ export const leased = (id: string, at: number): Bead =>
 /** The other half of the same bar (board-index `isInFlight`): a run whose PR is up. */
 export const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] });
 
-/** A feature card with an open ticket under it — a legal re-parent home. */
+/** A feature card — the tier a working-layer bead's home has to be. */
 export const CARD = bead("anton-card", { issue_type: "feature" });
+
+/**
+ * The ticket {@link CARD} already carries, and the reason a cluster may be hung off it at all: the
+ * detector only calls a card an obvious home when the board ALREADY files work of this kind under it
+ * (reparent.ts `MIN_CARRIED_TICKETS`), and the approval re-asks that against the fresh board. Every
+ * cluster board here carries it for the same reason every fixture bead states one {@link SUBJECT} —
+ * without it these boards could not have produced the plans they approve. A case that needs the bar
+ * BROKEN leaves it off, which is exactly how a card loses its last ticket in the field.
+ */
+export const CARRIED = child("anton-t0", CARD.id);
 
 /** The tier ABOVE a card: an epic, which may only carry cards once it already groups one. */
 export const EPIC = bead("anton-epic", { issue_type: "epic" });

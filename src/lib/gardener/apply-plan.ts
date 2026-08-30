@@ -32,7 +32,13 @@ import {
   type GardenerPlan,
 } from "./detections";
 import { impliesOrdering } from "./relink";
-import { groupedUnder, isClusterTier, MIN_CLUSTER_SIZE } from "./reparent";
+import {
+  groupedUnder,
+  isClusterTier,
+  MIN_CARRIED_TICKETS,
+  MIN_CLUSTER_SIZE,
+  ticketsPerCard,
+} from "./reparent";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -288,9 +294,13 @@ function homeRefusal(
   // to `homeUnusable`, so without this the step would record that newcomer's claim as its own
   // baseline and the under-lock re-check ({@link homeClaimed}) would compare it against itself and
   // wave the move through, hanging tickets under a run that has already chosen what it will run.
+  //
+  // Then the CONTAINER bar the cluster detector chose this home on — the one thing about the home
+  // that nothing downstream re-asks, because the survivor re-check reads titles and labels alone.
   const gone =
     homeUnusable(target, at.nowMs) ??
-    claimedSinceFiling(target, at, "hanging work under it", CLAIM_COST.home);
+    claimedSinceFiling(target, at, "hanging work under it", CLAIM_COST.home) ??
+    homeStoppedCarrying(plan, target, index);
   if (gone) return gone;
   // Then the tier the taxonomy demands of a home, asked SUBJECT BY SUBJECT: a working-layer bead
   // wants the board card that runs it, a card wants the container epic that groups it, and one
@@ -307,6 +317,34 @@ function homeRefusal(
     if (wrongTier) return wrongTier;
   }
   return undefined;
+}
+
+/**
+ * Why this home no longer carries work of its own, or undefined — the CONTAINER half of the
+ * cluster detector's "obvious home" (reparent.ts {@link MIN_CARRIED_TICKETS}), re-asked against the
+ * board the writes would land on.
+ *
+ * It is the one premise of a `parentless-cluster` nothing else restates: {@link homeUnusable} asks
+ * only whether the card is still open and free, and {@link regroupSurvivors} re-derives the
+ * MEMBERS' half from titles and labels. So a card whose last ticket was deleted or re-homed between
+ * the filing and the approval would take the cluster anyway — and hanging one off a leaf card is
+ * exactly what the bar exists to stop: it turns one PR's worth of work into somebody else's epic.
+ *
+ * The cluster's own members are excluded from the count. A member somebody filed under the home by
+ * hand since the proposal rides that card now, so counting it would let the ask prove its own
+ * premise with the very move it is asking for.
+ *
+ * Asked of `parentless-cluster` alone: no other kind chose its home on this evidence.
+ */
+function homeStoppedCarrying(
+  plan: GardenerPlan,
+  home: Bead,
+  index: BoardIndex,
+): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  const carried = ticketsPerCard(index, new Set(plan.subjects)).get(home.id) ?? 0;
+  if (carried >= MIN_CARRIED_TICKETS) return undefined;
+  return `${home.id} carries no tickets of its own any more — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if ${home.id} is still the right home`;
 }
 
 /** A subject no longer part of the claim: the board answered it after the proposal was filed. */
@@ -444,7 +482,7 @@ function reparentSubject(
   // ABOUT, so a missing subject is still the board changing out from under the ask.
   if (!subject) return clusterMemberDeleted(plan, id) ?? missing(id);
   const currentParent = beads.parentOf(subject) ?? "";
-  if (currentParent === home.id) return { inPlace: subject }; // already where the proposal wants it
+  if (currentParent === home.id) return clusterMemberInPlace(plan, subject, at);
   // Asked before every safety bar because they are not ones: they decide whether this bead is still
   // part of the claim at all, and a bead nothing will write to cannot be unsafe to leave alone.
   const answered =
@@ -467,6 +505,29 @@ function reparentSubject(
     kind: plan.kind,
     observedAtMs: at.observedAtMs,
   };
+}
+
+/**
+ * What a member that ALREADY sits under the home resolves to: the cluster it half-applies, or the
+ * answer that drops it.
+ *
+ * Nothing is written to such a bead, but it still COUNTS — towards the subject the survivors must
+ * state between them ({@link regroupSurvivors}) and towards the floor below which the cluster has
+ * dissolved. So the same question every other member is asked has to be asked of it: is it still one
+ * of the loose beads the cluster was derived from? Closed, claimed, or promoted out of the working
+ * layer, it left the cluster exactly as a re-homed member does — and counting it there would carry
+ * a lone survivor past a bar a fresh patrol would refuse.
+ *
+ * {@link reparentPremiseGone} is deliberately NOT asked: the card it now rides is the home, which is
+ * the outcome this proposal wanted, not a newer decision to preserve.
+ */
+function clusterMemberInPlace(
+  plan: GardenerPlan,
+  subject: Bead,
+  at: ApplyMoment,
+): Answered | InPlace {
+  const answered = clusterMemberLeftLayer(plan, subject) ?? clusterMemberGone(plan, subject, at);
+  return answered ? { answered } : { inPlace: subject };
 }
 
 /** Why this subject cannot be moved under this home, or undefined. */

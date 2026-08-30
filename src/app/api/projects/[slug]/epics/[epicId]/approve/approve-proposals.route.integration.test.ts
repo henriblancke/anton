@@ -72,10 +72,33 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     resetIssueSnapshots();
   });
 
+  // The subjects state a SUBJECT with the card and the card already carries a ticket, because that
+  // is what makes a cluster proposal applyable at all: approving one re-derives the detector's own
+  // grouping over the survivors (`regroupSurvivors`) and re-asks the container bar on the home
+  // (`homeStoppedCarrying`). A board of "Loose one"/"Loose two" beads under an empty card could
+  // never have produced this proposal, so approving it would (rightly) refuse.
   it("re-parents a cluster under its card, and settles the proposal with what changed", async () => {
-    const card = await beads.create(repo, { title: "The home", type: "feature", acceptance: "- [ ] a" });
-    const one = await beads.create(repo, { title: "Loose one", type: "task", acceptance: "- [ ] a" });
-    const two = await beads.create(repo, { title: "Loose two", type: "task", acceptance: "- [ ] a" });
+    const card = await beads.create(repo, {
+      title: "Escalation banner rollout",
+      type: "feature",
+      acceptance: "- [ ] a",
+    });
+    await beads.create(repo, {
+      title: "Escalation banner shell",
+      type: "task",
+      acceptance: "- [ ] a",
+      deps: [`parent-child:${card}`],
+    });
+    const one = await beads.create(repo, {
+      title: "Escalation banner copy",
+      type: "task",
+      acceptance: "- [ ] a",
+    });
+    const two = await beads.create(repo, {
+      title: "Escalation banner timing",
+      type: "task",
+      acceptance: "- [ ] a",
+    });
     const proposal = await file({
       kind: "parentless-cluster",
       move: "reparent",
