@@ -15,13 +15,13 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Share2Icon, TriangleAlertIcon } from "lucide-react";
+import { Share2Icon } from "lucide-react";
 
 import type { EpicGraphEdge, EpicGraphNode } from "@/lib/epic-graph";
 import type { Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/atoms";
-import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import {
   buildProjectGraph,
   EPIC_H,
@@ -159,15 +159,10 @@ export function ProjectGraph({ slug }: { slug: string }) {
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-        </span>
-        <p className="text-sm text-risk-high">{error}</p>
-        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        message={error}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
     );
   }
 
