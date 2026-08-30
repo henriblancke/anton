@@ -162,6 +162,20 @@ export interface ClusterPremise {
   /** The members the decision's regrouping kept — moving and already in place. */
   members: string[];
   /**
+   * The members the board should ALREADY show under the home when this step is re-checked: the ones
+   * the decision found in place, plus every earlier step of the same apply — `applySteps` runs them
+   * in this order, so each step's premise names exactly what has landed by its turn.
+   *
+   * Their own step has run or will never run, so nothing else notices them LEAVING, and the card
+   * test in {@link memberLeftCluster} structurally cannot: it reads a bead moved under a container
+   * epic as still-unreachable work this very proposal is the fix for (see
+   * {@link reparentPremiseGone}), which is right for a member still waiting to move and wrong for
+   * one this apply already placed. Without this, detaching the landed half of a two-member cluster
+   * between the writes leaves it supplying the grouping evidence for the other half's move, and the
+   * proposal settles as applied with one bead under the home.
+   */
+  landed: string[];
+  /**
    * The home's own pre-existing tickets, as the decision found them — the beads its CONTAINER
    * premise rests on, and the set the write half re-asks that premise over while holding their
    * locks (`homeCarriesNothing`'s `only`).
@@ -583,14 +597,23 @@ function regroupSurvivors(
   const grouped = groupedUnder(home, [...moving, ...inPlace]);
   const named = new Set(plan.subjects);
   const carriers = carriedTickets(index, home.id, named);
-  const cluster: ClusterPremise = {
+  const premise = {
     named: [...named],
     members: [...grouped].sort(),
     carriers,
     carrierPaths: carrierPaths(index, home.id, carriers),
   };
+  // Grows with the writes: the decision's in-place members have landed before the first step runs,
+  // and each step adds its own subject for the ones after it (see {@link ClusterPremise.landed}).
+  const landed = inPlace.filter((member) => grouped.has(member.id)).map((member) => member.id);
   return {
-    steps: steps.filter((step) => grouped.has(step.id)).map((step) => ({ ...step, cluster })),
+    steps: steps
+      .filter((step) => grouped.has(step.id))
+      .map((step) => {
+        const cluster: ClusterPremise = { ...premise, landed: [...landed] };
+        landed.push(step.id);
+        return { ...step, cluster };
+      }),
     dropped: steps.filter((step) => !grouped.has(step.id)).map((step) => step.id),
   };
 }
@@ -622,36 +645,42 @@ function clusterDissolved(home: Bead, left: string[]): string {
  * Asked of the WHOLE membership rather than of this step's subject alone, because the per-step locks
  * are released between the writes. Two questions come out of that:
  *
- *   • has a member the board ALREADY has under the home left the cluster? That one is the damage,
- *     and nothing else is left to notice it: an earlier step of this apply put it there (or the
- *     decision counted it in place), and a check that only asked whether `subjectId` reached some
- *     group would pass every later step of a three-member cluster whose first member was retitled
- *     after its move — settling the proposal over a bead beneath a card it no longer belongs to.
+ *   • has a member the board ALREADY has under the home stopped stating the subject? That one is the
+ *     damage, and nothing else is left to notice it: an earlier step of this apply put it there (or
+ *     the decision counted it in place), and a check that only asked whether `subjectId` reached
+ *     some group would pass every later step of a three-member cluster whose first member was
+ *     retitled after its move — settling the proposal over a bead beneath a card it no longer
+ *     belongs to.
  *   • is the subject about to be written still grouped — over the members still IN the cluster,
  *     which is what {@link memberLeftCluster} drops, so a lone survivor cannot be carried past a bar
  *     a fresh patrol would refuse.
  *
- * A member somebody has re-homed under another card is left alone: that is a newer decision than
- * this proposal, and the rollback deliberately does not fight it (apply-steps.ts `rollbackStep`).
- * Every member not yet under the home is its own step besides, re-read under its own lock when its
- * turn comes — so this is the only place the ones already there are judged at all.
+ * A member somebody has re-homed since is left where they put it: that is a newer decision than this
+ * proposal, and the rollback deliberately does not fight it (apply-steps.ts `rollbackStep`). What it
+ * no longer does is carry the grouping — the whole cluster is refused instead, so the rest of it is
+ * not landed on evidence the board has withdrawn. Every member not yet under the home is its own
+ * step besides, re-read under its own lock when its turn comes — so this is the only place the ones
+ * already there are judged at all.
  */
 export function clusterUngrouped(
   subjectId: string,
   home: Bead,
   cluster: ClusterPremise,
   index: BoardIndex,
-  nowMs: number,
+  at: ApplyMoment,
 ): string | undefined {
   const inCluster = cluster.members.flatMap((id) => {
     const member = index.byId.get(id);
-    return member && !memberLeftCluster(member, home, index, nowMs) ? [member] : [];
+    return member && !memberLeftCluster(member, home, cluster, index, at) ? [member] : [];
   });
   const grouped = groupedUnder(home, inCluster);
-  const strayed = cluster.members.find(
-    (id) => id !== subjectId && !grouped.has(id) && sitsUnder(index, id, home.id),
+  // Asked of the members still IN the cluster: one that left it by being closed or claimed is not a
+  // bead whose SUBJECT changed, and naming an edit that never happened would send the approver
+  // looking for it. It sits where the proposal wanted it, and the dissolution below is its reading.
+  const strayed = inCluster.find(
+    (m) => m.id !== subjectId && !grouped.has(m.id) && sitsUnder(index, m.id, home.id),
   );
-  if (strayed) return clusterMemberStrayed(strayed, home);
+  if (strayed) return clusterMemberStrayed(strayed.id, home);
   if (grouped.has(subjectId)) return undefined;
   // Which refusal the approver reads turns on WHY the grouping came apart: an edit to the beads
   // themselves, or members that left the cluster and took their half of the evidence with them.
@@ -683,13 +712,26 @@ const clusterMemberStrayed = (id: string, home: Bead): string =>
  *
  * The same questions {@link clusterMemberGone}, {@link clusterMemberLeftLayer} and
  * {@link reparentPremiseGone} ask of a subject, asked here of the members whose own step has already
- * run or will never run. One bargain: the claim half is judged on a LIVE RUN alone, because dating a
- * claim against the filing needs the per-member baseline only a step carries
- * ({@link StepSubject.claim}) — a member claimed without a lease is caught by its own step, or not
- * at all.
+ * run or will never run — the claim half through {@link subjectBusy}, exactly as the decision asks
+ * it. A live lease alone is not enough: `bd update --claim` writes the assignee and `in_progress` a
+ * moment before its run publishes one, and a member picked up in that window would otherwise go on
+ * supplying the grouping evidence that carries everybody else's move (reparent.ts `isFree` excludes
+ * it from the cluster at detection for the same reason). Dating it against the filing keeps the
+ * baseline honest — a claim the plan itself saw is the thing being proposed against, not news.
+ *
+ * A member already LANDED under the home ({@link ClusterPremise.landed}) is held to one bar more: it
+ * must still sit there.
  */
-function memberLeftCluster(member: Bead, home: Bead, index: BoardIndex, nowMs: number): boolean {
-  if (!isOpenWork(member) || !isClusterTier(member) || isInFlight(member, nowMs)) return true;
+function memberLeftCluster(
+  member: Bead,
+  home: Bead,
+  cluster: ClusterPremise,
+  index: BoardIndex,
+  at: ApplyMoment,
+): boolean {
+  if (!isOpenWork(member) || !isClusterTier(member)) return true;
+  if (subjectBusy(member, at, DOING.reparent)) return true;
+  if (cluster.landed.includes(member.id)) return beads.parentOf(member) !== home.id;
   const card = index.cards.cardOf(member);
   return card !== undefined && card !== home.id;
 }

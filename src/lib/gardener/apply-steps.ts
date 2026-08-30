@@ -350,7 +350,12 @@ function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
   if (!target) throw new SubjectMovedError(missing(step.parent));
   const leaf = homeCarriesNothing(target, board, new Set(cluster.named), new Set(cluster.carriers));
   if (leaf) throw new SubjectMovedError(leaf);
-  const ungrouped = clusterUngrouped(step.id, target, cluster, board, Date.now());
+  // The step's own filing stamp rides along: dropping a member a run claimed since asks the same
+  // dated question the decision asked of it, so a claim the plan already saw is not read as news.
+  const ungrouped = clusterUngrouped(step.id, target, cluster, board, {
+    nowMs: Date.now(),
+    observedAtMs: step.observedAtMs,
+  });
   if (ungrouped) throw new SubjectMovedError(ungrouped);
 }
 

@@ -79,10 +79,12 @@ describe("planApply — what an approval means against the board as it now is", 
           // tickets the container bar is counted over, plus the beads those tickets reach the home
           // through — empty here, this one sits directly under the card (apply-steps.ts
           // `assertClusterHolds`). None is readable from the step's two ends alone, and each names a
-          // bead the write must lock.
+          // bead the write must lock. `landed` grows with the writes: nothing has moved yet when
+          // the first step is re-checked, so nothing is owed a place under the home.
           cluster: {
             named: ["anton-a", "anton-b"],
             members: ["anton-a", "anton-b"],
+            landed: [],
             carriers: [CARRIED.id],
             carrierPaths: [],
           },
@@ -100,6 +102,7 @@ describe("planApply — what an approval means against the board as it now is", 
           cluster: {
             named: ["anton-a", "anton-b"],
             members: ["anton-a", "anton-b"],
+            landed: ["anton-a"],
             carriers: [CARRIED.id],
             carrierPaths: [],
           },
@@ -729,6 +732,17 @@ describe("planApply — what an approval means against the board as it now is", 
       it("counts a member already sitting under the home towards the minimum", () => {
         const decision = decide(CLUSTER, [CARD, CARRIED, child("anton-a", CARD.id), bead("anton-b")]);
         expect(moved(decision)).toEqual(["anton-b"]);
+      });
+
+      // …and the write half is told it is already there. A member the board should show under the
+      // home by the time a step runs must still be under it — the one departure no later step
+      // notices on its own, because its own step has run or will never run.
+      it("names the members already under the home as the step's landed set", () => {
+        const decision = decide(CLUSTER, [CARD, CARRIED, child("anton-a", CARD.id), bead("anton-b")]);
+        const premise = (decision.status === "apply" ? decision.steps : []).map((step) =>
+          step.verb === "reparent" ? step.cluster : undefined,
+        )[0];
+        expect(premise?.landed).toEqual(["anton-a"]);
       });
 
       /**
