@@ -1458,6 +1458,29 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // The ESM block is not the only executable place a backtick can stand: a braced expression runs
+    // too, so the template literal in ``{`${Widget()}`}`` interpolates a real call. Masking it as a
+    // markdown span leaves that caller unseen and the finding standing.
+    it("keeps a template literal inside an MDX expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/inline.mdx": "Rendered with {`${Widget()}`} on the page.\n",
+        "docs/wrapped.mdx": "{\n  `${Widget()}`\n}\n",
+        "docs/notes.mdx": "The `Widget` helper was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/inline.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/wrapped.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
     // JSX lets a comment's braces stand off its `/* */`. Matching only the attached `{/*` leaves
     // the span unmasked, and the `{` in front of it then proves the prose is an expression —
     // erasing a finding that was right.
@@ -1605,6 +1628,26 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
       expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
+    // HTML lets a handler's value stand unquoted, and a minifier writes it that way. The browser
+    // still invokes it, so requiring a quote after the `=` reports a live function dead.
+    it("counts a symbol in an unquoted handler attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/bare.html": "<button onclick=Widget()>go</button>\n",
+        "src/ui/notes.vue": "<template>\n  <Panel title=static>Widget was removed</Panel>\n</template>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/bare.html");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
     });
 

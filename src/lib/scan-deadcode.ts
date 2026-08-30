@@ -400,25 +400,39 @@ function closingBacktickRun(line: string, from: number, length: number): number 
 }
 
 /**
- * The line with its inline code spans blanked. A span opens on a run of backticks and closes on the
- * next run of the same length, so ``` ``<Widget />`` ``` is one span rather than two bare pairs with
- * live code between them. An unopened-looking run — one nothing closes — is blanked to the end of
- * the line: over-blanking hides a caller and leaves a signal standing, which is the direction this
- * filter errs in everywhere.
+ * The line with its inline code spans blanked, and the expression depth it leaves for the line
+ * below. A span opens on a run of backticks and closes on the next run of the same length, so
+ * ``` ``<Widget />`` ``` is one span rather than two bare pairs with live code between them. An
+ * unopened-looking run — one nothing closes — is blanked to the end of the line: over-blanking
+ * hides a caller and leaves a signal standing, which is the direction this filter errs in
+ * everywhere.
+ *
+ * A backtick inside an open braced expression is a template literal rather than a code span: MDX
+ * runs `` {`${Widget()}`} ``, so blanking it would hide a real caller. Braces inside a blanked span
+ * don't count — a `{` shown in an example opens nothing.
  */
-function maskMdxCodeSpans(line: string): string {
+function maskMdxCodeSpans(line: string, depth = 0): { masked: string; depth: number } {
   const spans: [number, number][] = [];
   let at = 0;
   while (at < line.length) {
-    const open = line.indexOf("`", at);
-    if (open < 0) break;
-    const openEnd = backtickRunEnd(line, open);
-    const close = closingBacktickRun(line, openEnd, openEnd - open);
-    spans.push([open, close ?? line.length]);
-    if (close === undefined) break;
-    at = close;
+    const char = line[at];
+    if (char === "{") depth += 1;
+    else if (char === "}") depth = Math.max(0, depth - 1);
+    else if (char === "`") {
+      const openEnd = backtickRunEnd(line, at);
+      if (depth > 0) {
+        at = openEnd;
+        continue;
+      }
+      const close = closingBacktickRun(line, openEnd, openEnd - at);
+      spans.push([at, close ?? line.length]);
+      if (close === undefined) break;
+      at = close;
+      continue;
+    }
+    at += 1;
   }
-  return blankSpans(line, spans);
+  return { masked: blankSpans(line, spans), depth };
 }
 
 /**
@@ -433,6 +447,7 @@ function maskMdxCodeSpans(line: string): string {
 function maskMdxProse(text: string): string {
   let fence: string | undefined;
   let esm = false;
+  let depth = 0;
   return text
     .split("\n")
     .map((line) => {
@@ -455,10 +470,20 @@ function maskMdxProse(text: string): string {
       // A backtick inside an ESM statement opens a template literal, not a markdown code span, so
       // the interpolation in ``export const meta = `${Widget()}` `` names a real caller. The block
       // runs to the next blank line — the bound `mdxOpenLines` reads it with — so a template
-      // literal spanning lines stays code for as long as the statement holding it does.
-      if (!line.trim()) esm = false;
-      else if (!esm && MDX_ESM_STATEMENT.test(line)) esm = true;
-      return esm ? line : maskMdxCodeSpans(line);
+      // literal spanning lines stays code for as long as the statement holding it does. A braced
+      // expression holds a template literal open the same way, carried line to line as depth and
+      // closed by the same blank line.
+      if (!line.trim()) {
+        esm = false;
+        depth = 0;
+      } else if (!esm && MDX_ESM_STATEMENT.test(line)) {
+        esm = true;
+        depth = 0;
+      }
+      if (esm) return line;
+      const span = maskMdxCodeSpans(line, depth);
+      depth = span.depth;
+      return span.masked;
     })
     .join("\n");
 }
@@ -576,16 +601,26 @@ const DIRECTIVE = String.raw`(?:use|on|bind|transition|in|out|animate|class|styl
 const DIRECTIVE_HEAD = new RegExp(String.raw`(?:^|[\s"'])${DIRECTIVE}:\s*$`);
 
 /**
- * Inside the value of an attribute that carries code, opened on this line — `onclick="go()"`,
- * `@click='go'`, `v-if="ready"`, `bind:value="widget"`, Angular's `[prop]="widget"`. An ordinary
- * attribute holds content rather than a binding, so `<div title="Widget was removed">` names the
- * symbol the way the text between the tags does: counting every attribute would let a committed
- * page prove its own caller and delete a true finding.
+ * An attribute that carries code rather than content — a handler, a framework directive, a dynamic
+ * bind: `onclick`, `v-if`, `@click`, `bind:value`, Angular's `[prop]` and `(event)`.
  */
-const ATTR_VALUE = new RegExp(
-  String.raw`(?:^|[\s"'])(?:on[a-z]+|v-[\w-]+|${DIRECTIVE}:[\w.-]*|[@:#][\w.-]+|\([\w.-]+\)|\[[\w.-]+\])\s*=\s*["'][^"']*$`,
-  "i",
-);
+const CODE_ATTR = String.raw`(?:on[a-z]+|v-[\w-]+|${DIRECTIVE}:[\w.-]*|[@:#][\w.-]+|\([\w.-]+\)|\[[\w.-]+\])`;
+
+/**
+ * Inside the quoted value of a code-carrying attribute, opened on this line — `onclick="go()"`,
+ * `@click='go'`, `v-if="ready"`, `bind:value="widget"`, `[prop]="widget"`. An ordinary attribute
+ * holds content rather than a binding, so `<div title="Widget was removed">` names the symbol the
+ * way the text between the tags does: counting every attribute would let a committed page prove its
+ * own caller and delete a true finding.
+ */
+const ATTR_VALUE = new RegExp(String.raw`(?:^|[\s"'])${CODE_ATTR}\s*=\s*["'][^"']*$`, "i");
+
+/**
+ * The same attribute with its value left unquoted — `<button onclick=Widget()>` is HTML a browser
+ * runs, and the symbol starts right at the `=`. Only whitespace may precede the name: inside a
+ * quoted value an `onclick=` is text a reader sees rather than a binding the page carries.
+ */
+const ATTR_VALUE_BARE = new RegExp(String.raw`(?:^|\s)${CODE_ATTR}\s*=\s*$`, "i");
 
 /** Where a line is program text rather than markup, as `[start, end)` offsets into that line. */
 type CodeSpans = [number, number][];
@@ -657,6 +692,7 @@ function referencesMarkup(line: string | undefined, symbol: string, code: CodeSp
     return (
       TAG_HEAD.test(markup) ||
       ATTR_VALUE.test(markup) ||
+      ATTR_VALUE_BARE.test(markup) ||
       DIRECTIVE_HEAD.test(markup) ||
       insideExpression(markup)
     );
