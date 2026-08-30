@@ -496,6 +496,11 @@ function reparentSteps(
  * unravelling; and a member the board answered is reported as the refusal it is, because no write
  * happened and an approver reading "settled" would be told the ask landed under a target it never
  * reached.
+ *
+ * A cluster left with no answer at all — every member moved home by hand, and then retitled out of
+ * the subject they shared — is REFUSED rather than settled ({@link clusterUnravelledInPlace}). What
+ * sits under the home is not the cluster this ask was decided on, so a fresh patrol would propose
+ * nothing, and closing it as applied would put the gardener's name on a grouping nobody derived.
  */
 function nothingLeftToMove(
   plan: GardenerPlan,
@@ -509,7 +514,21 @@ function nothingLeftToMove(
     return { status: "refuse", reason: clusterDissolved(home, survivors.dropped) };
   }
   const [firstAnswer] = answered;
-  return firstAnswer ? { status: "refuse", reason: firstAnswer } : settledInPlace(inPlace, home.id);
+  if (firstAnswer) return { status: "refuse", reason: firstAnswer };
+  if (plan.kind === "parentless-cluster") {
+    return { status: "refuse", reason: clusterUnravelledInPlace(home, inPlace) };
+  }
+  return settledInPlace(inPlace, home.id);
+}
+
+/**
+ * How a cluster already sitting where it asked to sit, yet no longer stating one subject, reads to
+ * the approver — the in-place twin of {@link clusterMemberUngrouped}, named over the whole set
+ * because none of these beads is being written to.
+ */
+function clusterUnravelledInPlace(home: Bead, inPlace: Bead[]): string {
+  const sit = inPlace.length === 1 ? "sits" : "sit";
+  return `${list(inPlace.map((b) => b.id))} already ${sit} under ${home.id} but no longer state a subject ${home.id} states too — a title or \`area:\` label was edited since this proposal was decided, and it takes ${MIN_CLUSTER_SIZE} beads stating one subject before a home is obvious; nothing was written, so decline it and re-parent by hand if ${home.id} is still the right home`;
 }
 
 /**

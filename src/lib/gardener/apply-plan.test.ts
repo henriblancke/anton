@@ -786,6 +786,24 @@ describe("planApply — what an approval means against the board as it now is", 
       });
 
       /**
+       * …and with nobody left to blame the unravelling on — every member moved home by hand, then
+       * retitled out of the subject they shared — the refusal has to be stated of the in-place set
+       * itself. Settling here would close a proposal as applied over a grouping no detector would
+       * derive today, putting the gardener's name on it.
+       */
+      it("refuses in-place members that agree about nothing, answered members or not", () => {
+        const board = [
+          CARD,
+          CARRIED,
+          child("anton-a", CARD.id, { title: "anton-a: docker image cache" }),
+          child("anton-b", CARD.id),
+        ];
+        expect(reason(decide(CLUSTER, board))).toMatch(
+          /anton-a, anton-b already sit under anton-card but no longer state a subject anton-card states too/,
+        );
+      });
+
+      /**
        * The fourth way a member leaves, and the one every bar around it read as a fatal HOME refusal:
        * promoted to a `feature`, it is a board card, and the tier taxonomy rejects the move as
        * `feature-under-non-epic` before any member is judged — taking the pair that is still a cluster
