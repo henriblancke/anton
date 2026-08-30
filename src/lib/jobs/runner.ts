@@ -208,7 +208,8 @@ export interface JobContext {
  * A handler settles by returning: a {@link JobEffect} states whether the run changed anything, and
  * `void` leaves that unstated. Returning it (rather than reporting through `ctx`) keeps the claim on
  * the same path as the throw that would have contradicted it — a handler cannot report "nothing to
- * do" and then fail.
+ * do" and then fail. The claim is ATTEMPT-local: what an earlier attempt did before it threw is
+ * unreported, which is why a retry's no-op is withheld at settle (see `hasPriorAttempt`).
  */
 export type JobHandler = (ctx: JobContext) => Promise<JobEffect | void>;
 
@@ -332,6 +333,21 @@ export function nextAction(
       };
     }
   }
+}
+
+/**
+ * Did an earlier attempt of this job run without completing? A settling handler only reports what
+ * ITS attempt did, so this is what stops a retry's "nothing to do" from being published as the whole
+ * job's no-op after a previous attempt did durable work and then threw.
+ *
+ * The evidence is on the row: `attempts` counts every lease, so `> 1` means an earlier attempt was
+ * dispatched (including one lost to a crash, which never settles), and a settle that rescheduled
+ * stamps `lastError`, which survives the next lease — the refunded retries (quota, lease-held,
+ * not-wired) rewind `attempts`, so the error is the only trace they leave. A human `resumeJob`
+ * deliberately clears both for a clean slate, so a resumed job's next attempt reads as its first.
+ */
+export function hasPriorAttempt(job: Pick<JobRow, "attempts" | "lastError">): boolean {
+  return job.attempts > 1 || Boolean(job.lastError);
 }
 
 /** An in-flight job's registry entry: the abort handle plus the mutable live-report handle. */
@@ -1133,7 +1149,7 @@ export class JobRunner {
     const action = nextAction(config, fresh, outcome, this.clock.now());
     switch (action.action) {
       case "complete":
-        await complete(this.db, this.clock, job.id, effect);
+        await complete(this.db, this.clock, job.id, effect, { retried: hasPriorAttempt(fresh) });
         break;
       case "reschedule":
         await reschedule(this.db, this.clock, job.id, action.runAtMs, {

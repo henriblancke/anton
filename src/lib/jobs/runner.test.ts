@@ -15,6 +15,7 @@ import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
   classifyError,
   DEFAULT_CONFIG,
+  hasPriorAttempt,
   JobRunner,
   nextAction,
   type BeadLabelsReader,
@@ -48,6 +49,21 @@ const CONFIG: RunnerConfig = {
   maxConcurrent: 2,
   tickMs: 1_000,
 };
+
+describe("hasPriorAttempt (durable evidence of an unfinished attempt)", () => {
+  it("reads a first attempt as the job's first", () => {
+    expect(hasPriorAttempt({ attempts: 1, lastError: null })).toBe(false);
+  });
+
+  it("counts a second lease — the first attempt ran and did not complete", () => {
+    expect(hasPriorAttempt({ attempts: 2, lastError: null })).toBe(true);
+  });
+
+  it("counts a refunded retry by the error it stamped, not by attempts", () => {
+    // Quota / lease-held / not-wired rewind `attempts`, so the row's error is their only trace.
+    expect(hasPriorAttempt({ attempts: 1, lastError: "usage-limit: resumes at …" })).toBe(true);
+  });
+});
 
 describe("nextAction (pure durability policy)", () => {
   const now = 1_000_000_000_000;
@@ -239,6 +255,59 @@ describe("JobRunner (live, in-memory db)", () => {
     expect(job?.status).toBe("parked");
     expect(job?.outcome).toBeNull();
     expect(job?.lastError).toContain("boom");
+  });
+
+  it("withholds a retry's no-op claim — an earlier attempt may have changed state", async () => {
+    // The effect is attempt-local: gate-check can close gates and then throw, leaving the retry
+    // nothing to find. Publishing that retry's "no gate closed" would report work that happened as
+    // work that didn't, so the claim is withheld and the job settles as "ran, effect unknown".
+    let attempt = 0;
+    const r = runner(
+      async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("closed 2 gate(s), then failed");
+        return { changed: false, note: "no gate closed" };
+      },
+      { maxAttempts: 3, backoffBaseMs: 1_000 },
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+    clock.advance(2_000);
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.attempts).toBe(2);
+    expect(job?.outcome).toBeNull();
+    expect(job?.outcomeNote).toContain("no gate closed");
+    expect(job?.outcomeNote).toContain("earlier attempt");
+  });
+
+  it("still records a retry that changed something as ok", async () => {
+    let attempt = 0;
+    const r = runner(
+      async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("transient");
+        return { changed: true, note: "closed 2 gate(s)" };
+      },
+      { maxAttempts: 3, backoffBaseMs: 1_000 },
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+    clock.advance(2_000);
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("ok");
+    expect(job?.outcomeNote).toBe("closed 2 gate(s)");
   });
 
   it("runs a queued job to completion", async () => {

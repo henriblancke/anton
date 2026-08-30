@@ -802,12 +802,33 @@ export interface JobEffect {
 /** How a `JobEffect` is stored on the row: the two values `jobs.outcome` ever holds. */
 export type JobOutcome = "ok" | "noop";
 
-/** Persisted shape of an effect — kept next to `complete` so writer and reader agree. */
-export function toJobOutcome(effect: JobEffect | undefined): {
+/** How a withheld no-op explains itself on the row (see `toJobOutcome`). */
+const PRIOR_ATTEMPT_NOTE = "an earlier attempt may have changed state";
+
+/**
+ * Persisted shape of an effect — kept next to `complete` so writer and reader agree.
+ *
+ * `retried` says an earlier attempt of this job ran and did not complete. The effect is
+ * attempt-local, so a no-op reported by a retry is not a claim the JOB did nothing: an attempt that
+ * performed durable work and then threw (gate-check closes gates, then fails its own assertion)
+ * leaves the retry nothing left to find. Withhold the no-op there and settle as NULL — "ran, effect
+ * unknown" — rather than report work that happened as work that didn't. A `changed` claim stands
+ * either way: this attempt changed something regardless of what came before.
+ */
+export function toJobOutcome(
+  effect: JobEffect | undefined,
+  opts?: { retried?: boolean },
+): {
   outcome: JobOutcome | null;
   outcomeNote: string | null;
 } {
   if (!effect) return { outcome: null, outcomeNote: null };
+  if (!effect.changed && opts?.retried) {
+    return {
+      outcome: null,
+      outcomeNote: effect.note ? `${effect.note} — ${PRIOR_ATTEMPT_NOTE}` : PRIOR_ATTEMPT_NOTE,
+    };
+  }
   return { outcome: effect.changed ? "ok" : "noop", outcomeNote: effect.note ?? null };
 }
 
@@ -816,6 +837,7 @@ export async function complete(
   clock: Clock,
   jobId: string,
   effect?: JobEffect,
+  opts?: { retried?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
   await db
@@ -824,7 +846,7 @@ export async function complete(
       status: "done",
       leaseExpiresAt: null,
       lastError: null,
-      ...toJobOutcome(effect),
+      ...toJobOutcome(effect, opts),
       updatedAt: secDate(nowMs),
     })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
