@@ -312,11 +312,14 @@ function recordOutcome(
  * truthful "N unpushed" count instead of the failure hiding in server logs. A backstop/durable
  * retry (newWork false) or a pull-only failure leaves the count as-is: the stranded work is already
  * counted (anton-rn88).
+ *
+ * Reads the raw record for the same reason {@link planPass} does: the registry still holds this
+ * pass at `syncing`, so getSyncStatus would announce a slow-but-completed pass as wedged.
  */
 function recordFailure(cwd: string, pass: PlannedPass, error: Error): void {
   const patch: Partial<SyncRecord> = { state: "failing", lastError: error.message };
   if (pass.mode === "full" && pass.newWork) {
-    patch.unpushedCount = getSyncStatus(cwd).unpushedCount + 1;
+    patch.unpushedCount = rawStatus(cwd).unpushedCount + 1;
   }
   recordStatus(cwd, patch);
 }
