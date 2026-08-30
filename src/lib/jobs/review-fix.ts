@@ -477,6 +477,14 @@ async function notifyReReview(args: {
 const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
 
 /**
+ * Delivery evidence: a status that means a commit landed, and no won't-do decision on top of it.
+ * An abandoned child is closed but explicitly undelivered (execute-epic drops it from `live` for
+ * the same reason), so it carries no mechanism for the tickets behind it.
+ */
+const deliveredAtMerge = (b: Bead | undefined): boolean =>
+  !!b && DELIVERED_AT_MERGE.has(b.status) && !beads.isAbandoned(b);
+
+/**
  * The children a merged target must NOT close — the tickets its run deliberately left for a human
  * (anton-67xj.1). A merge says the branch shipped, not that every ticket under the target ran, and
  * closing one that never ran turns the bd note it carries into a pointer at work the board now
@@ -496,7 +504,9 @@ const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
  * behind IT have the mechanism they were written against. Delivery is `closed`, or `in_progress`:
  * a child's close write is best-effort (execute-epic), so a transient bd failure leaves a ticket
  * that committed claimed and mid-stage. Reading that bookkeeping failure as "never ran" would
- * strand shipped work open, when the merge is precisely what repairs it.
+ * strand shipped work open, when the merge is precisely what repairs it. An ABANDONED child is the
+ * exception (deliveredAtMerge): closed on a human's won't-do, with no commit behind it, so the walk
+ * passes straight through to whatever waited on it.
  */
 export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const byId = new Map(children.map((c) => [c.id, c]));
@@ -511,7 +521,7 @@ export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const queue = [...keep];
   while (queue.length) {
     for (const dependent of dependents.get(queue.shift()!) ?? []) {
-      if (keep.has(dependent) || DELIVERED_AT_MERGE.has(byId.get(dependent)?.status ?? "")) continue;
+      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent))) continue;
       keep.add(dependent); // never revisited, so a cycle terminates
       queue.push(dependent);
     }

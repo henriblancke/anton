@@ -9,7 +9,7 @@
  * work a human still has to run.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import { LABELS, type Bead } from "../beads/bd";
 
 const batchMock = vi.fn();
 const untagMock = vi.fn();
@@ -120,6 +120,18 @@ describe("finalizeMergedEpic", () => {
     ]);
   });
 
+  it("leaves a ticket stranded behind an abandoned dependency open", async () => {
+    // t2 was abandoned by hand — closed, but with no commit behind it — so t3 was never dispatched
+    // and must not be retired by the merge.
+    await finalize(bead("epic-1"), [
+      bead("t1", "blocked"),
+      { ...waitsOn("t2", "t1", "closed"), labels: [LABELS.abandoned] } as Bead,
+      waitsOn("t3", "t2"),
+    ]);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "epic-1" }]);
+  });
+
   it("closes a delivered dependent whose close write failed, repairing it", async () => {
     // t1 timed out AFTER committing, so the run carried on and t2 ran and committed too — but t2's
     // best-effort `beads.close` failed, leaving it claimed and `in_progress`. The merge is what
@@ -168,6 +180,15 @@ describe("undeliveredAtMerge", () => {
     ];
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1"]));
+  });
+
+  it("walks through an abandoned dependent — it is closed on a won't-do, not on a commit", () => {
+    // `abandoned` is the one closed status that carries no delivery: execute-epic drops such a
+    // ticket from `live` for exactly this reason, so t3 behind it never ran either.
+    const abandoned = { ...waitsOn("t2", "t1", "closed"), labels: [LABELS.abandoned] } as Bead;
+    const children = [bead("t1", "blocked"), abandoned, waitsOn("t3", "t2")];
+
+    expect(undeliveredAtMerge(children)).toEqual(new Set(["t1", "t2", "t3"]));
   });
 
   it("ignores non-blocks edges and edges leaving the run", () => {
