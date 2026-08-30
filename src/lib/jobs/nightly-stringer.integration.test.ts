@@ -271,11 +271,11 @@ process.stdin.on('end',()=>{
     expect(handed.signals.map((s) => s.Source)).toEqual(["todo"]);
     expect(readFileSync(scanFile, "utf8")).not.toContain("phantom.db");
 
-    // ...and the agent that read it filed a bead for the survivor only — no phantom reached the board.
-    const created = (await beads.list(repo, ["--status", "all"])).filter((b) =>
-      b.title.startsWith("Triaged:"),
-    );
-    expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore + 1);
+    // ...and the agent that read it filed a bead for the survivor only — no phantom reached the
+    // board. One snapshot, so the count and the titles are assertions about the same board state.
+    const board = await beads.list(repo, ["--status", "all"]);
+    expect(board.length).toBe(beadsBefore + 1);
+    const created = board.filter((b) => b.title.startsWith("Triaged:"));
     expect(created.some((b) => b.title.includes("phantom.db"))).toBe(false);
 
     // The drop stays visible: filtered out of the prompt is not filtered out of the record.
