@@ -1006,7 +1006,10 @@ export async function finalizeMergedEpic(args: {
  * hangs off another moving ticket rides along on it. `subtree` is the run's whole ticket set
  * (runTickets), which is what tells a legitimately nested ticket apart from one another operator
  * moved onto a target of their own. The ride-along cuts both ways, so a ticket that still carries a
- * preserved descendant anton is NOT moving stays put as well ({@link Rehomed.pinned}).
+ * preserved descendant anton is NOT moving stays put as well ({@link Rehomed.pinned}), and a
+ * DELIVERED descendant is detached back onto the merged target before its ancestor moves — its work
+ * is in that merged diff, and carrying it onto a fresh branch is how a squash-merged ticket gets
+ * re-run (pass 1c).
  *
  * Best-effort, like every other write here: a failure leaves the tickets parented where they were —
  * still open, still noted with the manual remedy — rather than aborting a finalization whose closes
@@ -1061,18 +1064,34 @@ async function rehomePreserved(
   // the direct parent filed every one of those as work another operator had moved: a nested ticket
   // whose parent shipped stayed stranded under the merged target, and one whose parent moved too
   // followed it without ever passing through reopenPreserved, so nothing could claim it.
+  // The whole chain is re-read, not just the candidate. `subtree` is the sweep's snapshot, and an
+  // ANCESTOR another operator reparented since carries every ticket beneath it out of this run:
+  // resolving the walk from the snapshot answers "still on the merged target" for work that is now
+  // somebody else's, and reparents it out of their target into this follow-up. Every read is
+  // memoised, so a chain shared by several candidates costs one `bd show` per bead, not one per walk.
   const bySubtreeId = new Map(subtree.map((b) => [b.id, b]));
-  const ridesOnTarget = (fresh: Bead): boolean => {
-    const seen = new Set<string>([fresh.id]);
-    let parentId = beads.parentOf(fresh);
+  const fresh = new Map<string, Bead | undefined>();
+  const readFresh = async (id: string): Promise<Bead | undefined> => {
+    if (!fresh.has(id))
+      fresh.set(id, await beads.show(repo, id).catch(() => undefined));
+    return fresh.get(id);
+  };
+  const liveParentOf = async (bead: Bead): Promise<string | undefined> =>
+    beads.parentOf((await readFresh(bead.id)) ?? bead);
+  const ridesOnTarget = async (
+    candidate: Bead,
+  ): Promise<"target" | "elsewhere" | "unknown"> => {
+    const seen = new Set<string>([candidate.id]);
+    let parentId = beads.parentOf(candidate);
     while (parentId && !seen.has(parentId)) {
-      if (parentId === epic.id) return true;
+      if (parentId === epic.id) return "target";
       seen.add(parentId); // a parent cycle terminates rather than hanging finalization
-      const parent = bySubtreeId.get(parentId);
-      if (!parent) return false; // the chain left the run's own subtree — another target owns it
+      if (!bySubtreeId.has(parentId)) return "elsewhere"; // left the subtree — another target owns it
+      const parent = await readFresh(parentId);
+      if (!parent) return "unknown"; // an unreadable link proves nothing either way
       parentId = beads.parentOf(parent);
     }
-    return false;
+    return "elsewhere";
   };
 
   // Pass 1 — re-read every candidate and decide which ones the follow-up may still take
@@ -1082,13 +1101,15 @@ async function rehomePreserved(
   // own ticket-set drift check and parks it. A read that fails moves nothing either, for the same
   // reason the status write doesn't: the snapshot is not evidence enough on its own.
   const takeable = new Map<string, Bead>();
-  const live = new Map<string, Bead>();
   for (const bead of rerunnable) {
-    const fresh = await beads.show(repo, bead.id).catch(() => undefined);
-    if (!fresh) continue;
-    live.set(bead.id, fresh);
-    if (!ridesOnTarget(fresh)) {
-      elsewhere.set(bead.id, beads.parentOf(fresh));
+    const candidate = await readFresh(bead.id);
+    if (!candidate) continue;
+    const belonging = await ridesOnTarget(candidate);
+    // An unreadable ancestor decides nothing — neither that the ticket still rides on the merged
+    // target nor that somebody took it — so it moves nothing and claims neither in its note.
+    if (belonging === "unknown") continue;
+    if (belonging === "elsewhere") {
+      elsewhere.set(bead.id, beads.parentOf(candidate));
       continue;
     }
     // The parent is only half of what went stale. In the same window the ticket can have been
@@ -1105,14 +1126,14 @@ async function rehomePreserved(
     // takeover either, since the snapshot carries the same foreign owner. Reparenting that one
     // advertises work somebody holds under a second target. Any owner but the dead run's own is a
     // live reservation, whenever it landed.
-    const freshOwner = ownerOf(fresh);
+    const freshOwner = ownerOf(candidate);
     const heldByOther = freshOwner !== undefined && freshOwner !== runOwner;
     const tookOver = freshOwner !== undefined && freshOwner !== ownerOf(bead);
-    if (!safeToRerunAtMerge(fresh, runOwner) || heldByOther || tookOver) {
-      changed.set(bead.id, stateOf(fresh));
+    if (!safeToRerunAtMerge(candidate, runOwner) || heldByOther || tookOver) {
+      changed.set(bead.id, stateOf(candidate));
       continue;
     }
-    takeable.set(bead.id, fresh);
+    takeable.set(bead.id, candidate);
   }
 
   // Pass 1b — a reparent is an edge on the ANCESTOR alone (anton-67xj). A ticket pass 1 refused
@@ -1123,23 +1144,49 @@ async function rehomePreserved(
   // still flatten onto the follow-up in pass 2, exactly as when bd refuses a reparent.
   //
   // Only the PRESERVED tickets can pin. Everything else in the subtree closed with the merge, so it
-  // holds no reservation and no pending decision — riding along costs nothing, while blocking on
+  // holds no reservation and no pending decision — it is detached in 1c instead, while blocking on
   // delivered work would strand a parent merely because part of it shipped.
-  const parentOfLive = (bead: Bead): string | undefined =>
-    beads.parentOf(live.get(bead.id) ?? bead);
   const pinned = new Map<string, string>();
-  for (const bead of preserved) {
-    if (takeable.has(bead.id)) continue;
+  const pinAncestors = async (bead: Bead): Promise<void> => {
     const seen = new Set<string>([bead.id]);
-    let parentId = parentOfLive(bead);
+    let parentId = await liveParentOf(bead);
     while (parentId && !seen.has(parentId)) {
       seen.add(parentId); // a parent cycle terminates rather than hanging finalization
       if (takeable.has(parentId) && !pinned.has(parentId))
         pinned.set(parentId, bead.id);
       const parent = bySubtreeId.get(parentId);
       if (!parent) break; // the chain left the run's subtree — nothing moving carries this ticket
-      parentId = parentOfLive(parent);
+      parentId = await liveParentOf(parent);
     }
+  };
+  for (const bead of preserved) {
+    if (takeable.has(bead.id)) continue;
+    await pinAncestors(bead);
+  }
+
+  // Pass 1c — a DELIVERED descendant is taken off its ancestor BEFORE that ancestor moves
+  // (anton-67xj). The reparent carries the whole subtree with it, so a ticket that shipped in this
+  // merge would land under the follow-up too — and a squash-merge leaves none of its `<id>:` commit
+  // subjects on the follow-up's fresh branch, so execute-epic reads that closed ticket as a
+  // cross-machine resume: it reopens it and re-runs work the merge already shipped. Detaching it
+  // onto the merged target keeps it with the diff that carries it, on a closed and terminal home
+  // nothing anton runs reaches again.
+  //
+  // Only DIRECT children need a write — detaching one carries its own descendants with it — and a
+  // detach that does not land pins the ancestor exactly as an undelivered descendant does: a move
+  // anton cannot make safe must not happen at all.
+  const preservedIds = new Set(preserved.map((b) => b.id));
+  for (const bead of subtree) {
+    if (preservedIds.has(bead.id)) continue;
+    const parentId = beads.parentOf(bead);
+    if (!parentId || !takeable.has(parentId) || pinned.has(parentId)) continue;
+    const shipped = await readFresh(bead.id);
+    // Still the sweep's evidence until the board confirms it: a ticket another operator has since
+    // moved off this ancestor rides on nothing, and detaching would rewrite an edge that is theirs.
+    if (shipped && beads.parentOf(shipped) !== parentId) continue;
+    if (shipped && (await safe(() => beads.reparent(repo, bead.id, epic.id))))
+      continue;
+    await pinAncestors(bead);
   }
 
   // Pass 2 — move them ancestors first. A ticket whose own parent is moving rides along on it
@@ -1147,16 +1194,16 @@ async function rehomePreserved(
   // reparenting it separately would hand the same subtree two homes. Ordering is what makes that
   // safe — the ride-along is decided on what actually MOVED, so a parent whose reparent bd refused
   // leaves its descendant to take a home of its own rather than staying stranded behind it.
-  for (const fresh of ancestorsFirst(takeable)) {
-    if (pinned.has(fresh.id)) continue;
-    const parentId = beads.parentOf(fresh);
+  for (const mover of ancestorsFirst(takeable)) {
+    if (pinned.has(mover.id)) continue;
+    const parentId = beads.parentOf(mover);
     if (parentId && moved.has(parentId)) {
-      nested.set(fresh.id, parentId);
-      moved.add(fresh.id);
+      nested.set(mover.id, parentId);
+      moved.add(mover.id);
       continue;
     }
-    if (await safe(() => beads.reparent(repo, fresh.id, followUp)))
-      moved.add(fresh.id);
+    if (await safe(() => beads.reparent(repo, mover.id, followUp)))
+      moved.add(mover.id);
   }
   if (moved.size > 0)
     return { id: followUp, moved, nested, elsewhere, changed, pinned };

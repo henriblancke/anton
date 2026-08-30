@@ -591,10 +591,12 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[2][2]).toContain("now lives under epic-2");
   });
 
-  it("moves an ancestor whose nested descendant shipped in the merge", async () => {
-    // Only PRESERVED tickets pin. t3 closes with the merge, so it holds no reservation and no
-    // pending decision — riding along under the follow-up costs nothing, and blocking on it would
-    // strand t2 merely because part of its subtree was delivered.
+  it("detaches a delivered descendant before moving its ancestor (anton-67xj)", async () => {
+    // Only PRESERVED tickets pin — blocking on delivered work would strand t2 merely because part
+    // of its subtree shipped. But t3 must not RIDE ALONG either: a squash-merge leaves no `t3:`
+    // commit subject on the follow-up's fresh branch, so execute-epic would read the closed t3 as a
+    // cross-machine resume and re-run work this merge already shipped. It goes back onto the merged
+    // target, which is closed and terminal, and t2 moves without it.
     await finalize(bead("epic-1"), [
       bead("t2", "blocked", ["not-delivered"]),
       under("t2", bead("t3")),
@@ -604,8 +606,90 @@ describe("finalizeMergedEpic", () => {
       { op: "close", id: "t3" },
       { op: "close", id: "epic-1" },
     ]);
-    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "t3", "epic-1"],
+      ["/repo", "t2", "epic-2"],
+    ]);
     expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+  });
+
+  it("leaves a delivered descendant another operator moved off the ancestor alone", async () => {
+    // The snapshot says t3 hangs off t2; the live board says it does not. Detaching it would
+    // rewrite an edge that belongs to whoever moved it, and nothing rides onto the follow-up.
+    const shipped = under("t2", bead("t3"));
+    parents.set("t3", "epic-9");
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      shipped,
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+  });
+
+  it("leaves the ancestor put when a delivered descendant cannot be detached", async () => {
+    // The detach is what makes the move safe, so a bd refusal takes the move with it — moving t2
+    // anyway would carry the shipped t3 onto a branch that has no commit for it.
+    reparentMock.mockImplementation(async (_r: string, id: string) => {
+      if (id === "t3") throw new Error("bd update: DB locked");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3")),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t3", "epic-1"]]);
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    // Still handed back claimable, with the manual remedy named — the pinned lane exactly.
+    expect(setStatusMock.mock.calls).toEqual([["/repo", "t2", "open"]]);
+    expect(noteMock.mock.calls[0][2]).toContain("t3 still hangs off it");
+  });
+
+  it("leaves a ticket whose ANCESTOR another operator reparented since the sweep (anton-67xj)", async () => {
+    // Belonging is read off the live chain, not the snapshot: t2 shipped and another operator has
+    // since moved it under their own target, taking t3 with it. Resolving t2 from the sweep's
+    // snapshot answered "still on the merged target" and reparented t3 out of their run into this
+    // follow-up.
+    const shipped = bead("t2");
+    parents.set("t2", "epic-9");
+
+    await finalize(bead("epic-1"), [
+      shipped,
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("Another operator moved it under t2");
+  });
+
+  it("moves nothing when an ancestor in the chain cannot be re-read", async () => {
+    // An unreadable link proves neither that t3 still rides on the merged target nor that somebody
+    // took it, so it moves nothing and its note claims neither.
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") throw new Error("bd show: DB locked");
+      return {
+        id,
+        title: id,
+        status: statuses.get(id) ?? "open",
+        labels: boardLabels.get(id) ?? [],
+        assignee: assignees.get(id),
+        parent: parents.get(id),
+      } as Bead;
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2"),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("could NOT be rehomed");
+    expect(note).not.toContain("Another operator moved it");
   });
 
   it("reruns a marker-bearing ticket the timeout left in_progress (anton-67xj)", async () => {
