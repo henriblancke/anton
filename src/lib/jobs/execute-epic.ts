@@ -357,7 +357,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         status: "running",
       });
     } else {
-      await updateRun(db, clock, runId, { status: "running", error: null });
+      // The score goes with the attempt that earned it (anton-cekf). A resume REUSES the parked row,
+      // so leaving it would let a resumed attempt that never reaches review settle carrying the
+      // previous attempt's number — and the score breaker, which reads one score per row, would
+      // judge this attempt on a review it never had and could re-latch the disarm a human just
+      // cleared. Cleared here, and rewritten by the gate the moment this attempt is reviewed.
+      await updateRun(db, clock, runId, { status: "running", error: null, reviewScore: null });
     }
 
     // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels this

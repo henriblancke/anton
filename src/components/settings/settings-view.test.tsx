@@ -421,6 +421,15 @@ describe("SettingsView autopilot brakes (anton-nmy7)", () => {
     renderView({});
     expect(screen.getByText(/releases itself the moment one of those PRs merges or closes/i)).toBeTruthy();
   });
+
+  it("says abandoned work counts toward the streak, matching what the breaker does", () => {
+    // verdictOf reads `abandoned` as a failure BEFORE it reads `cancelled`. Copy that lumped the
+    // two together would have an operator set the threshold expecting abandons to be ignored.
+    renderView({});
+    expect(
+      screen.getByText(/Runs you cancelled do not count toward the streak; work you abandoned does/i),
+    ).toBeTruthy();
+  });
 });
 
 describe("SettingsView pipeline variants (anton-aa3m)", () => {

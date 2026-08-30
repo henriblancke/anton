@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { abandonEpic, NotAbandonableError } from "@/lib/abandon";
-import { resolveProject } from "../../../resolve-project";
+import { parseJsonBody, resolveProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -18,12 +18,8 @@ export async function POST(
   const { project, response } = await resolveProject(slug);
   if (!project) return response;
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
+  const { body, response: badBody } = await parseJsonBody(request);
+  if (badBody) return badBody;
 
   const reason = (body as { reason?: unknown })?.reason;
   if (typeof reason !== "string" || !reason.trim()) {

@@ -58,11 +58,25 @@ const MIN_STREAK_WINDOW = 20;
  */
 const CANCEL_MATCH_SLACK_MS = 60_000;
 
-function wasCancelled(run: RunDetail, cancels: readonly number[] | undefined): boolean {
+/**
+ * Whether an operator cancel landed inside this run's window.
+ *
+ * `nextAttemptStartMs` is when the SAME epic's next attempt started, and it closes this run's window
+ * early. Without it a retry that begins inside the slack — an epic requeued seconds after the last
+ * one settled — shares that instant with the attempt before it, so one cancel of the retry would
+ * also silence the earlier genuine failure and shorten the streak the breaker fires on.
+ */
+function wasCancelled(
+  run: RunDetail,
+  cancels: readonly number[] | undefined,
+  nextAttemptStartMs: number | undefined,
+): boolean {
   if (!cancels?.length) return false;
   const from = (run.startedAt ?? run.updatedAt) * 1000;
   const until = (run.endedAt ?? run.updatedAt) * 1000 + CANCEL_MATCH_SLACK_MS;
-  return cancels.some((at) => at >= from && at <= until);
+  const beforeNextAttempt = (at: number) =>
+    nextAttemptStartMs === undefined || at < nextAttemptStartMs;
+  return cancels.some((at) => at >= from && at <= until && beforeNextAttempt(at));
 }
 
 /** The board's won't-do beads, by id — a lookup rather than a scan per run. */
@@ -135,20 +149,34 @@ async function readRunOutcomes(
     cancelledExecuteEpicJobs(db, projectId),
   ]);
   const abandoned = abandonedIds(board);
+  // When each epic's next attempt started, filled in as the walk moves from newest to oldest — the
+  // bound that keeps one cancel from being claimed by two attempts of the same epic.
+  const nextAttemptStart = new Map<string, number>();
   // Filtered after the read, never before it: the floor only ever drops the OLDEST rows, so the
   // window still holds the newest `window` runs it was sized to hold.
   return runs
     .filter((run) => settledAfterReArm(run, reArmedAt))
-    .map((run) => ({
-      id: run.id,
-      epicBeadId: run.epicBeadId,
-      status: run.status,
-      error: run.error,
-      cancelled: wasCancelled(run, cancels.get(run.epicBeadId)),
-      // The ticket counts as well as the target: abandoning a child kills the run executing it, and
-      // that run ended on work somebody gave up on however its own row reads.
-      abandoned:
-        abandoned.has(run.epicBeadId) ||
-        (run.ticketBeadId !== undefined && abandoned.has(run.ticketBeadId)),
-    }));
+    .map((run) => {
+      const startedAt = run.startedAt ?? run.updatedAt;
+      const nextStart = nextAttemptStart.get(run.epicBeadId);
+      nextAttemptStart.set(run.epicBeadId, startedAt);
+      return {
+        id: run.id,
+        epicBeadId: run.epicBeadId,
+        status: run.status,
+        error: run.error,
+        // A newer row that somehow starts no later than this one is not a later attempt, so it
+        // bounds nothing — `updatedAt` orders the read, and it can tie with `startedAt`.
+        cancelled: wasCancelled(
+          run,
+          cancels.get(run.epicBeadId),
+          nextStart !== undefined && nextStart > startedAt ? nextStart * 1000 : undefined,
+        ),
+        // The ticket counts as well as the target: abandoning a child kills the run executing it,
+        // and that run ended on work somebody gave up on however its own row reads.
+        abandoned:
+          abandoned.has(run.epicBeadId) ||
+          (run.ticketBeadId !== undefined && abandoned.has(run.ticketBeadId)),
+      };
+    });
 }

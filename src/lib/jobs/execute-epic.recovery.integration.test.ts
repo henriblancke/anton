@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { resetOperatorCache } from "../operator";
+import { updateRun } from "../runs";
 import { describeBd } from "@/lib/testing/integration";
 import { expectJobStatus } from "@/lib/testing/jobs";
 import {
@@ -426,6 +427,10 @@ process.exit(0);`),
       const run3 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic3)!;
       expect(run3.status).toBe("parked");
       expect(existsSync(run3.worktreePath!)).toBe(true);
+      // A score this attempt earned before it parked. The resume reuses this row, so it must not
+      // survive into the next attempt — the score breaker reads one score per row and would judge
+      // an attempt that never reached review on a number it never earned.
+      await updateRun(tdb.db, clock, run3.id, { reviewScore: 4 });
 
       // Exactly one ticket closed before the park; the other is still open.
       const statusAtPark = {
@@ -455,6 +460,9 @@ process.exit(0);`),
       expect(run3b[0].id).toBe(run3.id);
       expect(run3b[0].worktreePath).toBe(run3.worktreePath); // same worktree reused
       expect(run3b[0].status).toBe("done");
+      // The gate is off in this fixture, so this attempt earned no score — and the parked row's
+      // stale one was cleared rather than inherited.
+      expect(run3b[0].reviewScore).toBeNull();
 
       // Both tickets closed; the already-closed ticket was SKIPPED on resume (invoked once total),
       // while the previously-quota'd ticket was invoked twice (quota + resumed success).

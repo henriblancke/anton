@@ -132,6 +132,19 @@ describe("checkFailureStreak", () => {
     expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeDefined();
   });
 
+  it("gives one cancel to the attempt it hit, not to the retry before it", async () => {
+    // A cancel of the RETRY lands inside the previous attempt's slack window when the retry started
+    // seconds after that attempt settled. Letting both claim it erases a genuine failure.
+    await project({ autopilotFailureStreak: 2 });
+    await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
+    await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 15, error: "boom" });
+    await run({ id: "r3", epic: "anton-b", status: "failed", startedMinutes: 25.5, error: "boom" });
+    await cancelledJob("anton-b", 25.7);
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
+  });
+
   it("counts an abandoned run, whose job the abandon also cancelled", async () => {
     await project();
     await threeFailures();
