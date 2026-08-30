@@ -191,15 +191,69 @@ export async function activeDisarm(
   return row ? toDisarmView(row) : undefined;
 }
 
+/** The project's open `autopilot-disarm` escalation, if it has one. */
+function openDisarmEscalation(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+): { id: string } | undefined {
+  return tx
+    .select({ id: schema.escalations.id })
+    .from(schema.escalations)
+    .where(
+      and(
+        eq(schema.escalations.projectId, projectId),
+        eq(schema.escalations.kind, "autopilot-disarm"),
+        eq(schema.escalations.status, "open"),
+      ),
+    )
+    .limit(1)
+    .all()[0];
+}
+
+/**
+ * Settle the strip row a LIFTED latch left behind — the repair for the other half of
+ * {@link withEscalation}.
+ *
+ * `reArmAutopilot` settles the escalation only AFTER its own UPDATE has committed, deliberately: the
+ * latch is lifted either way, so a settle failure must not answer a successful re-arm with "failed to
+ * re-arm". What that leaves is the one state nothing else repairs — an open `autopilot-disarm` asking
+ * the operator to re-arm a project that has no latch (the action can only answer `not-disarmed`) and
+ * that `dismissStall` refuses by kind. Left alone it is permanent, and the next disarm of the same
+ * reason would ADOPT it, stale evidence and all, instead of raising its own.
+ *
+ * Sound because an `autopilot-disarm` escalation is only ever raised FOR a latch: with no latched row
+ * there is nothing it can still be about. The check and the settle share one transaction so a disarm
+ * landing concurrently cannot have the escalation it just adopted resolved out from under it.
+ */
+function settleLiftedDisarmEscalations(db: AntonDb, clock: Clock, projectId: string): void {
+  // The armed common case pays a SELECT, not a write transaction — this runs on every pass.
+  if (!openDisarmEscalation(db, projectId)) return;
+  const at = secDate(clock.now());
+  db.transaction((tx) => {
+    if (latchedRow(tx, projectId)) return;
+    tx.update(schema.escalations)
+      .set({ status: "resolved", resolution: "resumed", updatedAt: at })
+      .where(
+        and(
+          eq(schema.escalations.projectId, projectId),
+          eq(schema.escalations.kind, "autopilot-disarm"),
+          eq(schema.escalations.status, "open"),
+        ),
+      )
+      .run();
+  });
+}
+
 /**
  * The same question a DETECTOR asks before it stops deciding — repairing a half-written latch on
- * the way.
+ * the way, in EITHER direction.
  *
  * The freeze and its escalation are two writes, and only the first is the safety property. A crash
  * between them leaves a frozen policy that the "Needs you" band never mentions, and nothing would
  * ever finish the job: every breaker returns early once a disarm exists, so the escalation write
- * gets no natural second chance. This is that second chance — the one call every breaker already
- * makes on every pass.
+ * gets no natural second chance. The re-arm has the mirror-image gap (see
+ * {@link settleLiftedDisarmEscalations}). This is that second chance for both — the one call every
+ * breaker already makes on every pass.
  */
 export async function activeDisarmForPass(
   db: AntonDb,
@@ -207,7 +261,11 @@ export async function activeDisarmForPass(
   projectId: string,
 ): Promise<AutopilotDisarm | undefined> {
   const row = latchedRow(db, projectId);
-  return row ? toDisarmView(await withEscalation(db, clock, row)) : undefined;
+  if (!row) {
+    settleLiftedDisarmEscalations(db, clock, projectId);
+    return undefined;
+  }
+  return toDisarmView(await withEscalation(db, clock, row));
 }
 
 export type ReArmResult =
@@ -247,6 +305,8 @@ export async function reArmAutopilot(
   // Best-effort, and deliberately so: the UPDATE above has already committed, so the latch IS
   // lifted. Propagating a settle failure would answer a successful re-arm with "Failed to re-arm
   // autopilot" and leave the operator believing the autopilot is still frozen when it is running.
+  // The escalation it leaves open is not stranded either — the next pass settles it (see
+  // settleLiftedDisarmEscalations), which is what keeps this failure recoverable rather than final.
   if (row.escalationId) {
     try {
       await settleEscalation(db, clock, row.escalationId, "resumed");

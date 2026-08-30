@@ -141,6 +141,13 @@
       "when": 1788027982729,
       "tag": "0019_last_the_professor",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1788050421756,
+      "tag": "0020_thankful_sharon_carter",
+      "breakpoints": true
     }
   ]
 }

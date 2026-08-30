@@ -213,12 +213,7 @@ describe("makeBoardPickerHandler", () => {
     // The other quality brake (R4.3): these runs all DELIVERED, so the failure breaker sees nothing
     // — what stops the picker is the trend in what they shipped.
     const targets = ["anton-a", "anton-b", "anton-c"];
-    board.current = [
-      bead("t1"),
-      ...targets.map((id, i) =>
-        bead(id, { status: "closed", labels: [`review-score:${4 + i}`] }),
-      ),
-    ];
+    board.current = [bead("t1"), ...targets.map((id) => bead(id, { status: "closed" }))];
     for (const [i, id] of targets.entries()) {
       const at = new Date(NOW - (3 - i) * 3_600_000);
       t.db
@@ -228,6 +223,8 @@ describe("makeBoardPickerHandler", () => {
           projectId: "p1",
           epicBeadId: id,
           status: "done",
+          // The score each ATTEMPT earned, as its review gate reported it (anton-cekf).
+          reviewScore: 4 + i,
           startedAt: at,
           endedAt: at,
           updatedAt: at,

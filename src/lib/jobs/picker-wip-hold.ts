@@ -20,7 +20,9 @@
  *
  * Those reads are paid for ONLY when the board already shows the limit's worth of in-review
  * targets. Under the limit no confirmation could produce a hold, so the common case — a project
- * whose operator is keeping up — costs zero `gh` spawns and the ten-minute cadence stays free.
+ * whose operator is keeping up — costs zero `gh` spawns and the ten-minute cadence stays free. And
+ * OVER the limit they are bounded and stop at the limit (see {@link confirmSlots}), so the backlog
+ * this brake exists for cannot turn each pass into one `gh` process per waiting PR.
  */
 import { readAllIssues } from "../beads/issues";
 import type { Bead } from "../beads/types";
@@ -81,6 +83,43 @@ async function occupiesQueue(
 }
 
 /**
+ * How many PR reads may be in flight at once. Every one is a `gh pr view` PROCESS with a two-minute
+ * ceiling of its own, and the project that reaches this code is by definition the one with the
+ * biggest in-review backlog — so confirming a fourteen-PR queue all at once would answer a flow
+ * problem with a process burst against GitHub's rate limit, on every pass and every board load.
+ * Wide enough that the ordinary case (a queue at the limit) is still a single round trip.
+ */
+const PR_READ_CONCURRENCY = 4;
+
+/**
+ * Confirm candidates until `limit` of them are known to still occupy the queue.
+ *
+ * Bounded AND short-circuited: past the limit the answer cannot change — a hold is a hold whether
+ * five or fifty PRs are waiting — so a backlog costs the same handful of reads a full queue does.
+ * The batch that reaches the limit is finished rather than abandoned, so an over-limit queue can
+ * still report more slots than the limit, which `describeWipHold` is worded for.
+ */
+async function confirmSlots(
+  read: ReadPrActivity,
+  input: WipHoldInput,
+  candidates: readonly { bead: Bead; prNumber: number }[],
+  limit: number,
+): Promise<ReviewSlot[]> {
+  const slots: ReviewSlot[] = [];
+  for (let i = 0; i < candidates.length && slots.length < limit; i += PR_READ_CONCURRENCY) {
+    const batch = await Promise.all(
+      candidates
+        .slice(i, i + PR_READ_CONCURRENCY)
+        .map(async ({ bead, prNumber }): Promise<ReviewSlot | undefined> =>
+          (await occupiesQueue(read, input, prNumber)) ? { beadId: bead.id, prNumber } : undefined,
+        ),
+    );
+    slots.push(...batch.filter((slot) => slot !== undefined));
+  }
+  return slots;
+}
+
+/**
  * The project's WIP hold, or `undefined` when there is still review bandwidth (and when the
  * operator has turned the hold off with a limit of 0).
  *
@@ -100,12 +139,7 @@ export async function checkWipLimit(
   if (candidates.length < config.limit) return undefined;
 
   const read = input.readPrActivity ?? getPrActivity;
-  const confirmed = await Promise.all(
-    candidates.map(async ({ bead, prNumber }): Promise<ReviewSlot | undefined> =>
-      (await occupiesQueue(read, input, prNumber)) ? { beadId: bead.id, prNumber } : undefined,
-    ),
-  );
-  return detectWipHold(confirmed.filter((slot) => slot !== undefined), config);
+  return detectWipHold(await confirmSlots(read, input, candidates, config.limit), config);
 }
 
 /**

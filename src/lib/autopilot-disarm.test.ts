@@ -19,7 +19,12 @@ import {
   reArmAutopilot,
   settledAfterReArm,
 } from "@/lib/autopilot-disarm";
-import { listOpenEscalations, toEscalationView } from "@/lib/escalations";
+import {
+  getEscalation,
+  listOpenEscalations,
+  raiseEscalation,
+  toEscalationView,
+} from "@/lib/escalations";
 import type { Clock } from "@/lib/jobs/queue";
 
 const PROJECT = "p-brake";
@@ -252,6 +257,71 @@ describe("a latch whose escalation write never landed", () => {
   it("raises nothing for an armed project", async () => {
     expect(await activeDisarmForPass(test.db, clock, PROJECT)).toBeUndefined();
     expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(0);
+  });
+});
+
+describe("a re-arm whose escalation never settled", () => {
+  const stranded = {
+    projectId: PROJECT,
+    reason: "score-regression" as const,
+    detail: "3 consecutive runs scored below 7/10 (6, 5, 4).",
+    evidence: ["r-1 · anton-a · 6/10"],
+  };
+
+  /** Re-arm the project, with the settle write failing exactly as a transient db error would. */
+  async function reArmWithFailedSettle(): Promise<void> {
+    const update = test.db.update.bind(test.db);
+    const spy = vi.spyOn(test.db, "update").mockImplementation((table) => {
+      if (table === schema.escalations) throw new Error("database is locked");
+      return update(table);
+    });
+    await reArmAutopilot(test.db, clock, { projectId: PROJECT, actor: "Henri Blancke" });
+    spy.mockRestore();
+  }
+
+  it("is settled by the next pass, so the strip stops asking for an impossible re-arm", async () => {
+    // The latch is gone, so re-arming again can only answer `not-disarmed` and `dismissStall`
+    // refuses the kind outright: nothing but this repairs it, and the next disarm of the same
+    // reason would otherwise ADOPT the row and show its stale evidence.
+    const { disarm } = await disarmWithEscalation(test.db, clock, stranded);
+    await reArmWithFailedSettle();
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(1);
+    ticks = 600_000;
+
+    expect(await activeDisarmForPass(test.db, clock, PROJECT)).toBeUndefined();
+
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(0);
+    // Settled the way the re-arm itself would have settled it: the work resumed.
+    const settled = await getEscalation(test.db, PROJECT, disarm.escalationId!);
+    expect(settled?.status).toBe("resolved");
+    expect(settled?.resolution).toBe("resumed");
+  });
+
+  it("leaves a LATCHED project's escalation open — that one is still asking for a decision", async () => {
+    await disarmWithEscalation(test.db, clock, stranded);
+
+    await activeDisarmForPass(test.db, clock, PROJECT);
+
+    expect(await listOpenEscalations(test.db, PROJECT)).toHaveLength(1);
+  });
+
+  it("touches only the disarm's own strip row, not another kind's", async () => {
+    await disarmWithEscalation(test.db, clock, stranded);
+    await raiseEscalation(test.db, clock, {
+      projectId: PROJECT,
+      finding: {
+        kind: "stale-pr",
+        key: "stale-pr:42",
+        reason: "PR #42 has been idle for 3 days",
+        since: T0,
+      },
+    });
+    await reArmWithFailedSettle();
+
+    await activeDisarmForPass(test.db, clock, PROJECT);
+
+    const open = (await listOpenEscalations(test.db, PROJECT)).map(toEscalationView);
+    expect(open.map((e) => e.kind)).toEqual(["stale-pr"]);
   });
 });
 

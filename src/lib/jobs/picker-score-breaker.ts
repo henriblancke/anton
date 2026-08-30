@@ -4,24 +4,25 @@
  * latch the disarm if it is.
  *
  * Split the way picker-failure-breaker.ts is split from autopilot-failure-streak.ts — the rules are
- * pure and everything that needs a db lives here. What this module owns is the JOIN: a score is
- * persisted on the run TARGET (jobs/review-score.ts writes a `review-score:<n>` label alongside the
- * per-round comments), and the order those scores happened in is only knowable from the runs. The
- * board alone would give the scores with no reliable sequence; the runs alone would give the
- * sequence with no scores.
+ * pure and everything that needs a db lives here.
  *
- * The label is read off the board the pass ALREADY loaded, so the whole series costs no bd call —
- * which is what lets this sit on a ten-minute cadence. The per-round comment thread is the richer
- * record, but reading it is one bd spawn per target, and the label carries the number this breaker
- * actually judges.
+ * The score is read off the RUN that earned it, not off the target's `review-score:<n>` label. The
+ * label is the target's LATEST score across every attempt, so joining it to the newest run row would
+ * lend an old review to a new run: a rerun that settles without reaching the review gate — cancelled,
+ * failed early, a recovery attempt — would carry the score of the attempt before it, and the breaker
+ * could freeze a project on reviews that happened before those runs ran, or before the operator's
+ * last re-arm lifted the freeze those same reviews caused. One score per ATTEMPT (execute-epic
+ * stamps it as the gate reports it) is the only join that cannot lie about which run was judged.
+ *
+ * A run that predates that column reads as unscored, which is a GAP — and a series with a gap yields
+ * no verdict at all, so an upgraded install fails open until it has re-scored a window's worth of
+ * runs. That is the same trade every degraded read here makes (see {@link checkScoreSlide}).
  *
  * The series also STARTS at the last re-arm. Those scores are the case an operator read and
  * overruled; a window that could still reach back past them would re-latch the identical disarm on
  * the next pass — off runs that have not changed and cannot change — and revert the human decision
  * before anything new had been scored at all.
  */
-import { reviewScoreOf } from "../ticket-view";
-import type { Bead } from "../beads/types";
 import {
   describeScoreSlide,
   detectScoreSlide,
@@ -36,7 +37,7 @@ import {
   settledAfterReArm,
 } from "../autopilot-disarm";
 import { getProjectSettings, resolveScoreBreaker } from "../projects";
-import { listRecentRuns } from "../runs";
+import { listRecentRunOutcomes } from "../runs";
 import type { AntonDb, Clock } from "./queue";
 
 /**
@@ -48,8 +49,6 @@ const MIN_SCORE_WINDOW = 20;
 
 export interface ScoreBreakerInput {
   projectId: string;
-  /** The board the pass just read — where each target's score label is, at no extra `bd` call. */
-  board: readonly Bead[];
 }
 
 export interface ScoreBreakerOutcome {
@@ -65,9 +64,9 @@ export interface ScoreBreakerOutcome {
  *
  * Returns `undefined` when the breaker is off, when the project is already disarmed (a latch does
  * not clear itself, and re-deciding could only produce a second freeze to clear), or when the series
- * does not carry a verdict — which includes every degraded read: too few runs, a run whose score
- * never landed, a board that no longer holds a target. Failing open there is deliberate (R4.3): the
- * cost is one more run at the current quality, against a project frozen on evidence nobody recorded.
+ * does not carry a verdict — which includes every degraded read: too few runs, and a run that left
+ * no score of its own. Failing open there is deliberate (R4.3): the cost is one more run at the
+ * current quality, against a project frozen on evidence nobody recorded.
  */
 export async function checkScoreSlide(
   db: AntonDb,
@@ -81,7 +80,7 @@ export async function checkScoreSlide(
   if (await activeDisarmForPass(db, clock, projectId)) return undefined;
 
   const since = await lastReArmAt(db, projectId);
-  const series = await readScoreSeries(db, projectId, input.board, config.window, since);
+  const series = await readScoreSeries(db, projectId, config.window, since);
   const slide = detectScoreSlide(series, config);
   if (!slide) return undefined;
 
@@ -95,42 +94,31 @@ export async function checkScoreSlide(
 }
 
 /**
- * The project's finished runs with each one's score attached, newest first — nothing from before
+ * The project's finished runs with each one's own score attached, newest first — nothing from before
  * `reArmedAt`, whose scores the operator already read and overruled.
  */
 async function readScoreSeries(
   db: AntonDb,
   projectId: string,
-  board: readonly Bead[],
   window: number,
   reArmedAt: number | undefined,
 ): Promise<ScoredRun[]> {
-  const read = await listRecentRuns(db, projectId, Math.max(MIN_SCORE_WINDOW, window * 3));
+  const read = await listRecentRunOutcomes(db, projectId, Math.max(MIN_SCORE_WINDOW, window * 3));
   // Filtered after the read, never before it: the floor only ever drops the OLDEST rows, so the
   // window still holds the newest `window` runs it was sized to hold.
   const runs = read.filter((run) => settledAfterReArm(run, reArmedAt));
-  const scores = scoresByTarget(board);
   const seen = new Set<string>();
   return runs.flatMap((run): ScoredRun[] => {
     // A queued or running run has not been reviewed yet. Skipped rather than counted as a gap: it
     // is not evidence the series is broken, only that it has not happened.
     if (run.status === "queued" || run.status === "running") return [];
-    // One score per TARGET. A retried or resumed epic gets a fresh run row, but the label carries
-    // only that target's latest score — counting it once per attempt would let a single bad review
-    // fill the whole window on its own.
+    // One entry per TARGET, and it is the target's NEWEST attempt: a feature retried three times is
+    // one piece of work being judged, and counting each attempt would let a single bad review fill
+    // the window on its own. When that newest attempt left no score, the target reads as a gap —
+    // which is the honest answer, not a licence to reach back to what an older attempt scored.
     if (seen.has(run.epicBeadId)) return [];
     seen.add(run.epicBeadId);
-    const score = scores.get(run.epicBeadId);
+    const score = run.reviewScore;
     return [{ id: run.id, targetBeadId: run.epicBeadId, ...(score !== undefined ? { score } : {}) }];
   });
-}
-
-/** The board's `review-score:<n>` labels, by bead id — a lookup rather than a scan per run. */
-function scoresByTarget(board: readonly Bead[]): Map<string, number> {
-  const scores = new Map<string, number>();
-  for (const bead of board) {
-    const score = reviewScoreOf(bead);
-    if (score !== undefined) scores.set(bead.id, score);
-  }
-  return scores;
 }

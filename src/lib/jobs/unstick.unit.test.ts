@@ -36,6 +36,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     formula: null,
     formulaVariant: null,
     status: "parked",
+    reviewScore: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",

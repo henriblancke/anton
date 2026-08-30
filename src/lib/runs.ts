@@ -85,6 +85,7 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
     ...toSummary(row),
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
     error: row.error ?? undefined,
+    reviewScore: row.reviewScore ?? undefined,
     formula: row.formula ?? undefined,
     formulaVariant: row.formulaVariant ?? undefined,
   };
@@ -148,6 +149,8 @@ export type RunPatch = Partial<{
   formulaVariant: string | null;
   attempts: number;
   error: string | null;
+  /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
+  reviewScore: number | null;
   endedAt: number; // ms; converted to seconds
 }>;
 
@@ -268,10 +271,11 @@ function recentRunRows(
 }
 
 /**
- * {@link listRecentRuns} with each run's ERROR attached (anton-rgso). The consecutive-failure
- * breaker compares failures BY their message — that is how it tells one broken environment from
- * several hard tickets — so it needs the column the list view has no use for. db-injectable and
- * read-only, like its sibling.
+ * {@link listRecentRuns} with each run's ERROR and review SCORE attached (anton-rgso, anton-cekf).
+ * Both autopilot breakers read a column the list view has no use for: the consecutive-failure one
+ * compares failures BY their message — that is how it tells one broken environment from several hard
+ * tickets — and the score-regression one judges each attempt on the score that attempt earned.
+ * db-injectable and read-only, like its sibling.
  */
 export async function listRecentRunOutcomes(
   db: AntonDb,

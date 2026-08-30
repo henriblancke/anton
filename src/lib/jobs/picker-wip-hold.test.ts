@@ -201,6 +201,41 @@ describe("checkWipLimit", () => {
     expect(await ask(reader({ 12: "MERGED" }))).toBeUndefined();
   });
 
+  it("stops reading once the limit is confirmed, rather than one gh per backlogged PR", async () => {
+    // The project with a fourteen-PR backlog is the one this brake exists for; it must not be the
+    // one that spawns fourteen processes per pass to find that out.
+    await project();
+    const readPrActivity = reader();
+    const board = Array.from({ length: 14 }, (_, i) => inReview(`anton-${i}`, 20 + i));
+
+    const hold = await checkWipLimit(t.db, {
+      projectId: PROJECT,
+      repoPath: REPO,
+      board,
+      readPrActivity,
+    });
+
+    expect(hold).toBeDefined();
+    expect(readPrActivity.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it("keeps reading past a merged PR until the limit is confirmed", async () => {
+    // Short-circuiting must not shrink the count: a batch full of merged PRs proves bandwidth, not
+    // a hold, so the confirmation has to carry on into the rest of the queue.
+    await project();
+    const readPrActivity = reader({ 20: "MERGED", 21: "MERGED", 22: "CLOSED" });
+    const board = Array.from({ length: 6 }, (_, i) => inReview(`anton-${i}`, 20 + i));
+
+    const hold = await checkWipLimit(t.db, {
+      projectId: PROJECT,
+      repoPath: REPO,
+      board,
+      readPrActivity,
+    });
+
+    expect(hold?.slots.map((s) => s.prNumber)).toEqual([23, 24, 25]);
+  });
+
   it("re-holds by itself when the queue fills again", async () => {
     // Nothing is latched, so there is no state that could survive the release and stay stuck.
     await project();

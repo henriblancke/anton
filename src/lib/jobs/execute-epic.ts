@@ -1418,7 +1418,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // are written here or lost with the attempt — for a poison park (a round-3 death still
             // owes the founder rounds 1 and 2) and equally for a retryable one, where the run is
             // rescheduled and the resumed gate restarts from round 1 with nothing on the board.
-            await persistPartialReviewScores(repo, epicBeadId, gateRounds);
+            // The score goes on the RUN too, not only the board (anton-cekf): the label is the
+            // target's latest across every attempt, so a later rerun would otherwise inherit this
+            // one's number and let the breaker judge that run on a review it never had.
+            const partialScore = await persistPartialReviewScores(repo, epicBeadId, gateRounds);
+            if (partialScore !== undefined) {
+              await updateRun(db, clock, runId, { reviewScore: partialScore });
+            }
             // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
             // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
             // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
@@ -1460,7 +1466,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // The score history belongs to the board, not this run's logs — written on both exits the gate
           // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
           // founder needs. The throwing exit is covered by the catch above.
-          await persistReviewScores(repo, epicBeadId, review);
+          const reviewScore = await persistReviewScores(repo, epicBeadId, review);
+          // ...and on the run row, which is what the score-regression breaker reads: one score per
+          // ATTEMPT, so a rerun that settles unreviewed reads as a gap rather than as its target's
+          // older score (see picker-score-breaker.ts).
+          if (reviewScore !== undefined) {
+            await updateRun(db, clock, runId, { reviewScore });
+          }
 
           const blocking = blockingFindings(review.unresolved);
           // Three states must not become a PR: blocking findings the converge loop couldn't clear, a

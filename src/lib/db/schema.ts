@@ -38,6 +38,13 @@ export const runs = sqliteTable("runs", {
   formulaVariant: text("formula_variant"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
+  // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports
+  // one. The board carries the same number as a `review-score:<n>` label, but that label is the
+  // TARGET's latest score, not any one attempt's: a rerun that settles without being reviewed would
+  // lend its target's old score to a new run row, and the score-regression breaker would judge — and
+  // freeze — a project on reviews that happened before those runs, or before the operator's last
+  // re-arm. Recorded per attempt so the join cannot lie.
+  reviewScore: integer("review_score"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),

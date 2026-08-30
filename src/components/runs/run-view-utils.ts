@@ -47,6 +47,12 @@ export interface RunSummary {
 export interface RunDetail extends RunSummary {
   leaseExpiresAt?: number;
   error?: string;
+  /**
+   * The self-review score THIS attempt earned (anton-cekf), 0-10. Absent on a run whose review gate
+   * never reported one — a run that failed before it, or one whose score write never landed — which
+   * is a GAP in the project's score series, never a zero.
+   */
+  reviewScore?: number;
   /** The pipeline this run walked — the formula file it was read from (anton-aa3m). */
   formula?: string;
   /** The bead label that selected that pipeline; absent ⇒ the project/bundled default. */

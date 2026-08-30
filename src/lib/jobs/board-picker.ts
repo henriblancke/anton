@@ -83,7 +83,7 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // after the failure breaker rather than beside it because both latch the same single disarm —
     // whichever fires first owns the freeze, and the other reads it as already-disarmed and abstains
     // rather than stacking a second thing for the operator to clear.
-    const slide = await checkScoreSlide(db, clock, { projectId, board });
+    const slide = await checkScoreSlide(db, clock, { projectId });
     if (slide?.latched) {
       console.warn(`[board-picker] ${projectId}: disarmed — ${describeScoreSlide(slide.slide)}`);
     }
