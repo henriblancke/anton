@@ -1496,6 +1496,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           status: "parked",
           error: `run-live-elsewhere${orphanNotice}`,
         });
+      } else if (e instanceof NeedsHumanError) {
+        // The ask becomes board state before the row settles (anton-287p): a `human` gate on the run
+        // target, which a person resolves to release the run through the existing gate-resume pass.
+        // Parked with no endedAt, like a review park — this run is waiting on someone, not dead, and
+        // the resume reuses THIS row (findOpenRunForEpic) so its worktree/branch continue.
+        const gateId = await armHumanGate(repo, epicBeadId, e.ask);
+        await updateRun(db, clock, runId, {
+          status: "parked",
+          error: needsHumanParkMessage(e, gateId),
+        });
       } else if (e instanceof ReviewBlockedError) {
         // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
         // gate refused on and resume it — the run history must not read like a crash. Resuming reuses
@@ -1661,12 +1671,15 @@ async function runTicket(args: {
           }),
         },
       });
-      // A `blocked` self-report is STICKY across a phase with several dispatching steps. A later
-      // agent — a `step:claude` the project added after `implement` — reports on its own work only,
-      // so letting its `delivered` overwrite an earlier block would close a ticket the implementer
-      // declared incomplete on the partial changes it left behind. A missing/unparseable line (null)
-      // keeps whatever the phase reported before it, as it always has.
-      if (selfReport?.outcome !== "blocked") selfReport = result.facts?.selfReport ?? selfReport;
+      // A `blocked` or `needs-human` self-report is STICKY across a phase with several dispatching
+      // steps. A later agent — a `step:claude` the project added after `implement` — reports on its
+      // own work only, so letting its `delivered` overwrite an earlier block would close a ticket
+      // the implementer declared incomplete on the partial changes it left behind, and would drop
+      // an ask no later step ever saw. A missing/unparseable line (null) keeps whatever the phase
+      // reported before it, as it always has.
+      if (selfReport?.outcome === "delivered" || !selfReport) {
+        selfReport = result.facts?.selfReport ?? selfReport;
+      }
 
       if (definition.name !== "commit") {
         // A step that RAN and did not achieve its work halts the ticket (and, through it, the epic).
@@ -1687,7 +1700,19 @@ async function runTicket(args: {
       // propagates out of the ticket loop, halting dispatch of the rest of the epic. NoDeliveryError
       // is poison, so the runner parks the run for a human instead of retrying claude to the same
       // empty result forever.
-      if (!result.facts?.committed) {
+      committed = result.facts?.committed === true;
+
+      // The agent asked for a HUMAN (anton-287p): the next step belongs to a person — a credential,
+      // a dashboard click, a judgement call — not to another attempt. Judged BEFORE the
+      // delivery-evidence gate, because an ask is legitimate with or without a diff: the common
+      // shape is an agent that got as far as it could and stopped, which the gate below would file
+      // as a zero-diff false stall a human then has to decode. The run parks on a human gate
+      // carrying this ask instead (see the run-level catch).
+      if (selfReport?.outcome === "needs-human") {
+        throw new NeedsHumanError(ticket.id, selfReport.reason);
+      }
+
+      if (!committed) {
         // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
         // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
         // false success the gate exists to catch; a `blocked` self-report corroborates the block and
@@ -1699,7 +1724,6 @@ async function runTicket(args: {
             selfReportSuffix(selfReport),
         );
       }
-      committed = true;
 
       // Commit evidence exists, but the agent SELF-REPORTED blocked (anton-j5i8): it is telling us
       // the ticket is not actually done. Honor that honest signal — block the ticket for a human
@@ -1987,6 +2011,49 @@ async function armMergeGate(
   });
 }
 
+// ── human wait (anton-287p) ──
+
+/**
+ * Arm the run target's HUMAN wait: a `human` gate blocking the target, whose reason IS the agent's
+ * ask, verbatim. Returns the gate's id — or undefined when bd refused the write.
+ *
+ * The one gate flavour nothing automates away, by design on both sides: `bd gate check` never
+ * evaluates a human gate, and gate-check's expiry pass deliberately skips it (a wait on a person is
+ * never anton's to call overdue). So it carries no timeout and ends only when someone runs
+ * `bd gate resolve` — at which point the gate-resume pass hands this target back to the runner,
+ * which is why the resume half needed nothing new here.
+ */
+async function armHumanGate(
+  repo: string,
+  targetId: string,
+  ask: string | undefined,
+): Promise<string | undefined> {
+  try {
+    return await beads.gateCreate(repo, {
+      blocks: targetId,
+      type: "human",
+      reason: ask ?? `${targetId} stopped for a human, but the agent named no ask`,
+    });
+  } catch (e) {
+    console.error(
+      `[execute-epic] could not arm ${targetId}'s human gate — the ask reaches the operator only ` +
+        `through the parked run's error (${e instanceof Error ? e.message : String(e)})`,
+    );
+    return undefined;
+  }
+}
+
+/**
+ * The park reason on the run row: the agent's ask, and the one command that releases the run. Says
+ * so plainly when no gate exists — a park a resolve cannot end needs a human to resume it by hand.
+ */
+function needsHumanParkMessage(e: NeedsHumanError, gateId: string | undefined): string {
+  return gateId
+    ? `${e.message} Answer it, then \`bd gate resolve ${gateId}\` — closing that gate resumes this run.`
+    : `${e.message} Its human gate could NOT be created, so nothing on the board carries the ask — ` +
+        `answer it, then resume the run by hand.`;
+}
+
 // ── helpers ──
 
 /** Cap on in-session `claude --resume` retries before escalating to a fresh restart (anton-juar). */
@@ -2155,6 +2222,30 @@ class NoDeliveryError extends Error {
 class BlockedByAgentError extends Error {
   constructor(msg: string) {
     super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * The agent reported `ANTON-RESULT: needs-human — <ask>` (anton-287p): it stopped because only a
+ * person can take the next step, not because it hit a broken state. Distinct from
+ * {@link BlockedByAgentError} in what it COSTS the operator — a block is a defect to diagnose, an ask
+ * is a minute of their attention — and the run-level catch is what turns it into board state: a
+ * `human` gate on the run target carrying {@link ask} verbatim.
+ *
+ * Poison-classified (`name = "PoisonError"`) so the runner parks rather than burning attempts. A
+ * retry cannot answer an ask; only the person can, and resolving their gate is what releases the run.
+ */
+class NeedsHumanError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** The agent's ask, verbatim — the gate's reason. Undefined when it named none. */
+    readonly ask: string | undefined,
+  ) {
+    super(
+      `${ticketId} needs a human: ${ask ?? "(the agent named no ask)"}. The run is parked until ` +
+        `someone answers it.`,
+    );
     this.name = "PoisonError"; // classified as poison by the runner
   }
 }
