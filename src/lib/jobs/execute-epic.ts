@@ -59,6 +59,7 @@ import {
   findOpenRunForEpic,
   findRunFormulaForBranch,
   updateRun,
+  type RunPatch,
 } from "../runs";
 import {
   appendSessionLog,
@@ -212,14 +213,41 @@ export function runReadiness(
   };
 }
 
+/**
+ * The ask each open human gate among `blockers` carries, phrased as what a person does about it.
+ *
+ * A human gate blocks its target like any other prerequisite, but no work completes it — only
+ * someone answering it — so listing it beside ordinary blockers describes a wait for something that
+ * is never coming.
+ */
+function openHumanGateAsks(board: Bead[], blockers: string[]): string[] {
+  return blockers.flatMap((id) => {
+    const bead = board.find((b) => b.id === id);
+    if (!bead || bead.status === "closed" || !beads.isHumanGate(bead)) return [];
+    const ask = gateReason(bead) ?? "no reason recorded on the gate";
+    return [
+      `${id} is a human gate, not work in flight — "${ask}" — answer it, then ` +
+        `\`bd gate resolve ${id}\`.`,
+    ];
+  });
+}
+
 /** The park a run takes when NOTHING in it can start. */
-function blockedRunPoison(beadId: string, readiness: RunReadiness): PoisonEpic {
-  return readiness.blockers.length > 0
-    ? blockedByPoison(beadId, readiness.blockers)
-    : new PoisonEpic(
-        `${beadId} has no ticket it can start — every ticket it would run is held by an open ` +
-          `blocker outside this run; resume the run once they complete`,
-      );
+function blockedRunPoison(beadId: string, readiness: RunReadiness, board: Bead[]): PoisonEpic {
+  if (readiness.blockers.length === 0) {
+    return new PoisonEpic(
+      `${beadId} has no ticket it can start — every ticket it would run is held by an open ` +
+        `blocker outside this run; resume the run once they complete`,
+    );
+  }
+  const blocked = blockedByPoison(beadId, readiness.blockers);
+  // A human gate among the blockers is an ASK, not work in progress — and it can be the only record
+  // of one: a needs-human park whose run row could not be settled leaves the gate standing alone
+  // (anton-287p), and the next attempt lands here. Naming the ask is what keeps that recovery from
+  // reading as an ordinary block. The blocked-by clause stays intact ahead of it — run-health
+  // parses the ids back out of it to report this stall as the gate's own wait rather than twice.
+  const asks = openHumanGateAsks(board, readiness.blockers);
+  return asks.length > 0 ? new PoisonEpic(`${blocked.message}. ${asks.join(" ")}`) : blocked;
 }
 
 /**
@@ -330,7 +358,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // step 0 after the cross-machine pull refreshes `all` (a blocker another machine pushed since
     // would be invisible to this pre-pull snapshot).
     const readiness = computeReadiness(all);
-    if (!readiness.runnable) throw blockedRunPoison(epicBeadId, readiness);
+    if (!readiness.runnable) throw blockedRunPoison(epicBeadId, readiness, all);
 
     // A grouping target runs all its children into one PR; a leaf target IS its own single ticket
     // (an epic-of-one). The rest of the pipeline — worktree, per-ticket claude→tests→commit→close,
@@ -636,7 +664,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     dispatch can't disagree about which tickets a cross-run blocker holds: `gated` is read
       //     from the same pulled board the loop iterates.
       const freshReadiness = computeReadiness(all);
-      if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness);
+      if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, all);
       const gated = new Set(freshReadiness.gated);
 
       // 0a-ter. Re-derive the target's SHAPE against the freshly-pulled board. Runnability and
@@ -1660,7 +1688,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // read, then any supersede) before it writes, so a force-kill arriving in that window would
         // otherwise still land a gate — the very state askSettleError exists to prevent. It refuses
         // the write in that case, and the ask settles in its cancelled form here.
-        let gate: { gateId: string; held: string[] } | undefined;
+        let gate: ArmedHumanGate | undefined;
         let gateError: string | undefined;
         // The one cancelled arm that DID leave board state behind: the kill landed inside `gate
         // create` and the undo failed too, so a gate blocks the target that this run will never come
@@ -1685,21 +1713,33 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             error: thrown instanceof Error ? thrown.message : String(thrown),
             endedAt: clock.now(),
           });
+        } else if (gate) {
+          // The gate is live, so the row is the only half left that can disagree with the board —
+          // and settling it is the last thing that can go wrong (anton-287p). Written through a
+          // reporter, never a raw throw: a rejected write must not swallow the ask this branch
+          // exists to deliver.
+          thrown = await settleArmedAsk({
+            targetId: epicBeadId,
+            ask: e,
+            raw,
+            gate,
+            signal: ctx.signal,
+            now: () => clock.now(),
+            settle: async (patch) => {
+              try {
+                await updateRun(db, clock, runId, patch);
+                return undefined;
+              } catch (failure) {
+                return failure instanceof Error ? failure.message : String(failure);
+              }
+            },
+          });
         } else {
-          await updateRun(
-            db,
-            clock,
-            runId,
-            gate
-              ? { status: "parked", error: needsHumanParkMessage(e, gate.gateId, gate.held) }
-              : {
-                  status: "failed",
-                  error: stranded
-                    ? strandedAskMessage(e, stranded)
-                    : ungatedAskMessage(e, gateError),
-                  endedAt: clock.now(),
-                },
-          );
+          await updateRun(db, clock, runId, {
+            status: "failed",
+            error: stranded ? strandedAskMessage(e, stranded) : ungatedAskMessage(e, gateError),
+            endedAt: clock.now(),
+          });
         }
       } else if (e instanceof BlockedTailError) {
         // Parked, not failed, for the same reason as a blocked review below: this run delivered the
@@ -2295,6 +2335,24 @@ export function humanGatePlan(
   };
 }
 
+/** What an arm left on the board — and, only while that is safe, how to take it back. */
+export interface ArmedHumanGate {
+  /** The gate carrying this ask: created here, or the one an earlier attempt armed for it. */
+  gateId: string;
+  /** Every OTHER open human gate on the target — a person's own holds, left where they are. */
+  held: string[];
+  /**
+   * Resolve the gate this call created, returning the target to the state the arm found it in.
+   *
+   * Offered ONLY while undoing cannot be the thing that leaves the target bare (anton-287p): the
+   * gate was created here AND no older wait was retired behind it. Absent for a gate an earlier
+   * attempt armed — not this run's to take back — and absent after a supersede, where resolving the
+   * replacement would leave the target carrying no wait at all on an ask nobody answered. Answers
+   * whether the gate is actually gone; a resolve that failed leaves it standing.
+   */
+  undo?: () => Promise<boolean>;
+}
+
 /**
  * Arm the run target's HUMAN wait: a `human` gate blocking the target, whose reason IS the agent's
  * ask, verbatim. Returns that gate's id alongside the ids of every OTHER open human gate on the
@@ -2344,7 +2402,7 @@ export async function armHumanGate(
   ask: string | undefined,
   /** The run's LIVE cancellation signal, re-read immediately before every board write below. */
   signal?: AbortSignal,
-): Promise<{ gateId: string; held: string[] }> {
+): Promise<ArmedHumanGate> {
   const reason = humanGateReason(targetId, ask);
   // A kill can only be observed between awaits, and this function awaits the board twice before it
   // writes anything — so the caller's pre-arm read of the signal is already stale here (anton-287p).
@@ -2469,6 +2527,8 @@ export async function armHumanGate(
     // Still retires what this ask supersedes — the reused gate IS the armed replacement, so an
     // earlier attempt's leftovers would otherwise stay open beside it forever.
     await retireSuperseded(open.id);
+    // No `undo`: an earlier attempt armed this wait for this same ask, and closing someone else's
+    // live wait is not how this run stops.
     return { gateId: open.id, held: heldIds };
   }
 
@@ -2490,7 +2550,23 @@ export async function armHumanGate(
   await undoIfCancelled(gateId, "the gate was labelled");
   // Replacement armed — only now is the older ask's wait retired.
   await retireSuperseded(gateId);
-  return { gateId, held: heldIds };
+  return {
+    gateId,
+    held: heldIds,
+    // Retiring a wait behind this one spends the right to undo it: resolving the replacement would
+    // then leave the target carrying no wait of anton's at all, on an ask nobody answered.
+    undo:
+      stale.length > 0
+        ? undefined
+        : () =>
+            safe(() =>
+              beads.gateResolve(
+                repo,
+                gateId,
+                `run cancelled after ${targetId}'s human gate was armed`,
+              ),
+            ),
+  };
 }
 
 /**
@@ -2519,6 +2595,94 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
     `be created (${gateError ?? "unknown error"}), so nothing on the board carries the ask and no ` +
     `\`bd gate resolve\` can release the run — it is FAILED rather than parked, because a park with ` +
     `no gate is a wait nothing can end. Answer the ask, then re-run the target.`
+  );
+}
+
+/**
+ * Settle the run row for an ask whose gate IS armed, and answer with the error the run throws.
+ *
+ * Split out of the handler because it is where the two halves of a needs-human park can still come
+ * apart (anton-287p): the gate is on the board, and the row write that records the park is both
+ * fallible and — like every other await in this unwind — a window a force-kill can land in. Three
+ * outcomes, one per way that goes:
+ *
+ *   • **It landed.** The run is parked behind the gate; the ask rides out as the runner's park.
+ *   • **A kill landed inside it.** Every check in the arm passed before it, and no check follows,
+ *     so the row would otherwise read as parked behind a wait nobody is servicing. The arm is taken
+ *     back where {@link ArmedHumanGate.undo} says that is still safe, and the gate is NAMED where
+ *     it is not; either way the row settles FAILED, like a kill that landed earlier in the arm.
+ *   • **The write failed.** The gate stays. Taking it back is the one move that is never right
+ *     here — this failed on the run's own database, not on the board, so undoing would leave
+ *     nothing at all carrying the ask, and a supersede the arm already retired makes it worse. The
+ *     gate is the durable half (run-health reports an open human gate from the instant it opens)
+ *     and the job parks LOUDLY naming it, rather than retrying into a park that says "blocked".
+ */
+export async function settleArmedAsk(args: {
+  /** The run target the gate blocks. */
+  targetId: string;
+  /** The ask as the ticket raised it — the park and failure messages are composed from it. */
+  ask: NeedsHumanError;
+  /** The error the run's catch received, for the cancelled form of the ask. */
+  raw: unknown;
+  gate: ArmedHumanGate;
+  /** The run's LIVE cancellation signal, re-read AFTER the settle write. */
+  signal: AbortSignal;
+  now: () => number;
+  /** Write the row, answering with the failure message when the write did not land. */
+  settle: (patch: RunPatch) => Promise<string | undefined>;
+}): Promise<unknown> {
+  const { targetId, ask, raw, gate, signal, settle } = args;
+  let thrown: unknown = ask;
+  let unsettled = await settle({
+    status: "parked",
+    error: needsHumanParkMessage(ask, gate.gateId, gate.held),
+  });
+  if (!unsettled && signal.aborted) {
+    const undone = gate.undo ? await gate.undo() : false;
+    // Undone, nothing on the board carries the ask — which is exactly what the cancelled form of
+    // the error says. Standing, the gate blocks the target with no run coming back for it, so the
+    // row AND the runner's park have to name it: the ask's own message would promise a park this
+    // run is no longer taking.
+    thrown = undone
+      ? askSettleError(raw, signal)
+      : new PoisonEpic(
+          strandedAskMessage(
+            ask,
+            new StrandedHumanGateError(
+              targetId,
+              gate.gateId,
+              `the run was cancelled while its park was being recorded, so the wait armed ` +
+                `for the ask stands`,
+            ),
+          ),
+        );
+    unsettled = await settle({
+      status: "failed",
+      error: thrown instanceof Error ? thrown.message : String(thrown),
+      endedAt: args.now(),
+    });
+  }
+  if (unsettled) {
+    console.error(
+      `[execute-epic] ${targetId}: human gate ${gate.gateId} is armed but the run row could ` +
+        `not be settled (${unsettled})`,
+    );
+    thrown = new PoisonEpic(unsettledAskMessage(ask, gate.gateId, unsettled));
+  }
+  return thrown;
+}
+
+/**
+ * The FAILURE reason when the ask DID reach the board but the run row could not record the park.
+ * The gate is the durable half and still releases the target, so it is named here: the row may say
+ * nothing at all, leaving this message the only place the two halves are connected.
+ */
+function unsettledAskMessage(e: NeedsHumanError, gateId: string, failure: string): string {
+  return (
+    `${e.ticketId} needs a human: ${e.ask ?? "(the agent named no ask)"}. Human gate ${gateId} ` +
+    `IS armed and carries the ask, but this run's row could not be settled as parked ` +
+    `(${failure}), so the run history does not show the wait. Answer the ask, then ` +
+    `\`bd gate resolve ${gateId}\` — that still releases the target and resumes the run.`
   );
 }
 

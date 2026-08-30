@@ -16,6 +16,10 @@
  * The other half is ORDER: the replacement is armed before the wait it supersedes is retired, so no
  * failure and no kill can leave the target carrying no human gate on an ask nobody answered.
  *
+ * The last section is the SETTLE that follows a successful arm — the one place left where the gate
+ * and the run row can still tell different stories: the row write can fail outright, and a kill can
+ * land inside it after every check in the arm has passed.
+ *
  * Mocked at the bd seam, because the states under test are bd calls that fail: the end-to-end shapes
  * of the arm live in execute-epic.needs-human.integration.test.ts against real bd.
  */
@@ -45,9 +49,13 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
-const { armHumanGate, HUMAN_GATE_ARMED_LABEL, StrandedHumanGateError } = await import(
-  "./execute-epic"
-);
+const {
+  armHumanGate,
+  HUMAN_GATE_ARMED_LABEL,
+  NeedsHumanError,
+  settleArmedAsk,
+  StrandedHumanGateError,
+} = await import("./execute-epic");
 
 const REPO = "/tmp/anton";
 const ASK = "the staging DB password has to be rotated by a person";
@@ -84,7 +92,11 @@ it("reads the board strictly, so a failed gate listing can never read as 'nothin
   loadAllIssuesMock.mockResolvedValue([]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({ gateId: "g-new", held: [] });
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+    gateId: "g-new",
+    held: [],
+    undo: expect.any(Function),
+  });
   expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
 });
 
@@ -108,7 +120,11 @@ it("still parks on the gate when the label write is lost — the ask is already 
   gateCreateMock.mockResolvedValue("g-new");
   tagMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({ gateId: "g-new", held: [] });
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+    gateId: "g-new",
+    held: [],
+    undo: expect.any(Function),
+  });
 });
 
 it("aborts when its own superseded gate cannot be resolved, instead of parking behind it", async () => {
@@ -132,7 +148,13 @@ it("arms the replacement BEFORE retiring the wait it supersedes", async () => {
   loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({ gateId: "g-new", held: [] });
+  // No `undo` past the retire: `g-old` is closed, so taking `g-new` back would leave the target
+  // with no wait at all on an ask nobody answered.
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+    gateId: "g-new",
+    held: [],
+    undo: undefined,
+  });
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-old", expect.stringMatching(/superseded/));
   expect(gateCreateMock.mock.invocationCallOrder[0]).toBeLessThan(
     gateResolveMock.mock.invocationCallOrder[0],
@@ -209,6 +231,7 @@ it("never resolves a human gate anton did not arm, and reports it back for the p
   await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
     gateId: "g-new",
     held: ["g-theirs"],
+    undo: expect.any(Function),
   });
   expect(gateResolveMock).not.toHaveBeenCalled();
 });
@@ -326,6 +349,38 @@ it("arms as usual while the run is still live", async () => {
   await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).resolves.toEqual({
     gateId: "g-new",
     held: [],
+    undo: expect.any(Function),
+  });
+});
+
+it("offers the caller an undo for the gate it created, for a kill that lands after the arm returns", async () => {
+  // The last window of all (anton-287p): the settle write is uninterruptible too, so a kill can land
+  // after every check inside the arm has passed. Nothing was superseded here, so taking the gate
+  // back returns the target to exactly the state the arm found — the caller's only safe correction.
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockResolvedValue("g-new");
+
+  const armed = await armHumanGate(REPO, "f-1", ASK);
+  await expect(armed.undo!()).resolves.toBe(true);
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
+});
+
+it("reports an undo that failed, so the caller names the gate instead of assuming it is gone", async () => {
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockResolvedValue("g-new");
+
+  const armed = await armHumanGate(REPO, "f-1", ASK);
+  gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
+  await expect(armed.undo!()).resolves.toBe(false);
+});
+
+it("offers NO undo for a wait an earlier attempt armed — it is not this run's to take back", async () => {
+  loadAllIssuesMock.mockResolvedValue([target("g-mine"), gate("g-mine", ASK)]);
+
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+    gateId: "g-mine",
+    held: [],
+    undo: undefined,
   });
 });
 
@@ -341,4 +396,163 @@ it("reports a person's hold beside a wait it REUSES, not only beside one it crea
     held: ["g-theirs"],
   });
   expect(gateCreateMock).not.toHaveBeenCalled();
+});
+
+// ── the settle behind a live gate (anton-287p) ──
+
+const ASK_ERROR = () => new NeedsHumanError("t-1", ASK);
+
+/** A row writer that records every patch and can be told to fail. */
+const recorder = (failure?: string) => {
+  const patches: Record<string, unknown>[] = [];
+  return {
+    patches,
+    settle: async (patch: Record<string, unknown>) => {
+      patches.push(patch);
+      return failure;
+    },
+  };
+};
+
+it("parks the run behind the gate and throws the ask while the run is still live", async () => {
+  const row = recorder();
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [], undo: async () => true },
+    signal: new AbortController().signal,
+    now: () => 1,
+    settle: row.settle,
+  });
+
+  expect(row.patches).toEqual([{ status: "parked", error: expect.stringContaining(ASK) }]);
+  expect(row.patches[0].error).toContain("bd gate resolve g-new");
+  expect(thrown).toBeInstanceOf(NeedsHumanError);
+});
+
+it("takes the arm back when the kill lands INSIDE the park write, and fails the row", async () => {
+  // The window the arm's own checks cannot cover: the settle is an uninterruptible await too, and
+  // nothing follows it — so a force-kill landing here would leave the run reading as parked behind
+  // a wait nobody is servicing, blocking the target until someone clears it by hand.
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      controller.abort(); // the kill lands while the park is being written
+      return undefined;
+    },
+  };
+  let undone = false;
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: {
+      gateId: "g-new",
+      held: [],
+      undo: async () => {
+        undone = true;
+        return true;
+      },
+    },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(undone).toBe(true);
+  expect(row.patches.map((p) => p.status)).toEqual(["parked", "failed"]);
+  expect(row.patches[1].endedAt).toBe(42);
+  // Nothing on the board carries the ask any more, and the error says exactly that.
+  expect(String(row.patches[1].error)).toContain("armed NO gate");
+  expect((thrown as Error).message).toContain("armed NO gate");
+});
+
+it("names the gate that STANDS when the kill lands mid-write and undoing is unsafe", async () => {
+  // No `undo` — the arm superseded an older wait behind this gate, so resolving it would leave the
+  // target with none at all. The gate blocks the target with no run coming back for it, so both the
+  // row and the thrown error have to name the id; nothing else on the board would.
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      controller.abort();
+      return undefined;
+    },
+  };
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [] },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(row.patches.map((p) => p.status)).toEqual(["parked", "failed"]);
+  expect(String(row.patches[1].error)).toContain("bd gate resolve g-new");
+  expect((thrown as Error).name).toBe("PoisonError"); // no retry can answer an ask
+  expect((thrown as Error).message).toContain("bd gate resolve g-new");
+});
+
+it("names the gate that stands when the undo itself fails after the kill", async () => {
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      controller.abort();
+      return undefined;
+    },
+  };
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [], undo: async () => false },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(String(row.patches[1].error)).toContain("bd gate resolve g-new");
+  expect((thrown as Error).message).toContain("bd gate resolve g-new");
+});
+
+it("keeps the gate and parks the JOB loudly when the row cannot be settled at all", async () => {
+  // The failure is on the run's own database, not on the board — so undoing the gate would leave
+  // NOTHING carrying the ask, and the next attempt would meet an ask with no record of itself. The
+  // gate stays and the error names it, ask included.
+  const row = recorder("SQLITE_BUSY: database is locked");
+  let undone = false;
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: {
+      gateId: "g-new",
+      held: [],
+      undo: async () => {
+        undone = true;
+        return true;
+      },
+    },
+    signal: new AbortController().signal,
+    now: () => 1,
+    settle: row.settle,
+  });
+
+  expect(undone).toBe(false);
+  expect((thrown as Error).name).toBe("PoisonError");
+  expect((thrown as Error).message).toContain(ASK);
+  expect((thrown as Error).message).toContain("bd gate resolve g-new");
+  expect((thrown as Error).message).toContain("database is locked");
 });

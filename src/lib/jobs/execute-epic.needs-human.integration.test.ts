@@ -192,6 +192,15 @@ process.exit(0);`),
       // Still exactly one open wait, and it is the SAME gate — the ask a person is holding.
       const after = await gatesBlocking(feature.id);
       expect(after.map((g) => g.id)).toEqual([armed[0].id]);
+
+      // The re-entry parks on the readiness gate, BEFORE the arm — the gate blocks the target like
+      // any other prerequisite. So the park has to read the ask off the gate itself, or a run whose
+      // own settle was lost after arming (anton-287p) comes back as a generic "blocked by g-…" with
+      // nothing saying a person is what it waits on.
+      const reentry = await getJob(tdb.db, jobIds[1]);
+      expect(reentry?.status).toBe("parked");
+      expect(reentry?.lastError).toContain(ask);
+      expect(reentry?.lastError).toContain(`bd gate resolve ${armed[0].id}`);
       // …and re-entry never claimed a delivery on the way: no PR was opened by either run.
       expect(beads.getPrRef(await beads.show(repo, feature.id)) ?? null).toBeNull();
     } finally {
