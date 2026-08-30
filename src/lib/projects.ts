@@ -592,11 +592,17 @@ export const pickerPolicySchema = z
           .object({
             namespace: z.string().trim().min(1).max(POLICY_TEXT_MAX.namespace),
             // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
-            // why nothing on this path sorts them.
+            // why nothing on this path sorts them. Duplicate-free: a repeat is a second membership
+            // test the first already answered, and under a ranking it is a value at two positions at
+            // once — which `admittedValues` resolves by its first, so a bound could admit a slice
+            // the stored order does not show.
             values: z
               .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.value))
               .min(1)
-              .max(POLICY_CRITERION_VALUES_MAX),
+              .max(POLICY_CRITERION_VALUES_MAX)
+              .refine((vs) => new Set(vs).size === vs.length, {
+                message: "each value may be listed once",
+              }),
             ranked: z.boolean().optional(),
             // A `≤`/`≥` over that ranking. Rejected without `ranked`, and rejected when it names a
             // value the ranking does not carry: the predicate fails such a criterion CLOSED against

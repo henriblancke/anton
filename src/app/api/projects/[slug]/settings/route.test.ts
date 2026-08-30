@@ -851,6 +851,19 @@ describe("settings route — work policy (anton-c7iv)", () => {
           { namespace: "severity", values: ["minor"] },
         ],
       },
+      // A value listed twice is one membership test twice over, and under a ranking it is a value
+      // at two positions — a bound could then admit a slice the stored order does not show.
+      { labels: [{ namespace: "severity", values: ["major", "major"] }] },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major", "critical"],
+            ranked: true,
+            compare: { op: "lte", value: "critical" },
+          },
+        ],
+      },
       { maxPriority: -1 },
       { maxPriority: "P2" },
       { requireUnblocked: "yes" },
