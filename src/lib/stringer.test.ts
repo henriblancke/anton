@@ -1719,6 +1719,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.svelte");
     });
 
+    // ...and an interpolation that wraps stays open across the lines it spans: `<div>{{` with the
+    // call under it names a caller the template really invokes, and reading that line alone
+    // reports a live binding dead. A blank line still ends the expression, and a `<style>` rule's
+    // braces never open one, so neither can let prose below prove a caller.
+    it("counts a markup symbol inside an expression opened on an earlier line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.vue": "<template>\n  <div>{{\n    Widget()\n  }}</div>\n</template>\n",
+        "public/notes.html": "<p>Press { to open the menu</p>\n\n<p>Widget was removed</p>\n",
+        "src/ui/theme.svelte": '<style>\n  .banner {\n    content: "Widget was removed";\n  }\n</style>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.vue");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/theme.svelte");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {

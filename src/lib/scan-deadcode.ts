@@ -497,13 +497,13 @@ function maskMdxProse(text: string): string {
 const TAG_HEAD = /<\/?\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
 
 /**
- * Whether the text before the symbol leaves a braced expression open. An expression closes on the
- * line that opened it — `<p>{version} Widget was removed</p>` renders `Widget` as text once `}`
- * has run — so accepting any earlier `{` reads that prose as code, calls the page a caller, and
- * deletes a true finding about a genuinely unused symbol.
+ * Whether the text before the symbol leaves a braced expression open, counting from the depth the
+ * lines above left open. An expression closes on the line that opened it unless a caller tracked
+ * that depth — `<p>{version} Widget was removed</p>` renders `Widget` as text once `}` has run —
+ * so treating any earlier `{` on the line as still open reads that prose as code, calls the page a
+ * caller, and deletes a true finding about a genuinely unused symbol.
  */
-function insideExpression(head: string): boolean {
-  let depth = 0;
+function insideExpression(head: string, depth = 0): boolean {
   for (const char of head) {
     if (char === "{") depth += 1;
     else if (char === "}") depth = Math.max(0, depth - 1);
@@ -587,6 +587,9 @@ const ASTRO_FENCE = /^---\s*$/;
 /** A `<script>` or `</script>` tag, with whatever attributes it carries (`<script lang="ts">`). */
 const SCRIPT_TAG = /<(\/?)script\b[^>]*?(\/?)>/gi;
 
+/** The same for `<style>`, whose braces are CSS rather than the template's interpolations. */
+const STYLE_TAG = /<(\/?)style\b[^>]*?(\/?)>/gi;
+
 /**
  * The framework directive prefixes that introduce a binding: Svelte's `use:enhance`, Vue's
  * `v-on:click`. Only the known prefixes count — accepting any `word:` would read `the helper:
@@ -638,24 +641,36 @@ type CodeSpans = [number, number][];
  */
 function markupCodeSpans(code: string[], file: string): CodeSpans[] {
   const frontmatterEnd = ASTRO_FILE.test(file) ? astroFrontmatterEnd(code) : -1;
+  const scripts = elementBodySpans(code, SCRIPT_TAG, frontmatterEnd + 1);
+  return code.map((line, index) =>
+    index <= frontmatterEnd ? [[0, line.length]] : (scripts[index] ?? []),
+  );
+}
+
+/**
+ * Where each line sits inside the body of `tag` — the program a `<script>` holds, the CSS a
+ * `<style>` holds. Both are the element's own language rather than the template's, so the markup
+ * rules stop at their tags.
+ */
+function elementBodySpans(code: string[], tag: RegExp, from = 0): CodeSpans[] {
   const lines: CodeSpans[] = [];
   let open = false;
   for (const [index, line] of code.entries()) {
-    if (index <= frontmatterEnd) {
-      lines.push([[0, line.length]]);
+    if (index < from) {
+      lines.push([]);
       continue;
     }
     const spans: CodeSpans = [];
     // A body an earlier line left open runs from the start of this one; a body this line opens
     // runs from the end of its tag, and an unclosed one carries on into the line below.
     let start: number | undefined = open ? 0 : undefined;
-    for (const match of line.matchAll(SCRIPT_TAG)) {
-      const [tag, closing, selfClosing] = match;
+    for (const match of line.matchAll(tag)) {
+      const [opener, closing, selfClosing] = match;
       if (closing === "/") {
         if (start !== undefined) spans.push([start, match.index]);
         start = undefined;
       } else if (start === undefined && selfClosing !== "/") {
-        start = match.index + tag.length;
+        start = match.index + opener.length;
       }
     }
     if (start !== undefined) spans.push([start, line.length]);
@@ -663,6 +678,49 @@ function markupCodeSpans(code: string[], file: string): CodeSpans[] {
     lines.push(spans);
   }
   return lines;
+}
+
+/**
+ * How deep a braced expression is left open at the start of each markup line. A template
+ * interpolation wraps — `<div>{{` with `Widget()` on the line under it — and judging that line
+ * alone finds no brace before the symbol, so a binding the template really invokes reads as
+ * rendered text and its signal goes on costing the health record a debt point. MDX carries the
+ * same state across its lines for the same reason.
+ *
+ * Braces inside a `<script>` or `<style>` body don't count: an object literal or a CSS rule is the
+ * element's own punctuation, not an interpolation, and letting one open an expression would read
+ * every line below it as code.
+ *
+ * A blank line closes whatever is open, and blankness is read from `raw` — the file before masking
+ * — so a line a comment emptied is not mistaken for the break. That bound is deliberate, as it is
+ * in MDX: an unbalanced `{` in rendered text can then only mislead its own block instead of every
+ * line after it, and reading prose as code is the direction that deletes a true finding.
+ */
+function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): number[] {
+  const style = elementBodySpans(code, STYLE_TAG);
+  const depths: number[] = [];
+  let depth = 0;
+  for (const [index, line] of code.entries()) {
+    depths.push(depth);
+    if (!raw[index]?.trim()) {
+      depth = 0;
+      continue;
+    }
+    const skip = [...(script[index] ?? []), ...(style[index] ?? [])];
+    let at = 0;
+    while (at < line.length) {
+      const body = skip.find(([start, end]) => at >= start && at < end);
+      if (body) {
+        at = body[1];
+        continue;
+      }
+      const char = line[at];
+      if (char === "{") depth += 1;
+      else if (char === "}") depth = Math.max(0, depth - 1);
+      at += 1;
+    }
+  }
+  return depths;
 }
 
 /** The last line of the Astro frontmatter fence, or -1 when the file opens with markup. */
@@ -681,20 +739,31 @@ function astroFrontmatterEnd(code: string[]): number {
  * a braced expression (`{count}` in Svelte and Astro, `{{ count }}` in Vue). Text between the tags
  * — and inside a static attribute — is what the page shows a reader, so a name there describes the
  * symbol rather than calling it.
+ *
+ * `depth` is how many expressions the lines above left open, so an interpolation that wraps still
+ * reads as one on the line the call actually sits on.
  */
-function referencesMarkup(line: string | undefined, symbol: string, code: CodeSpans = []): boolean {
+function referencesMarkup(
+  line: string | undefined,
+  symbol: string,
+  code: CodeSpans = [],
+  depth = 0,
+): boolean {
   return referencesWord(line, symbol, (head) => {
     const at = head.length;
     if (code.some(([start, end]) => at >= start && at < end)) return true;
     // Only the markup since the last script body is template: a brace left in the JavaScript
-    // beside it is not the `{count}` that would make the text after it an expression.
-    const markup = head.slice(code.reduce((from, [, end]) => (end <= at ? end : from), 0));
+    // beside it is not the `{count}` that would make the text after it an expression. A script
+    // between the line's start and the symbol restarts that reading, so the depth carried from
+    // above stops there too.
+    const from = code.reduce((last, [, end]) => (end <= at ? end : last), 0);
+    const markup = head.slice(from);
     return (
       TAG_HEAD.test(markup) ||
       ATTR_VALUE.test(markup) ||
       ATTR_VALUE_BARE.test(markup) ||
       DIRECTIVE_HEAD.test(markup) ||
-      insideExpression(markup)
+      insideExpression(markup, from === 0 ? depth : 0)
     );
   });
 }
@@ -764,6 +833,8 @@ interface MaskedFile {
   open?: boolean[];
   /** For markup, where each line is program text: a `<script>` body or an Astro frontmatter line. */
   script?: CodeSpans[];
+  /** For markup, how many braced expressions the lines above leave open at each line's start. */
+  depth?: number[];
 }
 
 /**
@@ -829,10 +900,13 @@ async function codeReferencingFiles(
         // MDX's markdown — its fences and code spans — is blanked before the JSX comment grammar
         // runs, so a `/*` or `//` shown inside an example can't open a comment across the program.
         const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
+        const raw = text.split("\n");
+        const script = isMarkup ? markupCodeSpans(code, file) : undefined;
         masked.set(file, {
           code,
-          open: isMdx ? mdxOpenLines(code, text.split("\n")) : undefined,
-          script: isMarkup ? markupCodeSpans(code, file) : undefined,
+          open: isMdx ? mdxOpenLines(code, raw) : undefined,
+          script,
+          depth: script && markupOpenDepths(code, script, raw),
         });
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
@@ -846,7 +920,8 @@ async function codeReferencingFiles(
     const references = (line: number): boolean => {
       const text = entry.code[line - 1];
       if (isMdx) return referencesMdx(text, symbol, entry.open?.[line - 1] === true);
-      if (isMarkup) return referencesMarkup(text, symbol, entry.script?.[line - 1]);
+      if (isMarkup)
+        return referencesMarkup(text, symbol, entry.script?.[line - 1], entry.depth?.[line - 1]);
       return referencesWord(text, symbol);
     };
     if (lines.some(references)) files.push(file);
