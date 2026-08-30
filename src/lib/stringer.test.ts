@@ -1500,6 +1500,61 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("2 signature");
     });
 
+    // A window holding a function's WHOLE body — its parameter list and the `) => execute(…)` that
+    // closes it — is a duplicated function, so the parameter lines above the body do not outvote it.
+    // The same parameters whose body lives BELOW the window still declare, and so does a list whose
+    // only executable line is a literal default: the override is a body, not any code line at all.
+    it("keeps a window carrying the arrow's whole body, however many parameter lines precede it", async () => {
+      const repo = writeRepo({
+        "src/dispatch.ts": [
+          "export const dispatch = (",
+          "  job: Job,",
+          "  repo: string,",
+          "  logger: Logger,",
+          "  signal: AbortSignal,",
+          ") => execute(job, repo, logger, signal);",
+          "",
+        ].join("\n"),
+        "src/collect.ts": [
+          "export function collect(",
+          "  job: Job,",
+          "  repo: string,",
+          "  logger: Logger,",
+          "  signal: AbortSignal,",
+          ") {",
+          "  return execute(job, repo, logger, signal);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/panel.ts": [
+          "export function Panel({",
+          "  title,",
+          "  subtitle,",
+          "  budgetAware = false,",
+          "  onSelect,",
+          "}: PanelProps) {",
+          "  return render(title);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/dispatch.ts", 1]], 6),
+        clone([["src/collect.ts", 1]], 6),
+        clone([["src/panel.ts", 1]], 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/dispatch.ts" }]);
+      expect(result.duplication.dropped.map((d) => d.path)).toEqual([
+        "src/collect.ts",
+        "src/panel.ts",
+      ]);
+      expect(result.duplication.dropped[0].reason).toContain("6 signature");
+      expect(result.duplication.dropped[1].reason).toContain("4 signature");
+    });
+
     // The `=>` a closing line carries may belong to its RETURN TYPE, where nothing runs. Reading it
     // as an expression body would count the line as code and keep a signal over a bare signature.
     it("reads a return type carrying `=>` as a signature, not as an expression body", async () => {

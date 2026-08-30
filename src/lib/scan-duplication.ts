@@ -51,9 +51,14 @@ export interface DuplicationFilter {
 }
 
 /**
- * What one source line contributes. `code` is the only class that does work; `blank` and
+ * What one source line contributes. `code` and `body` are the classes that do work; `blank` and
  * `structural` (a lone brace, a JSX closer) are neither — they say nothing about the block either
  * way. Everything between is declaration: prose, an import specifier, a type field, a parameter.
+ *
+ * `body` is the one line that carries a function's WHOLE executable body — the `) => execute(…)`
+ * or `) { return x; }` that closes a multiline parameter list. It computes like `code` does, and it
+ * additionally proves the window holds a complete function definition, which is what lets it
+ * outweigh the parameter lines above it.
  */
 type LineClass =
   | "blank"
@@ -63,7 +68,8 @@ type LineClass =
   | "type"
   | "declaration"
   | "signature"
-  | "code";
+  | "code"
+  | "body";
 
 /** The classes that make a block a declaration rather than a computation. */
 const DECLARATIVE: ReadonlySet<LineClass> = new Set<LineClass>([
@@ -560,11 +566,11 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
             }
           }
         }
-        classes.push(
-          arrow === "absent" || hasParameterDefault(line) || (tail !== undefined && hasInlineBody(tail))
-            ? "code"
-            : "signature",
-        );
+        // An `absent` arrow means the construct was a parenthesized expression, never a function, so
+        // its closing line runs as ordinary code rather than carrying a declaration's body.
+        const carriesBody = arrow !== "absent" && tail !== undefined && hasInlineBody(tail);
+        const computes = arrow === "absent" || hasParameterDefault(line);
+        classes.push(carriesBody ? "body" : computes ? "code" : "signature");
         if (tail !== undefined) {
           statement = undefined;
           depth = 0;
@@ -771,8 +777,15 @@ function describeBlock(classes: LineClass[]): string {
  *
  * A window with NO content line at all — nothing but blanks and closers — is not code either, and
  * is reported in those terms rather than as a block that declares.
+ *
+ * The majority is overridden by one line only: a `body`. A window holding a function's whole
+ * executable body is a duplicated FUNCTION, parameter list and all, however many parameter lines
+ * precede it — real duplicated computation an operator can extract. That is not the case a stray
+ * literal default makes (`budgetAware = false`, which computes nothing), so the override is tied to
+ * a recognized body rather than to any `code` line at all.
  */
 function isCodeBlock(classes: LineClass[]): boolean {
+  if (classes.includes("body")) return true;
   const code = classes.filter((cls) => cls === "code").length;
   const declarative = classes.filter((cls) => DECLARATIVE.has(cls)).length;
   return code > 0 && code >= declarative;
