@@ -208,11 +208,14 @@ const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|
  * the slash before a divisor expects an expression exactly as `+` does. The `//` and `/*` forms are
  * recognized ahead of this rule everywhere it is read, so a comment's own slashes never reach it.
  *
+ * Bitwise-not is in the set for the same reason as `!`: `~/[/*]/.test(input)` coerces a match, and
+ * `~` is prefix-only — it never follows a value, so a `/` behind it can never divide.
+ *
  * `++`/`--` are excluded, since `i++ / 2` divides: the trailing `+` there is a postfix operator that
  * DOES yield a value. `<` and `>` are held apart in `COMPARISON_OPERATORS`, since they lead an
  * expression only across whitespace.
  */
-const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^/]|(?<!\+)\+|(?<!-)-`;
+const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^/~]|(?<!\+)\+|(?<!-)-`;
 
 /**
  * The comparison operators, which expect an expression next exactly as the binary operators above do
@@ -236,7 +239,7 @@ const COMPARISON_OPERATORS = String.raw`[<>]=?`;
  * parameter list — turning a genuine clone of runtime work into a declaration and dropping it.
  */
 const REGEX_LITERAL = new RegExp(
-  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS}|${COMPARISON_OPERATORS}(?=\s))(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
+  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS}|${COMPARISON_OPERATORS}(?=\s))(\s*)\/(?:\\.|\[([{,;:=!&|?*%^/]:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
   "g",
 );
 

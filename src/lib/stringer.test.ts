@@ -2214,6 +2214,31 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // Bitwise-not leads an expression too — `~/[/*]/.test(input)` coerces a match to a number. Read
+    // as division, the `/*` inside the character class opens a comment that runs to the end of the
+    // file and every real duplication window below it is dropped unread.
+    it("reads a slash after a bitwise-not as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/coerce.ts": [
+          "export const marker = ~/[/*]/.test(input);",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/coerce.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/coerce.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // A comparison leads an expression too — `value < /[/*]/.source` compares against a regex's
     // source. Read as a comparison all the way through, the `/*` inside the character class opens a
     // comment that runs to the end of the file and every real duplication window below it is
