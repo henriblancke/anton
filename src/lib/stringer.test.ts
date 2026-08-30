@@ -2793,6 +2793,78 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // Rust's `r#"…"#` holds arbitrary text that no escape can end, and a fixture inside one
+    // routinely quotes source. Untracked, an `import (` in that text opens import state that no real
+    // `)` closes, and every executable window past the closing `"#` is dropped as a specifier list.
+    it("tracks a Rust raw string so a declaration inside it cannot swallow the code below", async () => {
+      const repo = writeRepo({
+        "src/fixture.rs": [
+          "fn load(rows: &[Row]) {",
+          "    // the opening fragment of a generated file — its `(` closes in a later chunk",
+          '    let header = r#"',
+          "import (",
+          '    "fmt"',
+          '"#;',
+          "    let total = compute(rows);",
+          "    report(total);",
+          "    flush(total);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/aliases.rs": [
+          "type Rows = Vec<Row>;",
+          "type Names = Vec<String>;",
+          "type Counts = Vec<usize>;",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/fixture.rs", 7]], 3),
+        clone([["src/aliases.rs", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the alias list beside it is still dropped, so the survivor is the raw-string
+      // state rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/fixture.rs", Line: 7 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/aliases.rs" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 type");
+    });
+
+    // `type` is an executable BUILTIN in shell — `type git` asks whether a command is on the PATH —
+    // not an erased declaration. Read as one, a duplicated block of availability checks is dropped
+    // as if it were a field list and the real clone never reaches triage.
+    it("reads shell's `type` as the command it is, not as a type declaration", async () => {
+      const repo = writeRepo({
+        "scripts/preflight.sh": [
+          "#!/usr/bin/env bash",
+          "type git",
+          "type bun",
+          "type jq",
+          "",
+        ].join("\n"),
+        "src/kind.ts": [
+          "export type Kind = 'draft';",
+          "export type Mode = 'ready';",
+          "export type Stage = 'done';",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/preflight.sh", 2]], 3),
+        clone([["src/kind.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the TypeScript alias list beside it is still dropped, so the gate is by
+      // LANGUAGE rather than the recognizer having been removed.
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/preflight.sh" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/kind.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 type");
+    });
+
     // A file anton could not READ is not a file that is GONE: `EACCES`, `EMFILE` and the like say
     // nothing about the block, so the signal keeps its place instead of being dropped as rewritten
     // away. Here the unreadable path is a directory — an `EISDIR` that needs no permission games.

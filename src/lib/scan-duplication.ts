@@ -65,6 +65,22 @@ const TRIPLE_QUOTE_EXTENSIONS = [".py", ".pyi"];
  */
 const BOUND_BARE_IMPORT_EXTENSIONS = [".go"];
 
+/**
+ * Where a string spans lines behind delimiters NO escape can end — Rust's `r"…"` and `r#"…"#`. The
+ * same characters elsewhere are an identifier beside a quote, so reading them as an opener would
+ * swallow the rest of the file.
+ */
+const RAW_STRING_EXTENSIONS = [".rs"];
+
+/**
+ * Where `type X`, `interface X` and the erased `enum` forms DECLARE a type. `type` is an executable
+ * builtin in shell — `type git` asks whether a command exists — so reading it as a declaration there
+ * files a duplicated block of availability checks as a field list and drops it. An ALLOW-list for
+ * that reason: a language anton has no rule for keeps its signals rather than losing them to
+ * TypeScript's grammar.
+ */
+const TYPE_DECLARATION_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".go", ".rs"];
+
 /** One duplication signal the filter removed, and the proof that removed it. */
 export interface DroppedDuplication {
   /** The file stringer named, as it spelled it. */
@@ -487,6 +503,87 @@ function maskTripleQuoted(
   return { text, open: quote };
 }
 
+/**
+ * Rust's raw string opener — `r"`, `r#"`, `br##"`, `cr#"`. The hashes are CAPTURED because only a
+ * `"` carrying the same number of them closes the string; that is the whole point of the form.
+ * Sticky, so it is read at one position rather than searched for, and whether the token starts
+ * there is the caller's check — an `r` inside an identifier opens nothing.
+ */
+const RAW_STRING_OPEN = /(?:b|c)?r(#*)"/y;
+
+/**
+ * Rust's char literal — `'x'`, `'\n'`, `'\u{1f600}'`. A `'` that opens none of those is a lifetime
+ * (`&'a str`), which delimits nothing: read as a quote it would swallow the rest of the line and
+ * hide a raw string opening after it.
+ */
+const CHAR_LITERAL = /^'(?:\\[^']*|[^'\\])'/;
+
+/**
+ * Blank the Rust raw strings a line carries, INCLUDING the one it leaves open. `r#"…"#` holds
+ * arbitrary text that no escape sequence can end — an embedded query, a shell snippet, a fixture of
+ * source code — so without this its text reaches the declaration classifiers as syntax: an
+ * `import (` quoted inside one opens import state that no real `)` closes, and every executable
+ * window past the closing `"#` inherits the class and is dropped as a specifier list.
+ *
+ * The hash COUNT is carried rather than a flag, since a `"#` inside an `r##"…"##` string closes
+ * nothing. Quoted strings, char literals and comments are stepped over, so an `r"` inside any of
+ * them opens nothing; the count is returned so the next line resumes behind the same delimiter.
+ */
+function maskRawString(
+  line: string,
+  open: number | undefined,
+): { text: string; open: number | undefined } {
+  let hashes = open;
+  let text = hashes === undefined ? "" : '""';
+  let i = 0;
+  while (i < line.length) {
+    if (hashes !== undefined) {
+      if (line[i] === '"' && line.startsWith("#".repeat(hashes), i + 1)) {
+        i += 1 + hashes;
+        hashes = undefined;
+      } else i += 1;
+      continue;
+    }
+    const char = line[i];
+    // Only where a token STARTS: `bar"` is an identifier beside a string, and `r#type` is a raw
+    // identifier — neither opens anything.
+    if (!/\w/.test(line[i - 1] ?? "")) {
+      RAW_STRING_OPEN.lastIndex = i;
+      const opened = RAW_STRING_OPEN.exec(line);
+      if (opened) {
+        hashes = opened[1].length;
+        text += '""';
+        i += opened[0].length;
+        continue;
+      }
+    }
+    if (char === "'") {
+      const literal = CHAR_LITERAL.exec(line.slice(i));
+      const end = literal ? i + literal[0].length : i + 1;
+      text += line.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (char === '"') {
+      const end = afterQuoted(line, i);
+      text += line.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (char === "/" && line[i + 1] === "/") break;
+    if (char === "/" && line[i + 1] === "*") {
+      const close = line.indexOf("*/", i + 2);
+      if (close < 0) break;
+      text += line.slice(i, close + 2);
+      i = close + 2;
+      continue;
+    }
+    text += char;
+    i += 1;
+  }
+  return { text, open: hashes };
+}
+
 /** Net nesting a line opens, over the brackets given — `stripNoise`d, so a brace in a string is not one. */
 function nestingDelta(line: string, open: string, close: string): number {
   const text = stripNoise(line);
@@ -761,6 +858,8 @@ function classifyLines(
     tripleQuotes: boolean;
     nestedComments: boolean;
     boundBareImport: boolean;
+    rawStrings: boolean;
+    typeDeclarations: boolean;
   },
 ): LineClass[] {
   const classes: LineClass[] = [];
@@ -784,6 +883,8 @@ function classifyLines(
   let template: TemplateFrame[] = [];
   // The triple-quote delimiter an open Python string is behind; undefined outside one.
   let tripleQuote: TripleQuote | undefined;
+  // How many `#` the open Rust raw string's closer must carry; undefined outside one.
+  let rawString: number | undefined;
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
   // Whether the open import is a side-effect one: held as an `import` so it terminates on its own
@@ -818,6 +919,18 @@ function classifyLines(
       line = walked.rest.trim();
       if (line === "") {
         classes.push("comment");
+        continue;
+      }
+    }
+    // Inside an open raw string the line is raw text, exactly as template and docstring text are:
+    // an embedded snippet declares nothing and its delimiters are not syntax. Read before the
+    // template, comment and blank tests, since a line of raw text starting with `//` is not prose.
+    if (rawString !== undefined) {
+      const masked = maskRawString(line, rawString);
+      rawString = masked.open;
+      line = masked.text.trim();
+      if (rawString !== undefined || line === "") {
+        classes.push("code");
         continue;
       }
     }
@@ -869,6 +982,17 @@ function classifyLines(
       }
       // The comment closed and something followed it: that suffix is what the line does.
       line = opened.rest;
+    }
+
+    // A raw string this line OPENS and does not close — `let query = r#"` over an embedded
+    // snippet. Blanked ahead of the template masker, because a raw string holds ANY text: a
+    // backtick inside one would otherwise open a template that runs past the string's own close.
+    if (opts.rawStrings) {
+      const masked = maskRawString(line, undefined);
+      if (masked.open !== undefined) {
+        rawString = masked.open;
+        line = masked.text.trim();
+      }
     }
 
     // A template this line OPENS and does not close: blank its text now, so the delimiters inside it
@@ -998,7 +1122,7 @@ function classifyLines(
     const kind =
       IMPORT_START.test(line) || FROM_IMPORT_START.test(line)
         ? "import"
-        : TYPE_START.test(line)
+        : opts.typeDeclarations && TYPE_START.test(line)
           ? "type"
           : "code";
     classes.push(kind);
@@ -1112,6 +1236,8 @@ function sourceIndex(repoPath: string) {
         tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         nestedComments: NESTED_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         boundBareImport: BOUND_BARE_IMPORT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        rawStrings: RAW_STRING_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        typeDeclarations: TYPE_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
     cache.set(path, result);
