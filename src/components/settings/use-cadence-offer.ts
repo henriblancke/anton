@@ -217,7 +217,13 @@ export function useCadenceOffer({
    * picker is cycled. Re-opened from the live rows, so it stays silent unless the premise holds.
    */
   async function aroundSetCron(id: string, write: () => Promise<boolean>) {
-    if (id === offer?.automationId) withdraw();
+    // Keyed on the row the offer is ever ABOUT, not on a question being on screen: an accept or
+    // decline already in flight left the screen empty, and the restore it may still perform reads
+    // the generation to know its premise died (see {@link restorable}). Without the bump, an edit
+    // back to the cadence the offer was derived from reads as restorable, so a failed answer would
+    // resurrect a question the operator has since answered by hand — and this edit landing would
+    // not take it away, because it withdrew nothing.
+    if (id === CADENCE_COUPLED_AUTOMATION) withdraw();
     const stored = await write();
     if (!stored && id === CADENCE_COUPLED_AUTOMATION) ask();
   }

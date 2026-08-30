@@ -137,6 +137,74 @@ describe("a hand cadence edit that lands", () => {
 });
 
 /**
+ * A hand edit made while an ANSWER is in flight. The offer is already off screen, so the edit has no
+ * question to take away — but the answer can still put one back, and an edit that lands afterwards
+ * would not remove it. The operator would be left with a prompt to overwrite the cadence they just
+ * chose by hand.
+ */
+describe("a hand cadence edit while an answer is in flight", () => {
+  it("keeps a failed accept from resurrecting a question the edit has already answered", async () => {
+    const rows = {
+      current: {
+        "board-picker": { enabled: true, cron: "*/10 * * * *" },
+        "product-master": { enabled: true, cron: WEEKLY },
+      } as Rows,
+    };
+    let failAccept!: (ok: boolean) => void;
+    const setCron = vi.fn(() => {
+      rows.current = { ...rows.current, "product-master": { enabled: true, cron: DAILY } };
+      return new Promise<boolean>((resolve) => {
+        failAccept = resolve;
+      });
+    });
+    const { result } = renderHook(() =>
+      useCadenceOffer({
+        rows,
+        initialRows: rows.current,
+        keepWeekly: false,
+        patchSettings: vi.fn(async () => new Response("{}", { status: 200 })),
+        setCron,
+      }),
+    );
+    expect(result.current.offer).not.toBeNull();
+
+    // The accept goes out and is still open when the operator picks the original weekly cadence
+    // back by hand — the very cron the offer was derived from.
+    let accepting!: Promise<void>;
+    act(() => {
+      accepting = result.current.accept();
+    });
+    expect(result.current.offer).toBeNull();
+
+    let landEdit!: (ok: boolean) => void;
+    let edit!: Promise<void>;
+    act(() => {
+      edit = result.current.aroundSetCron("product-master", () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return new Promise<boolean>((resolve) => {
+          landEdit = resolve;
+        });
+      });
+    });
+
+    // The accept fails against a row that reads exactly like the offer's premise — but that premise
+    // is the operator's own later choice, not the one the question was asked about.
+    await act(async () => {
+      failAccept(false);
+      await accepting;
+    });
+    expect(result.current.offer).toBeNull();
+
+    // The edit lands, so nothing re-asks: it withdrew the question rather than deferring it.
+    await act(async () => {
+      landEdit(true);
+      await edit;
+    });
+    expect(result.current.offer).toBeNull();
+  });
+});
+
+/**
  * The question survives the operator walking away from it. Nothing about "the picker is armed and
  * product-master still runs weekly" expires when the page unmounts, and only an ANSWER — accept, so
  * the cadence is no longer weekly; decline, so the opt-out is on record — ends it.
