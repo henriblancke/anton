@@ -300,9 +300,29 @@ describe("answerGateWait — resume closes the gate FIRST", () => {
       ],
     } as Bead;
     loadAllIssues.mockResolvedValue([ticket, runTarget(), gate(), second]);
+    // Each mark is held OPEN: a call count alone would also be produced by starting a tag, nudging
+    // while it is still in flight, and awaiting it after. The nudge pushes immediately, so a push
+    // over a half-written batch leaves the other gate remotely unmarked — the exact state
+    // gate-check re-dispatches from.
+    const marks = new Map([
+      ["g-1", deferred()],
+      ["g-2", deferred()],
+    ]);
+    beadsTag.mockImplementation(async (_repo, id) => {
+      await marks.get(id)!.promise;
+    });
 
-    await answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+    const answering = answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+    await settle();
 
+    expect(nudgeSync).not.toHaveBeenCalledWith(project, "gate-resumed");
+    marks.get("g-1")!.resolve();
+    await settle();
+
+    expect(nudgeSync).not.toHaveBeenCalledWith(project, "gate-resumed");
+    marks.get("g-2")!.resolve();
+
+    await answering;
     expect(beadsTag.mock.calls.map(([, id]) => id).sort()).toEqual(["g-1", "g-2"]);
     // One nudge for the whole batch of marks — a push carries whatever landed.
     expect(nudgeSync.mock.calls.filter(([, label]) => label === "gate-resumed")).toHaveLength(1);
@@ -476,8 +496,22 @@ describe("answerGateWait — the dispatch rule that holds a resume", () => {
 
 describe("resolving the gate itself", () => {
   it("pushes the close out, like every other operator board write", async () => {
-    await answerGateWait(project, "abandon", view(), "g-1");
+    // The close is held OPEN: the nudge syncs immediately, so one fired while the close is still in
+    // flight pushes a board that does not carry it yet — and the teammates this push exists for keep
+    // reading the wait as open.
+    const closing = deferred();
+    gateResolve.mockImplementation(async () => {
+      await closing.promise;
+      return "ok";
+    });
 
+    const answering = answerGateWait(project, "abandon", view(), "g-1");
+    await settle();
+
+    expect(nudgeSync).not.toHaveBeenCalledWith(project, "gate-resolve");
+    closing.resolve();
+
+    await answering;
     expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resolve");
   });
 

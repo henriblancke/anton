@@ -318,18 +318,21 @@ describe("actOnBead", () => {
 
   // `abandonTicket` kills only an ACTIVE job, but an escalation is raised precisely against work
   // that already stopped — so the stopped local rows are settled here or the next sweep re-raises.
-  // The abandon is held OPEN rather than resolved on call: settling the local rows over an unlanded
-  // abandon produces the same trace, and if that abandon then refuses the bead stays open behind
-  // job and run rows this already terminalized.
+  // Each step is held OPEN rather than resolved on call: settling the local rows over an unlanded
+  // step produces the same trace, and if that step then refuses the row it guards is terminalized
+  // anyway — the bead left open behind job and run rows this already closed, or the run
+  // terminalized behind a job that was never cancelled and keeps retrying.
   it("settles the parked run and the exhausted job the escalation named, after the bead", async () => {
     const order: string[] = [];
     const abandoning = deferred();
+    const cancelling = deferred();
     abandonTicket.mockImplementation(async () => {
       order.push("bead");
       await abandoning.promise;
     });
     cancelJob.mockImplementation(async () => {
       order.push("job");
+      await cancelling.promise;
       return { ok: true };
     });
     settleParkedRun.mockImplementation(async () => {
@@ -342,6 +345,11 @@ describe("actOnBead", () => {
 
     expect(order).toEqual(["bead"]);
     abandoning.resolve();
+    await settle();
+
+    expect(order).toEqual(["bead", "job"]);
+    expect(settleParkedRun).not.toHaveBeenCalled();
+    cancelling.resolve();
 
     expect(await acting).toBe("abandoned");
     expect(order).toEqual(["bead", "job", "run"]);
