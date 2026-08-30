@@ -25,6 +25,8 @@
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads, gateReason, type Gate } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
@@ -42,11 +44,13 @@ import {
   createExecuteEpicSandbox,
   createTicket,
   makeEpicRunner,
+  enqueueEpicJob,
   driveEpicRun,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
 describeBd("execute-epic e2e — the human gate (real handler · real bd/git · fake claude/gh)", () => {
+  let sandbox: string;
   let repo: string;
   let binDir: string;
   let tdb: ExecuteEpicSandbox["tdb"];
@@ -57,7 +61,7 @@ describeBd("execute-epic e2e — the human gate (real handler · real bd/git · 
 
   beforeAll(async () => {
     ctx = await createExecuteEpicSandbox();
-    ({ repo, binDir, tdb, clock, projectId, successClaude } = ctx);
+    ({ sandbox, repo, binDir, tdb, clock, projectId, successClaude } = ctx);
   });
 
   afterAll(() => {
@@ -345,6 +349,76 @@ process.exit(0);`),
       expect(run.error).toContain(ask);
       expect(run.error).toMatch(/human gate could NOT be created/);
       expect(run.error).not.toMatch(/closing that gate resumes this run/);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("arms NO gate when the ticket was abandoned while the ask was in flight (anton-287p)", async () => {
+    // A cancellation that lands just after the agent asks. The ask must NOT become board state: a
+    // `human` gate blocks the target until a person clears it by hand, and an abandoned ticket's run
+    // is over — nothing would ever resolve it, so the target would be left waiting on an ask nobody
+    // asked for. The abandon arrives here the way a cross-machine one does (by sync, while the job
+    // keeps running) rather than through a kill, which is what makes it observable end to end.
+    const ask = "someone has to approve the MARKER_ABANDONED_ASK vendor contract";
+    const feature = await approvedFeature("Ask overtaken by an abandon");
+    const started = join(sandbox, "ask-abandon-started");
+    const go = join(sandbox, "ask-abandon-go");
+    // Announce, then hold the ask until the test has abandoned the ticket — the ordering the race
+    // needs, without a sleep to lose.
+    const claude = writeBin(
+      binDir,
+      "claude-ask-abandoned",
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+const text='I got as far as I could.\\n\\nANTON-RESULT: needs-human — '+${JSON.stringify(ask)};
+e({type:'system',subtype:'init',session_id:'ask'});
+fs.writeFileSync(${JSON.stringify(started)},'1');
+const finish=()=>{
+  e({type:'assistant',message:{content:[{type:'text',text}]}});
+  e({type:'result',subtype:'success',result:text,session_id:'ask',num_turns:1,is_error:false});
+  process.exit(0);
+};
+const waitForGo=()=>fs.existsSync(${JSON.stringify(go)})?finish():setTimeout(waitForGo,50);
+waitForGo();`),
+    );
+
+    const runner = makeEpicRunner(ctx, { leaseMs: 60_000 });
+    process.env.ANTON_CLAUDE_BIN = claude;
+    let jobId: string | undefined;
+    try {
+      jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: feature.id });
+      void runner.tickOnce();
+      const deadline = Date.now() + 40_000;
+      while (!existsSync(started) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(existsSync(started)).toBe(true);
+
+      await beads.abandon(repo, feature.ticket, "changed our minds while it was asking");
+      writeFileSync(go, "1");
+      await runner.whenIdle();
+
+      // Nothing was armed — no gate blocks the target, orphan or otherwise.
+      expect(await gatesBlocking(feature.id)).toEqual([]);
+
+      // The run settled FAILED and ended, carrying the ask and saying plainly that no gate holds it.
+      const run = await runFor(feature.id);
+      expect(run.status).toBe("failed");
+      expect(run.endedAt ?? null).not.toBeNull();
+      expect(run.error).toContain(ask);
+      expect(run.error).toMatch(/armed NO gate/);
+      expect(run.error).not.toMatch(/bd gate resolve/);
+
+      // The operator's own decision stands: the ticket stays closed + abandoned, never reopened or
+      // blocked by the unwinding handler.
+      const bead = await beads.show(repo, feature.ticket);
+      expect(bead.status).toBe("closed");
+      expect(beads.isAbandoned(bead)).toBe(true);
+
+      // Poison, so the job parks rather than retrying an ask a retry cannot answer; nothing shipped.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      expect(beads.getPrRef(await beads.show(repo, feature.id)) ?? null).toBeNull();
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");

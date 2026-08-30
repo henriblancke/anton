@@ -1589,7 +1589,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         error: [timeoutNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
       });
       await safe(() => removeWorktree(worktree));
-    } catch (e) {
+    } catch (raw) {
+      // A kill that lands while this handler unwinds (releasing children costs several bd writes)
+      // arrives too late for runTicket's own abort check but is still an operator stopping the run —
+      // and the ask below is the one branch that would write NEW board state on the way out. Convert
+      // it here too, so the gate is armed only for a run nobody cancelled (anton-287p).
+      const e =
+        raw instanceof NeedsHumanError && ctx.signal.aborted
+          ? new CancelledAskError(raw.ticketId, "aborted", raw.ask)
+          : raw;
       // Give the children back before settling the row (anton-0d85). This attempt has stopped —
       // parked on a blocking review, killed by an abandon, backed off after losing the lease race, or
       // failed outright — so holding its reservations would leave the whole feature invisible to
@@ -2037,6 +2045,12 @@ async function runTicket(args: {
     if (ctx.signal.aborted || settledElsewhere) {
       const why = ctx.signal.aborted ? "aborted" : "abandoned";
       await appendSessionLog(logPath, `[${why}] ${ticket.id} was ${why} mid-run\n`).catch(() => {});
+      // "Writes nothing to the board" covers the RUN's writes too, and the ask is one of them: the
+      // run-level catch turns a NeedsHumanError into a `human` gate blocking the target. That gate
+      // outlives the cancellation — a person must clear it by hand, and on an abandoned target
+      // gate-check never resumes anything that would. Cancellation wins; the ask travels as a plain
+      // stop instead, carrying what was asked so it still reaches the operator through the run row.
+      if (e instanceof NeedsHumanError) throw new CancelledAskError(ticket.id, why, e.ask);
       throw e;
     }
     // Release the claim so the board never shows a dead session's ticket as in-flight
@@ -2571,6 +2585,27 @@ class NeedsHumanError extends Error {
     super(
       `${ticketId} needs a human: ${ask ?? "(the agent named no ask)"}. The run is parked until ` +
         `someone answers it.`,
+    );
+    this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * A {@link NeedsHumanError} that a cancellation overtook (anton-287p): the agent asked for a human,
+ * and by the time the ask reached the run's catch the job had been force-killed or the ticket
+ * abandoned. Thrown in the ask's place so NO gate is armed — a `human` gate is new board state that
+ * blocks the target until a person resolves it by hand, and arming one on a run someone just stopped
+ * (an abandoned target especially, which gate-check will never resume) leaves a wait nobody asked
+ * for. The ask still reaches the operator, through this run's error.
+ *
+ * Poison-classified exactly like the error it replaces: a retry cannot answer an ask either.
+ */
+class CancelledAskError extends Error {
+  constructor(ticketId: string, why: "aborted" | "abandoned", ask: string | undefined) {
+    super(
+      `${ticketId} needed a human: ${ask ?? "(the agent named no ask)"}. The ticket was ${why} ` +
+        `first, so the run stopped there and armed NO gate — nothing on the board carries the ask. ` +
+        `Answer it and re-run the target if the work is still wanted.`,
     );
     this.name = "PoisonError"; // classified as poison by the runner
   }
