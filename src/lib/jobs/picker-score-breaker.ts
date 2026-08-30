@@ -74,10 +74,12 @@ export async function checkScoreSlide(
   input: ScoreBreakerInput,
 ): Promise<ScoreBreakerOutcome | undefined> {
   const { projectId } = input;
+  // Reconciled BEFORE the config is honoured — same reason as its sibling breaker: a half-written
+  // latch, or a strip row left open by a re-arm whose settle failed, outlives the setting that
+  // raised it, and nothing else ever repairs either one.
+  const disarmed = await activeDisarmForPass(db, clock, projectId);
   const config = resolveScoreBreaker(await getProjectSettings(db, projectId));
-  if (!config) return undefined;
-  // Repairs a latch whose escalation write never landed — no later pass would (see activeDisarmForPass).
-  if (await activeDisarmForPass(db, clock, projectId)) return undefined;
+  if (!config || disarmed) return undefined;
 
   const since = await lastReArmAt(db, projectId);
   const series = await readScoreSeries(db, projectId, config.window, since);

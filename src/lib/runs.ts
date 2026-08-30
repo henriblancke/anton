@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
@@ -257,6 +257,21 @@ export async function listRecentRuns(
   return (await recentRunRows(db, projectId, limit)).map(toSummary);
 }
 
+/**
+ * The newest `limit` runs of a project, in a TOTAL order (anton-rgso).
+ *
+ * `updatedAt` is stored whole-second, so runs settling in the same second tie on it — and with
+ * concurrent execution that is ordinary, not exotic. Left as the only key, SQLite is free to return
+ * such a tie either way round, and the autopilot breakers read this list as a sequence: one
+ * delivered run placed before rather than after two same-second failures resets a streak instead of
+ * latching it, and at the boundary the `limit` itself would take different rows on different reads.
+ *
+ * Nothing persisted records settlement order below the second, so the tie-break is the closest
+ * proxy the rows do carry — attempt order: the run that STARTED later is the later attempt (the same
+ * rule the failure breaker's cancel-matching uses), and `rowid`, SQLite's own insertion counter,
+ * finishes the job for attempts that also started in the same second. The result is deterministic,
+ * which is the property the readers actually need.
+ */
 function recentRunRows(
   db: AntonDb,
   projectId: string,
@@ -266,7 +281,7 @@ function recentRunRows(
     .select()
     .from(schema.runs)
     .where(eq(schema.runs.projectId, projectId))
-    .orderBy(desc(schema.runs.updatedAt))
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.startedAt), sql`rowid desc`)
     .limit(limit);
 }
 

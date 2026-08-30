@@ -9,7 +9,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { activeDisarm, disarmAutopilot, reArmAutopilot } from "../autopilot-disarm";
+import {
+  activeDisarm,
+  disarmAutopilot,
+  disarmWithEscalation,
+  reArmAutopilot,
+} from "../autopilot-disarm";
 import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Bead } from "../beads/types";
 import type { Clock } from "./queue";
@@ -187,6 +192,27 @@ describe("checkFailureStreak", () => {
     await threeFailures();
 
     expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
+  });
+
+  it("settles a stranded strip row even with the breaker switched off", async () => {
+    // The re-arm lifted the latch but its own settle never landed, and the operator then turned the
+    // breaker off. Nothing else repairs that row — re-arming can only answer `not-disarmed`, and the
+    // strip refuses to dismiss the kind — so gating the repair behind the config strands it in
+    // "Needs you" for good.
+    await project({ autopilotFailureStreak: 0 });
+    await disarmWithEscalation(t.db, clock, {
+      projectId: PROJECT,
+      reason: "consecutive-failures",
+      detail: "3 runs in a row ended without delivering",
+    });
+    await t.db
+      .update(schema.autopilotDisarms)
+      .set({ rearmedAt: new Date(T0 + 30 * MINUTE), rearmedBy: "ops" });
+    expect(await listOpenEscalations(t.db, PROJECT)).toHaveLength(1);
+
+    expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
+
+    expect(await listOpenEscalations(t.db, PROJECT)).toHaveLength(0);
   });
 
   it("honours an operator's longer streak", async () => {

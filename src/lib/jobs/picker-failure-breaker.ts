@@ -113,10 +113,14 @@ export async function checkFailureStreak(
   input: FailureBreakerInput,
 ): Promise<FailureBreakerOutcome | undefined> {
   const { projectId } = input;
+  // Reconciled BEFORE the config is honoured, not after: this call is the only second chance either
+  // half-written latch gets (see activeDisarmForPass), and both halves outlive the setting that
+  // raised them. An operator who turns the breakers off while a strip row is stranded — an open
+  // `autopilot-disarm` whose latch a re-arm already lifted — would otherwise leave it in "Needs you"
+  // forever, since re-arming answers `not-disarmed` and dismissal refuses the kind.
+  const disarmed = await activeDisarmForPass(db, clock, projectId);
   const config = resolveFailureBreaker(await getProjectSettings(db, projectId));
-  if (!config) return undefined;
-  // Repairs a latch whose escalation write never landed — no later pass would (see activeDisarmForPass).
-  if (await activeDisarmForPass(db, clock, projectId)) return undefined;
+  if (!config || disarmed) return undefined;
 
   const since = await lastReArmAt(db, projectId);
   const outcomes = await readRunOutcomes(db, projectId, input.board, config.threshold, since);

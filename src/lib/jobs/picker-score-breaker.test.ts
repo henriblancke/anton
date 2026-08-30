@@ -168,6 +168,26 @@ describe("checkScoreSlide", () => {
     );
   });
 
+  it("repairs a half-written latch even with the floor zeroed", async () => {
+    // The freeze landed and its strip row did not. Every breaker returns early once a latch exists,
+    // so this pass is the only second chance the escalation write ever gets — and the latch outlives
+    // the setting that raised it, so a disabled breaker must still finish the job.
+    await project({ autopilotScoreFloor: 0 });
+    await disarmAutopilot(t.db, clock, {
+      projectId: PROJECT,
+      reason: "score-regression",
+      detail: "3 consecutive runs scored below 7/10 (6, 5, 4)",
+      evidence: ["r1 · anton-a · 6/10"],
+    });
+
+    expect(await checkScoreSlide(t.db, clock, { projectId: PROJECT })).toBeUndefined();
+
+    const open = (await listOpenEscalations(t.db, PROJECT)).map(toEscalationView);
+    expect(open).toHaveLength(1);
+    expect(open[0]?.kind).toBe("autopilot-disarm");
+    expect((await activeDisarm(t.db, PROJECT))?.escalationId).toBe(open[0]?.id);
+  });
+
   it("raises one escalation carrying the same series, and stamps it on the disarm", async () => {
     await project();
     await threeLowRuns();
