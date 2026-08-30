@@ -12,6 +12,7 @@ import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, SyncNotWiredError, UsageLimitError } from "./errors";
 import {
   BUDGET_DEFER_PREFIX,
+  BUDGET_DEFER_PRIOR_SEP,
   complete,
   enqueue,
   getJob,
@@ -78,6 +79,15 @@ describe("hasPriorAttempt (durable evidence of an unfinished attempt)", () => {
     expect(hasPriorAttempt({ attempts: 1, lastError })).toBe(false);
     // Once an attempt has actually run, the stale marker no longer decides it.
     expect(hasPriorAttempt({ attempts: 2, lastError })).toBe(true);
+  });
+
+  it("still counts a refunded attempt whose error a later defer carried inside the marker", () => {
+    // A deferral can land on a row a refunded attempt already ran; `deferQueuedJobs` appends that
+    // attempt's error rather than replacing it, so the evidence survives into the next lease.
+    const lastError =
+      `${BUDGET_DEFER_PREFIX}weekly pace — resumes at 2026-01-01T00:00:00.000Z` +
+      `${BUDGET_DEFER_PRIOR_SEP}usage-limit: resumes at …`;
+    expect(hasPriorAttempt({ attempts: 1, lastError })).toBe(true);
   });
 });
 

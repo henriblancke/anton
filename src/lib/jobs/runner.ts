@@ -16,6 +16,7 @@
  */
 import {
   BUDGET_DEFER_PREFIX,
+  BUDGET_DEFER_PRIOR_SEP,
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
@@ -347,14 +348,17 @@ export function nextAction(
  * not-wired) rewind `attempts`, so the error is the only trace they leave. A human `resumeJob`
  * deliberately clears both for a clean slate, so a resumed job's next attempt reads as its first.
  *
- * The budget governor's `budget: ` marker is the one `lastError` that proves nothing: it is stamped
- * on a QUEUED row that never ran and survives into its first lease, so counting it would withhold a
- * genuine first-attempt no-op as "unknown" for every job pacing ever deferred.
+ * A bare `budget: ` marker is the one `lastError` that proves nothing: the governor stamps it on a
+ * QUEUED row that never ran and it survives into that row's first lease, so counting it would
+ * withhold a genuine first-attempt no-op as "unknown" for every job pacing ever deferred. But a
+ * deferral can also land on a row a REFUNDED attempt already ran (quota, lease-held, not-wired), so
+ * `deferQueuedJobs` carries that attempt's error along inside the marker — evidence again, not pacing.
  */
 export function hasPriorAttempt(job: Pick<JobRow, "attempts" | "lastError">): boolean {
   if (job.attempts > 1) return true;
   if (!job.lastError) return false;
-  return !job.lastError.startsWith(BUDGET_DEFER_PREFIX);
+  if (!job.lastError.startsWith(BUDGET_DEFER_PREFIX)) return true;
+  return job.lastError.includes(BUDGET_DEFER_PRIOR_SEP);
 }
 
 /** An in-flight job's registry entry: the abort handle plus the mutable live-report handle. */

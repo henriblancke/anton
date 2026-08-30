@@ -931,10 +931,36 @@ export async function reschedule(
 }
 
 /**
- * Marker `deferQueuedJobs` stamps on the rows the budget governor holds. It lands on a *queued* job
- * that has never run, so it is a pacing note — not evidence of an attempt (see `hasPriorAttempt`).
+ * Marker `deferQueuedJobs` stamps on the rows the budget governor holds. On its own it is a pacing
+ * note — not evidence of an attempt (see `hasPriorAttempt`).
  */
 export const BUDGET_DEFER_PREFIX = "budget: ";
+
+/**
+ * Separator carrying a row's pre-existing `lastError` through a governor deferral. A governed row is
+ * not always virgin: a refunded attempt (quota, lease-held, not-wired) rewinds `attempts` and leaves
+ * its error as the ONLY trace that the job already ran. Overwriting that with a bare pacing note
+ * would publish the next attempt's "nothing to do" as the whole job's no-op even though the refunded
+ * attempt did durable work, so the marker carries the prior error instead of replacing it.
+ */
+export const BUDGET_DEFER_PRIOR_SEP = " | prior: ";
+
+/**
+ * The attempt evidence a row's `lastError` holds, as SQL: the text carried after the separator when
+ * it is already a governor marker, the whole error when it is not a marker at all, and null when the
+ * row holds nothing but a pacing note. Shared by defer (which re-carries it) and resume (which
+ * restores it), so a marker never accumulates and never swallows the evidence underneath it.
+ */
+function priorErrorSql(): SQL {
+  const col = schema.jobs.lastError;
+  const sep = BUDGET_DEFER_PRIOR_SEP;
+  return sql`case
+    when ${col} is null then null
+    when instr(${col}, ${sep}) > 0 then substr(${col}, instr(${col}, ${sep}) + ${sep.length})
+    when ${col} like ${`${BUDGET_DEFER_PREFIX}%`} then null
+    else ${col}
+  end`;
+}
 
 /**
  * Budget-defer (anton-szld): push the `queued` jobs of `types` for a project out to `retryAtMs`, so
@@ -949,6 +975,9 @@ export const BUDGET_DEFER_PREFIX = "budget: ";
  * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
  * the immediate ones (flag set). Absent → no payload filter (defer every matching row). SQLite maps
  * a JSON `true` to the integer 1 via `json_extract`, so an absent/`false` flag is `IS NOT 1`.
+ *
+ * The pacing note never destroys attempt evidence: any non-marker `lastError` already on the row is
+ * appended to it via {@link BUDGET_DEFER_PRIOR_SEP} rather than overwritten.
  */
 export async function deferQueuedJobs(
   db: AntonDb,
@@ -971,9 +1000,13 @@ export async function deferQueuedJobs(
       : opts.bypass === "exclude"
         ? sql`${bypassExtract} is not 1`
         : undefined;
+  const prior = priorErrorSql();
+  const lastError = opts.lastError
+    ? sql`${opts.lastError} || coalesce(${BUDGET_DEFER_PRIOR_SEP} || (${prior}), '')`
+    : prior;
   const rows = await db
     .update(schema.jobs)
-    .set({ runAt: retryDate, lastError: opts.lastError ?? null, updatedAt: secDate(nowMs) })
+    .set({ runAt: retryDate, lastError, updatedAt: secDate(nowMs) })
     .where(
       and(
         eq(schema.jobs.status, "queued"),
@@ -995,7 +1028,8 @@ export async function deferQueuedJobs(
  * only scans due rows, so disabling pacing wouldn't actually resume them. Pull the governor's own
  * deferrals back to due-now. Scoped by the `budget: ` lastError marker `deferQueuedJobs` writes:
  * quota backoffs and retry reschedules carry different lastError text and are left where they are.
- * Returns how many rows it resumed.
+ * Clearing the marker restores whatever prior error it was carrying, so undoing a hold cannot erase
+ * a refunded attempt's evidence either. Returns how many rows it resumed.
  */
 export async function resumeBudgetDeferredJobs(
   db: AntonDb,
@@ -1006,7 +1040,7 @@ export async function resumeBudgetDeferredJobs(
   const nowDate = secDate(clock.now());
   const rows = await db
     .update(schema.jobs)
-    .set({ runAt: nowDate, lastError: null, updatedAt: nowDate })
+    .set({ runAt: nowDate, lastError: priorErrorSql(), updatedAt: nowDate })
     .where(
       and(
         eq(schema.jobs.status, "queued"),
