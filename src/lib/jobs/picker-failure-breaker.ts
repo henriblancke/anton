@@ -23,9 +23,11 @@
 import { beads } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import {
+  EVEN_WEIGHT,
   describeFailureStreak,
   detectFailureStreak,
   failureStreakEvidence,
+  verdictOf,
   type FailureStreak,
   type FailureWeight,
   type RunOutcome,
@@ -40,12 +42,23 @@ import { getProjectSettings, resolveFailureBreaker } from "../projects";
 import { listRecentRunOutcomes, type RunDetail } from "../runs";
 import { cancelledExecuteEpicJobs, type AntonDb, type CancelledJob, type Clock } from "./queue";
 
+/** How many run rows one page of the streak read costs. */
+const STREAK_PAGE = 20;
+
 /**
- * How far back the breaker looks, at minimum. Wider than any sane threshold so that cancels and
- * still-running rows interleaved with the failures cannot push the streak's oldest member out of the
- * window and quietly shorten it.
+ * The most rows one pass will read before giving up on a streak it has not closed.
+ *
+ * The read is PAGED rather than sized once, because cancels and still-running rows count as neither
+ * failure nor delivery — they are skipped, not treated as a reset — so how many ROWS a streak spans
+ * is not knowable before reading them. A fixed window lets a run of cancels push the streak's oldest
+ * member out of sight and quietly shorten it: two failures behind eighteen cancels would report as
+ * two, and the project stays armed on a third failure nobody read.
+ *
+ * The cap is what keeps that bounded in the opposite direction: a project whose whole history is
+ * cancels has no delivery to stop the walk, and would otherwise re-read its entire runs table on
+ * every picker pass to learn nothing.
  */
-const MIN_STREAK_WINDOW = 20;
+const MAX_STREAK_ROWS = 200;
 
 /**
  * How long after a run last moved a cancel may still be its own — the LEGACY join only.
@@ -138,8 +151,13 @@ export async function checkFailureStreak(
   if (!config || disarmed) return undefined;
 
   const since = await lastReArmAt(db, projectId);
-  const outcomes = await readRunOutcomes(db, projectId, input.board, config.threshold, since);
-  const streak = detectFailureStreak(outcomes, { ...config, weigh: input.weigh });
+  const weigh = input.weigh ?? EVEN_WEIGHT;
+  const outcomes = await readRunOutcomes(db, projectId, input.board, {
+    threshold: config.threshold,
+    weigh,
+    reArmedAt: since,
+  });
+  const streak = detectFailureStreak(outcomes, { ...config, weigh });
   if (!streak) return undefined;
 
   const { disarm, created } = await disarmWithEscalation(db, clock, {
@@ -154,32 +172,41 @@ export async function checkFailureStreak(
 /**
  * The project's recent runs as the breaker reads them, newest first — nothing from before
  * `reArmedAt`, which is the evidence the operator already adjudicated.
+ *
+ * Pages back until the streak is CLOSED (a delivery, the re-arm fence, or the end of history), the
+ * threshold is already met, or the row cap is hit. Reading on past a met threshold within the page
+ * in hand is deliberate: the streak the operator is shown is the whole run of failures, not just
+ * the first N of it, and the page is already read by then.
  */
 async function readRunOutcomes(
   db: AntonDb,
   projectId: string,
   board: readonly Bead[],
-  threshold: number,
-  reArmedAt: number | undefined,
+  { threshold, weigh, reArmedAt }: { threshold: number; weigh: FailureWeight; reArmedAt?: number },
 ): Promise<RunOutcome[]> {
-  const window = Math.max(MIN_STREAK_WINDOW, threshold * 3);
-  const [runs, cancels] = await Promise.all([
-    listRecentRunOutcomes(db, projectId, window),
-    cancelledExecuteEpicJobs(db, projectId),
-  ]);
+  const cancelsRead = cancelledExecuteEpicJobs(db, projectId);
   const abandoned = abandonedIds(board);
   // When each epic's next attempt started, filled in as the walk moves from newest to oldest — the
-  // bound that keeps one cancel from being claimed by two attempts of the same epic.
+  // bound that keeps one cancel from being claimed by two attempts of the same epic. Spans pages,
+  // because so does an epic's retry chain.
   const nextAttemptStart = new Map<string, number>();
-  // Filtered after the read, never before it: the floor only ever drops the OLDEST rows, so the
-  // window still holds the newest `window` runs it was sized to hold.
-  return runs
-    .filter((run) => settledAfterReArm(run, reArmedAt))
-    .map((run) => {
+  const outcomes: RunOutcome[] = [];
+  let weight = 0;
+  let delivered = false;
+
+  for (let offset = 0; offset < MAX_STREAK_ROWS; offset += STREAK_PAGE) {
+    const [page, cancels] = await Promise.all([
+      listRecentRunOutcomes(db, projectId, STREAK_PAGE, offset),
+      cancelsRead,
+    ]);
+    for (const run of page) {
+      // Filtered per row, not per page: the fence only ever drops the OLDEST rows, so dropping one
+      // costs the walk nothing the next page cannot supply.
+      if (!settledAfterReArm(run, reArmedAt)) continue;
       const startedAt = run.startedAt ?? run.updatedAt;
       const nextStart = nextAttemptStart.get(run.epicBeadId);
       nextAttemptStart.set(run.epicBeadId, startedAt);
-      return {
+      const outcome: RunOutcome = {
         id: run.id,
         epicBeadId: run.epicBeadId,
         status: run.status,
@@ -197,5 +224,22 @@ async function readRunOutcomes(
           abandoned.has(run.epicBeadId) ||
           (run.ticketBeadId !== undefined && abandoned.has(run.ticketBeadId)),
       };
-    });
+      outcomes.push(outcome);
+      const verdict = verdictOf(outcome);
+      if (verdict === "delivered") {
+        delivered = true;
+        break;
+      }
+      if (verdict === "failure") weight += weigh(outcome);
+    }
+    // A delivery ends the streak, so nothing older can extend it; a met threshold already latches,
+    // and evidence older than that is not worth another read.
+    if (delivered || weight >= threshold) break;
+    const oldest = page.at(-1);
+    if (page.length < STREAK_PAGE || oldest === undefined) break;
+    // `updatedAt` — not the fence's own `endedAt ?? updatedAt` — is what the page order is on, so
+    // it is the only value that proves every row BEHIND this one is also pre-re-arm.
+    if (reArmedAt !== undefined && oldest.updatedAt <= reArmedAt) break;
+  }
+  return outcomes;
 }

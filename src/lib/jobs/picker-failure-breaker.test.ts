@@ -245,6 +245,32 @@ describe("checkFailureStreak", () => {
     expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2", "r3", "r4"]);
   });
 
+  it("pages past a run of cancels to the failure a fixed window would have hidden", async () => {
+    // Cancels are skipped rather than treated as a reset, so a single fixed-size read can stop one
+    // row short of a still-consecutive failure — and the project stays armed on a streak that has
+    // already tripped.
+    await project();
+    await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
+    for (let i = 0; i < 18; i += 1) {
+      const epic = `anton-x${i}`;
+      const job = await cancelledJob(epic, 20 + i * 5);
+      await run({
+        id: `c${i}`,
+        epic,
+        status: "failed",
+        startedMinutes: 15 + i * 5,
+        error: "stopped",
+        job,
+      });
+    }
+    await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 200, error: "boom" });
+    await run({ id: "r3", epic: "anton-c", status: "failed", startedMinutes: 215, error: "boom" });
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    expect(outcome?.latched).toBe(true);
+    expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2", "r3"]);
+  });
+
   it("resets on a delivered run", async () => {
     await project();
     await threeFailures();
