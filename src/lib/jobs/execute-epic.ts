@@ -2316,14 +2316,20 @@ export function humanGatePlan(
  *   • THIS ask ALREADY ARMED — return that gate's id, create nothing. Two gates for one ask is one
  *     dead wait: resolving either leaves the target blocked by the other.
  *   • A DIFFERENT ask ANTON armed — this run stopped for a new reason, so the old wait is superseded
- *     and resolved here. Nothing else ever would, and it blocks the target while it lives.
+ *     and resolved here. Nothing else ever would, and it blocks the target while it lives. Retired
+ *     only AFTER the replacement is armed, never before: a create that fails between the two would
+ *     otherwise leave the target with no wait at all on an ask nobody answered — runnable again, and
+ *     on a shared board claimable elsewhere. Overshooting into two open waits blocks the target
+ *     instead of freeing it, and the next arm supersedes what is left.
  *   • A DIFFERENT ask A PERSON armed — left exactly where it is. A hand-made human gate is a hold
  *     only its author may release; superseding it would let this run resume through someone's
  *     explicit stop.
  *
- * THROWS when the gate cannot be created, when a superseded gate cannot be resolved, when a kill
- * lands anywhere from the board read through the label write (a gate this run created is undone
- * first; one it was only reusing is left where it stands), or when the board cannot be read (arming blind
+ * THROWS when the gate cannot be created, when a superseded gate cannot be resolved (the replacement
+ * stands — it is the target's only blocker by then — and every still-open id rides out in the
+ * error), when a kill lands anywhere from the board read through the label write (a gate this run
+ * created is undone first, which is safe only while the superseded wait is still open; one it was
+ * only reusing is left where it stands), or when the board cannot be read (arming blind
  * is how the duplicate wait gets made) — so the caller settles
  * the run LOUDLY instead of parking it. All three are the same failure: a park is only meaningful if
  * resolving the gate it names makes the target runnable, and it does not when there is no gate, when
@@ -2358,6 +2364,9 @@ export async function armHumanGate(
   // that lands while it runs (anton-287p): the gate would exist, the caller would read a successful
   // arm, and a cancelled run would park behind a wait nobody is waiting on. Re-read the signal after
   // each and undo the create, so the ask settles in its cancelled form exactly as if it never landed.
+  //
+  // Only ever called BEFORE the supersede: undoing is safe exactly while every wait this ask
+  // supersedes is still open, so the undo can never be what leaves the target bare.
   const undoIfCancelled = async (gateId: string, during: string) => {
     if (!signal?.aborted) return;
     const undone = await safe(() =>
@@ -2372,7 +2381,11 @@ export async function armHumanGate(
     // The undo was the only thing that would ever have closed it: no automatic pass resolves a human
     // gate, so the target stays blocked until someone clears this id by hand. It rides out in the
     // error because nothing else on the board names it.
-    throw new StrandedHumanGateError(targetId, gateId);
+    throw new StrandedHumanGateError(
+      targetId,
+      gateId,
+      `the run was cancelled while ${during}, and gate ${gateId} could not be resolved`,
+    );
   };
   // STRICT, and no catch: this read is the ONLY thing that can tell "the ask is already with
   // someone" from "nothing is armed", and bd omits gate beads from every ordinary listing — so a
@@ -2392,23 +2405,49 @@ export async function armHumanGate(
 
   const { stale, held, open } = humanGatePlan(board, targetId, reason);
 
-  if (stale.length > 0) {
-    refuseIfCancelled("a gate armed now would block the target with nobody waiting on it");
-  }
-  for (const gate of stale) {
-    const resolved = await safe(() =>
-      beads.gateResolve(repo, gate.id, `superseded — ${targetId} now waits on a newer ask`),
-    );
-    // Nothing else will ever close it, and it is a real blocker while it lives — so a park behind it
-    // is a wait resolving the named gate cannot end. Abort the arm instead: the run settles FAILED
-    // carrying the ask, which a person can still act on.
-    if (!resolved) {
-      throw new Error(
-        `could not resolve ${targetId}'s superseded human gate ${gate.id} — it would stay open ` +
-          `beside the current ask, so resolving the new gate could not release the run`,
+  /**
+   * Retire the waits this ask supersedes — ONLY ever with `armed` already live on the board.
+   *
+   * Ordering is the safety property (anton-287p): closing the old wait first would, on a `gate
+   * create` that fails or a kill that lands in it, leave the target carrying no human gate at all
+   * while its current ask is still unanswered — silently claimable again, on a shared board by
+   * another machine. Armed-then-retired can only ever overshoot into TWO open waits, which blocks
+   * the target rather than freeing it, and which the next arm's own supersede clears.
+   *
+   * THROWS with every still-open id when a supersede fails, or when a kill lands inside one: past
+   * this point the replacement is the target's only blocker, so undoing it is exactly the failure
+   * above. The gate stands and rides out in the error instead — the run settles FAILED naming it.
+   */
+  const retireSuperseded = async (armed: string) => {
+    const unresolved: string[] = [];
+    for (const gate of stale) {
+      const resolved = await safe(() =>
+        beads.gateResolve(repo, gate.id, `superseded — ${targetId} now waits on a newer ask`),
+      );
+      if (!resolved) unresolved.push(gate.id);
+    }
+    // Nothing else will ever close them, and each is a real blocker while it lives — so a park
+    // behind the current ask is a wait resolving the named gate cannot end. Fail the arm instead:
+    // the run settles FAILED carrying the ask and every id still holding the target.
+    if (unresolved.length > 0) {
+      throw new StrandedHumanGateError(
+        targetId,
+        armed,
+        `${targetId}'s superseded human gate(s) ${unresolved.join(", ")} could not be resolved, so ` +
+          `they stay open beside the wait this run armed (${armed})`,
+        unresolved,
       );
     }
-  }
+    if (stale.length > 0 && signal?.aborted) {
+      throw new StrandedHumanGateError(
+        targetId,
+        armed,
+        `the run was cancelled while ${targetId}'s superseded human gate(s) were retired, so the ` +
+          `wait this run armed stands rather than leaving the target with none`,
+      );
+    }
+  };
+
   // A person's own hold is not anton's to close, and it keeps blocking the target after this ask is
   // answered — the park would otherwise read as though one `bd gate resolve` resumes the run.
   for (const gate of held) {
@@ -2427,6 +2466,9 @@ export async function armHumanGate(
       `gate ${open.id} already carries this ask, so the cancelled run must settle instead of ` +
         `parking behind a wait it is no longer taking`,
     );
+    // Still retires what this ask supersedes — the reused gate IS the armed replacement, so an
+    // earlier attempt's leftovers would otherwise stay open beside it forever.
+    await retireSuperseded(open.id);
     return { gateId: open.id, held: heldIds };
   }
 
@@ -2443,8 +2485,11 @@ export async function armHumanGate(
     );
   }
   // The label write is the last uninterruptible await, and a kill landing inside it would otherwise
-  // ride out as a successful arm past every check above.
+  // ride out as a successful arm past every check above. Last point an undo is still safe: the waits
+  // this ask supersedes are all still open behind it.
   await undoIfCancelled(gateId, "the gate was labelled");
+  // Replacement armed — only now is the older ask's wait retired.
+  await retireSuperseded(gateId);
   return { gateId, held: heldIds };
 }
 
@@ -2478,15 +2523,16 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
 }
 
 /**
- * The FAILURE reason when a kill landed inside the gate's creation and the undo failed with it: the
- * ask IS on the board, but on a gate this dead run will never come back for. Named explicitly —
- * nothing automatic resolves a human gate, so the target stays blocked until someone clears this id.
+ * The FAILURE reason when the arm left a live gate behind that no resume will reach — a kill whose
+ * undo failed, or a supersede that failed beside the wait just armed. The ask IS on the board, on
+ * gate(s) this run will never come back for. Named explicitly — nothing automatic resolves a human
+ * gate, so the target stays blocked until someone clears every id.
  */
 function strandedAskMessage(e: NeedsHumanError, stranded: StrandedHumanGateError): string {
   return (
     `${e.ticketId} needs a human: ${e.ask ?? "(the agent named no ask)"}. ${stranded.message}. The ` +
-    `run is FAILED rather than parked — it was cancelled, so no resume is coming for that gate. ` +
-    `Answer the ask, clear the gate, then re-run the target.`
+    `run is FAILED rather than parked — no resume is coming for that gate. Answer the ask, clear ` +
+    `the gate${stranded.gateIds.length > 1 ? "s" : ""}, then re-run the target.`
   );
 }
 
@@ -2714,14 +2760,20 @@ class CancelledAskError extends Error {
  * person resolves it; the run settles FAILED naming it, because that id exists nowhere else.
  */
 export class StrandedHumanGateError extends Error {
+  /** Every human gate left open on the target — the wait this run armed first. */
+  readonly gateIds: string[];
   constructor(
     readonly targetId: string,
     readonly gateId: string,
+    detail: string,
+    alsoOpen: string[] = [],
   ) {
+    const ids = [gateId, ...alsoOpen];
     super(
-      `the run was cancelled while ${targetId}'s human gate ${gateId} was created, and the gate ` +
-        `could not be resolved — it still blocks ${targetId} until \`bd gate resolve ${gateId}\` runs`,
+      `${detail} — ${targetId} stays blocked until ` +
+        `${ids.map((id) => `\`bd gate resolve ${id}\``).join(" and ")} runs`,
     );
+    this.gateIds = ids;
   }
 }
 

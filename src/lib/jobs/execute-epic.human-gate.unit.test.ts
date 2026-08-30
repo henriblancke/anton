@@ -13,6 +13,9 @@
  * which blocks the target exactly like that twin. The run then settles FAILED carrying the ask,
  * which a person can still act on — recoverable, unlike a wait resolving cannot end.
  *
+ * The other half is ORDER: the replacement is armed before the wait it supersedes is retired, so no
+ * failure and no kill can leave the target carrying no human gate on an ask nobody answered.
+ *
  * Mocked at the bd seam, because the states under test are bd calls that fail: the end-to-end shapes
  * of the arm live in execute-epic.needs-human.integration.test.ts against real bd.
  */
@@ -110,12 +113,87 @@ it("still parks on the gate when the label write is lost — the ask is already 
 
 it("aborts when its own superseded gate cannot be resolved, instead of parking behind it", async () => {
   // The failure this guards: the stale gate blocks the target for good (nothing auto-resolves a
-  // human gate), so resolving the gate the park NAMES would leave the run parked forever.
+  // human gate), so resolving the gate the park NAMES would leave the run parked forever. Both ids
+  // ride out in the error — the replacement is already armed by the time the supersede is tried.
   loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
+  gateCreateMock.mockResolvedValue("g-new");
   gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).rejects.toThrow(/superseded human gate g-old/);
+  const failure = await armHumanGate(REPO, "f-1", ASK).catch((e) => e);
+  expect(failure).toBeInstanceOf(StrandedHumanGateError);
+  expect(failure.gateIds).toEqual(["g-new", "g-old"]);
+  expect(failure.message).toContain("bd gate resolve g-old");
+});
+
+it("arms the replacement BEFORE retiring the wait it supersedes", async () => {
+  // Ordering is the whole safety property (anton-287p): retire-then-arm leaves the target carrying
+  // no human gate at all for the width of the `gate create` — unanswered ask, and on a shared board
+  // claimable by another machine in that window.
+  loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
+  gateCreateMock.mockResolvedValue("g-new");
+
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({ gateId: "g-new", held: [] });
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-old", expect.stringMatching(/superseded/));
+  expect(gateCreateMock.mock.invocationCallOrder[0]).toBeLessThan(
+    gateResolveMock.mock.invocationCallOrder[0],
+  );
+});
+
+it("leaves the superseded wait open when the replacement cannot be created", async () => {
+  // The create is what the old ordering gambled on: fail it after the retire and the target is bare.
+  // Armed-first means this failure costs nothing — the older gate still blocks, and the run settles
+  // FAILED carrying the ask.
+  loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
+  gateCreateMock.mockRejectedValue(new Error("bd: database is locked"));
+
+  await expect(armHumanGate(REPO, "f-1", ASK)).rejects.toThrow("database is locked");
+  expect(gateResolveMock).not.toHaveBeenCalled();
+});
+
+it("keeps the superseded wait when the kill lands inside `gate create` and the new gate is undone", async () => {
+  // The undo is only ever safe here BECAUSE the retire has not run yet: the target keeps `g-old`,
+  // so a cancelled arm can never be what hands an unanswered target back to the board.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
+  gateCreateMock.mockImplementation(async () => {
+    controller.abort();
+    return "g-new";
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateResolveMock).toHaveBeenCalledTimes(1);
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
+});
+
+it("lets the armed gate stand when the kill lands inside the supersede, and names it", async () => {
+  // Past the point of undo: `g-old` is already closed, so resolving `g-new` too would leave the
+  // target with no wait on an unanswered ask. The gate stays and rides out in the error instead.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
+  gateCreateMock.mockResolvedValue("g-new");
+  gateResolveMock.mockImplementation(async () => {
+    controller.abort();
+  });
+
+  const failure = await armHumanGate(REPO, "f-1", ASK, controller.signal).catch((e) => e);
+  expect(failure).toBeInstanceOf(StrandedHumanGateError);
+  expect(failure.gateIds).toEqual(["g-new"]);
+  expect(gateResolveMock).toHaveBeenCalledTimes(1); // only the supersede — g-new is never undone
+});
+
+it("retires the superseded wait on the REUSE path too, behind the gate already carrying the ask", async () => {
+  // The reused gate IS the armed replacement, so the ordering already holds — but skipping the
+  // retire here would leave an earlier attempt's stale wait open beside it, blocking the target
+  // after the named gate is resolved.
+  loadAllIssuesMock.mockResolvedValue([
+    target("g-mine", "g-old"),
+    gate("g-mine", ASK),
+    gate("g-old", "an older ask"),
+  ]);
+
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({ gateId: "g-mine", held: [] });
   expect(gateCreateMock).not.toHaveBeenCalled();
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-old", expect.stringMatching(/superseded/));
 });
 
 it("never resolves a human gate anton did not arm, and reports it back for the park message", async () => {
