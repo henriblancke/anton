@@ -1435,6 +1435,29 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // Backticks mean two things in MDX: a markdown code span, which shows a symbol, and a template
+    // literal inside an ESM statement, which runs. Masking every span alike blanks the
+    // interpolation and leaves a live component reported dead.
+    it("keeps a template literal in an MDX ESM block, and still masks a code span in prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/meta.mdx": "export const value = `${Widget()}`\n",
+        "docs/multi.mdx": "export const banner = `\n  ${Widget()}\n`\n",
+        "docs/notes.mdx": "export the `Widget` helper from the old build.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/meta.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/multi.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
     // JSX lets a comment's braces stand off its `/* */`. Matching only the attached `{/*` leaves
     // the span unmasked, and the `{` in front of it then proves the prose is an expression —
     // erasing a finding that was right.
@@ -1586,6 +1609,29 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/form.svelte");
       expect(result.deadcode.dropped[0].reason).toContain("src/pages/index.astro");
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A `<script>` runs between its tags, not across its line. Rendered text sharing the line with
+    // one is still markup, so reading the whole line as code lets that prose prove a caller and
+    // delete a true finding — while the script's own body has to keep counting.
+    it("reads a script's body rather than its whole line", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "public/notes.html": "<p>neverCalled was removed</p><script>const x = 1;</script>\n",
+        "public/braced.html": "<script>const o = {};</script><p>neverCalled was removed</p>\n",
+        "public/app.html": "<p>still wired</p><script>neverCalled();</script>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/braced.html");
     });
 
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the

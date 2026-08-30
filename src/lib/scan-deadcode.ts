@@ -356,6 +356,16 @@ const MDX_FILE = /\.mdx$/i;
 const MDX_ESM_LINE = /^\s*(?:import|export)\b/;
 
 /**
+ * An ESM statement as JavaScript spells one, rather than a paragraph opening with the word
+ * `export`. `MDX_ESM_LINE` can afford to be loose — a prose line it reads as code only leaves a
+ * signal standing — but leaving a line's backticks unmasked runs the other way: unmasking the span
+ * in ``export the `Widget` helper`` would let that sentence prove a caller and delete a true
+ * finding. So the keyword has to be followed by something markdown prose does not put there.
+ */
+const MDX_ESM_STATEMENT =
+  /^\s*(?:import\s*(?:[({*'"]|type\b)|import\s+[A-Za-z_$][\w$]*\s*(?:,|from\b)|export\s+(?:default\b|type\b|\*|\{|const\b|let\b|var\b|class\b|(?:async\s+)?function\b))/;
+
+/**
  * A markdown fence, opening or closing: up to three spaces of indent, then a run of three or more
  * backticks or tildes, then the info string. Fences are the delimiter a code example actually
  * carries, and pairing backticks one at a time cannot see one — `~~~~tsx` holds no backtick at all
@@ -422,6 +432,7 @@ function maskMdxCodeSpans(line: string): string {
  */
 function maskMdxProse(text: string): string {
   let fence: string | undefined;
+  let esm = false;
   return text
     .split("\n")
     .map((line) => {
@@ -441,7 +452,13 @@ function maskMdxProse(text: string): string {
         fence = marker[1];
         return blankAll(line);
       }
-      return maskMdxCodeSpans(line);
+      // A backtick inside an ESM statement opens a template literal, not a markdown code span, so
+      // the interpolation in ``export const meta = `${Widget()}` `` names a real caller. The block
+      // runs to the next blank line — the bound `mdxOpenLines` reads it with — so a template
+      // literal spanning lines stays code for as long as the statement holding it does.
+      if (!line.trim()) esm = false;
+      else if (!esm && MDX_ESM_STATEMENT.test(line)) esm = true;
+      return esm ? line : maskMdxCodeSpans(line);
     })
     .join("\n");
 }
@@ -555,26 +572,45 @@ const ATTR_VALUE = new RegExp(
   "i",
 );
 
+/** Where a line is program text rather than markup, as `[start, end)` offsets into that line. */
+type CodeSpans = [number, number][];
+
 /**
- * Which lines of a markup file are program text rather than markup: the body of a `<script>`
+ * Which spans of a markup file are program text rather than markup: the body of a `<script>`
  * element, or an Astro frontmatter block. Those are where a component gets imported, so judging
  * them by markup's rules would miss the import that proves the symbol live.
  *
+ * Spans rather than whole lines, because an element can share its line with rendered text:
+ * `<p>Widget was removed</p><script>go()</script>` runs only between the tags, and calling the
+ * whole line executable lets the prose beside the script prove a caller and delete a true finding.
+ *
  * Read from the masked lines, so a `<script>` shown inside a comment opens nothing.
  */
-function markupCodeLines(code: string[], file: string): boolean[] {
+function markupCodeSpans(code: string[], file: string): CodeSpans[] {
   const frontmatterEnd = ASTRO_FILE.test(file) ? astroFrontmatterEnd(code) : -1;
-  const lines: boolean[] = [];
-  let script = false;
+  const lines: CodeSpans[] = [];
+  let open = false;
   for (const [index, line] of code.entries()) {
-    // A whole element written on one line (`<script>go()</script>`) leaves that line executable
-    // while closing the block under it.
-    let executable = script || index <= frontmatterEnd;
-    for (const [, closing, selfClosing] of line.matchAll(SCRIPT_TAG)) {
-      executable = true;
-      script = closing !== "/" && selfClosing !== "/";
+    if (index <= frontmatterEnd) {
+      lines.push([[0, line.length]]);
+      continue;
     }
-    lines.push(executable);
+    const spans: CodeSpans = [];
+    // A body an earlier line left open runs from the start of this one; a body this line opens
+    // runs from the end of its tag, and an unclosed one carries on into the line below.
+    let start: number | undefined = open ? 0 : undefined;
+    for (const match of line.matchAll(SCRIPT_TAG)) {
+      const [tag, closing, selfClosing] = match;
+      if (closing === "/") {
+        if (start !== undefined) spans.push([start, match.index]);
+        start = undefined;
+      } else if (start === undefined && selfClosing !== "/") {
+        start = match.index + tag.length;
+      }
+    }
+    if (start !== undefined) spans.push([start, line.length]);
+    open = start !== undefined;
+    lines.push(spans);
   }
   return lines;
 }
@@ -596,17 +632,20 @@ function astroFrontmatterEnd(code: string[]): number {
  * — and inside a static attribute — is what the page shows a reader, so a name there describes the
  * symbol rather than calling it.
  */
-function referencesMarkup(line: string | undefined, symbol: string, code = false): boolean {
-  if (code) return referencesWord(line, symbol);
-  return referencesWord(
-    line,
-    symbol,
-    (head) =>
-      TAG_HEAD.test(head) ||
-      ATTR_VALUE.test(head) ||
-      DIRECTIVE_HEAD.test(head) ||
-      head.includes("{"),
-  );
+function referencesMarkup(line: string | undefined, symbol: string, code: CodeSpans = []): boolean {
+  return referencesWord(line, symbol, (head) => {
+    const at = head.length;
+    if (code.some(([start, end]) => at >= start && at < end)) return true;
+    // Only the markup since the last script body is template: a brace left in the JavaScript
+    // beside it is not the `{count}` that would make the text after it an expression.
+    const markup = head.slice(code.reduce((from, [, end]) => (end <= at ? end : from), 0));
+    return (
+      TAG_HEAD.test(markup) ||
+      ATTR_VALUE.test(markup) ||
+      DIRECTIVE_HEAD.test(markup) ||
+      markup.includes("{")
+    );
+  });
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -670,11 +709,10 @@ type CandidateHits = Map<string, number[]>;
 /** A file read once and reused across symbols: its comments blanked, plus MDX's cross-line state. */
 interface MaskedFile {
   code: string[];
-  /**
-   * For a file where prose and program are interleaved, which lines are already code: an MDX line
-   * inside a block an earlier line left open, or a markup line inside a `<script>` element.
-   */
-  executable?: boolean[];
+  /** For MDX, which lines start inside a block — an expression or ESM statement — left open above. */
+  open?: boolean[];
+  /** For markup, where each line is program text: a `<script>` body or an Astro frontmatter line. */
+  script?: CodeSpans[];
 }
 
 /**
@@ -742,11 +780,8 @@ async function codeReferencingFiles(
         const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
         masked.set(file, {
           code,
-          executable: isMdx
-            ? mdxOpenLines(code, text.split("\n"))
-            : isMarkup
-              ? markupCodeLines(code, file)
-              : undefined,
+          open: isMdx ? mdxOpenLines(code, text.split("\n")) : undefined,
+          script: isMarkup ? markupCodeSpans(code, file) : undefined,
         });
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
@@ -759,9 +794,8 @@ async function codeReferencingFiles(
     if (!entry) continue;
     const references = (line: number): boolean => {
       const text = entry.code[line - 1];
-      const executable = entry.executable?.[line - 1] === true;
-      if (isMdx) return referencesMdx(text, symbol, executable);
-      if (isMarkup) return referencesMarkup(text, symbol, executable);
+      if (isMdx) return referencesMdx(text, symbol, entry.open?.[line - 1] === true);
+      if (isMarkup) return referencesMarkup(text, symbol, entry.script?.[line - 1]);
       return referencesWord(text, symbol);
     };
     if (lines.some(references)) files.push(file);
