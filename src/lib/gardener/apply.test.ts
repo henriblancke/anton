@@ -119,14 +119,36 @@ describe("the plan a proposal carries — read strictly, because it decides what
     expect(parseGardenerPlan(value)).toBeUndefined();
   });
 
-  // The one kind whose subject list the hash does NOT cover (anton-9hpp): a cluster's membership is
-  // re-derived every patrol, so hashing it gave the same claim a fresh fingerprint each time and
-  // four proposals for one target stood open at once. The guard traded away is real — an edited
-  // subject list redirects the move rather than invalidating it — and what replaces it is apply's
-  // own re-derivation of "no board card carries this" for every subject it is handed.
-  it("accepts a cluster whose membership moved, because the target is its identity", () => {
+  // The one kind whose subject list the FINGERPRINT does not cover (anton-9hpp): a cluster's
+  // membership is re-derived every patrol, so hashing it gave the same claim a fresh fingerprint
+  // each time and four proposals for one target stood open at once. Suppression is target-shaped
+  // for that reason — two memberships under one target are one open ask.
+  it("fingerprints a cluster by its target, so any membership is the same open ask", () => {
+    const grown = planFor({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-a", "anton-b", "anton-c"],
+      target: CARD.id,
+    });
+    expect(grown.fingerprint).toBe(CLUSTER.fingerprint);
+    expect(grown.subjectChecksum).not.toBe(CLUSTER.subjectChecksum);
+  });
+
+  // …and the guard the fingerprint gave up is carried by the CHECKSUM instead, so the membership is
+  // still bound. Without it, editing the list manufactures the grouping evidence apply re-derives:
+  // naming a ticket the home already carries makes it an in-place member, and a single loose bead
+  // rides under a home no fresh patrol would propose for it.
+  it("rejects a cluster whose membership was edited under a kept fingerprint", () => {
     const grown = { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] };
-    expect(parseGardenerPlan(grown)).toEqual(grown);
+    expect(parseGardenerPlan(grown)).toBeUndefined();
+    // A dropped guard is an edit too — a plan that simply omits it is not a plan the emitter wrote.
+    const unguarded: Record<string, unknown> = { ...CLUSTER };
+    delete unguarded.subjectChecksum;
+    expect(parseGardenerPlan(unguarded)).toBeUndefined();
+    // The kinds whose fingerprint already binds the list carry none, and one appearing is the same
+    // tell: a plan whose identity says more than its execution does.
+    const guarded = { ...REPARENT, subjectChecksum: CLUSTER.subjectChecksum };
+    expect(parseGardenerPlan(guarded)).toBeUndefined();
   });
 
   // `move` and `retireAs` are the two fields the hash can't cover, so the kind→verb pairing is what
@@ -172,6 +194,14 @@ describe("the plan a proposal carries — read strictly, because it decides what
     };
     expect(legacy.fingerprint).not.toBe(CLUSTER.fingerprint);
     expect(parseGardenerPlan(legacy)).toEqual(legacy);
+
+    // And it reads back WITHOUT the subject guard, which the older emitter never wrote: that
+    // fingerprint hashes the membership itself, so the list it binds is already bound.
+    const unguarded: Record<string, unknown> = { ...legacy };
+    delete unguarded.subjectChecksum;
+    expect(parseGardenerPlan(unguarded)).toEqual(unguarded);
+    // …but a guard that disagrees with the list is still an edit, whichever identity carries it.
+    expect(parseGardenerPlan({ ...legacy, subjectChecksum: "0".repeat(12) })).toBeUndefined();
 
     // The concession is that kind's alone: nothing else ever hashed anything but its own subjects.
     const wrongKind = {

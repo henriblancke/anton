@@ -19,6 +19,7 @@ import type { ApplyActor } from "./apply";
 import {
   detectionSubjectKey,
   proposalFingerprint,
+  subjectChecksum,
   type GardenerPlan,
 } from "./detections";
 
@@ -207,17 +208,19 @@ export const edged = (from: string, to: string): Bead[] =>
   ["anton-aa", "anton-bb"].map((id) => (id === from ? blockedBy(id, to) : bead(id)));
 
 /**
- * A plan fingerprinted the way the emitter would fingerprint it — through the SAME key builder, not
- * a copy of it, because apply now recomputes that hash from the plan's own fields and a fixture with
- * a hand-rolled fingerprint would prove the opposite of what these tests claim.
+ * A plan fingerprinted and checksummed the way the emitter would do both — through the SAME key
+ * builders, not copies of them, because apply now recomputes each from the plan's own fields and a
+ * fixture with a hand-rolled hash would prove the opposite of what these tests claim.
  */
-export function planFor(input: Omit<GardenerPlan, "fingerprint">): GardenerPlan {
+export function planFor(input: Omit<GardenerPlan, "fingerprint" | "subjectChecksum">): GardenerPlan {
+  const checksum = subjectChecksum(input.kind, input.subjects, input.target, input.detail);
   return {
     ...input,
     fingerprint: proposalFingerprint(
       input.kind,
       detectionSubjectKey(input.kind, input.subjects, input.target, input.detail),
     ),
+    ...(checksum ? { subjectChecksum: checksum } : {}),
   };
 }
 

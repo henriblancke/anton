@@ -242,6 +242,18 @@ export interface GardenerDetection {
    * approved suppress the second forever.
    */
   detail?: string;
+  /**
+   * Binds the subject list for a kind whose fingerprint no longer does — set exactly when the kind
+   * declares a {@link ClaimIdentity}, absent everywhere else. Two records of one claim, deliberately
+   * kept apart: the fingerprint is the SUPPRESSION identity (one open ask per target, whatever
+   * membership the patrol found), this is the INTEGRITY one (these subjects, as emitted).
+   *
+   * Without it a target-identified plan's membership is unguarded, and the grouping evidence apply
+   * re-derives can be manufactured by editing it — naming a ticket the home already carries makes it
+   * an in-place member, so a single loose bead clears the cluster's two-member bar and lands under a
+   * home no fresh patrol would propose for it.
+   */
+  subjectChecksum?: string;
   /** One line: what is wrong and what the move would do. The proposal's title material. */
   summary: string;
   /**
@@ -293,6 +305,7 @@ export function makeDetection(input: DetectionInput): GardenerDetection {
   // ({@link parseGardenerPlan}).
   const subjects = [...new Set(input.subjects)].sort();
   const subjectKey = detectionSubjectKey(input.kind, subjects, input.target, input.detail);
+  const checksum = subjectChecksum(input.kind, subjects, input.target, input.detail);
   return {
     kind: input.kind,
     move: input.move,
@@ -302,6 +315,7 @@ export function makeDetection(input: DetectionInput): GardenerDetection {
     ...(input.target ? { target: input.target } : {}),
     ...(input.retireAs ? { retireAs: input.retireAs } : {}),
     ...(input.detail ? { detail: input.detail } : {}),
+    ...(checksum ? { subjectChecksum: checksum } : {}),
     summary: input.summary,
     evidence: input.evidence,
   };
@@ -340,11 +354,13 @@ const ANY_SUBJECTS = "*";
  *
  * …except where the KIND says the subjects are not the claim ({@link ClaimIdentity}), which today is
  * `parentless-cluster` alone: its subject list is a membership the next patrol re-derives, so it
- * hashes as {@link ANY_SUBJECTS} and one open proposal per target answers for every membership. That
- * kind pays for it by losing the hash's guard on its subject list — an edit there redirects the move
- * rather than invalidating it — which is why apply re-derives the whole "no board card carries this"
- * premise for each subject from the fresh board (apply-plan.ts `reparentPremiseGone`) instead of
- * trusting the list it was handed.
+ * hashes as {@link ANY_SUBJECTS} and one open proposal per target answers for every membership.
+ *
+ * What that kind gives up here it gets back from a second record: the subjects it was filed with are
+ * bound by {@link subjectChecksum}, so suppression can stay target-shaped while a membership edit
+ * still invalidates the plan. Apply re-derives the "no board card carries this" premise for each
+ * subject from the fresh board besides (apply-plan.ts `reparentPremiseGone`), because a list that is
+ * intact is not the same as a list that is still true.
  */
 export function detectionSubjectKey(
   kind: GardenerDetectionKind,
@@ -366,16 +382,35 @@ const subjectKey = (
 ): string => `${kind}:${about}` + (target ? `>${target}` : "") + (detail ? `#${detail}` : "");
 
 /**
- * The identity a kind used BEFORE its claim moved to the target (anton-9hpp): the membership,
- * spelled out. Nothing emits one — it exists so a proposal already open when the identity changed
- * still reads back. See {@link identityMatches}.
+ * The membership spelled out: the same key {@link detectionSubjectKey} builds for every kind whose
+ * subjects ARE its claim. Two readers need it for a kind whose subjects are not — {@link
+ * subjectChecksum}, which binds the list the fingerprint stopped covering, and the legacy identity a
+ * proposal filed before the claim moved to its target still carries ({@link identityForm}).
  */
-const legacySubjectKey = (
+const membershipKey = (
   kind: GardenerDetectionKind,
   subjects: string[],
   target?: string,
   detail?: string,
 ): string => subjectKey(kind, [...subjects].sort().join("+"), target, detail);
+
+/**
+ * The checksum a target-identified kind carries so its subject list stays guarded — see
+ * {@link GardenerDetection.subjectChecksum}. Undefined for every other kind: their fingerprint
+ * already hashes the membership, and a second record of it would be a field nothing reads.
+ */
+export function subjectChecksum(
+  kind: GardenerDetectionKind,
+  subjects: string[],
+  target?: string,
+  detail?: string,
+): string | undefined {
+  if (KINDS[kind].identity === undefined) return undefined;
+  return hashKey(membershipKey(kind, subjects, target, detail));
+}
+
+/** Which record of its claim a proposal's fingerprint is, or undefined when it is neither. */
+type IdentityForm = "canonical" | "legacy";
 
 /**
  * Does this fingerprint stand for exactly these fields — the canonical identity, or the membership
@@ -386,18 +421,22 @@ const legacySubjectKey = (
  * move" and refuse forever, while the next patrol filed a fresh-format duplicate beside it — the
  * exact state target-identity exists to remove. Emission only ever writes the canonical form, and
  * suppression folds a legacy proposal onto it (`canonicalFingerprintOf`), so no duplicate is filed.
+ *
+ * Which form matched decides how hard {@link parseGardenerPlan} presses on the subject checksum: a
+ * legacy fingerprint hashes the membership itself, so it needs no second record of it.
  */
-function identityMatches(
+function identityForm(
   kind: GardenerDetectionKind,
   subjects: string[],
   target: string | undefined,
   detail: string | undefined,
   fingerprint: string,
-): boolean {
+): IdentityForm | undefined {
   const canonical = proposalFingerprint(kind, detectionSubjectKey(kind, subjects, target, detail));
-  if (canonical === fingerprint) return true;
-  if (KINDS[kind].identity === undefined) return false;
-  return proposalFingerprint(kind, legacySubjectKey(kind, subjects, target, detail)) === fingerprint;
+  if (canonical === fingerprint) return "canonical";
+  if (KINDS[kind].identity === undefined) return undefined;
+  const legacy = proposalFingerprint(kind, membershipKey(kind, subjects, target, detail));
+  return legacy === fingerprint ? "legacy" : undefined;
 }
 
 /**
@@ -406,9 +445,12 @@ function identityMatches(
  * under `pm:` (or the reverse) even by mistake, and the two producers can never collide on a hash.
  */
 export function proposalFingerprint(kind: GardenerDetectionKind, subjectKey: string): string {
-  const hash = createHash("sha1").update(subjectKey).digest("hex").slice(0, FINGERPRINT_HASH_LENGTH);
-  return `${namespaceOf(kind)}:${kind}:${hash}`;
+  return `${namespaceOf(kind)}:${kind}:${hashKey(subjectKey)}`;
 }
+
+/** The digest both records of a claim are cut from — collision-safe at board scale, label-short. */
+const hashKey = (key: string): string =>
+  createHash("sha1").update(key).digest("hex").slice(0, FINGERPRINT_HASH_LENGTH);
 
 /** A fingerprint label's exact shape, so an unrelated `pm:`-ish label is never mistaken for one. */
 const FINGERPRINT_LABEL = new RegExp(
@@ -487,6 +529,8 @@ export interface GardenerPlan {
   retireAs?: RetireVerb;
   /** The move's non-bead parameter — see {@link GardenerDetection.detail}. */
   detail?: string;
+  /** The subject list's own guard — see {@link GardenerDetection.subjectChecksum}. */
+  subjectChecksum?: string;
 }
 
 /** The plan half of a detection — what rides on the proposal bead as metadata. */
@@ -499,6 +543,7 @@ export function planOf(detection: GardenerDetection): GardenerPlan {
     ...(detection.target ? { target: detection.target } : {}),
     ...(detection.retireAs ? { retireAs: detection.retireAs } : {}),
     ...(detection.detail ? { detail: detection.detail } : {}),
+    ...(detection.subjectChecksum ? { subjectChecksum: detection.subjectChecksum } : {}),
   };
 }
 
@@ -521,17 +566,19 @@ const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
  * `retireAs` is required exactly when the move is `retire` and forbidden otherwise, which is the
  * same invariant {@link GardenerDetection} documents; a retire with no verb has no safe default.
  *
- * Three checks bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
+ * Four checks bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
  * one ask and have another execute:
  *   • the fingerprint is RECOMPUTED from the parsed kind/subjects/target and must match the field
  *     carried alongside them — editing the subjects or the target of a proposal now invalidates it
  *     rather than silently redirecting the move (for the one kind whose subjects are not its
  *     identity, the target still is — see {@link ClaimIdentity});
+ *   • the {@link subjectChecksum} is recomputed too, which is what re-binds the subject list for
+ *     exactly that kind ({@link checksumViolation});
  *   • the move and retirement verb must be the ones {@link CANONICAL_MOVE} pairs with the kind,
  *     which is what covers the two fields the hash can't (a `stale` bead reads as a defer, so it
  *     must not execute a close);
- *   • the subjects must be DISTINCT, which is what covers the list the hash stops guarding for a
- *     target-identified kind — a bead named twice is not two members of anything.
+ *   • the subjects must be DISTINCT — a bead named twice is not two members of anything, and no
+ *     hash of a sorted set catches it.
  */
 export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -579,14 +626,29 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
   if (canonical.move !== move || canonical.retireAs !== (move === "retire" ? retireAs : undefined)) {
     return undefined;
   }
-  const identity = identityMatches(
+  const form = identityForm(
     kind as GardenerDetectionKind,
     subjects as string[],
     target as string | undefined,
     detail as string | undefined,
     fingerprint,
   );
-  if (!identity) return undefined;
+  if (!form) return undefined;
+
+  const checksum = raw.subjectChecksum;
+  if (checksum !== undefined && typeof checksum !== "string") return undefined;
+  if (
+    checksumViolation(
+      kind as GardenerDetectionKind,
+      subjects as string[],
+      target as string | undefined,
+      detail as string | undefined,
+      checksum,
+      form,
+    )
+  ) {
+    return undefined;
+  }
 
   return {
     kind: kind as GardenerDetectionKind,
@@ -596,7 +658,34 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
     ...(target ? { target: target as string } : {}),
     ...(move === "retire" ? { retireAs: retireAs as RetireVerb } : {}),
     ...(detail ? { detail: detail as string } : {}),
+    ...(checksum ? { subjectChecksum: checksum } : {}),
   };
+}
+
+/**
+ * Is this plan's subject guard wrong for what it carries? All-or-nothing, the same invariant
+ * `detail` and `retireAs` hold: a kind whose fingerprint already hashes its membership must carry no
+ * checksum, because a second record nothing reads is a plan whose identity says more than its
+ * execution does.
+ *
+ * Where the kind DOES declare one, the canonical form must carry it and it must match — that is the
+ * whole guard, and the reason a cluster's membership cannot be edited into fresh grouping evidence.
+ * A legacy fingerprint is exempt from carrying one, and only from carrying one: it hashes the
+ * membership itself, so the list is already bound, and requiring a field the older emitter never
+ * wrote would strand exactly the proposals {@link identityForm} exists to keep readable.
+ */
+function checksumViolation(
+  kind: GardenerDetectionKind,
+  subjects: string[],
+  target: string | undefined,
+  detail: string | undefined,
+  checksum: string | undefined,
+  form: IdentityForm,
+): boolean {
+  const expected = subjectChecksum(kind, subjects, target, detail);
+  if (expected === undefined) return checksum !== undefined;
+  if (form === "legacy") return checksum !== undefined && checksum !== expected;
+  return checksum !== expected;
 }
 
 /**
