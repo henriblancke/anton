@@ -1551,10 +1551,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           continue;
         }
 
-        // Anything else the project put after its commit — a `step:verify` it moved there, or a
-        // `step:claude` of its own. A step that RAN and did not achieve its work stops the run: the
-        // registry leaves that judgement to the caller, and carrying on would report a delivery on
-        // a pipeline that didn't finish.
+        // Anything else the project put after its commit — a `step:verify` it moved there. Never a
+        // step that DISPATCHES an agent: the floor (anton-6b99, `diff-after-commit`) refuses every
+        // `producesDiff` step here, which is both `implement` and `claude`, and it is asserted on
+        // every attempt before the walk begins. So nothing reaching this line carries a
+        // `facts.selfReport`, and an agent's ask or block is judged where the agents actually run —
+        // the ticket phase (see the `needs-human` throw in runTicket). A step that RAN and did not
+        // achieve its work stops the run: the registry leaves that judgement to the caller, and
+        // carrying on would report a delivery on a pipeline that didn't finish.
         const result = await definition.handler(stepCtx);
         if (!result.ok) {
           throw new Error(
