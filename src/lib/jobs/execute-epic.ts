@@ -1590,14 +1590,6 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       });
       await safe(() => removeWorktree(worktree));
     } catch (raw) {
-      // A kill that lands while this handler unwinds (releasing children costs several bd writes)
-      // arrives too late for runTicket's own abort check but is still an operator stopping the run —
-      // and the ask below is the one branch that would write NEW board state on the way out. Convert
-      // it here too, so the gate is armed only for a run nobody cancelled (anton-287p).
-      const e =
-        raw instanceof NeedsHumanError && ctx.signal.aborted
-          ? new CancelledAskError(raw.ticketId, "aborted", raw.ask)
-          : raw;
       // Give the children back before settling the row (anton-0d85). This attempt has stopped —
       // parked on a blocking review, killed by an abandon, backed off after losing the lease race, or
       // failed outright — so holding its reservations would leave the whole feature invisible to
@@ -1612,7 +1604,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // The ONE exception is a usage-limit park: that run is not dead, it is waiting out a quota
       // window and resumes on THIS machine with everything intact — the same reason runTicket keeps
       // the in-flight ticket's claim on that path, and releasing here would contradict it.
-      if (childCascade && !isUsageLimitError(e)) {
+      if (childCascade && !isUsageLimitError(raw)) {
         const release = await releaseChildren(repo, childCascade.ids, childCascade.actor);
         if (release.released.length > 0) {
           console.warn(
@@ -1631,6 +1623,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           );
         }
       }
+      // Resolved HERE — after the release awaits, immediately before the settle that would arm the
+      // gate — so a kill landing mid-unwind still converts (anton-287p). Nothing above this line
+      // branches on the distinction (the release runs the same for either error), so the late read
+      // costs nothing earlier.
+      const e = askSettleError(raw, ctx.signal);
       // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
@@ -2576,7 +2573,7 @@ class BlockedByAgentError extends Error {
  * Poison-classified (`name = "PoisonError"`) so the runner parks rather than burning attempts. A
  * retry cannot answer an ask; only the person can, and resolving their gate is what releases the run.
  */
-class NeedsHumanError extends Error {
+export class NeedsHumanError extends Error {
   constructor(
     readonly ticketId: string,
     /** The agent's ask, verbatim — the gate's reason. Undefined when it named none. */
@@ -2609,6 +2606,22 @@ class CancelledAskError extends Error {
     );
     this.name = "PoisonError"; // classified as poison by the runner
   }
+}
+
+/**
+ * What a run settles on when its ticket asked for a human — the ask itself, or the cancelled form
+ * that arms no gate (anton-287p).
+ *
+ * Takes the LIVE signal, never a snapshot of `aborted`: the epic handler unwinds through several
+ * awaited bd writes (releasing the children it reserved) before it settles, and a force-kill that
+ * lands during them is still an operator stopping the run. Read too early, the ask would go on to
+ * arm a `human` gate that blocks the target until someone clears it by hand, for a run nobody is
+ * waiting on. So callers must pass the signal and call this at the settle, not at the catch.
+ */
+export function askSettleError(raw: unknown, signal: AbortSignal): unknown {
+  return raw instanceof NeedsHumanError && signal.aborted
+    ? new CancelledAskError(raw.ticketId, "aborted", raw.ask)
+    : raw;
 }
 
 /**

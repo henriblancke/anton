@@ -8,6 +8,7 @@ import type { Bead, BeadDep, Gate } from "../beads/bd";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import { blockedTailReason, poisonBlockerIds, PoisonEpic } from "./errors";
 import {
+  askSettleError,
   claudeResumeDecision,
   continuationPrompt,
   inactiveAgentTickets,
@@ -15,6 +16,7 @@ import {
   humanGatePlan,
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
+  NeedsHumanError,
   reviewParkMessage,
   runReadiness,
   runTargetDrift,
@@ -806,5 +808,36 @@ describe("humanGatePlan", () => {
     const reason = humanGateReason("f-1", undefined);
     const plan = humanGatePlan([target("g-1"), gate("g-1", reason)], "f-1", reason);
     expect(plan.open?.id).toBe("g-1");
+  });
+});
+
+describe("askSettleError — a cancellation that overtakes the ask (anton-287p)", () => {
+  const ask = new NeedsHumanError("t-1", "someone must approve the vendor contract");
+
+  it("keeps the ask when nothing cancelled the run, so the gate is armed", () => {
+    expect(askSettleError(ask, new AbortController().signal)).toBe(ask);
+  });
+
+  it("reads the signal at the settle, not when the error was caught", () => {
+    // The regression this guards: the handler unwinds through several awaited bd writes (releasing
+    // the children it reserved) before it settles, so a kill can land AFTER the catch. A snapshot
+    // taken on the way in would still arm a `human` gate — permanent board state blocking a target
+    // nobody is waiting on — for a run an operator just killed.
+    const controller = new AbortController();
+    expect(askSettleError(ask, controller.signal)).toBe(ask);
+    controller.abort();
+    const settled = askSettleError(ask, controller.signal);
+    expect(settled).not.toBe(ask);
+    expect((settled as Error).name).toBe("PoisonError"); // still parks; a retry can't answer an ask
+    expect((settled as Error).message).toContain("armed NO gate");
+    expect((settled as Error).message).toContain("someone must approve the vendor contract");
+  });
+
+  it("passes every other error through untouched, cancelled or not", () => {
+    const other = new Error("the build broke");
+    const controller = new AbortController();
+    controller.abort();
+    expect(askSettleError(other, controller.signal)).toBe(other);
+    expect(askSettleError(other, new AbortController().signal)).toBe(other);
   });
 });
