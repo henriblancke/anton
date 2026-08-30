@@ -487,10 +487,18 @@ async function lockedInAdminDir(wt: Worktree): Promise<boolean | undefined> {
 }
 
 /**
- * Why `wt` must be left alone, or undefined when it is anton's to remove. Today that is exactly one
- * case: another tool locked the checkout. `git worktree remove --force` refuses a locked worktree,
- * and the orphan fallback below would then delete a directory another owner is working in — the lock
- * is precisely the statement that it must not.
+ * Why `wt` must be left alone, or undefined when it is anton's to remove. Two cases, both read from
+ * git at the moment of removal rather than trusted from a caller's snapshot.
+ *
+ * Another tool LOCKED the checkout: `git worktree remove --force` refuses a locked worktree, and the
+ * orphan fallback below would then delete a directory another owner is working in — the lock is
+ * precisely the statement that it must not.
+ *
+ * Or the path is no longer this branch's. Removal is by path and `--force` never checks what is on
+ * it, so a path re-registered to another branch between a caller's `listWorktrees` snapshot and this
+ * call would be deleted with that branch's uncommitted work. Only a DIFFERENT branch blocks: a record
+ * git reports with no branch (a detached HEAD) is still the checkout anton made, and a caller with no
+ * branch to compare — project teardown removes by recorded path alone — is unaffected.
  *
  * An unreadable listing erases that evidence, so for a checkout still ON DISK it fails CLOSED: the
  * lock is re-read from the admin directory, and one that can be neither proven nor ruled out is left
@@ -510,14 +518,18 @@ async function removalBlocker(wt: Worktree): Promise<string | undefined> {
       : "git's worktree list is unreadable, so another owner's lock cannot be ruled out";
   }
   const record = records.find((r) => resolve(r.path) === target);
-  if (!record?.locked) return undefined;
-  return `locked by another owner (${record.lockReason ?? "no reason given"})`;
+  if (record?.locked) return `locked by another owner (${record.lockReason ?? "no reason given"})`;
+  if (wt.branch && record?.branch && record.branch !== wt.branch) {
+    return `git registers ${record.branch} at that checkout now, not ${wt.branch}`;
+  }
+  return undefined;
 }
 
 /**
  * Remove the worktree (force, so dirty state is discarded) and prune. If `deleteBranch` is set,
  * also delete the branch. Safe to call when the worktree is already gone (idempotent), and a no-op
- * that REPORTS itself when the checkout is locked by another owner.
+ * that REPORTS itself when the checkout is locked by another owner or the path has since been
+ * registered to a different branch (see {@link removalBlocker}).
  */
 export async function removeWorktree(
   wt: Worktree,

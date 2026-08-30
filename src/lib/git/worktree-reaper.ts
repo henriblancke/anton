@@ -227,10 +227,12 @@ export function reapCandidates(input: {
     runs.filter((r) => r.status === "running" || r.status === "queued").map((r) => r.branch),
   );
   // Git is the only authority on what a path holds NOW. A run row remembers where its checkout was,
-  // and removal is by path (`git worktree remove --force <path>`, which never checks what is on it):
-  // a path since reused for another branch would be deleted with that branch's uncommitted work. So
-  // a recorded path is carried only while git still attributes it to this branch — otherwise the row
-  // contributes branch-only residue. A path git has NO record of is not someone else's either: that
+  // and removal is by path (`git worktree remove --force <path>`): a path since reused for another
+  // branch would be deleted with that branch's uncommitted work. So a recorded path is carried only
+  // while git still attributes it to this branch — otherwise the row contributes branch-only
+  // residue. This snapshot ages before anything is deleted, so `removeWorktree` re-reads the same
+  // association at the moment of removal; both together close the window. A path git has NO record
+  // of is not someone else's either: that
   // is the pruned-registration orphan this sweep exists to reclaim, and `removeWorktree` proves
   // ownership of it from its own `.git` marker before deleting anything.
   const recordAtPath = new Map(worktrees.map((wt) => [resolve(wt.path), wt]));
@@ -358,8 +360,9 @@ async function applyPlan(
     repoPath,
   };
   const outcome = await removeWorktree(wt, { deleteBranch: plan.deleteBranch });
-  // The lock can appear between the plan and the act; `removeWorktree` refuses it either way, so
-  // the entry reports the refusal rather than the plan's optimism.
+  // A lock — or a re-registration of the path to another branch — can appear between the plan and
+  // the act; `removeWorktree` re-reads both and refuses, so the entry reports the refusal rather
+  // than the plan's optimism.
   if (outcome.skipped) {
     return { ...base, outcome: "refused", reason: `skipped ${entry.path ?? entry.branch}: ${outcome.skipped}` };
   }

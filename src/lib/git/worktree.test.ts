@@ -342,6 +342,35 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  it("SKIPS a path git now registers to a DIFFERENT branch, however stale the caller's record", async () => {
+    // The reaper decides from a `listWorktrees` snapshot and deletes by path seconds to minutes
+    // later. If the path was re-registered in between, `--force` removal would take the replacement
+    // checkout and its uncommitted work with it — so the association is re-read here, at removal.
+    const holder = "anton/run-path-holder";
+    const stale = "anton/run-path-stale";
+    const wt = await createWorktree({ repoPath: repo, branch: holder });
+    writeFileSync(join(wt.path, "in-progress.txt"), "the replacement's work\n");
+    execFileSync("git", ["-C", repo, "branch", stale]);
+
+    try {
+      const removal = await removeWorktree(
+        { path: wt.path, branch: stale, baseBranch: stale, repoPath: repo },
+        { deleteBranch: true },
+      );
+
+      expect(removal.removed).toBe(false);
+      expect(removal.branchDeleted).toBe(false);
+      expect(removal.skipped).toBe(`git registers ${holder} at that checkout now, not ${stale}`);
+      expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+      expect(
+        execFileSync("git", ["-C", repo, "branch", "--list", holder], { encoding: "utf8" }).trim(),
+      ).not.toBe("");
+    } finally {
+      await removeWorktree(wt, { deleteBranch: true });
+      execFileSync("git", ["-C", repo, "branch", "-D", stale]);
+    }
+  });
+
   it("removes a verified orphan when the main repository metadata is gone", async () => {
     const orphanRepo = mkdtempSync(join(tmpdir(), "anton-wt-orphan-repo-"));
     const orphanPath = mkdtempSync(join(tmpdir(), "anton-wt-orphan-checkout-"));
