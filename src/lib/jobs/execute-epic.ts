@@ -2322,7 +2322,8 @@ export function humanGatePlan(
  *     explicit stop.
  *
  * THROWS when the gate cannot be created, when a superseded gate cannot be resolved, when a kill
- * lands inside the create (the gate is undone first), or when the board cannot be read (arming blind
+ * lands anywhere from the board read through the label write (a gate this run created is undone
+ * first; one it was only reusing is left where it stands), or when the board cannot be read (arming blind
  * is how the duplicate wait gets made) — so the caller settles
  * the run LOUDLY instead of parking it. All three are the same failure: a park is only meaningful if
  * resolving the gate it names makes the target runnable, and it does not when there is no gate, when
@@ -2345,13 +2346,33 @@ export async function armHumanGate(
   // target until someone clears it by hand, for a wait nobody is waiting on. Refusing the SUPERSEDE
   // matters for the same reason in reverse — resolving the older ask while arming nothing would
   // leave the target with no wait at all, silently runnable again on an ask nobody answered.
-  const refuseIfCancelled = () => {
+  const refuseIfCancelled = (consequence: string) => {
     if (signal?.aborted) {
       throw new Error(
         `refusing to arm ${targetId}'s human gate — the run was cancelled while the board was ` +
-          `read; a gate armed now would block the target with nobody waiting on it`,
+          `read; ${consequence}`,
       );
     }
+  };
+  // The writes below are uninterruptible awaits of their own, so no check BEFORE one covers a kill
+  // that lands while it runs (anton-287p): the gate would exist, the caller would read a successful
+  // arm, and a cancelled run would park behind a wait nobody is waiting on. Re-read the signal after
+  // each and undo the create, so the ask settles in its cancelled form exactly as if it never landed.
+  const undoIfCancelled = async (gateId: string, during: string) => {
+    if (!signal?.aborted) return;
+    const undone = await safe(() =>
+      beads.gateResolve(repo, gateId, `run cancelled while ${targetId}'s human gate was armed`),
+    );
+    if (undone) {
+      throw new Error(
+        `refusing to arm ${targetId}'s human gate — the run was cancelled while ${during}; gate ` +
+          `${gateId} was resolved, so the target carries no wait from this run`,
+      );
+    }
+    // The undo was the only thing that would ever have closed it: no automatic pass resolves a human
+    // gate, so the target stays blocked until someone clears this id by hand. It rides out in the
+    // error because nothing else on the board names it.
+    throw new StrandedHumanGateError(targetId, gateId);
   };
   // STRICT, and no catch: this read is the ONLY thing that can tell "the ask is already with
   // someone" from "nothing is armed", and bd omits gate beads from every ordinary listing — so a
@@ -2371,7 +2392,9 @@ export async function armHumanGate(
 
   const { stale, held, open } = humanGatePlan(board, targetId, reason);
 
-  if (stale.length > 0) refuseIfCancelled();
+  if (stale.length > 0) {
+    refuseIfCancelled("a gate armed now would block the target with nobody waiting on it");
+  }
   for (const gate of stale) {
     const resolved = await safe(() =>
       beads.gateResolve(repo, gate.id, `superseded — ${targetId} now waits on a newer ask`),
@@ -2396,29 +2419,20 @@ export async function armHumanGate(
   }
   const heldIds = held.map((g) => g.id);
   // this ask is already with a human — a second gate would race it
-  if (open) return { gateId: open.id, held: heldIds };
-
-  refuseIfCancelled();
-  const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
-  // The create is an uninterruptible await of its own, so the check above cannot cover a kill that
-  // lands while it runs (anton-287p): the gate would exist, the caller would read a successful arm,
-  // and a cancelled run would park behind a wait nobody is waiting on. Re-read the signal on the far
-  // side and undo the write, so the ask settles in its cancelled form exactly as if it never landed.
-  if (signal?.aborted) {
-    const undone = await safe(() =>
-      beads.gateResolve(repo, gateId, `run cancelled while ${targetId}'s human gate was armed`),
+  if (open) {
+    // Reusing writes nothing, so it reaches neither guarded write above — but a successful return is
+    // what makes the caller PARK, and a cancelled run must never park (anton-287p). The gate itself
+    // stays: an earlier attempt armed it for this same ask, and it is not this run's to take back.
+    refuseIfCancelled(
+      `gate ${open.id} already carries this ask, so the cancelled run must settle instead of ` +
+        `parking behind a wait it is no longer taking`,
     );
-    if (undone) {
-      throw new Error(
-        `refusing to arm ${targetId}'s human gate — the run was cancelled while the gate was ` +
-          `created; gate ${gateId} was resolved, so the target carries no wait from this run`,
-      );
-    }
-    // The undo was the only thing that would ever have closed it: no automatic pass resolves a human
-    // gate, so the target stays blocked until someone clears this id by hand. It rides out in the
-    // error because nothing else on the board names it.
-    throw new StrandedHumanGateError(targetId, gateId);
+    return { gateId: open.id, held: heldIds };
   }
+
+  refuseIfCancelled("a gate armed now would block the target with nobody waiting on it");
+  const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
+  await undoIfCancelled(gateId, "the gate was created");
   // Best-effort, unlike everything above: the gate exists and carries the ask, so the park is
   // already valid. A lost tag only costs a later arm the right to supersede this wait — it reads as
   // a person's hold and stays open, which is the safe direction for a gate only a human ends.
@@ -2428,6 +2442,9 @@ export async function armHumanGate(
         `(${HUMAN_GATE_ARMED_LABEL}) — a later ask will leave it open instead of superseding it`,
     );
   }
+  // The label write is the last uninterruptible await, and a kill landing inside it would otherwise
+  // ride out as a successful arm past every check above.
+  await undoIfCancelled(gateId, "the gate was labelled");
   return { gateId, held: heldIds };
 }
 

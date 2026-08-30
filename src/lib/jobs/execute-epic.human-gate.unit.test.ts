@@ -196,6 +196,50 @@ it("names the gate it could not undo, because nothing else ever will", async () 
   expect(failure.message).toContain("bd gate resolve g-new");
 });
 
+it("undoes the gate when the kill lands inside the label write, the last uninterruptible await", async () => {
+  // The window past every earlier check: the gate is created and live, and the label write is the
+  // final await before the successful return the caller PARKS on. A kill arriving there would ride
+  // out as a good arm and leave a cancelled run's target blocked by a gate only a person can clear.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockResolvedValue("g-new");
+  tagMock.mockImplementation(async () => {
+    controller.abort();
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
+});
+
+it("names the gate it could not undo after a kill inside the label write", async () => {
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockResolvedValue("g-new");
+  tagMock.mockImplementation(async () => {
+    controller.abort();
+  });
+  gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
+
+  const failure = await armHumanGate(REPO, "f-1", ASK, controller.signal).catch((e) => e);
+  expect(failure).toBeInstanceOf(StrandedHumanGateError);
+  expect(failure.gateId).toBe("g-new");
+});
+
+it("refuses to REUSE an armed gate when the kill lands mid-read, rather than parking a dead run", async () => {
+  // The reuse path writes nothing, so it reaches neither guarded write — but returning a gate is
+  // exactly what makes the caller park, and a cancelled run parked on a human gate waits forever.
+  // The gate stays: an earlier attempt armed it for this same ask, so it is not this run's to undo.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockImplementation(async () => {
+    controller.abort();
+    return [target("g-mine"), gate("g-mine", ASK)];
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateResolveMock).not.toHaveBeenCalled();
+  expect(gateCreateMock).not.toHaveBeenCalled();
+});
+
 it("arms as usual while the run is still live", async () => {
   loadAllIssuesMock.mockResolvedValue([target()]);
   gateCreateMock.mockResolvedValue("g-new");
