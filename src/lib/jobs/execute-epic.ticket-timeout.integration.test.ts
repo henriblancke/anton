@@ -18,6 +18,9 @@
  * 5. **The tickets BEHIND a timed-out one are skipped, not dispatched** (anton-67xj). Their premise
  *    was rolled back off the branch, so dispatching them buys a zero diff and a poisoned run; the
  *    run narrows to the independent work and still opens its PR for it.
+ * 6. **A `not-delivered` marker that will not persist halts the run** (anton-67xj). That label is
+ *    merge finalization's only signal that a ticket is in no diff, so a run that opened its PR
+ *    without it would have the merge close never-written work as shipped.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -27,6 +30,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
+import { BD_BIN_ENV, resetBdBinCache, resolveBdBin } from "../beads/bd-bin";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
 import { resetOperatorCache } from "../operator";
@@ -394,6 +398,65 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       process.env.ANTON_CLAUDE_BIN = successClaude;
       process.env.ANTON_GH_BIN = okGh;
       await patchSettings({ ticketTimeoutMinutes: undefined });
+    }
+  });
+
+  it("halts the run when the `not-delivered` marker will not persist (anton-67xj)", async () => {
+    // The false success this closes: the label is merge finalization's ONLY evidence that a ticket
+    // is in no diff. Swallow the write failure and the run opens its PR anyway — and the merge that
+    // ships the rest of the feature closes this rolled-back ticket as delivered, silently, against
+    // the note on the bead telling the operator to re-run it.
+    const epic = await approvedEpic("MarkerRefused");
+    const invLog = join(sandbox, "marker-inv.jsonl");
+    const claude = hangingClaude("claude-hang-marker", invLog, "first");
+
+    // A real bd for everything except the one write under test: the marker is refused, so the
+    // failure is bd's own rather than a mock's, and every other board write still lands.
+    const realBd = resolveBdBin();
+    const shim = writeBin(
+      binDir,
+      "bd-refuses-marker",
+      `const {spawnSync}=require('child_process');const a=process.argv.slice(2);
+const i=a.indexOf('--add-label');
+if(i>=0&&a[i+1]==='not-delivered'){process.stderr.write('Error: simulated bd write failure\\n');process.exit(1);}
+const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.status===null?1:r.status);`,
+    );
+
+    await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    const priorBdBin = process.env[BD_BIN_ENV];
+    process.env[BD_BIN_ENV] = shim;
+    resetBdBinCache();
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: epic.id });
+
+      // The run STOPPED rather than walk on to a PR whose merge would swallow the ticket.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/would not record `not-delivered`/i);
+
+      // The second ticket was never dispatched, and no PR was opened for the work that did land.
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).toHaveLength(1);
+      const target = await beads.show(repo, epic.id);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      expect(target.labels ?? []).not.toContain("stage:in-review");
+
+      // The timed-out ticket still carries everything the run COULD write about it — the halt is
+      // about the missing label, not a reason to leave the operator with nothing.
+      const stalled = await beads.show(repo, invoked[0]);
+      expect(stalled.status).toBe("blocked");
+      expect(stalled.labels ?? []).not.toContain("not-delivered");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
+      else process.env[BD_BIN_ENV] = priorBdBin;
+      resetBdBinCache();
+      await patchSettings({ ticketTimeoutMinutes: undefined });
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });
 });

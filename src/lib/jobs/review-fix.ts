@@ -511,9 +511,13 @@ export async function finalizeMergedEpic(args: {
   //    ticket timeout opens its PR for the work that DID land and marks the rest `not-delivered` —
   //    those beads are in no diff, so closing them here would file work that was never done as
   //    shipped and lose it silently, against the note on the bead telling the operator to run it.
-  //    They are left open and named on the target instead; the target itself still closes, since
-  //    the PR it points at is merged and terminal.
-  const preserved = children.filter((b) => b.status !== "closed" && beads.isNotDelivered(b));
+  //    They are left open and rehomed instead (1b); the target itself still closes, since the PR it
+  //    points at is merged and terminal. The target is never itself "preserved": a leaf run target
+  //    marked undelivered has no merged PR to finalize, and excluding it from the close would leave
+  //    `stage:in-review` on forever, re-selecting this epic on every sweep.
+  const preserved = children.filter(
+    (b) => b.id !== epic.id && b.status !== "closed" && beads.isNotDelivered(b),
+  );
   const skip = new Set(preserved.map((b) => b.id));
   const stillOpen = new Map(
     [...children, epic]
@@ -525,8 +529,16 @@ export async function finalizeMergedEpic(args: {
   );
   if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
-  // 1b. Say on each preserved bead that the feature shipped without it — the operator meets this
-  //     ticket long after the run that skipped it, under a target that now reads as done.
+  // 1b. Rehome the preserved tickets under a NEW run target, then say on each of them that the
+  //     feature shipped without it — the operator meets this ticket long after the run that skipped
+  //     it, under a target that now reads as done.
+  //
+  //     Rehoming is what makes the instruction actionable (anton-67xj). Left where they are these
+  //     tickets are unreachable: a task/bug WITH a parent is never a run target (beads.isRunTarget),
+  //     and the parent they hang off has just closed carrying a MERGED PR ref, which execute-epic
+  //     short-circuits on as an already-finished run. So neither the ticket nor its old home can be
+  //     claimed, and "re-run this" would mean restructuring the board by hand.
+  const followUp = await rehomePreserved(repo, epic, preserved);
   for (const bead of preserved) {
     await safe(() =>
       beads.note(
@@ -534,7 +546,13 @@ export async function finalizeMergedEpic(args: {
         bead.id,
         `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
           `deliver it (see the note above), so none of its work is in that diff. Left open on ` +
-          `purpose: closing it here would file work that was never done as shipped.`,
+          `purpose: closing it here would file work that was never done as shipped. ` +
+          (followUp.moved.has(bead.id)
+            ? `It now lives under ${followUp.id}, a fresh run target — approve that target to have ` +
+              `anton pick this work back up.`
+            : `It could NOT be rehomed onto a fresh run target, so nothing anton runs reaches it ` +
+              `yet: move it under a new epic (\`bd update ${bead.id} --parent <new-epic>\`) or ` +
+              `clear its parent to make it a run target of its own.`),
       ),
     );
   }
@@ -549,6 +567,61 @@ export async function finalizeMergedEpic(args: {
   // 3. Finalize the run row if one is still open (a run already marked done at PR-open is left as-is).
   const run = await findOpenRunForEpic(db, projectId, epic.id);
   if (run) await updateRun(db, clock, run.id, { status: "done", endedAt: clock.now(), error: null });
+}
+
+/**
+ * Move the tickets a merged PR did not contain under a NEW epic, and answer that epic's id
+ * (undefined when there is nothing to rehome, or bd refused). An epic with no `feature` children is
+ * a run target, so the preserved work becomes claimable and runnable again — see the caller for why
+ * leaving it under the merged target does not.
+ *
+ * Deliberately NOT `approved`: approval is the founder's gate, and re-running work a run already
+ * failed to deliver — after a timeout, possibly needing re-scoping first — is exactly the decision
+ * that gate exists for. It carries the epic-tier contract (an outcome and Success Criteria) so the
+ * approve route and execute-epic's own gate admit it rather than refusing a target anton wrote.
+ *
+ * Best-effort, like every other write here: a failure leaves the tickets parented where they were —
+ * still open, still noted with the manual remedy — rather than aborting a finalization whose closes
+ * have already landed. An epic that ends up with no children at all is deleted again, since a
+ * childless epic is a poison run rather than a home.
+ */
+async function rehomePreserved(repo: string, epic: Bead, preserved: Bead[]): Promise<Rehomed> {
+  const none: Rehomed = { moved: new Set() };
+  if (preserved.length === 0) return none;
+  const ids = preserved.map((b) => b.id).join(", ");
+  let followUp: string;
+  try {
+    followUp = await beads.create(repo, {
+      title: `${epic.title} — undelivered tickets`,
+      type: "epic",
+      // The roadmap groups by `area:`, and the contract wants exactly one: inherit the merged
+      // target's so the follow-up lands in the same column its work was always meant to ship in.
+      labels: (epic.labels ?? []).filter((l) => l.startsWith("area:")),
+      description:
+        `The pull request for ${epic.id} merged without ${ids}. The run that opened it ran out of ` +
+        `time, so that work is in no diff — this epic is its home, because a ticket parented to an ` +
+        `already-merged target is not something anton can run.\n\n` +
+        `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
+        `first if the timeout means they were too big.`,
+      acceptance: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
+    });
+  } catch {
+    return none;
+  }
+  const moved = new Set<string>();
+  for (const bead of preserved) {
+    if (await safe(() => beads.reparent(repo, bead.id, followUp))) moved.add(bead.id);
+  }
+  if (moved.size > 0) return { id: followUp, moved };
+  // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
+  await safe(() => beads.delete(repo, followUp));
+  return none;
+}
+
+/** Where {@link rehomePreserved} got to: the new target's id, and which tickets actually reached it. */
+interface Rehomed {
+  id?: string;
+  moved: Set<string>;
 }
 
 // ── helpers ──

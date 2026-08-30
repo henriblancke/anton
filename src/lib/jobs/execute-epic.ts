@@ -1298,7 +1298,17 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           await safe(() => beads.unassign(repo, ticket.id));
           // …and mark it as work this run did NOT deliver, which is what stops merge finalization
           // from closing it as shipped when the PR for the rest of the feature lands (anton-67xj).
-          await safe(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]));
+          // That marker is finalization's only input, so it is not best-effort: a run that cannot
+          // record it must not go on to open a PR whose merge would then file this ticket as
+          // shipped. Retry, then park for a human rather than proceed on an unwritten fact.
+          if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
+            throw new PoisonEpic(
+              `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+                `not record \`${LABELS.notDelivered}\` on it — the run stopped rather than open a ` +
+                `pull request whose merge would close this undelivered ticket as shipped. Check ` +
+                `the beads DB, then resume the run`,
+            );
+          }
           await safe(() => beads.note(repo, ticket.id, skipNote(skipping)));
           console.warn(
             `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
@@ -1982,7 +1992,11 @@ async function runTicket(args: {
       // Rolled back ⇒ nothing from this ticket is on the branch, so it is in no PR: mark it, or
       // merge finalization closes it as shipped when the rest of the feature lands (anton-67xj).
       // A ticket stopped AFTER its commit is NOT marked — its work is in the diff a human merges.
-      if (!committed) await safe(() => beads.tag(repo, ticket.id, [LABELS.notDelivered]));
+      // The marker is finalization's only input, so it is retried rather than best-effort; a run
+      // that still cannot record it must not reach its PR (escalated below, once the note is on the
+      // bead — the operator needs the timeout's own account either way).
+      const marked =
+        committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
       await safe(() =>
         beads.note(
           repo,
@@ -2011,6 +2025,18 @@ async function runTicket(args: {
             `partial work could NOT be rolled back — the run's worktree (${worktreePath}) still ` +
             `carries changes that the next ticket would commit as its own, so the run stopped ` +
             `here. Clear the worktree by hand, then resume the run`,
+        );
+      }
+      // Same reasoning one step further out: this ticket's work is on no branch, and without the
+      // marker the merge of the PR carrying the REST of the feature closes it as shipped. The note
+      // above can't prevent that — finalization reads labels, not prose — so halt instead of
+      // absorbing this timeout and walking on toward a PR that would swallow the ticket.
+      if (!marked) {
+        throw new PoisonEpic(
+          `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
+            `partial work was rolled back, but bd would not record \`${LABELS.notDelivered}\` on ` +
+            `it — the run stopped rather than carry on to a pull request whose merge would close ` +
+            `this undelivered ticket as shipped. Check the beads DB, then resume the run`,
         );
       }
       throw new TicketTimeoutError(ticket.id, timeoutMs, committed);
@@ -2994,3 +3020,29 @@ async function safe(fn: () => Promise<unknown>): Promise<boolean> {
     return false; // best-effort
   }
 }
+
+/** Backoff between {@link mustPersist} attempts — long enough to outlast a contended Dolt write. */
+const PERSIST_RETRY_MS = 500;
+
+/**
+ * A bd write the run is NOT allowed to proceed without, retried before it is permitted to fail.
+ * Answers whether it landed, so the caller escalates instead of carrying on as if it had.
+ *
+ * `safe` is right for a label whose absence a reader can survive. It is wrong for the
+ * `not-delivered` marker (anton-67xj): that label is merge finalization's ONLY signal that a ticket
+ * is in no diff, so swallowing its failure lets the run open a PR whose merge closes never-written
+ * work as shipped — silently, and against the note on the bead telling the operator to re-run it.
+ */
+async function mustPersist(fn: () => Promise<unknown>, attempts = 3): Promise<boolean> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (await safe(fn)) return true;
+    if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+  }
+  return false;
+}
+
+const delayMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === "function") t.unref();
+  });
