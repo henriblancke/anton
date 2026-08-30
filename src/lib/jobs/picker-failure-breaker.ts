@@ -38,6 +38,7 @@ import {
   lastReArmAt,
   settledAfterReArm,
 } from "../autopilot-disarm";
+import { isActiveRun } from "@/components/runs/run-view-utils";
 import { getProjectSettings, resolveFailureBreaker } from "../projects";
 import { listRecentRunOutcomes, type RunDetail } from "../runs";
 import { cancelledExecuteEpicJobs, type AntonDb, type CancelledJob, type Clock } from "./queue";
@@ -75,6 +76,23 @@ const STREAK_PAGE = 20;
 const CANCEL_MATCH_SLACK_MS = 60_000;
 
 /**
+ * When this run stopped being its job's live attempt, or nothing while it is still open.
+ *
+ * A SETTLED run (`done`/`failed`) is over, and its job may already have queued the retry that
+ * follows it — the runner reuses the job row and only opens the retry's own run when that attempt
+ * actually starts. So a cancel raised after this run ended stopped whatever came next, never this
+ * run: the handler writes the cancel BEFORE the run it interrupts unwinds to `failed`, which is why
+ * no slack is allowed on this side.
+ *
+ * An OPEN run — running, or parked on a quota window or a human — has no such bound. It stops
+ * moving and waits, so the cancel that ends it is its own however many hours later it lands.
+ */
+function settledAtMs(run: RunDetail): number | undefined {
+  if (isActiveRun(run.status)) return undefined;
+  return (run.endedAt ?? run.updatedAt) * 1000;
+}
+
+/**
  * Whether an operator cancelled the job behind this run.
  *
  * The join is the run's own `jobId` — the job that started or last resumed this attempt — so a
@@ -82,13 +100,19 @@ const CANCEL_MATCH_SLACK_MS = 60_000;
  * cancel of some OTHER job of the same epic (a queued attempt stopped before it ever ran) counts as
  * nothing here. Exact in both directions, which the window below can only approximate.
  *
- * `nextAttemptStartMs` — when the SAME epic's next attempt started — bounds BOTH joins, because a
- * job id is not one attempt. The runner's automatic retry reuses the job row and gives the retry a
- * fresh run (see `findRunFormulaForBranch`), so one job id can span several run rows; cancelling
- * the retry would otherwise mark every earlier attempt of that job cancelled too and dissolve
- * genuine failures out of the streak. A cancel raised after the next attempt was already running
- * belongs to that attempt, not to this one. The legacy window needs the same bound for its own
- * reason: a retry beginning inside the slack shares that instant with the attempt before it.
+ * Two bounds keep one job id from claiming a cancel for every attempt it spans, because a job id is
+ * not one attempt: the runner's automatic retry reuses the job row and gives the retry a fresh run
+ * (see `findRunFormulaForBranch`).
+ *
+ *   • `nextAttemptStartMs` — when the SAME epic's next attempt started. A cancel raised after that
+ *     belongs to that attempt, not to this one; without it, cancelling a retry would mark every
+ *     earlier attempt of its job cancelled too.
+ *   • {@link settledAtMs} — when THIS run settled. It is what covers the retry that never started:
+ *     a cancel during the backoff has no next attempt to be bounded by, and the id join alone would
+ *     hand it back to the failure it followed and dissolve a real failure out of the streak.
+ *
+ * The legacy window needs both for its own reason: a retry beginning inside the slack, or a cancel
+ * of one queued inside it, shares that stretch with the attempt before it.
  */
 function wasCancelled(
   run: RunDetail,
@@ -96,14 +120,16 @@ function wasCancelled(
   nextAttemptStartMs: number | undefined,
 ): boolean {
   if (!cancels?.length) return false;
-  const beforeNextAttempt = (at: number) =>
-    nextAttemptStartMs === undefined || at < nextAttemptStartMs;
+  const settledAt = settledAtMs(run);
+  const couldBeThisRun = (at: number) =>
+    (nextAttemptStartMs === undefined || at < nextAttemptStartMs) &&
+    (settledAt === undefined || at <= settledAt);
   if (run.jobId !== undefined) {
-    return cancels.some((cancel) => cancel.id === run.jobId && beforeNextAttempt(cancel.at));
+    return cancels.some((cancel) => cancel.id === run.jobId && couldBeThisRun(cancel.at));
   }
   const from = (run.startedAt ?? run.updatedAt) * 1000;
   const until = (run.endedAt ?? run.updatedAt) * 1000 + CANCEL_MATCH_SLACK_MS;
-  return cancels.some(({ at }) => at >= from && at <= until && beforeNextAttempt(at));
+  return cancels.some(({ at }) => at >= from && at <= until && couldBeThisRun(at));
 }
 
 /** The board's won't-do beads, by id — a lookup rather than a scan per run. */

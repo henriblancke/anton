@@ -216,6 +216,39 @@ describe("checkFailureStreak", () => {
     expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
   });
 
+  it("counts the failure whose QUEUED retry the operator cancelled", async () => {
+    // The retry reuses the job row and opens its own run only once it starts, so a cancel during
+    // the backoff has no next attempt to be bounded by. Handing it back to the attempt that failed
+    // before it would excuse a genuine failure and keep the breaker from ever firing.
+    await project({ autopilotFailureStreak: 2 });
+    const job = await cancelledJob("anton-b", 40);
+    await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
+    await run({
+      id: "r2",
+      epic: "anton-b",
+      status: "failed",
+      startedMinutes: 15,
+      error: "boom",
+      job,
+    });
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
+  });
+
+  it("counts a failure whose retry was cancelled inside the legacy slack window", async () => {
+    // The same hole on the pre-`job_id` join: the retry backoff starts at seconds, so a cancel of
+    // the queued retry lands well inside the slack an INTERRUPTING cancel needs — and the failure
+    // that settled before it is not what the operator stopped.
+    await project({ autopilotFailureStreak: 2 });
+    await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
+    await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 15, error: "boom" });
+    await cancelledJob("anton-b", 25.5);
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
+  });
+
   it("counts an abandoned run, whose job the abandon also cancelled", async () => {
     await project();
     await threeFailures();
