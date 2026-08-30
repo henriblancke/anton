@@ -15,13 +15,18 @@
  * ("epics can only block other epics"), so the gated shape only exists for the targets the tier
  * split actually produces.
  *
+ * The rest of the file is anton-287p.4 — the same ask arriving twice. A human gate is the one
+ * flavour nothing automates away, so both failure modes are permanent once they land: a duplicate
+ * gate is a wait resolving cannot end, and a park with NO gate is a wait nothing can end at all.
+ *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { beads, type Gate } from "../beads/bd";
+import { beads, gateReason, type Gate } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import * as schema from "../db/schema";
+import { armHumanGate } from "./execute-epic";
 import { getJob, park } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
@@ -159,6 +164,70 @@ process.exit(0);`),
     }
   });
 
+  it("re-entering a target that already waits on a human adds no second gate", async () => {
+    // The re-entry this covers is the cheap one to get wrong: the same target executed twice. The
+    // first run leaves the ask on the board; the second must not stack a second wait behind it,
+    // because resolving either would leave the target blocked by the other.
+    const ask = "someone has to pick which of the two schemas MARKER_SCHEMA_PICK we keep";
+    const feature = await approvedFeature("Needs a decision");
+    const claude = askingClaude("claude-ask-twice", ask, true);
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    const jobIds: string[] = [];
+    try {
+      jobIds.push(await driveEpicRun(runner, { projectId, epicBeadId: feature.id }));
+      const armed = await gatesBlocking(feature.id);
+      expect(armed).toHaveLength(1);
+
+      jobIds.push(await driveEpicRun(runner, { projectId, epicBeadId: feature.id }));
+
+      // Still exactly one open wait, and it is the SAME gate — the ask a person is holding.
+      const after = await gatesBlocking(feature.id);
+      expect(after.map((g) => g.id)).toEqual([armed[0].id]);
+      // …and re-entry never claimed a delivery on the way: no PR was opened by either run.
+      expect(beads.getPrRef(await beads.show(repo, feature.id)) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      for (const id of jobIds) await park(tdb.db, clock, id, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("reuses the wait for the same ask and supersedes one whose ask no longer applies", async () => {
+    // Straight at the arm, because the states it has to survive are the ones a full run cannot
+    // reach: a settle lost after the gate landed, and a resumed run that stops for a NEW reason.
+    const ask = "the staging DB password MARKER_PW has to be rotated by a person";
+    const feature = await approvedFeature("Needs a rotation");
+
+    const first = await armHumanGate(repo, feature.id, ask);
+    expect(await armHumanGate(repo, feature.id, ask)).toBe(first); // same ask ⇒ same wait
+    expect((await gatesBlocking(feature.id)).map((g) => g.id)).toEqual([first]);
+
+    const newer = "actually MARKER_ZONE needs a DNS record first";
+    const second = await armHumanGate(repo, feature.id, newer);
+    expect(second).not.toBe(first);
+
+    // One open wait, carrying the current ask. Nothing else would ever have closed the old one:
+    // `bd gate check` does not evaluate a human gate and the expiry pass skips it — so left open it
+    // would block this target on an ask nobody is answering.
+    const open = await gatesBlocking(feature.id);
+    expect(open.map((g) => g.id)).toEqual([second]);
+    expect(gateReason(open[0])).toBe(newer);
+    const all = await beads.gateList(repo, { all: true });
+    expect(all.find((g) => g.id === first)?.status).toBe("closed");
+  });
+
+  it("refuses an epic target loudly instead of littering the board with a gate that blocks nothing", async () => {
+    // bd rejects a gate edge onto an epic ("epics can only block other epics") and STILL leaves the
+    // gate bead behind, blocking nothing. Refusing up front is what keeps a retry from filing one
+    // orphan per attempt.
+    const before = (await beads.gateList(repo, { all: true })).length;
+    await expect(armHumanGate(repo, ctx.epicId, "an ask an epic cannot carry")).rejects.toThrow(
+      /is an epic/,
+    );
+    expect((await beads.gateList(repo, { all: true })).length).toBe(before);
+  });
+
   it("arms the gate rather than tripping the zero-diff delivery gate — with NO diff", async () => {
     const ask = "the DNS record MARKER_ZONE_APEX has to be added in the registrar console";
     const feature = await approvedFeature("Needs a DNS record");
@@ -186,6 +255,35 @@ process.exit(0);`),
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       await patchSettings({ testCommand: "test -f AGENT_WORK.md" });
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("fails the run loudly when the ask cannot become a gate — never parks behind nothing", async () => {
+    // The forced failure is a real one, not a stub: the run target is the fixture's LEGACY EPIC, and
+    // bd refuses a gate edge onto an epic. A park here would be a wait no `bd gate resolve` could
+    // ever end — the run would sit in the waiting-on-a-person surface until someone read the logs.
+    const ask = "only a person can decide whether MARKER_EPIC_SPLIT ships as one epic or two";
+    const claude = askingClaude("claude-ask-epic", ask, true);
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: ctx.epicId });
+
+      // No gate was created — including no orphan one blocking nothing.
+      expect(await gatesBlocking(ctx.epicId)).toEqual([]);
+
+      // FAILED, ended, and the error carries the ask plus why nothing on the board holds it.
+      const run = await runFor(ctx.epicId);
+      expect(run.status).toBe("failed");
+      expect(run.endedAt ?? null).not.toBeNull();
+      expect(run.error).toContain(ask);
+      expect(run.error).toMatch(/human gate could NOT be created/);
+      expect(run.error).not.toMatch(/closing that gate resumes this run/);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });

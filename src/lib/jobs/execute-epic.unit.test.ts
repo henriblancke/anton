@@ -12,6 +12,8 @@ import {
   continuationPrompt,
   inactiveAgentTickets,
   mergeGatePlan,
+  humanGatePlan,
+  humanGateReason,
   reviewParkMessage,
   runTargetDrift,
   splitFormulaPhases,
@@ -582,5 +584,83 @@ describe("mergeGatePlan", () => {
     ];
     expect(mergeGatePlan(board, "f-1", "9").stale.map((g) => g.id)).toEqual(["g-related"]);
     expect(mergeGatePlan(withRelated, "f-1", "9")).toEqual({ stale: [], create: true });
+  });
+});
+
+/**
+ * anton-287p.4: the human wait must be re-enterable. A settle lost after the gate landed, a resume,
+ * or a fresh worktree on another machine all re-run the arm — and unlike every other flavour, a
+ * human gate is a REAL blocker that nothing but a person ever closes, so both a duplicate and a
+ * superseded leftover keep the target unrunnable.
+ */
+describe("humanGatePlan", () => {
+  const ASK = "the sandbox Stripe key is not something I can create";
+  /** A gate as bd returns it: the reason lives inside the description bd composes. */
+  const gate = (id: string, reason: string, o: Partial<Gate> = {}): Gate =>
+    ({
+      id,
+      title: "Gate: human",
+      status: "open",
+      issue_type: "gate",
+      await_type: "human",
+      description: `Ad-hoc gate blocking f-1\n\nReason: ${reason}`,
+      ...o,
+    }) as Gate;
+
+  const target = (...gateIds: string[]): Bead =>
+    ({
+      id: "f-1",
+      title: "f-1",
+      status: "open",
+      dependencies: gateIds.map((g) => ({ issue_id: "f-1", depends_on_id: g, type: "blocks" })),
+    }) as Bead;
+
+  it("creates the wait when the target carries none", () => {
+    expect(humanGatePlan([target()], "f-1", ASK)).toEqual({ stale: [], open: undefined });
+  });
+
+  it("reuses the gate already carrying this ask rather than racing it with a second", () => {
+    const plan = humanGatePlan([target("g-1"), gate("g-1", ASK)], "f-1", ASK);
+    expect(plan.open?.id).toBe("g-1");
+    expect(plan.stale).toEqual([]);
+  });
+
+  it("supersedes a gate whose ask no longer applies", () => {
+    const plan = humanGatePlan([target("g-old"), gate("g-old", "an older ask")], "f-1", ASK);
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-old"]);
+    expect(plan.open).toBeUndefined();
+  });
+
+  it("resolves EVERY stale gate even when the live one is seen first", () => {
+    // The failure this guards: a gateResolve that failed on an earlier run leaves the old ask open
+    // next to the current one. Stopping at the live gate would leave it blocking the target forever
+    // — no `bd gate check` and no expiry pass ever looks at a human gate.
+    const board = [target("g-1", "g-a", "g-b"), gate("g-1", ASK), gate("g-a", "ask A"), gate("g-b", "ask B")];
+    const plan = humanGatePlan(board, "f-1", ASK);
+    expect(plan.open?.id).toBe("g-1");
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-a", "g-b"]);
+  });
+
+  it("ignores resolved gates, non-blocks edges, and gates of another flavour", () => {
+    const board = [
+      target("g-closed", "g-related", "g-merge"),
+      gate("g-closed", ASK, { status: "closed" }),
+      gate("g-related", "a related ask"),
+      gate("g-merge", "merge wait", { await_type: "gh:pr" }),
+    ];
+    // A closed gate is a wait a person already ended — its ask must not be reused, so this arms anew.
+    expect(humanGatePlan(board, "f-1", ASK)).toMatchObject({ open: undefined });
+    expect(humanGatePlan(board, "f-1", ASK).stale.map((g) => g.id)).toEqual(["g-related"]);
+    const related = [
+      { ...board[0], dependencies: [{ issue_id: "f-1", depends_on_id: "g-related", type: "related" }] } as Bead,
+      board[2],
+    ];
+    expect(humanGatePlan(related, "f-1", ASK)).toEqual({ stale: [], open: undefined });
+  });
+
+  it("matches the ask an agent that named none gets, so that gate is reused too", () => {
+    const reason = humanGateReason("f-1", undefined);
+    const plan = humanGatePlan([target("g-1"), gate("g-1", reason)], "f-1", reason);
+    expect(plan.open?.id).toBe("g-1");
   });
 });

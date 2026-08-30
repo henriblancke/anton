@@ -14,7 +14,15 @@
  * commit never got pushed. See DESIGN.md §4/§7.
  */
 import { randomUUID } from "node:crypto";
-import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead, type Gate } from "../beads/bd";
+import {
+  beads,
+  gateReason,
+  labelValueOf,
+  LABELS,
+  unclaimableStatus,
+  type Bead,
+  type Gate,
+} from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { ownerOf } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
@@ -1501,11 +1509,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // target, which a person resolves to release the run through the existing gate-resume pass.
         // Parked with no endedAt, like a review park — this run is waiting on someone, not dead, and
         // the resume reuses THIS row (findOpenRunForEpic) so its worktree/branch continue.
-        const gateId = await armHumanGate(repo, epicBeadId, e.ask);
-        await updateRun(db, clock, runId, {
-          status: "parked",
-          error: needsHumanParkMessage(e, gateId),
-        });
+        //
+        // No gate, no park (anton-287p.4): a parked run whose ask reached no gate is a wait no
+        // `bd gate resolve` can end, and it would sit in the waiting-on-a-person surface forever. It
+        // settles FAILED instead — the ask still reaches the operator, through a run state that
+        // reads as needing attention rather than as patience.
+        let gateId: string | undefined;
+        let gateError: string | undefined;
+        try {
+          gateId = await armHumanGate(repo, epicBeadId, e.ask);
+        } catch (failure) {
+          gateError = failure instanceof Error ? failure.message : String(failure);
+          console.error(
+            `[execute-epic] could not arm ${epicBeadId}'s human gate — the ask reaches the operator ` +
+              `only through this run's error (${gateError})`,
+          );
+        }
+        await updateRun(
+          db,
+          clock,
+          runId,
+          gateId
+            ? { status: "parked", error: needsHumanParkMessage(e, gateId) }
+            : { status: "failed", error: ungatedAskMessage(e, gateError), endedAt: clock.now() },
+        );
       } else if (e instanceof ReviewBlockedError) {
         // Parked, not failed, and with no endedAt: the run is waiting on a human to resolve what the
         // gate refused on and resume it — the run history must not read like a crash. Resuming reuses
@@ -2014,44 +2041,128 @@ async function armMergeGate(
 // ── human wait (anton-287p) ──
 
 /**
+ * The reason a human gate carries for THIS ask — the string the gate is identified by, so the arm
+ * can tell "this ask is already with someone" from "the ask has changed". Shared by the plan and
+ * the create so the two can never disagree about what an armed gate looks like.
+ */
+export function humanGateReason(targetId: string, ask: string | undefined): string {
+  return ask ?? `${targetId} stopped for a human, but the agent named no ask`;
+}
+
+/**
+ * What arming this target's human wait has to do, from the board alone: the open gate that already
+ * carries THIS ask (`open` — reuse it, a second gate would race it), and every other open human gate
+ * on the target (`stale` — its ask no longer applies).
+ *
+ * ALL the stale gates, not the first, for the reason mergeGatePlan resolves all of its own: a
+ * `gateResolve` that failed on an earlier run leaves a superseded gate open ALONGSIDE the live one,
+ * and dependency order says nothing about which is seen first. It costs more here than it does
+ * there — a human gate is a real blocker, so one left behind keeps the target unrunnable until
+ * someone finds it by hand.
+ */
+export function humanGatePlan(
+  board: Bead[],
+  targetId: string,
+  reason: string,
+): { stale: Gate[]; open: Gate | undefined } {
+  const byId = new Map(board.map((b) => [b.id, b]));
+  const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
+    .filter((d) => d.type === "blocks")
+    .map((d) => byId.get(d.depends_on_id))
+    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isHumanGate(b));
+  const open = armed.find((g) => gateReason(g)?.trim() === reason.trim());
+  return { stale: armed.filter((g) => g !== open), open };
+}
+
+/**
  * Arm the run target's HUMAN wait: a `human` gate blocking the target, whose reason IS the agent's
- * ask, verbatim. Returns the gate's id — or undefined when bd refused the write.
+ * ask, verbatim. Returns the gate's id — the one command that releases the parked run.
  *
  * The one gate flavour nothing automates away, by design on both sides: `bd gate check` never
  * evaluates a human gate, and gate-check's expiry pass deliberately skips it (a wait on a person is
  * never anton's to call overdue). So it carries no timeout and ends only when someone runs
  * `bd gate resolve` — at which point the gate-resume pass hands this target back to the runner,
  * which is why the resume half needed nothing new here.
+ *
+ * Re-entrant (anton-287p.4), because a park is not the only way this is reached: a settle lost after
+ * the gate landed, a resume, or a fresh worktree on another machine all re-run the arm against a
+ * board that may already carry the wait. Read fresh — the run's own snapshot predates any gate an
+ * earlier attempt armed — and mirror the merge gate's shape:
+ *
+ *   • THIS ask ALREADY ARMED — return that gate's id, create nothing. Two gates for one ask is one
+ *     dead wait: resolving either leaves the target blocked by the other.
+ *   • A DIFFERENT ask armed — this run stopped for a new reason, so the old wait is superseded and
+ *     resolved here. Nothing else ever would, and it blocks the target while it lives.
+ *
+ * THROWS when the gate cannot be created, so the caller settles the run LOUDLY instead of parking
+ * it: a park with no gate is a wait nothing can end. An epic target is that case up front — bd
+ * refuses a gate edge onto one ("epics can only block other epics") and a failed `gate create` still
+ * leaves an orphan gate bead behind, so it is refused here rather than attempted.
  */
-async function armHumanGate(
+export async function armHumanGate(
   repo: string,
   targetId: string,
   ask: string | undefined,
-): Promise<string | undefined> {
-  try {
-    return await beads.gateCreate(repo, {
-      blocks: targetId,
-      type: "human",
-      reason: ask ?? `${targetId} stopped for a human, but the agent named no ask`,
-    });
-  } catch (e) {
-    console.error(
-      `[execute-epic] could not arm ${targetId}'s human gate — the ask reaches the operator only ` +
-        `through the parked run's error (${e instanceof Error ? e.message : String(e)})`,
+): Promise<string> {
+  const reason = humanGateReason(targetId, ask);
+  // A failed board read must not silence the ask: fall through to a create. A duplicate gate is
+  // recoverable by hand; a park with no gate is not.
+  const board = await loadAllIssues(repo).catch((e: unknown) => {
+    console.warn(
+      `[execute-epic] could not read the board before arming ${targetId}'s human gate — a gate an ` +
+        `earlier attempt armed cannot be reused (${e instanceof Error ? e.message : String(e)})`,
     );
     return undefined;
+  });
+
+  const target = board?.find((b) => b.id === targetId);
+  if (target && beads.isEpic(target)) {
+    throw new Error(
+      `${targetId} is an epic — bd refuses a gate edge onto one, so the ask cannot become a gate`,
+    );
   }
+
+  const { stale, open } = board
+    ? humanGatePlan(board, targetId, reason)
+    : { stale: [] as Gate[], open: undefined };
+
+  for (const gate of stale) {
+    const resolved = await safe(() =>
+      beads.gateResolve(repo, gate.id, `superseded — ${targetId} now waits on a newer ask`),
+    );
+    // Nothing else will ever close it, and it is a real blocker while it lives — say so rather than
+    // leaving the target waiting on an ask no one is answering.
+    if (!resolved) {
+      console.warn(
+        `[execute-epic] could not resolve ${targetId}'s superseded human gate ${gate.id} — it stays ` +
+          `open alongside the current ask and keeps blocking the target`,
+      );
+    }
+  }
+  if (open) return open.id; // this ask is already with a human — a second gate would race it
+
+  return await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
 }
 
 /**
- * The park reason on the run row: the agent's ask, and the one command that releases the run. Says
- * so plainly when no gate exists — a park a resolve cannot end needs a human to resume it by hand.
+ * The park reason on the run row: the agent's ask, and the one command that releases the run.
  */
-function needsHumanParkMessage(e: NeedsHumanError, gateId: string | undefined): string {
-  return gateId
-    ? `${e.message} Answer it, then \`bd gate resolve ${gateId}\` — closing that gate resumes this run.`
-    : `${e.message} Its human gate could NOT be created, so nothing on the board carries the ask — ` +
-        `answer it, then resume the run by hand.`;
+function needsHumanParkMessage(e: NeedsHumanError, gateId: string): string {
+  return `${e.message} Answer it, then \`bd gate resolve ${gateId}\` — closing that gate resumes this run.`;
+}
+
+/**
+ * The FAILURE reason when the ask could never become board state. Composed from the ask rather than
+ * from {@link NeedsHumanError.message}, which promises a park this run deliberately does not take:
+ * with no gate there is nothing to resolve, so parking would be a wait nothing can end.
+ */
+function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): string {
+  return (
+    `${e.ticketId} needs a human: ${e.ask ?? "(the agent named no ask)"}. Its human gate could NOT ` +
+    `be created (${gateError ?? "unknown error"}), so nothing on the board carries the ask and no ` +
+    `\`bd gate resolve\` can release the run — it is FAILED rather than parked, because a park with ` +
+    `no gate is a wait nothing can end. Answer the ask, then re-run the target.`
+  );
 }
 
 // ── helpers ──
