@@ -238,6 +238,48 @@ process.stdin.on('end',()=>{
     expect(log).toContain("phantom.db");
   });
 
+  // anton-o827: the filter has to reach the PROMPT, not just the counts. Triage is handed a path,
+  // and the only thing that makes that path safe is that it names the one artifact anton filtered —
+  // a pass that scanned a phantom beside real work would otherwise let the agent file a bead for a
+  // file git has never heard of, a judgment call every unattended pass has to make again.
+  it("hands triage the filtered scan file, so a dropped signal is not in the prompt's artifact", async () => {
+    process.env.FAKE_STRINGER_SIGNALS = "1";
+    process.env.FAKE_STRINGER_UNTRACKED = "1";
+    rmSync(join(sandbox, "claude-argv.jsonl"), { force: true });
+    const beadsBefore = (await beads.list(repo, ["--status", "all"])).length;
+    const before = new Set((await tdb.db.select().from(schema.sessions)).map((s) => s.id));
+
+    let jobId: string;
+    try {
+      jobId = await runScan();
+    } finally {
+      delete process.env.FAKE_STRINGER_UNTRACKED;
+    }
+
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+    // The file the prompt NAMES — the artifact triage actually opens — carries only the survivor.
+    const inv = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8").trim().split("\n").pop()!;
+    const prompt = (JSON.parse(inv) as { prompt: string }).prompt;
+    const scanFile = /scan file to triage is: (\S+)/.exec(prompt)![1];
+    const handed = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { Source: string }[] };
+    expect(handed.signals.map((s) => s.Source)).toEqual(["todo"]);
+    expect(readFileSync(scanFile, "utf8")).not.toContain("phantom.db");
+
+    // ...and the agent that read it filed a bead for the survivor only — no phantom reached the board.
+    const created = (await beads.list(repo, ["--status", "all"])).filter((b) =>
+      b.title.startsWith("Triaged:"),
+    );
+    expect((await beads.list(repo, ["--status", "all"])).length).toBe(beadsBefore + 1);
+    expect(created.some((b) => b.title.includes("phantom.db"))).toBe(false);
+
+    // The drop stays visible: filtered out of the prompt is not filtered out of the record.
+    const sessions = await tdb.db.select().from(schema.sessions);
+    const log = readFileSync(sessions.find((s) => !before.has(s.id))!.logPath!, "utf8");
+    expect(log).toContain("dropped 1 signal(s)");
+    expect(log).toContain("phantom.db");
+  });
+
   it("warns on the session when a collector died, even with no signals to triage (anton-uspu)", async () => {
     process.env.FAKE_STRINGER_SIGNALS = "0";
     process.env.FAKE_STRINGER_STDERR =
