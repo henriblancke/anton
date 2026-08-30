@@ -42,11 +42,8 @@ import { getProjectSettings, resolveFailureBreaker } from "../projects";
 import { listRecentRunOutcomes, type RunDetail } from "../runs";
 import { cancelledExecuteEpicJobs, type AntonDb, type CancelledJob, type Clock } from "./queue";
 
-/** How many run rows one page of the streak read costs. */
-const STREAK_PAGE = 20;
-
 /**
- * The most rows one pass will read before giving up on a streak it has not closed.
+ * How many run rows one page of the streak read costs.
  *
  * The read is PAGED rather than sized once, because cancels and still-running rows count as neither
  * failure nor delivery — they are skipped, not treated as a reset — so how many ROWS a streak spans
@@ -54,11 +51,13 @@ const STREAK_PAGE = 20;
  * member out of sight and quietly shorten it: two failures behind eighteen cancels would report as
  * two, and the project stays armed on a third failure nobody read.
  *
- * The cap is what keeps that bounded in the opposite direction: a project whose whole history is
- * cancels has no delivery to stop the walk, and would otherwise re-read its entire runs table on
- * every picker pass to learn nothing.
+ * A row CAP would be that same bug at a larger size — enough skipped rows and the walk stops before
+ * the evidence — so the walk has none. It stops only where the evidence itself does: a delivery, the
+ * re-arm fence, a met threshold, or the end of history. What that costs is a project whose whole
+ * history is cancels re-reading its runs table each pass to learn nothing; a breaker that silently
+ * fails to fire is the worse of the two.
  */
-const MAX_STREAK_ROWS = 200;
+const STREAK_PAGE = 20;
 
 /**
  * How long after a run last moved a cancel may still be its own — the LEGACY join only.
@@ -173,8 +172,8 @@ export async function checkFailureStreak(
  * The project's recent runs as the breaker reads them, newest first — nothing from before
  * `reArmedAt`, which is the evidence the operator already adjudicated.
  *
- * Pages back until the streak is CLOSED (a delivery, the re-arm fence, or the end of history), the
- * threshold is already met, or the row cap is hit. Reading on past a met threshold within the page
+ * Pages back until the streak is CLOSED (a delivery, the re-arm fence, or the end of history) or the
+ * threshold is already met. Reading on past a met threshold within the page
  * in hand is deliberate: the streak the operator is shown is the whole run of failures, not just
  * the first N of it, and the page is already read by then.
  */
@@ -194,7 +193,9 @@ async function readRunOutcomes(
   let weight = 0;
   let delivered = false;
 
-  for (let offset = 0; offset < MAX_STREAK_ROWS; offset += STREAK_PAGE) {
+  // A delivery ends the streak, so nothing older can extend it; a met threshold already latches, and
+  // evidence older than that is not worth another read.
+  for (let offset = 0; !delivered && weight < threshold; offset += STREAK_PAGE) {
     const [page, cancels] = await Promise.all([
       listRecentRunOutcomes(db, projectId, STREAK_PAGE, offset),
       cancelsRead,
@@ -232,9 +233,6 @@ async function readRunOutcomes(
       }
       if (verdict === "failure") weight += weigh(outcome);
     }
-    // A delivery ends the streak, so nothing older can extend it; a met threshold already latches,
-    // and evidence older than that is not worth another read.
-    if (delivered || weight >= threshold) break;
     const oldest = page.at(-1);
     if (page.length < STREAK_PAGE || oldest === undefined) break;
     // `updatedAt` — not the fence's own `endedAt ?? updatedAt` — is what the page order is on, so
