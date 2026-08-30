@@ -147,10 +147,15 @@ beforeEach(() => {
 });
 
 describe("answerGateWait — abandon closes the gate LAST", () => {
+  // The abandon is held OPEN rather than resolved on call: a call order alone would also be produced
+  // by starting the abandon, closing the gate while it is still in flight, and awaiting it after —
+  // which closes the gate over a bead that is still open, and gate-check hands that straight back.
   it("closes the bead first, then the gate", async () => {
     const order: string[] = [];
+    const abandoning = deferred();
     actOnBead.mockImplementation(async () => {
       order.push("bead");
+      await abandoning.promise;
       return "abandoned";
     });
     gateResolve.mockImplementation(async () => {
@@ -158,8 +163,13 @@ describe("answerGateWait — abandon closes the gate LAST", () => {
       return "ok";
     });
 
-    const applied = await answerGateWait(project, "abandon", view(), "g-1", "anton-t9");
+    const answering = answerGateWait(project, "abandon", view(), "g-1", "anton-t9");
+    await settle();
 
+    expect(order).toEqual(["bead"]);
+    abandoning.resolve();
+
+    const applied = await answering;
     expect(order).toEqual(["bead", "gate"]);
     expect(applied).toEqual({ detail: "abandoned" });
     expect(actOnBead).toHaveBeenCalledWith(project, "abandon", expect.anything(), "anton-t9");
@@ -192,14 +202,17 @@ describe("answerGateWait — abandon closes the gate LAST", () => {
 });
 
 describe("answerGateWait — resume closes the gate FIRST", () => {
-  // The pull is held OPEN rather than resolved on call: a call order alone would also be produced
-  // by starting the pull, reading the board while it is still in flight, and awaiting it after —
-  // which decides on exactly the stale board the pull exists to replace.
+  // Both the close and the pull are held OPEN rather than resolved on call: a call order alone would
+  // also be produced by starting each step and awaiting it after the next one had begun — pulling
+  // over an unlanded close can miss the very write being answered, and reading the board over an
+  // unlanded pull decides on exactly the stale board that pull exists to replace.
   it("closes the gate before re-reading the board and re-queueing", async () => {
     const order: string[] = [];
+    const close = deferred();
     const pull = deferred();
     gateResolve.mockImplementation(async () => {
       order.push("gate");
+      await close.promise;
       return "ok";
     });
     beadsPull.mockImplementation(async () => {
@@ -216,6 +229,10 @@ describe("answerGateWait — resume closes the gate FIRST", () => {
     });
 
     const answering = answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+    await settle();
+
+    expect(order).toEqual(["gate"]);
+    close.resolve();
     await settle();
 
     // The pull sits BETWEEN the close and the read: pulling before the close can miss the very

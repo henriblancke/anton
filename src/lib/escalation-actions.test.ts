@@ -54,6 +54,18 @@ const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
 const project = { id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" } as Project;
 
+/** A promise the test releases by hand, so a step can be held mid-flight and observed there. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Drains the microtask queue, so everything not blocked on a held promise has run. */
+const flush = () => new Promise((r) => setImmediate(r));
+
 const view = (o: Partial<EscalationView> = {}): EscalationView =>
   ({
     id: "esc-1",
@@ -150,11 +162,16 @@ describe("actOnEscalation — the row it may act on", () => {
 });
 
 describe("actOnEscalation — settle first, act second", () => {
+  // The CAS is held OPEN rather than resolved on call: a call order alone would also be produced by
+  // starting the settle, running the verb while the claim is still in flight, and awaiting it after —
+  // which is exactly the racing double-click the CAS exists to serialise.
   it("claims the decision BEFORE the verb runs", async () => {
     open();
     const order: string[] = [];
+    const claim = deferred();
     settleEscalation.mockImplementation(async () => {
       order.push("settle");
+      await claim.promise;
       return true;
     });
     actOnBead.mockImplementation(async () => {
@@ -162,16 +179,26 @@ describe("actOnEscalation — settle first, act second", () => {
       return "enqueued";
     });
 
-    await actOnEscalation(project, "esc-1", "resume");
+    const acting = actOnEscalation(project, "esc-1", "resume");
+    await flush();
 
+    expect(order).toEqual(["settle"]);
+    claim.resolve();
+
+    await acting;
     expect(order).toEqual(["settle", "act"]);
   });
 
+  // The read is held OPEN: settling while it is still in flight and awaiting it after would produce
+  // the same call order while settling on an unread board — and a refusal that lands after the CAS
+  // has already taken the row off the panel is precisely what this order prevents.
   it("re-reads the board BEFORE the settle, so a refusal leaves the row on the panel", async () => {
     open();
     const order: string[] = [];
+    const read = deferred();
     readTargetState.mockImplementation(async () => {
       order.push("read");
+      await read.promise;
       return "clear";
     });
     settleEscalation.mockImplementation(async () => {
@@ -179,8 +206,13 @@ describe("actOnEscalation — settle first, act second", () => {
       return true;
     });
 
-    await actOnEscalation(project, "esc-1", "resume");
+    const acting = actOnEscalation(project, "esc-1", "resume");
+    await flush();
 
+    expect(order).toEqual(["read"]);
+    read.resolve();
+
+    await acting;
     expect(order).toEqual(["read", "settle"]);
   });
 
