@@ -848,6 +848,7 @@ export async function finalizeMergedEpic(args: {
     repo,
     epic,
     rerunnable,
+    preserved,
     children,
     areaLabelOf(epic, all),
     runOwner,
@@ -948,10 +949,17 @@ export async function finalizeMergedEpic(args: {
                     : followUp.id && followUp.moved.has(bead.id)
                       ? `It now lives under ${followUp.id}, a fresh run target — approve that ` +
                         `target to have anton pick this work back up.`
-                      : `It could NOT be rehomed onto a fresh run target, so nothing anton runs ` +
-                        `reaches it yet: move it under a new epic ` +
-                        `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent to ` +
-                        `make it a run target of its own.`) +
+                      : followUp.pinned.has(bead.id)
+                        ? `It was NOT rehomed: ${followUp.pinned.get(bead.id)} still hangs off ` +
+                          `it, and anton left that ticket where it is — moving this one would ` +
+                          `have carried it onto a fresh target too. Settle that ticket first, ` +
+                          `then move this one under a new epic ` +
+                          `(\`bd update ${bead.id} --parent <new-epic>\`) to have anton pick the ` +
+                          `work back up.`
+                        : `It could NOT be rehomed onto a fresh run target, so nothing anton ` +
+                          `runs reaches it yet: move it under a new epic ` +
+                          `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent ` +
+                          `to make it a run target of its own.`) +
               ownershipNote(bead, owner, {
                 stillOwned,
                 foreignOwner,
@@ -997,7 +1005,8 @@ export async function finalizeMergedEpic(args: {
  * Nesting is preserved: only the ROOTS of the rehomed forest are reparented, and a ticket that
  * hangs off another moving ticket rides along on it. `subtree` is the run's whole ticket set
  * (runTickets), which is what tells a legitimately nested ticket apart from one another operator
- * moved onto a target of their own.
+ * moved onto a target of their own. The ride-along cuts both ways, so a ticket that still carries a
+ * preserved descendant anton is NOT moving stays put as well ({@link Rehomed.pinned}).
  *
  * Best-effort, like every other write here: a failure leaves the tickets parented where they were —
  * still open, still noted with the manual remedy — rather than aborting a finalization whose closes
@@ -1008,6 +1017,7 @@ async function rehomePreserved(
   repo: string,
   epic: Bead,
   rerunnable: Bead[],
+  preserved: Bead[],
   subtree: Bead[],
   area: string | undefined,
   runOwner: string | undefined,
@@ -1017,6 +1027,7 @@ async function rehomePreserved(
     nested: new Map(),
     elsewhere: new Map(),
     changed: new Map(),
+    pinned: new Map(),
   };
   if (rerunnable.length === 0) return none;
   const ids = rerunnable.map((b) => b.id).join(", ");
@@ -1071,9 +1082,11 @@ async function rehomePreserved(
   // own ticket-set drift check and parks it. A read that fails moves nothing either, for the same
   // reason the status write doesn't: the snapshot is not evidence enough on its own.
   const takeable = new Map<string, Bead>();
+  const live = new Map<string, Bead>();
   for (const bead of rerunnable) {
     const fresh = await beads.show(repo, bead.id).catch(() => undefined);
     if (!fresh) continue;
+    live.set(bead.id, fresh);
     if (!ridesOnTarget(fresh)) {
       elsewhere.set(bead.id, beads.parentOf(fresh));
       continue;
@@ -1102,12 +1115,40 @@ async function rehomePreserved(
     takeable.set(bead.id, fresh);
   }
 
+  // Pass 1b — a reparent is an edge on the ANCESTOR alone (anton-67xj). A ticket pass 1 refused
+  // keeps its own parent, so moving that parent carries it onto the follow-up regardless: a
+  // reservation another operator holds, or a status a human set, ends up advertised under a target
+  // anton wrote — and the note telling them anton left it under the merged target becomes false. So
+  // a ticket carrying one stays where it is, named with what pinned it; its own takeable descendants
+  // still flatten onto the follow-up in pass 2, exactly as when bd refuses a reparent.
+  //
+  // Only the PRESERVED tickets can pin. Everything else in the subtree closed with the merge, so it
+  // holds no reservation and no pending decision — riding along costs nothing, while blocking on
+  // delivered work would strand a parent merely because part of it shipped.
+  const parentOfLive = (bead: Bead): string | undefined =>
+    beads.parentOf(live.get(bead.id) ?? bead);
+  const pinned = new Map<string, string>();
+  for (const bead of preserved) {
+    if (takeable.has(bead.id)) continue;
+    const seen = new Set<string>([bead.id]);
+    let parentId = parentOfLive(bead);
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId); // a parent cycle terminates rather than hanging finalization
+      if (takeable.has(parentId) && !pinned.has(parentId))
+        pinned.set(parentId, bead.id);
+      const parent = bySubtreeId.get(parentId);
+      if (!parent) break; // the chain left the run's subtree — nothing moving carries this ticket
+      parentId = parentOfLive(parent);
+    }
+  }
+
   // Pass 2 — move them ancestors first. A ticket whose own parent is moving rides along on it
   // rather than being flattened onto the follow-up: the nesting is how its work was scoped, and
   // reparenting it separately would hand the same subtree two homes. Ordering is what makes that
   // safe — the ride-along is decided on what actually MOVED, so a parent whose reparent bd refused
   // leaves its descendant to take a home of its own rather than staying stranded behind it.
   for (const fresh of ancestorsFirst(takeable)) {
+    if (pinned.has(fresh.id)) continue;
     const parentId = beads.parentOf(fresh);
     if (parentId && moved.has(parentId)) {
       nested.set(fresh.id, parentId);
@@ -1117,10 +1158,11 @@ async function rehomePreserved(
     if (await safe(() => beads.reparent(repo, fresh.id, followUp)))
       moved.add(fresh.id);
   }
-  if (moved.size > 0) return { id: followUp, moved, nested, elsewhere, changed };
+  if (moved.size > 0)
+    return { id: followUp, moved, nested, elsewhere, changed, pinned };
   // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
   await safe(() => beads.delete(repo, followUp));
-  return { moved: new Set(), nested, elsewhere, changed };
+  return { moved: new Set(), nested, elsewhere, changed, pinned };
 }
 
 /**
@@ -1197,6 +1239,12 @@ interface Rehomed {
    * they are, status untouched, and named by their live state in the note.
    */
   changed: Map<string, string>;
+  /**
+   * Ticket id → the preserved ticket hanging off it that anton is NOT moving. Reparenting would
+   * carry that descendant onto the follow-up on its own parent edge, so the ancestor stays under
+   * the merged target instead, and its note names what pinned it rather than the generic remedy.
+   */
+  pinned: Map<string, string>;
 }
 
 // ── helpers ──

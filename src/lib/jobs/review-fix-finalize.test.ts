@@ -541,6 +541,73 @@ describe("finalizeMergedEpic", () => {
     );
   });
 
+  it("leaves an ancestor put when an excluded descendant rides on it (anton-67xj)", async () => {
+    // A reparent is an edge on the ancestor alone: t3 keeps its own parent, so moving t2 would
+    // carry op-2's live claim onto a target anton wrote — and contradict t3's own note, which says
+    // anton left it under the merged target.
+    const nestedTicket = under("t2", bead("t3", "blocked", ["not-delivered"]));
+    statuses.set("t3", "in_progress");
+    assignees.set("t3", "op-2");
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      nestedTicket,
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    // Still handed back in a claimable state — the manual move the note asks for is all it needs.
+    expect(setStatusMock.mock.calls).toEqual([["/repo", "t2", "open"]]);
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("t3 still hangs off it");
+    expect(note).toContain("--parent <new-epic>");
+    expect(note).not.toContain("now lives under");
+  });
+
+  it("leaves an ancestor put when a descendant a human deferred rides on it", async () => {
+    // t3 never reaches pass 1 — the rerun allowlist drops a snooze before that. It still pins t2:
+    // the deferral is a decision about when this work happens, not an invitation to requeue it.
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "deferred", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("t3 still hangs off it");
+    expect(noteMock.mock.calls[1][2]).toContain("did NOT queue it for a rerun");
+  });
+
+  it("still gives a takeable sibling its own home under a pinned ancestor", async () => {
+    // Pinning t2 must not strand the rest of its subtree: t4 flattens onto the follow-up exactly as
+    // it would when bd refuses its parent's reparent.
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "deferred", ["not-delivered"])),
+      under("t2", bead("t4", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t4", "epic-2"]]);
+    expect(noteMock.mock.calls[0][2]).toContain("t3 still hangs off it");
+    expect(noteMock.mock.calls[2][2]).toContain("now lives under epic-2");
+  });
+
+  it("moves an ancestor whose nested descendant shipped in the merge", async () => {
+    // Only PRESERVED tickets pin. t3 closes with the merge, so it holds no reservation and no
+    // pending decision — riding along under the follow-up costs nothing, and blocking on it would
+    // strand t2 merely because part of its subtree was delivered.
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3")),
+    ]);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([
+      { op: "close", id: "t3" },
+      { op: "close", id: "epic-1" },
+    ]);
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+    expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+  });
+
   it("reruns a marker-bearing ticket the timeout left in_progress (anton-67xj)", async () => {
     // The timeout writes `blocked` best-effort but RETRIES the `not-delivered` marker, so a bd
     // hiccup can leave a rolled-back ticket sitting on the claim it was dispatched under. Nothing
