@@ -27,9 +27,12 @@ const assignees = new Map<string, string>();
 const statuses = new Map<string, string>();
 /** id → current parent, so the re-read before a reparent sees the board, not the snapshot. */
 const parents = new Map<string, string | undefined>();
+/** id → current labels, so a re-read still carries the `not-delivered` marker the lane turns on. */
+const boardLabels = new Map<string, string[]>();
 
 vi.mock("../beads/bd", async () => {
-  const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
+  const actual =
+    await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
     beads: {
@@ -64,6 +67,7 @@ const { finalizeMergedEpic, undeliveredAtMerge } = await import("./review-fix");
 /** Seeds the live board with the same status, so a re-read agrees with the snapshot by default. */
 const bead = (id: string, status = "open", labels: string[] = []): Bead => {
   statuses.set(id, status);
+  boardLabels.set(id, labels);
   return { id, title: id, status, labels } as Bead;
 };
 
@@ -109,27 +113,32 @@ describe("finalizeMergedEpic", () => {
     assignees.clear();
     statuses.clear();
     parents.clear();
-    unassignMock.mockReset().mockImplementation(async (_repo: string, id: string) => {
-      assignees.delete(id);
-    });
-    setStatusMock.mockReset().mockResolvedValue(undefined);
-    showMock
+    boardLabels.clear();
+    unassignMock
       .mockReset()
-      .mockImplementation(
-        async (_repo: string, id: string) =>
-          ({
-            id,
-            title: id,
-            status: statuses.get(id) ?? "open",
-            labels: [],
-            assignee: assignees.get(id),
-            parent: parents.get(id),
-          }) as Bead,
-      );
+      .mockImplementation(async (_repo: string, id: string) => {
+        assignees.delete(id);
+      });
+    setStatusMock.mockReset().mockResolvedValue(undefined);
+    showMock.mockReset().mockImplementation(
+      async (_repo: string, id: string) =>
+        ({
+          id,
+          title: id,
+          status: statuses.get(id) ?? "open",
+          labels: boardLabels.get(id) ?? [],
+          assignee: assignees.get(id),
+          parent: parents.get(id),
+        }) as Bead,
+    );
   });
 
   it("closes the still-open children and the target in one batch, children first", async () => {
-    await finalize(bead("epic-1"), [bead("t1"), bead("t2", "closed"), bead("t3")]);
+    await finalize(bead("epic-1"), [
+      bead("t1"),
+      bead("t2", "closed"),
+      bead("t3"),
+    ]);
 
     expect(batchMock).toHaveBeenCalledTimes(1);
     // Already-closed t2 is left out: re-closing it is noise, and its outcome is already settled.
@@ -138,7 +147,9 @@ describe("finalizeMergedEpic", () => {
       { op: "close", id: "t3" },
       { op: "close", id: "epic-1" },
     ]);
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
   });
 
   it("leaves an already-closed target out of the batch but still clears the stage", async () => {
@@ -146,7 +157,9 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1", "closed"), [bead("t1", "closed")]);
 
     expect(batchMock.mock.calls[0][1]).toEqual([]); // nothing left to close (the seam spawns no bd)
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
   });
 
   it("leaves a `not-delivered` child open — a merged PR does not contain it", async () => {
@@ -165,7 +178,9 @@ describe("finalizeMergedEpic", () => {
     ]);
     // The target still closes — the PR it points at is merged and terminal — so the preserved
     // tickets say for themselves why they outlived it.
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
     expect(noteMock.mock.calls.map((c) => c[1])).toEqual(["t2", "t3"]);
     expect(noteMock.mock.calls[0][2]).toContain("merged WITHOUT this ticket");
   });
@@ -202,10 +217,18 @@ describe("finalizeMergedEpic", () => {
     // Reading only the feature's labels would file the follow-up arealess — ungrouped on the
     // roadmap and without the Linear routing key — and it lands top-level, so nothing downstream
     // can derive one for it either.
-    const feature = { ...bead("feat-1"), issue_type: "feature", parent: "epic-p" } as Bead;
+    const feature = {
+      ...bead("feat-1"),
+      issue_type: "feature",
+      parent: "epic-p",
+    } as Bead;
     const product = bead("epic-p", "open", ["area:runs", "approved"]);
 
-    await finalize(feature, [bead("t2", "blocked", ["not-delivered"])], [product]);
+    await finalize(
+      feature,
+      [bead("t2", "blocked", ["not-delivered"])],
+      [product],
+    );
 
     expect(createMock.mock.calls[0][1].labels).toEqual(["area:runs"]);
   });
@@ -217,7 +240,9 @@ describe("finalizeMergedEpic", () => {
 
     // Finalization still completes — its closes already landed — but the note must not claim a
     // home the ticket never reached.
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
     expect(noteMock.mock.calls[0][2]).toContain("could NOT be rehomed");
   });
 
@@ -252,7 +277,9 @@ describe("finalizeMergedEpic", () => {
 
     // Finalization still completes; the note must not advertise a rerun the operator cannot start.
     expect(noteMock.mock.calls[0][2]).toContain("still assigned to op-1");
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
   });
 
   it("leaves an unclaimed preserved ticket alone rather than writing to bd for nothing", async () => {
@@ -325,7 +352,9 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [preserved]);
 
     expect(setStatusMock).not.toHaveBeenCalled();
-    expect(noteMock.mock.calls[0][2]).toContain("Its status is now `in_progress` under op-2");
+    expect(noteMock.mock.calls[0][2]).toContain(
+      "Its status is now `in_progress` under op-2",
+    );
   });
 
   it("does not reopen a ticket that closed after the sweep read the board", async () => {
@@ -359,7 +388,9 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
 
     expect(noteMock.mock.calls[0][2]).toContain("`bd update t2 --status open`");
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
   });
 
   it("keeps a ticket stopped AFTER its commit off the rerun path", async () => {
@@ -419,10 +450,83 @@ describe("finalizeMergedEpic", () => {
     expect(note).not.toContain("--parent <new-epic>");
   });
 
+  it("reruns a marker-bearing ticket the timeout left in_progress (anton-67xj)", async () => {
+    // The timeout writes `blocked` best-effort but RETRIES the `not-delivered` marker, so a bd
+    // hiccup can leave a rolled-back ticket sitting on the claim it was dispatched under. Nothing
+    // of it is in the merged diff, so stranding it on the manual-review path over that bookkeeping
+    // failure would lose the work the marker exists to protect.
+    const stalled = claimed(
+      bead("t2", "in_progress", ["not-delivered"]),
+      "op-1",
+    );
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [stalled]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+    expect(setStatusMock).toHaveBeenCalledWith("/repo", "t2", "open");
+    expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+  });
+
+  it("keeps a marker-bearing in_progress ticket held by another operator off the rerun path", async () => {
+    // Same shape, different owner: this claim is somebody's live run, not the dead run's leftover.
+    const held = claimed(bead("t2", "in_progress", ["not-delivered"]), "op-2");
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [held]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("did NOT queue it for a rerun");
+  });
+
+  it("does not reparent a ticket claimed after the sweep computed the rerun lane (anton-67xj)", async () => {
+    // `rerunnable` is the snapshot; the reparent lands days later. Moving a ticket someone has since
+    // picked up hands a second run their work.
+    const preserved = bead("t2", "blocked", ["not-delivered"]);
+    statuses.set("t2", "in_progress");
+    assignees.set("t2", "op-2");
+
+    await finalize(bead("epic-1"), [preserved]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(setStatusMock).not.toHaveBeenCalled();
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("Its status is now `in_progress` under op-2");
+    expect(note).not.toContain("now lives under");
+  });
+
+  it("does not reparent a ticket closed after the sweep computed the rerun lane", async () => {
+    // A closed ticket under a follow-up branch that carries no commit for it is exactly what
+    // execute-epic reads as a cross-machine resume — it would run the finished work again.
+    const preserved = bead("t2", "blocked", ["not-delivered"]);
+    statuses.set("t2", "closed");
+
+    await finalize(bead("epic-1"), [preserved]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("Its status is now `closed`");
+  });
+
+  it("does not reparent a ticket whose claim changed hands after the sweep", async () => {
+    // The status still reads rerunnable, but the reservation is another operator's now.
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+    assignees.set("t2", "op-2");
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain(
+      "Its status is now `blocked` under op-2",
+    );
+  });
+
   it("still rehomes the tickets skipped behind a post-commit timeout", async () => {
     // Only the timed-out ticket's own work is in the diff. t3 was never dispatched, so it carries
     // no marker and no commit — the lane split must keep it runnable rather than strand it too.
-    await finalize(bead("epic-1"), [bead("t2", "blocked"), waitsOn("t3", "t2")]);
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked"),
+      waitsOn("t3", "t2"),
+    ]);
 
     expect(reparentMock.mock.calls).toEqual([["/repo", "t3", "epic-2"]]);
     expect(noteMock.mock.calls[1][2]).toContain("now lives under epic-2");
@@ -447,7 +551,9 @@ describe("finalizeMergedEpic", () => {
 
     expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "epic-1" }]);
     expect(createMock).not.toHaveBeenCalled();
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
   });
 
   it("keeps stage:in-review when the transaction fails, so the next sweep retries", async () => {
@@ -469,13 +575,19 @@ describe("finalizeMergedEpic", () => {
       { op: "close", id: "t2" },
       { op: "close", id: "epic-1" },
     ]);
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
   });
 
   it("leaves a ticket skipped behind a blocked one open too", async () => {
     // t2 was never dispatched (anton-67xj) — it stays `open` for the board, so only the `blocks`
     // edge to the rolled-back t1 tells the merge it delivered nothing.
-    await finalize(bead("epic-1"), [bead("t1", "blocked"), waitsOn("t2", "t1"), bead("t3")]);
+    await finalize(bead("epic-1"), [
+      bead("t1", "blocked"),
+      waitsOn("t2", "t1"),
+      bead("t3"),
+    ]);
 
     expect(batchMock.mock.calls[0][1]).toEqual([
       { op: "close", id: "t3" },
@@ -527,7 +639,11 @@ describe("undeliveredAtMerge", () => {
 
   it("stops at a closed dependent — its commit is on the branch whatever its blocker did", () => {
     // t2 committed before t1's budget ran out, so t3 has the mechanism it was written against.
-    const children = [bead("t1", "blocked"), waitsOn("t2", "t1", "closed"), waitsOn("t3", "t2")];
+    const children = [
+      bead("t1", "blocked"),
+      waitsOn("t2", "t1", "closed"),
+      waitsOn("t3", "t2"),
+    ];
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1"]));
   });
@@ -548,17 +664,27 @@ describe("undeliveredAtMerge", () => {
   it("walks through an abandoned dependent — it is closed on a won't-do, not on a commit", () => {
     // `abandoned` is the one closed status that carries no delivery: execute-epic drops such a
     // ticket from `live` for exactly this reason, so t3 behind it never ran either.
-    const abandoned = { ...waitsOn("t2", "t1", "closed"), labels: [LABELS.abandoned] } as Bead;
+    const abandoned = {
+      ...waitsOn("t2", "t1", "closed"),
+      labels: [LABELS.abandoned],
+    } as Bead;
     const children = [bead("t1", "blocked"), abandoned, waitsOn("t3", "t2")];
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1", "t2", "t3"]));
   });
 
   it("ignores non-blocks edges and edges leaving the run", () => {
-    const parented = { ...bead("t2"), dependencies: [{ issue_id: "t2", depends_on_id: "t1", type: "parent-child" }] } as Bead;
+    const parented = {
+      ...bead("t2"),
+      dependencies: [
+        { issue_id: "t2", depends_on_id: "t1", type: "parent-child" },
+      ],
+    } as Bead;
     const outside = waitsOn("t3", "other-epic-ticket");
 
-    expect(undeliveredAtMerge([bead("t1", "blocked"), parented, outside])).toEqual(new Set(["t1"]));
+    expect(
+      undeliveredAtMerge([bead("t1", "blocked"), parented, outside]),
+    ).toEqual(new Set(["t1"]));
   });
 
   it("holds back a ticket the run marked not-delivered, and everything behind it", () => {
@@ -578,20 +704,32 @@ describe("undeliveredAtMerge", () => {
     // Closed on another machine, its commit on no branch here: the run reopens it, but a bd
     // failure can leave it closed — the marker still says its work is in no diff, so t3 behind it
     // is undelivered too.
-    const marked = { ...waitsOn("t2", "t1", "closed"), labels: [LABELS.notDelivered] } as Bead;
+    const marked = {
+      ...waitsOn("t2", "t1", "closed"),
+      labels: [LABELS.notDelivered],
+    } as Bead;
 
-    expect(undeliveredAtMerge([bead("t1", "blocked"), marked, waitsOn("t3", "t2")])).toEqual(
-      new Set(["t1", "t2", "t3"]),
-    );
+    expect(
+      undeliveredAtMerge([bead("t1", "blocked"), marked, waitsOn("t3", "t2")]),
+    ).toEqual(new Set(["t1", "t2", "t3"]));
   });
 
   it("holds nothing back when every child delivered", () => {
-    expect(undeliveredAtMerge([bead("t1"), waitsOn("t2", "t1")])).toEqual(new Set());
+    expect(undeliveredAtMerge([bead("t1"), waitsOn("t2", "t1")])).toEqual(
+      new Set(),
+    );
   });
 
   it("terminates on a dependency cycle", () => {
-    const children = [bead("t1", "blocked"), waitsOn("t2", "t1"), waitsOn("t1b", "t2")];
-    children[0] = { ...children[0], dependencies: [{ issue_id: "t1", depends_on_id: "t1b", type: "blocks" }] } as Bead;
+    const children = [
+      bead("t1", "blocked"),
+      waitsOn("t2", "t1"),
+      waitsOn("t1b", "t2"),
+    ];
+    children[0] = {
+      ...children[0],
+      dependencies: [{ issue_id: "t1", depends_on_id: "t1b", type: "blocks" }],
+    } as Bead;
 
     expect(undeliveredAtMerge(children)).toEqual(new Set(["t1", "t2", "t1b"]));
   });

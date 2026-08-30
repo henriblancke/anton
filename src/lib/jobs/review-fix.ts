@@ -32,7 +32,13 @@ import { existsSync } from "node:fs";
 import { beads, LABELS, ownerOf, type BatchOp, type Bead } from "../beads/bd";
 import { releaseChildren } from "../beads/child-assign";
 import { runClaude } from "../claude/driver";
-import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
+import {
+  branchAheadOfRemote,
+  commitAll,
+  fetchOrigin,
+  mergeIntoCurrent,
+  pushBranch,
+} from "../git/ops";
 import {
   ANTON_MARK,
   classifyReview,
@@ -47,7 +53,13 @@ import {
   type Actionable,
   type PrReview,
 } from "../git/pr";
-import { createWorktree, findWorktree, removeWorktree, worktreePathFor, type Worktree } from "../git/worktree";
+import {
+  createWorktree,
+  findWorktree,
+  removeWorktree,
+  worktreePathFor,
+  type Worktree,
+} from "../git/worktree";
 import { resolveOperator } from "../operator";
 import {
   getProjectById,
@@ -59,7 +71,11 @@ import { runVerifyGates } from "./shell";
 import { findOpenRunForEpic, updateRun } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
-import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./review-fix-context";
+import {
+  buildReviewFixPrompt,
+  parseThreadReport,
+  type ThreadOutcome,
+} from "./review-fix-context";
 import { isUsageLimitError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -102,7 +118,10 @@ const consoleLog: RunnerLogger = {
  * is undefined only in the degenerate case where even $USER is unset; then nothing but unclaimed
  * epics match, so an anton that genuinely can't name itself never races a claimed PR.
  */
-export function ownedByOperator(b: Bead, operator: string | undefined): boolean {
+export function ownedByOperator(
+  b: Bead,
+  operator: string | undefined,
+): boolean {
   const assignee = (b.assignee ?? undefined)?.trim() || undefined;
   if (!assignee) return true; // unclaimed — free to take
   return assignee === operator; // claimed-by-me; a different operator's claim is excluded
@@ -186,18 +205,25 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
       } catch (e) {
         if (isUsageLimitError(e)) throw e; // stop the sweep; runner reschedules past the reset.
         lastError = e;
-        consoleLog.error(`epic ${epic.id} (PR fix) failed; continuing sweep`, e);
+        consoleLog.error(
+          `epic ${epic.id} (PR fix) failed; continuing sweep`,
+          e,
+        );
       }
     }
     // The claude sessions above may have written beads (notes, bd remember); push them.
     // Logged, not thrown — a sync hiccup must not shadow (or fabricate) a sweep failure.
     await beads
       .sync(repo)
-      .catch((e) => consoleLog.error("beads dolt sync failed after review-fix sweep", e));
+      .catch((e) =>
+        consoleLog.error("beads dolt sync failed after review-fix sweep", e),
+      );
 
     // Surface a non-quota failure so the job retries/parks — but only after trying every epic.
     if (lastError) {
-      throw lastError instanceof Error ? lastError : new Error(String(lastError));
+      throw lastError instanceof Error
+        ? lastError
+        : new Error(String(lastError));
     }
   };
 }
@@ -215,7 +241,18 @@ async function handleEpic(args: {
   baseBranch: string | undefined;
   all: Bead[];
 }): Promise<void> {
-  const { db, clock, ctx, repo, projectId, epic, settings, branchPrefix, baseBranch, all } = args;
+  const {
+    db,
+    clock,
+    ctx,
+    repo,
+    projectId,
+    epic,
+    settings,
+    branchPrefix,
+    baseBranch,
+    all,
+  } = args;
   const number = prNumberFromRef(beads.getPrRef(epic));
   if (number === undefined) return;
 
@@ -246,9 +283,31 @@ async function handleEpic(args: {
 
   // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
   // sync it with origin, and pre-merge the base if GitHub reports a conflict.
-  const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number });
+  const { worktree, conflicts } = await prepareFixWorktree({
+    ctx,
+    repo,
+    branch,
+    settings,
+    baseBranch,
+    pr,
+    number,
+  });
 
-  await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
+  await runFixSession({
+    db,
+    clock,
+    ctx,
+    repo,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    verdict,
+    conflicts,
+    branch,
+    number,
+  });
 }
 
 /**
@@ -269,7 +328,12 @@ async function prepareFixWorktree(args: {
 }): Promise<{ worktree: Worktree; conflicts: string[] }> {
   const { ctx, repo, branch, settings, baseBranch, pr, number } = args;
 
-  const worktree = await createWorktree({ repoPath: repo, branch, baseBranch: settings.baseBranch, warm: false });
+  const worktree = await createWorktree({
+    repoPath: repo,
+    branch,
+    baseBranch: settings.baseBranch,
+    warm: false,
+  });
   // Fail loudly here rather than letting a missing worktree ride through the best-effort git steps
   // below — `safe()` swallows their errors, so the first thing to actually report the problem would
   // be `spawn <claude> ENOENT` from the cwd, which names the wrong culprit entirely (anton-2wvb).
@@ -280,13 +344,20 @@ async function prepareFixWorktree(args: {
   }
   await ctx.heartbeat();
 
-  await safe(() => fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]));
-  await safe(() => mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }));
+  await safe(() =>
+    fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
+  );
+  await safe(() =>
+    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }),
+  );
 
   let conflicts: string[] = [];
   if (pr.mergeable === "CONFLICTING" && baseBranch) {
     try {
-      const merge = await mergeIntoCurrent(worktree.path, `origin/${baseBranch}`);
+      const merge = await mergeIntoCurrent(
+        worktree.path,
+        `origin/${baseBranch}`,
+      );
       conflicts = merge.conflicts; // clean auto-merge → a merge commit is pushed below
     } catch (e) {
       consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
@@ -316,7 +387,21 @@ async function runFixSession(args: {
   branch: string;
   number: number;
 }): Promise<void> {
-  const { db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number } = args;
+  const {
+    db,
+    clock,
+    ctx,
+    repo,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    verdict,
+    conflicts,
+    branch,
+    number,
+  } = args;
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
@@ -331,7 +416,10 @@ async function runFixSession(args: {
   ctx.report({ sessionId, cwd: worktree.path });
 
   try {
-    await appendSessionLog(logPath, `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`);
+    await appendSessionLog(
+      logPath,
+      `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
+    );
 
     const { prompt, appendSystemPrompt } = await buildReviewFixPrompt({
       epic,
@@ -352,12 +440,20 @@ async function runFixSession(args: {
       onEvent,
     });
     if (!result.ok) {
-      throw new Error(`claude reported an error resolving PR #${number}: ${result.text ?? "unknown"}`);
+      throw new Error(
+        `claude reported an error resolving PR #${number}: ${result.text ?? "unknown"}`,
+      );
     }
 
     await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
 
-    const pushed = await commitAndPushFix(repo, worktree.path, epic.id, branch, number);
+    const pushed = await commitAndPushFix(
+      repo,
+      worktree.path,
+      epic.id,
+      branch,
+      number,
+    );
 
     await applyThreadOutcomes({
       repo,
@@ -370,12 +466,21 @@ async function runFixSession(args: {
     });
 
     if (!pushed) {
-      await appendSessionLog(logPath, `[review-fix] no changes produced; leaving PR #${number} as-is\n`);
+      await appendSessionLog(
+        logPath,
+        `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
+      );
       await endSession(db, clock, sessionId, "done");
       return;
     }
 
-    await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
+    await notifyReReview({
+      repo,
+      number,
+      pr,
+      reasons: verdict.reasons,
+      signal: ctx.signal,
+    });
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
@@ -399,7 +504,8 @@ async function runTestGate(
     cwd,
     signal,
     logPath,
-    (gate, code) => `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
+    (gate, code) =>
+      `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
   );
 }
 
@@ -416,7 +522,10 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
-  const { committed } = await commitAll(worktreePath, `${epicId}: address review feedback (PR #${number})`);
+  const { committed } = await commitAll(
+    worktreePath,
+    `${epicId}: address review feedback (PR #${number})`,
+  );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   if (pushed) await pushBranch(repo, branch);
   return pushed;
@@ -444,12 +553,27 @@ async function applyThreadOutcomes(args: {
     const anchor = thread?.comments[0];
     if (!thread || !anchor) continue;
     if (item.outcome === "fixed" && !pushed) continue;
-    const note = item.reply?.trim() || (item.outcome === "fixed" ? "addressed in the latest push" : "left as-is");
-    await safe(() => replyToReviewComment(repo, number, anchor.id, `${ANTON_MARK} ${note}`, signal));
+    const note =
+      item.reply?.trim() ||
+      (item.outcome === "fixed"
+        ? "addressed in the latest push"
+        : "left as-is");
+    await safe(() =>
+      replyToReviewComment(
+        repo,
+        number,
+        anchor.id,
+        `${ANTON_MARK} ${note}`,
+        signal,
+      ),
+    );
     if (item.outcome === "fixed") {
       await safe(() => resolveReviewThread(repo, thread.id, signal));
     }
-    await appendSessionLog(logPath, `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`);
+    await appendSessionLog(
+      logPath,
+      `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
+    );
   }
 }
 
@@ -470,7 +594,9 @@ async function notifyReReview(args: {
       signal,
     ),
   );
-  await safe(() => reRequestReview(repo, number, reviewersRequestingChanges(pr), signal));
+  await safe(() =>
+    reRequestReview(repo, number, reviewersRequestingChanges(pr), signal),
+  );
 }
 
 // ── merge finalization (anton-ner.5) ──
@@ -485,7 +611,10 @@ const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
  * so in as many words — neither carries a mechanism for the tickets behind it.
  */
 const deliveredAtMerge = (b: Bead | undefined): boolean =>
-  !!b && DELIVERED_AT_MERGE.has(b.status) && !beads.isAbandoned(b) && !beads.isNotDelivered(b);
+  !!b &&
+  DELIVERED_AT_MERGE.has(b.status) &&
+  !beads.isAbandoned(b) &&
+  !beads.isNotDelivered(b);
 
 /**
  * The children a merged target must NOT close — the tickets its run deliberately left for a human
@@ -527,19 +656,33 @@ const deliveredAtMerge = (b: Bead | undefined): boolean =>
  * post-commit failure) or one a human must rule on anyway (zero delivery, agent-declared blocked):
  * reopening and rehoming it would advertise a rerun that duplicates or conflicts with the diff.
  *
- * So the lane is an ALLOWLIST of the two states that earn a rerun, never "not blocked" (anton-67xj):
- * `open` — a dependent that was never dispatched — and `blocked` carrying the marker, the timed-out
- * ticket whose work was rolled back. Any other status a preserved ticket can be in is somebody's own
- * decision about it — a `deferred` snooze, a live `in_progress` claim — and rehoming or reopening
- * one would overwrite that decision with a rerun nobody asked for.
+ * So the lane is an ALLOWLIST of the states that earn a rerun, never "not blocked" (anton-67xj):
+ * `open` — a dependent that was never dispatched — and the marker-bearing timed-out ticket whose
+ * work was rolled back. That one is normally `blocked`, but need not be: the timeout writes the
+ * status best-effort while it RETRIES the marker, so a run whose `blocked` write failed leaves the
+ * ticket on the claim it was dispatched under, `in_progress` and marked. Rejecting that shape would
+ * strand a ticket with nothing in the diff on the manual-review path over a bookkeeping failure — so
+ * it earns the rerun too, but only while the claim is still the dead run's own (or already gone).
+ * Any other status a preserved ticket can be in is somebody's own decision about it — a `deferred`
+ * snooze, an `in_progress` claim held by another operator — and rehoming or reopening one would
+ * overwrite that decision with a rerun nobody asked for.
  */
-const safeToRerunAtMerge = (b: Bead): boolean =>
-  b.status === "open" || (b.status === "blocked" && beads.isNotDelivered(b));
+const safeToRerunAtMerge = (b: Bead, runOwner: string | undefined): boolean => {
+  if (b.status === "open") return true;
+  if (!beads.isNotDelivered(b)) return false;
+  if (b.status === "blocked") return true;
+  const owner = ownerOf(b);
+  return (
+    b.status === "in_progress" && (owner === undefined || owner === runOwner)
+  );
+};
 
 export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const byId = new Map(children.map((c) => [c.id, c]));
   const keep = new Set(
-    children.filter((c) => c.status === "blocked" || beads.isNotDelivered(c)).map((c) => c.id),
+    children
+      .filter((c) => c.status === "blocked" || beads.isNotDelivered(c))
+      .map((c) => c.id),
   );
   // blocker id → the run's own tickets waiting on it; edges leaving the run are another gate's
   // business (a ticket held on an outside blocker was never in this run's dispatch set).
@@ -551,7 +694,8 @@ export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const queue = [...keep];
   while (queue.length) {
     for (const dependent of dependents.get(queue.shift()!) ?? []) {
-      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent))) continue;
+      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent)))
+        continue;
       keep.add(dependent); // never revisited, so a cycle terminates
       queue.push(dependent);
     }
@@ -607,7 +751,10 @@ async function reopenPreserved(
   if (!fresh) return manualRemedy(bead.status);
   if (fresh.status === "open") return "";
   const owner = ownerOf(fresh);
-  if (fresh.status !== bead.status || (owner !== undefined && owner !== runOwner))
+  if (
+    fresh.status !== bead.status ||
+    (owner !== undefined && owner !== runOwner)
+  )
     return (
       ` Its status is now \`${fresh.status}\`${owner ? ` under ${owner}` : ""} — that changed after ` +
       `the run stopped it, so anton left the status alone rather than reopening a ticket someone ` +
@@ -676,7 +823,10 @@ export async function finalizeMergedEpic(args: {
       .map((b) => [b.id, b]),
   ); // by id: a leaf run target is its own ticket, so it can appear on both sides
   const closed = await safe(() =>
-    beads.batch(repo, [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id }))),
+    beads.batch(
+      repo,
+      [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
+    ),
   );
   if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
@@ -690,12 +840,18 @@ export async function finalizeMergedEpic(args: {
   //     and the parent they hang off has just closed carrying a MERGED PR ref, which execute-epic
   //     short-circuits on as an already-finished run. So neither the ticket nor its old home can be
   //     claimed, and "re-run this" would mean restructuring the board by hand.
-  const rerunnable = preserved.filter(safeToRerunAtMerge);
-  const followUp = await rehomePreserved(repo, epic, rerunnable, areaLabelOf(epic, all));
-  const rerun = new Set(rerunnable.map((b) => b.id));
   // The actor the finished run reserved its children for: execute-epic's claim cascade assigns every
   // child to the same operator it claimed the target for, so the target's own assignee names it.
   const runOwner = ownerOf(epic);
+  const rerunnable = preserved.filter((b) => safeToRerunAtMerge(b, runOwner));
+  const followUp = await rehomePreserved(
+    repo,
+    epic,
+    rerunnable,
+    areaLabelOf(epic, all),
+    runOwner,
+  );
+  const rerun = new Set(rerunnable.map((b) => b.id));
   for (const bead of preserved) {
     // Release the reservation the run that skipped this ticket still holds. Its own unassign at
     // skip time is best-effort (and older runs had none), and a claim that outlives its run hides
@@ -728,9 +884,14 @@ export async function finalizeMergedEpic(args: {
     // …unless another operator moved it out of this target since the sweep read the board
     // (rehomePreserved): the ticket is theirs now, and its status is part of the state they are
     // running it in.
+    // …or moved on in place: a ticket someone has since claimed, closed or snoozed keeps the status
+    // they put it in, so the reopen is skipped for the same reason the reparent was.
     const takenOver = followUp.elsewhere.has(bead.id);
+    const movedOn = followUp.changed.get(bead.id);
     const statusNote =
-      rerun.has(bead.id) && !takenOver ? await reopenPreserved(repo, bead, runOwner) : "";
+      rerun.has(bead.id) && !takenOver && !movedOn
+        ? await reopenPreserved(repo, bead, runOwner)
+        : "";
     // Three lanes, three different things to tell the operator who meets this ticket later: the
     // rerun lane, the post-commit lane (no marker — its work IS in the merged diff), and a ticket
     // whose status is somebody's own decision, which anton neither reruns nor asks a human to
@@ -742,12 +903,16 @@ export async function finalizeMergedEpic(args: {
         bead.id,
         decidedElsewhere
           ? `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
-            `deliver it (see the note above), so none of its work is in that diff. Its status is ` +
-            `\`${bead.status}\`, which is someone's own decision about this ticket rather than ` +
-            `the run's, so anton left it under ${epic.id} and did NOT queue it for a rerun. Once ` +
-            `that is settled, move it onto a fresh run target ` +
-            `(\`bd update ${bead.id} --parent <new-epic>\`) to have anton pick the work back up.` +
-            ownershipNote(bead, owner, { stillOwned, foreignOwner, blocksClaim: "" })
+              `deliver it (see the note above), so none of its work is in that diff. Its status is ` +
+              `\`${bead.status}\`, which is someone's own decision about this ticket rather than ` +
+              `the run's, so anton left it under ${epic.id} and did NOT queue it for a rerun. Once ` +
+              `that is settled, move it onto a fresh run target ` +
+              `(\`bd update ${bead.id} --parent <new-epic>\`) to have anton pick the work back up.` +
+              ownershipNote(bead, owner, {
+                stillOwned,
+                foreignOwner,
+                blocksClaim: "",
+              })
           : !rerun.has(bead.id)
             ? `anton: the pull request for ${epic.id} merged while this ticket was still ` +
               `\`${bead.status}\` — the run stopped it and carried on (see the note above). It ` +
@@ -756,7 +921,11 @@ export async function finalizeMergedEpic(args: {
               `deliberately NOT queued for a rerun: re-running it would redo work the merge ` +
               `already shipped. Review the branch against the note above, then close this by hand ` +
               `if it is complete, or file the remainder as a new ticket.` +
-              ownershipNote(bead, owner, { stillOwned, foreignOwner, blocksClaim: "" })
+              ownershipNote(bead, owner, {
+                stillOwned,
+                foreignOwner,
+                blocksClaim: "",
+              })
             : `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did ` +
               `not deliver it (see the note above), so none of its work is in that diff. Left ` +
               `open on purpose: closing it here would file work that was never done as shipped. ` +
@@ -765,13 +934,19 @@ export async function finalizeMergedEpic(args: {
                   `${followUp.elsewhere.get(bead.id) ?? "a different target"} while the pull ` +
                   `request was in review, so anton left it there rather than rehoming it — that ` +
                   `target owns this work now.`
-                : followUp.id && followUp.moved.has(bead.id)
-                  ? `It now lives under ${followUp.id}, a fresh run target — approve that target ` +
-                    `to have anton pick this work back up.`
-                  : `It could NOT be rehomed onto a fresh run target, so nothing anton runs ` +
-                    `reaches it yet: move it under a new epic ` +
-                    `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent to make ` +
-                    `it a run target of its own.`) +
+                : movedOn
+                  ? `Its status is now ${movedOn} — that changed while the pull request was in ` +
+                    `review, so anton left it under ${epic.id}, status untouched, rather than ` +
+                    `queueing a rerun on top of someone else's decision. Once that is settled, ` +
+                    `move it onto a fresh run target (\`bd update ${bead.id} --parent ` +
+                    `<new-epic>\`) to have anton pick the work back up.`
+                  : followUp.id && followUp.moved.has(bead.id)
+                    ? `It now lives under ${followUp.id}, a fresh run target — approve that target ` +
+                      `to have anton pick this work back up.`
+                    : `It could NOT be rehomed onto a fresh run target, so nothing anton runs ` +
+                      `reaches it yet: move it under a new epic ` +
+                      `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent to make ` +
+                      `it a run target of its own.`) +
               ownershipNote(bead, owner, {
                 stillOwned,
                 foreignOwner,
@@ -784,14 +959,22 @@ export async function finalizeMergedEpic(args: {
 
   // 2. Remove the merged branch and its worktree. If the worktree is already gone (the common case),
   //    removeWorktree still prunes and deletes the local branch off a synthetic descriptor.
-  const wt: Worktree =
-    (await findWorktree(repo, branch)) ??
-    { path: worktreePathFor(repo, branch), branch, baseBranch: branch, repoPath: repo };
+  const wt: Worktree = (await findWorktree(repo, branch)) ?? {
+    path: worktreePathFor(repo, branch),
+    branch,
+    baseBranch: branch,
+    repoPath: repo,
+  };
   await safe(() => removeWorktree(wt, { deleteBranch: true }));
 
   // 3. Finalize the run row if one is still open (a run already marked done at PR-open is left as-is).
   const run = await findOpenRunForEpic(db, projectId, epic.id);
-  if (run) await updateRun(db, clock, run.id, { status: "done", endedAt: clock.now(), error: null });
+  if (run)
+    await updateRun(db, clock, run.id, {
+      status: "done",
+      endedAt: clock.now(),
+      error: null,
+    });
 }
 
 /**
@@ -816,8 +999,13 @@ async function rehomePreserved(
   epic: Bead,
   rerunnable: Bead[],
   area: string | undefined,
+  runOwner: string | undefined,
 ): Promise<Rehomed> {
-  const none: Rehomed = { moved: new Set(), elsewhere: new Map() };
+  const none: Rehomed = {
+    moved: new Set(),
+    elsewhere: new Map(),
+    changed: new Map(),
+  };
   if (rerunnable.length === 0) return none;
   const ids = rerunnable.map((b) => b.id).join(", ");
   let followUp: string;
@@ -841,8 +1029,9 @@ async function rehomePreserved(
   }
   const moved = new Set<string>();
   const elsewhere = new Map<string, string | undefined>();
+  const changed = new Map<string, string>();
   for (const bead of rerunnable) {
-    // Re-read the parent before moving it (anton-67xj). `rerunnable` comes off the sweep's snapshot
+    // Re-read the ticket before moving it (anton-67xj). `rerunnable` comes off the sweep's snapshot
     // and a PR can sit in review for days: if another operator has reparented this ticket onto a
     // target of their own since, moving it here steals it out from under a run that may already be
     // executing it — which then trips that run's own ticket-set drift check and parks it. A read
@@ -854,12 +1043,32 @@ async function rehomePreserved(
       elsewhere.set(bead.id, beads.parentOf(fresh));
       continue;
     }
-    if (await safe(() => beads.reparent(repo, bead.id, followUp))) moved.add(bead.id);
+    // The parent is only half of what went stale. In the same window the ticket can have been
+    // claimed, closed or snoozed in place, or taken over by another operator — and a rerun lane
+    // earned by the snapshot is not one the board still grants: moving a now-active ticket hands a
+    // second run the work someone is doing, and moving a closed one puts finished work under a
+    // follow-up branch that carries no commit for it, which execute-epic then reads as a
+    // cross-machine resume and runs again. So the allowlist is re-applied to the fresh read, and a
+    // claim that changed hands since the snapshot disqualifies it however it reads.
+    const freshOwner = ownerOf(fresh);
+    const tookOver = freshOwner !== undefined && freshOwner !== ownerOf(bead);
+    if (!safeToRerunAtMerge(fresh, runOwner) || tookOver) {
+      changed.set(bead.id, stateOf(fresh));
+      continue;
+    }
+    if (await safe(() => beads.reparent(repo, bead.id, followUp)))
+      moved.add(bead.id);
   }
-  if (moved.size > 0) return { id: followUp, moved, elsewhere };
+  if (moved.size > 0) return { id: followUp, moved, elsewhere, changed };
   // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
   await safe(() => beads.delete(repo, followUp));
-  return { moved: new Set(), elsewhere };
+  return { moved: new Set(), elsewhere, changed };
+}
+
+/** A ticket's live state as a note fragment: the status, and who holds it when anyone does. */
+function stateOf(bead: Bead): string {
+  const owner = ownerOf(bead);
+  return `\`${bead.status}\`${owner ? ` under ${owner}` : ""}`;
 }
 
 /**
@@ -896,6 +1105,11 @@ interface Rehomed {
    * their note must not hand the operator a `--parent` command that would undo that.
    */
   elsewhere: Map<string, string | undefined>;
+  /**
+   * Tickets a fresh read no longer finds rerunnable — claimed, closed or snoozed since the sweep.
+   * Left where they are, status untouched, and named by their live state in the note.
+   */
+  changed: Map<string, string>;
 }
 
 // ── helpers ──
