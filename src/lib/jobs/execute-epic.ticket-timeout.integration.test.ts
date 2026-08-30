@@ -21,6 +21,8 @@
  * 6. **A `not-delivered` marker that will not persist halts the run** (anton-67xj). That label is
  *    merge finalization's only signal that a ticket is in no diff, so a run that opened its PR
  *    without it would have the merge close never-written work as shipped.
+ * 7. **A STALE marker that will not clear halts it too** (anton-67xj). The mirror failure: a run
+ *    that delivers a ticket still carrying the label has the merge treat that work as undelivered.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -456,6 +458,60 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
       else process.env[BD_BIN_ENV] = priorBdBin;
       resetBdBinCache();
       await patchSettings({ ticketTimeoutMinutes: undefined });
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("halts the run when a stale `not-delivered` marker will not clear (anton-67xj)", async () => {
+    // The mirror image of the case above. A ticket carrying the marker from an earlier run is being
+    // dispatched NOW, so that verdict is stale — and one that survives its own successful run makes
+    // merge finalization read delivered work as undelivered: the ticket is held out of the close
+    // and rehomed under a follow-up epic, telling the operator to re-run work the diff contains.
+    const id = await beads.create(repo, {
+      title: "StaleMarker",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nStaleMarker",
+    });
+    await beads.approve(repo, id);
+    const stale = createTicket(repo, {
+      title: "StaleMarker ticket one",
+      parent: id,
+      labels: ["not-delivered"],
+      acceptance: "work file exists",
+    });
+
+    // A real bd for everything except the one write under test — the clear is refused, the rest
+    // of the board still moves.
+    const realBd = resolveBdBin();
+    const shim = writeBin(
+      binDir,
+      "bd-refuses-clear",
+      `const {spawnSync}=require('child_process');const a=process.argv.slice(2);
+const i=a.indexOf('--remove-label');
+if(i>=0&&a[i+1]==='not-delivered'){process.stderr.write('Error: simulated bd write failure\\n');process.exit(1);}
+const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.status===null?1:r.status);`,
+    );
+
+    const runner = makeEpicRunner(ctx);
+    const priorBdBin = process.env[BD_BIN_ENV];
+    process.env[BD_BIN_ENV] = shim;
+    resetBdBinCache();
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: id });
+
+      // Parked before the agent could deliver work the merge would then file as undelivered.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toMatch(/would not clear it/i);
+      const target = await beads.show(repo, id);
+      expect(beads.getPrRef(target) ?? null).toBeNull();
+      expect((await beads.show(repo, stale)).labels ?? []).toContain("not-delivered");
+    } finally {
+      if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
+      else process.env[BD_BIN_ENV] = priorBdBin;
+      resetBdBinCache();
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });

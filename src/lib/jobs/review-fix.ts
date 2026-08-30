@@ -29,7 +29,7 @@
  * `stage:in-review` so a later sweep no longer treats the epic as in-review (never finalized twice).
  */
 import { existsSync } from "node:fs";
-import { beads, LABELS, type BatchOp, type Bead } from "../beads/bd";
+import { beads, LABELS, ownerOf, type BatchOp, type Bead } from "../beads/bd";
 import { runClaude } from "../claude/driver";
 import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
 import {
@@ -473,9 +473,70 @@ async function notifyReReview(args: {
 
 // ── merge finalization (anton-ner.5) ──
 
+/** A child whose commit is on the branch — `in_progress` included, see {@link undeliveredAtMerge}. */
+const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
+
 /**
- * Finalize an epic whose PR merged: close the epic + any still-open child tickets (bar the ones a
- * run marked `not-delivered`, which are in no diff and stay open), drop the `stage:in-review`
+ * Delivery evidence: a status that means a commit landed, and no verdict on top of it saying
+ * otherwise. An abandoned child is closed but explicitly undelivered (execute-epic drops it from
+ * `live` for the same reason), and a `not-delivered` child is the run that passed it over saying
+ * so in as many words — neither carries a mechanism for the tickets behind it.
+ */
+const deliveredAtMerge = (b: Bead | undefined): boolean =>
+  !!b && DELIVERED_AT_MERGE.has(b.status) && !beads.isAbandoned(b) && !beads.isNotDelivered(b);
+
+/**
+ * The children a merged target must NOT close — the tickets its run deliberately left for a human
+ * (anton-67xj). A merge says the branch shipped, not that every ticket under the target ran, and
+ * closing one that never ran turns the bd note it carries into a pointer at work the board now
+ * reads as delivered.
+ *
+ * Two seeds, one rule. A ticket the run BLOCKED says so in its status — its budget ran out and its
+ * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. Two narrower
+ * sub-shapes — a timeout that fired after the commit, and a post-commit failure — do leave work on
+ * the branch; they are held back for the same reason all the same, because their note asks a human
+ * to review and close by hand, not because nothing landed. A ticket the run SKIPPED behind one of
+ * those says so in its `not-delivered` label instead: it was never dispatched, so it keeps the
+ * `open` status the board keeps offering it under and carries no other mark of its own.
+ *
+ * Then the transitive closure over the run own `blocks` edges, which catches what neither seed can
+ * — a dependent skipped by a run too old to write the label, or one whose marker never landed.
+ *
+ * A DELIVERED dependent stops the walk. Its commit is on the branch whatever its blocker did — the
+ * run carries on past a timeout, so a ticket behind one still gets dispatched — and the tickets
+ * behind IT have the mechanism they were written against. Delivery is `closed`, or `in_progress`:
+ * a child close write is best-effort (execute-epic), so a transient bd failure leaves a ticket
+ * that committed claimed and mid-stage. Reading that bookkeeping failure as "never ran" would
+ * strand shipped work open, when the merge is precisely what repairs it. An ABANDONED child is the
+ * exception (deliveredAtMerge): closed on a won't-do, with no commit behind it, so the walk passes
+ * straight through to whatever waited on it.
+ */
+export function undeliveredAtMerge(children: Bead[]): Set<string> {
+  const byId = new Map(children.map((c) => [c.id, c]));
+  const keep = new Set(
+    children.filter((c) => c.status === "blocked" || beads.isNotDelivered(c)).map((c) => c.id),
+  );
+  // blocker id → the run's own tickets waiting on it; edges leaving the run are another gate's
+  // business (a ticket held on an outside blocker was never in this run's dispatch set).
+  const dependents = new Map<string, string[]>();
+  for (const e of beads.edgesOf(children)) {
+    if (e.type !== "blocks" || !byId.has(e.from) || !byId.has(e.to)) continue;
+    dependents.set(e.to, [...(dependents.get(e.to) ?? []), e.from]);
+  }
+  const queue = [...keep];
+  while (queue.length) {
+    for (const dependent of dependents.get(queue.shift()!) ?? []) {
+      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent))) continue;
+      keep.add(dependent); // never revisited, so a cycle terminates
+      queue.push(dependent);
+    }
+  }
+  return keep;
+}
+
+/**
+ * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, rehome the
+ * ones it did not ({@link undeliveredAtMerge}) onto a fresh run target, drop the `stage:in-review`
  * label, remove the merged branch + its worktree, and finalize the run row.
  *
  * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
@@ -493,7 +554,10 @@ export async function finalizeMergedEpic(args: {
   repo: string;
   projectId: string;
   epic: Bead;
-  /** The run target's whole ticket subtree (runTickets); open ones close alongside the epic. */
+  /**
+   * The run target's whole ticket subtree (runTickets), carrying its inline `blocks` edges. Open
+   * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
+   */
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;
@@ -508,15 +572,16 @@ export async function finalizeMergedEpic(args: {
   //    orphaning a still-open ticket/epic behind a run already marked done.
   //
   //    A merged PR does NOT mean every child shipped in it (anton-67xj). A run that absorbed a
-  //    ticket timeout opens its PR for the work that DID land and marks the rest `not-delivered` —
+  //    ticket timeout opens its PR for the work that DID land and leaves the rest undelivered —
   //    those beads are in no diff, so closing them here would file work that was never done as
   //    shipped and lose it silently, against the note on the bead telling the operator to run it.
   //    They are left open and rehomed instead (1b); the target itself still closes, since the PR it
   //    points at is merged and terminal. The target is never itself "preserved": a leaf run target
   //    marked undelivered has no merged PR to finalize, and excluding it from the close would leave
   //    `stage:in-review` on forever, re-selecting this epic on every sweep.
+  const undelivered = undeliveredAtMerge(children);
   const preserved = children.filter(
-    (b) => b.id !== epic.id && b.status !== "closed" && beads.isNotDelivered(b),
+    (b) => b.id !== epic.id && b.status !== "closed" && undelivered.has(b.id),
   );
   const skip = new Set(preserved.map((b) => b.id));
   const stillOpen = new Map(
@@ -540,6 +605,12 @@ export async function finalizeMergedEpic(args: {
   //     claimed, and "re-run this" would mean restructuring the board by hand.
   const followUp = await rehomePreserved(repo, epic, preserved);
   for (const bead of preserved) {
+    // Release the reservation the run that skipped this ticket still holds. Its own unassign at
+    // skip time is best-effort (and older runs had none), and a claim that outlives its run hides
+    // the ticket from `bd ready --unassigned` and refuses the claim cascade of whoever approves the
+    // follow-up — so the rerun path the note advertises works only once ownership is cleared. When
+    // it cannot be, the note says so rather than pointing at a target no one can claim through.
+    const stillOwned = ownerOf(bead) && !(await safe(() => beads.unassign(repo, bead.id)));
     await safe(() =>
       beads.note(
         repo,
@@ -552,7 +623,11 @@ export async function finalizeMergedEpic(args: {
               `anton pick this work back up.`
             : `It could NOT be rehomed onto a fresh run target, so nothing anton runs reaches it ` +
               `yet: move it under a new epic (\`bd update ${bead.id} --parent <new-epic>\`) or ` +
-              `clear its parent to make it a run target of its own.`),
+              `clear its parent to make it a run target of its own.`) +
+          (stillOwned
+            ? ` It is also still assigned to ${ownerOf(bead)} and could not be released, so no ` +
+              `other operator can claim it: clear that with \`bd assign ${bead.id} ""\`.`
+            : ""),
       ),
     );
   }

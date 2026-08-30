@@ -1290,8 +1290,18 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           skipped.set(ticket.id, skipping);
           // Closed on another machine but its commit never reached this branch, and now it will
           // never be regenerated here — reopen it, or the board advertises work no PR contains.
+          // Required, not best-effort: merge finalization only preserves and rehomes children that
+          // are still OPEN, so a ticket left closed here is recorded as shipped by the very merge
+          // that proves it never was — the `not-delivered` marker below cannot rescue it.
           if (doneOnBoard && ticket.status === "closed") {
-            await safe(() => beads.reopen(repo, ticket.id));
+            if (!(await mustPersist(() => beads.reopen(repo, ticket.id)))) {
+              throw new PoisonEpic(
+                `${ticket.id} is closed on the board but its commit is on no branch here, and it ` +
+                  `was skipped because ${skipping.stopped} ran out of time — bd would not reopen ` +
+                  `it, so the merge of this run's pull request would file work no diff contains ` +
+                  `as shipped. Check the beads DB, then resume the run`,
+              );
+            }
           }
           // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
           // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
@@ -1774,10 +1784,19 @@ async function runTicket(args: {
   // (fire-and-forget; the end-of-run sync is the backstop).
   await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
   // A previous run marked this ticket as undelivered (timed out, or skipped behind one that did).
-  // It is being run now, so that verdict is stale — leaving it would keep a ticket this run DOES
-  // deliver out of its own merge finalization (anton-67xj).
+  // It is being run now, so that verdict is stale — and clearing it is as load-bearing as writing
+  // it was (anton-67xj). The failure is the mirror image: a marker that survives its own successful
+  // run makes merge finalization read delivered work as undelivered, hold this ticket out of the
+  // close, and file a follow-up epic for work the merged diff already contains. So it is retried,
+  // and a run that cannot clear it parks before it can open that PR.
   if (beads.isNotDelivered(ticket)) {
-    await safe(() => beads.untag(repo, ticket.id, [LABELS.notDelivered]));
+    if (!(await mustPersist(() => beads.untag(repo, ticket.id, [LABELS.notDelivered])))) {
+      throw new PoisonEpic(
+        `${ticket.id} carries \`${LABELS.notDelivered}\` from a previous run but bd would not ` +
+          `clear it — running this ticket and opening a pull request would make merge ` +
+          `finalization treat delivered work as undelivered. Check the beads DB, then resume the run`,
+      );
+    }
   }
   void beads
     .sync(repo)
