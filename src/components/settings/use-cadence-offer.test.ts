@@ -179,3 +179,86 @@ describe("a remount with the question unanswered", () => {
     expect(render(armed({ cron: "0 0,12 * * 1-5" })).result.current.offer).toBeNull();
   });
 });
+
+/**
+ * The coupling has two halves, and the offer's premise is completed by whichever lands second. An
+ * arm against an already-running product-master is the obvious one; the mirror — enabling
+ * product-master under a picker that is already armed — is the same premise reached from the other
+ * side, and must ask the same question rather than wait for a reload.
+ */
+describe("enabling product-master under an already armed picker", () => {
+  /** The picker armed, product-master switched off — nothing to offer until it comes back. */
+  const coupledOff = (): Rows => ({
+    "board-picker": { enabled: true, cron: "*/10 * * * *" },
+    "product-master": { enabled: false, cron: WEEKLY },
+  });
+
+  it("opens the question the moment the enable lands", async () => {
+    const { result, rows } = render(coupledOff());
+    expect(result.current.offer).toBeNull();
+
+    await act(() =>
+      result.current.aroundToggle("product-master", true, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return true;
+      }),
+    );
+
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+
+  it("stays silent when the enable does not land", async () => {
+    const { result } = render(coupledOff());
+    await act(() => result.current.aroundToggle("product-master", true, async () => false));
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("stays silent once the operator has said keep weekly", async () => {
+    const { result, rows } = render(coupledOff(), true);
+    await act(() =>
+      result.current.aroundToggle("product-master", true, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("puts back a question its own off/on sequence withdrew", async () => {
+    const { result, rows } = render({
+      "board-picker": { enabled: true, cron: "*/10 * * * *" },
+      "product-master": { enabled: true, cron: WEEKLY },
+    });
+    expect(result.current.offer).not.toBeNull();
+
+    await act(() =>
+      result.current.aroundToggle("product-master", false, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: false, cron: WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+
+    await act(() =>
+      result.current.aroundToggle("product-master", true, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+
+  it("stays silent when the picker is not armed", async () => {
+    const { result, rows } = render({
+      "board-picker": { enabled: false, cron: "*/10 * * * *" },
+      "product-master": { enabled: false, cron: WEEKLY },
+    });
+    await act(() =>
+      result.current.aroundToggle("product-master", true, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+  });
+});

@@ -177,14 +177,20 @@ export function useCadenceOffer({
       // at all. Re-open it from the live rows; `ask()` stays silent unless the premise still holds.
       else if (restored && armingIntent.current) ask();
     }
-    // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs, so
-    // it is the one toggle that opens an offer — and only an offer. Asked only once the arm LANDED:
-    // the offer's entire premise is that the picker is now ranking off product-master's priorities,
-    // so a failed PATCH must not leave a question standing on a condition that never happened.
-    // Disarming deliberately does nothing to the cadence: an operator who accepted daily keeps daily
-    // until they say otherwise, and a schedule that silently sprang back would make this table
-    // untrustworthy about the only thing it exists to report.
-    if (stored && id === AUTOPILOT_ARMING_AUTOMATION && next) ask();
+    // The coupling is what opens an offer, and either side can be the half that completes it: the
+    // arm makes product-master's staleness cost something, and enabling product-master gives an
+    // already-armed picker priorities to rank off. Whichever lands second asks — otherwise the
+    // question waits for a reload, which is no answer to a premise that is true right now.
+    //
+    // Only ever an offer, and only once the enable LANDED: the premise is that the picker is now
+    // ranking off product-master's priorities, so a failed PATCH must not leave a question standing
+    // on a condition that never happened. Turning either one OFF deliberately does nothing to the
+    // cadence: an operator who accepted daily keeps daily until they say otherwise, and a schedule
+    // that silently sprang back would make this table untrustworthy about the only thing it exists
+    // to report.
+    const completesCoupling =
+      id === AUTOPILOT_ARMING_AUTOMATION || id === CADENCE_COUPLED_AUTOMATION;
+    if (stored && next && completesCoupling) ask();
   }
 
   /**
