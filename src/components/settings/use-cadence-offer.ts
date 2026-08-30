@@ -37,8 +37,12 @@ export interface CadenceOfferControl {
    * answers whether it LANDED, which is what decides whether a question is opened or put back.
    */
   aroundToggle: (id: string, next: boolean, write: () => Promise<boolean>) => Promise<void>;
-  /** A cadence set by hand supersedes a pending offer for that same row. */
-  supersede: (id: string) => void;
+  /**
+   * Run one hand cadence edit with the offer's lifecycle around it: it supersedes a pending offer
+   * for that same row, and `write` answers whether it LANDED — an edit that did not is rolled back
+   * to the cadence the question was about, which puts that question back in play.
+   */
+  aroundSetCron: (id: string, write: () => Promise<boolean>) => Promise<void>;
   accept: () => Promise<void>;
   decline: () => Promise<void>;
 }
@@ -185,9 +189,17 @@ export function useCadenceOffer({
    * A cadence chosen by hand in the row's own editor supersedes a pending offer for that same row:
    * the offer's cron was derived from the cadence being replaced, so accepting it afterwards would
    * overwrite the time the operator just picked with one computed from a row that is gone.
+   *
+   * An edit that did NOT land puts the coupled row back on the cadence the question is asked about,
+   * so the question applies again — and it may never have been asked at all: an arm landing while
+   * the edit was open decides `ask()` against the optimistic cron and stays silent, which without
+   * this would leave the picker armed and product-master weekly with nothing on screen until the
+   * picker is cycled. Re-opened from the live rows, so it stays silent unless the premise holds.
    */
-  function supersede(id: string) {
+  async function aroundSetCron(id: string, write: () => Promise<boolean>) {
     if (id === offer?.automationId) withdraw();
+    const stored = await write();
+    if (!stored && id === CADENCE_COUPLED_AUTOMATION) ask();
   }
 
   /**
@@ -239,5 +251,5 @@ export function useCadenceOffer({
     }
   }
 
-  return { offer, aroundToggle, supersede, accept, decline };
+  return { offer, aroundToggle, aroundSetCron, accept, decline };
 }

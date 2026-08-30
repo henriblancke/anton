@@ -32,7 +32,10 @@ interface WriteGuard {
 export interface AutomationSchedules {
   state: ScheduleState;
   toggle: (id: string, next: boolean) => Promise<void>;
-  /** A cadence set by hand — it also supersedes a pending offer for that row (anton-3xa9). */
+  /**
+   * A cadence set by hand — it also supersedes a pending offer for that row, and re-opens the
+   * question if the write does not land (anton-3xa9).
+   */
   setCron: (id: string, cron: string) => Promise<void>;
   /** The pending cadence offer, and the two ways it is answered (anton-3xa9). */
   cadenceOffer: CadenceOffer | null;
@@ -149,10 +152,7 @@ export function useAutomationSchedules({
       cadence.aroundToggle(id, next, () =>
         patchSchedule(id, { enabled: next }, `${id} ${next ? "enabled" : "disabled"}`),
       ),
-    setCron: async (id, cron) => {
-      cadence.supersede(id);
-      await setCron(id, cron);
-    },
+    setCron: (id, cron) => cadence.aroundSetCron(id, () => setCron(id, cron)),
     cadenceOffer: cadence.offer,
     acceptCadenceOffer: cadence.accept,
     declineCadenceOffer: cadence.decline,
