@@ -16,9 +16,10 @@
  * The other half is ORDER: the replacement is armed before the wait it supersedes is retired, so no
  * failure and no kill can leave the target carrying no human gate on an ask nobody answered.
  *
- * The last section is the SETTLE that follows a successful arm — the one place left where the gate
- * and the run row can still tell different stories: the row write can fail outright, and a kill can
- * land inside it after every check in the arm has passed.
+ * The last sections are the SETTLE that follows a successful arm and the CLEANUP that follows the
+ * settle — the two places left where the gate and the run row can still tell different stories: the
+ * row write can fail outright, a kill can land inside it after every check in the arm has passed,
+ * and a kill can land later still, in the uninterruptible lease-clear/sync the run ends with.
  *
  * Mocked at the bd seam, because the states under test are bd calls that fail: the end-to-end shapes
  * of the arm live in execute-epic.needs-human.integration.test.ts against real bd.
@@ -55,6 +56,7 @@ const {
   armHumanGate,
   HUMAN_GATE_ARMED_LABEL,
   NeedsHumanError,
+  reconcileCancelledArmedPark,
   settleArmedAsk,
   StrandedHumanGateError,
 } = await import("./execute-epic");
@@ -457,7 +459,7 @@ const recorder = (failure?: string) => {
 
 it("parks the run behind the gate and throws the ask while the run is still live", async () => {
   const row = recorder();
-  const thrown = await settleArmedAsk({
+  const { thrown, parked } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -474,6 +476,10 @@ it("parks the run behind the gate and throws the ask while the run is still live
   // session reads — otherwise the same question is asked again on resume, forever.
   expect(row.patches[0].error).toContain("note on t-1");
   expect(thrown).toBeInstanceOf(NeedsHumanError);
+  // The park LANDED, so the caller still owns this arm through its cleanup: a kill arriving in the
+  // awaits that follow has to take it back, and only this verdict tells the caller there is
+  // something left to take back.
+  expect(parked).toBe(true);
 });
 
 it("takes the arm back when the kill lands INSIDE the park write, and fails the row", async () => {
@@ -491,7 +497,7 @@ it("takes the arm back when the kill lands INSIDE the park write, and fails the 
   };
   let undone = false;
 
-  const thrown = await settleArmedAsk({
+  const { thrown, parked } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -514,6 +520,9 @@ it("takes the arm back when the kill lands INSIDE the park write, and fails the 
   // Nothing on the board carries the ask any more, and the error says exactly that.
   expect(String(row.patches[1].error)).toContain("armed NO gate");
   expect((thrown as Error).message).toContain("armed NO gate");
+  // Already unwound here — the caller must NOT unwind it a second time in its cleanup, where
+  // `undo` would resolve a gate that is already gone and report the ask as stranded.
+  expect(parked).toBe(false);
 });
 
 it("names the gate that STANDS when the kill lands mid-write and undoing is unsafe", async () => {
@@ -530,7 +539,7 @@ it("names the gate that STANDS when the kill lands mid-write and undoing is unsa
     },
   };
 
-  const thrown = await settleArmedAsk({
+  const { thrown } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -557,7 +566,7 @@ it("names the gate that stands when the undo itself fails after the kill", async
     },
   };
 
-  const thrown = await settleArmedAsk({
+  const { thrown } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -578,7 +587,7 @@ it("keeps the gate and parks the JOB loudly when the row cannot be settled at al
   const row = recorder("SQLITE_BUSY: database is locked");
   let undone = false;
 
-  const thrown = await settleArmedAsk({
+  const { thrown, parked } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -596,6 +605,9 @@ it("keeps the gate and parks the JOB loudly when the row cannot be settled at al
   });
 
   expect(undone).toBe(false);
+  // Not the caller's to take back in its cleanup either: the row never recorded the park, so undoing
+  // the gate later would leave NOTHING carrying the ask.
+  expect(parked).toBe(false);
   expect((thrown as Error).name).toBe("PoisonError");
   expect((thrown as Error).message).toContain(ASK);
   expect((thrown as Error).message).toContain("bd gate resolve g-new");
@@ -620,7 +632,7 @@ it("keeps the UNDONE verdict when the corrective write fails after a mid-park ki
   };
   let undone = false;
 
-  const thrown = await settleArmedAsk({
+  const { thrown } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -661,7 +673,7 @@ it("keeps the STRANDED verdict when the corrective write fails after a mid-park 
     },
   };
 
-  const thrown = await settleArmedAsk({
+  const { thrown } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -696,7 +708,7 @@ it("unwinds the cancellation even when the park write ITSELF failed", async () =
   };
   let undone = false;
 
-  const thrown = await settleArmedAsk({
+  const { thrown } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -739,7 +751,7 @@ it("carries BOTH write failures when the corrective write fails after a failed p
     },
   };
 
-  const thrown = await settleArmedAsk({
+  const { thrown } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -754,4 +766,109 @@ it("carries BOTH write failures when the corrective write fails after a failed p
   expect((thrown as Error).message).toContain("bd gate resolve g-new");
   expect((thrown as Error).message).toContain("the park write");
   expect((thrown as Error).message).toContain("the corrective write");
+});
+
+// ── the kill that lands in the CLEANUP, after the park landed (PR #205 review) ──
+
+it("leaves a standing park alone while the run has not been cancelled", async () => {
+  // The ordinary end of a needs-human run: the cleanup ran, nothing killed it, and the park behind
+  // the live gate IS the verdict. Reconciling here would tear down a wait a person is expected to
+  // answer — so it must write nothing at all.
+  const row = recorder();
+
+  const reconciled = await reconcileCancelledArmedPark({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [], undo: async () => true },
+    signal: new AbortController().signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(reconciled).toBeUndefined();
+  expect(row.patches).toEqual([]);
+});
+
+it("takes the arm back when the kill lands in the cleanup AFTER the park was recorded", async () => {
+  // The window every check inside the arm and the settle still misses: releasing the lease and
+  // syncing the board are uninterruptible awaits that run after the last signal read, and a board
+  // sync is seconds of network. Without this the stopped run leaves its gate blocking a target no
+  // resume is coming for, and a row that reads as patiently parked.
+  const controller = new AbortController();
+  controller.abort();
+  const row = recorder();
+  let undone = false;
+
+  const reconciled = await reconcileCancelledArmedPark({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: {
+      gateId: "g-new",
+      held: [],
+      undo: async () => {
+        undone = true;
+        return true;
+      },
+    },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(undone).toBe(true);
+  expect(row.patches).toEqual([
+    { status: "failed", error: expect.stringContaining("armed NO gate"), endedAt: 42 },
+  ]);
+  // Nothing on the board carries the ask any more, so nothing sends the operator to a resolve.
+  expect((reconciled?.thrown as Error).message).toContain("armed NO gate");
+  expect((reconciled?.thrown as Error).message).not.toContain("bd gate resolve g-new");
+});
+
+it("names the gate that STANDS when undoing after the cleanup kill is unsafe", async () => {
+  // No `undo` — the arm superseded an older wait behind this gate, so resolving it would leave the
+  // target with none at all. The id has to reach the operator; nothing else on the board names it.
+  const controller = new AbortController();
+  controller.abort();
+  const row = recorder();
+
+  const reconciled = await reconcileCancelledArmedPark({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [] },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(row.patches.map((p) => p.status)).toEqual(["failed"]);
+  expect(String(row.patches[0].error)).toContain("bd gate resolve g-new");
+  expect((reconciled?.thrown as Error).name).toBe("PoisonError"); // no retry can answer an ask
+  expect((reconciled?.thrown as Error).message).toContain("re-run the target");
+});
+
+it("keeps the cancelled verdict when the corrective write fails after the cleanup kill", async () => {
+  // The row may still read as parked, so the error is the only accurate account of the board: the
+  // gate is gone, and sending the operator to resolve it would leave them waiting on an id that no
+  // longer exists.
+  const controller = new AbortController();
+  controller.abort();
+  const row = recorder("SQLITE_BUSY: database is locked");
+
+  const reconciled = await reconcileCancelledArmedPark({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [], undo: async () => true },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect((reconciled?.thrown as Error).name).toBe("PoisonError");
+  expect((reconciled?.thrown as Error).message).toContain("armed NO gate");
+  expect((reconciled?.thrown as Error).message).toContain("database is locked");
+  expect((reconciled?.thrown as Error).message).not.toContain("bd gate resolve g-new");
 });

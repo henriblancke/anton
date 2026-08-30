@@ -427,6 +427,25 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // the try took — and only that — so the set has to outlive the block that took it. Null until the
     // claim gate runs, so every gate that parks before it releases nothing.
     let childCascade: { actor: string; ids: string[] } | null = null;
+    // A needs-human park that LANDED: the gate is live on the board and the row records the wait.
+    // Declared out here because the `finally`'s cleanup is the last window a force-kill can land in
+    // (anton-287p), and reconciling that window means taking THIS arm back — see
+    // reconcileCancelledArmedPark.
+    let armedPark: { gate: ArmedHumanGate; ask: NeedsHumanError; raw: unknown } | undefined;
+    // The error this attempt throws, thrown AFTER the `finally` rather than from inside the catch,
+    // so the cleanup's own kill window can still rewrite it. Undefined = nothing to throw.
+    let settled: { thrown: unknown } | undefined;
+    // Write the run row, ANSWERING with the failure instead of throwing (anton-287p): the settle
+    // paths behind a live gate must report a rejected write in the run's error rather than let it
+    // swallow the ask they exist to deliver.
+    const reportSettle = async (patch: RunPatch): Promise<string | undefined> => {
+      try {
+        await updateRun(db, clock, runId, patch);
+        return undefined;
+      } catch (failure) {
+        return failure instanceof Error ? failure.message : String(failure);
+      }
+    };
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -1718,22 +1737,19 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // and settling it is the last thing that can go wrong (anton-287p). Written through a
           // reporter, never a raw throw: a rejected write must not swallow the ask this branch
           // exists to deliver.
-          thrown = await settleArmedAsk({
+          const settlement = await settleArmedAsk({
             targetId: epicBeadId,
             ask: e,
             raw,
             gate,
             signal: ctx.signal,
             now: () => clock.now(),
-            settle: async (patch) => {
-              try {
-                await updateRun(db, clock, runId, patch);
-                return undefined;
-              } catch (failure) {
-                return failure instanceof Error ? failure.message : String(failure);
-              }
-            },
+            settle: reportSettle,
           });
+          thrown = settlement.thrown;
+          // A park that landed is not finished with: the cleanup below still has to run, and a kill
+          // inside it leaves this same gate blocking a target nothing returns to (anton-287p).
+          if (settlement.parked) armedPark = { gate, ask: e, raw };
         } else {
           await updateRun(db, clock, runId, {
             status: "failed",
@@ -1758,7 +1774,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           endedAt: clock.now(),
         });
       }
-      throw thrown; // let the runner apply job-level durability
+      settled = { thrown }; // thrown past the cleanup below; the runner applies job-level durability
     } finally {
       // Stop refreshing and drop the run-liveness lease now that this attempt has stopped executing
       // (anton-jz1). Clearing on EVERY settle path — done, parked, failed — is what lets a Force run
@@ -1779,7 +1795,35 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       await beads
         .sync(repo)
         .catch((e) => console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e));
+
+      // Everything above is an uninterruptible await and the sync is seconds of network, so this is
+      // the last — and widest — window a force-kill can land in (anton-287p). By then the ask is
+      // already recorded as a park behind a live gate and nothing else re-reads the signal: without
+      // this the stopped run would leave its wait blocking a target no resume is coming for.
+      if (armedPark) {
+        const reconciled = await reconcileCancelledArmedPark({
+          targetId: epicBeadId,
+          ...armedPark,
+          signal: ctx.signal,
+          now: () => clock.now(),
+          settle: reportSettle,
+        });
+        if (reconciled) {
+          settled = reconciled;
+          // Taking the arm back is a LOCAL bd write and the sync that would have carried it has
+          // already run, so without this push the gate still reads as OPEN on every other machine —
+          // the very state the reconcile just cleared here.
+          await beads
+            .sync(repo)
+            .catch((e) =>
+              console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e),
+            );
+        }
+      }
     }
+    // Thrown here rather than from the catch so the cleanup — and the kill window inside it — runs
+    // first: `settled.thrown` is the attempt's final word on what happened.
+    if (settled) throw settled.thrown;
   };
 }
 
@@ -2682,6 +2726,10 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
  * The second write in the cancelled outcome can fail the same way, and then only the message
  * changes: the unwind's verdict on the gate already happened, so it is carried through
  * ({@link unsettledCancelledAskMessage}) instead of being restated as still armed.
+ *
+ * A kill can also land AFTER all of this, in the cleanup the caller still has to run — so the first
+ * outcome reports itself ({@link ArmedAskSettlement.parked}) and the caller reconciles that window
+ * through {@link reconcileCancelledArmedPark}.
  */
 export async function settleArmedAsk(args: {
   /** The run target the gate blocks. */
@@ -2696,8 +2744,8 @@ export async function settleArmedAsk(args: {
   now: () => number;
   /** Write the row, answering with the failure message when the write did not land. */
   settle: (patch: RunPatch) => Promise<string | undefined>;
-}): Promise<unknown> {
-  const { targetId, ask, raw, gate, signal, settle } = args;
+}): Promise<ArmedAskSettlement> {
+  const { targetId, ask, gate, signal, settle } = args;
   let thrown: unknown = ask;
   const parkFailure = await settle({
     status: "parked",
@@ -2714,33 +2762,18 @@ export async function settleArmedAsk(args: {
   // run created blocking a target nobody is coming back for.
   if (signal.aborted) {
     cancelled = true;
-    const undone = gate.undo ? await gate.undo() : false;
-    // Undone, nothing on the board carries the ask — which is exactly what the cancelled form of
-    // the error says. Standing, the gate blocks the target with no run coming back for it, so the
-    // row AND the runner's park have to name it: the ask's own message would promise a park this
-    // run is no longer taking.
-    thrown = undone
-      ? askSettleError(raw, signal)
-      : new PoisonEpic(
-          strandedAskMessage(
-            ask,
-            new StrandedHumanGateError(
-              targetId,
-              gate.gateId,
-              `the run was cancelled while its park was being recorded, so the wait armed ` +
-                `for the ask stands`,
-            ),
-          ),
-        );
-    const corrective = await settle({
-      status: "failed",
-      error: thrown instanceof Error ? thrown.message : String(thrown),
-      endedAt: args.now(),
+    const unwound = await unwindCancelledAsk({
+      ...args,
+      during: "while its park was being recorded",
     });
+    thrown = unwound.thrown;
     // The corrective write is the row's last word: when it lands the row is right and a failed park
     // write before it is spent history. When it does not, BOTH failures are still true of the row,
     // so both ride out in the error rather than only the one that happened last.
-    unsettled = corrective && parkFailure ? `${parkFailure}, then ${corrective}` : corrective;
+    unsettled =
+      unwound.unsettled && parkFailure
+        ? `${parkFailure}, then ${unwound.unsettled}`
+        : unwound.unsettled;
   }
   if (unsettled) {
     console.error(
@@ -2755,7 +2788,105 @@ export async function settleArmedAsk(args: {
         : unsettledAskMessage(ask, gate.gateId, unsettled),
     );
   }
-  return thrown;
+  // Only a park that actually LANDED is still the caller's to reconcile: a cancellation this call
+  // already unwound is settled, and a park write that failed leaves the gate standing on an ask no
+  // row records — taking it back later would leave nothing carrying it at all.
+  return { thrown, parked: !cancelled && !parkFailure };
+}
+
+/** What {@link settleArmedAsk} left behind — the run's error, and whether the park is live. */
+export interface ArmedAskSettlement {
+  /** The error the run throws: the ask itself behind a standing park, its cancelled form otherwise. */
+  thrown: unknown;
+  /**
+   * True only while the run really is recorded as parked behind the live gate — the one outcome a
+   * kill arriving LATER (in the handler's cleanup) still has to reconcile, via
+   * {@link reconcileCancelledArmedPark}.
+   */
+  parked: boolean;
+}
+
+/**
+ * Take a live armed ask back after a kill: undo the gate where {@link ArmedHumanGate.undo} says that
+ * is still safe, NAME it where it is not, and record the run FAILED with whichever it was.
+ *
+ * Shared by the two windows a force-kill can land in once the gate is live and the park is this
+ * run's verdict (anton-287p) — inside the park write itself, and inside the cleanup that runs after
+ * it. Both leave the same state, because to the operator they are the same event: the run was
+ * stopped, and nothing is coming back for the wait it armed.
+ */
+async function unwindCancelledAsk(args: {
+  targetId: string;
+  ask: NeedsHumanError;
+  raw: unknown;
+  gate: ArmedHumanGate;
+  signal: AbortSignal;
+  /** What the run was doing when the kill landed — names the window in the stranded-gate message. */
+  during: string;
+  now: () => number;
+  settle: (patch: RunPatch) => Promise<string | undefined>;
+}): Promise<{ thrown: unknown; unsettled: string | undefined }> {
+  const { targetId, ask, raw, gate, signal } = args;
+  const undone = gate.undo ? await gate.undo() : false;
+  // Undone, nothing on the board carries the ask — which is exactly what the cancelled form of the
+  // error says. Standing, the gate blocks the target with no run coming back for it, so the row AND
+  // the runner's park have to name it: the ask's own message would promise a park this run is no
+  // longer taking.
+  const thrown = undone
+    ? askSettleError(raw, signal)
+    : new PoisonEpic(
+        strandedAskMessage(
+          ask,
+          new StrandedHumanGateError(
+            targetId,
+            gate.gateId,
+            `the run was cancelled ${args.during}, so the wait armed for the ask stands`,
+          ),
+        ),
+      );
+  const unsettled = await args.settle({
+    status: "failed",
+    error: thrown instanceof Error ? thrown.message : String(thrown),
+    endedAt: args.now(),
+  });
+  return { thrown, unsettled };
+}
+
+/**
+ * The LAST window a kill can land in once the ask is parked (anton-287p): the run's own cleanup —
+ * awaiting the in-flight lease refresh, clearing the lease, syncing the board — runs AFTER
+ * {@link settleArmedAsk}'s final signal read, is uninterruptible, and a board sync is seconds of
+ * network. A force-kill arriving there would otherwise ride out as an ordinary park: the row parked,
+ * the gate blocking the target, and no run ever coming back for either — the exact state every check
+ * inside the arm exists to prevent, reached one await later.
+ *
+ * Answers `undefined` when there is nothing to reconcile (the run was not cancelled after all), and
+ * otherwise the error the run must throw INSTEAD of its ask — the same unwind, and the same row, as
+ * a kill that landed one await earlier.
+ */
+export async function reconcileCancelledArmedPark(args: {
+  targetId: string;
+  ask: NeedsHumanError;
+  raw: unknown;
+  gate: ArmedHumanGate;
+  /** The run's LIVE signal, re-read after the cleanup awaits — nothing checks it after this. */
+  signal: AbortSignal;
+  now: () => number;
+  settle: (patch: RunPatch) => Promise<string | undefined>;
+}): Promise<{ thrown: unknown } | undefined> {
+  if (!args.signal.aborted) return undefined;
+  const { thrown, unsettled } = await unwindCancelledAsk({
+    ...args,
+    during: "while it released its lease and synced the board, after its park was recorded",
+  });
+  if (!unsettled) return { thrown };
+  console.error(
+    `[execute-epic] ${args.targetId}: the run row could not be settled (${unsettled}) — the ` +
+      `cancelled unwind's verdict on human gate ${args.gate.gateId} stands`,
+  );
+  // The row may still read as parked, so the verdict above is carried through rather than restated:
+  // it is the only accurate account of what the board holds.
+  return { thrown: new PoisonEpic(unsettledCancelledAskMessage(thrown, unsettled)) };
 }
 
 /**
