@@ -140,6 +140,10 @@ export function useCadenceOffer({
   }
 
   async function aroundToggle(id: string, next: boolean, write: () => Promise<boolean>) {
+    // Either half of the coupling: the arm makes product-master's staleness cost something, and
+    // enabling product-master gives an already-armed picker priorities to rank off. Both halves
+    // decide the premise, so both have to reconsider the question when their write resolves.
+    const couples = id === AUTOPILOT_ARMING_AUTOMATION || id === CADENCE_COUPLED_AUTOMATION;
     // Disarming withdraws the QUESTION, never the answer: with the picker off, nothing executes what
     // product-master judges, so an unanswered offer has lost its reason to be on screen. Toggling the
     // offered automation itself withdraws it too — a cadence offer for a job the operator just turned
@@ -174,13 +178,16 @@ export function useCadenceOffer({
       // still off. The reverted row is what the server confirmed.
       if (restored) {
         armingIntent.current = rows.current[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true;
-        // With the picker confirmed off, a question opened while this arm was open — the OTHER half
-        // of the coupling writes a different row, so it can land and ask inside that window — is
-        // standing on an arm that never happened. Withdrawn rather than left on screen, and the
-        // generation bump stops an answer still in flight from putting it back (see
-        // {@link restorable}, which reads the coupled row and cannot see the picker).
-        if (!armingIntent.current) withdraw();
       }
+      // A rollback can also leave a question standing that the live rows no longer support: the
+      // OTHER half of the coupling writes a different row, so it can land and ask inside this
+      // write's window, and the offer was never on screen for this click to withdraw. Left there it
+      // would retime a job the server says is off, or run it daily under a picker that is off — so
+      // it is withdrawn, not merely re-asked, because {@link ask} deliberately leaves an existing
+      // offer alone when the premise is false. The generation bump stops an answer still in flight
+      // from putting it back (see {@link restorable}, which reads the coupled row alone and can see
+      // neither the picker nor a standing opt-out).
+      if (couples && !offerFor(rows.current, keepWeekly.current, armingIntent.current)) withdraw();
       if (withdrawn && restorable(withdrawn, at)) setOffer(withdrawn);
       // Nothing to put back, but the toggle can still have SUPPRESSED a question that was therefore
       // never asked at all: a disarm that raced an arm, or a product-master disable clicked while an
@@ -189,10 +196,8 @@ export function useCadenceOffer({
       // restore. Re-open from the live rows; `ask()` stays silent unless the premise still holds.
       else if ((restored && armingIntent.current) || id === CADENCE_COUPLED_AUTOMATION) ask();
     }
-    // The coupling is what opens an offer, and either side can be the half that completes it: the
-    // arm makes product-master's staleness cost something, and enabling product-master gives an
-    // already-armed picker priorities to rank off. Whichever lands second asks — otherwise the
-    // question waits for a reload, which is no answer to a premise that is true right now.
+    // Whichever half lands second asks — otherwise the question waits for a reload, which is no
+    // answer to a premise that is true right now.
     //
     // Only ever an offer, and only once the enable LANDED: the premise is that the picker is now
     // ranking off product-master's priorities, so a failed PATCH must not leave a question standing
@@ -200,9 +205,7 @@ export function useCadenceOffer({
     // cadence: an operator who accepted daily keeps daily until they say otherwise, and a schedule
     // that silently sprang back would make this table untrustworthy about the only thing it exists
     // to report.
-    const completesCoupling =
-      id === AUTOPILOT_ARMING_AUTOMATION || id === CADENCE_COUPLED_AUTOMATION;
-    if (stored && next && completesCoupling) ask();
+    if (stored && next && couples) ask();
   }
 
   /**

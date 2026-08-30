@@ -532,3 +532,81 @@ describe("a product-master toggle that does not land while an answer is in fligh
     expect(result.current.offer).toBeNull();
   });
 });
+
+/**
+ * The mirror of a failed arm: the COUPLED enable is the half that does not land. The arm can land
+ * inside that window and ask against the optimistically enabled row, so the question is standing on
+ * a job the server still has switched off — and the failure has no offer of its own to put back.
+ */
+describe("an arm and a coupled enable clicked together, the enable failing", () => {
+  it("withdraws the question the arm asked against the optimistic row", async () => {
+    const { result, rows } = render({
+      "board-picker": { enabled: false, cron: "*/10 * * * *" },
+      "product-master": { enabled: false, cron: WEEKLY },
+    });
+
+    let failEnable!: (ok: boolean) => void;
+    let enable!: Promise<void>;
+    act(() => {
+      enable = result.current.aroundToggle("product-master", true, () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return new Promise<boolean>((resolve) => {
+          failEnable = resolve;
+        });
+      });
+    });
+
+    // The picker writes its own row, so the arm can land while the enable is still open — and it
+    // asks, because product-master reads as enabled and weekly.
+    await act(() =>
+      result.current.aroundToggle("board-picker", true, async () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: true, cron: "*/10 * * * *" } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).not.toBeNull();
+
+    await act(async () => {
+      rows.current = { ...rows.current, "product-master": { enabled: false, cron: WEEKLY } };
+      failEnable(false);
+      await enable;
+    });
+
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("keeps the question when the enable's rollback still leaves the premise standing", async () => {
+    const { result, rows } = render({
+      "board-picker": { enabled: false, cron: "*/10 * * * *" },
+      "product-master": { enabled: true, cron: WEEKLY },
+    });
+
+    // A disable that never reaches the server: the row goes back to enabled-and-weekly under a
+    // picker the operator has since armed, which is the question, not a stale one.
+    let failDisable!: (ok: boolean) => void;
+    let disable!: Promise<void>;
+    act(() => {
+      disable = result.current.aroundToggle("product-master", false, () => {
+        rows.current = { ...rows.current, "product-master": { enabled: false, cron: WEEKLY } };
+        return new Promise<boolean>((resolve) => {
+          failDisable = resolve;
+        });
+      });
+    });
+
+    await act(() =>
+      result.current.aroundToggle("board-picker", true, async () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: true, cron: "*/10 * * * *" } };
+        return true;
+      }),
+    );
+
+    await act(async () => {
+      rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+      failDisable(false);
+      await disable;
+    });
+
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+});
