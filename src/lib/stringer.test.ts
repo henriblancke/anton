@@ -1976,6 +1976,43 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("5 import");
     });
 
+    // Python starts a comment at any unquoted `#`, spaced or not — `)#{ unmatched brace`. Demanding
+    // a gap leaves the `{` inside the prose to cancel the paren that ends the import, so the state
+    // never closes and every executable window below it is dropped as a specifier list.
+    it("cuts a hash note that follows code with no space in a language that needs none", async () => {
+      const repo = writeRepo({
+        "src/tight.py": [
+          "from package.module import (",
+          "    parse_bd_version,",
+          ")#{ unmatched brace",
+          "total = compute(rows)",
+          "report(total)",
+          "flush(report)",
+          "",
+        ].join("\n"),
+        "src/grouped.py": [
+          "from package.module import (",
+          "    parse_bd_version,",
+          "    preflight_bd,",
+          "    resolve_bd_bin,",
+          ")",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/tight.py", 4]], 3),
+        clone([["src/grouped.py", 1]], 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the real specifier list beside it is still dropped, so the survivor is the
+      // note being cut rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/tight.py" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/grouped.py" }]);
+      expect(result.duplication.dropped[0].reason).toContain("5 import");
+    });
+
     // A block comment can open AFTER code — `value: string, /* why`. Left unread, the prose below it
     // counts as syntax: its unmatched `(` holds the parameter list open past the real `)` and files
     // every call in the body as more parameter list.
@@ -2174,6 +2211,32 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toMatchObject([{ FilePath: "src/length.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // A comparison leads an expression too — `value < /[/*]/.source` compares against a regex's
+    // source. Read as a comparison all the way through, the `/*` inside the character class opens a
+    // comment that runs to the end of the file and every real duplication window below it is
+    // dropped unread.
+    it("reads a slash after a comparison operator as a regex, not as a closing tag", async () => {
+      const repo = writeRepo({
+        "src/gate.ts": [
+          "export const gated = value < /[/*]/.source;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/gate.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/gate.ts", Line: 3 }]);
       expect(result.duplication).toEqual({ dropped: [] });
     });
 

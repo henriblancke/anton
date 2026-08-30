@@ -36,6 +36,14 @@ const FILE_BUDGET = 500;
 const HASH_COMMENT_EXTENSIONS = [".py", ".sh", ".bash", ".zsh", ".rb", ".yaml", ".yml", ".toml"];
 
 /**
+ * The subset where a `#` opens a comment only AFTER whitespace. Shell reads `${#items[@]}` and `$#`
+ * as expansions, and YAML reads the `#` in `key: a#b` as part of the scalar, so cutting at a bare
+ * marker there would drop real syntax. Python, Ruby and TOML have no such rule — `)#{ note` is
+ * comment from the `#` on — and demanding a gap leaves that `{` to be counted as a delimiter.
+ */
+const SPACED_HASH_EXTENSIONS = [".sh", ".bash", ".zsh", ".yaml", ".yml"];
+
+/**
  * Where `"""` / `'''` opens a string that spans lines. Python only: in a shell or YAML file the same
  * three characters are an empty string beside a quote, and reading them as an opener would swallow
  * the rest of the file.
@@ -201,11 +209,20 @@ const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|
  * recognized ahead of this rule everywhere it is read, so a comment's own slashes never reach it.
  *
  * `++`/`--` are excluded, since `i++ / 2` divides: the trailing `+` there is a postfix operator that
- * DOES yield a value. `<` and `>` are excluded for the opposite reason — a comparison against a
- * regex literal does not occur, while `</div>` and `/>` do on every JSX line, and reading a closing
- * tag as a regex opener would blank the brackets between two tags on one line.
+ * DOES yield a value. `<` and `>` are held apart in `COMPARISON_OPERATORS`, since they lead an
+ * expression only across whitespace.
  */
 const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^/]|(?<!\+)\+|(?<!-)-`;
+
+/**
+ * The comparison operators, which expect an expression next exactly as the binary operators above do
+ * — `value < /[/*]/.source` compares against a regex's source — but only ACROSS WHITESPACE. Written
+ * tight the same characters are JSX punctuation: `</div>` closes a tag and `<div></div>` carries a
+ * `>/` pair, and reading either as a regex opener would blank the brackets between two tags on one
+ * line. A tag never puts a gap between its `<` and its `/`; a comparison against a regex literal
+ * always does, so the gap is what tells the two apart.
+ */
+const COMPARISON_OPERATORS = String.raw`[<>]=?`;
 
 /**
  * A regex literal, and only where a `/` can BEGIN one: at the start of a line, or after an opener,
@@ -219,12 +236,15 @@ const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^/]|(?<!\+)\+|(?<!-)-`;
  * parameter list — turning a genuine clone of runtime work into a declaration and dropping it.
  */
 const REGEX_LITERAL = new RegExp(
-  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS})(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
+  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS}|${COMPARISON_OPERATORS}(?=\s))(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
   "g",
 );
 
 /** The same prefixes, anchored to the END of the text before a `/` — the one rule, read backwards. */
 const REGEX_PREFIX = new RegExp(String.raw`(?:${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS})$`);
+
+/** Its comparison half, read the same way; the gap the rule turns on is checked by the caller. */
+const COMPARISON_PREFIX = new RegExp(String.raw`(?:${COMPARISON_OPERATORS})$`);
 
 /**
  * Strip what would confuse brace counting: comments, string bodies and regex literals. Block
@@ -263,8 +283,14 @@ function afterQuoted(line: string, start: number): number {
  * instead of matching it whole.
  */
 function opensRegex(line: string, start: number): boolean {
-  const before = line.slice(0, start).trimEnd();
-  return before === "" || REGEX_PREFIX.test(before);
+  const raw = line.slice(0, start);
+  const before = raw.trimEnd();
+  if (before === "") return true;
+  // A comparison counts only when it stands off from the slash: the trimmed text is what the prefix
+  // is read against, so whether anything WAS trimmed is the whole distinction between `value < /re/`
+  // and a closing tag.
+  if (raw.length > before.length && COMPARISON_PREFIX.test(before)) return true;
+  return REGEX_PREFIX.test(before);
 }
 
 /**
@@ -573,17 +599,19 @@ function afterBlockComment(line: string): string | undefined {
  * the delta counters as syntax: one unmatched delimiter inside the prose holds a parenthesized
  * import open over every executable line below it, and each is dropped as a specifier.
  *
- * Only a `#` that starts a word counts, so shell's `${#items[@]}` and `$#` keep their delimiters;
- * quoted strings are stepped over, so a `#` inside one opens nothing.
+ * Under `spaced` only a `#` that starts a word counts, so shell's `${#items[@]}` and `$#` keep their
+ * delimiters; elsewhere any unquoted `#` cuts, as Python and TOML read it. Quoted strings are
+ * stepped over either way, so a `#` inside one opens nothing.
  */
-function withoutHashComment(line: string): string {
+function withoutHashComment(line: string, spaced: boolean): string {
   for (let i = 0; i < line.length; i += 1) {
     const char = line[i];
     if (char === "'" || char === '"') {
       i = afterQuoted(line, i) - 1;
       continue;
     }
-    if (char === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i).trimEnd();
+    if (char !== "#") continue;
+    if (!spaced || i === 0 || /\s/.test(line[i - 1])) return line.slice(0, i).trimEnd();
   }
   return line;
 }
@@ -637,7 +665,7 @@ function unclosedBlockComment(line: string): number {
  */
 function classifyLines(
   source: string,
-  opts: { hashComments: boolean; tripleQuotes: boolean },
+  opts: { hashComments: boolean; spacedHash: boolean; tripleQuotes: boolean },
 ): LineClass[] {
   const classes: LineClass[] = [];
   let inComment = false;
@@ -774,7 +802,7 @@ function classifyLines(
     // The same for a `#` note, which trails code as readily as it leads a line — `)  # keep {
     // documented`. Cut here, before any delta is counted, so the prose after the marker cannot hold
     // a wrapped import open over the executable lines below it.
-    if (opts.hashComments) line = withoutHashComment(line);
+    if (opts.hashComments) line = withoutHashComment(line, opts.spacedHash);
 
     if (statement) {
       if (statement === "signature") {
@@ -972,6 +1000,7 @@ function sourceIndex(repoPath: string) {
       status: "read",
       lines: classifyLines(source, {
         hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        spacedHash: SPACED_HASH_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
