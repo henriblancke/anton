@@ -107,6 +107,18 @@ export async function getRunDetail(
 
 // ── Write path (anton-dzh.5): db-injectable so the runner/tests share one connection ──
 
+/**
+ * The next value of the `runs.write_seq` counter, taken inside the statement that writes the row —
+ * SQLite serializes writers, so MAX+1 is atomic there and needs no separate sequence table.
+ *
+ * Stamped by EVERY write path below, without exception: the column is only settlement order
+ * (see its note in schema.ts) because a settled run's last write is its settlement, and a write
+ * that skipped the stamp would leave that run ordered by the second-granular proxy instead.
+ */
+function nextWriteSeq() {
+  return sql`(SELECT IFNULL(MAX(w.write_seq), 0) + 1 FROM runs w)`;
+}
+
 export interface CreateRunInput {
   id: string;
   projectId: string;
@@ -137,6 +149,7 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     status: input.status ?? "running",
     startedAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
+    writeSeq: nextWriteSeq(),
   });
   return input.id;
 }
@@ -167,7 +180,10 @@ export async function updateRun(
   id: string,
   patch: RunPatch,
 ): Promise<void> {
-  const set: Record<string, unknown> = { updatedAt: secDate(clock.now()) };
+  const set: Record<string, unknown> = {
+    updatedAt: secDate(clock.now()),
+    writeSeq: nextWriteSeq(),
+  };
   for (const [k, v] of Object.entries(patch)) {
     if (k === "endedAt" && typeof v === "number") set.endedAt = secDate(v);
     else set[k] = v;
@@ -198,6 +214,7 @@ export async function settleParkedRun(
       error: reason,
       endedAt: secDate(nowMs),
       updatedAt: secDate(nowMs),
+      writeSeq: nextWriteSeq(),
     })
     .where(
       and(
@@ -272,11 +289,15 @@ export async function listRecentRuns(
  * delivered run placed before rather than after two same-second failures resets a streak instead of
  * latching it, and at the boundary the `limit` itself would take different rows on different reads.
  *
- * Nothing persisted records settlement order below the second, so the tie-break is the closest
- * proxy the rows do carry — attempt order: the run that STARTED later is the later attempt (the same
- * rule the failure breaker's cancel-matching uses), and `rowid`, SQLite's own insertion counter,
- * finishes the job for attempts that also started in the same second. The result is deterministic,
- * which is the property the readers actually need.
+ * `writeSeq` breaks it, and breaks it CORRECTLY: it is a global counter stamped on every write to a
+ * run row, so a settled run's stamp is the instant it settled, ordered against every other run's at
+ * a granularity the second-wide timestamps cannot express. Start order would only be a proxy, and a
+ * proxy that inverts exactly where it is needed — a run started first can finish after one started
+ * later — so a later-started delivery would sort newest and reset a streak that the failure it
+ * actually settled before should have kept.
+ *
+ * `startedAt` and `rowid` remain behind it for the rows written before the column existed, whose
+ * `writeSeq` is null: deterministic, which is the weaker property those rows can still have.
  */
 function recentRunRows(
   db: AntonDb,
@@ -287,7 +308,12 @@ function recentRunRows(
     .select()
     .from(schema.runs)
     .where(eq(schema.runs.projectId, projectId))
-    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.startedAt), sql`rowid desc`)
+    .orderBy(
+      desc(schema.runs.updatedAt),
+      desc(schema.runs.writeSeq),
+      desc(schema.runs.startedAt),
+      sql`rowid desc`,
+    )
     .limit(limit);
 }
 
@@ -366,8 +392,10 @@ export async function findRunFormulaForBranch(
         isNotNull(schema.runs.formula),
       ),
     )
-    // `updatedAt` is second-granular, so two attempts inside one second can tie; `startedAt` breaks it.
-    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.startedAt))
+    // `updatedAt` is second-granular, so two attempts inside one second can tie; `writeSeq` — the
+    // per-write counter — breaks it by which attempt actually settled last, with `startedAt` behind
+    // it for rows written before that column existed.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
     .limit(1);
   const row = rows[0];
   if (!row?.formula) return undefined;

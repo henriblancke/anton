@@ -57,7 +57,20 @@ export const runs = sqliteTable("runs", {
   startedAt: ts("started_at"),
   endedAt: ts("ended_at"),
   updatedAt: ts("updated_at").notNull().default(now),
-});
+  // A global counter stamped on every write to this row (anton-rgso), so the rows carry the one
+  // thing no timestamp here can: SETTLEMENT ORDER. Every `ts` column is whole-second, and with
+  // per-project concurrency two runs settling in the same second is ordinary — but the autopilot
+  // breakers read the run list as a sequence, where a delivery placed before rather than after a
+  // failure resets a streak instead of latching it. Start order is only a proxy for settlement
+  // order and inverts precisely when the runs overlap; a run's LAST write is its settlement, so
+  // descending `writeSeq` is settlement order by construction. Null on rows written before this
+  // column existed, which fall back to that proxy.
+  writeSeq: integer("write_seq"),
+}, (table) => [
+  // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
+  // write an index lookup instead of a table scan.
+  index("runs_write_seq_idx").on(table.writeSeq),
+]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
 export const jobs = sqliteTable(

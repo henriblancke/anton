@@ -11,7 +11,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
-import { findRunFormulaForBranch, listRecentRunOutcomes } from "./runs";
+import { createRun, findRunFormulaForBranch, listRecentRunOutcomes, updateRun } from "./runs";
+import type { Clock } from "./jobs/queue";
 
 let t: TestDb;
 const PROJECT = "p1";
@@ -140,6 +141,22 @@ describe("listRecentRunOutcomes", () => {
     const runs = await listRecentRunOutcomes(t.db, PROJECT, 10);
 
     expect(runs.map((r) => r.id)).toEqual(["later", "earlier"]);
+  });
+
+  it("orders same-second settlements by which run SETTLED last, not which started last", async () => {
+    // Start order is only a proxy, and it inverts exactly where it matters: two runs overlap, the
+    // one that started first settles second. Read by start order the later-started delivery sorts
+    // newest and resets the streak that the failure settling after it should have kept.
+    const clock: Clock = { now: () => SETTLED };
+    await createRun(t.db, clock, { id: "started-first", projectId: PROJECT, epicBeadId: EPIC });
+    await createRun(t.db, clock, { id: "started-second", projectId: PROJECT, epicBeadId: EPIC });
+    await updateRun(t.db, clock, "started-second", { status: "done", endedAt: SETTLED });
+    await updateRun(t.db, clock, "started-first", { status: "failed", endedAt: SETTLED });
+
+    expect((await listRecentRunOutcomes(t.db, PROJECT, 10)).map((r) => r.id)).toEqual([
+      "started-first",
+      "started-second",
+    ]);
   });
 
   it("is still total when the attempts also started in the same second", async () => {

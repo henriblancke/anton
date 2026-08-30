@@ -70,10 +70,13 @@ const CANCEL_MATCH_SLACK_MS = 60_000;
  * cancel of some OTHER job of the same epic (a queued attempt stopped before it ever ran) counts as
  * nothing here. Exact in both directions, which the window below can only approximate.
  *
- * `nextAttemptStartMs` bounds the legacy window: it is when the SAME epic's next attempt started.
- * Without it a retry that begins inside the slack — an epic requeued seconds after the last one
- * settled — shares that instant with the attempt before it, so one cancel of the retry would also
- * silence the earlier genuine failure and shorten the streak the breaker fires on.
+ * `nextAttemptStartMs` — when the SAME epic's next attempt started — bounds BOTH joins, because a
+ * job id is not one attempt. The runner's automatic retry reuses the job row and gives the retry a
+ * fresh run (see `findRunFormulaForBranch`), so one job id can span several run rows; cancelling
+ * the retry would otherwise mark every earlier attempt of that job cancelled too and dissolve
+ * genuine failures out of the streak. A cancel raised after the next attempt was already running
+ * belongs to that attempt, not to this one. The legacy window needs the same bound for its own
+ * reason: a retry beginning inside the slack shares that instant with the attempt before it.
  */
 function wasCancelled(
   run: RunDetail,
@@ -81,11 +84,13 @@ function wasCancelled(
   nextAttemptStartMs: number | undefined,
 ): boolean {
   if (!cancels?.length) return false;
-  if (run.jobId !== undefined) return cancels.some((cancel) => cancel.id === run.jobId);
-  const from = (run.startedAt ?? run.updatedAt) * 1000;
-  const until = (run.endedAt ?? run.updatedAt) * 1000 + CANCEL_MATCH_SLACK_MS;
   const beforeNextAttempt = (at: number) =>
     nextAttemptStartMs === undefined || at < nextAttemptStartMs;
+  if (run.jobId !== undefined) {
+    return cancels.some((cancel) => cancel.id === run.jobId && beforeNextAttempt(cancel.at));
+  }
+  const from = (run.startedAt ?? run.updatedAt) * 1000;
+  const until = (run.endedAt ?? run.updatedAt) * 1000 + CANCEL_MATCH_SLACK_MS;
   return cancels.some(({ at }) => at >= from && at <= until && beforeNextAttempt(at));
 }
 
