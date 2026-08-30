@@ -530,16 +530,30 @@ const ASTRO_FENCE = /^---\s*$/;
 /** A `<script>` or `</script>` tag, with whatever attributes it carries (`<script lang="ts">`). */
 const SCRIPT_TAG = /<(\/?)script\b[^>]*?(\/?)>/gi;
 
-/** Inside an attribute value opened on this line — `onclick="neverCalled()"`, `@click='go'`. */
-const ATTR_VALUE = /=\s*["'][^"']*$/;
+/**
+ * The framework directive prefixes that introduce a binding: Svelte's `use:enhance`, Vue's
+ * `v-on:click`. Only the known prefixes count — accepting any `word:` would read `the helper:
+ * neverCalled ran nightly` as a call.
+ */
+const DIRECTIVE = String.raw`(?:use|on|bind|transition|in|out|animate|class|style|slot|v-[\w-]+)`;
 
 /**
- * A framework directive taking a bare binding rather than a braced one: Svelte's `use:enhance` and
- * Vue's `v-on:click` name a real caller with no other code around them. Only the known prefixes
- * count — accepting any `word:` would read `the helper: neverCalled ran nightly` as a call.
+ * A directive taking a bare binding rather than a braced one: `<form use:enhance>` and
+ * `<b v-on:click=go>` name a real caller with no other code around them.
  */
-const DIRECTIVE_HEAD =
-  /(?:^|[\s"'])(?:use|on|bind|transition|in|out|animate|class|style|slot|v-[\w-]+):\s*$/;
+const DIRECTIVE_HEAD = new RegExp(String.raw`(?:^|[\s"'])${DIRECTIVE}:\s*$`);
+
+/**
+ * Inside the value of an attribute that carries code, opened on this line — `onclick="go()"`,
+ * `@click='go'`, `v-if="ready"`, `bind:value="widget"`, Angular's `[prop]="widget"`. An ordinary
+ * attribute holds content rather than a binding, so `<div title="Widget was removed">` names the
+ * symbol the way the text between the tags does: counting every attribute would let a committed
+ * page prove its own caller and delete a true finding.
+ */
+const ATTR_VALUE = new RegExp(
+  String.raw`(?:^|[\s"'])(?:on[a-z]+|v-[\w-]+|${DIRECTIVE}:[\w.-]*|[@:#][\w.-]+|\([\w.-]+\)|\[[\w.-]+\])\s*=\s*["'][^"']*$`,
+  "i",
+);
 
 /**
  * Which lines of a markup file are program text rather than markup: the body of a `<script>`
@@ -577,9 +591,10 @@ function astroFrontmatterEnd(code: string[]): number {
 
 /**
  * Whether a markup line uses the symbol or merely renders it. Outside a script block the file is
- * a template, where only three shapes run: a tag name, an attribute value, and a braced expression
- * (`{count}` in Svelte and Astro, `{{ count }}` in Vue). Text between the tags is what the page
- * shows a reader, so a name there describes the symbol rather than calling it.
+ * a template, where only three shapes run: a tag name, the value of a code-carrying attribute, and
+ * a braced expression (`{count}` in Svelte and Astro, `{{ count }}` in Vue). Text between the tags
+ * — and inside a static attribute — is what the page shows a reader, so a name there describes the
+ * symbol rather than calling it.
  */
 function referencesMarkup(line: string | undefined, symbol: string, code = false): boolean {
   if (code) return referencesWord(line, symbol);

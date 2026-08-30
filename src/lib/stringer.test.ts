@@ -1540,6 +1540,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
     });
 
+    // A static attribute is content, not a binding: `title="Widget was removed"` shows the name to
+    // a reader exactly as the text between the tags does. Only an attribute that carries code —
+    // a handler, a directive, a dynamic bind — names a caller.
+    it("does not count a symbol inside a static attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html":
+          '<div title="Widget was removed" data-note=\'Widget was removed\'>gone</div>\n',
+        "src/ui/notes.vue": '<template>\n  <Panel title="Widget was removed" />\n</template>\n',
+        "public/app.html": '<button onclick="Widget()">go</button>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
     // The two shapes with no code punctuation around them at all: a Svelte directive binding
     // (`use:enhance`) and an Astro frontmatter import, which sits above the markup rather than in
     // a `<script>`. Both name the symbol as plainly as a call does.
