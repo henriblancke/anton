@@ -322,13 +322,15 @@ function AutomationTableRow({
  * SETTLED (lib/schedule-runs.ts). While a fire is running — minutes, for the long passes — the
  * outcome beside it is the PREVIOUS fire's, so pinning it to a two-minute-old timestamp reads as
  * "it just succeeded" (or just failed). The two are matched on ENQUEUE time, not settlement: an
- * outcome is this fire's only when the job behind it was enqueued by the same tick that stamped
- * `lastRunAt`. Settlement cannot decide it — an operator resuming a week-old parked fire settles it
- * today, after the fire now running was enqueued. Otherwise the fire is still in flight and says
- * so, and the older result is dated to when THAT fire ran — the same clock as the headline, so a
- * resumed week-old failure reads as a week old and not as something that just happened. A FIRST
- * fire has no older result to date, and still says it is in flight — otherwise the automation's
- * very first execution is indistinguishable from a bare timestamp with nothing behind it.
+ * outcome is this fire's only when the job behind it was enqueued by the tick that stamped
+ * `lastRunAt` — the scheduler writes the job and the stamp in one transaction from one instant, so
+ * a job newer than the stamp cannot exist and this comparison can only ever match the stamped fire.
+ * Settlement cannot decide it — an operator resuming a week-old parked fire settles it today, after
+ * the fire now running was enqueued. Otherwise the fire is still in flight and says so, and the
+ * older result is dated to when THAT fire ran — the same clock as the headline, so a resumed
+ * week-old failure reads as a week old and not as something that just happened. A FIRST fire has no
+ * older result to date, and still says it is in flight — otherwise the automation's very first
+ * execution is indistinguishable from a bare timestamp with nothing behind it.
  */
 function LastRunCell({ state, now }: { state: AutomationScheduleState; now: number }) {
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;

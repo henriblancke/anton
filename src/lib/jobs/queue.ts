@@ -69,21 +69,23 @@ function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
 
-export async function enqueue(
-  db: AntonDb,
-  clock: Clock,
-  input: {
-    type: JobType;
-    projectId?: string;
-    payload?: unknown;
-    /** ms epoch; default = now (immediately due). */
-    runAt?: number;
-  },
-): Promise<string> {
-  const id = randomUUID();
-  const nowMs = clock.now();
-  await db.insert(schema.jobs).values({
-    id,
+export interface EnqueueInput {
+  type: JobType;
+  projectId?: string;
+  payload?: unknown;
+  /** ms epoch; default = now (immediately due). */
+  runAt?: number;
+}
+
+/**
+ * The insert values for a fresh `queued` job, as a value — so a caller that must write the row
+ * inside its OWN synchronous transaction can, instead of restating the row shape. The scheduler does
+ * exactly that: it stamps `schedules.lastRunAt` from this row's `createdAt` in the same transaction,
+ * which is what lets the Automation table tell a fire's own outcome from an earlier one's.
+ */
+export function newJobRow(input: EnqueueInput, nowMs: number): typeof schema.jobs.$inferInsert {
+  return {
+    id: randomUUID(),
     type: input.type,
     projectId: input.projectId,
     payloadJson: JSON.stringify(input.payload ?? {}),
@@ -92,8 +94,13 @@ export async function enqueue(
     attempts: 0,
     createdAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
-  });
-  return id;
+  };
+}
+
+export async function enqueue(db: AntonDb, clock: Clock, input: EnqueueInput): Promise<string> {
+  const row = newJobRow(input, clock.now());
+  await db.insert(schema.jobs).values(row);
+  return row.id;
 }
 
 /** The active statuses that must hold at most one execute-epic job per (project, epic). */
@@ -977,7 +984,9 @@ function priorErrorSql(): SQL {
  * a JSON `true` to the integer 1 via `json_extract`, so an absent/`false` flag is `IS NOT 1`.
  *
  * The pacing note never destroys attempt evidence: any non-marker `lastError` already on the row is
- * appended to it via {@link BUDGET_DEFER_PRIOR_SEP} rather than overwritten.
+ * appended to it via {@link BUDGET_DEFER_PRIOR_SEP} rather than overwritten. Omitting `lastError`
+ * does NOT clear the column — it writes the same prior-attempt evidence back (an unmarked deferral),
+ * because erasing a refunded attempt's only trace is never what a caller that stays silent wants.
  */
 export async function deferQueuedJobs(
   db: AntonDb,
@@ -1003,7 +1012,7 @@ export async function deferQueuedJobs(
   const prior = priorErrorSql();
   const lastError = opts.lastError
     ? sql`${opts.lastError} || coalesce(${BUDGET_DEFER_PRIOR_SEP} || (${prior}), '')`
-    : prior;
+    : prior; // no marker supplied → strip any prior marker, keep the attempt evidence under it
   const rows = await db
     .update(schema.jobs)
     .set({ runAt: retryDate, lastError, updatedAt: secDate(nowMs) })

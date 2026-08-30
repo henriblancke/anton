@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { eq } from "drizzle-orm";
-import type { Clock } from "./queue";
+import { toMs, type Clock } from "./queue";
 import { Scheduler } from "./scheduler";
 import {
   backfillDefaultSchedules,
@@ -81,6 +81,25 @@ describe("Scheduler.tickOnce", () => {
     const next = row.nextRunAt as Date;
     expect(next.getDate()).toBe(12);
     expect(next.getHours()).toBe(3);
+  });
+
+  it("stamps lastRunAt from the enqueued job's own createdAt, in one write", async () => {
+    // The Automation table pairs a fire with its outcome by matching the job's enqueue time against
+    // this stamp, so the two must be written together and from one instant: a job newer than the
+    // stamp would show its verdict beside an earlier fire's date (anton-znoz review).
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "nightly-stringer",
+      cron: "0 3 * * *",
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(new Date(2026, 6, 11, 3, 0, 0, 0).getTime());
+    expect(await sched.tickOnce()).toBe(1);
+
+    const job = jobsFor(tdb, "p1")[0];
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect(toMs(row.lastRunAt)).toBe(toMs(job.createdAt));
   });
 
   it("does not double-enqueue on a second tick before the next slot", async () => {

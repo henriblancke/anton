@@ -26,10 +26,11 @@ export interface ScheduleLastRun {
   /** Epoch SECONDS — when the job settled, which is the fire's END, not its start. */
   at: number;
   /**
-   * Epoch SECONDS — when the scheduler ENQUEUED this fire. The schedule's own `lastRunAt` is
-   * stamped from the same tick, so this is what says whether this outcome belongs to the fire the
-   * row is showing or to an earlier one. Settlement time cannot answer that: a resumed fire settles
-   * after fires that came later than it.
+   * Epoch SECONDS — when the scheduler ENQUEUED this fire. The schedule's own `lastRunAt` is stamped
+   * from this very value, in the same transaction as the insert (jobs/scheduler.ts), so it says
+   * whether this outcome belongs to the fire the row is showing or to an earlier one: the stamped
+   * fire matches it exactly, every earlier fire is strictly older, and no fire can be newer than the
+   * stamp. Settlement time cannot answer that — a resumed fire settles after fires that came later.
    */
   enqueuedAt: number;
   /** One short line: what it did, or why it failed. */

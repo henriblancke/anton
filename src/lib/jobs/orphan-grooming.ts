@@ -147,10 +147,18 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
       .sync(repo)
       .catch((e) => console.error("[orphan-grooming] beads dolt sync failed", e));
 
+    // A pass that bucketed NOTHING because bd refused every link is a failed pass, not a quiet one:
+    // every loose ticket is still loose, and `changed: false` would file it as "nothing to do" —
+    // indistinguishable, on the Automation row, from a board that simply had no orphans. Thrown
+    // (not returned) so it retries and then parks for a human, and thrown only AFTER the note and
+    // sync above, so the evidence lands on the epic either way (anton-znoz review).
+    if (linked === 0 && failed.length > 0) {
+      throw new Error(`orphan-grooming: bd refused every link (${failed.join(", ")})`);
+    }
+
     // `linked`, not `orphans.length`: a ticket bd refused to link was not bucketed, and the row must
-    // not claim it was. The failures ride out in the note too — a pass where every link failed still
-    // left loose tickets actionable (and may have just created the epic), so reporting a bare
-    // "bucketed 0" would hide a partial pass behind a neutral no-op (anton-znoz review).
+    // not claim it was. The failures ride out in the note too, so a partly-failed pass reports the
+    // work it did without passing itself off as clean.
     const note = failed.length
       ? `bucketed ${linked} loose ticket(s); ${failed.length} failed to link`
       : `bucketed ${linked} loose ticket(s)`;

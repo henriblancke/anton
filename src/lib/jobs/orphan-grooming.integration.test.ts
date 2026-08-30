@@ -145,16 +145,39 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
   });
 
   it("reports links bd refused instead of passing them off as a clean pass", async () => {
-    // Every link failing leaves the loose tickets exactly as actionable as before, so a bare
-    // "bucketed 0" would read as a neutral nothing-to-do and hide the failure (anton-znoz review).
+    // A partly-failed pass DID bucket something, so it settles — but the note must carry what bd
+    // refused rather than reading as a clean sweep (anton-znoz review).
     createTicket(repo, "Loose ticket D");
-    const link = vi.spyOn(beads, "link").mockRejectedValue(new Error("bd: refused"));
+    const refused = createTicket(repo, "Loose ticket E");
+    const realLink = beads.link;
+    const link = vi
+      .spyOn(beads, "link")
+      .mockImplementation((cwd, a, b, type) =>
+        a === refused ? Promise.reject(new Error("bd: refused")) : realLink(cwd, a, b, type),
+      );
     try {
       const jobId = await runGrooming();
       const job = await getJob(tdb.db, jobId);
       expect(job?.status).toBe("done");
       expect(job?.outcomeNote).toContain("1 failed to link");
-      expect(job?.outcomeNote).toContain("bucketed 0");
+      expect(job?.outcomeNote).not.toContain("bucketed 0");
+    } finally {
+      link.mockRestore();
+    }
+  });
+
+  it("fails the pass when bd refuses EVERY link, instead of settling it as a no-op", async () => {
+    // Nothing got bucketed and every loose ticket is exactly as actionable as before: settling
+    // `done` with a "bucketed 0" note would file the pass as a neutral nothing-to-do, which on the
+    // Automation row is indistinguishable from a board with no orphans at all (anton-znoz review).
+    createTicket(repo, "Loose ticket F");
+    const link = vi.spyOn(beads, "link").mockRejectedValue(new Error("bd: refused"));
+    try {
+      const jobId = await runGrooming();
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).not.toBe("done"); // retries, then parks for a human — never settles clean
+      expect(job?.outcome).toBeFalsy(); // and is never recorded as `noop`
+      expect(job?.lastError).toContain("refused every link");
     } finally {
       link.mockRestore();
     }
