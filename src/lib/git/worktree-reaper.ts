@@ -22,6 +22,7 @@ import { lookupOpenPullRequest, type OpenPullRequestLookup } from "./ops";
 import {
   removeWorktree,
   withBranchLock,
+  worktreeClaimHolder,
   worktreePathFor,
   worktreesRootFor,
   type Worktree,
@@ -297,6 +298,19 @@ async function applyPlan(
   const base = { ...entry, worktreeRemoved: false, branchDeleted: false };
   if (!plan.removeWorktree && !plan.deleteBranch) {
     return { ...base, outcome: "kept", reason: `skipped ${entry.path ?? entry.branch}: ${plan.reason}` };
+  }
+
+  // A job can be USING this checkout without a run row behind it (review-fix), which is the one
+  // thing neither plan can see: both are made from run rows and the board. Read here — under the
+  // branch lock both destructive callers hold — so a claim taken concurrently either precedes this
+  // read or waits behind the removal.
+  const holder = worktreeClaimHolder(repoPath, entry.branch);
+  if (holder) {
+    return {
+      ...base,
+      outcome: "refused",
+      reason: `skipped ${entry.path ?? entry.branch}: ${holder} is using the checkout`,
+    };
   }
 
   // Residue can be a branch whose checkout is already gone; `removeWorktree` still prunes and

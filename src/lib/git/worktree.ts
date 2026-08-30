@@ -89,12 +89,16 @@ export function sanitizeBranch(branch: string): string {
  */
 const branchLocks = new Map<string, Promise<void>>();
 
+function branchKey(repoPath: string, branch: string): string {
+  return `${resolve(repoPath)}\u0000${branch}`;
+}
+
 export async function withBranchLock<T>(
   repoPath: string,
   branch: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const key = `${resolve(repoPath)}\u0000${branch}`;
+  const key = branchKey(repoPath, branch);
   const prior = branchLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const held = new Promise<void>((resolveHeld) => (release = resolveHeld));
@@ -108,6 +112,54 @@ export async function withBranchLock<T>(
     // Nobody queued behind us, so the key is dropped: the map tracks live contention, not history.
     if (branchLocks.get(key) === chain) branchLocks.delete(key);
   }
+}
+
+/**
+ * Who is actively USING a branch's checkout, keyed like the branch lock. The reaper proves a
+ * checkout is residue from run rows and the board, so a job that writes neither — review-fix
+ * re-materializes the PR branch and drives claude in it without a run row — is invisible to that
+ * proof: a stopped run's teardown reads "the bead is still open, release the worktree" and
+ * force-removes the directory the fix is being written in, discarding it and failing every command
+ * that follows. A claim is the missing evidence, and the only thing teardown and the sweep re-read
+ * for a checkout no run row names.
+ *
+ * In-process only, like {@link withBranchLock}: one job runner owns every job that touches these
+ * checkouts, and a second anton over the same repo is still held off by git's own worktree locks.
+ */
+const worktreeClaims = new Map<string, string[]>();
+
+/**
+ * Hold `branch`'s checkout for as long as `fn` runs. The claim is taken UNDER the branch lock, so it
+ * either lands before a removal starts or waits for that removal to finish — a claim can never be
+ * taken in the window a reaper has already decided to delete in. `fn` itself runs outside the lock:
+ * it drives a claude session for minutes, which no other run's teardown may be blocked on.
+ */
+export async function withWorktreeClaim<T>(
+  repoPath: string,
+  branch: string,
+  owner: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = branchKey(repoPath, branch);
+  await withBranchLock(repoPath, branch, async () => {
+    worktreeClaims.set(key, [...(worktreeClaims.get(key) ?? []), owner]);
+  });
+  try {
+    return await fn();
+  } finally {
+    const held = worktreeClaims.get(key) ?? [];
+    const rest = held.filter((_, i) => i !== held.indexOf(owner));
+    if (rest.length > 0) worktreeClaims.set(key, rest);
+    else worktreeClaims.delete(key);
+  }
+}
+
+/**
+ * The job holding this branch's checkout, or undefined when nothing is. Read under the branch lock
+ * by anything about to delete the checkout — outside it the answer is already stale.
+ */
+export function worktreeClaimHolder(repoPath: string, branch: string): string | undefined {
+  return worktreeClaims.get(branchKey(repoPath, branch))?.[0];
 }
 
 /**

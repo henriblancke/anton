@@ -46,7 +46,14 @@ import {
   type Actionable,
   type PrReview,
 } from "../git/pr";
-import { createWorktree, findWorktree, removeWorktree, worktreePathFor, type Worktree } from "../git/worktree";
+import {
+  createWorktree,
+  findWorktree,
+  removeWorktree,
+  withWorktreeClaim,
+  worktreePathFor,
+  type Worktree,
+} from "../git/worktree";
 import { resolveOperator } from "../operator";
 import {
   getProjectById,
@@ -242,11 +249,17 @@ async function handleEpic(args: {
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return; // nothing to fix on this PR yet.
 
-  // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
-  // sync it with origin, and pre-merge the base if GitHub reports a conflict.
-  const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number });
+  // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
+  // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
+  // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
+  // the commit and push behind it.
+  await withWorktreeClaim(repo, branch, "review-fix", async () => {
+    // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
+    // sync it with origin, and pre-merge the base if GitHub reports a conflict.
+    const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number });
 
-  await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
+    await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
+  });
 }
 
 /**

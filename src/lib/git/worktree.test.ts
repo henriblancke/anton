@@ -25,6 +25,8 @@ import {
   WARM_COMMAND_ENV,
   WARM_ENV,
   withBranchLock,
+  withWorktreeClaim,
+  worktreeClaimHolder,
   worktreePathFor,
   WORKTREES_ROOT_ENV,
 } from "./worktree";
@@ -345,6 +347,29 @@ suite("worktree manager (real git)", () => {
 
     expect(existsSync(wt.path)).toBe(true);
     await removeWorktree(wt, { deleteBranch: true });
+  });
+
+  it("takes a worktree claim only under the branch lock, so a removal in flight is never overtaken", async () => {
+    const branch = "anton/run-claimed";
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let done!: () => void;
+    const using = new Promise<void>((r) => (done = r));
+
+    // Stand in for a teardown that already holds the branch and is mid-removal.
+    const holder = withBranchLock(repo, branch, () => held);
+    const claiming = withWorktreeClaim(repo, branch, "review-fix", () => using);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
+
+    release();
+    await holder;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(worktreeClaimHolder(repo, branch)).toBe("review-fix");
+
+    done();
+    await claiming;
+    expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
   });
 
   it("leaves an arbitrary directory untouched when orphan ownership cannot be proven", async () => {

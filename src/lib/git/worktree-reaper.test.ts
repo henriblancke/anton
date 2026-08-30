@@ -23,6 +23,7 @@ import {
   listBranches,
   listWorktrees,
   withBranchLock,
+  withWorktreeClaim,
   WORKTREES_ROOT_ENV,
 } from "./worktree";
 
@@ -476,5 +477,66 @@ suite("the sweep over real residue (real git)", () => {
     expect(entry).toMatchObject({ worktreeRemoved: false, branchDeleted: false });
     expect(existsSync(wt.path)).toBe(true);
     expect(branches()).toContain("anton/anton-d8f");
+  });
+
+  it("releaseRunWorktree refuses a checkout a claim-holding job is still using", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-clm" });
+    let done!: () => void;
+    const fixing = new Promise<void>((r) => (done = r));
+    // review-fix writes no run row, so the claim is the ONLY evidence this checkout is live.
+    const claimed = withWorktreeClaim(repo, wt.branch, "review-fix", () => fixing);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const teardown = () =>
+      releaseRunWorktree({
+        repoPath: repo,
+        run: { branch: wt.branch, path: wt.path, beadId: "anton-clm", status: "done" },
+        isBeadSettled: async () => true,
+        lookupPr: noPr,
+      });
+
+    const refused = await teardown();
+    expect(refused).toMatchObject({ outcome: "refused", worktreeRemoved: false, branchDeleted: false });
+    expect(refused.reason).toContain("review-fix is using the checkout");
+    expect(existsSync(wt.path)).toBe(true);
+    expect(branches()).toContain("anton/anton-clm");
+
+    done();
+    await claimed;
+
+    // The claim released, the same teardown reclaims both.
+    expect(await teardown()).toMatchObject({ worktreeRemoved: true, branchDeleted: true });
+    expect(existsSync(wt.path)).toBe(false);
+    expect(branches()).not.toContain("anton/anton-clm");
+  });
+
+  it("the sweep spares a claimed checkout even when everything else says residue", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-clm2" });
+    let done!: () => void;
+    const fixing = new Promise<void>((r) => (done = r));
+    const claimed = withWorktreeClaim(repo, wt.branch, "review-fix", () => fixing);
+    await new Promise((r) => setTimeout(r, 50));
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates: [
+          { branch: wt.branch, path: wt.path, beadId: "anton-clm2", runLive: false, bead: "settled" as const },
+        ],
+        lookupPr: noPr,
+      });
+
+      expect(report.reaped).toEqual([]);
+      expect(report.skipped.map((e) => e.reason)).toEqual([
+        expect.stringContaining("review-fix is using the checkout"),
+      ]);
+      expect(existsSync(wt.path)).toBe(true);
+      expect(branches()).toContain("anton/anton-clm2");
+    } finally {
+      done();
+      await claimed;
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+    }
   });
 });
