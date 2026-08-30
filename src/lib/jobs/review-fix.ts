@@ -236,6 +236,7 @@ async function handleEpic(args: {
       epic,
       children: runTickets(all, epic.id),
       branch,
+      all,
     });
     return;
   }
@@ -599,8 +600,10 @@ export async function finalizeMergedEpic(args: {
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;
+  /** The full board — only for resolving the follow-up epic's `area:` ({@link areaLabelOf}). */
+  all: Bead[];
 }): Promise<void> {
-  const { db, clock, repo, projectId, epic, children, branch } = args;
+  const { db, clock, repo, projectId, epic, children, branch, all } = args;
 
   // 1. Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
   //    first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
@@ -644,7 +647,7 @@ export async function finalizeMergedEpic(args: {
   //     short-circuits on as an already-finished run. So neither the ticket nor its old home can be
   //     claimed, and "re-run this" would mean restructuring the board by hand.
   const rerunnable = preserved.filter(safeToRerunAtMerge);
-  const followUp = await rehomePreserved(repo, epic, rerunnable);
+  const followUp = await rehomePreserved(repo, epic, rerunnable, areaLabelOf(epic, all));
   const rerun = new Set(rerunnable.map((b) => b.id));
   // The actor the finished run reserved its children for: execute-epic's claim cascade assigns every
   // child to the same operator it claimed the target for, so the target's own assignee names it.
@@ -747,7 +750,12 @@ export async function finalizeMergedEpic(args: {
  * have already landed. An epic that ends up with no children at all is deleted again, since a
  * childless epic is a poison run rather than a home.
  */
-async function rehomePreserved(repo: string, epic: Bead, rerunnable: Bead[]): Promise<Rehomed> {
+async function rehomePreserved(
+  repo: string,
+  epic: Bead,
+  rerunnable: Bead[],
+  area: string | undefined,
+): Promise<Rehomed> {
   const none: Rehomed = { moved: new Set() };
   if (rerunnable.length === 0) return none;
   const ids = rerunnable.map((b) => b.id).join(", ");
@@ -758,7 +766,7 @@ async function rehomePreserved(repo: string, epic: Bead, rerunnable: Bead[]): Pr
       type: "epic",
       // The roadmap groups by `area:`, and the contract wants exactly one: inherit the merged
       // target's so the follow-up lands in the same column its work was always meant to ship in.
-      labels: (epic.labels ?? []).filter((l) => l.startsWith("area:")),
+      labels: area ? [area] : [],
       description:
         `The pull request for ${epic.id} merged without ${ids}. The run that opened it ran out of ` +
         `time, so that work is in no diff — this epic is its home, because a ticket parented to an ` +
@@ -778,6 +786,30 @@ async function rehomePreserved(repo: string, epic: Bead, rerunnable: Bead[]): Pr
   // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
   await safe(() => beads.delete(repo, followUp));
   return none;
+}
+
+/**
+ * The `area:` label a merged target's follow-up epic inherits: the target's own, else the nearest
+ * ancestor that carries one.
+ *
+ * Walking up is what makes this work for the normal shape (anton-67xj). A `feature` run target
+ * carries no `area:` of its own — the Add-work path puts it on the PRODUCT EPIC above the feature
+ * (lib/backlog.ts) and every roadmap/board reader resolves it from there. Reading only the merged
+ * target's labels would leave the follow-up arealess: ungrouped on the roadmap, missing the Linear
+ * routing key, and flagged by the contract validator — and it has no parent of its own to derive
+ * one from, since it lands top-level.
+ */
+function areaLabelOf(bead: Bead, all: Bead[]): string | undefined {
+  const seen = new Set<string>();
+  let current: Bead | undefined = bead;
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id); // a parent cycle terminates rather than hanging finalization
+    const area = (current.labels ?? []).find((l) => l.startsWith("area:"));
+    if (area) return area;
+    const parent = beads.parentOf(current);
+    current = parent ? all.find((b) => b.id === parent) : undefined;
+  }
+  return undefined;
 }
 
 /** Where {@link rehomePreserved} got to: the new target's id, and which tickets actually reached it. */

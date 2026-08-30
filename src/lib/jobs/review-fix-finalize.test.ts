@@ -73,7 +73,8 @@ const waitsOn = (id: string, blocker: string, status = "open"): Bead =>
     dependencies: [{ issue_id: id, depends_on_id: blocker, type: "blocks" }],
   }) as Bead;
 
-const finalize = (epic: Bead, children: Bead[]) =>
+/** `rest` is the rest of the board — the product epic a feature target hangs off, say. */
+const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) =>
   finalizeMergedEpic({
     db: {} as never,
     clock: { now: () => 0 } as never,
@@ -82,6 +83,7 @@ const finalize = (epic: Bead, children: Bead[]) =>
     epic,
     children,
     branch: "anton/epic-1",
+    all: [epic, ...children, ...rest],
   });
 
 describe("finalizeMergedEpic", () => {
@@ -166,6 +168,19 @@ describe("finalizeMergedEpic", () => {
     expect(contractGaps([created], "blocking")).toEqual([]);
     expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
     expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+  });
+
+  it("takes the follow-up's area: off the product epic when the merged target is a feature", async () => {
+    // The normal shape: Add-work puts `area:` on the PRODUCT EPIC, never on the feature under it.
+    // Reading only the feature's labels would file the follow-up arealess — ungrouped on the
+    // roadmap and without the Linear routing key — and it lands top-level, so nothing downstream
+    // can derive one for it either.
+    const feature = { ...bead("feat-1"), issue_type: "feature", parent: "epic-p" } as Bead;
+    const product = bead("epic-p", "open", ["area:runs", "approved"]);
+
+    await finalize(feature, [bead("t2", "blocked", ["not-delivered"])], [product]);
+
+    expect(createMock.mock.calls[0][1].labels).toEqual(["area:runs"]);
   });
 
   it("names the manual remedy when the ticket cannot be rehomed", async () => {
