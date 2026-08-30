@@ -612,6 +612,60 @@ suite("the sweep over real residue (real git)", () => {
     expect(branches()).not.toContain("anton/anton-clm");
   });
 
+  it("releaseRunWorktree refuses when the re-read says another run took the branch", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-rtk" });
+
+    const entry = await releaseRunWorktree({
+      repoPath: repo,
+      run: { branch: wt.branch, path: wt.path, beadId: "anton-rtk", status: "done" },
+      // The bead was reopened and a new run is already checked out here — an open bead alone would
+      // read as "release the checkout", so only the re-read can save it.
+      isBeadSettled: async () => false,
+      lookupPr: noPr,
+      revalidate: async () => "another run took the branch while this one was tearing down",
+    });
+
+    expect(entry).toMatchObject({ outcome: "refused", worktreeRemoved: false, branchDeleted: false });
+    expect(entry.reason).toContain("another run took the branch");
+    expect(existsSync(wt.path)).toBe(true);
+    expect(branches()).toContain("anton/anton-rtk");
+
+    execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
+    execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+  });
+
+  it("releaseRunWorktree reads the bead and the PR UNDER the branch lock, not before it", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-lck" });
+    const reads: string[] = [];
+    let release!: () => void;
+    const holding = new Promise<void>((r) => (release = r));
+    // A new run creating its checkout holds this same lock (see createWorktree); nothing the plan is
+    // made from may be read while it does, or the plan describes a branch that has already moved on.
+    const held = withBranchLock(repo, wt.branch, () => holding);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const teardown = releaseRunWorktree({
+      repoPath: repo,
+      run: { branch: wt.branch, path: wt.path, beadId: "anton-lck", status: "done" },
+      isBeadSettled: async () => {
+        reads.push("bead");
+        return true;
+      },
+      lookupPr: async () => {
+        reads.push("pr");
+        return {};
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(reads).toEqual([]);
+
+    release();
+    await held;
+    expect(await teardown).toMatchObject({ worktreeRemoved: true, branchDeleted: true });
+    expect(reads).toEqual(["bead", "pr"]);
+    expect(existsSync(wt.path)).toBe(false);
+  });
+
   it("the sweep spares a claimed checkout even when everything else says residue", async () => {
     const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-clm2" });
     let done!: () => void;

@@ -121,6 +121,13 @@ export async function releaseRunResources(args: {
       holdsPartialWork: args.holdsPartialWork,
     },
     isBeadSettled: async () => (await beads.show(args.repoPath, args.beadId)).status === "closed",
+    // Read under the branch lock, immediately before deletion: a bead reopened while this run
+    // unwound already has a NEW run checked out on the same branch, and an open bead alone reads as
+    // "release the checkout" — which would force-remove that run's tree. Only a run row proves it.
+    revalidate: async () =>
+      (await liveRunOnBranch(args.db, args.projectId, args.worktree.branch, args.runId))
+        ? "another run took the branch while this one was tearing down"
+        : undefined,
   });
   // A pure keep released nothing and has nothing to account for. Without this gate every quota park
   // — which stops with the worktree deliberately intact so the run resumes in it — would leave one
@@ -163,6 +170,26 @@ export async function readBoardOrFail(
 }
 
 /**
+ * Whether a run is executing on this branch RIGHT NOW. `exceptRunId` is the row of the run being
+ * torn down: on the idempotent early-exit path that row is still `running` when its teardown runs,
+ * and reading a run as its own rival would refuse every teardown there.
+ */
+async function liveRunOnBranch(
+  db: AntonDb,
+  projectId: string,
+  branch: string,
+  exceptRunId?: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: schema.runs.id, status: schema.runs.status })
+    .from(schema.runs)
+    .where(and(eq(schema.runs.projectId, projectId), eq(schema.runs.branch, branch)));
+  return rows.some(
+    (r) => r.id !== exceptRunId && (r.status === "running" || r.status === "queued"),
+  );
+}
+
+/**
  * The last-moment proof that a candidate is still residue (anton-hrun.1). The board and run rows the
  * plan was made from are already stale by the time the per-branch `gh` lookup returns, and a bead
  * reopened in that window has a new run recreating this exact branch and checkout — which the sweep
@@ -179,11 +206,7 @@ export function makeRevalidator(args: {
   showBead: (repoPath: string, beadId: string) => Promise<{ status: string }>;
 }): Revalidate {
   return async (candidate: ReapCandidate) => {
-    const rows = await args.db
-      .select({ status: schema.runs.status })
-      .from(schema.runs)
-      .where(and(eq(schema.runs.projectId, args.projectId), eq(schema.runs.branch, candidate.branch)));
-    if (rows.some((r) => r.status === "running" || r.status === "queued")) {
+    if (await liveRunOnBranch(args.db, args.projectId, candidate.branch)) {
       return "a run started on it during the sweep";
     }
     if (!candidate.beadId) return undefined;

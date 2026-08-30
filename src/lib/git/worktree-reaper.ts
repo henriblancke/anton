@@ -327,6 +327,19 @@ function actedLine(
   return `${parts.join("; ")} — ${plan.reason}`;
 }
 
+/** The entry for a candidate the last-moment re-read said to leave alone: nothing was touched. */
+function refusedEntry(entry: { branch: string; path?: string; beadId?: string }, why: string): ReapEntry {
+  return {
+    branch: entry.branch,
+    path: entry.path,
+    beadId: entry.beadId,
+    outcome: "refused",
+    reason: `skipped ${entry.path ?? entry.branch}: ${why}`,
+    worktreeRemoved: false,
+    branchDeleted: false,
+  };
+}
+
 /** Carry out one plan, and record what actually happened (a locked checkout still refuses). */
 async function applyPlan(
   repoPath: string,
@@ -402,15 +415,6 @@ export async function reapWorktrees(args: {
   signal?: AbortSignal;
 }): Promise<ReapReport> {
   const report: ReapReport = { reaped: [], skipped: [] };
-  const refused = (candidate: ReapCandidate, why: string): ReapEntry => ({
-    branch: candidate.branch,
-    path: candidate.path,
-    beadId: candidate.beadId,
-    outcome: "refused",
-    reason: `skipped ${candidate.path ?? candidate.branch}: ${why}`,
-    worktreeRemoved: false,
-    branchDeleted: false,
-  });
   for (const candidate of args.candidates) {
     if (args.signal?.aborted) {
       report.aborted = true;
@@ -441,10 +445,11 @@ export async function reapWorktrees(args: {
     // either visible to the re-read or blocked until the removal is done.
     const entry = await withBranchLock(args.repoPath, candidate.branch, async () => {
       const stale = await args.revalidate?.(candidate);
-      if (stale) return refused(candidate, stale);
+      if (stale) return refusedEntry(candidate, stale);
       // Waiting for the lock and re-reading the board are both slow, and the next line deletes: a
       // cancel that arrived across either of them must stop the sweep HERE, not one candidate later.
-      if (args.signal?.aborted) return refused(candidate, "the sweep was cancelled before deletion");
+      if (args.signal?.aborted)
+        return refusedEntry(candidate, "the sweep was cancelled before deletion");
       return applyPlan(args.repoPath, candidate, plan);
     });
     // Classified on the outcome, never the plan: a checkout locked between planning and removal is
@@ -465,24 +470,34 @@ export async function reapWorktrees(args: {
  * Release one stopped run's worktree and branch. `isBeadSettled` is read HERE, not passed in: an
  * abandon closes the bead while the run it killed is still unwinding, so a status captured at the
  * top of the run says "open" for work that is already won't-do.
+ *
+ * Every read the plan is made from happens UNDER the branch's lock, not before it: a bead reopened
+ * while this run unwinds already has a new run checking the same branch out, and that creation takes
+ * this very lock (see `createWorktree`). Reading outside it would let the new checkout land in the
+ * window between the reads and the removal — and the stale plan would then force-remove the live
+ * checkout it was never about. `revalidate` is the other half: the bead being open again does not by
+ * itself keep the worktree (an open bead's checkout is exactly what a stopped run hands back), so
+ * whoever owns run rows says here whether someone else has since taken the branch.
  */
 export async function releaseRunWorktree(args: {
   run: Omit<RunTeardown, "beadSettled">;
   repoPath: string;
   isBeadSettled: () => Promise<boolean>;
   lookupPr?: typeof lookupOpenPullRequest;
+  /** Why this teardown must be abandoned, re-read under the lock; undefined when it may proceed. */
+  revalidate?: () => Promise<string | undefined>;
 }): Promise<ReapEntry> {
-  const beadSettled = await args.isBeadSettled().catch(() => false);
-  const run: RunTeardown = { ...args.run, beadSettled };
-  // Only a settled bead can lose its branch, so only that case pays for a `gh` lookup.
-  const openPr = beadSettled
-    ? await openPrNotice(args.repoPath, run.branch, args.lookupPr)
-    : undefined;
-  // Under the branch's lock like the sweep's: this run has stopped, and another job (a review-fix,
-  // a retry) can be checking the same branch out right now.
-  return withBranchLock(args.repoPath, run.branch, () =>
-    applyPlan(args.repoPath, run, planRunTeardown(run, openPr)),
-  );
+  return withBranchLock(args.repoPath, args.run.branch, async () => {
+    const taken = await args.revalidate?.();
+    if (taken) return refusedEntry(args.run, taken);
+    const beadSettled = await args.isBeadSettled().catch(() => false);
+    const run: RunTeardown = { ...args.run, beadSettled };
+    // Only a settled bead can lose its branch, so only that case pays for a `gh` lookup.
+    const openPr = beadSettled
+      ? await openPrNotice(args.repoPath, run.branch, args.lookupPr)
+      : undefined;
+    return applyPlan(args.repoPath, run, planRunTeardown(run, openPr));
+  });
 }
 
 /** The session-log block for a pass: every worktree and branch reaped, and every one skipped, with why. */

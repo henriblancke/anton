@@ -325,6 +325,55 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
     execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
   });
 
+  it("refuses a teardown whose branch a NEW run took while the old one was unwinding", async () => {
+    await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-rop" });
+    const stopped = randomUUID();
+    const restarted = randomUUID();
+    // The bead was reopened: the old run is settling while its successor is already executing in the
+    // checkout this teardown was about to force-remove.
+    await tdb.db.insert(schema.runs).values([
+      { id: stopped, projectId, epicBeadId: "anton-rop", branch: wt.branch, worktreePath: wt.path, status: "done" },
+      { id: restarted, projectId, epicBeadId: "anton-rop", branch: wt.branch, worktreePath: wt.path, status: "running" },
+    ]);
+
+    const entry = await releaseRunResources({
+      db: tdb.db,
+      clock: systemClock,
+      ctx: ctx(await jobRow()),
+      projectId,
+      runId: stopped,
+      repoPath: repo,
+      worktree: wt,
+      beadId: "anton-rop",
+      status: "done",
+    });
+
+    expect(entry).toMatchObject({ outcome: "refused", worktreeRemoved: false, branchDeleted: false });
+    expect(entry.reason).toContain("another run took the branch");
+    expect(existsSync(wt.path)).toBe(true);
+
+    // The successor's own teardown still runs: a run is never its own rival.
+    const successor = await releaseRunResources({
+      db: tdb.db,
+      clock: systemClock,
+      ctx: ctx(await jobRow()),
+      projectId,
+      runId: restarted,
+      repoPath: repo,
+      worktree: wt,
+      beadId: "anton-rop",
+      status: "done",
+    });
+    expect(successor).toMatchObject({ worktreeRemoved: true });
+    expect(existsSync(wt.path)).toBe(false);
+
+    // Sessions first: each teardown's account references its run row.
+    await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+    await tdb.db.delete(schema.runs).where(eq(schema.runs.projectId, projectId));
+    execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+  });
+
   it("leaves no session behind for a park that keeps both — a quota park is not a teardown", async () => {
     await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
     const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-prk" });
