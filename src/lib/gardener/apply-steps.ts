@@ -23,7 +23,7 @@ import {
 } from "./board-index";
 import {
   blockerUnusable,
-  clusterMemberUngrouped,
+  clusterUngrouped,
   DOING,
   EVIDENCE_PREMISE,
   home,
@@ -190,7 +190,9 @@ function lockedBeads(step: ApplyStep): string[] {
  * read and still guarantee nothing.
  *
  * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
- * {@link alreadySatisfied}.
+ * {@link alreadySatisfied} — and a step the board already satisfies still re-asks its cluster's
+ * premises before it is accepted as one ({@link assertSatisfiedClusterHolds}), because closing the
+ * proposal over it is a decision even when it writes nothing.
  *
  * `signal` is an unattended caller's cancel, and apply.ts hands it here for the FIRST step alone —
  * the only one that can still stop for free. Everything above the write is an await: acquiring the
@@ -213,6 +215,7 @@ export async function applyStep(
 ): Promise<boolean> {
   return withBeadWriteLocks(repo, lockedBeads(step), async () => {
     if (await lockedSubjectSatisfied(repo, step)) {
+      await assertSatisfiedClusterHolds(repo, step);
       signal?.throwIfAborted();
       return false;
     }
@@ -237,6 +240,27 @@ async function lockedSubjectSatisfied(repo: string, step: ApplyStep): Promise<bo
   const moved = subjectMoved(step, subject, Date.now());
   if (moved) throw new SubjectMovedError(moved);
   return subject !== undefined && alreadySatisfied(step, subject);
+}
+
+/**
+ * What a CLUSTER re-parent owes its premises even when the board has already made its move.
+ *
+ * A satisfied step writes nothing, so nothing here can be rolled back — but it is still one of the
+ * moves this proposal is about to be CLOSED as applied over. Reach that state on every member at
+ * once (another approval, or an operator, landing the whole cluster between the decision and these
+ * locks) and no step reaches {@link assertClusterHolds} at all, so the proposal settles as applied
+ * against premises nobody re-asked: a home whose recorded carrier has since gone, or a membership
+ * the regrouping no longer holds. The same fresh board would refuse that ask outright.
+ *
+ * Only the CLUSTER premises, not {@link assertHomeHolds} whole: a subject somebody else already
+ * moved under the home rides the home's ticket set now, which is exactly the change
+ * {@link assertOwnerUnchanged} refuses — and refusing an agreeing move is what the idempotent branch
+ * exists to prevent (see {@link alreadySatisfied}).
+ */
+async function assertSatisfiedClusterHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "reparent" || !step.cluster) return;
+  const doing = `before settling ${step.id}'s move under ${step.parent} as already made`;
+  assertClusterHolds(step, await lockedBoard(repo, doing));
 }
 
 /** The bead this step POINTS AT, re-judged under its own lock by the bar the decision used. */
@@ -281,7 +305,7 @@ async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
 /**
  * What a CLUSTER re-parent owes the two premises its home was chosen on — the card already filing
  * work of this kind under it (reparent.ts `MIN_CARRIED_TICKETS`) and the members stating one subject
- * between them ({@link clusterMemberUngrouped}) — judged from a board read taken INSIDE the locks and
+ * between them ({@link clusterUngrouped}) — judged from a board read taken INSIDE the locks and
  * through the same helpers the decision used. Absent on the re-parents that make no such claim.
  *
  * `planReparent` asks both of the snapshot, and nothing else here restates either: every check above
@@ -297,8 +321,13 @@ async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
  * The grouping is read from titles and `area:` labels, edited under the bead's own lock
  * (`ticket-detail.ts` `updateTicket`) — held here for every member, not just the subject, because a
  * rename does its damage from either end: the partner that proves the subject still shares a topic
- * can be the one edited away, and when that partner is already in place no later step is left to
- * refuse and roll the cluster back.
+ * can be the one edited away, and the member edited away can be one this apply has ALREADY moved.
+ * The locks only order one step's own reads, though — they are released between the writes — so the
+ * grouping is re-derived over the whole recorded membership rather than over this step's subject
+ * alone, and a member already sitting under the home that has left the cluster refuses HERE, which
+ * rolls the earlier writes back (apply.ts `applySteps`). Asking only about `step.id` let a
+ * three-member cluster whose first member was retitled after its move pass every later step and
+ * settle over a bead beneath a card it no longer belongs to.
  *
  * One bargain remains, a level up: a carrier attributed to the home THROUGH an intermediate bead is
  * only as ordered as that bead. Re-homing one takes the home's own lock as its ticket owner, but
@@ -316,11 +345,7 @@ function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
   if (!target) throw new SubjectMovedError(missing(step.parent));
   const leaf = homeCarriesNothing(target, board, new Set(cluster.named), new Set(cluster.carriers));
   if (leaf) throw new SubjectMovedError(leaf);
-  const members = cluster.members.flatMap((id) => {
-    const member = board.byId.get(id);
-    return member ? [member] : [];
-  });
-  const ungrouped = clusterMemberUngrouped(step.id, target, members);
+  const ungrouped = clusterUngrouped(step.id, target, cluster, board, Date.now());
   if (ungrouped) throw new SubjectMovedError(ungrouped);
 }
 

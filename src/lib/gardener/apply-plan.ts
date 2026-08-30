@@ -575,22 +575,88 @@ function clusterDissolved(home: Bead, left: string[]): string {
 }
 
 /**
- * Why this member no longer belongs to the cluster its move was decided as part of, or undefined —
- * the detector's own grouping predicate (reparent.ts {@link groupedUnder}), re-asked of the members
- * as they now read.
+ * Why the CLUSTER this step is one move of no longer holds, or undefined — the detector's own
+ * grouping predicate (reparent.ts {@link groupedUnder}), re-asked over the whole recorded membership
+ * as it now reads.
  *
  * The decision asks it of the approval's snapshot ({@link regroupSurvivors}); the write re-asks it
  * because the evidence is TITLES and `area:` labels, which every other bar a step holds is blind to
  * — a rename leaves the bead open, unclaimed, unmoved and the right tier, and the move then lands a
  * bead under a card it no longer shares a subject with.
+ *
+ * Asked of the WHOLE membership rather than of this step's subject alone, because the per-step locks
+ * are released between the writes. Two questions come out of that:
+ *
+ *   • has a member the board ALREADY has under the home left the cluster? That one is the damage,
+ *     and nothing else is left to notice it: an earlier step of this apply put it there (or the
+ *     decision counted it in place), and a check that only asked whether `subjectId` reached some
+ *     group would pass every later step of a three-member cluster whose first member was retitled
+ *     after its move — settling the proposal over a bead beneath a card it no longer belongs to.
+ *   • is the subject about to be written still grouped — over the members still IN the cluster,
+ *     which is what {@link memberLeftCluster} drops, so a lone survivor cannot be carried past a bar
+ *     a fresh patrol would refuse.
+ *
+ * A member somebody has re-homed under another card is left alone: that is a newer decision than
+ * this proposal, and the rollback deliberately does not fight it (apply-steps.ts `rollbackStep`).
+ * Every member not yet under the home is its own step besides, re-read under its own lock when its
+ * turn comes — so this is the only place the ones already there are judged at all.
  */
-export function clusterMemberUngrouped(
-  id: string,
+export function clusterUngrouped(
+  subjectId: string,
   home: Bead,
-  members: Bead[],
+  cluster: ClusterPremise,
+  index: BoardIndex,
+  nowMs: number,
 ): string | undefined {
-  if (groupedUnder(home, members).has(id)) return undefined;
-  return `${id} no longer states a subject the rest of this cluster and ${home.id} hold in common — a title or \`area:\` label was edited since this proposal was decided, and it takes ${MIN_CLUSTER_SIZE} beads stating one subject ${home.id} states too before a home is obvious`;
+  const inCluster = cluster.members.flatMap((id) => {
+    const member = index.byId.get(id);
+    return member && !memberLeftCluster(member, home, index, nowMs) ? [member] : [];
+  });
+  const grouped = groupedUnder(home, inCluster);
+  const strayed = cluster.members.find(
+    (id) => id !== subjectId && !grouped.has(id) && sitsUnder(index, id, home.id),
+  );
+  if (strayed) return clusterMemberStrayed(strayed, home);
+  if (grouped.has(subjectId)) return undefined;
+  // Which refusal the approver reads turns on WHY the grouping came apart: an edit to the beads
+  // themselves, or members that left the cluster and took their half of the evidence with them.
+  return inCluster.length === cluster.members.length
+    ? clusterMemberUngrouped(subjectId, home)
+    : clusterDissolved(
+        home,
+        inCluster.map((member) => member.id),
+      );
+}
+
+/** Is this member already where the cluster's move puts it — by an earlier step of it, or by hand? */
+function sitsUnder(index: BoardIndex, id: string, homeId: string): boolean {
+  const member = index.byId.get(id);
+  return member !== undefined && beads.parentOf(member) === homeId;
+}
+
+/** Why this member no longer states the subject the cluster is grouped on. */
+const clusterMemberUngrouped = (id: string, home: Bead): string =>
+  `${id} no longer states a subject the rest of this cluster and ${home.id} hold in common — a title or \`area:\` label was edited since this proposal was decided, and it takes ${MIN_CLUSTER_SIZE} beads stating one subject ${home.id} states too before a home is obvious`;
+
+/** The same, for a member this apply has already landed under the home — the one it cannot leave. */
+const clusterMemberStrayed = (id: string, home: Bead): string =>
+  `${clusterMemberUngrouped(id, home)}, and it already sits under ${home.id} — landing the rest of this cluster would leave it beneath a card whose work it is no longer part of`;
+
+/**
+ * Has this member left the cluster since the decision, by any of the ways the decision itself drops
+ * one — settled, promoted out of the working layer, picked up by a run, or given another card?
+ *
+ * The same questions {@link clusterMemberGone}, {@link clusterMemberLeftLayer} and
+ * {@link reparentPremiseGone} ask of a subject, asked here of the members whose own step has already
+ * run or will never run. One bargain: the claim half is judged on a LIVE RUN alone, because dating a
+ * claim against the filing needs the per-member baseline only a step carries
+ * ({@link StepSubject.claim}) — a member claimed without a lease is caught by its own step, or not
+ * at all.
+ */
+function memberLeftCluster(member: Bead, home: Bead, index: BoardIndex, nowMs: number): boolean {
+  if (!isOpenWork(member) || !isClusterTier(member) || isInFlight(member, nowMs)) return true;
+  const card = index.cards.cardOf(member);
+  return card !== undefined && card !== home.id;
 }
 
 /**
