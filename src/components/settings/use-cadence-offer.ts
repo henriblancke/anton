@@ -223,7 +223,9 @@ export function useCadenceOffer({
    * so the question applies again — and it may never have been asked at all: an arm landing while
    * the edit was open decides `ask()` against the optimistic cron and stays silent, which without
    * this would leave the picker armed and product-master weekly with nothing on screen until the
-   * picker is cycled. Re-opened from the live rows, so it stays silent unless the premise holds.
+   * picker is cycled. Re-opened from the live rows, so it stays silent unless the premise holds —
+   * and not at all while an earlier hand edit still stands, which is the operator's own choice of
+   * cadence rather than a question waiting to be answered.
    */
   async function aroundSetCron(id: string, write: () => Promise<boolean>) {
     // Keyed on the row the offer is ever ABOUT, not on a question being on screen: an accept or
@@ -241,7 +243,10 @@ export function useCadenceOffer({
       // The edit never reached the server, so it superseded nothing: the count goes back before the
       // re-ask, or an answer failing afterwards would read this rollback as the operator's choice.
       handEdits.current -= 1;
-      ask();
+      // Only once nothing else stands. An EARLIER edit — landed, or still open — is the operator
+      // picking the cadence themselves, which already ended the question; the row it rolls back to
+      // is theirs, and re-asking on the back of this unrelated failure would offer to overwrite it.
+      if (handEdits.current === 0) ask();
     }
   }
 

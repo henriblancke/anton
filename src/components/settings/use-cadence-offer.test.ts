@@ -16,6 +16,8 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 const WEEKLY = "0 6 * * 1";
 const DAILY = "0 6 * * *";
 const HAND_PICKED = "30 9 * * *";
+/** A weekly cadence the operator chose themselves — still weekly, so the offer would still apply. */
+const HAND_WEEKLY = "30 9 * * 3";
 
 type Rows = Record<string, AutomationScheduleState>;
 
@@ -108,6 +110,33 @@ describe("a hand cadence edit that does not land", () => {
   it("stays silent while the premise is gone — the picker was never armed", async () => {
     const { result } = render(disarmed());
     await act(() => result.current.aroundSetCron("product-master", async () => false));
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("leaves an earlier hand-picked weekly cadence alone rather than re-offering to raise it", async () => {
+    const { result, rows } = render(disarmed());
+    await act(() => result.current.aroundToggle("board-picker", true, async () => true));
+    expect(result.current.offer).not.toBeNull();
+
+    // The operator answers the question by hand — a weekly cadence of their own choosing.
+    await act(() =>
+      result.current.aroundSetCron("product-master", async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: HAND_WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+
+    // A later edit fails and rolls back to that same weekly cadence. It is the operator's, not the
+    // question's, so nothing is asked again.
+    await act(() =>
+      result.current.aroundSetCron("product-master", async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: HAND_PICKED } };
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: HAND_WEEKLY } };
+        return false;
+      }),
+    );
+
     expect(result.current.offer).toBeNull();
   });
 
