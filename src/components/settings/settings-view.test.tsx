@@ -1920,6 +1920,86 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(offer()).toBeNull();
   });
 
+  /**
+   * Two clicks on one row: the route read-modify-writes it, so the second PATCH is queued behind the
+   * first (see `queueRowWrite`) and the first answer describes a row the operator has already moved
+   * past. Applying that answer whole would put the superseded state back on screen — and the offer,
+   * decided against the live rows, would then be asked about it.
+   */
+  it("keeps a queued disable on screen when the enable's response lands first", async () => {
+    const answers: Array<() => void> = [];
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = new Response(JSON.stringify({ schedule: { cron: WEEKLY, ...patch } }));
+      return new Promise<Response>((resolve) => answers.push(() => resolve(stored)));
+    });
+    // Picker already armed and product-master off: enabling it is the half that completes the
+    // coupling, so its response is the one that would open the offer.
+    renderView({}, [], coupledSchedules({ picker: { enabled: true }, pm: { enabled: false } }));
+
+    const pm = () => screen.getByRole("switch", { name: "product-master" });
+    fireEvent.click(pm());
+    await waitFor(() => expect(answers).toHaveLength(1));
+
+    // Switched straight back off. The second write is QUEUED, not sent — but it is what the operator
+    // asked for, and it is already on screen.
+    fireEvent.click(pm());
+    expect(patchesTo(fetchMock, "/schedules")).toHaveLength(1);
+    expect(pm().getAttribute("aria-checked")).toBe("false");
+
+    answers[0]!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master enabled"));
+    // The enable's answer is true of its own write and stale of the row: the later click stands, and
+    // no offer is opened to raise the cadence of a job that is on its way off.
+    expect(pm().getAttribute("aria-checked")).toBe("false");
+    expect(offer()).toBeNull();
+
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master disabled"));
+    expect(pm().getAttribute("aria-checked")).toBe("false");
+    expect(offer()).toBeNull();
+  });
+
+  it("keeps a cadence edit queued behind a toggle, rather than restoring the echoed cron", async () => {
+    const answers: Array<() => void> = [];
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = new Response(
+        JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...patch } }),
+      );
+      return new Promise<Response>((resolve) => answers.push(() => resolve(stored)));
+    });
+    renderView({}, [], coupledSchedules({ picker: { enabled: true }, pm: { enabled: false } }));
+
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    await waitFor(() => expect(answers).toHaveLength(1));
+
+    // Retimed while the toggle is still open. The toggle's answer echoes the cadence as it was when
+    // that write ran — weekly — which must not overwrite the daily the operator has just picked.
+    fireEvent.click(screen.getByRole("button", { name: "product-master cadence" }));
+    fireEvent.click(screen.getByRole("button", { name: "Daily" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set cadence" }));
+    expect(cadenceOf("product-master")).toContain("Daily at 06:00");
+
+    answers[0]!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master enabled"));
+    expect(cadenceOf("product-master")).toContain("Daily at 06:00");
+
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]!();
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
+    expect(cadenceOf("product-master")).toContain("Daily at 06:00");
+  });
+
   it("stays quiet when there is nothing to raise", () => {
     stubPanelFetch();
     // Already daily — and a hand-written expression or an off product-master are the same silence:

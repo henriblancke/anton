@@ -85,6 +85,11 @@ export function useAutomationSchedules({
   // applied LAST can be the one describing the older state, leaving the table reporting a cadence or
   // an enabled flag the server has already moved past.
   const rowWrites = useRef(new Map<string, Promise<void>>());
+  // What each of those queued writes ASKED for, oldest first. A response describes the row as of its
+  // own write, so a click made behind it — already optimistic on screen, still to be sent — has to
+  // survive it: applying the first answer whole puts the superseded state back, and the coupled
+  // cadence offer, decided against these rows, is then asked about a state nobody is heading for.
+  const rowIntents = useRef(new Map<string, PendingWrite[]>());
 
   // The one writer of the rows: the ref is the source of truth and the state mirrors it. Stable —
   // it closes over nothing but the two refs — so the poll's effect is not torn down every render.
@@ -112,6 +117,7 @@ export function useAutomationSchedules({
   ): Promise<boolean> {
     const prev = rows.current[id];
     update((p) => ({ ...p, [id]: { ...prev, ...patch } }));
+    const intent = trackIntent(rowIntents, id, patch);
     // Counted at the CALL, not at the send: a patch waiting on the row's queue is still a write this
     // panel owns, and a poll that landed in that window would answer with pre-write times.
     writes.current.inFlight += 1;
@@ -121,16 +127,18 @@ export function useAutomationSchedules({
       // and from the fields this write asked for when it does not.
       const confirmed = stored ?? { ...committed.current[id], ...patch };
       committed.current = { ...committed.current, [id]: confirmed };
-      if (stored) update((p) => ({ ...p, [id]: stored }));
+      // Server truth under the operator's newer intent, never over it.
+      if (stored) update((p) => ({ ...p, [id]: { ...stored, ...intent.later() } }));
       toast.success(message);
       return true;
     } catch (err) {
-      update((p) => ({ ...p, [id]: reverted(p[id], committed.current[id], patch) }));
+      update((p) => ({ ...p, [id]: reverted(p[id], committed.current[id], patch, intent.later()) }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
       return false;
     } finally {
       // In `finally` so a rejected patch also clears the in-flight count — otherwise one network
       // failure would leave the counter above zero and silently stop the poll for the whole session.
+      intent.release();
       writes.current.inFlight -= 1;
       writes.current.completed += 1;
     }
@@ -157,6 +165,42 @@ export function useAutomationSchedules({
     cadenceOffer: cadence.offer,
     acceptCadenceOffer: cadence.accept,
     declineCadenceOffer: cadence.decline,
+  };
+}
+
+/** One write still open on a row, holding the fields it asked for (see {@link rowIntents}). */
+interface PendingWrite {
+  patch: SchedulePatch;
+}
+
+/**
+ * Record one write as open on its row, and answer with the two things its own completion needs: the
+ * fields any LATER write on that row has already put on screen, and the release to run once this one
+ * has settled.
+ *
+ * `later()` is read at completion rather than captured up front — the clicks it has to defer to are
+ * exactly the ones made while this write was open.
+ */
+function trackIntent(
+  open: RefObject<Map<string, PendingWrite[]>>,
+  id: string,
+  patch: SchedulePatch,
+): { later: () => SchedulePatch; release: () => void } {
+  const entry: PendingWrite = { patch };
+  const queued = open.current.get(id) ?? [];
+  queued.push(entry);
+  open.current.set(id, queued);
+  return {
+    later: () => {
+      const at = queued.indexOf(entry);
+      if (at < 0) return {};
+      return queued.slice(at + 1).reduce<SchedulePatch>((all, w) => ({ ...all, ...w.patch }), {});
+    },
+    release: () => {
+      const at = queued.indexOf(entry);
+      if (at >= 0) queued.splice(at, 1);
+      if (queued.length === 0) open.current.delete(id);
+    },
   };
 }
 
@@ -307,15 +351,22 @@ function withTimes(state: ScheduleState, rows: AutomationSchedule[]): ScheduleSt
  * Undo only the fields this patch wrote, back to what the server last confirmed. Restoring the whole
  * `committed` row would also roll back a concurrent patch for the same automation (toggle while a
  * cadence save is in flight), leaving the row wrong until reload.
+ *
+ * A field a queued write has since claimed is left alone for the same reason: that write is what the
+ * operator asked for last, and it is still to be sent — rolling it back here would take a click off
+ * screen that the row is about to be given anyway.
  */
 function reverted(
   current: AutomationScheduleState,
   committed: AutomationScheduleState,
   patch: SchedulePatch,
+  later: SchedulePatch,
 ): AutomationScheduleState {
   return {
     ...current,
-    ...(patch.cron !== undefined ? { cron: committed.cron } : {}),
-    ...(patch.enabled !== undefined ? { enabled: committed.enabled } : {}),
+    ...(patch.cron !== undefined && later.cron === undefined ? { cron: committed.cron } : {}),
+    ...(patch.enabled !== undefined && later.enabled === undefined
+      ? { enabled: committed.enabled }
+      : {}),
   };
 }
