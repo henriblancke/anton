@@ -233,7 +233,9 @@ process.stdin.on('end',()=>{
     // Nothing survived the filter, so triage never ran — and the log says why it had nothing.
     expect(existsSync(join(sandbox, "claude-argv.jsonl"))).toBe(false);
     const sessions = await tdb.db.select().from(schema.sessions);
-    const log = readFileSync(sessions.find((s) => !before.has(s.id))!.logPath!, "utf8");
+    const newSession = sessions.find((s) => !before.has(s.id));
+    expect(newSession, "no new session was created during the scan run").toBeDefined();
+    const log = readFileSync(newSession!.logPath!, "utf8");
     expect(log).toContain("dropped 1 signal(s)");
     expect(log).toContain("phantom.db");
   });
@@ -284,7 +286,9 @@ process.stdin.on('end',()=>{
 
     // The drop stays visible: filtered out of the prompt is not filtered out of the record.
     const sessions = await tdb.db.select().from(schema.sessions);
-    const log = readFileSync(sessions.find((s) => !before.has(s.id))!.logPath!, "utf8");
+    const newSession = sessions.find((s) => !before.has(s.id));
+    expect(newSession, "no new session was created during the scan run").toBeDefined();
+    const log = readFileSync(newSession!.logPath!, "utf8");
     expect(log).toContain("dropped 1 signal(s)");
     expect(log).toContain("phantom.db");
   });
