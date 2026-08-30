@@ -444,7 +444,7 @@ describe("settings route — self-review settings (anton-of1m)", () => {
   });
 
   it("PATCH rejects out-of-range score-alarm thresholds", async () => {
-    for (const bad of [11, -1, 4.5, "low"]) {
+    for (const bad of [11, -1, 4.5, "low", "7", true]) {
       const res = await PATCH(patchReq({ reviewMinScore: bad }), ctx("tmp"));
       expect(res.status).toBe(400);
       expect((await res.json()).error).toMatch(/reviewMinScore/);
