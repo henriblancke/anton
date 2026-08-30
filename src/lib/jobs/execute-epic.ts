@@ -1662,16 +1662,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // the write in that case, and the ask settles in its cancelled form here.
         let gate: { gateId: string; held: string[] } | undefined;
         let gateError: string | undefined;
+        // The one cancelled arm that DID leave board state behind: the kill landed inside `gate
+        // create` and the undo failed too, so a gate blocks the target that this run will never come
+        // back for. It cannot settle as "nothing was written" — the id has to reach the operator.
+        let stranded: StrandedHumanGateError | undefined;
         try {
           gate = await armHumanGate(repo, epicBeadId, e.ask, ctx.signal);
         } catch (failure) {
+          if (failure instanceof StrandedHumanGateError) stranded = failure;
           gateError = failure instanceof Error ? failure.message : String(failure);
           console.error(
             `[execute-epic] could not arm ${epicBeadId}'s human gate — the ask reaches the operator ` +
               `only through this run's error (${gateError})`,
           );
         }
-        if (!gate && ctx.signal.aborted) {
+        if (!gate && !stranded && ctx.signal.aborted) {
           // Killed mid-arm — not a gate failure. Nothing was written, so this settles exactly like a
           // kill that beat the ask to the catch: no gate, no park, the ask carried in the error.
           thrown = askSettleError(raw, ctx.signal);
@@ -1687,7 +1692,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             runId,
             gate
               ? { status: "parked", error: needsHumanParkMessage(e, gate.gateId, gate.held) }
-              : { status: "failed", error: ungatedAskMessage(e, gateError), endedAt: clock.now() },
+              : {
+                  status: "failed",
+                  error: stranded
+                    ? strandedAskMessage(e, stranded)
+                    : ungatedAskMessage(e, gateError),
+                  endedAt: clock.now(),
+                },
           );
         }
       } else if (e instanceof BlockedTailError) {
@@ -2310,8 +2321,9 @@ export function humanGatePlan(
  *     only its author may release; superseding it would let this run resume through someone's
  *     explicit stop.
  *
- * THROWS when the gate cannot be created, when a superseded gate cannot be resolved, or when the
- * board cannot be read (arming blind is how the duplicate wait gets made) — so the caller settles
+ * THROWS when the gate cannot be created, when a superseded gate cannot be resolved, when a kill
+ * lands inside the create (the gate is undone first), or when the board cannot be read (arming blind
+ * is how the duplicate wait gets made) — so the caller settles
  * the run LOUDLY instead of parking it. All three are the same failure: a park is only meaningful if
  * resolving the gate it names makes the target runnable, and it does not when there is no gate, when
  * a twin blocks the target, or when anton's own superseded wait is still open beside it. An epic
@@ -2388,6 +2400,25 @@ export async function armHumanGate(
 
   refuseIfCancelled();
   const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
+  // The create is an uninterruptible await of its own, so the check above cannot cover a kill that
+  // lands while it runs (anton-287p): the gate would exist, the caller would read a successful arm,
+  // and a cancelled run would park behind a wait nobody is waiting on. Re-read the signal on the far
+  // side and undo the write, so the ask settles in its cancelled form exactly as if it never landed.
+  if (signal?.aborted) {
+    const undone = await safe(() =>
+      beads.gateResolve(repo, gateId, `run cancelled while ${targetId}'s human gate was armed`),
+    );
+    if (undone) {
+      throw new Error(
+        `refusing to arm ${targetId}'s human gate — the run was cancelled while the gate was ` +
+          `created; gate ${gateId} was resolved, so the target carries no wait from this run`,
+      );
+    }
+    // The undo was the only thing that would ever have closed it: no automatic pass resolves a human
+    // gate, so the target stays blocked until someone clears this id by hand. It rides out in the
+    // error because nothing else on the board names it.
+    throw new StrandedHumanGateError(targetId, gateId);
+  }
   // Best-effort, unlike everything above: the gate exists and carries the ask, so the park is
   // already valid. A lost tag only costs a later arm the right to supersede this wait — it reads as
   // a person's hold and stays open, which is the safe direction for a gate only a human ends.
@@ -2426,6 +2457,19 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
     `be created (${gateError ?? "unknown error"}), so nothing on the board carries the ask and no ` +
     `\`bd gate resolve\` can release the run — it is FAILED rather than parked, because a park with ` +
     `no gate is a wait nothing can end. Answer the ask, then re-run the target.`
+  );
+}
+
+/**
+ * The FAILURE reason when a kill landed inside the gate's creation and the undo failed with it: the
+ * ask IS on the board, but on a gate this dead run will never come back for. Named explicitly —
+ * nothing automatic resolves a human gate, so the target stays blocked until someone clears this id.
+ */
+function strandedAskMessage(e: NeedsHumanError, stranded: StrandedHumanGateError): string {
+  return (
+    `${e.ticketId} needs a human: ${e.ask ?? "(the agent named no ask)"}. ${stranded.message}. The ` +
+    `run is FAILED rather than parked — it was cancelled, so no resume is coming for that gate. ` +
+    `Answer the ask, clear the gate, then re-run the target.`
   );
 }
 
@@ -2643,6 +2687,24 @@ class CancelledAskError extends Error {
         `Answer it and re-run the target if the work is still wanted.`,
     );
     this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * A cancelled arm that could not undo its own write (anton-287p): the kill landed while `gate create`
+ * ran, so the gate exists — and the `gate resolve` that would have taken it back failed too. Nothing
+ * automatic ever closes a human gate, so {@link gateId} keeps blocking {@link targetId} until a
+ * person resolves it; the run settles FAILED naming it, because that id exists nowhere else.
+ */
+export class StrandedHumanGateError extends Error {
+  constructor(
+    readonly targetId: string,
+    readonly gateId: string,
+  ) {
+    super(
+      `the run was cancelled while ${targetId}'s human gate ${gateId} was created, and the gate ` +
+        `could not be resolved — it still blocks ${targetId} until \`bd gate resolve ${gateId}\` runs`,
+    );
   }
 }
 

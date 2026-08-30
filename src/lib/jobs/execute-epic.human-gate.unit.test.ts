@@ -42,7 +42,9 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
-const { armHumanGate, HUMAN_GATE_ARMED_LABEL } = await import("./execute-epic");
+const { armHumanGate, HUMAN_GATE_ARMED_LABEL, StrandedHumanGateError } = await import(
+  "./execute-epic"
+);
 
 const REPO = "/tmp/anton";
 const ASK = "the staging DB password has to be rotated by a person";
@@ -159,6 +161,39 @@ it("leaves its own superseded gate alone when the kill lands mid-read, rather th
   await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateResolveMock).not.toHaveBeenCalled();
   expect(gateCreateMock).not.toHaveBeenCalled();
+});
+
+it("undoes the gate it just created when the kill lands inside `gate create` (anton-287p)", async () => {
+  // The window no pre-write check can cover: `gate create` is itself an uninterruptible await, so a
+  // force-kill arriving while it runs leaves a gate the caller would read as a successful arm — and
+  // a cancelled run would park behind a wait nobody is waiting on, blocking the target for good.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockImplementation(async () => {
+    controller.abort();
+    return "g-new";
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
+  expect(tagMock).not.toHaveBeenCalled(); // nothing is left to label
+});
+
+it("names the gate it could not undo, because nothing else ever will", async () => {
+  // Both halves lost: the gate exists and its resolve failed, so no automatic pass will close it and
+  // the target stays blocked. The id has to ride out in the error — the run settles FAILED on it.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockImplementation(async () => {
+    controller.abort();
+    return "g-new";
+  });
+  gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
+
+  const failure = await armHumanGate(REPO, "f-1", ASK, controller.signal).catch((e) => e);
+  expect(failure).toBeInstanceOf(StrandedHumanGateError);
+  expect(failure.gateId).toBe("g-new");
+  expect(failure.message).toContain("bd gate resolve g-new");
 });
 
 it("arms as usual while the run is still live", async () => {
