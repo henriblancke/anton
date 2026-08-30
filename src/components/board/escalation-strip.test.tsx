@@ -7,6 +7,10 @@
  * and the "nothing stopped, render nothing" honesty rule (now a much simpler claim than the old
  * "checked, clean" vs "never checked" distinction, because this component no longer has hygiene or
  * review data to be clean ABOUT).
+ *
+ * Plus the request-vs-failure split (anton-mivh.2): a wait on a person is work paused on purpose,
+ * and the strip has to say so — in its own colour, its own verb, and its own place in the order —
+ * without softening how the four accidental stalls read.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -132,6 +136,91 @@ describe("EscalationStrip", () => {
     renderStrip([escalation({ beadId: undefined })]);
     expect(screen.queryByText("Abandon")).toBeNull();
     expect(screen.getByText("Resume")).toBeTruthy();
+  });
+
+  it("renders a wait on a person as a request, with its ask in full and its own age", () => {
+    const ask =
+      "waiting on a human 4h: check the pricing copy against the deck before this ships, " +
+      "including the annual tier, because the last two launches shipped a number nobody had read";
+    const { container } = renderStrip([
+      escalation({ kind: "needs-human", gateId: "g-1", runId: undefined, reason: ask }),
+    ]);
+
+    expect(screen.getByText("Waiting on you")).toBeTruthy();
+    // Verbatim and whole: the ask is the sentence the founder acts on, and a clipped one sends them
+    // to bd to read the rest.
+    expect(screen.getByText(ask)).toBeTruthy();
+    expect(screen.getByText("waiting 4h")).toBeTruthy();
+    // A request is not a failure: it is never counted as stopped, and never drawn in the
+    // destructive red the four accidental stalls earn.
+    expect(screen.getByText("1 to answer")).toBeTruthy();
+    expect(screen.queryByText(/stopped/)).toBeNull();
+    expect(screen.queryByText(/^stuck /)).toBeNull();
+    expect(screen.getByText("Waiting on you").className).toContain("stage-in-review");
+    expect(container.querySelector("section")?.className).not.toContain("destructive");
+  });
+
+  it("keeps the failure classes reading as failures when a request shares the strip", () => {
+    const { container } = renderStrip([
+      escalation(),
+      escalation({ id: "esc-2", kind: "needs-human", gateId: "g-1" }),
+    ]);
+
+    expect(screen.getByText("Parked run").className).toContain("risk-high");
+    expect(screen.getByText("stuck 4h")).toBeTruthy();
+    expect(screen.getByText("1 stopped")).toBeTruthy();
+    expect(screen.getByText("1 to answer")).toBeTruthy();
+    expect(container.querySelector("section")?.className).toContain("destructive");
+  });
+
+  it("leads with the requests, so a thirty-second answer isn't buried under investigations", () => {
+    renderStrip([
+      escalation({ id: "esc-1", kind: "parked-run" }),
+      escalation({ id: "esc-2", kind: "needs-human", gateId: "g-1" }),
+      escalation({ id: "esc-3", kind: "stale-pr", prNumber: 42 }),
+      escalation({ id: "esc-4", kind: "needs-human", gateId: "g-2" }),
+    ]);
+
+    // getAllByText returns document order, which is the reading order the row grouping is about.
+    const labels = screen
+      .getAllByText(/^(Waiting on you|Parked run|Stale PR)$/)
+      .map((chip) => chip.textContent);
+    expect(labels).toEqual(["Waiting on you", "Waiting on you", "Parked run", "Stale PR"]);
+  });
+
+  it("answers a wait on a person with resolve-and-resume, and never with Dismiss", () => {
+    // Dismiss would settle the row while leaving the gate open — an acknowledged wait that nothing
+    // ends, re-raised on every sweep. Abandon stays: "I'm not doing this" is a real answer.
+    renderStrip([escalation({ kind: "needs-human", gateId: "g-1", runId: undefined })]);
+    expect(screen.getByText("Resolve & resume")).toBeTruthy();
+    expect(screen.queryByText("Dismiss")).toBeNull();
+    expect(screen.getByText("Abandon")).toBeTruthy();
+  });
+
+  it("still offers the resolve when the gate blocks work anton doesn't run", () => {
+    // No run target above the gated bead, so there is nothing to re-enqueue — but the person is
+    // still being waited on, and only they can end it.
+    renderStrip([
+      escalation({ kind: "needs-human", gateId: "g-1", epicBeadId: undefined, runId: undefined }),
+    ]);
+    expect(screen.getByText("Resolve & resume")).toBeTruthy();
+  });
+
+  it("still offers the abandon when the gate blocks work that isn't on the board", () => {
+    // No bead and no job to close — but "I'm not going to do this" is an answer to the wait, and
+    // closing the gate is the whole of it. Without this the only button is resolve-and-resume, which
+    // records the founder's refusal as a resolution.
+    renderStrip([
+      escalation({
+        kind: "needs-human",
+        gateId: "g-1",
+        beadId: undefined,
+        epicBeadId: undefined,
+        runId: undefined,
+        jobId: undefined,
+      }),
+    ]);
+    expect(screen.getByText("Abandon")).toBeTruthy();
   });
 
   it("offers job-level answers for a stall that names no bead at all", () => {

@@ -179,7 +179,7 @@ describeBd("post-approval re-validation e2e (real handler · real bd)", () => {
 
   it("removes the approved label on approval, and notes why on the bead itself", async () => {
     const [proposal] = await asks();
-    const result = await applyProposal(repo, proposal, await board());
+    const result = await applyProposal(repo, proposal, await board(), "approval");
     expect(result.changed).toEqual([rotting]);
 
     const subject = await show(rotting);

@@ -159,6 +159,20 @@ export function refreshIssueSnapshot(
 }
 
 /**
+ * The background board read currently in flight for `cwd`, or null when none is (anton-3dpp).
+ *
+ * The refreshes above are deliberately un-awaited — that is what keeps a read from waiting behind
+ * embedded Dolt — so the `bd list` they spawn outlives the call that started it. On an EMBEDDED
+ * board that matters to exactly one other caller: a Dolt pass takes the repo's exclusive lock, and
+ * bd fails (it does not queue) when a read still holds it. The sync coalescer awaits this before
+ * starting a pass so the two never collide. Returned as an opaque promise: callers wait for the
+ * read to be over, never for its beads.
+ */
+export function issueSnapshotRefreshInFlight(cwd: string): Promise<unknown> | null {
+  return entryFor(cwd).refresh;
+}
+
+/**
  * Return the last valid snapshot immediately. Cold loads wait once; stale warm loads trigger a
  * background refresh and keep serving known-good data. A pending local write is the exception when
  * `blockOnPendingWrite` (the default): the retained board predates the write yet the version already

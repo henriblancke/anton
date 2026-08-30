@@ -1,17 +1,19 @@
 import type { ReactNode } from "react";
-import { CircleSlashIcon, LockIcon, MoonIcon } from "lucide-react";
+import { CircleSlashIcon, LockIcon, LockOpenIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { STAGE_ACCENT_DOT, STAGE_LABELS } from "@/components/board/board-utils";
 
-type ChipTone = "neutral" | "risk-high" | "risk-med" | "blocked" | "pr" | "done";
+type ChipTone = "neutral" | "risk-high" | "risk-med" | "partial" | "blocked" | "pr" | "done";
 
 const CHIP_TONE: Record<ChipTone, string> = {
   neutral: "border-border bg-secondary text-muted-foreground",
   "risk-high": "border-risk-high/30 bg-risk-high/10 text-risk-high",
   "risk-med": "border-risk-med/28 bg-risk-med/10 text-risk-med",
+  // Amber, deliberately not the blocked rose: a partially-gated run still starts.
+  partial: "border-risk-med/30 bg-risk-med/10 text-risk-med",
   blocked: "border-blocked/30 bg-blocked/10 text-blocked",
   pr: "border-stage-in-review/30 bg-stage-in-review/10 text-stage-in-review",
   done: "border-stage-done/30 bg-stage-done/10 text-stage-done",
@@ -93,6 +95,32 @@ export function BlockedChip({ blockedBy }: { blockedBy: string[] }) {
     <MetaChip tone="blocked">
       <LockIcon className="size-2.5" aria-hidden="true" />
       <span title={`blocked by ${blockedBy.join(", ")}`}>{label}</span>
+    </MetaChip>
+  );
+}
+
+/**
+ * "partially blocked · N/M ready" chip — a run target whose work is only part-held (anton-zztt). The
+ * run starts on the M−N tickets nothing holds and parks the rest, so this is a progress signal, not
+ * a stop: an open padlock in amber, never the blocked rose, and the card it sits on stays lit and
+ * approvable. The held ticket ids ride in the title. Renders nothing once nothing is held.
+ */
+export function PartiallyBlockedChip({
+  ready,
+  total,
+  held,
+}: {
+  ready: number;
+  total: number;
+  held: string[];
+}) {
+  if (held.length === 0) return null;
+  return (
+    <MetaChip tone="partial">
+      <LockOpenIcon className="size-2.5" aria-hidden="true" />
+      <span title={`held by a blocker outside this run: ${held.join(", ")}`}>
+        {`partially blocked · ${ready}/${total} ready`}
+      </span>
     </MetaChip>
   );
 }
@@ -204,5 +232,31 @@ export function RelativeTime({ iso, className }: { iso: string | null | undefine
     <time dateTime={iso ?? undefined} title={exact ?? undefined} className={className}>
       {relative}
     </time>
+  );
+}
+
+/**
+ * The project breadcrumb bar every project section renders above its tabs — `<project> / <section>`.
+ * `children` is an optional trailing slot (settings hangs its unsaved-count and Save button there),
+ * so a section with extra header controls no longer has to re-copy the bar and drift from the rest.
+ */
+export function PageHeader({
+  project,
+  section,
+  children,
+}: {
+  project: string;
+  section: string;
+  children?: ReactNode;
+}) {
+  return (
+    <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-6">
+      <div className="flex items-center gap-2 text-[13px]">
+        <span className="text-muted-foreground">{project}</span>
+        <span className="text-subtle">/</span>
+        <span className="font-medium text-foreground">{section}</span>
+      </div>
+      {children}
+    </header>
   );
 }

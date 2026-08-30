@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 /**
- * The Add-work surface end to end (anton-bm4.2). The surface is now two panes with separate state —
- * the live pty and the draft epic — so these pin the seams between them: the seed handed over when
- * shaping starts, the gate that keeps an unshaped bead off the board, and the pty teardown that must
- * happen on the way out.
+ * The Add-work surface end to end (anton-bm4.2, anton-h1ds). The surface is two panes with separate
+ * state — the live pty and the draft FEATURE — so these pin the seams between them: the seed handed
+ * over when shaping starts, the gate that keeps an unshaped or parentless bead off the board, and
+ * the pty teardown that must happen on the way out.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -26,12 +26,17 @@ vi.mock("@/components/pty/pty-terminal", () => ({
   PtyTerminal: ({ sessionId }: { sessionId: string }) => <div data-testid="pty">{sessionId}</div>,
 }));
 
-const SEED = "Reports are shareable outside the app\nevery view exports to something openable";
+const SEED = "Export a report view to CSV\nevery view exports to something openable";
+
+const EPICS = [
+  { id: "anton-1", title: "Reports are shareable", area: "reports", looseTickets: 0 },
+  { id: "anton-2", title: "Legacy billing", looseTickets: 2 },
+];
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 function renderView() {
-  render(<ShapeView slug="anton" projectName="anton" areas={["reports"]} />);
+  render(<ShapeView slug="anton" projectName="anton" areas={["reports"]} epics={EPICS} />);
 }
 
 function sendButton() {
@@ -47,11 +52,24 @@ function areaInput() {
   return screen.getByRole("combobox", { name: /^Area/ }) as HTMLInputElement;
 }
 
+/** The epic picker — the only combobox whose label opens with "Epic" (Area is the other one). */
+function epicSelect() {
+  return screen.getByRole("combobox", { name: /^Epic/ }) as HTMLSelectElement;
+}
+
+/** Fill the feature's sections the seed doesn't cover, so only the epic is left to choose. */
+function fillFeature() {
+  typeInto(/^Acceptance criteria/, "- [ ] every report view has a CSV export button");
+  typeInto(/^Context/, "touches: src/app/reports");
+  typeInto(/^Out of scope/, "- PDF export");
+  typeInto(/^Verify/, "unit test on the serializer");
+}
+
 /** Drive the surface to a live session, resolving the shape POST with `sessionId`. */
 async function startShaping(fetchMock: ReturnType<typeof vi.fn>, seed = SEED) {
   vi.stubGlobal("fetch", fetchMock);
   renderView();
-  fireEvent.change(screen.getByRole("textbox", { name: "Describe an epic" }), {
+  fireEvent.change(screen.getByRole("textbox", { name: "Describe the work" }), {
     target: { value: seed },
   });
   fireEvent.click(screen.getByRole("button", { name: "Start shaping" }));
@@ -77,7 +95,7 @@ describe("ShapeView", () => {
     expect(screen.queryByTestId("pty")).toBeNull();
     expect(screen.getByText("not started")).toBeTruthy();
     expect(sendButton().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("Lands as an open bead · unapproved")).toBeTruthy();
+    expect(screen.getByText("Lands as an open feature · unapproved")).toBeTruthy();
   });
 
   it("Start shaping posts the description, swaps in the terminal, and seeds the draft", async () => {
@@ -89,14 +107,12 @@ describe("ShapeView", () => {
     expect(JSON.parse(init.body)).toEqual({ description: SEED });
     expect(screen.getByTestId("pty").textContent).toBe("s-1");
 
-    // The seed's first line becomes the title, the whole seed the outcome — the founder refines
-    // from something, not from an empty panel.
+    // The seed's first line becomes the feature's title, the whole seed its goal — the founder
+    // refines from something, not from an empty panel.
     expect((screen.getByRole("textbox", { name: /^Title/ }) as HTMLInputElement).value).toBe(
-      "Reports are shareable outside the app",
+      "Export a report view to CSV",
     );
-    expect((screen.getByRole("textbox", { name: /^Outcome/ }) as HTMLTextAreaElement).value).toBe(
-      SEED,
-    );
+    expect((screen.getByRole("textbox", { name: /^Goal/ }) as HTMLTextAreaElement).value).toBe(SEED);
   });
 
   it("⌘↵ in the composer starts shaping, and an empty description can't", async () => {
@@ -104,7 +120,7 @@ describe("ShapeView", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderView();
 
-    const composer = screen.getByRole("textbox", { name: "Describe an epic" });
+    const composer = screen.getByRole("textbox", { name: "Describe the work" });
     fireEvent.keyDown(composer, { key: "Enter", metaKey: true });
     expect(fetchMock).not.toHaveBeenCalled();
 
@@ -119,7 +135,7 @@ describe("ShapeView", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderView();
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Describe an epic" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Describe the work" }), {
       target: { value: SEED },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start shaping" }));
@@ -134,7 +150,7 @@ describe("ShapeView", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderView();
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Describe an epic" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Describe the work" }), {
       target: { value: SEED },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start shaping" }));
@@ -157,7 +173,7 @@ describe("ShapeView", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderView();
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Describe an epic" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Describe the work" }), {
       target: { value: SEED },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start shaping" }));
@@ -174,44 +190,98 @@ describe("ShapeView", () => {
     expect(error).not.toHaveBeenCalled();
   });
 
-  it("gates Send on the epic contract and names what is missing", async () => {
+  it("gates Send on the feature contract AND its epic, naming what is missing", async () => {
     await startShaping(vi.fn().mockResolvedValue(json({ sessionId: "s-1" })));
 
-    // Title and outcome came from the seed; the rest of the contract has not been filled in.
+    // Title and goal came from the seed; the rest of the contract has not been filled in.
     expect(sendButton().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("Needs success criteria, an area")).toBeTruthy();
+    expect(screen.getByText("Needs an epic, acceptance criteria, context + 2 more")).toBeTruthy();
 
-    typeInto(/^Success criteria/, "- [ ] every report view exports");
-    fireEvent.change(areaInput(), { target: { value: "two words" } });
-    // A malformed area leaves no gap, so without its own line the panel would read as ready.
+    fillFeature();
+    // Everything but the epic — the gap this ticket exists to close.
     expect(sendButton().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("Area must be a single label-safe word")).toBeTruthy();
+    expect(screen.getByText("Needs an epic")).toBeTruthy();
 
-    fireEvent.change(areaInput(), { target: { value: "reports" } });
+    fireEvent.change(epicSelect(), { target: { value: "anton-1" } });
     expect(sendButton().hasAttribute("disabled")).toBe(false);
-    expect(screen.getByText("Lands as an open bead · unapproved")).toBeTruthy();
+    expect(screen.getByText("Lands as an open feature · unapproved")).toBeTruthy();
   });
 
-  it("Send to backlog posts the trimmed draft, kills the pty, and leaves for the board", async () => {
+  it("warns when the chosen epic still carries loose tickets it would strand", async () => {
+    await startShaping(vi.fn().mockResolvedValue(json({ sessionId: "s-1" })));
+
+    fireEvent.change(epicSelect(), { target: { value: "anton-1" } });
+    expect(screen.queryByText(/stop being runnable/)).toBeNull();
+
+    fireEvent.change(epicSelect(), { target: { value: "anton-2" } });
+    expect(screen.getByText(/2 tickets hang directly off this epic/)).toBeTruthy();
+  });
+
+  it("asks for the epic's own contract when the founder creates one, and sends it along", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(json({ sessionId: "s-1" }))
-      .mockResolvedValueOnce(json({ id: "anton-1" }, 201))
+      .mockResolvedValueOnce(json({ id: "anton-9", epicId: "anton-8" }, 201))
       .mockResolvedValue(json({}));
-    await startShaping(fetchMock, "Reports are shareable");
+    await startShaping(fetchMock, "Export a report view to CSV");
 
-    typeInto(/^Success criteria/, "  - [ ] every report view exports  ");
+    fillFeature();
+    fireEvent.change(epicSelect(), { target: { value: "__new__" } });
+    expect(screen.getByText("Needs an epic title, an epic outcome, epic success criteria + 1 more"))
+      .toBeTruthy();
+
+    typeInto(/^Epic title/, "Reports are shareable outside the app");
+    typeInto(/^Epic outcome/, "Every report leaves the app in a format a customer can open.");
+    typeInto(/^Epic success criteria/, "- [ ] every report view exports");
+    // A malformed area leaves no gap, so without its own line the panel would read as ready.
+    fireEvent.change(areaInput(), { target: { value: "two words" } });
+    expect(sendButton().hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText("Area must be a single label-safe word")).toBeTruthy();
+
     fireEvent.change(areaInput(), { target: { value: " reports " } });
+    fireEvent.click(sendButton());
+
+    await waitFor(() => expect(push).toHaveBeenCalledWith("/projects/anton"));
+    const [, backlogInit] = fetchMock.mock.calls[1]!;
+    expect(JSON.parse(backlogInit.body).epic).toEqual({
+      kind: "new",
+      epic: {
+        title: "Reports are shareable outside the app",
+        goal: "Every report leaves the app in a format a customer can open.",
+        successCriteria: "- [ ] every report view exports",
+        area: "reports",
+      },
+    });
+  });
+
+  it("Send to backlog posts the trimmed feature under its epic, kills the pty, and leaves", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json({ sessionId: "s-1" }))
+      .mockResolvedValueOnce(json({ id: "anton-9", epicId: "anton-1" }, 201))
+      .mockResolvedValue(json({}));
+    await startShaping(fetchMock, "Export a report view to CSV");
+
+    typeInto(/^Acceptance criteria/, "  - [ ] every report view has a CSV export button  ");
+    typeInto(/^Context/, "touches: src/app/reports");
+    typeInto(/^Out of scope/, "- PDF export");
+    typeInto(/^Verify/, "unit test on the serializer");
+    fireEvent.change(epicSelect(), { target: { value: "anton-1" } });
     fireEvent.click(sendButton());
 
     await waitFor(() => expect(push).toHaveBeenCalledWith("/projects/anton"));
     const [backlogUrl, backlogInit] = fetchMock.mock.calls[1]!;
     expect(backlogUrl).toBe("/api/projects/anton/backlog");
     expect(JSON.parse(backlogInit.body)).toEqual({
-      title: "Reports are shareable",
-      goal: "Reports are shareable",
-      successCriteria: "- [ ] every report view exports",
-      area: "reports",
+      feature: {
+        title: "Export a report view to CSV",
+        goal: "Export a report view to CSV",
+        acceptance: "- [ ] every report view has a CSV export button",
+        context: "touches: src/app/reports",
+        outOfScope: "- PDF export",
+        verify: "unit test on the serializer",
+      },
+      epic: { kind: "existing", id: "anton-1" },
     });
 
     // The pty outlives this page unless the surface kills it on the way out.
@@ -219,24 +289,26 @@ describe("ShapeView", () => {
     expect(ptyUrl).toBe("/api/projects/anton/sessions/s-1/pty");
     expect(ptyInit.method).toBe("DELETE");
     expect(ptyInit.keepalive).toBe(true);
-    expect(success).toHaveBeenCalledWith("Draft landed in backlog — approve it when you're ready.");
+    expect(success).toHaveBeenCalledWith(
+      "Feature landed in backlog — approve it when you're ready.",
+    );
   });
 
   it("keeps the draft on the surface when the create fails", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(json({ sessionId: "s-1" }))
-      .mockResolvedValueOnce(json({ error: "bd write failed" }, 500));
-    await startShaping(fetchMock, "Reports are shareable");
+      .mockResolvedValueOnce(json({ error: "epic anton-1 is not on the board" }, 400));
+    await startShaping(fetchMock, "Export a report view to CSV");
 
-    typeInto(/^Success criteria/, "- [ ] every report view exports");
-    fireEvent.change(areaInput(), { target: { value: "reports" } });
+    fillFeature();
+    fireEvent.change(epicSelect(), { target: { value: "anton-1" } });
     fireEvent.click(sendButton());
 
-    await waitFor(() => expect(error).toHaveBeenCalledWith("bd write failed"));
+    await waitFor(() => expect(error).toHaveBeenCalledWith("epic anton-1 is not on the board"));
     expect(push).not.toHaveBeenCalled();
-    // Send is live again — the founder can retry without retyping the draft.
+    // Send is live again — the founder can retry (or pick another epic) without retyping the draft.
     await waitFor(() => expect(sendButton().hasAttribute("disabled")).toBe(false));
-    expect(areaInput().value).toBe("reports");
+    expect(epicSelect().value).toBe("anton-1");
   });
 });

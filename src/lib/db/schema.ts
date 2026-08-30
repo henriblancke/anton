@@ -149,6 +149,49 @@ export const runHealthReports = sqliteTable("run_health_reports", {
 });
 
 /**
+ * The board-picker's latest ranked plan per project (anton-it5i) — what anton would start next, in
+ * order, and why every other candidate is not on the list. The pass is read-only over the board, so
+ * this row IS its whole output, and it follows `run_health_reports` exactly: ONE row per project,
+ * each pass replacing the last. Appending would grow a log of ten-minute ticks nobody reads while
+ * the three surfaces that need the answer — the Up Next lane, the decision log, and arming — each
+ * went on re-deriving it, which is the disagreement this row exists to prevent.
+ *
+ * Machine-local by construction, like the policy it derives from: two machines on one repo may hold
+ * different policies and so different plans, and bd's claim protocol — never this table — settles
+ * the race between them.
+ */
+export const boardPickerPlans = sqliteTable("board_picker_plans", {
+  projectId: text("project_id")
+    .primaryKey()
+    .references(() => projects.id),
+  /** The picker job that produced this plan, so an entry traces back to its job row. */
+  jobId: text("job_id"),
+  generatedAt: ts("generated_at").notNull().default(now),
+  /**
+   * Digest of the board snapshot the plan was ranked against. A surface compares it with a digest of
+   * the board as it now reads: unequal means the board MOVED, and a plan ranked against a board that
+   * has since moved must never be presented as the current answer — the gardener's premise fence,
+   * asked of a whole snapshot rather than one bead.
+   */
+  boardDigest: text("board_digest").notNull(),
+  /**
+   * When the pass read the board, in epoch MILLISECONDS rather than the `ts()` seconds every other
+   * stamp here uses. It dates against bd's per-bead write stamps exactly as the gardener's
+   * `observedAtMs` does, and truncating to the second would let a write landing inside that same
+   * second read as having happened before the snapshot.
+   */
+  boardObservedAtMs: integer("board_observed_at_ms").notNull(),
+  /** How many beads the digest covers — the snapshot's size, without parsing anything. */
+  boardBeadCount: integer("board_bead_count").notNull().default(0),
+  /** `PickerPlanEntry[]` (src/lib/board-picker-plan.ts), serialized, in rank order. */
+  entriesJson: text("entries_json").notNull().default("[]"),
+  /** `PickerExclusion[]`, serialized — the machine-readable "why not this one?" for the rest. */
+  exclusionsJson: text("exclusions_json").notNull().default("[]"),
+  /** Denormalized so a lane badge / refresh token needn't parse the blob. */
+  targetCount: integer("target_count").notNull().default(0),
+});
+
+/**
  * One gardener patrol's hygiene report (anton-3nv7). Unlike `run_health_reports` this is one row PER
  * RUN, not per project: the patrol WRITES to the board (it closes eligible epics and repairs the
  * blocked flag), so the row is the durable record of what a given patrol actually did — keyed to the
@@ -245,7 +288,7 @@ export const scanSummaries = sqliteTable(
      * when there was none anton could read (a whole-repo pass, or a state it could not identify).
      *
      * Kept beside the one it left because a retried job's rescan is only legible against both. When
-     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer.ts),
+     * a pass dies before triage the handler puts the baseline BACK (src/lib/jobs/nightly-stringer-scan.ts),
      * so the retry measures from this value again: it REPLAYED the row's own window rather than
      * continuing past it, and its counts supersede rather than fold. A retry measuring from
      * `delta_state` instead scanned the next window along, and folds in. Written once, at insert —
@@ -272,6 +315,16 @@ export const scanSummaries = sqliteTable(
     beadsDeduped: integer("beads_deduped"),
     /** Collectors that died mid-scan: every one is a hole in the counts above. */
     collectorFailures: integer("collector_failures").notNull().default(0),
+    /**
+     * The commit the scanned working tree held (anton-qor2). NULL for rows written before it was
+     * tracked, or when git could not name one.
+     *
+     * A point on the trend is a measurement of a TREE, and until this was recorded nothing said
+     * which: the 2026-08-06 nightly measured a checkout 6 commits behind origin/main and the column
+     * it charted was indistinguishable from one measuring the shipped code. Stale is now visible on
+     * the point rather than inferred from a diff hours later.
+     */
+    scannedSha: text("scanned_sha"),
   },
   (table) => [
     // Serves "this project's last N scans" (and the prune) without a full scan.

@@ -175,8 +175,8 @@ export interface RunningJobInfo extends LiveJobInfo {
 }
 
 /**
- * Bead-label source for the per-job value gate (anton-k05r): the labels of a job's target bead
- * (e.g. `risk:high`, `blocking-PR`), read at lease time so `jobValueScore` can rank governed work.
+ * Bead-label source for the per-job value gate (anton-k05r): the labels of a job's target bead, read
+ * at lease time so `jobValueScore` can rank governed work against the project's own nominations.
  * Returns `null` when the bead can't be resolved — the gate fails open on null (admits the job)
  * rather than starving work on a guess.
  */
@@ -276,12 +276,18 @@ export function nextAction(
       // A run is live on another machine (anton-jz1). Retry after a cool-off, refunding the attempt:
       // it's not this job's failure and the foreign run may hold its lease for a long time, so it
       // must never park for a human — it re-checks liveness each time until the lease clears.
+      // KEEP the classified reason (anton-3dpp). "lease-held" covers two situations an operator has
+      // to tell apart: another machine demonstrably holds the lease, and this run could not PROVE it
+      // holds one (a board write/read that failed, so it fails closed). Both reschedule identically,
+      // so the row's text is the only place the difference can survive — dropping it left a job
+      // whose only record said "run live elsewhere" when nothing had read a foreign lease at all,
+      // undiagnosable here and in CI (the runner's logger is a no-op in tests).
       const runAtMs = nowMs + config.quotaCooloffMs;
       return {
         action: "reschedule",
         runAtMs,
         refundAttempt: true,
-        lastError: `run live elsewhere: retries at ${new Date(runAtMs).toISOString()}`,
+        lastError: `run live elsewhere: ${outcome.error} — retries at ${new Date(runAtMs).toISOString()}`,
       };
     }
     case "not-wired": {
@@ -863,8 +869,8 @@ export class JobRunner {
   /**
    * Per-job value/cost admission gate (anton-k05r), run when the coarse `budgetGate` ADMITS a
    * budget-aware project: of that project's due queued governed jobs, hold the ones `admitJob`
-   * says aren't worth the remaining budget — scarce headroom admits only high-value work
-   * (risk:high / blocking-PR), abundant budget drains down to cleanup, and a job whose per-type
+   * says aren't worth the remaining budget — scarce headroom admits only work the project's own
+   * value nominations rank highly, abundant budget drains down to cleanup, and a job whose per-type
    * burn average can't fit the remaining session is held regardless of value. Holds are per-tick
    * only (queued holds feed leaseDue's `exclude`; reclaim holds feed capOf — see tickOnce):
    * nothing is deferred or written, so the next tick re-evaluates against fresh usage/pace state

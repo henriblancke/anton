@@ -15,10 +15,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { describeCouplingFilter } from "./scan-coupling";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
   describeCollectorFailure,
+  describeUntrackedFilter,
   extractSignals,
   formatTimeout,
   parseCollectorFailures,
@@ -121,6 +124,20 @@ describe("scan", () => {
     expect(DEFAULT_SCAN_EXCLUDES).toContain(".claude/**");
     const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
     expect(globs).toContain(".claude/**");
+  });
+
+  it("excludes anton's own database, a githygiene finding that recurs on every scan of this repo", async () => {
+    const argvDump = join(dir, "argv.json");
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+    await scan({ repoPath: "/repo", scanFile: join(dir, "s.json") });
+
+    // anton.db sits at the repo root of the project anton runs FROM; `githygiene` walks the working
+    // tree, so a gitignored multi-megabyte SQLite file is reported as a large binary every night
+    // (anton-qor2). The glob also covers SQLite's -wal/-shm sidecars.
+    expect(DEFAULT_SCAN_EXCLUDES).toContain("anton.db*");
+    const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
+    expect(globs).toContain("anton.db*");
   });
 
   it("appends caller-supplied excludes after the defaults", async () => {
@@ -559,6 +576,427 @@ describe("scan", () => {
     });
   });
 
+  // anton-j2zg: `githygiene` reads the WORKING TREE, so it flagged anton's own gitignored anton.db
+  // as a "large binary file" on every pass — a medium-severity finding nobody can act on, counted
+  // into the health record and re-triaged nightly. git's index is the arbiter.
+  describe("findings about files git does not track", () => {
+    /** A real git repo (inside `dir`, so the fake stringer binary is never one of its files). */
+    function initRepo(files: Record<string, string>): string {
+      const repo = join(dir, "repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      return repo;
+    }
+
+    const largeBinary = (path: string) => ({
+      Source: "githygiene",
+      Kind: "large-binary",
+      FilePath: path,
+      Title: `Large binary file: ${path}`,
+      Tags: ["git-hygiene", "large-binary"],
+    });
+
+    it("drops the finding, keeps the count, and removes it from the file triage reads", async () => {
+      const repo = initRepo({ ".gitignore": "phantom.db\n", "keep.bin": "committed" });
+      writeFileSync(join(repo, "phantom.db"), "local database", "utf8");
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [largeBinary("phantom.db"), largeBinary("keep.bin")],
+        metadata: { total_count: 2 },
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.signals).toMatchObject([{ FilePath: "keep.bin", AntonSeverity: "medium" }]);
+      expect(result.untracked).toEqual({
+        dropped: [{ path: "phantom.db", kind: "large-binary", severity: "medium" }],
+      });
+      // Same set on both sides of the seam: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as {
+        signals: { FilePath: string }[];
+        metadata: { total_count: number };
+      };
+      expect(written.signals.map((s) => s.FilePath)).toEqual(["keep.bin"]);
+      expect(written.metadata.total_count).toBe(2); // stringer's own envelope rides through untouched
+    });
+
+    it("leaves a scan whose flagged files are all tracked exactly as it was", async () => {
+      const repo = initRepo({ "keep.bin": "committed", "src/app.ts": "export {};\n" });
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("keep.bin"),
+        { ...largeBinary("src/app.ts"), Kind: "mixed-line-endings" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.signals).toHaveLength(2);
+      expect(result.untracked).toEqual({ dropped: [] });
+      expect(
+        (JSON.parse(readFileSync(scanFile, "utf8")) as { FilePath: string }[]).map((s) => s.FilePath),
+      ).toEqual(["keep.bin", "src/app.ts"]);
+    });
+
+    // The filter drops only what git positively contradicts: a debt signal reads the same whether or
+    // not the file is committed yet, a directory is never in the index, and a signal naming no file
+    // is not a claim about the repo at all.
+    it("drops nothing it cannot contradict — other collectors, directories, pathless signals", async () => {
+      const repo = initRepo({ "src/app.ts": "export {};\n" });
+      writeFileSync(join(repo, "scratch.ts"), "// TODO: later\n", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        { Source: "todos", Kind: "todo", FilePath: "scratch.ts" },
+        { ...largeBinary("src"), Kind: "many-large-files" },
+        { ...largeBinary("."), Kind: "many-large-files" }, // the repo root, as collectors spell it
+        { Source: "githygiene", Kind: "merge-conflict" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(4);
+      expect(result.untracked.dropped).toEqual([]);
+    });
+
+    // How a collector SPELLS a path must not decide the drop: `src/../keep.bin` is absent from the
+    // index verbatim, but it is the same tracked file as `keep.bin` — matching literally would
+    // delete a real finding about a committed file.
+    it("resolves `./` and mid-path traversals before asking git", async () => {
+      const repo = initRepo({ "keep.bin": "committed", ".gitignore": "phantom.db\n" });
+      writeFileSync(join(repo, "phantom.db"), "local database", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("src/../keep.bin"),
+        largeBinary("./phantom.db"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/../keep.bin" }]);
+      expect(result.untracked.dropped).toEqual([
+        { path: "phantom.db", kind: "large-binary", severity: "medium" },
+      ]);
+    });
+
+    // The drop log is the only place a filtered finding still exists, so it has to carry what was
+    // lost: a gitignored file holding a secret must not read as one more stale-binary phantom.
+    it("records the kind and pre-filter severity of every drop", async () => {
+      const repo = initRepo({ ".gitignore": "phantom.db\nsecrets.env\n", "keep.bin": "committed" });
+      writeFileSync(join(repo, "phantom.db"), "local database", "utf8");
+      writeFileSync(join(repo, "secrets.env"), "TOKEN=1", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("phantom.db"),
+        { ...largeBinary("secrets.env"), Kind: "committed-secret", Tags: ["secret"] },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.untracked.dropped).toEqual([
+        { path: "phantom.db", kind: "large-binary", severity: "medium" },
+        { path: "secrets.env", kind: "committed-secret", severity: "critical" },
+      ]);
+    });
+
+    // A filter that can't prove a file is untracked must under-filter rather than delete findings —
+    // and say why, so the extra medium signals aren't read as the repo suddenly getting worse.
+    it("counts everything and reports why when git cannot be asked", async () => {
+      const notARepo = join(dir, "loose");
+      mkdirSync(notARepo, { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        largeBinary("phantom.db"),
+      ]);
+
+      const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.untracked.dropped).toEqual([]);
+      expect(result.untracked.unavailable).toBeTruthy();
+    });
+  });
+
+
+  // anton-yvx9: the `coupling` collector builds its import graph from the source text, so an
+  // `import type` — erased by the compiler, with no runtime edge — weighs exactly as much as a value
+  // import. The 2026-08-18 scan charted an 11-module "circular dependency" closed only by
+  // src/lib/types.ts, a pure type barrel, and handed it to triage as work.
+  describe("coupling signals whose edges only the type system can see", () => {
+    /** A source tree — no git, since nothing here is a claim about the index. */
+    function writeRepo(files: Record<string, string>): string {
+      const repo = join(dir, "repo");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      return repo;
+    }
+
+    /** stringer's own phrasing: the component's members, alphabetical, and its size in the body. */
+    const cycle = (modules: string[]) => ({
+      Source: "coupling",
+      Kind: "circular-dependency",
+      FilePath: modules[0],
+      Title: `Circular dependency: ${[...modules, modules[0]].join(" → ")}`,
+      Description:
+        `Strongly connected component with ${modules.length} modules forming a dependency cycle. ` +
+        `Circular dependencies make code harder to test, refactor, and reason about independently.`,
+      Tags: ["architecture", "coupling"],
+    });
+
+    const fanOut = (path: string, imports: number) => ({
+      Source: "coupling",
+      Kind: "high-coupling",
+      FilePath: path,
+      Title: `High coupling: ${path} imports ${imports} modules`,
+      Description:
+        `Module "${path}" has ${imports} direct dependencies, which is above the threshold of 10. ` +
+        `High fan-out increases the risk of cascading breakage when any dependency changes.`,
+      Tags: ["architecture", "coupling"],
+    });
+
+    /** src/lib/types.ts in miniature: 11 outgoing edges, every one of them erased at compile time. */
+    function typeBarrel(): Record<string, string> {
+      const names = Array.from({ length: 10 }, (_, i) => `M${i}`);
+      const files: Record<string, string> = {
+        "src/types.ts": [
+          ...names.map((name, i) => `import type { ${name} } from "./m${i}";`),
+          `export type { A } from "./a";`,
+          `export type Every = ${names.join(" | ")};`,
+          `export const STAGES = ["backlog"];`,
+          ``,
+        ].join("\n"),
+        // ...and the module that closes the reported cycle imports the barrel for a VALUE.
+        "src/a.ts": `import { STAGES } from "./types";\nexport type A = number;\nexport const first = () => STAGES[0];\n`,
+      };
+      for (let i = 0; i < 10; i += 1) files[`src/m${i}.ts`] = `export type M${i} = ${i};\n`;
+      return files;
+    }
+
+    it("drops the phantom cycle and the barrel's fan-out, on both sides of the seam", async () => {
+      const repo = writeRepo(typeBarrel());
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [
+          cycle(["src/a", "src/types"]),
+          fanOut("src/types", 11),
+          { Source: "todos", Kind: "todo", FilePath: "src/a.ts" },
+        ],
+        metadata: { total_count: 3 },
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      // Not vacuous: the todo rides through, so the drop is this filter rather than an empty read.
+      expect(result.signals).toMatchObject([{ Source: "todos" }]);
+      expect(result.coupling.dropped).toMatchObject([
+        { path: "src/a", kind: "circular-dependency" },
+        { path: "src/types", kind: "high-coupling" },
+      ]);
+      // Every drop says why, in terms an operator can check against the source by hand.
+      expect(result.coupling.dropped[0].reason).toContain("type-only");
+      expect(result.coupling.dropped[0].reason).toContain("src/types.ts → src/a.ts");
+      expect(result.coupling.dropped[1].reason).toContain("11 of its 11 imports are type-only");
+      expect(describeCouplingFilter(result.coupling)).toContain("11 of its 11 imports are type-only");
+      // Same set on both sides: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { Source: string }[] };
+      expect(written.signals.map((s) => s.Source)).toEqual(["todos"]);
+    });
+
+    it("keeps a real value-import cycle exactly as stringer wrote it", async () => {
+      const repo = writeRepo({
+        "src/x.ts": `import { y } from "./y";\nexport const x = () => y();\n`,
+        "src/y.ts": `import { x } from "./x";\nexport const y = () => x;\n`,
+      });
+      const scanFile = join(dir, "scan.json");
+      const signal = cycle(["src/x", "src/y"]);
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [signal]);
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.signals).toMatchObject([{ Title: signal.Title, AntonSeverity: "medium" }]);
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+      expect(describeCouplingFilter(result.coupling)).toBeUndefined();
+    });
+
+    // `import { type Q }` is elided whole; one default binding beside it makes the same statement a
+    // runtime import, and a cycle it closes is real.
+    it("reads inline `type` bindings, and the default binding that outranks them", async () => {
+      const repo = writeRepo({
+        "src/p.ts": `import { type Q } from "./q";\nexport const p: Q = 1;\n`,
+        "src/q.ts": `import { p } from "./p";\nexport type Q = number;\nexport const usesP = () => p;\n`,
+        "src/r.ts": `import S, { type T } from "./s";\nexport const r: T = S;\n`,
+        "src/s.ts": `import { r } from "./r";\nexport type T = number;\nexport default r;\n`,
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        cycle(["src/p", "src/q"]),
+        cycle(["src/r", "src/s"]),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/r" }]);
+      expect(result.coupling.dropped).toMatchObject([{ path: "src/p" }]);
+    });
+
+    // A `semi:false` repo has no `;` to end a statement on, so the only thing separating one from
+    // the next is the line-start keyword. Read without that bound, `export type …` runs forward into
+    // the value re-export below it and takes the whole pair for erased — dropping a real cycle.
+    it("reads one statement at a time in a repo that writes no semicolons", async () => {
+      const repo = writeRepo({
+        "src/a.ts": `export type Meta = number\n\nexport { b } from "./b"\n\nexport const a = 1\n`,
+        "src/b.ts": `import { a } from "./a"\n\nexport const b = () => a\n`,
+      });
+      const signal = cycle(["src/a", "src/b"]);
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [signal]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: signal.Title }]);
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+    });
+
+    // A cycle closed by `@/lib/x` is only visible if the alias resolver lands on the same file the
+    // compiler would: a resolver that misses turns a value edge into an unresolved specifier, and
+    // the cycle it was holding up is dropped as a phantom.
+    it("resolves `@/`-alias imports to the file they name on disk", async () => {
+      const repo = writeRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "src/a.ts": `import { b } from "@/b";\nexport const a = () => b();\n`,
+        "src/b.ts": `import { a } from "@/a";\nexport const b = () => a;\n`,
+      });
+      const signal = cycle(["src/a", "src/b"]);
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [signal]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: signal.Title }]);
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+    });
+
+    it("re-prices a surviving fan-out, so triage acts on the runtime number", async () => {
+      const files: Record<string, string> = {};
+      const lines: string[] = [];
+      for (let i = 0; i < 3; i += 1) {
+        files[`src/t${i}.ts`] = `export type T${i} = ${i};\n`;
+        lines.push(`import type { T${i} } from "./t${i}";`);
+      }
+      for (let i = 0; i < 12; i += 1) {
+        files[`src/v${i}.ts`] = `export const v${i} = ${i};\n`;
+        lines.push(`import { v${i} } from "./v${i}";`);
+      }
+      files["src/hub.ts"] = `${lines.join("\n")}\nexport const all = [v0];\n`;
+      const repo = writeRepo(files);
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [fanOut("src/hub", 15)]);
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.coupling.dropped).toEqual([]);
+      expect(result.coupling.recounted).toEqual([{ path: "src/hub", reported: 15, value: 12 }]);
+      const kept = result.signals[0] as { Title: string; Description: string };
+      expect(kept.Title).toBe("High coupling: src/hub imports 12 modules");
+      expect(kept.Description).toContain("has 12 direct dependencies");
+      expect(kept.Description).toContain("3 of the 15 imports stringer counted are type-only");
+      // The corrected number is in the file triage reads, not only in the array anton counted.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as { Title: string }[];
+      expect(written[0].Title).toBe("High coupling: src/hub imports 12 modules");
+    });
+
+    /**
+     * stringer's collector reads single-line statements only — a wrapped `import { … } from` is
+     * missing from its count entirely (measured: 12 single-line imports report `imports 12
+     * modules`; the same 12 with 4 wrapped report nothing). So its number is a floor, and a
+     * subtraction off it can price a module below the fan-out it really has.
+     */
+    function undercountedHub(typeImports: number, values: number, wrapped: number) {
+      const files: Record<string, string> = {};
+      const lines: string[] = [];
+      for (let i = 0; i < typeImports; i += 1) {
+        files[`src/t${i}.ts`] = `export type T${i} = ${i};\n`;
+        lines.push(`import type { T${i} } from "./t${i}";`);
+      }
+      for (let i = 0; i < values; i += 1) {
+        files[`src/v${i}.ts`] = `export const v${i} = ${i};\n`;
+        lines.push(
+          i < wrapped ? `import {\n  v${i},\n} from "./v${i}";` : `import { v${i} } from "./v${i}";`,
+        );
+      }
+      files["src/hub.ts"] = `${lines.join("\n")}\nexport const all = [v0];\n`;
+      // What stringer would have counted: every single-line statement, the wrapped ones unseen.
+      return { files, counted: typeImports + values - wrapped };
+    }
+
+    it("keeps a fan-out stringer undercounted, rather than pricing it below its runtime edges", async () => {
+      const { files, counted } = undercountedHub(3, 12, 4);
+      const repo = writeRepo(files);
+      const scanFile = join(dir, "scan.json");
+      expect(counted).toBe(11); // stringer's view: 3 type-only + the 8 unwrapped value imports
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        fanOut("src/hub", counted),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      // 11 − 3 = 8 is below the threshold, but 12 modules are imported for a value: not a drop, and
+      // not a correction either — anton has nothing to subtract that stringer didn't already miss.
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+      expect((result.signals[0] as { Title: string }).Title).toBe(
+        "High coupling: src/hub imports 11 modules",
+      );
+    });
+
+    it("prices a drop off its own runtime count, not off stringer's subtraction", async () => {
+      const { files, counted } = undercountedHub(4, 9, 2);
+      const repo = writeRepo(files);
+      expect(counted).toBe(11); // 4 type-only + the 7 unwrapped value imports
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        fanOut("src/hub", counted),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      // 11 − 4 = 7 would understate it; 9 modules really are imported for a value, still under 10.
+      expect(result.coupling.dropped[0].reason).toContain("leaving 9 at runtime");
+    });
+
+    // Under-filtering costs one triaged bead; over-filtering deletes an architecture finding nobody
+    // hears about again. So anything anton cannot PROVE is erased rides through untouched.
+    it("keeps every signal it cannot disprove", async () => {
+      const repo = writeRepo({
+        "src/only-values.ts": `import { v } from "./v";\nexport const u = v;\n`,
+        "src/v.ts": `export const v = 1;\n`,
+        ...typeBarrel(),
+      });
+      const truncated = {
+        ...cycle(["src/a", "src/types"]),
+        // The component holds five modules; the title spells two, so it is not evidence about the rest.
+        Description: "Strongly connected component with 5 modules forming a dependency cycle.",
+      };
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        truncated,
+        cycle(["internal/api", "internal/store"]), // another language's modules — nothing anton can parse
+        fanOut("src/only-values", 12), // no erased edge to subtract
+        { ...fanOut("src/types", 11), Kind: "unknown-coupling-kind" }, // a kind these rules don't know
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(4);
+      expect(result.coupling).toEqual({ dropped: [], recounted: [] });
+      expect((result.signals[2] as { Title: string }).Title).toBe(
+        "High coupling: src/only-values imports 12 modules",
+      );
+    });
+  });
+
   it("keeps a caller abort an AbortError rather than reporting a timeout", async () => {
     process.env[STRINGER_BIN_ENV] = writeScript("slow-stringer", ["setTimeout(() => {}, 60000);"]);
     const ac = new AbortController();
@@ -648,6 +1086,53 @@ describe("parseCollectorFailures", () => {
         `time=2026-07-26T19:26:45Z level=INFO msg="collector complete" name=todos signals=1 duration=15ms`,
       ),
     ).toEqual([]);
+  });
+});
+
+// A silent filter is indistinguishable from a collector that found nothing, so every drop has to be
+// legible on the session that made it.
+describe("describeUntrackedFilter", () => {
+  const drop = (path: string, kind = "large-binary", severity = "medium") => ({
+    path,
+    kind,
+    severity,
+  });
+
+  it("names what disappeared, stays quiet when nothing did, and reports an unreadable index", () => {
+    expect(describeUntrackedFilter({ dropped: [] })).toBeUndefined();
+
+    const line = describeUntrackedFilter({
+      dropped: [drop("anton.db"), drop("scratch/notes.bin")],
+    });
+    expect(line).toContain("dropped 2 signal(s)");
+    expect(line).toContain("about 2 path(s)");
+    expect(line).toContain("anton.db (medium large-binary)");
+    expect(line).toContain("scratch/notes.bin (medium large-binary)");
+
+    const many = describeUntrackedFilter({
+      dropped: Array.from({ length: 12 }, (_, i) => drop(`f${i}.db`)),
+    });
+    expect(many).toContain("(+2 more)");
+
+    const blind = describeUntrackedFilter({ dropped: [], unavailable: "not a git repo" });
+    expect(blind).toContain("not a git repo");
+    expect(blind).toContain("are counted this pass");
+  });
+
+  // Triage turns on WHAT vanished, not how much: a dropped secret has to be distinguishable from
+  // the stale-binary noise this filter exists to remove, even when they share a path.
+  it("names the severity and kind behind each dropped path", () => {
+    const line = describeUntrackedFilter({
+      dropped: [
+        drop("config/.env", "committed-secret", "critical"),
+        drop("config/.env", "large-binary"),
+        drop("anton.db"),
+      ],
+    });
+
+    expect(line).toContain("dropped 3 signal(s) about 2 path(s)");
+    expect(line).toContain("config/.env (critical committed-secret, medium large-binary)");
+    expect(line).toContain("anton.db (medium large-binary)");
   });
 });
 

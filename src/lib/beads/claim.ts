@@ -32,6 +32,8 @@
  * read-decide-write sequence on the bead's chain; `setAssigneeIfOwner` is the one-shot swap built
  * on it.
  */
+import { NextResponse } from "next/server";
+
 import { beads, ownerOf, type Bead } from "./bd";
 import { withBeadWriteLock } from "./claim-lock";
 
@@ -64,6 +66,30 @@ export function conflictBody(id: string, owner: string | undefined): { error: st
   return owner
     ? { error: `${id} was claimed by ${owner} while this request was in flight — reload and retry`, owner }
     : { error: `${id}'s claim changed while this request was in flight — reload and retry` };
+}
+
+/**
+ * The 409 for a take-over this route REFUSED outright — no `{ steal: true }` to authorize it, no
+ * operator identity to attribute it to, or a target whose run has already left backlog. Approve
+ * and claim both answer through here so a blocked steal always carries the same envelope: the
+ * reason, the `owner` the UI names, and the `stage` when a live run is what makes it untakeable.
+ *
+ * It TAKES the message rather than deciding it. The wording is per-route authorization policy —
+ * approve takes a reservation over, claim also releases someone else's — and collapsing those into
+ * one sentence would tell the operator to do something this route does not offer. Only the
+ * envelope and the status are shared.
+ *
+ * Unlike {@link conflictBody} this returns the response, not the body: the status is half of what
+ * the gates were duplicating, so leaving it at the call sites would leave the clone half-standing.
+ */
+export function stealRefused(
+  message: string,
+  owner: string | undefined,
+  stage?: string,
+): NextResponse {
+  // Undefined fields serialize away, so a refusal that names no stage — or, like conflictBody, no
+  // owner — answers byte-identically to the hand-written body it replaces.
+  return NextResponse.json({ error: message, owner, stage }, { status: 409 });
 }
 
 /**

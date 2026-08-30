@@ -3,6 +3,7 @@ import type { Bead } from "./types";
 import {
   ACCEPTANCE_KEYS,
   acceptanceBody,
+  contractFormGaps,
   contractGaps,
   formatContractGaps,
   isContractJudged,
@@ -141,6 +142,16 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(scaffold)).toEqual([["Acceptance", "blocking"]]);
     // A box WITH text is a criterion — the marker is only scaffolding when it carries nothing.
     expect(validateBeadContract(ticket({ acceptance_criteria: "- [ ] it works" }))).toEqual([]);
+  });
+
+  it("treats a section holding only a bare heading marker as unwritten", () => {
+    // `###` alone renders as an empty heading — scaffolding over nothing. Reading the marker as
+    // content passed the blocking gate on a section stating no definition of done.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "###"].join("\n"),
+    });
+    expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
   });
 
   it("treats a section holding only a thematic break as unwritten", () => {
@@ -863,5 +874,98 @@ describe("contractGaps + formatContractGaps (the gates' shared input, anton-j9zs
 
   it("formats empty gaps as an empty string", () => {
     expect(formatContractGaps([])).toBe("");
+  });
+});
+
+describe("contractFormGaps (the form question, separate from the run gate)", () => {
+  /** The ticket fixture's description plus the Acceptance heading it deliberately lacks. */
+  const FULL_DESCRIPTION = `${DESCRIPTION}\n\n## Acceptance Criteria\n- [ ] it works`;
+
+  /** An epic carrying both of its sections in the description. */
+  const FULL_EPIC_DESCRIPTION = [
+    "## Outcome",
+    "Reports are shareable outside the app.",
+    "",
+    "## Success Criteria",
+    "- [ ] every report leaves the app in a customer-openable format",
+  ].join("\n");
+
+  it("reports nothing for a ticket whose description carries all five", () => {
+    expect(contractFormGaps(ticket({ description: FULL_DESCRIPTION }))).toEqual([]);
+  });
+
+  it("accepts the bare `## Acceptance` spelling older beads still carry", () => {
+    const older = ticket({ description: `${DESCRIPTION}\n\n## Acceptance\n- [ ] it works` });
+    expect(contractFormGaps(older)).toEqual([]);
+  });
+
+  it("reports Acceptance when it lives only in bd's field — the drift the gate cannot see", () => {
+    // The whole point of the split: this bead is contract-complete to the gate, because
+    // `acceptanceBodies` accepts bd's field as an equal home. The form question still names it.
+    const fieldOnly = ticket();
+    expect(validateBeadContract(fieldOnly)).toEqual([]);
+    expect(contractFormGaps(fieldOnly)).toEqual(["Acceptance"]);
+  });
+
+  it("reads a section holding the formula's TODO prompt as absent", () => {
+    const prompted = ticket({
+      description: FULL_DESCRIPTION.replace(
+        "Ship the thing.",
+        "TODO — one sentence: what this delivers",
+      ),
+    });
+    expect(contractFormGaps(prompted)).toEqual(["Goal"]);
+  });
+
+  it("names every section of a bead cooked from the formula and never authored", () => {
+    const cooked = ticket({
+      acceptance_criteria: "- [ ] TODO — a concrete, checkable statement of done",
+      description: [
+        "## Goal",
+        "TODO — one sentence: what this delivers, and why it matters",
+        "",
+        "## Acceptance Criteria",
+        "- [ ] TODO — a concrete, checkable statement of done",
+        "",
+        "## Context",
+        "TODO — touches: <files/areas>; follow the pattern in <file>",
+        "",
+        "## Out of scope",
+        "- TODO — what this deliberately does not change",
+        "",
+        "## Verify",
+        "TODO — the tests that prove this landed, and which to add",
+      ].join("\n"),
+    });
+    // The gate's own reporting order, so the two read the same way side by side.
+    expect(contractFormGaps(cooked)).toEqual([
+      "Acceptance",
+      "Goal",
+      "Context",
+      "Out of scope",
+      "Verify",
+    ]);
+  });
+
+  it("judges an epic on its own two sections, not a ticket's five", () => {
+    // The fixture's outcome is a bare preamble line — a heading is the convention, not the
+    // requirement — and its Success Criteria lives only in bd's field.
+    expect(contractFormGaps(epic())).toEqual(["Success Criteria"]);
+  });
+
+  it("reports nothing for an epic carrying both sections in the description", () => {
+    expect(contractFormGaps(epic({ description: FULL_EPIC_DESCRIPTION }))).toEqual([]);
+  });
+
+  it("is silent on the `area:` label — that gap is the gate's, not the description's", () => {
+    const noArea = epic({ description: FULL_EPIC_DESCRIPTION, labels: [] });
+    expect(summarize(noArea)).toEqual([["area:", "advisory"]]);
+    expect(contractFormGaps(noArea)).toEqual([]);
+  });
+
+  it("faults neither an exempt type nor a bead no bd read produced", () => {
+    const shallow: Bead = { id: "anton-p", title: "projection", status: "open", issue_type: "task" };
+    expect(contractFormGaps(shallow)).toEqual([]);
+    expect(contractFormGaps(ticket({ issue_type: "learning", description: "" }))).toEqual([]);
   });
 });

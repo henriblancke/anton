@@ -7,7 +7,7 @@
  * clock. Times are stored as unix SECONDS (the schema's timestamp mode); this module works in ms
  * and converts at the boundary.
  */
-import { and, desc, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, like, lt, lte, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { randomUUID } from "node:crypto";
 import * as schema from "../db/schema";
@@ -24,7 +24,8 @@ export type JobType =
   | "unstick"
   | "gate-check"
   | "gardener"
-  | "product-master";
+  | "product-master"
+  | "board-picker";
 
 /**
  * `queued`  — eligible when runAt ≤ now (also how a backoff/quota reschedule is represented).
@@ -140,6 +141,87 @@ function executeEpicPayload(projectId: string, epicBeadId: string, bypassBudget?
     : { projectId, epicBeadId };
 }
 
+/**
+ * Id of the first job matching `where`, or undefined. The shared preamble of every dedupe lookup
+ * below: they differ only in their predicate, and all run synchronously so a caller can use them as
+ * the read half of a better-sqlite3 read→write transaction (see `enqueueExecuteEpicDeduped`).
+ */
+function firstJobId(tx: Pick<AntonDb, "select">, where: SQL | undefined): string | undefined {
+  const rows = tx
+    .select({ id: schema.jobs.id })
+    .from(schema.jobs)
+    .where(where)
+    .limit(1)
+    .all();
+  return rows[0]?.id;
+}
+
+/** Id of an execute-epic job for this project + epic in any of `statuses`, if one exists. */
+function executeEpicIdInStatuses(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+  statuses: readonly JobStatus[],
+): string | undefined {
+  return firstJobId(
+    tx,
+    and(
+      eq(schema.jobs.type, "execute-epic"),
+      eq(schema.jobs.projectId, projectId),
+      inArray(schema.jobs.status, [...statuses]),
+      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+    ),
+  );
+}
+
+/**
+ * The insert values for a fresh `queued` execute-epic job. Both enqueue paths
+ * (`enqueueExecuteEpicIfAbsent`, `enqueueExecuteEpicDeduped`) build their row here so a payload-shape
+ * or column-default change is a single edit and can't drift between them.
+ */
+function newExecuteEpicJobRow(
+  projectId: string,
+  epicBeadId: string,
+  nowMs: number,
+  bypassBudget?: boolean,
+): typeof schema.jobs.$inferInsert {
+  return {
+    id: randomUUID(),
+    type: "execute-epic",
+    projectId,
+    payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, bypassBudget)),
+    status: "queued",
+    runAt: secDate(nowMs),
+    attempts: 0,
+    createdAt: secDate(nowMs),
+    updatedAt: secDate(nowMs),
+  };
+}
+
+/**
+ * Promote a covering QUEUED execute-epic job to "run now": set the bypass flag and pull `runAt` due,
+ * clearing any budget defer that had pushed it into the future. Guarded to `queued` — a `running` job
+ * is already executing (its payload is re-read only on the next attempt) and a parked/failed one is
+ * left for its own resume path.
+ */
+function promoteToBypass(
+  tx: Pick<AntonDb, "update">,
+  jobId: string,
+  projectId: string,
+  epicBeadId: string,
+  nowMs: number,
+): void {
+  tx.update(schema.jobs)
+    .set({
+      payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
+      runAt: secDate(nowMs),
+      lastError: null,
+      updatedAt: secDate(nowMs),
+    })
+    .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "queued")))
+    .run();
+}
+
 /** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {
@@ -156,20 +238,7 @@ export function activeExecuteEpicId(
   projectId: string,
   epicBeadId: string,
 ): string | undefined {
-  const rows = tx
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "execute-epic"),
-        eq(schema.jobs.projectId, projectId),
-        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows[0]?.id;
+  return executeEpicIdInStatuses(tx, projectId, epicBeadId, ACTIVE_STATUSES);
 }
 
 /**
@@ -185,20 +254,7 @@ function coveringExecuteEpicId(
   projectId: string,
   epicBeadId: string,
 ): string | undefined {
-  const rows = tx
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "execute-epic"),
-        eq(schema.jobs.projectId, projectId),
-        inArray(schema.jobs.status, [...COVERING_STATUSES]),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows[0]?.id;
+  return executeEpicIdInStatuses(tx, projectId, epicBeadId, COVERING_STATUSES);
 }
 
 /** The statuses a settled execute-epic job can be un-parked from — exactly what `resumeJob` accepts. */
@@ -311,39 +367,15 @@ export function enqueueExecuteEpicIfAbsent(
       if (covering) {
         // A take-over with "run now" intent (`bypassBudget`) onto a covering QUEUED job — e.g. a
         // paced "Queue for optimal usage" row, possibly budget-deferred to a future runAt — must
-        // promote it, mirroring `enqueueExecuteEpicDeduped`: set the bypass flag and pull it due
-        // now, or the governor keeps holding the reused job to the pace boundary and the "run now"
-        // intent is silently dropped. Guarded to `queued`: a running job is already executing, and
-        // a parked/failed one is left for its own resume path.
-        if (opts?.bypassBudget) {
-          tx.update(schema.jobs)
-            .set({
-              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
-              runAt: secDate(nowMs),
-              lastError: null,
-              updatedAt: secDate(nowMs),
-            })
-            .where(and(eq(schema.jobs.id, covering), eq(schema.jobs.status, "queued")))
-            .run();
-        }
+        // promote it, mirroring `enqueueExecuteEpicDeduped`, or the governor keeps holding the
+        // reused job to the pace boundary and the "run now" intent is silently dropped.
+        if (opts?.bypassBudget) promoteToBypass(tx, covering, projectId, epicBeadId, nowMs);
         return undefined;
       }
 
-      const id = randomUUID();
-      tx.insert(schema.jobs)
-        .values({
-          id,
-          type: "execute-epic",
-          projectId,
-          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, opts?.bypassBudget)),
-          status: "queued",
-          runAt: secDate(nowMs),
-          attempts: 0,
-          createdAt: secDate(nowMs),
-          updatedAt: secDate(nowMs),
-        })
-        .run();
-      return id;
+      const row = newExecuteEpicJobRow(projectId, epicBeadId, nowMs, opts?.bypassBudget);
+      tx.insert(schema.jobs).values(row).run();
+      return row.id;
     });
   } catch (e) {
     // Backstop: the index rejected a concurrent insert. The winning job now covers the epic locally.
@@ -377,20 +409,16 @@ export function enqueueReviewFixIfAbsent(
 ): string | undefined {
   const nowMs = clock.now();
   return db.transaction((tx) => {
-    const existing = tx
-      .select({ id: schema.jobs.id })
-      .from(schema.jobs)
-      .where(
-        and(
-          eq(schema.jobs.type, "review-fix"),
-          eq(schema.jobs.projectId, projectId),
-          inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
-          eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-        ),
-      )
-      .limit(1)
-      .all();
-    if (existing[0]) return undefined;
+    const existing = firstJobId(
+      tx,
+      and(
+        eq(schema.jobs.type, "review-fix"),
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    );
+    if (existing) return undefined;
 
     const id = randomUUID();
     tx.insert(schema.jobs)
@@ -436,39 +464,15 @@ export function enqueueExecuteEpicDeduped(
       const existing = activeExecuteEpicId(tx, projectId, epicBeadId);
       if (existing) {
         // "Approve" (immediate) on an epic that already has a queued run: promote it so the budget
-        // governor stops pacing it — set the bypass flag AND pull it due now, clearing any budget
-        // defer that had pushed its runAt into the future. Guarded to `queued` (a `running` job is
-        // already executing, and its payload is re-read only on the next attempt). A queue-mode
-        // (non-bypass) re-approve leaves the existing job exactly as it is (anton-d8i4).
-        if (bypassBudget) {
-          tx.update(schema.jobs)
-            .set({
-              payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, true)),
-              runAt: secDate(nowMs),
-              lastError: null,
-              updatedAt: secDate(nowMs),
-            })
-            .where(and(eq(schema.jobs.id, existing), eq(schema.jobs.status, "queued")))
-            .run();
-        }
+        // governor stops pacing it. A queue-mode (non-bypass) re-approve leaves the existing job
+        // exactly as it is (anton-d8i4).
+        if (bypassBudget) promoteToBypass(tx, existing, projectId, epicBeadId, nowMs);
         return existing;
       }
 
-      const id = randomUUID();
-      tx.insert(schema.jobs)
-        .values({
-          id,
-          type: "execute-epic",
-          projectId,
-          payloadJson: JSON.stringify(executeEpicPayload(projectId, epicBeadId, bypassBudget)),
-          status: "queued",
-          runAt: secDate(nowMs),
-          attempts: 0,
-          createdAt: secDate(nowMs),
-          updatedAt: secDate(nowMs),
-        })
-        .run();
-      return id;
+      const row = newExecuteEpicJobRow(projectId, epicBeadId, nowMs, bypassBudget);
+      tx.insert(schema.jobs).values(row).run();
+      return row.id;
     });
   } catch (e) {
     // Backstop: the index rejected a concurrent insert. Return the job that won the race.
@@ -491,19 +495,14 @@ function queuedSyncPushId(
   tx: Pick<AntonDb, "select">,
   projectId: string,
 ): string | undefined {
-  const rows = tx
-    .select({ id: schema.jobs.id })
-    .from(schema.jobs)
-    .where(
-      and(
-        eq(schema.jobs.type, "sync-push"),
-        eq(schema.jobs.projectId, projectId),
-        eq(schema.jobs.status, "queued"),
-      ),
-    )
-    .limit(1)
-    .all();
-  return rows[0]?.id;
+  return firstJobId(
+    tx,
+    and(
+      eq(schema.jobs.type, "sync-push"),
+      eq(schema.jobs.projectId, projectId),
+      eq(schema.jobs.status, "queued"),
+    ),
+  );
 }
 
 /**

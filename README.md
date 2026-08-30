@@ -4,7 +4,14 @@
 
 <h1 align="center">anton</h1>
 
-<p align="center"><strong>Shape an idea into an epic, approve it, and let it ship itself.</strong></p>
+<p align="center"><strong>Shape an idea into a feature, approve it, and let it ship itself.</strong></p>
+
+anton is a local app that turns ideas — yours, or findings from scanning your code — into merged pull requests. You describe what you want and approve the plan; anton does the rest: it spins up an isolated git worktree, drives `claude` to write the code, runs your verify gates, reviews its own diff in a fresh context, opens the PR, and keeps working it until CI is green and reviewers are satisfied.
+
+- **You decide twice; anton does the rest.** Approve the work, merge the PR — everything between runs on its own.
+- **Nothing runs unapproved.** Every piece of work is a readable contract (Goal, Acceptance, Verify) you sign off before a line is written.
+- **Everything is visible.** A live board, streaming terminals, run history, review scores, a health page — and when something stalls, it surfaces as a decision for you, never a silent hang.
+- **Local and private.** anton runs on your machine and drives your local `claude`, `git`, `gh`, and `bd`. Nothing to sign up for, nothing leaves your machine — unless you opt into a [shared board server](#board-modes--solo-or-team) you host yourself.
 
 ## Get started
 
@@ -19,73 +26,79 @@ Then set it up and start the server:
 ```bash
 anton setup                    # check prereqs, migrate the DB, install skills & agents
 anton start                    # start the server → http://localhost:3000
-open http://localhost:3000     # add a repo, shape an epic, approve, watch it run
+open http://localhost:3000     # add a repo, shape a feature, approve, watch it run
 ```
 
 anton drives your local `claude`, `git`, `gh`, and `bd` — install those first ([Prerequisites](#prerequisites)). For how the bundle works and how to manage it see [Install](#install); to hack on anton itself, run it [from source](#from-source-contributors).
 
-## What is anton
-
-anton is a local app that takes an idea — or a finding from scanning your code — and turns it into work that gets done while you watch. You describe what you want; anton **shapes** it into an epic with concrete tickets and sets it aside for your OK. Once you **approve**, it runs each ticket **autonomously**: it spins up an isolated git worktree, drives `claude` to write the code, runs your tests, and opens a **pull request**. Then it keeps working the PR for you — when a reviewer asks for changes or CI goes red, it **auto review-fixes** until the PR is clean.
-
-The loop, in one line:
+## How it works
 
 ```
-shape → approve → autonomous run → PR → auto review-fix
+shape → approve → run (worktree → claude → verify gates → self-review) → PR → review-fix → merge
 ```
 
-You stay in control at exactly two points — approving the epic and merging the PR. Everything in between runs on its own.
+1. **Shape.** An interactive `/shape` session turns your idea into an **epic** (the product outcome) and **features** under it — each feature one PR's worth of work with Goal, Acceptance criteria, and tickets. It lands in **backlog**, unapproved.
+2. **Approve.** You read the contract and click **Approve** — or **Queue**, to pace the run against your Claude usage. anton only ever executes approved work.
+3. **Run.** One worktree, one PR. anton works the feature's tickets — `claude` implements (base contract + your seed prompt + the ticket's agent prompt), your verify gates check each step, and a fresh-context **self-review** scores the diff and fixes blocking findings — then it commits and opens the PR.
+4. **Review-fix.** A scheduled job watches the open PR: reviewer comments and failing checks are dispatched back to `claude`, pushed, and review re-requested until the PR is clean. You merge.
 
-> **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. It is not a hosted service — there's nothing to sign up for and nothing leaves your machine. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
+> **Local, not deployed.** anton runs as a Next.js server on your machine and drives your local `claude`, `git`, `gh`, `bd`, and `stringer`. See [`DESIGN.md`](./DESIGN.md) for the full architecture.
 
-## What it does
+**beads is the source of truth for work.** Epics, features, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. That per-machine copy is the default; a team can instead point a project at one shared Dolt server and skip syncing altogether — see [Board modes](#board-modes--solo-or-team). anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
 
-The core loop:
-
-```
-Add a repo  →  /shape an epic (interactive)  →  it lands in "backlog"
-            →  you Approve the epic
-            →  anton runs it: worktree → claude (+ agent prompt) → tests → commit → PR
-            →  epic moves to "in-review" with a live terminal + PR link
-            →  review-fix watches the PR: resolves review comments + CI failures, pushes, re-requests review
-```
-
-Plus two scheduled background jobs, per project:
-
-- **nightly-stringer** — scans the repo for actionable signals (`stringer scan --delta`) and triages the few worth doing into well-formed beads.
-- **orphan-grooming** — buckets loose tickets (no parent epic) under a grooming epic so they become approvable work.
-
-**beads is the source of truth for work.** Epics, tickets, approval, stage, and the PR link all live in each repo's `.beads/` (queried via `bd`). Beads state syncs between machines via Dolt — `refs/dolt/data` on the git remote, configured by `anton setup` — so a fresh clone hydrates its board with `bd dolt pull`, not from files in the clone. The `.beads/*.jsonl` files are passive local exports for viewers: git-ignored, regenerated, and never the source of truth. anton's own SQLite (`anton.db`) holds only machine-local execution state: projects, runs, jobs, schedules, and sessions — it's disposable and git-ignored.
-
-## Feature walkthrough
+## Features
 
 ### The board
 
-![The epics board — four stage columns derived live from beads](docs/images/board.png)
+![The board — features moving through four stages, derived live from beads](docs/images/board.png)
 
-A project's home is a four-column board — **backlog → implementing → in-review → done** — with a live count on each column and a **live-synced** pill that shows the board is following beads in real time. Every stage is derived from beads at read time (an epic's tickets and its PR state decide where it sits), so the board is never a cache to reconcile: approve an epic in backlog and it moves right on its own as its runs land. In-review cards carry their PR number, and backlog cards expose the controls directly — **Approve** to start automation, or **Claim** to reserve an epic for yourself without approving it yet (**Release** to drop the claim). Loose bugs and tasks with no parent epic surface in their own **Standalone** lane so they're just as approvable as epics.
+A project's home: **backlog → implementing → in-review → done**, derived from beads at read time — never a cache to reconcile. Group by stage or by epic, filter by epic or area, search everything (`⌘K`). Cards carry their epic, agent, risk, size, review score, and PR; backlog cards expose **Approve**, **Queue**, and **Claim** directly. Loose bugs and tasks surface in a **Standalone** lane, just as approvable. A **health pill** and a **sync pill** keep the scan trend and board freshness in view.
 
-### Epic detail
+### Needs you
 
-![An epic's contract and its live dependency graph](docs/images/epic.png)
+![The Needs-you strip — stalls surfaced as decisions](docs/images/needs-you.png)
 
-Opening an epic shows its full contract — Goal, Acceptance, and child tickets with size labels — beside a live **dependency graph** of the ticket DAG (`blocks` / `part of` edges, laid out left→right). This is the review-and-approve gate from step 3 of the loop: you read exactly what anton will build before anything runs, then **Run epic** launches it (or **Open worktree** to inspect the isolated checkout).
+Nothing wedges silently. A parked run, a job out of retries, or a gate waiting on a human surfaces on the board as an escalation with the decision inline — **Resume** or **Abandon** — and disappears the moment it's settled.
+
+### Feature detail
+
+![A feature's contract, self-review rounds, and live dependency graph](docs/images/epic.png)
+
+The approval gate. A feature shows its full contract — Goal, Acceptance, tickets, PR — beside the live **dependency graph** of its ticket DAG. Below it, the **self-review** record: each round with its score and findings, so you can see what the reviewer flagged and what got fixed before the PR opened. **Send back** reworks a feature with your notes — even after its PR opened or merged. **Open worktree** drops you into the isolated checkout.
+
+### Roadmap
+
+![The roadmap — epics, priorities, areas, and shipped counts](docs/images/roadmap.png)
+
+The epic-level view: every product outcome with its priority, area, and features shipped. Epics can sync to **Linear** (`bd linear sync`) if you track them there too.
+
+### Health
+
+![The health page — patrol, scan trend, review trajectory](docs/images/health.png)
+
+How the codebase and the system are doing: **Worth a look** flags work that stalled (in progress but untouched for days), **Codebase signals** tracks each nightly scan — new signals by severity, what got triaged into beads, what was deduped — and **Housekeeping** counts contract gaps, stale claims, and shipped-but-open work. The sidebar holds the scan trend and the **review-score average** across recent runs.
 
 ### Tickets
 
-![The filterable tickets list across all epics](docs/images/tickets.png)
+![The filterable tickets index](docs/images/tickets.png)
 
-The tickets view is the flat, cross-epic index — every epic and ticket in the project with its id, parent epic, agent, risk, and size, filterable by any of those plus title, status, and type. It's the granular counterpart to the board: where the board tracks epics through stages, this is where you scan, filter, and drill into individual work items.
+The flat, cross-epic index: every epic, feature, and ticket with its id, epic, agent, claim, risk, and size — filterable by all of it plus title, status, type, and outcome. Where the board tracks features through stages, this is where you scan and drill in.
 
-### More views
+### Runs & jobs
 
-Three more views round out a project, in the left nav:
+![Run history — every worktree anton has executed](docs/images/runs.png)
 
-- **Dependencies** — the project-wide dependency graph across every epic and ticket, so you can see the whole DAG at once rather than one epic at a time.
-- **Runs** — every run anton has executed, each with its epic · ticket · agent, status (done / failed), and duration. Runs are the per-ticket unit of work: a worktree, a `claude` session, tests, a commit.
-- **Jobs** — the background job queue behind those runs — `execute-epic`, `review-fix`, and the scheduled jobs — showing what's running, queued, done, or parked, with attempts and timing. A stuck job can be **force-killed** here.
+**Runs** is the execution history — every worktree with its feature · ticket · agent, status, and duration. **Jobs** is the queue behind them — what's running, queued, done, or parked, with attempts, live output, an **Investigate** shortcut, and a **Force kill** for anything stuck.
 
-A global **usage pill** in the sidebar tracks your live Claude session and weekly limits at a glance (toggle with `ANTON_USAGE_PILL`).
+### The board tends itself
+
+Scheduled passes keep the queue healthy without you: **nightly-stringer** scans the repo and triages real signals into well-formed beads, **orphan-grooming** buckets loose tickets into approvable work, and a **product-master** pass reads the whole board and proposes reprioritizations, rehomes, splits, and kills. Every proposal is a bead you accept or decline — and per detection kind you dial autonomy from **propose** (file it and stop) through **shadow** (also record what applying would have done) to **apply** (write it, with an audit trail under Jobs).
+
+### The pipeline is yours
+
+The run pipeline is a bd formula at `.beads/formulas/anton-run.formula.toml` — git-tracked, project-owned, editable. **Pipeline variants** walk a different formula for beads carrying a label (say, a stricter pipeline for `risk:high`; first match wins). **Verify gates** (test, lint, typecheck, build) run in the worktree before every commit and before every review-fix push. Specialist **agent prompts** ride on `agent:` labels, and a **seed prompt** layers your conventions onto every run.
+
+Also in a project's nav: **Dependencies**, the project-wide DAG across every epic and ticket. In the sidebar: a live Claude **usage pill** (toggle with `ANTON_USAGE_PILL`) and the workspace switcher — anton drives as many repos as you point it at.
 
 ## Prerequisites
 
@@ -174,6 +187,7 @@ The **job runner and cron scheduler start automatically** with the server (via `
 ```
 anton setup     check prereqs, migrate DB, install/refresh agents & skills  [--agents <a,b,c>|all] [--force-skills]
 anton init      configure beads in a target repo + register it       [path] [--prefix <p>] [--force-skills]
+anton server-mode  point one project's board at a shared Dolt server + verify it  [path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]
 anton doctor    check prereqs + anton.db + stale skills (non-destructive)
 anton board-check  report beads that break epic → feature → ticket   [path...] (default: cwd)
 anton dev       run the dev server (next dev)                         [--port <n>]
@@ -214,31 +228,30 @@ Two different scopes — run each at its own layer:
 Once the server is up at `http://localhost:3000`, a full turn of work looks like this:
 
 1. **Add a project.** From the projects screen, add a local repo that has a `.beads/` directory — or run **`anton init <path>`** in a terminal, which configures beads there and registers the repo in one step (see [`anton setup` vs `anton init`](#anton-setup-vs-anton-init)). Adding a repo from the UI records its path and detects its default branch; it self-heals the beads team-config but never rewrites your git history.
-2. **Shape an epic.** Click **Add work** to open an interactive `/shape` session in the browser terminal. You talk through the idea with `claude`; it writes an epic — Goal, Acceptance, and child tickets — into the repo's beads. The epic lands in **backlog**, unapproved.
-3. **Review and approve.** Open the epic on the board and read its Goal, Acceptance, and tickets. When it's right, click **Approve**. This is the gate: **anton only ever executes approved epics.** Nothing runs against your code until you approve.
-4. **Watch it run.** On approval the epic moves to **implementing** and anton enqueues a run per ticket. Each run gets its own git worktree, drives `claude` (base contract + your seed prompt + the ticket's agent prompt) to implement the ticket, runs your test command, commits, and opens a PR. A live terminal streams the session; the board shows progress. When every ticket is done the epic moves to **in-review** with its PR link.
+2. **Shape a feature.** Click **Add work** to open an interactive `/shape` session in the browser terminal. You talk through the idea with `claude`; together you land a **feature** — one PR's worth of work, with Goal, Acceptance criteria, Context, Out of scope and Verify — under the **epic** (the product outcome) it advances, which you pick from the board or shape on the spot. The feature lands in **backlog**, unapproved.
+3. **Review and approve the feature.** Open the **feature** on the board and read its Goal, Acceptance criteria, and tickets. When it's right, click **Approve**. This is the gate: **anton only ever executes approved work.** Approval is per feature — the epic above it groups features and is never approved or run itself, so each PR gets its own decision. Nothing runs against your code until you approve.
+4. **Watch it run.** On approval the feature moves to **implementing** and anton enqueues its run — one worktree, one PR. The run works through the tickets shaped under the feature (a feature with none is itself the single ticket), driving `claude` (base contract + your seed prompt + the ticket's agent prompt) to implement each one, running your test command, and committing. A live terminal streams the session; the board shows progress. When the work is done the feature moves to **in-review** with its PR link.
 5. **Let review-fix work the PR.** The **review-fix** job polls each open PR. When a reviewer requests changes or CI fails, it dispatches `claude` with the PR context (comments, failing checks) to resolve them, pushes, and re-requests review — repeating until the PR is clean. You review and merge; anton keeps the loop tidy in between.
 
-You stay in control at two points — approving the epic and merging the PR. Everything between is autonomous.
+You stay in control at two points — approving the feature and merging the PR. Everything between is autonomous.
 
 ### Project settings
 
 Each project has its own settings (under **Settings** for that project). Nothing here is required — sensible defaults apply when a field is empty.
 
-| Setting | What it controls |
+| Section | What it controls |
 |---------|------------------|
-| **Model** | Which model the headless `claude` driver uses for runs (Opus / Sonnet / Haiku / Fable, or **Default** to use `claude`'s own configured model). |
-| **Seed prompt** | Extra operator guidance layered onto the locked base contract for every run — conventions, things to avoid, where key files live. It customizes *how* epics are approached; it can't override the base contract. Empty = base + agent prompt only. |
-| **Review-fix prompt** | Overrides the default review-fix reasoning prompt (`skills/review-fix/SKILL.md`). anton appends the concrete PR context beneath it. Empty = the shipped default. |
-| **Verify gates** | The commands anton runs in a worktree to verify a ticket before committing — **test**, plus optional **lint**, **typecheck**, and **build**. Each is a shell command; a non-zero exit fails the ticket. Unset gates are skipped. |
-| **Active agents** | Which specialist agent prompts dispatch may assign. A run whose ticket needs a disabled agent is **parked** rather than silently run with the default. Empty (never set) = all discovered agents active. |
-| **Base branch** | The branch runs target and open their PRs against (defaults to the repo's detected default branch). |
-| **Conventional-commit PR titles** | When on, prefixes the epic PR title with a derived `<type>(<scope>): ` (bug→`fix`, epic/task→`feat`; scope = the `agent:` label). Off by default — the title stays `<title> (<id>)`. |
-| **Max concurrent runs** | How many worktrees run in parallel (1–6). |
-| **Job timeout / max retries** | Wall-clock limit for a single job attempt, and how many attempts before a job is parked for a human. |
-| **Autonomous execution** | Whether approved epics run without further prompting. When off, approval still enqueues the run but it waits until you turn autonomy back on. |
-
-The three background jobs (**review-fix**, **nightly-stringer**, **orphan-grooming**) can each be toggled on/off per project under **Automation**.
+| **General** | Name, repository path, base branch runs open PRs against, and which model the headless `claude` driver uses (Opus / Sonnet / Haiku / Fable, or **Default** for `claude`'s own configured model). |
+| **Active agents** | Which specialist agent prompts dispatch may assign. A ticket needing a disabled agent is **parked**, never silently run with the default. Empty (never set) = all discovered agents active. |
+| **Execution prompt** | Operator guidance layered onto the locked base contract for every run — conventions, pitfalls, where key files live. It customizes *how* work is approached; it can't override the base contract. |
+| **Pipeline variants** | Per-label pipeline overrides — beads carrying a matching label walk their own formula instead of `anton-run.formula.toml`; first match wins. |
+| **Concurrency & limits** | Parallel runs (1–6), job/ticket timeouts, retries before parking, conventional-commit PR titles, budget-aware pacing (enables **Queue**), and the **autonomous execution** switch — when off, approvals still enqueue but nothing runs. |
+| **Verify gates** | The commands that gate every commit — **test**, plus optional **lint**, **typecheck**, and **build**. Each is a shell command; a non-zero exit fails the ticket. Unset gates are skipped. |
+| **Self-review** | The pre-PR review gate — on by default, findings fixed in a bounded loop. Swap the reviewer for one of the project's agents or a custom prompt. |
+| **Review-fix** | Overrides the default review-fix reasoning prompt (`skills/review-fix/SKILL.md`). anton appends the concrete PR context beneath it. |
+| **Automation** | Every scheduled job's on/off and cadence (see [Default schedules](#default-schedules)), plus the product-master prompt override. |
+| **Proposal autonomy** | How far an automated pass may go with what it finds, per detection kind: **propose** / **shadow** / **apply**. Unattended writes are recorded under Jobs. |
+| **Danger zone** | Remove the project from anton (the repo and its beads are untouched). |
 
 ### Default schedules
 
@@ -247,8 +260,9 @@ Default per-project schedules are seeded on project creation:
 - **review-fix** — every 15 min (`*/15 * * * *`)
 - **nightly-stringer** — daily at 03:00 (`0 3 * * *`)
 - **orphan-grooming** — weekly, Mon 04:00 (`0 4 * * 1`)
+- **run-health** — hourly stall sweep (`0 * * * *`), off by default
 
-Edit the cron or disable any of them in project settings.
+More job types can be put on a cron under **Automation** — **gate-check** (settle waits on human gates), **unstick** (recover wedged jobs), **gardener** (board hygiene detections), and **product-master** (whole-board proposals). Edit the cadence or disable any of them in project settings.
 
 ## Configuration
 
@@ -266,6 +280,43 @@ Environment variables (all optional):
 | `ANTON_STRINGER_BIN` | `stringer` (on `PATH`) | override the `stringer` executable |
 | `ANTON_USAGE_PILL` | on | live Claude usage pill (`GET /api/usage`); set falsy (`0`/`false`/`off`) to disable |
 
+### Board modes — solo or team
+
+Each project's beads board runs one of two ways. **Embedded is the default and needs no configuration.**
+
+| | **Embedded** (default) | **Shared server** |
+|---|---|---|
+| Where the board lives | a Dolt database under `.beads/` on each machine | one `dolt sql-server` you host |
+| How machines agree | `bd dolt push/pull` over `refs/dolt/data` on the git remote | they read and write the same database |
+| Offline | works | needs the server reachable |
+| Sync pill | **Live** / **Not wired to shared remote** / **Sync failing** | **Shared server** |
+| Claims | advisory | advisory (unchanged) |
+
+Embedded is right for one person, or for teammates who can live with push/pull lag: your board is always there, and only propagation waits on the network. **Server mode** is for a small team that wants one board in real time — every machine writes the same database, so a bead created on one is visible on the others immediately and there is nothing to sync. The trade is the obvious one: there's no local copy, so while the server is unreachable that board is unavailable. anton fails loud about it (the sync pill goes `Sync failing`, naming the configured host and port) rather than quietly drifting.
+
+Server mode is **opt-in, per project, and self-hosted** — the server is yours; anton adds no service and no account. To turn it on, put the connection in the project's `.beads/metadata.json` (committed, so **never** a password):
+
+```json
+{
+  "dolt_mode": "server",
+  "dolt_server_host": "dolt.example.dev",
+  "dolt_server_port": 3306,
+  "dolt_server_user": "beads",
+  "dolt_database": "myproject",
+  "dolt_server_tls": true
+}
+```
+
+`dolt_server_tls` is the project's transport: `true` when the server sets `require_secure_transport`, `false` when it is plaintext. Declare it per project rather than exporting `BEADS_DOLT_SERVER_TLS`, which is one value for every project — one anton driving a TLS server and a plaintext one gets `TLS requested but server does not support TLS` on whichever the ambient value doesn't describe. Omit the key and that ambient value is inherited, as before.
+
+The password goes in the environment anton runs in, scoped to that database user — `BEADS_DOLT_PASSWORD_BEADS` for the user above (`BEADS_DOLT_PASSWORD_<USER>`, uppercased, non-alphanumerics folded to `_`), or a bare `BEADS_DOLT_PASSWORD` if every project shares one account. When two servers both have an account called `beads` with different passwords, scope it by server too — `BEADS_DOLT_PASSWORD_<HOST>_<PORT>_<USER>`, i.e. `BEADS_DOLT_PASSWORD_DOLT_EXAMPLE_DEV_3306_BEADS`, which wins over the per-user variable. Set no other `BEADS_DOLT_*` variables in a shell you launch anton from: they outrank each project's own config, and a stray `BEADS_DOLT_SERVER_DATABASE` points *every* project at that one database.
+
+Check it with `bd dolt show` — it should name the host, port, user, and database you configured and report the server reachable — and with `bd dolt test`.
+
+**Moving an existing embedded board onto a server** is two jobs, and anton owns only the second. The board's history is a Dolt database directory, and it reaches the server's data volume by a copy you run by hand — follow [`docs/runbooks/embedded-board-to-shared-dolt-server.md`](./docs/runbooks/embedded-board-to-shared-dolt-server.md), validated end to end. Then `anton server-mode <repo> --host <host> --database <db>` (add `--tls` / `--no-tls` to declare the transport) does the config half: it writes the metadata above, verifies the board reads back whole, and puts the old file back if it doesn't. `bd export` → `bd import` is **not** a substitute — it moves the issues and drops the board's Dolt commit history. The embedded `.beads/embeddeddolt/<db>/` copy stays where it is throughout: it's the history backup and the way back.
+
+Full behaviour, including what each mode does when the network or the server goes down, is in [`DESIGN.md` §3a](./DESIGN.md#3a-board-modes--embedded-vs-shared-server).
+
 ## Troubleshooting
 
 **`anton setup`/`doctor` reports a MISSING required tool.** anton can't run without `git`, `bd`, `claude`, and node ≥ 20. Install the flagged tool, make sure it's on your `PATH`, and re-run `anton doctor` until every required row shows `found`. `gh` and `stringer` are optional — without `gh` you lose PRs and review-fix; without `stringer` you lose the nightly scan.
@@ -281,6 +332,10 @@ Then restart the server. (A node upgrade can break the ABI again — re-run the 
 **The UI boots but nothing executes.** Approved epics run only when the job runner is on. If you started with `ANTON_RUNNER=off`, the UI comes up but the runner and scheduler don't — restart without that variable so runs execute and scheduled jobs fire. Conversely, set `ANTON_RUNNER=off` when you *want* the UI without any background execution (e.g. inspecting state).
 
 **A run never opens a PR, or review-fix does nothing.** These need `gh` authenticated against the repo's remote. Check `gh auth status` and that the project's remote is reachable. review-fix also only acts once a PR exists and a reviewer has requested changes or a check has failed.
+
+**`anton init`/`doctor` says the shared Dolt server is UNREACHABLE.** On a server-mode board there is no local copy, so anton refuses to configure (or reports red for) a repo whose server it can't reach, naming the configured `host:port/database`. Same causes and same fixes as the sync-pill entry below — reach the server, correct `.beads/metadata.json`, export the password variable — or set `dolt_mode` back to `"embedded"` to work from this machine's copy until the server is back. `anton doctor` exits non-zero while it's unreachable, so it's safe to gate a script on.
+
+**The sync pill says `Sync failing` on a shared-server board.** anton preflights the shared Dolt server and reports the configured host, port, and database in the error. Check that the server is up and reachable from this machine, that `.beads/metadata.json` names the right host/port/user, and that the password variable for that user (`BEADS_DOLT_PASSWORD_<USER>`, or `BEADS_DOLT_PASSWORD`) is set **in the environment anton itself was started from** — a `direnv` approval that never got granted is a common cause. No restart is needed once it's fixed: the next heartbeat picks the server back up. To keep working while the server is down, a machine that still has its old embedded database can set `dolt_mode` back to `"embedded"` — see [Board modes](#board-modes--solo-or-team).
 
 **`anton doctor` shows `anton.db not created`.** Run `anton setup` — it applies the Drizzle migrations that create/update `anton.db`. `anton.db` is disposable machine-local state; deleting it and re-running `anton setup` is a safe reset (your work lives in beads + git, not here).
 

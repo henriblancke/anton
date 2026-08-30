@@ -232,6 +232,21 @@ describe("toEscalationView", () => {
     });
   });
 
+  it("surfaces the gate a wait on a person hangs on — the bead resolve-and-resume closes", async () => {
+    // The gate has no column of its own, so this blob IS the link between the detector that found
+    // the wait and the verb that ends it (escalation-actions.ts).
+    const { escalation } = await raise({
+      finding: finding({
+        kind: "needs-human",
+        key: "needs-human:g-1",
+        gateId: "g-1",
+        beadId: "t-1",
+        targetBeadId: "e-1",
+      }),
+    });
+    expect(toEscalationView(escalation)).toMatchObject({ kind: "needs-human", gateId: "g-1" });
+  });
+
   it("stays actionable when the evidence blob is corrupt", async () => {
     // The row's own columns carry the reason, target and stall time, so a bad blob costs the extra
     // evidence — never the escalation itself.

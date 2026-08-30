@@ -20,6 +20,8 @@ let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
 let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_BUDGET_POLICY;
 let updateProjectSettings: typeof import("./projects").updateProjectSettings;
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
+let resolveValueLabels: typeof import("./projects").resolveValueLabels;
+let valueLabelsSchema: typeof import("./projects").valueLabelsSchema;
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-projects-test-"));
@@ -49,6 +51,8 @@ beforeAll(async () => {
   DEFAULT_PROJECT_BUDGET_POLICY = mod.DEFAULT_PROJECT_BUDGET_POLICY;
   updateProjectSettings = mod.updateProjectSettings;
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
+  resolveValueLabels = mod.resolveValueLabels;
+  valueLabelsSchema = mod.valueLabelsSchema;
 });
 
 afterAll(() => {
@@ -303,6 +307,37 @@ describe("budget policy (anton-egrg)", () => {
 
   it("rejects unknown keys so a typo can't silently persist", () => {
     expect(budgetPolicySchema.safeParse({ daytimeReserve: 15 }).success).toBe(false);
+  });
+});
+
+describe("nominated value labels (anton-prng)", () => {
+  it("nominates nothing by default — a repo anton has never seen ranks on native fields alone", () => {
+    expect(resolveValueLabels({})).toEqual([]);
+    expect(resolveBudgetPolicy({}).valueLabels).toEqual([]);
+  });
+
+  it("carries the operator's nominations, in order, onto the governor policy", () => {
+    const policy = resolveBudgetPolicy({ valueLabels: ["risk:high", "blocking-PR"] });
+    expect(policy.valueLabels).toEqual(["risk:high", "blocking-PR"]);
+  });
+
+  it("rejects a repeat nomination — a second entry could never reach its tier", () => {
+    expect(valueLabelsSchema.safeParse(["risk:high", "risk:high"]).success).toBe(false);
+    expect(valueLabelsSchema.safeParse(["risk:high", "blocking-PR"]).success).toBe(true);
+    expect(valueLabelsSchema.safeParse([""]).success).toBe(false);
+    expect(valueLabelsSchema.safeParse(Array.from({ length: 9 }, (_, i) => `l${i}`)).success).toBe(
+      false,
+    );
+  });
+
+  it("replaces the nominations wholesale — the array order IS the band order", async () => {
+    const created = await addProject({ name: "Value Labels", repoPath: makeRepoDir("value-labels") });
+    await updateProjectSettings(created.slug, { valueLabels: ["risk:high", "blocking-PR"] });
+    const settings = await updateProjectSettings(created.slug, { valueLabels: ["blocking-PR"] });
+    // A merge would have kept the demoted label; re-ranking has to be able to drop one.
+    expect(settings.valueLabels).toEqual(["blocking-PR"]);
+    expect((await updateProjectSettings(created.slug, { valueLabels: undefined })).valueLabels)
+      .toBeUndefined();
   });
 });
 

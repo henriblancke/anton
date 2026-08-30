@@ -41,6 +41,66 @@ export class PoisonError extends Error {
  */
 export class PoisonEpic extends PoisonError {}
 
+/** How a blocked-run park lists the beads holding the run back — and how it is read back. */
+const BLOCKED_BY = / is blocked by ([^—]+) — refusing to execute/;
+
+/** The clause {@link BLOCKED_BY} parses. Every blocked park is phrased through it, or the ids stop
+ * being readable back. */
+function blockedByClause(beadId: string, blockers: string[]): string {
+  return `${beadId} is blocked by ${blockers.join(", ")} — refusing to execute`;
+}
+
+/**
+ * The poison a run parks on when a prerequisite is still open. Built here, next to its parser,
+ * because that message is the ONLY durable record of WHICH beads held the run back: the run-health
+ * sweep reads the ids back out to tell a job stalled behind an open human gate — already reported as
+ * that gate's own wait — from one stalled on anything else. Reworded in one place only, the two
+ * would drift silently and the double escalation would come back.
+ */
+export function blockedByPoison(beadId: string, blockers: string[]): PoisonEpic {
+  return new PoisonEpic(
+    `${blockedByClause(beadId, blockers)}; resume the run once the blocker(s) complete`,
+  );
+}
+
+/**
+ * The reason a run parks once it has run every ticket it could and the REST are held by a
+ * prerequisite outside this run (anton-1two). Lives beside {@link blockedByPoison} for the same
+ * reason and shares its clause: run-health must read the blocker ids back out of a partially-gated
+ * park exactly as it does an all-or-nothing one. Returns the text rather than an error so the caller
+ * can classify the park itself — this one stops a run whose earlier tickets already committed.
+ */
+export function blockedTailReason(
+  beadId: string,
+  args: { blockers: string[]; held: string[]; ran: string[] },
+): string {
+  const ran =
+    args.ran.length > 0
+      ? `${args.ran.length} ticket(s) that could run did (${args.ran.join(", ")}) and their commits ` +
+        `are on the branch, but no pull request opens until the whole run target is complete. `
+      : "";
+  return (
+    `${blockedByClause(beadId, args.blockers)} ${args.held.join(", ")} — ` +
+    `${ran}Resume the run once the blocker(s) complete and the held ticket(s) will run into this ` +
+    `same branch and its one pull request`
+  );
+}
+
+/**
+ * The blocker ids a {@link blockedByPoison} park names, or undefined when the message is some other
+ * poison. Matched anywhere in the text so a caller can pass the park reason with the runner's
+ * `poison:` prefix — or a report finding's prose — still attached.
+ */
+export function poisonBlockerIds(parkMessage: string): string[] | undefined {
+  const match = BLOCKED_BY.exec(parkMessage);
+  if (!match) return undefined;
+  const ids = match[1]!
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return ids.length > 0 ? ids : undefined;
+}
+
 /**
  * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
  * run-lease (anton-jz1). Two triggers, same recovery:

@@ -33,12 +33,34 @@ const DEFAULT_CRONS = {
   unstick: "10 * * * *",
   "gate-check": "*/10 * * * *",
   gardener: "0 5 * * *",
+  "board-picker": "*/10 * * * *",
 };
+
+type Earned = Parameters<typeof SettingsView>[0]["earned"];
+
+/**
+ * The settled-proposal record the server hands in (anton-m29g). The default is the board every
+ * project starts on — nothing settled, so no kind has earned `apply` — because that is what the
+ * control has to render correctly first.
+ */
+const NO_RECORD: Earned = Object.fromEntries(
+  GARDENER_DETECTION_KINDS.map((kind) => [
+    kind,
+    { applied: 0, settled: 0, eligible: false, reason: "no settled proposals yet — apply unlocks at 10 settled with 80% applied" },
+  ]),
+);
+
+/** A record that has earned `apply` on every kind — for the tests that are about the POLICY. */
+const EARNED: Earned = Object.fromEntries(
+  GARDENER_DETECTION_KINDS.map((kind) => [kind, { applied: 30, settled: 30, eligible: true }]),
+);
 
 function renderView(
   settings: Parameters<typeof SettingsView>[0]["settings"] = {},
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
   schedules: Parameters<typeof SettingsView>[0]["schedules"] = [],
+  earned: Earned = NO_RECORD,
+  labelVocabulary: Parameters<typeof SettingsView>[0]["labelVocabulary"] = [],
 ) {
   return render(
     <SettingsView
@@ -49,6 +71,8 @@ function renderView(
       defaultCrons={DEFAULT_CRONS}
       agents={agents}
       bundledIds={[]}
+      labelVocabulary={labelVocabulary}
+      earned={earned}
     />,
   );
 }
@@ -389,6 +413,98 @@ describe("SettingsView pipeline variants (anton-aa3m)", () => {
   });
 });
 
+describe("SettingsView work value (anton-prng)", () => {
+  showing("value");
+
+  /** A board whose namespaces are its own — the picker must offer these, not labels anton assumed. */
+  const VOCABULARY = [
+    {
+      namespace: "severity",
+      labels: [
+        { label: "severity:sev1", count: 4 },
+        { label: "severity:sev2", count: 2 },
+      ],
+    },
+    { namespace: "", labels: [{ label: "approved", count: 9 }] },
+  ];
+
+  it("shows the zero-config state: nothing nominated, ranking by age alone", () => {
+    renderView({});
+    expect(screen.getByText(/Nothing nominated/)).toBeTruthy();
+  });
+
+  it("seeds the rows from the persisted nominations, in band order", () => {
+    renderView({ valueLabels: ["risk:high", "blocking-PR"] });
+    expect((screen.getByLabelText("Value label 1") as HTMLInputElement).value).toBe("risk:high");
+    expect((screen.getByLabelText("Value label 2") as HTMLInputElement).value).toBe("blocking-PR");
+  });
+
+  it("offers the board's OWN labels, grouped by namespace, and nominates one on click", () => {
+    const fetchMock = stubFetch();
+    renderView({}, [], [], NO_RECORD, VOCABULARY);
+
+    expect(screen.getByText("severity:")).toBeTruthy();
+    const chip = screen.getByRole("button", { name: /severity:sev1/ });
+    expect(chip.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(chip);
+    expect(
+      (screen.getByLabelText("Value label 1") as HTMLInputElement).value,
+    ).toBe("severity:sev1");
+    expect(
+      screen.getByRole("button", { name: /severity:sev1/ }).getAttribute("aria-pressed"),
+    ).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["severity:sev1"]);
+  });
+
+  it("PATCHes typed nominations on Save, dropping blank and repeat rows", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.change(screen.getByLabelText("Value label 1"), { target: { value: " risk:high " } });
+    // A repeat could never reach its tier (first match wins) and would 400 the whole save.
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.change(screen.getByLabelText("Value label 2"), { target: { value: "risk:high" } });
+    // An abandoned scaffolding row is not a nomination.
+    fireEvent.click(screen.getByRole("button", { name: /add label/i }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["risk:high"]);
+  });
+
+  it("reorders a nomination — the list's order is the band order, so it must be editable", () => {
+    const fetchMock = stubFetch();
+    renderView({ valueLabels: ["risk:high", "blocking-PR"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Move value label 2 up" }));
+    expect((screen.getByLabelText("Value label 1") as HTMLInputElement).value).toBe("blocking-PR");
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual(["blocking-PR", "risk:high"]);
+  });
+
+  it("removes a nomination, and an emptied list clears them", () => {
+    const fetchMock = stubFetch();
+    renderView({ valueLabels: ["risk:high"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove value label 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.valueLabels).toEqual([]);
+  });
+
+  it("says so when the board read came back empty, instead of offering nothing at all", () => {
+    renderView({});
+    expect(screen.getByText(/No labels read off this board yet/)).toBeTruthy();
+  });
+});
+
 describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
   showing("automation");
 
@@ -470,10 +586,25 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getAllByText("never").length).toBeGreaterThan(0);
   });
 
+  it("ships the board-picker row off, at the cadence it would be created at", () => {
+    // Seeded disabled (schedules.ts) because nothing an operator did not ask for should start
+    // running; the panel is where that choice is made, so the row must be visible while still off.
+    renderView({}, [], stringer());
+
+    expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+    // The pass decides only. The row must promise the ranking and NOT a start, or arming it reads
+    // as autopilot and the operator waits for work that was never going to begin.
+    expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
+    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
+  });
+
   it("reads 'not scheduled' when the automation is off or has no row", () => {
     renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
 
-    expect(screen.getAllByText("not scheduled").length).toBe(8);
+    expect(screen.getAllByText("not scheduled").length).toBe(9);
     // gardener has no row at all — it still shows the cadence it would be created at.
     expect(cadenceButton("gardener").textContent).toContain("Daily at 05:00");
   });
@@ -546,7 +677,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     );
     try {
       // Rendered from the page's snapshot: due in a minute, and never run.
-      expect(screen.getAllByText("never").length).toBe(8);
+      expect(screen.getAllByText("never").length).toBe(9);
 
       // Arriving at the panel re-reads once — a hash switch is not a navigation, so the snapshot
       // this page was rendered with could be an hour old.
@@ -555,7 +686,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
       // Both time columns moved to what the server now holds...
       expect(screen.getByText("in 30m")).toBeTruthy();
       expect(screen.getByText("1m ago")).toBeTruthy();
-      expect(screen.getAllByText("never").length).toBe(7);
+      expect(screen.getAllByText("never").length).toBe(8);
       // ...while the cadence stayed the operator's, not the poll's.
       expect(cadenceButton().textContent).toContain("Every 30 minutes");
 
@@ -864,13 +995,113 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
     expect(choice("container-orphan", "shadow").disabled).toBe(false);
   });
 
-  it("offers apply but never lets it be picked, and says why", () => {
-    renderView({});
-    for (const kind of KINDS) {
-      expect(choice(kind, "apply").disabled).toBe(true);
+  it("lets apply be picked on every armable kind whose record has earned it (anton-hzce)", () => {
+    // The passes can perform the write now (anton-4ab3), so the level is real. What is still off the
+    // table is a kind autonomyFor pins at propose whatever the policy says.
+    renderView({}, [], [], EARNED);
+    for (const kind of KINDS.filter((k) => k !== "oversized")) {
+      expect(choice(kind, "apply").disabled).toBe(false);
     }
-    expect(screen.getByText(/arrives with armed writes/)).toBeTruthy();
-    expect(choice("stale", "shadow").disabled).toBe(false);
+    expect(choice("oversized", "apply").disabled).toBe(true);
+  });
+
+  it("locks apply on a kind whose record has not earned it, WITH the counts and the reason", () => {
+    // The failure this floor exists to stop repeating is evidence printed and not read. A disabled
+    // control an operator cannot account for is exactly that failure, one surface over — so the row
+    // states what it is locked on and what would unlock it.
+    renderView({}, [], [], {
+      ...EARNED,
+      "parentless-cluster": {
+        applied: 3,
+        settled: 12,
+        eligible: false,
+        reason: "3/12 applied (25%) — apply unlocks at 10 settled with 80% applied",
+      },
+    });
+
+    expect(screen.getByText(/apply locked · 3\/12 applied \(25%\)/)).toBeTruthy();
+    expect(screen.getByText(/apply unlocks at 10 settled with 80% applied/)).toBeTruthy();
+    expect(choice("parentless-cluster", "apply").disabled).toBe(true);
+    // Only `apply` goes: `shadow` is how a record becomes readable in the first place and writes
+    // nothing, so gating it would lock the door and pocket the key.
+    expect(choice("parentless-cluster", "shadow").disabled).toBe(false);
+    expect(choice("parentless-cluster", "propose").disabled).toBe(false);
+    // Its neighbours are untouched — the record is per kind.
+    expect(choice("container-orphan", "apply").disabled).toBe(false);
+  });
+
+  it("locks apply on a verdict that carries NO reason — eligible is the gate, reason only the label", () => {
+    // `eligible` and `reason` are separate fields, and the server omits the reason whenever it has
+    // none to give (an unreadable board yields counts of zero and nothing to say). A gate derived
+    // from the reason would read that as "no lock" and leave apply CLICKABLE on a kind with no
+    // record at all — the one direction this floor may never fail in.
+    renderView({}, [], [], {
+      ...EARNED,
+      misfiled: { applied: 0, settled: 0, eligible: false },
+    });
+
+    expect(choice("misfiled", "apply").disabled).toBe(true);
+    // Still accountable: a disabled control that names no reason is the failure one surface over.
+    expect(screen.getByText(/apply locked · no record could be read/)).toBeTruthy();
+    expect(choice("misfiled", "shadow").disabled).toBe(false);
+  });
+
+  it("locks every kind on the board as it stands — nothing has earned apply yet", () => {
+    renderView({});
+    for (const kind of KINDS) expect(choice(kind, "apply").disabled).toBe(true);
+    expect(screen.getAllByText(/no settled proposals yet/).length).toBe(KINDS.length - 1);
+  });
+
+  it("shows the record on a kind that CLEARS the bar, not only on one that does not", () => {
+    // A bar that speaks only when it refuses gives an operator no way to know it was consulted.
+    renderView({}, [], [], EARNED);
+    expect(screen.getAllByText(/record · 30\/30 applied — clears the bar/).length).toBe(
+      KINDS.length - 1,
+    );
+  });
+
+  it("states what arming apply costs in each group, not once for all of them", () => {
+    // The whole point of the boxes: arming a link and arming a close are not the same decision, so
+    // a single blanket warning at the top would flatten exactly the difference they exist to show.
+    renderView({});
+
+    expect(
+      within(groupBox("Undone by one write")).getByText(/the cheapest group to arm first/),
+    ).toBeTruthy();
+    expect(
+      within(groupBox("Takes work out of the queue")).getByText(
+        /work stops being picked up while you sleep/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(groupBox("Writes history")).getByText(/the claim it writes outlives the undo/),
+    ).toBeTruthy();
+  });
+
+  it("says where an unattended write is recorded, at the moment one is armed", () => {
+    // An applied proposal closes as it is filed, so it never stands on the board as an ask. An
+    // operator arming a kind has to be told where the evidence will be before they arm it.
+    renderView({});
+    const jobs = screen.getByRole("link", { name: "Jobs page" });
+    expect(jobs.getAttribute("href")).toBe("/projects/tmp/jobs");
+  });
+
+  it("arming a kind at apply round-trips through the save", () => {
+    const fetchMock = stubFetch();
+    renderView({}, [], [], EARNED);
+
+    fireEvent.click(choice("stale", "apply"));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.proposalAutonomy.stale).toBe("apply");
+  });
+
+  it("survives a reload: a kind armed at apply comes back armed", () => {
+    renderView({ proposalAutonomy: { stale: "apply" } }, [], [], EARNED);
+
+    expect(choice("stale", "apply").checked).toBe(true);
+    expect(choice("stale", "propose").checked).toBe(false);
   });
 
   it("seeds the control from a persisted policy (round-trip in)", () => {
@@ -885,9 +1116,17 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
   it("floors a stored level the kind can never reach back to propose", () => {
     // A hand-edited blob can name anything. Showing `oversized` as armed when autonomyFor would
     // answer `propose` for it is the one lie this control cannot tell.
-    renderView({ proposalAutonomy: { oversized: "apply", stale: "nonsense" } });
+    renderView({ proposalAutonomy: { oversized: "apply", stale: "nonsense" } }, [], [], EARNED);
     expect(choice("oversized", "propose").checked).toBe(true);
     expect(choice("stale", "propose").checked).toBe(true);
+  });
+
+  it("floors a stored apply the RECORD has not earned back to propose (anton-m29g)", () => {
+    // Same lie, second floor: the pass resolves an unearned `apply` to `propose`, so a control
+    // showing it armed would be describing a write that never happens.
+    renderView({ proposalAutonomy: { stale: "apply" } });
+    expect(choice("stale", "propose").checked).toBe(true);
+    expect(choice("stale", "apply").checked).toBe(false);
   });
 
   it("PATCHes the whole policy on Save (round-trip out)", () => {

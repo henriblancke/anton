@@ -2,6 +2,10 @@
  * The answers a founder can give an escalation (anton-wvcy): retry the work, call it won't-do, or —
  * for a stall anton has no verb for — acknowledge it.
  *
+ * This module owns the ORDER and nothing else. Each answer is applied by the handler for the thing it
+ * acts on: the work itself in escalation-work.ts (the bead a run stalled on, the job a stall named),
+ * and a wait on a PERSON in escalation-gate.ts.
+ *
  * Both settle the escalation FIRST, with the status CAS in `settleEscalation` as the lock: whoever
  * flips `open → resolved` owns the decision, so a double-click (or two operators on one board)
  * cannot resume the same epic twice or abandon a bead that is already closing. That CAS is local,
@@ -27,25 +31,29 @@
  * the escalation while changing nothing about the PR, and the next sweep would raise it again. What
  * a stale PR actually needs is a reviewer, which is a human act outside anton. Dismiss says exactly
  * that: it settles the row, touches nothing, and lets the sweep re-raise the finding if the PR is
- * still idle — so acknowledging a stall can never hide one.
+ * still idle — so acknowledging a stall can never hide one. It is refused on a wait for a person,
+ * which settling the row alone cannot end (see escalation-gate.ts).
  */
+import { RunRestartedError } from "./abandon";
 import { getDb } from "./db";
-import { abandonTicket, RunRestartedError } from "./abandon";
-import { beads, isMissingBeadError } from "./beads/bd";
 import { getEscalation, settleEscalation, toEscalationView } from "./escalations";
-import { cancelJob, resumeJob, resumeStalledEpic, runIsLiveForTarget } from "./jobs/service";
-import { getJob, systemClock } from "./jobs/queue";
-import { settleParkedRun } from "./runs";
-import { MAX_ABANDON_REASON_CHARS } from "./types";
-import type { Bead } from "./beads/bd";
-import type { EscalationResolution, EscalationView } from "./escalations";
+import { answerGateWait } from "./escalation-gate";
+import { actOnBead, actOnJob, readTargetState, restartedLocally } from "./escalation-work";
+import { systemClock } from "./jobs/queue";
+import type { AntonDb } from "./jobs/queue";
+import type { Applied } from "./escalation-gate";
+import type { TargetState } from "./escalation-work";
+import type { EscalationAction, EscalationResolution, EscalationView } from "./escalations";
 import type { Project } from "./types";
 
-export type EscalationAction = "resume" | "abandon" | "dismiss";
+export type { EscalationAction };
 
 export function isEscalationAction(value: unknown): value is EscalationAction {
   return value === "resume" || value === "abandon" || value === "dismiss";
 }
+
+/** The two answers that act on work — everything a `dismiss` deliberately does not do. */
+type EscalationVerb = Exclude<EscalationAction, "dismiss">;
 
 /**
  * Why an action couldn't run:
@@ -53,6 +61,9 @@ export function isEscalationAction(value: unknown): value is EscalationAction {
  *   • `not-open`   — someone already settled it (409).
  *   • `no-target`  — the finding names neither a bead/epic nor a job, so there is nothing to resume
  *                    or abandon (409).
+ *   • `not-dismissable`
+ *                  — a wait on a PERSON, which dismissing cannot settle: the gate stays open and the
+ *                    next sweep raises the same row again (409).
  *   • `contested`  — the work was picked back up since the stall was raised, here or on another
  *                    machine (409).
  *   • `unverified` — bd could not confirm CURRENT shared state (the pull or a bead read failed), so
@@ -63,18 +74,19 @@ export type EscalationActionFailure =
   | "not-found"
   | "not-open"
   | "no-target"
+  | "not-dismissable"
   | "contested"
   | "unverified";
 
 export type EscalationActionResult =
-  | { ok: true; action: EscalationAction; escalation: EscalationView; detail: string }
+  | {
+      ok: true;
+      action: EscalationAction;
+      escalation: EscalationView;
+      detail: string;
+      note?: string;
+    }
   | { ok: false; reason: EscalationActionFailure };
-
-/** The abandon reason recorded on the bead — the escalation's own evidence, capped to bd's limit. */
-function abandonReason(escalation: EscalationView): string {
-  const reason = `Abandoned from a run-health escalation (${escalation.kind}): ${escalation.reason}`;
-  return reason.slice(0, MAX_ABANDON_REASON_CHARS);
-}
 
 /**
  * Apply a founder's decision to one escalation. Project-scoped so a route can't settle another
@@ -91,66 +103,152 @@ export async function actOnEscalation(
   if (row.status !== "open") return { ok: false, reason: "not-open" };
 
   const view = toEscalationView(row);
+  if (action === "dismiss") return dismissStall(db, view);
+  return applyVerb(project, view, action);
+}
 
-  // Dismiss settles the row and nothing else, so it needs no target and can't fail half-way.
-  if (action === "dismiss") {
-    if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
-      return { ok: false, reason: "not-open" };
-    }
-    return { ok: true, action, escalation: view, detail: "dismissed" };
-  }
-
-  const target = action === "resume" ? view.epicBeadId : view.beadId;
-  // No bead to act on falls back to the job the stall named — an alert with no settling move is an
-  // alert that trains the operator to ignore the panel.
-  if (!target && !view.jobId) return { ok: false, reason: "no-target" };
-
-  // The escalation froze the stall as the sweep saw it; a bead-backed verb is applied later, by
-  // hand. Re-check that the work is still stopped first — before the settle, so a refusal leaves the
-  // row on the panel for the next sweep to re-judge. Locally first: it costs one indexed read, where
-  // the lease re-check costs a bd pull.
-  if (target) {
-    const epicBeadId = view.epicBeadId ?? target;
-    // Re-run AFTER the board read as well as before it: `readTargetState` awaits a bd pull that can
-    // take seconds, and a resume that lands inside that window republishes the stalled run's own id
-    // — which the lease check exempts as this escalation's own leftover. Checked before it too
-    // because it is one indexed read and refusing early spares the pull entirely.
-    const abandonWouldKillLiveWork = () =>
-      action === "abandon" && restartedLocally(project.id, epicBeadId);
-    if (abandonWouldKillLiveWork()) return { ok: false, reason: "contested" };
-    const state = await readTargetState(project, view, target);
-    if (state === "contested" || abandonWouldKillLiveWork()) {
-      return { ok: false, reason: "contested" };
-    }
-    // Shared state couldn't be confirmed. Both verbs are cross-machine acts judged off the run-lease
-    // (see {@link readTargetState}), so they wait rather than act on an unproven snapshot: an extra
-    // sweep of stall costs a glance, a duplicate run costs a duplicate PR and an abandon closes a
-    // bead underneath live work.
-    if (state === "unverified") return { ok: false, reason: "unverified" };
-    // The work settled itself after the sweep froze this stall — deleted, or closed by hand — so
-    // neither verb has anything to act on (see {@link readTargetState}). Settle the row as the no-op
-    // it is rather than refusing: the panel offers Dismiss only on a stale PR, so a refusal would
-    // strand this escalation with no move that could ever retire it, and the detail says plainly
-    // which way the work ended and that nothing was restarted.
-    if (state === "gone" || state === "closed") {
-      if (!(await settleEscalation(db, systemClock, escalationId, "dismissed"))) {
-        return { ok: false, reason: "not-open" };
-      }
-      const detail = state === "gone" ? "target-gone" : "target-closed";
-      return { ok: true, action, escalation: view, detail };
-    }
-  }
-
-  // Claim the decision before acting — see the module note: the CAS is the lock.
-  if (!(await settleEscalation(db, systemClock, escalationId, resolutionOf(action)))) {
+/**
+ * Dismiss settles the row and nothing else, so it needs no target and can't fail half-way.
+ *
+ * Except on a wait for a PERSON, where settling the row alone settles nothing: the gate stays open,
+ * `detectOpenHumanGates` sees it on the very next sweep, and the board bounces the same "Waiting on
+ * you" row forever. The panel offers no Dismiss there (see escalation-gate.ts); this is that rule
+ * where it is enforceable, since a direct POST never passes through the panel.
+ */
+async function dismissStall(db: AntonDb, view: EscalationView): Promise<EscalationActionResult> {
+  if (view.kind === "needs-human") return { ok: false, reason: "not-dismissable" };
+  if (!(await settleEscalation(db, systemClock, view.id, "dismissed"))) {
     return { ok: false, reason: "not-open" };
   }
+  return { ok: true, action: "dismiss", escalation: view, detail: "dismissed" };
+}
 
+/**
+ * Re-read the board, claim the decision, then act — the order the module note describes.
+ *
+ * The gate a wait on a person hangs on is a settling move in its own right: it can block work anton
+ * doesn't run, and that wait still ends when the person says it does. So no bead and no job is only
+ * "nothing to act on" when there is no gate either — an alert with no settling move is an alert that
+ * trains the operator to ignore the panel.
+ */
+async function applyVerb(
+  project: Project,
+  view: EscalationView,
+  action: EscalationVerb,
+): Promise<EscalationActionResult> {
+  const target = action === "resume" ? view.epicBeadId : view.beadId;
+  if (!target && !view.jobId && !view.gateId) return { ok: false, reason: "no-target" };
+
+  const checked = await preflight(project, view, action, target);
+  if (checked.verdict === "stop") return checked.result;
+
+  // Claim the decision before acting — see the module note: the CAS is the lock.
+  if (!(await settleEscalation(getDb(), systemClock, view.id, resolutionOf(action)))) {
+    return { ok: false, reason: "not-open" };
+  }
+  return runVerb(project, view, action, checked.target);
+}
+
+/**
+ * What the pre-settle board read decided: `act` on the work still left to act on (which for a gate
+ * wait can be none of it), or `stop` with the answer to return as-is.
+ */
+type Preflight =
+  | { verdict: "act"; target?: string }
+  | { verdict: "stop"; result: EscalationActionResult };
+
+/**
+ * The escalation froze the stall as the sweep saw it; a bead-backed verb is applied later, by hand.
+ * Re-check that the work is still stopped first — BEFORE the settle, so a refusal leaves the row on
+ * the panel for the next sweep to re-judge.
+ *
+ * Both verbs are cross-machine acts judged off the run-lease (see {@link readTargetState}), so an
+ * unverified board waits rather than acting on an unproven snapshot: an extra sweep of stall costs a
+ * glance, a duplicate run costs a duplicate PR and an abandon closes a bead underneath live work.
+ *
+ * Work that settled itself after the sweep froze this stall — deleted, or closed by hand — leaves
+ * neither verb anything to act on. That is settled as the no-op it is rather than refused: the panel
+ * offers Dismiss only on a stale PR, so a refusal would strand this escalation with no move that
+ * could ever retire it.
+ */
+async function preflight(
+  project: Project,
+  view: EscalationView,
+  action: EscalationVerb,
+  target?: string,
+): Promise<Preflight> {
+  if (!target) return { verdict: "act" };
+  const state = await liveTargetState(project, view, action, target);
+  if (state === "contested" || state === "unverified") {
+    return { verdict: "stop", result: { ok: false, reason: state } };
+  }
+  if (state === "clear") return { verdict: "act", target };
+  // A wait on a person outlives the work it blocked: the gate is still open, and only a person closes
+  // it. So a gate wait drops the FROZEN pointer and acts anyway — otherwise the gate would keep
+  // raising this escalation forever, and every answer to it would report "nothing to act on". The
+  // answer is not dropped with the pointer: the gate is a live pointer of its own, so the resume
+  // re-derives what it releases now, which after a reparent is a run target this settled ancestor
+  // says nothing about.
+  if (view.gateId) return { verdict: "act" };
+  return settleAsNoOp(view, action, state);
+}
+
+/**
+ * Liveness, judged on the ancestor this escalation FROZE — evidence only while that ancestor is still
+ * what the verb acts on. For a wait on a PERSON it need not be: the gate blocks a BEAD, and
+ * reparenting moves the run target above it while the row sits on the panel — so a run starting on the
+ * bead the gate LEFT would veto BOTH answers, leaving a wait that offers no dismiss unanswerable until
+ * unrelated work stopped. The veto moves rather than being dropped: each verb re-derives its live
+ * target and re-reads the lease there (`gateDispatch` for the resume, `abandonTicket`'s
+ * `requireStopped` for the abandon — see {@link actOnBead}).
+ *
+ * The local read runs on both sides of the board read: `readTargetState` awaits a bd pull that can
+ * take seconds, and a resume that lands inside that window republishes the stalled run's own id —
+ * which the lease check exempts as this escalation's own leftover. Before it too, because it is one
+ * indexed read and refusing early spares the pull entirely.
+ */
+async function liveTargetState(
+  project: Project,
+  view: EscalationView,
+  action: EscalationVerb,
+  target: string,
+): Promise<TargetState> {
+  const judgeFrozenLease = !view.gateId;
+  const epicBeadId = view.epicBeadId ?? target;
+  const abandonWouldKillLiveWork = () =>
+    judgeFrozenLease && action === "abandon" && restartedLocally(project.id, epicBeadId);
+  if (abandonWouldKillLiveWork()) return "contested";
+  const state = await readTargetState(project, view, target, judgeFrozenLease);
+  if (state === "contested") return state;
+  return abandonWouldKillLiveWork() ? "contested" : state;
+}
+
+/**
+ * Settle a row whose work ended without either verb: the detail says plainly which way it ended and
+ * that nothing was restarted.
+ */
+async function settleAsNoOp(
+  view: EscalationView,
+  action: EscalationVerb,
+  state: "gone" | "closed",
+): Promise<Preflight> {
+  if (!(await settleEscalation(getDb(), systemClock, view.id, "dismissed"))) {
+    return { verdict: "stop", result: { ok: false, reason: "not-open" } };
+  }
+  const detail = state === "gone" ? "target-gone" : "target-closed";
+  return { verdict: "stop", result: { ok: true, action, escalation: view, detail } };
+}
+
+/** The settle has landed; from here a failure leaves the row settled and the stall standing. */
+async function runVerb(
+  project: Project,
+  view: EscalationView,
+  action: EscalationVerb,
+  liveTarget?: string,
+): Promise<EscalationActionResult> {
   try {
-    const detail = target
-      ? await actOnBead(project, action, view, target)
-      : await actOnJob(project.id, action, view.jobId!);
-    return { ok: true, action, escalation: view, detail };
+    const { detail, note } = await applied(project, view, action, liveTarget);
+    return { ok: true, action, escalation: view, detail, note };
   } catch (e) {
     // The abandon's own boundary check caught a resume that landed after the settle: it refused
     // before touching anything, so the run is still executing and the bead is still open. That is the
@@ -158,16 +256,18 @@ export async function actOnEscalation(
     // cost is a row settled as abandoned, which the next sweep re-raises if the work stalls again.
     if (e instanceof RunRestartedError) {
       console.warn(
-        `[unstick] escalation ${escalationId} was settled as abandoned but its work restarted first ` +
+        `[unstick] escalation ${view.id} was settled as abandoned but its work restarted first ` +
           `— nothing was cancelled or closed`,
       );
       return { ok: false, reason: "contested" };
     }
     // Settled but not acted: the route answers 500, and the row is already gone from the panel, so
     // this line is the only place the two halves of that state meet. The stall itself isn't lost —
-    // it is still in the next run-health report, which raises it again.
+    // it is still in the next run-health report, which raises it again. A gate wait whose resolve
+    // landed and whose resume then failed is recovered by the other pass instead: a closed gate over
+    // runnable work is precisely what gate-check's `plainGateResumes` dispatches.
     console.error(
-      `[unstick] escalation ${escalationId} was settled as ${resolutionOf(action)} but the ` +
+      `[unstick] escalation ${view.id} was settled as ${resolutionOf(action)} but the ` +
         `${action} failed — the stall is unchanged and re-surfaces on the next run-health sweep`,
       e,
     );
@@ -175,194 +275,17 @@ export async function actOnEscalation(
   }
 }
 
-/**
- * Has the work restarted on THIS machine since the stall was raised? Runs and jobs are machine-local,
- * so a local resume reuses the stalled run's id and republishes the lease under it — which
- * {@link contestedByLiveRun} reads as ours by design, leaving the stale control unguarded.
- *
- * Only an abandon consults this, because only an abandon is destructive: `abandonTicket` cancels the
- * run target's ACTIVE job before closing the bead, so it would kill the execution the resume just
- * started and undo it. Nothing downstream catches that — `settleAbandonedWork`'s status-guarded
- * settles run after the cancel already terminalized the job. A resume needs no such guard: `resumeEpic`
- * absorbs an epic that is already active as a no-op.
- *
- * An active execute-epic job is exactly what the abandon's cancel would reach, so this refuses in
- * precisely the cases where it has something live to destroy — a job that has parked again since is
- * stopped work, and stays abandonable.
- *
- * Every call here is a SNAPSHOT: the settle, and the bd reads inside the abandon, all await after it.
- * It refuses early and cheaply; the answer that actually gates the destruction is the identical read
- * `abandonTicket`'s `requireStopped` makes at the cancel boundary itself.
- */
-function restartedLocally(projectId: string, epicBeadId: string): boolean {
-  return runIsLiveForTarget(projectId, epicBeadId);
-}
-
-/**
- * What the board says NOW about the work an escalation froze: `clear` to act on, `contested` by a
- * run on another machine, `unverified` when bd couldn't say either way, `gone` because the bead
- * itself was deleted, or `closed` because someone settled it by hand. The last two are one meaning —
- * nothing left to act on — kept apart only so the panel can say which way the work ended.
- */
-type TargetState = "clear" | "contested" | "unverified" | "gone" | "closed";
-
-/**
- * One bead as bd answers for it now — the row, `missing` when bd says there is no such bead, or
- * `unreadable` when bd could not answer at all. The last two are NOT interchangeable: only `missing`
- * is evidence, and only evidence may refuse a founder's action (see {@link isMissingBeadError}).
- */
-type BeadRead = Bead | "missing" | "unreadable";
-
-async function readBead(repoPath: string, id: string): Promise<BeadRead> {
-  try {
-    // A successful lookup that names no issue says the same thing as bd's "no issue found" exit.
-    return (await beads.show(repoPath, id)) ?? "missing";
-  } catch (e) {
-    return isMissingBeadError(e) ? "missing" : "unreadable";
-  }
-}
-
-/**
- * Re-read the work an escalation names, because the escalation is a frozen snapshot while the button
- * lives on the board until someone clicks it. Later sweeps hold the finding without resolving the
- * open row, so nothing else retires a stale control. Two things can have changed underneath it:
- *
- *   • Someone else picked the stall back up. Jobs and runs are machine-local, so the run-lease on the
- *     epic bead is the only record of that. Applying the stale button then resumes work already in
- *     flight — or, worse, abandons it, and `abandonTicket` reads only the bead's own status, so
- *     nothing downstream catches it.
- *   • The work SETTLED — the bead was deleted, or closed by hand. Then the verb has nothing left to
- *     act on: a resume hands execute-epic a bead it either can only park back on with
- *     `bead ... not found`, turning an intentional deletion into a poison job, or runs work that was
- *     explicitly called done, and an abandon's `abandonTicket` throws on both — after the settle.
- *     The unstick pass makes this exact call on the sweep side (`epicSettled`); this is the same
- *     rule for the manual path.
- *
- * Pull before reading, like the runner's enqueue-time `liveRunCheck` and the unstick pass: the local
- * Dolt working set trails the shared remote by a sync heartbeat. Both verbs then FAIL CLOSED on
- * anything that leaves current shared state unread — a rejected pull, a bead bd couldn't answer for
- * — exactly as `leaseStandDown` does on the sweep side. A stale mirror can only be wrong in the
- * direction that double-runs, and neither verb is cheap to be wrong about: a resume duplicates a run
- * another machine owns, an abandon closes its bead underneath it. Refusing costs one more sweep of
- * stall and leaves the row on the panel, so the founder's move is deferred, never lost — and a
- * workspace with no remote at all resolves the pull (`not-wired`) rather than rejecting, so a
- * single-machine board is unaffected. `dismiss` reads none of this and stays available regardless.
- *
- * Evidence the local mirror does hold still counts against the work EXISTING — a deletion or a
- * close can only have got there by being made here or synced from elsewhere — because settling the
- * row on those changes nothing about the work.
- *
- * The lease is published under the RUN id, so the stalled run's own leftover is ours, not a foreign
- * holder; a finding with no run of its own (a dead lease) treats any live lease as foreign.
- */
-async function readTargetState(
+/** Which handler owns this answer: the gate a person waits on, the work itself, or the bare job. */
+async function applied(
   project: Project,
   view: EscalationView,
-  target: string,
-): Promise<TargetState> {
-  const pulled = await beads.pull(project.repoPath).then(
-    () => true,
-    () => false,
-  );
-  // Existence is checked on the bead the VERB acts on — the epic a resume re-enqueues, the ticket an
-  // abandon closes — which is not always the one carrying the lease.
-  const acted = await readBead(project.repoPath, target);
-  if (acted === "missing") return "gone";
-  // A bead bd could not answer for is no evidence of anything (see {@link BeadRead}): it can neither
-  // say the work was closed out from under this escalation nor rule out a run holding it.
-  if (acted === "unreadable") return "unverified";
-  if (acted.status === "closed") return "closed";
-
-  // Runs are keyed by RUN TARGET, so that is the bead execute-epic publishes the lease on, and it is
-  // what `epicBeadId` holds for every kind: the run's epic for a parked run, the finding's own bead
-  // for a stale PR or a dead lease (both name a run target — `inReviewTargets` classifies with
-  // `isRunTarget`, and only run targets ever carry a lease). `target` is the fallback for a finding
-  // that recorded no epic at all, and the common case where the two coincide costs no second read.
-  const epicBeadId = view.epicBeadId ?? target;
-  const holder = epicBeadId === target ? acted : await readBead(project.repoPath, epicBeadId);
-  if (holder === "unreadable") return "unverified";
-  // A gone EPIC carries no lease — and that is evidence, not a failed read — so an abandon of its
-  // (existing) ticket is still worth doing.
-  if (holder !== "missing") {
-    const nowMs = systemClock.now();
-    const live = view.runId
-      ? beads.foreignRunLeaseLive(holder, nowMs, view.runId)
-      : beads.isRunLive(holder, nowMs);
-    if (live) return "contested";
-  }
-  // Every read landed — but a lease another machine published seconds ago reaches this mirror only
-  // through the pull, so without one "no live lease" is an unread answer, not a clear board.
-  return pulled ? "clear" : "unverified";
-}
-
-/** Resume/abandon against the work itself — the epic a run stalled on, or the bead to close. */
-async function actOnBead(
-  project: Project,
-  action: EscalationAction,
-  view: EscalationView,
-  target: string,
-): Promise<string> {
-  if (action === "resume") return resumeStalledEpic(project.id, target);
-  const reason = abandonReason(view);
-  // `requireStopped`: the checks above are snapshots, and the settle that follows them awaits. The
-  // abandon re-reads liveness where it would actually kill the run and refuses there instead (see
-  // {@link restartedLocally}), so a resume landing in that window is answered with a
-  // `RunRestartedError` and an untouched board rather than a cancelled job and a closed bead.
-  await abandonTicket(project, target, reason, { requireStopped: true });
-  await settleAbandonedWork(project.id, view, reason);
-  return "abandoned";
-}
-
-/**
- * The machine-local rows an abandon must settle beyond the bead. `abandonTicket` kills only an ACTIVE
- * (queued/running) job, but an escalation is raised precisely against work that already STOPPED — a
- * parked run, a parked/failed job. Left as they are, the bead closes while the local rows stay in the
- * exact state `detectParkedRuns` / `detectExhaustedJobs` report, so the next sweep escalates work
- * whose target is already abandoned. Both settles are status-guarded CASes, so work an operator
- * restarted between the raise and the click keeps running.
- *
- * Runs after the bead closes, so a failure here propagates like any other action failure (see the
- * module note) while the abandon it follows still stands.
- */
-async function settleAbandonedWork(
-  projectId: string,
-  view: EscalationView,
-  reason: string,
-): Promise<void> {
-  if (view.jobId) await cancelJob(projectId, view.jobId, STOPPABLE_FROM);
-  if (view.runId) await settleParkedRun(getDb(), systemClock, projectId, view.runId, reason);
-}
-
-/**
- * The statuses an exhausted-job escalation is raised against, and the only ones its "stop retrying"
- * may terminalize. The unstick pass re-validates before RAISING, but the button lives on the board
- * until someone clicks it: an operator who resumed the job in between put it back to work, and
- * cancelling then would abort a live child on the strength of a stale control.
- */
-const STOPPABLE_FROM = ["parked", "failed"] as const;
-
-/**
- * The same decision for a stall that names only a job: resume gives it a fresh retry budget, abandon
- * cancels it so it never runs again. Both move the job out of `parked`/`failed` — the only states
- * `detectExhaustedJobs` reports — so settling here also stops the next sweep re-raising this exact
- * finding. A job that has since moved on reports that rather than claiming an action it didn't take.
- */
-async function actOnJob(
-  projectId: string,
-  action: EscalationAction,
-  jobId: string,
-): Promise<string> {
-  if (action === "resume") {
-    return (await resumeJob(projectId, jobId)) ? "resumed-job" : "job-not-resumable";
-  }
-  const result = await cancelJob(projectId, jobId, STOPPABLE_FROM);
-  if (result.ok) return "cancelled-job";
-  // The guard refused it. Say WHICH way, so the operator learns their stale button hit a job that is
-  // running again rather than one that had merely stopped on its own.
-  const job = await getJob(getDb(), jobId);
-  return job?.status === "queued" || job?.status === "running"
-    ? "job-restarted"
-    : "job-already-settled";
+  action: EscalationVerb,
+  liveTarget?: string,
+): Promise<Applied> {
+  const gateId = view.gateId;
+  if (gateId) return answerGateWait(project, action, view, gateId, liveTarget);
+  if (liveTarget) return { detail: await actOnBead(project, action, view, liveTarget) };
+  return { detail: await actOnJob(project.id, action, view.jobId!) };
 }
 
 function resolutionOf(action: EscalationAction): EscalationResolution {

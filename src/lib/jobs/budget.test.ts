@@ -300,11 +300,46 @@ const BLOCKING_PR = { value: 0.6, sessionCost: 2 };
 const CLEANUP = { value: 0.2, sessionCost: 2 };
 const MIXED_QUEUE = [CLEANUP, RISK_HIGH, BLOCKING_PR];
 
+/**
+ * anton's OWN board vocabulary (anton-prng) — nominated in this project's settings, not shipped by
+ * the scorer. Every assertion that speaks of `risk:high` / `blocking-PR` scores this policy, because
+ * on a board that nominates nothing those strings mean nothing.
+ */
+const ANTON_POLICY: BudgetPolicy = { ...POLICY, valueLabels: ["risk:high", "blocking-PR"] };
+
 describe("jobValueScore", () => {
-  it("bands labels risk:high > blocking-PR > age, disjointly", () => {
-    const high = jobValueScore({ labels: ["risk:high", "size:L"] }, POLICY);
-    const pr = jobValueScore({ labels: ["blocking-PR"] }, POLICY);
-    const cleanup = jobValueScore({ labels: ["size:S"], ageMs: DAY_MS }, POLICY);
+  it("nominates nothing by default — every bead ranks in the age band", () => {
+    // The agnosticism default: a repo anton has never seen the conventions of ranks on native
+    // fields alone, and says so by scoring identically whatever labels a bead happens to carry.
+    const risky = jobValueScore({ labels: ["risk:high", "blocking-PR"], ageMs: DAY_MS }, POLICY);
+    const plain = jobValueScore({ labels: ["whatever"], ageMs: DAY_MS }, POLICY);
+    expect(risky).toBe(plain);
+    expect(risky).toBe(0.4 * (DAY_MS / POLICY.valueAgeWindowMs));
+    // Age still orders the queue; it is simply the only signal left.
+    expect(jobValueScore({ labels: [], ageMs: 7 * DAY_MS }, POLICY)).toBe(0.4);
+  });
+
+  it("reproduces the shipped bands exactly under anton's own two-tier nomination", () => {
+    const ageFrac = 3 / 7; // three days into the seven-day age window
+    const aged = 3 * DAY_MS;
+    expect(jobValueScore({ labels: ["risk:high", "size:L"], ageMs: aged }, ANTON_POLICY)).toBe(
+      0.8 + 0.2 * ageFrac,
+    );
+    expect(jobValueScore({ labels: ["blocking-PR"], ageMs: aged }, ANTON_POLICY)).toBe(
+      0.5 + 0.2 * ageFrac,
+    );
+    expect(jobValueScore({ labels: ["size:S"], ageMs: aged }, ANTON_POLICY)).toBe(0.4 * ageFrac);
+    // Band edges, where the thresholds admitJob was tuned against sit.
+    expect(jobValueScore({ labels: ["risk:high"], ageMs: 0 }, ANTON_POLICY)).toBe(0.8);
+    expect(jobValueScore({ labels: ["risk:high"], ageMs: 30 * DAY_MS }, ANTON_POLICY)).toBe(1);
+    expect(jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, ANTON_POLICY)).toBe(0.5);
+    expect(jobValueScore({ labels: ["blocking-PR"], ageMs: 30 * DAY_MS }, ANTON_POLICY)).toBe(0.7);
+  });
+
+  it("bands the nominations in order, disjointly", () => {
+    const high = jobValueScore({ labels: ["risk:high", "size:L"] }, ANTON_POLICY);
+    const pr = jobValueScore({ labels: ["blocking-PR"] }, ANTON_POLICY);
+    const cleanup = jobValueScore({ labels: ["size:S"], ageMs: DAY_MS }, ANTON_POLICY);
     expect(high).toBeGreaterThanOrEqual(0.8);
     expect(pr).toBeGreaterThanOrEqual(0.5);
     expect(pr).toBeLessThan(0.7 + 1e-9);
@@ -314,12 +349,57 @@ describe("jobValueScore", () => {
     expect(high).toBeGreaterThan(pr);
   });
 
+  it("scores a bead in the HIGHEST nomination it carries, not the first label it has", () => {
+    // The nomination order is the tier order — a bead carrying both bands in the top one.
+    const both = jobValueScore({ labels: ["blocking-PR", "risk:high"] }, ANTON_POLICY);
+    expect(both).toBe(jobValueScore({ labels: ["risk:high"] }, ANTON_POLICY));
+  });
+
+  it("keeps three nominated tiers disjoint — the structure generalises past two", () => {
+    const three: BudgetPolicy = { ...POLICY, valueLabels: ["sev:1", "sev:2", "sev:3"] };
+    const oldest = (label: string) =>
+      jobValueScore({ labels: [label], ageMs: 30 * DAY_MS }, three);
+    const freshest = (label: string) => jobValueScore({ labels: [label], ageMs: 0 }, three);
+    // Every band's ceiling stays below the next band's floor: the oldest bead in a tier still loses
+    // to the freshest bead one tier up, so the ordering is total rather than age-contaminated.
+    expect(oldest("sev:2")).toBeLessThan(freshest("sev:1"));
+    expect(oldest("sev:3")).toBeLessThan(freshest("sev:2"));
+    expect(oldest("nothing")).toBeLessThan(freshest("sev:3"));
+    // Still bounded by [0,1], with the nominated region above the unnominated one.
+    expect(oldest("sev:1")).toBeLessThanOrEqual(1);
+    expect(freshest("sev:3")).toBeGreaterThanOrEqual(0.5);
+    expect(oldest("nothing")).toBe(0.4);
+  });
+
+  it("floors the top band on the scarce bar and the lowest on the normal bar, at any tier count", () => {
+    // The bands are what admitJob's thresholds cut against, so "scarce admits the top tier only" and
+    // "on-pace admits anything nominated" have to hold for one nomination or five — not just for the
+    // two anton's own board happens to use. A single nomination that floored at 0.5 would be held by
+    // every scarce tick, silently, which is the whole class of bug this ticket exists to kill.
+    for (const valueLabels of [["a"], ["a", "b"], ["a", "b", "c"], ["a", "b", "c", "d", "e"]]) {
+      const policy: BudgetPolicy = { ...POLICY, valueLabels };
+      const top = valueLabels[0];
+      const bottom = valueLabels[valueLabels.length - 1];
+      expect(jobValueScore({ labels: [top], ageMs: 0 }, policy)).toBe(
+        POLICY.valueThresholdScarce,
+      );
+      // A sole nomination IS the top tier — there is no lower one to floor on the normal bar.
+      if (valueLabels.length > 1) {
+        expect(jobValueScore({ labels: [bottom], ageMs: 0 }, policy)).toBe(
+          POLICY.valueThresholdNormal,
+        );
+      }
+      // And the whole nominated region stays inside [normal bar, 1].
+      expect(jobValueScore({ labels: [top], ageMs: 30 * DAY_MS }, policy)).toBeLessThanOrEqual(1);
+    }
+  });
+
   it("uses age only as a within-band tie-break", () => {
-    const fresh = jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, POLICY);
-    const old = jobValueScore({ labels: ["blocking-PR"], ageMs: 7 * DAY_MS }, POLICY);
+    const fresh = jobValueScore({ labels: ["blocking-PR"], ageMs: 0 }, ANTON_POLICY);
+    const old = jobValueScore({ labels: ["blocking-PR"], ageMs: 7 * DAY_MS }, ANTON_POLICY);
     expect(old).toBeGreaterThan(fresh);
     // Even a week-old cleanup job stays below the freshest blocking-PR job.
-    const oldCleanup = jobValueScore({ labels: [], ageMs: 30 * DAY_MS }, POLICY);
+    const oldCleanup = jobValueScore({ labels: [], ageMs: 30 * DAY_MS }, ANTON_POLICY);
     expect(oldCleanup).toBeLessThan(fresh);
   });
 });

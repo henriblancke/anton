@@ -48,6 +48,32 @@ const child = (id: string, parent: string, extra: Partial<Bead> = {}): Bead =>
 const subjectsOf = (board: Bead[]): string[][] =>
   revalidateApprovals(board, NOW).map((d) => d.subjects);
 
+/**
+ * An approved feature whose named tickets each wait on a ticket of ANOTHER run target — the
+ * cross-run gate of issue #58. By default only the tail child is held, so the run still has work
+ * to dispatch; name every ticket to gate the whole target.
+ */
+function partiallyGatedBoard(gated: string[] = ["anton-t3"]): Bead[] {
+  const ticket = (id: string): Bead =>
+    child(id, "anton-fa", {
+      acceptance_criteria: "- [ ] ok",
+      dependencies: [
+        { issue_id: id, depends_on_id: "anton-fa", type: "parent-child" },
+        ...(gated.includes(id)
+          ? [{ issue_id: id, depends_on_id: "anton-b1", type: "blocks" }]
+          : []),
+      ],
+    });
+  return [
+    approved("anton-fa", { issue_type: "feature" }),
+    ticket("anton-t1"),
+    ticket("anton-t2"),
+    ticket("anton-t3"),
+    bead("anton-fb", { issue_type: "feature" }),
+    child("anton-b1", "anton-fb", { acceptance_criteria: "- [ ] ok" }),
+  ];
+}
+
 describe("re-validating approvals the board has moved past", () => {
   it("files exactly one proposal for an approved bead whose Acceptance was stripped", () => {
     const board = [approved("anton-a", { acceptance_criteria: undefined }), approved("anton-b")];
@@ -95,6 +121,21 @@ describe("re-validating approvals the board has moved past", () => {
     const [detection] = revalidateApprovals(board, NOW);
     expect(detection.subjects).toEqual(["anton-a"]);
     expect(detection.evidence.join("\n")).toMatch(/blocked by anton-b/);
+  });
+
+  it("leaves a PARTIALLY-gated target approved — the run starts, so nothing degraded", () => {
+    // One cross-run-gated tail child, two ready siblings: the approve route runs this target
+    // (issue #58). Judging it on the coarse target-level rollup here would file an `unapprove`
+    // proposal claiming a worker cannot start it — false, and approving it strips the label off a
+    // run that was shipping fine, every pass until someone gives in.
+    expect(subjectsOf(partiallyGatedBoard())).toEqual([]);
+  });
+
+  it("still files on a FULLY gated target — zero tickets a worker could pick up", () => {
+    const board = partiallyGatedBoard(["anton-t1", "anton-t2", "anton-t3"]);
+    const [detection] = revalidateApprovals(board, NOW);
+    expect(detection.subjects).toEqual(["anton-fa"]);
+    expect(detection.evidence.join("\n")).toMatch(/blocked by anton-fb/);
   });
 
   it("asks ONCE per bead however many ways it degraded", () => {

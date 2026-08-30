@@ -167,8 +167,10 @@ function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string,
 }
 
 /** The description text ahead of the first heading — an epic whose outcome is written as a bare
- * line rather than under `## Goal` still states one, and must not be faulted for it. */
-function preambleOf(description: string): string {
+ * line rather than under `## Goal` still states one, and must not be faulted for it. Exported for
+ * the readers that must render what an UNSHAPED bead says about itself (pm/context.ts): a ticket
+ * with no `## Goal` still has a contract, and a reader blind to this home shows it as blank. */
+export function preambleOf(description: string): string {
   const lines: string[] = [];
   for (const { text, heading } of scanMarkdown(description)) {
     if (heading) break;
@@ -268,6 +270,19 @@ function bodyState(raw: string): SectionState {
   const lines = contentLines(raw);
   if (lines.length === 0) return "absent";
   return lines.every((l) => !l.fenced && PROMPT_LINE.test(l.text)) ? "prompt" : "written";
+}
+
+/**
+ * Did an author WRITE this body, or is it still the formula's TODO prompt (or nothing at all)?
+ *
+ * The public half of {@link bodyState}, for readers that quote a contract section back as the bead's
+ * own words. {@link acceptanceBody} and {@link goalBody} deliberately return the prompt when nothing
+ * is written — a view must show the placeholder beside its "no rubric yet" marker — but a reader that
+ * REASONS from the text needs the same distinction the gate makes, or it treats scaffolding the
+ * approval gate calls missing as something the bead stated.
+ */
+export function isAuthoredBody(body: string | undefined): boolean {
+  return typeof body === "string" && bodyState(body) === "written";
 }
 
 /** How one section's gap reads, at either state it can be in. */
@@ -709,4 +724,77 @@ function areaViolations(bead: Bead): ContractViolation[] {
             : "a bare `area:` label names no product surface — give it a value (`bd tag <id> area:<surface>`)",
     },
   ];
+}
+
+/**
+ * A section the FORM question asks about, and every heading that answers it in the description.
+ * `preamble` marks the one section whose text may also sit ahead of the first heading.
+ *
+ * `keys` are the GATE's reading keys, aliases included, on purpose: the question is which HOME
+ * carries the contract — the description or bd's field (anton-9dda) — not how a heading is spelled.
+ * A bead whose rubric sits under the older `## Acceptance` does carry its spec in the markdown, and
+ * naming it a missing section would report a gap the description does not have. Canonical spelling
+ * is the WRITERS' rule ({@link ACCEPTANCE_HEADING}, {@link SUCCESS_HEADING}), enforced at every
+ * place a bead is written — the formula, the ticket dialog, rework, orphan grooming.
+ */
+interface FormRule {
+  section: ContractSection;
+  keys: readonly string[];
+  /** An epic's outcome written as a bare line is still the description carrying it
+   * ({@link preambleOf}) — a heading is the convention, not the requirement. */
+  preamble?: boolean;
+}
+
+/** A ticket's five, in {@link validateBeadContract}'s own reporting order. Derived from
+ * {@link TICKET_RULES} so a section added to the gate cannot go unasked here. */
+const TICKET_FORM_RULES: readonly FormRule[] = [
+  { section: "Acceptance", keys: ACCEPTANCE_KEYS },
+  ...TICKET_RULES.map(({ section, keys }) => ({ section, keys })),
+];
+
+/** An epic's two. The `area:` label is not a description section, so the form question is silent
+ * on it — that gap is the gate's to report. */
+const EPIC_FORM_RULES: readonly FormRule[] = [
+  { section: "Outcome", keys: OUTCOME_KEYS, preamble: true },
+  { section: "Success Criteria", keys: SUCCESS_KEYS },
+];
+
+/**
+ * Which contract sections this bead's DESCRIPTION does not carry — empty when it carries them all,
+ * and for a bead no tier judges or no bd read produced.
+ *
+ * A SECOND question, deliberately distinct from {@link validateBeadContract}. The gate reads
+ * acceptance from either home on purpose ({@link acceptanceBodies}) — bd's `acceptance_criteria`
+ * field satisfies it exactly as `## Acceptance Criteria` does, and that dual-home reading must not
+ * narrow: beads whose rubric lives only in bd's field approve and run today, correctly. This asks
+ * the form question instead — does the markdown alone carry the whole contract — which is precisely
+ * why producer drift into the field-only shape was invisible to every existing check.
+ *
+ * Consequences of that split, both intended: a bead the gate passes can report gaps here, and a gap
+ * here is never blocking. Callers report it; nothing gates on it.
+ *
+ * Tier-aware like the gate ({@link contractKeysOf}): an epic is judged on its outcome and Success
+ * Criteria, not a ticket's five. A section holding the formula's `TODO —` prompt counts as absent,
+ * for the same reason the gate treats it so ({@link stateOf}) — a heading cooked and never authored
+ * carries no contract.
+ *
+ * Denominator note: an empty result means "carries the form" only for a bead
+ * {@link isContractJudged} accepts. A rate must divide by that, exactly as the contract rate does.
+ */
+export function contractFormGaps(bead: Bead): ContractSection[] {
+  if (!isContractJudged(bead)) return [];
+  const tier = tierOf(bead);
+
+  const description = typeof bead.description === "string" ? bead.description : "";
+  const sections = sectionsOf(description, contractKeysOf(tier));
+  const rules = tier === "epic" ? EPIC_FORM_RULES : TICKET_FORM_RULES;
+  return rules
+    .filter((rule) => {
+      const bodies = [
+        ...(rule.preamble ? [preambleOf(description)] : []),
+        ...rule.keys.map((k) => sections.get(k) ?? ""),
+      ];
+      return stateOf(bodies) !== "written";
+    })
+    .map((rule) => rule.section);
 }

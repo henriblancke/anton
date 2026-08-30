@@ -88,6 +88,19 @@ describe("nextAction (pure durability policy)", () => {
     expect(a.refundAttempt).toBe(true);
   });
 
+  it("keeps the classified reason on the row a lease-held reschedule writes (anton-3dpp)", () => {
+    // Two very different situations reschedule identically: a foreign machine holding the lease, and
+    // a run that could not PROVE it holds one because its board write failed. The row's text is the
+    // only place that difference survives — a bare "run live elsewhere" reads as the first when it
+    // was the second, and sends an operator (or a CI reader) looking for a machine that never ran.
+    const unproven =
+      "epic-1 could not publish its run-lease to the shared board (bd dolt push failed) — parking";
+    const a = nextAction(CONFIG, { attempts: 1 }, { kind: "lease-held", error: unproven }, now);
+    if (a.action !== "reschedule") throw new Error("unreachable");
+    expect(a.lastError).toContain(unproven);
+    expect(a.lastError).toContain(new Date(now + CONFIG.quotaCooloffMs).toISOString());
+  });
+
   it("classifies RunAlreadyLiveError as a lease-held outcome (anton-jz1)", () => {
     expect(classifyError(new RunAlreadyLiveError("live on B"))).toEqual({
       kind: "lease-held",
@@ -1817,6 +1830,13 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   // daytime reserve never holds these ticks: the coarse gate admits and the fine gate decides.
   // sessionPct 85 → 15% headroom ≤ scarceHeadroomPct 20 → scarce (high-value only).
 
+  /**
+   * A project that has NOMINATED `risk:high` as its top value label (anton-prng). The scorer ships
+   * no vocabulary, so a gate test about high-value work has to say which label this board calls
+   * high-value — exactly as the project's settings do at runtime.
+   */
+  const VALUE_POLICY: BudgetPolicy = { ...DEFAULT_BUDGET_POLICY, valueLabels: ["risk:high"] };
+
   /** Labels by bead id for the gate's reader; anything not listed reads as label-less cleanup. */
   const labelsReader =
     (byBead: Record<string, string[]>): BeadLabelsReader =>
@@ -1840,6 +1860,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         readUsage: async () => usage({ sessionPct: 85 }),
+        policy: VALUE_POLICY,
         readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
       },
     );
@@ -1871,6 +1892,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // No burn samples → execute-epic costs the L-tier seed (20%), over the 15% headroom.
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
+      policy: VALUE_POLICY,
       readBeadLabels: labelsReader({ "A-1": ["risk:high"] }),
     });
     await r.enqueue({
@@ -1964,6 +1986,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
       },
       {
         readUsage: async () => usage({ sessionPct }),
+        policy: VALUE_POLICY,
         readBeadLabels: labelsReader({ "A-high": ["risk:high"] }),
       },
     );

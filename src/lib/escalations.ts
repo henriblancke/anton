@@ -28,6 +28,13 @@ export type EscalationStatus = "open" | "resolved";
  */
 export type EscalationResolution = "resumed" | "abandoned" | "dismissed";
 
+/**
+ * The verb side of {@link EscalationResolution} — what the founder clicked, before it is recorded as
+ * how the row was settled. It lives here rather than with the code that applies it so that every
+ * handler taking a verb can name one without importing back through escalation-actions.ts.
+ */
+export type EscalationAction = "resume" | "abandon" | "dismiss";
+
 export type EscalationRow = typeof schema.escalations.$inferSelect;
 
 /** One escalation as the board renders it — the finding's evidence plus its decision state. */
@@ -40,6 +47,11 @@ export interface EscalationView {
   beadId?: string;
   /** The epic a resume re-enqueues — jobs are keyed by epic, not by the ticket that stalled. */
   epicBeadId?: string;
+  /**
+   * The human gate a `needs-human` wait hangs on — what resolve-and-resume closes (see
+   * escalation-gate.ts). Absent on every other kind: nothing else stalls on a gate.
+   */
+  gateId?: string;
   runId?: string;
   jobId?: string;
   prNumber?: number;
@@ -87,6 +99,8 @@ export function toEscalationView(row: EscalationRow): EscalationView {
     reason: row.reason,
     beadId: row.beadId ?? undefined,
     epicBeadId: row.epicBeadId ?? undefined,
+    // No column of its own: the gate is evidence the detector recorded, like the PR pointers below.
+    gateId: typeof evidence.gateId === "string" ? evidence.gateId : undefined,
     runId: row.runId ?? undefined,
     jobId: row.jobId ?? undefined,
     prNumber: typeof evidence.prNumber === "number" ? evidence.prNumber : undefined,

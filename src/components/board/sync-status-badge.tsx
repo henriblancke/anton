@@ -1,6 +1,7 @@
 "use client";
 
-import { CloudOffIcon, LoaderIcon, TriangleAlertIcon, UploadIcon } from "lucide-react";
+import { CloudIcon,
+  CloudOffIcon, LoaderIcon, TriangleAlertIcon, UploadIcon } from "lucide-react";
 import { useSyncExternalStore } from "react";
 import { deriveSyncBadge } from "@/lib/sync-status";
 import type { SyncStatusView } from "@/lib/types";
@@ -140,6 +141,16 @@ export function SyncStatusBadge({ sync }: { sync: SyncStatusView }) {
         >
           <CloudOffIcon className="size-3" aria-hidden="true" />
           Not wired to shared remote
+        </span>
+      );
+    case "shared-server":
+      return (
+        <span
+          className={cn(base, "border-sky-500/40 text-sky-600 dark:text-sky-400")}
+          title="This board is served by a shared Dolt sql-server — every machine reads and writes the same database, so there is no push/pull to run."
+        >
+          <CloudIcon className="size-3" aria-hidden="true" />
+          Shared server
         </span>
       );
     default:

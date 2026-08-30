@@ -5,10 +5,11 @@ import {
   ReworkInvalidError,
   ReworkNotAllowedError,
   ReworkNotFoundError,
+  ReworkUnavailableError,
   type ReworkInput,
 } from "@/lib/rework";
 import type { ReviewFinding } from "@/lib/jobs/review-context";
-import { withProject } from "../../../resolve-project";
+import { parseJsonBody, withProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -20,12 +21,8 @@ export const dynamic = "force-dynamic";
  * page already loads for its score series — so opening this dialog costs no second read.
  */
 export const POST = withProject<{ slug: string; epicId: string }>(async (request, { project, params }) => {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
+  const { body, response: badBody } = await parseJsonBody(request);
+  if (badBody) return badBody;
 
   try {
     const result = await reworkTicket(project, params.epicId, readInput(body));
@@ -44,6 +41,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     }
     if (err instanceof ReworkNotFoundError) {
       return NextResponse.json({ error: err.message }, { status: 404 });
+    }
+    // 503, not 500: the request is fine and nothing here is broken — `gh` couldn't answer what the
+    // target's PR did, and a retry once it can will succeed unchanged (anton-leit).
+    if (err instanceof ReworkUnavailableError) {
+      return NextResponse.json({ error: err.message }, { status: 503 });
     }
     const message = err instanceof Error ? err.message : "Failed to send the ticket back";
     console.error(`[rework] ${params.epicId} failed`, err);

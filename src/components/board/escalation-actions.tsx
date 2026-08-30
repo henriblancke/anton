@@ -19,14 +19,27 @@ const ACTION_DETAIL: Record<string, string> = {
   "job-already-settled": "Already settled — the job had already stopped",
   "job-restarted": "Not stopped — the job is running again, so it was left alone",
   dismissed: "Dismissed — anton raises it again if it's still stuck at the next sweep",
+  "gate-resolved": "Gate closed — the wait is over; there was no run left to restart",
+  // Names no blocker and promises no restart, deliberately. This ONE detail covers every reason the
+  // board refused the dispatch — unapproved, abandoned, claimed by another operator, already in
+  // review, held by a second gate, running on another machine, or a board that wouldn't read — and
+  // only one of those clears on its own. Naming "another blocker" sends a founder whose target is
+  // simply unapproved off to wait for something that was never going to happen. The route returns
+  // the real reason as `note`, printed underneath; this line is what stays true when there isn't one.
+  "gate-still-blocked": "Gate closed — the work isn't starting yet",
   "target-gone": "Nothing to act on — this work was deleted from the board, so the alert is cleared",
   "target-closed": "Nothing to act on — this work is already closed, so the alert is cleared",
 };
 
-/** Button copy per target: a stall that names only a job is retried/stopped, not abandoned. */
+/**
+ * Button copy per target: a stall that names only a job is retried/stopped, not abandoned, and a wait
+ * on a PERSON is not a restart at all — the founder is saying "I did the thing you asked", so the
+ * button names the gate it closes rather than the run it happens to re-queue.
+ */
 const COPY = {
   work: { resume: "Resume", pendingResume: "Resuming…", abandon: "Abandon", confirm: "Confirm abandon", pendingAbandon: "Abandoning…" },
   job: { resume: "Retry job", pendingResume: "Retrying…", abandon: "Stop retrying", confirm: "Confirm stop", pendingAbandon: "Stopping…" },
+  gate: { resume: "Resolve & resume", pendingResume: "Resolving…", abandon: "Abandon", confirm: "Confirm abandon", pendingAbandon: "Abandoning…" },
 } as const;
 
 type Action = "resume" | "abandon" | "dismiss";
@@ -45,7 +58,9 @@ const FALLBACK_DETAIL: Record<Action, string> = {
  * A client leaf inside the server-rendered panel — the only interactive part, so the escalation
  * list itself stays a Server Component. Abandon is deliberately two-step (it closes the bead and
  * cascades to its open children); Resume and Dismiss are one click because they are idempotent —
- * clicking twice re-queues nothing and the second settle is refused.
+ * clicking twice re-queues nothing and the second settle is refused. That holds for a gate wait
+ * too: the server settles the row before it touches the gate, so the second click is refused rather
+ * than resolving and resuming twice (anton-mivh.3).
  */
 export function EscalationActions({
   slug,
@@ -67,8 +82,11 @@ export function EscalationActions({
    * resolution that resolves nothing.
    */
   canDismiss?: boolean;
-  /** What the buttons act on: the work itself, or (no bead named) the job that stranded it. */
-  target?: "work" | "job";
+  /**
+   * What the buttons act on: the work itself, the gate a person is being waited on for, or (no bead
+   * named) the job that stranded it. Copy only — the server picks the verb from the escalation.
+   */
+  target?: "work" | "job" | "gate";
 }) {
   const router = useRouter();
   const copy = COPY[target];
@@ -84,10 +102,16 @@ export function EscalationActions({
         body: JSON.stringify({ action }),
       });
       const body = (await res.json().catch(() => null)) as
-        | { error?: string; detail?: string }
+        | { error?: string; detail?: string; note?: string }
         | null;
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
-      toast.success(ACTION_DETAIL[body?.detail ?? ""] ?? FALLBACK_DETAIL[action]);
+      const said = ACTION_DETAIL[body?.detail ?? ""] ?? FALLBACK_DETAIL[action];
+      // The server's own prose for WHY, on the one detail whose line can't carry it (see
+      // `gate-still-blocked`). Already phrased as a clause — "it is not approved", "it is claimed by
+      // bob" — so it reads as a sentence here without reformatting. Branching rather than passing
+      // `undefined`: a toast with no reason should be the same one-argument call it always was.
+      if (body?.note) toast.success(said, { description: `Held because ${body.note}.` });
+      else toast.success(said);
       // The panel is server-rendered, so a refresh is what removes the settled row.
       router.refresh();
     } catch (err) {

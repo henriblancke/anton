@@ -66,6 +66,12 @@ export type GardenerMove =
  * The product master's — PRODUCT judgment, reported by a fresh-context session (anton-d2sx):
  *   • `mispriority`         — the bead's priority contradicts what the board says it is worth.
  *   • `missing-order`       — one top-tier bead has to land before another and no edge says so.
+ *   • `misfiled`            — a bead hangs under the wrong home: a feature under the wrong epic, or a
+ *                             ticket under the wrong card. ONE kind for both, because it is one claim
+ *                             about one relation — and the gardener's re-parents cannot see it, since
+ *                             both of theirs fire on work riding NO card, never on a home that is
+ *                             merely wrong. Which home is right is a reading of what two beads are
+ *                             about, so it is judgment rather than topology.
  *   • `oversized`           — one ticket carries several concerns, with a decomposition sketch.
  *   • `low-value`           — work whose value the evidence no longer supports: kill it.
  *   • `degraded-approval`   — approved work that has since stopped clearing the approve gate. The one
@@ -82,6 +88,7 @@ export type GardenerDetectionKind =
   | "shipped-orphan"
   | "mispriority"
   | "missing-order"
+  | "misfiled"
   | "oversized"
   | "low-value"
   | "degraded-approval";
@@ -95,6 +102,7 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "shipped-orphan",
   "mispriority",
   "missing-order",
+  "misfiled",
   "oversized",
   "low-value",
   "degraded-approval",
@@ -154,6 +162,7 @@ export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   "shipped-orphan": { namespace: "gardener", move: "retire", retireAs: "close" },
   mispriority: { namespace: "pm", move: "reprioritize", detail: "priority" },
   "missing-order": { namespace: "pm", move: "link" },
+  misfiled: { namespace: "pm", move: "reparent" },
   oversized: { namespace: "pm", move: "split" },
   "low-value": { namespace: "pm", move: "retire", retireAs: "defer" },
   "degraded-approval": { namespace: "pm", move: "unapprove" },
@@ -335,6 +344,21 @@ const FINGERPRINT_LABEL = new RegExp(
  */
 export function fingerprintLabelOf(bead: { labels?: string[] }): string | undefined {
   return (bead.labels ?? []).find((l) => FINGERPRINT_LABEL.test(l));
+}
+
+/**
+ * The kind a fingerprint label names, or undefined when it names none anton knows.
+ *
+ * The label is the one record of a proposal's kind that survives everything: a hand-edited metadata
+ * blob, a plan from an older anton, a bead whose description someone rewrote. That is why the
+ * settled-proposal record reads the kind from HERE rather than from the plan (track-record.ts) — the
+ * record is a count of what the founder decided, and a proposal whose metadata rotted was still
+ * decided about.
+ */
+export function kindOfFingerprint(label: string): GardenerDetectionKind | undefined {
+  if (!FINGERPRINT_LABEL.test(label)) return undefined;
+  const kind = label.split(":")[1] as GardenerDetectionKind;
+  return GARDENER_DETECTION_KINDS.includes(kind) ? kind : undefined;
 }
 
 /**

@@ -73,6 +73,22 @@ const PRODUCER: Record<ProposalNamespace, { title: string; filedBy: string }> = 
 export const MAX_PROPOSALS_PER_PASS = 10;
 
 /**
+ * How many proposals ONE pass may APPLY unattended (anton-4ab3) — a different budget from
+ * {@link MAX_PROPOSALS_PER_PASS}, and deliberately smaller.
+ *
+ * That cap bounds a founder's ATTENTION: ten asks is a readable morning, and being wrong costs a
+ * longer list. This one bounds unattended WRITES to the board, where being wrong costs board state
+ * nobody chose — a different question, which deserves a smaller answer. Three is a night's tidying;
+ * a board that wants more than that in one pass is a board an operator should be looking at.
+ *
+ * The overflow is not lost and not applied later by stealth: it stays open as an ordinary ask that
+ * a human approves or declines. No later pass re-decides it — suppression keys on the fingerprint
+ * an open proposal already carries, so the ask standing on the board is what keeps it from being
+ * re-filed, and the armed walk only ever visits the proposals its own pass just created.
+ */
+export const MAX_APPLIES_PER_PASS = 3;
+
+/**
  * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
  * declined (abandoned). A plainly-closed proposal is absent deliberately — see the module header.
  */
@@ -368,6 +384,32 @@ export interface ReconcileResult {
   failed: string[];
 }
 
+/** The one phrase that marks a close as a fold. Written by {@link foldReason}, read by nothing else. */
+const FOLD_REASON_PREFIX = "duplicate of ";
+
+/**
+ * Why a folded duplicate was closed — built here rather than inline, because TWO readers depend on
+ * telling this close from an apply's.
+ *
+ * A fold is a PLAIN close on purpose (see {@link reconcileDuplicateProposals}), so nothing about the
+ * bead's status distinguishes "the founder accepted this ask" from "overlapping patrols filed it
+ * twice and we kept the other one". The settled-proposal record (track-record.ts) counts the first as
+ * evidence a kind can be armed on, and counting the second would score every fold as a success —
+ * inflating precision exactly when a detector is at its noisiest, which is the failure mode
+ * inverted. One builder, one predicate, so the writer and the reader cannot drift.
+ */
+export function foldReason(keep: string, fingerprint: string): string {
+  return (
+    `${FOLD_REASON_PREFIX}${keep}: overlapping patrols filed the same claim ` +
+    `(${fingerprint}) twice — ${keep} carries the ask`
+  );
+}
+
+/** Was this close a {@link foldReason} — a duplicate withdrawn — rather than an apply or a decline? */
+export function isFoldReason(reason: unknown): boolean {
+  return typeof reason === "string" && reason.trimStart().startsWith(FOLD_REASON_PREFIX);
+}
+
 export interface ReconcileOptions {
   /** The patrol's cancel signal, checked between closes. */
   signal?: AbortSignal;
@@ -420,12 +462,7 @@ export async function reconcileDuplicateProposals(
             !isOpenWork(live) ||
             !unclaimedTwin(live);
           if (stale) return false;
-          await beads.close(
-            repo,
-            id,
-            `duplicate of ${duplicate.keep}: overlapping patrols filed the same claim ` +
-              `(${duplicate.fingerprint}) twice — ${duplicate.keep} carries the ask`,
-          );
+          await beads.close(repo, id, foldReason(duplicate.keep, duplicate.fingerprint));
           return true;
         });
         if (folded) result.folded.push({ id, into: duplicate.keep });

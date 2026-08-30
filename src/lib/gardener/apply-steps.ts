@@ -27,16 +27,18 @@ import {
   EVIDENCE_PREMISE,
   home,
   homeClaimed,
+  HOME_STANDING,
   homeUnusable,
+  homeWrongTier,
   inFlightReason,
   list,
   missing,
   namesSome,
   orderingUnstated,
   premiseTouched,
-  retiringTicket,
   settledWord,
   survivorUnusable,
+  takingTicket,
   unapproveNote,
   type ApplyStep,
   type EvidenceFence,
@@ -50,7 +52,7 @@ export class SubjectMovedError extends Error {}
 /** The verbs that SETTLE the subject — the ones that would strand whatever still hangs under it. */
 const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"]);
 
-/** The verbs that take the subject OUT of whatever run's ticket set it rides. */
+/** The verbs that SETTLE the subject out of whatever run's ticket set it rides. */
 const RETIRING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede", "defer"]);
 
 /**
@@ -76,8 +78,10 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * The filing-time premise a CONTENT-derived move rests on, or absent for the verbs that make no claim
  * about a bead's contents. See {@link EvidenceFence} for why the step carries it.
  *
- * `link` is here for its `missing-order` half alone; an `implied-order` resolves to no premise in
- * {@link EVIDENCE_PREMISE} and is re-derived from the board instead ({@link assertOrderingStated}).
+ * `link` is here for its `missing-order` half alone and `reparent` for its `misfiled` half alone; an
+ * `implied-order` and the gardener's two re-parents resolve to no premise in
+ * {@link EVIDENCE_PREMISE} and are re-derived from the board instead ({@link assertOrderingStated},
+ * apply-plan.ts `reparentPremiseGone`).
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -86,6 +90,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "defer":
     case "reprioritize":
     case "link":
+    case "reparent":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -93,15 +98,17 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
 }
 
 /**
- * The run target whose ticket set a RETIREMENT would take its subject out of, when it rides one. Not
- * written to and not pointed at — but the run that owns it is the one this write can abort, and the
- * only place that run is visible (see {@link TicketOwner}), so it is locked and re-judged too.
+ * The run target whose ticket set this step would take its subject out of, when it rides one —
+ * settled by a retirement, handed to another target by a re-parent. Not written to and not pointed
+ * at, but the run that owns it is the one this write can abort, and the only place that run is
+ * visible (see {@link TicketOwner}), so it is locked and re-judged too.
  */
 function ownerOf(step: ApplyStep): TicketOwner["owner"] {
   switch (step.verb) {
     case "close":
     case "supersede":
     case "defer":
+    case "reparent":
       return step.owner;
     default:
       return undefined;
@@ -131,37 +138,63 @@ function lockedBeads(step: ApplyStep): string[] {
  * the subject — a run claiming the HOME between the decision and the write has already selected its
  * tickets, so work attached now rides along unrun and is stranded when that run settles the card.
  * The ticket OWNER earns its lock the same way, from the other direction: a run picks its target up
- * on this very chain, so either its claim lands first and this read refuses, or this retirement
- * lands first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic
- * step 1c) and retries — rather than aborting mid-flight on a bead the board no longer holds.
+ * on this very chain, so either its claim lands first and this read refuses, or the write lands
+ * first and the run's own post-lease re-confirmation sees its ticket set move (execute-epic step 1c)
+ * and retries — rather than aborting mid-flight on a bead the board no longer holds. A re-parent
+ * holds it too: handing a ticket to another card takes it out of that set exactly as retiring it
+ * does, and leaves the run's commit landing in a PR for a bead that now belongs elsewhere.
  *
  * The body is the checks in the order they have to run, each named for what it refuses. Four of them
  * buy a whole board read rather than trusting the snapshot: whether the subject still rides the
  * TICKET SET the step captured ({@link assertOwnerUnchanged}), whether a bead about to be SETTLED
- * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still a
- * BOARD CARD ({@link assertHomeIsCard}), and whether the board still STATES the ordering a link rests
- * on ({@link assertOrderingStated}). All four earn it the same way — the write that flips the answer
- * is itself a locked write on a bead this step holds. Attaching work under a bead, and moving a bead
- * onto another card, are both re-parents, which take those beads' locks as subject and home; the one
- * home that can STOP being a card is a legacy epic, which stops the moment a feature lands under it —
- * that same locked write; and a link's evidence sits on the PAIR, whose bodies are edited under these
- * very locks (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
+ * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still
+ * the TIER its subject demands ({@link assertHomeFitsSubject}), and whether the board still STATES
+ * the ordering a link rests on ({@link assertOrderingStated}). All four earn it the same way — the
+ * write that flips the answer is itself a locked write on a bead this step holds. Attaching work
+ * under a bead, and moving a bead onto another card, are both re-parents, which take those beads'
+ * locks as subject and home; an epic's tier turns entirely on its feature children — it stops being
+ * a card, or stops being a container, the moment one lands under it or leaves it, that same locked
+ * write; and a link's evidence sits on the PAIR, whose bodies are edited under these very locks
+ * (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
  *
  * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
  * {@link alreadySatisfied}.
+ *
+ * `signal` is an unattended caller's cancel, and apply.ts hands it here for the FIRST step alone —
+ * the only one that can still stop for free. Everything above the write is an await: acquiring the
+ * locks, re-reading the subject, its counterpart and its owner, and up to a whole board read per
+ * topology check. A cancel arriving in any of them is a pass an operator (or the no-progress
+ * timeout) already stopped, and honouring it only at the caller's checkpoint would let it move a
+ * subject and close the proposal over it regardless. So it is re-checked HERE, under the locks and
+ * with no await left between it and the write — before the write, never after: a step that has
+ * spawned its bd call is a write this process can no longer un-decide.
+ *
+ * The NO-OP return needs the same checkpoint, for a reason the write's own does not cover: it sits
+ * on the far side of those very awaits, and returning "wrote nothing" unchecked is what lets the
+ * caller settle the ask (apply.ts `settleProposal`) over a pass that was already stopped. Writing
+ * nothing is not the same as having nothing left to stop.
  */
-export async function applyStep(repo: string, step: ApplyStep): Promise<boolean> {
+export async function applyStep(
+  repo: string,
+  step: ApplyStep,
+  signal?: AbortSignal,
+): Promise<boolean> {
   return withBeadWriteLocks(repo, lockedBeads(step), async () => {
-    if (await lockedSubjectSatisfied(repo, step)) return false;
+    if (await lockedSubjectSatisfied(repo, step)) {
+      signal?.throwIfAborted();
+      return false;
+    }
     await assertCounterpartUnmoved(repo, step);
     await assertOwnerIdle(repo, step);
     await assertRetirementHolds(repo, step);
     await assertHomeHolds(repo, step);
     await assertEvidenceHolds(repo, step);
-    await runStep(repo, await lockedWrite(repo, step));
+    const write = await lockedWrite(repo, step);
+    signal?.throwIfAborted();
+    await runStep(repo, write);
     return true;
   });
 }
@@ -203,11 +236,15 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
   if (SETTLING.has(step.verb)) assertNothingStranded(step.id, board);
 }
 
-/** What a RE-PARENT owes the home it is about to hang work under. */
+/**
+ * What a RE-PARENT owes the two run targets it sits between: the home it is about to hang work
+ * under, and the ticket set it is taking that work out of.
+ */
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
-  const doing = `before re-parenting under ${step.parent}`;
-  assertHomeIsCard(step.parent, await lockedBoard(repo, doing));
+  const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`);
+  assertOwnerUnchanged(step, board);
+  assertHomeFitsSubject(step, board);
 }
 
 /**
@@ -280,16 +317,16 @@ async function lockedBoard(repo: string, doing: string): Promise<BoardIndex> {
 }
 
 /**
- * Refuse a retirement whose subject has changed hands since the decision, judged from a board read
- * taken INSIDE the subject's write lock.
+ * Refuse a step whose subject has changed hands since the decision, judged from a board read taken
+ * INSIDE the subject's write lock.
  *
  * {@link ownerStarted} re-reads the owner the STEP captured and asks whether a run has started on it.
- * Neither it nor {@link subjectMoved} — which compares parents for a re-parent alone — can see the
- * other half: a re-parent approval landing in this window moves the subject under a DIFFERENT run
- * target, one this step holds no lock on and never re-reads, so retiring it here takes a ticket out
- * of a live run the decision never looked at, and that run aborts when its claim reaches the bead.
- * Re-derived through the same {@link ticketOwnerOf} the decision used, so the write cannot hold
- * ownership to a different bar than `planRetire` held the snapshot to.
+ * Neither it nor {@link subjectMoved} — which compares the subject's OWN parent, for a re-parent
+ * alone — can see the other half: a re-parent approval landing in this window can move an ANCESTOR
+ * of the subject under a different run target, one this step holds no lock on and never re-reads, so
+ * taking the ticket out here raids a live run the decision never looked at, and that run aborts when
+ * its claim reaches the bead. Re-derived through the same {@link ticketOwnerOf} the decision used, so
+ * the write cannot hold ownership to a different bar than the planner held the snapshot to.
  *
  * Refused on the IDENTITY change alone rather than on the newcomer's liveness: nothing locks the new
  * owner, so any liveness read of it would be racing the very claim this serialization exists to
@@ -303,7 +340,7 @@ function assertOwnerUnchanged(step: ApplyStep, board: BoardIndex): void {
   const was = ownerOf(step)?.id;
   if (now === was) return;
   throw new SubjectMovedError(
-    `${step.id} now rides ${ticketSet(now)} rather than ${ticketSet(was)} — the run target it hangs under changed since this proposal was decided, so ${retiringTicket(step.id)} would act on a ticket set this approval never looked at`,
+    `${step.id} now rides ${ticketSet(now)} rather than ${ticketSet(was)} — the run target it hangs under changed since this proposal was decided, so ${takingTicket(step.verb, step.id)} would act on a ticket set this approval never looked at`,
   );
 }
 
@@ -332,23 +369,32 @@ function assertNothingStranded(id: string, board: BoardIndex): void {
 }
 
 /**
- * Refuse to hang work under a home that is no longer a BOARD CARD, judged from a board read taken
- * INSIDE the home's write lock rather than from the approval's snapshot.
+ * Refuse to hang work under a home the tier taxonomy will not let carry this SUBJECT — judged from a
+ * board read taken INSIDE the home's write lock rather than from the approval's snapshot, and
+ * through the same {@link homeWrongTier} the decision used.
  *
  * `planReparent` asks the same question of the snapshot, and against a lone approval that is enough.
- * What it cannot see is a CONCURRENT one: the only home that can stop being a card is a legacy epic,
- * and it stops the instant a FEATURE lands under it — a re-parent that takes this very epic's write
- * lock as its own home (see {@link applyStep}). So the two orders are already serialized, and
- * re-asking here is what makes the ordering mean something. Without it, both pass against snapshots
- * taken before either wrote, and this step attaches its subject directly to what is now a container
- * epic — work riding no card and reachable by no run, which is the state the proposal exists to fix.
+ * What it cannot see is a CONCURRENT one — and one write flips either tier: a legacy epic stops
+ * being a board card, and an epic stops being a container, the instant a FEATURE lands under it or
+ * leaves it, which is a re-parent taking this very epic's write lock as its own home or subject (see
+ * {@link applyStep}). So the two orders are already serialized, and re-asking here is what makes the
+ * ordering mean something. Without it, both pass against snapshots taken before either wrote, and
+ * this step lands its subject one tier off: work attached directly to a container epic, riding no
+ * card and reachable by no run — the state the proposal exists to fix — or a card hung under an epic
+ * the move demotes out of its own run.
  */
-function assertHomeIsCard(parentId: string, board: BoardIndex): void {
-  if (!board.cards.ids.has(parentId)) {
-    throw new SubjectMovedError(
-      `${parentId} is no longer a board card — re-parenting under it would leave the work riding no card, which is the state this proposal is about`,
-    );
-  }
+function assertHomeFitsSubject(
+  step: Extract<ApplyStep, { verb: "reparent" }>,
+  board: BoardIndex,
+): void {
+  // Both ends were re-read under their own locks already; these guard the whole-board read
+  // disagreeing with them, and say so the same way every other missing bead here does.
+  const subject = board.byId.get(step.id);
+  if (!subject) throw new SubjectMovedError(missing(step.id));
+  const home = board.byId.get(step.parent);
+  if (!home) throw new SubjectMovedError(missing(step.parent));
+  const wrongTier = homeWrongTier(subject, home, board, HOME_STANDING.locked);
+  if (wrongTier) throw new SubjectMovedError(wrongTier);
 }
 
 /**
@@ -402,9 +448,19 @@ function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
  * here treats a failed read as a refusal. On such a bd a sound approval would refuse forever;
  * `loadAllIssues` falls back to merging the open and closed listings instead. Callers phrase their
  * own refusal for the read that genuinely fails.
+ *
+ * GATE-COMPLETE, for the reason the armed pass's own pre-apply read is (gardener/armed.ts
+ * `readBoardForApply`) — and this is the read that comes AFTER it, under the locks, with nothing
+ * between it and the write. bd omits gate beads from every ordinary listing while carrying the
+ * `blocks` edge a gate puts on the bead it gates, and every blocker helper reads a blocker absent
+ * from the list as still open (epic-graph.ts). Degrading is right for a page render and wrong here:
+ * a gate listing that fails leaves an approved target's own `gh:pr` merge gate reading as a real
+ * blocker, which is a `blocked` approval gap — so {@link assertStillDegraded} would find gaps that
+ * were repaired and strip the `approved` label off sound work, unattended. Failing the read closed
+ * costs nothing extra, because every caller here already refuses on a read it could not make.
  */
 export function readWholeBoard(repo: string): Promise<Bead[]> {
-  return loadAllIssues(repo);
+  return loadAllIssues(repo, { strictGates: true });
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */
@@ -453,11 +509,11 @@ function claimMoved(step: ApplyStep, subject: Bead, nowMs: number): string | und
 
 /**
  * Why an edit has falsified the evidence this step rests on, or undefined. A retirement, a
- * re-ranking and a `missing-order` all rest on a claim about the subject's CONTENTS that every other
- * check is blind to — a rescoping edit leaves status, liveness and claim exactly as the plan found
- * them. Each planner asked it of the route's snapshot; re-asked here against the read taken under
- * this bead's own lock, so an edit landing in that window refuses instead of being settled as
- * delivered.
+ * re-ranking, a `missing-order` and a `misfiled` all rest on a claim about the subject's CONTENTS
+ * that every other check is blind to — a rescoping edit leaves status, liveness and claim exactly as
+ * the plan found them. Each planner asked it of the route's snapshot; re-asked here against the read
+ * taken under this bead's own lock, so an edit landing in that window refuses instead of being
+ * settled as delivered.
  *
  * …but not when the board already reads as applied. Setting the asked-for priority BY HAND is itself
  * a write since the filing, so an unguarded fence would refuse the very state the ask wanted — the
@@ -497,7 +553,15 @@ function counterpartMoved(
   if (!counterpart) return missing(id);
   switch (step.verb) {
     case "reparent":
-      return homeUnusable(counterpart, nowMs) ?? homeClaimed(step, counterpart);
+      // The home's end of a `misfiled` match, re-asked under its own lock for the reason the
+      // subject's is: the bars above ask only whether the home is still open, unclaimed and the
+      // right tier, all of which a rewrite leaves untouched — and filing work under a home that has
+      // since become something else is the misfiling the ask was raised to fix.
+      return (
+        homeUnusable(counterpart, nowMs) ??
+        homeClaimed(step, counterpart) ??
+        premiseTouched(counterpart, EVIDENCE_PREMISE[step.kind]?.twin, step.observedAtMs)
+      );
     case "link":
       return blockerUnusable(counterpart, step.id);
     case "supersede":
@@ -515,10 +579,10 @@ function counterpartMoved(
 }
 
 /**
- * Why a run has started on the target whose ticket set this retirement's subject rides, or
- * undefined. Judged by the same two bars `planRetire` held the snapshot to — a live run, and a claim
- * taken in the window before a lease exists to see — so the write cannot pass an owner the decision
- * would have refused.
+ * Why a run has started on the target whose ticket set this step's subject rides, or undefined.
+ * Judged by the same two bars the planner held the snapshot to — a live run, and a claim taken in
+ * the window before a lease exists to see — so the write cannot pass an owner the decision would
+ * have refused.
  *
  * An owner that has LEFT the board is no obstacle: nothing is running a ticket set that no longer
  * exists, and the subject's own re-read already covers what became of it.
@@ -534,10 +598,11 @@ function ownerStarted(
   nowMs: number,
 ): string | undefined {
   if (!live) return undefined;
-  if (isInFlight(live, nowMs)) return inFlightReason(live, nowMs, retiringTicket(step.id));
+  const doing = takingTicket(step.verb, step.id);
+  if (isInFlight(live, nowMs)) return inFlightReason(live, nowMs, doing);
   const claim = runClaimOf(live);
   if (!claim || claim === owner.claim) return undefined;
-  return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${retiringTicket(step.id)} would abort it when its claim reaches a bead the board no longer holds`;
+  return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${doing} would abort it when its claim reaches a bead the board no longer holds`;
 }
 
 /** The bd verb each step resolves to — the only place this module spawns a write. */
@@ -587,21 +652,44 @@ interface RollbackOutcome {
   overtaken: string[];
 }
 
+/** What a rollback left behind: the clause the failure reports, and the beads it did not put back. */
+export interface RollbackResult {
+  /** The clause the apply failure ends on. */
+  report: string;
+  /**
+   * Every bead this rollback left somewhere other than where the apply found it — stranded, adopted,
+   * or overtaken. Carried as data as well as prose because the failure that ends here is reported as
+   * `failed`, the one verdict that promises an unchanged board: a caller reading the verdict alone
+   * would tell a founder nothing moved over beads this checkout has moved and cannot un-move, and
+   * would go on reasoning against a snapshot those writes already invalidated (gardener/armed.ts
+   * `movedTheBoard`). `overtaken` counts for the same reason the other two do — our write landed
+   * locally, and another one landing on top of it does not put the bead back.
+   */
+  survivors: string[];
+}
+
 /**
- * Undo the steps that DID land when a later one failed, newest first, and report the outcome as a
- * clause for the error. Only a cluster re-parent is ever multi-step, so this is the one shape that
- * can strand a half-applied move; every other move fails with nothing written.
+ * Undo the steps that DID land when a later one failed, newest first, and report the outcome — as a
+ * clause for the error, and as the beads that stayed moved. Only a cluster re-parent is ever
+ * multi-step, so this is the one shape that can strand a half-applied move; every other move fails
+ * with nothing written.
  *
  * A rollback that itself fails is named in the error rather than swallowed: the board is then in a
  * state a human has to look at, and saying so is the whole point of failing loud.
  */
-export async function rollbackSteps(repo: string, applied: ApplyStep[]): Promise<string> {
-  if (applied.length === 0) return " — nothing had been written";
+export async function rollbackSteps(
+  repo: string,
+  applied: ApplyStep[],
+): Promise<RollbackResult> {
+  if (applied.length === 0) return { report: " — nothing had been written", survivors: [] };
   const outcome: RollbackOutcome = { stranded: [], adopted: [], overtaken: [] };
   for (const step of [...applied].reverse()) {
     await rollbackStep(repo, step, outcome);
   }
-  return rollbackReport(applied.length, outcome);
+  return {
+    report: rollbackReport(applied.length, outcome),
+    survivors: [...outcome.stranded, ...outcome.adopted, ...outcome.overtaken],
+  };
 }
 
 /**

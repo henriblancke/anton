@@ -3,9 +3,8 @@
 import { usePathname, useRouter } from "next/navigation";
 
 import type { Epic, Stage } from "@/lib/types";
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
+import { FilterSelect, withActive } from "@/components/ui/filter-select";
 import {
   boardAreaOptions,
   boardEpicOptions,
@@ -13,11 +12,6 @@ import {
   hasBoardFilters,
   type BoardFilters,
 } from "@/components/board/board-utils";
-
-const selectClassName = cn(
-  "h-8 min-w-24 max-w-40 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors",
-  "focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
-);
 
 /**
  * Epic and Area facets for the board. The URL is the single source of truth, so an epic badge is a
@@ -61,8 +55,11 @@ export function BoardFilters({
     <>
       {epicOptions.length > 0 && (
         <FilterSelect
+          idPrefix="board-filter"
           field="epic"
           label="Epic"
+          emptyLabel="Epic: All"
+          className="max-w-40"
           value={filters.epic ?? ""}
           options={epicOptions}
           onChange={(epic) => apply({ ...filters, epic: epic || undefined })}
@@ -70,8 +67,11 @@ export function BoardFilters({
       )}
       {areaOptions.length > 0 && (
         <FilterSelect
+          idPrefix="board-filter"
           field="area"
           label="Area"
+          emptyLabel="Area: All"
+          className="max-w-40"
           value={filters.area ?? ""}
           options={areaOptions}
           onChange={(area) => apply({ ...filters, area: area || undefined })}
@@ -88,49 +88,6 @@ export function BoardFilters({
           Clear
         </Button>
       )}
-    </>
-  );
-}
-
-type SelectOption = { value: string; label: string };
-
-function withActive(options: SelectOption[], active?: string): SelectOption[] {
-  if (!active || options.some((option) => option.value === active)) return options;
-  return [...options, { value: active, label: active }];
-}
-
-function FilterSelect({
-  field,
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  field: string;
-  label: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (value: string) => void;
-}) {
-  const id = `board-filter-${field}`;
-  return (
-    <>
-      <Label htmlFor={id} className="sr-only">
-        {label}
-      </Label>
-      <select
-        id={id}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className={selectClassName}
-      >
-        <option value="">{label}: All</option>
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
     </>
   );
 }

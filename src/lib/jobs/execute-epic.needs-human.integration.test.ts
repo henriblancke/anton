@@ -10,6 +10,9 @@
  *    settle `done` and open a PR for work its own agent said isn't finished.
  * 2. **With NO diff.** The commoner shape — nothing could be done at all. Without this the ask is
  *    swallowed by the zero-diff delivery gate and reaches the operator as a generic false stall.
+ * 3. **With the NEXT step failing on what the ask is about.** The verify gate throws on the missing
+ *    credential the agent just asked for. Without this the step failure masks the ask entirely and
+ *    the run fails behind no gate.
  *
  * The run target is a FEATURE, not the fixture's legacy epic: bd refuses a gate edge onto an epic
  * ("epics can only block other epics"), so the gated shape only exists for the targets the tier
@@ -255,6 +258,41 @@ process.exit(0);`),
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       await patchSettings({ testCommand: "test -f AGENT_WORK.md" });
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("arms the gate even when the step after the ask fails on the very thing it asks for", async () => {
+    // The ask is usually ABOUT what the next step needs — the credential nobody issued, the account
+    // nobody created — so the run's own verify gate is the likeliest thing to throw right after it.
+    // Allowed to run, it replaces the ask with a generic step failure and the run takes the ordinary
+    // failure path: no gate, and a person reading "tests failed" instead of what they owe. Here the
+    // sandbox's real verify command (`test -f AGENT_WORK.md`) fails, because an ask with no diff
+    // never writes the file — no settings patch, unlike the case above.
+    const ask = "the CI service account MARKER_CI_ACCOUNT has to be created by an admin";
+    const feature = await approvedFeature("Needs an account");
+    const claude = askingClaude("claude-ask-verify-fails", ask, false);
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: feature.id });
+
+      const gates = await gatesBlocking(feature.id);
+      expect(gates).toHaveLength(1);
+      expect(gates[0].await_type).toBe("human");
+      expect(gates[0].description ?? "").toContain(ask);
+
+      // Parked on the gate with the ask — not failed on the verify the ask predicted.
+      const run = await runFor(feature.id);
+      expect(run.status).toBe("parked");
+      expect(run.endedAt ?? null).toBeNull();
+      expect(run.error).toContain(ask);
+      expect(run.error).toContain(`bd gate resolve ${gates[0].id}`);
+      expect(run.error).not.toMatch(/AGENT_WORK|step:verify/);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });

@@ -15,13 +15,22 @@ import {
   STAGE_INSET_SHADOW,
   TYPE_LABELS,
   agentDotClass,
+  canStartRun,
+  childReadinessCounts,
   ticketProgress,
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
-import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip } from "@/components/atoms";
+import {
+  AbandonedChip,
+  BlockedChip,
+  MetaChip,
+  PartiallyBlockedChip,
+  PrLink,
+  RiskChip,
+} from "@/components/atoms";
 import { ReviewScoreChip } from "@/components/review-score";
 import { ClaimControl } from "@/components/board/claim-control";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -103,9 +112,10 @@ export function EpicCard({
   }
 
   // Gate approval on readiness, not just stage: approving enqueues execute-epic immediately, so a
-  // blocked epic (open blockers) must not be startable before its blocker completes (mirrors the
-  // approve route, which rejects a not-ready epic).
-  const showApprove = epic.stage === "backlog" && !approved && epic.ready;
+  // fully blocked epic (nothing it would dispatch can run) must not be startable before its blocker
+  // completes. A partially-gated one still is — mirrors the approve route, which gates on the same
+  // verdict.
+  const showApprove = epic.stage === "backlog" && !approved && canStartRun(epic);
   // A contract gap is the other reason a run can't start. It differs from a blocker in what it asks
   // of the founder — a blocker needs waiting, this needs a one-line edit — so the affordance stays in
   // place and names the missing section instead of disappearing (or 422ing on click).
@@ -319,9 +329,13 @@ function CardShell({
       ? STAGE_INSET_SHADOW[epic.stage]
       : undefined;
 
-  // A blocked epic (open blockers) is dimmed in every column so it reads as "the runtime won't
-  // pick this up yet", mirroring the "blocked by" chip. Done cards are never blocked in practice.
-  const blocked = !epic.ready;
+  // A fully blocked epic — nothing this run would dispatch can start — is dimmed in every column so
+  // it reads as "the runtime won't pick this up yet", mirroring the "blocked by" chip. Done cards are
+  // never blocked in practice. A PARTIALLY-gated one keeps full contrast and gets its own N/M chip
+  // instead: its ready tickets run now, so dimming it would read as stalled work that isn't.
+  const blocked = epic.childReadiness === "blocked";
+  const partial = epic.childReadiness === "partially-blocked";
+  const counts = childReadinessCounts(epic);
 
   return (
     <div
@@ -346,6 +360,13 @@ function CardShell({
       )}
       <div className="pointer-events-none relative z-[1] flex flex-col gap-2.5">
         {blocked && <BlockedChip blockedBy={epic.blockedBy} />}
+        {partial && (
+          <PartiallyBlockedChip
+            ready={counts.ready}
+            total={counts.total}
+            held={epic.blockedChildren}
+          />
+        )}
         {children}
       </div>
     </div>

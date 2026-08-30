@@ -41,8 +41,16 @@ export type SignalClass = (typeof SIGNAL_CLASSES)[number];
 export interface ScanSignal {
   Source?: string | null;
   source?: string | null;
+  /** Repo-relative path the finding is about; absent for a signal that isn't about one file. */
+  FilePath?: string | null;
+  filePath?: string | null;
   Kind?: string | null;
   kind?: string | null;
+  /** The one-line finding, as stringer phrases it — some collectors put the whole claim in it. */
+  Title?: string | null;
+  title?: string | null;
+  Description?: string | null;
+  description?: string | null;
   Priority?: number | string | null;
   priority?: number | string | null;
   /** Not emitted today; read first if a future stringer adds it, rather than guessing around it. */

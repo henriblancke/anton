@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
-import { refreshAllIssues } from "@/lib/beads/issues";
+import { loadAllIssues, refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, withClaimLock } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, stealRefused, withClaimLock } from "@/lib/beads/claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
@@ -49,8 +49,37 @@ async function readApprovalBody(
   }
 }
 
-/** HTTP status per apply failure: the caller's mistake, the board's, or ours. */
-const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500 } as const;
+/**
+ * HTTP status per apply failure: the caller's mistake, the board's, or ours. `unsettled` is ours too
+ * — the move is on the board and only its proposal could not be closed, and the error text is what
+ * tells the operator that approving it again settles it.
+ */
+const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500, unsettled: 500 } as const;
+
+/**
+ * Why this bead is not something approval may enqueue, or undefined when it is a run target. Reuses
+ * the same `beads.isRunTarget` gate execute-epic enforces (a shared helper, no duplicated type
+ * logic) so the route and the runner agree on what "runnable" means, and names WHICH of the three
+ * ways it fails so the operator is told what to approve instead.
+ *
+ * One function because this question is asked TWICE per approval — once off the pre-lock board read,
+ * once again under the claim lock (see the swap below) — and the two answers must read identically.
+ */
+function notRunTargetReason(target: Bead, board: Bead[]): string | undefined {
+  if (beads.isRunTarget(target, board)) return undefined;
+  const id = target.id;
+  if (beads.isContainer(target, board)) {
+    // Approval is a per-PR gate, so it must never be offered on a bead whose approval would
+    // launch one PR per feature under it (design 2026-07-26: "Approval stays per feature").
+    return `${id} is a container epic, not a run target — approve one of its features instead; each feature is its own run and its own PR`;
+  }
+  const parent = beads.parentOf(target);
+  const type = target.issue_type ?? "unknown";
+  if ((type === "task" || type === "bug") && parent) {
+    return `${id} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`;
+  }
+  return `${id} is not runnable: type "${type}" — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
+}
 
 /**
  * Approve a gardener proposal: apply its board move and close it (anton-1t3n). Never enqueues a run
@@ -67,7 +96,7 @@ async function applyProposalResponse(
   board: Bead[],
 ): Promise<NextResponse> {
   try {
-    const applied = await applyProposal(project.repoPath, proposal, board);
+    const applied = await applyProposal(project.repoPath, proposal, board, "approval");
     // The move landed locally; propagate it like every other operator write (immediate coalesced
     // push + the durable backstop), off the response path.
     nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
@@ -126,20 +155,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     return applyProposalResponse(project, target, allBeads);
   }
 
-  if (!beads.isRunTarget(target, allBeads)) {
-    const parent = beads.parentOf(target);
-    const type = target.issue_type ?? "unknown";
-    let reason: string;
-    if (beads.isContainer(target, allBeads)) {
-      // Approval is a per-PR gate, so it must never be offered on a bead whose approval would
-      // launch one PR per feature under it (design 2026-07-26: "Approval stays per feature").
-      reason = `${epicId} is a container epic, not a run target — approve one of its features instead; each feature is its own run and its own PR`;
-    } else if ((type === "task" || type === "bug") && parent) {
-      reason = `${epicId} is a child ticket of ${parent} — approve its epic ${parent} instead; a child runs via its epic's PR, not on its own`;
-    } else {
-      reason = `${epicId} is not runnable: type "${type}" — only a feature, a parentless task/bug, or an epic with no feature children can be approved to run`;
-    }
-    return NextResponse.json({ error: reason }, { status: 422 });
+  // Cheap refusal first, off the read above — most non-run-targets never get near the lock. The
+  // verdict is re-taken under the lock before anything is written, because this read cannot hold.
+  const notRunnable = notRunTargetReason(target, allBeads);
+  if (notRunnable) {
+    return NextResponse.json({ error: notRunnable }, { status: 422 });
   }
 
   // The bead contract, judged over the SAME set execute-epic gates on — the target plus every
@@ -207,20 +227,31 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // the epic-graph rollup (epic→epic + cross-epic child blocks) PLUS any parentless standalone
   // (task/bug) prerequisite the rollup DROPS (epicStandaloneBlockers) — otherwise an epic that
   // depends on an open standalone item would read ready. For a standalone target the rollup never
-  // carries it, so derive from its own `blocks` edges. Two consumers below: the readiness gate (a
-  // fresh approval enqueues immediately, so a still-blocked target must be rejected before we
-  // label + enqueue work `bd ready` would keep blocked), and the take-over enqueue at the end (which
-  // only fires when nothing is open).
+  // carries it, so derive from its own `blocks` edges. Two consumers below: the standalone half of
+  // the readiness gate (a fresh approval enqueues immediately, so a still-blocked target must be
+  // rejected before we label + enqueue work `bd ready` would keep blocked), and the refusal message,
+  // which names what the operator is waiting on.
   const openBlockers = epic
     ? [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)]
     : standaloneBlockers(allBeads, epicId);
+  // Whether this request can actually start work. `openBlockers` is a target-level roll-up: it fires
+  // on ANY open blocker under the target, so one gated tail child made the whole run unapprovable
+  // while its independent siblings sat idle (issue #58). The rollup's per-child verdict answers the
+  // question that actually matters — is there a ticket this run could dispatch right now — so a
+  // partially-gated target approves and runs its ready children, and only a target with ZERO of them
+  // is refused. A standalone task/bug (epic-of-one) carries no such verdict and has no children to
+  // be partial about: it stays gated on its own open blockers.
+  const runnable = epic ? epic.childReadiness !== "blocked" : openBlockers.length === 0;
   // A pure take-over bypasses this gate — it only reassigns the reservation and enqueues no run that
   // would start blocked work (see the enqueue gate at the end) — so a target that gained a blocker
   // AFTER its original approval stays transferable to a new owner rather than stranded with the old.
-  if (!takeOver && openBlockers.length > 0) {
-    const message = epic
-      ? `Epic is blocked by ${openBlockers.join(", ")}`
-      : `${epicId} is blocked by ${openBlockers.join(", ")}`;
+  if (!takeOver && !runnable) {
+    const message =
+      openBlockers.length > 0
+        ? epic
+          ? `Epic is blocked by ${openBlockers.join(", ")}`
+          : `${epicId} is blocked by ${openBlockers.join(", ")}`
+        : `${epicId} is blocked: every ticket it would run is held by an open blocker`;
     return NextResponse.json({ error: message }, { status: 409 });
   }
 
@@ -237,9 +268,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // enqueues nothing (the enqueue gate at the end skips it) — it only moves the reservation — so
   // refusing it on a contract gap would strand an approved target with its previous owner over a
   // section no run of ours is about to read. The condition mirrors that enqueue gate exactly: a
-  // non-take-over always enqueues (a blocked one already 409'd above), a take-over only when
-  // nothing is open.
-  const willEnqueue = !takeOver || openBlockers.length === 0;
+  // non-take-over always enqueues (an unrunnable one already 409'd above), a take-over only when the
+  // target has work it can actually start.
+  const willEnqueue = !takeOver || runnable;
   const blocking = willEnqueue ? contractGaps(contractGated, "blocking") : [];
   if (blocking.length > 0) {
     return NextResponse.json(
@@ -298,12 +329,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
     // explicit steal to take it over, mirroring the claim route's 409.
     if (!steal) {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
-          owner,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} — pass { steal: true } to approve and take it over`,
+        owner,
       );
     }
     // A steal only moves the reservation; it does not stop a run already executing under the current
@@ -315,13 +343,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // can't bypass it. Derive from the fresh `target` read above.
     const stage = deriveStage(target);
     if (stage !== "backlog") {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
-          owner,
-          stage,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} and is already ${stage} — its run is in progress, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+        owner,
+        stage,
       );
     }
     // Steal requested, but no operator identity resolves (no ANTON_OPERATOR, no global git user.name),
@@ -329,16 +354,16 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // reservation while leaving them as assignee — a half-steal that breaks the soft-lock the response
     // text and DESIGN.md promise. Reject until an operator identity is set to take ownership.
     if (!operator) {
-      return NextResponse.json(
-        {
-          error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
-          owner,
-        },
-        { status: 409 },
+      return stealRefused(
+        `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is taking it over before approving`,
+        owner,
       );
     }
   }
-  // Auto-claim, then approve, both under the bead's claim-write lock.
+  // Re-check the board shape, auto-claim, then approve — all under the bead's claim-write lock.
+  //
+  // The shape re-check: every gate above judged a read taken before the lock existed, so the lock is
+  // also what makes the run-target verdict hold through the write. See the body.
   //
   // The claim: an unclaimed target (or one being stolen) gets assigned to the approver so the
   // reservation is set BEFORE the runtime execution-claim, closing the gap where a teammate could
@@ -362,35 +387,58 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
   // label against concurrent claims.
   const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
-    // Re-derive the stage HERE, under the lock — not only from the pre-lock `target` read above.
-    // On a steal (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then
-    // the original owner's runner starts in the window before this CAS: it moves the bead to
+    // One raw board read under the lock, serving every re-check below. `loadAllIssues`, not the
+    // snapshot-backed `refreshAllIssues`: a refresh whose generation is bumped mid-flight (any other
+    // bd write to this repo) discards what it read and answers with the RETAINED board instead
+    // (lib/beads/snapshot.ts) — last-good data is right for a view and wrong for a gate that is
+    // about to write. This one goes straight to bd and is judged as read.
+    const lockedBoard = await loadAllIssues(project.repoPath);
+    const locked = lockedBoard.find((b) => b.id === epicId);
+    if (!locked) return { vanished: true } as const;
+
+    // Re-take the run-target verdict HERE, under the lock. The pre-lock gate answered from a read
+    // taken before every gate below it ran, and the Add-work commit (lib/backlog.ts
+    // `createDraftFeature`) attaches a feature child while holding THIS SAME per-bead lock. Without
+    // this the two orders are asymmetric: the feature landing first turns a standalone run target
+    // into a container behind the pre-lock gate's back, and we would label it `approved` and enqueue
+    // a run that execute-epic's own `isRunTarget` gate only poison-parks — a false green, the exact
+    // failure the pre-lock gate exists to prevent. Under the lock the shape cannot move between this
+    // verdict and the `beads.approve` below, so the two writes are genuinely ordered: either the
+    // feature lands first and this refuses, or approval lands first and `createDraftFeature`'s own
+    // re-check refuses the draft.
+    const refusal = notRunTargetReason(locked, lockedBoard);
+    if (refusal) return { refused: refusal } as const;
+
+    // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
+    // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the original
+    // owner's runner starts in the window before this CAS: it moves the bead to
     // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
     // (which matches on assignee alone) would still succeed and reassign a *live* run to the
     // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
     // stage inside the lock makes a run that started in that window lose the swap instead. A
     // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
     // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
-    let locked: Bead | undefined;
     if (owner && owner !== operator) {
-      locked = await beads.show(project.repoPath, epicId);
-      const lockedStage = locked ? deriveStage(locked) : undefined;
-      if (lockedStage && lockedStage !== "backlog") return { moved: lockedStage } as const;
+      const lockedStage = deriveStage(locked);
+      if (lockedStage !== "backlog") return { moved: lockedStage } as const;
     }
-    // Hand the stage gate's read to the CAS: it needs the assignee as of this lock, which is exactly
-    // what `locked` holds — re-reading it would be a second `bd show` of a bead nothing can move.
+    // Hand this read to the CAS: it needs the assignee as of this lock, which is exactly what
+    // `locked` holds — re-reading it would be a `bd show` of a bead nothing can move.
     const result = await cas(owner, operator ?? owner, locked);
     if (result.ok) await beads.approve(project.repoPath, epicId);
     return result;
   });
+  if ("vanished" in swap) {
+    return notFoundResponse(`Ticket ${epicId} not found on the board`);
+  }
+  if ("refused" in swap) {
+    return NextResponse.json({ error: swap.refused }, { status: 422 });
+  }
   if ("moved" in swap) {
-    return NextResponse.json(
-      {
-        error: `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
-        owner,
-        stage: swap.moved,
-      },
-      { status: 409 },
+    return stealRefused(
+      `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+      owner,
+      swap.moved,
     );
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
@@ -415,10 +463,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   //    job and reuses it (returns no new id), so a parked prior run stays resumable rather than
   //    shadowed by a duplicate.
   //
-  //    Skip the take-over enqueue when the target is currently blocked: a take-over bypasses the
-  //    readiness gate above (to stay transferable), but starting blocked work is exactly what that
-  //    gate prevents — the runner would only park it. The operator force-runs it once the blocker
-  //    clears, matching a fresh approval's own blocker rejection.
+  //    Skip the take-over enqueue when the target has nothing it can start: a take-over bypasses the
+  //    readiness gate above (to stay transferable), but starting fully blocked work is exactly what
+  //    that gate prevents — the runner would only park it. The operator force-runs it once the
+  //    blocker clears, matching a fresh approval's own refusal.
   //
   // Best-effort — approving must still succeed even if the runner enqueue hiccups.
   // The autonomy master-switch (anton-y3l) gates at *claim* in the runner instead, so with autonomy

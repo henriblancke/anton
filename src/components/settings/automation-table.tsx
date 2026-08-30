@@ -31,7 +31,7 @@ export interface AutomationSpec {
    * idle — and the row has to say which, or an operator reads a healthy no-op as a failure.
    */
   dependsOn?: string;
-  /** Which group it belongs to, so seven rows read as three concerns. */
+  /** Which group it belongs to, so a list of rows reads as three concerns. */
   group: string;
 }
 
@@ -41,7 +41,7 @@ export const AUTOMATION_GROUPS = ["Board maintenance", "Run health", "Delivery"]
 /**
  * How often the time columns re-read the clock. Five seconds and not a minute because the countdown
  * prints seconds inside the last minute ("in 45s"), so a minute-long tick would let a row sit a full
- * minute past due still claiming time was left; five seconds and not one because seven rows of text
+ * minute past due still claiming time was left; five seconds and not one because a page of text
  * do not need sixty renders a minute to stay honest.
  */
 const CLOCK_TICK_MS = 5_000;
@@ -90,7 +90,7 @@ function formatCountdown(unixSeconds: number, nowMs: number): string {
 /**
  * Settings → Automation, as a table (anton-ue90.4).
  *
- * Seven automations are records with identical fields, so they are rendered as rows that can be read
+ * The automations are records with identical fields, so they are rendered as rows that can be read
  * down a column — the previous card list lived in half a two-column grid, which is what made every
  * control fight for its width. Cadence is a button opening {@link CadenceEditor} in a popover rather
  * than a select that grew an input and reflowed the rows beneath it.

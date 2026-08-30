@@ -1,5 +1,7 @@
 "use client";
 
+import type { EpicChoice } from "@/lib/backlog";
+
 import { IdleDraftPanel, ShapingDraftPanel } from "./shape-draft-panel";
 import { SessionPane } from "./shape-session-pane";
 import { useSendToBacklog, useShapeDraft } from "./use-shape-draft";
@@ -7,10 +9,11 @@ import { useShapeSession } from "./use-shape-session";
 
 /**
  * The Add-work / shaping surface (anton-bm4.2). A real `/shape` session runs a `claude` pty streamed
- * to an xterm on the left; on the right the founder shapes a draft epic and commits it to backlog.
+ * to an xterm on the left; on the right the founder shapes a draft feature — the tier anton runs —
+ * and commits it to backlog under its epic (anton-h1ds).
  *
  * This component only sequences those two panes. The panes' state is two unrelated concerns and is
- * owned that way: `useShapeSession` holds the live pty, `useShapeDraft` the epic being composed
+ * owned that way: `useShapeSession` holds the live pty, `useShapeDraft` the feature being composed
  * beside it, and `useSendToBacklog` the landing. They meet at exactly two points — the seed handed
  * over when shaping starts, and the session id the send needs to tear the pty down.
  */
@@ -18,11 +21,14 @@ export function ShapeView({
   slug,
   projectName,
   areas,
+  epics,
 }: {
   slug: string;
   projectName: string;
   /** `area:` values already on the board — suggested so surfaces get reused, not re-minted. */
   areas: string[];
+  /** The live epics the draft feature may attach to. */
+  epics: EpicChoice[];
 }) {
   const draft = useShapeDraft();
   const backlog = useSendToBacklog(slug);
@@ -49,6 +55,7 @@ export function ShapeView({
           <ShapingDraftPanel
             draft={draft}
             areas={areas}
+            epics={epics}
             sending={backlog.sending}
             onSend={() => backlog.send(sessionId, draft.fields)}
           />

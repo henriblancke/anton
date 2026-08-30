@@ -18,7 +18,7 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
-import { describeBd } from "@/lib/testing/integration";
+import { describeBd, nextBdSecond } from "@/lib/testing/integration";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
 import { makeDetection, type DetectionInput } from "@/lib/gardener/detections";
 import { proposalDraft } from "@/lib/gardener/emit";
@@ -32,25 +32,6 @@ let beads: ApproveSuiteCtx["beads"];
 
 describeBd("POST approve — gardener proposals apply their move (temp anton.db + real bd)", () => {
   /**
-   * Wait until every write already made carries a stamp STRICTLY BELOW the current second. bd stamps
-   * at one-second resolution, so a subject stamped in the same second the proposal was filed cannot
-   * be ordered against it, and every retirement then fails closed on "carries no write stamp this
-   * proposal's filing can be ordered against" (apply.ts `writtenSinceFiling`). A real patrol files
-   * hours after the writes it judges; only a fixture is fast enough to collide, so the wait belongs
-   * here — not in a looser rule.
-   *
-   * bd ROUNDS to that grid rather than truncating: a write landing at `S.6` is stamped `S+1`, a
-   * second AHEAD of the clock it landed on. So clearing the boundary is not enough — waiting to
-   * `S+1.05` leaves a subject written at `S.6` sharing the filing's second, which is exactly the tie
-   * this exists to avoid (it flaked CI ~1 run in 4). The target second is therefore taken from the
-   * highest stamp a completed write can already hold, `round(now)`, not from `now`.
-   */
-  const nextSecond = (): Promise<void> => {
-    const settled = Math.round(Date.now() / 1_000) * 1_000; // the latest stamp prior writes can carry
-    return new Promise((resolve) => setTimeout(resolve, settled + 1_050 - Date.now()));
-  };
-
-  /**
    * File a proposal the way the patrol would: the emitter's own draft, created through the seam.
    * `observedAtMs` is when the board the detection judged was READ — passed only by the case that
    * proves it fences separately from the bead's own creation stamp.
@@ -59,7 +40,7 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     input: DetectionInput,
     observedAtMs?: number,
   ): Promise<{ id: string; fingerprint: string }> => {
-    await nextSecond(); // the subjects were just written — see nextSecond
+    await nextBdSecond(); // the subjects were just written — see nextBdSecond
     const detection = makeDetection(input);
     const id = await beads.create(repo, proposalDraft(detection, observedAtMs));
     return { id, fingerprint: detection.fingerprint };
@@ -295,15 +276,15 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
   it("refuses a subject edited after the board snapshot but before the proposal was created", async () => {
     const ticket = await beads.create(repo, { title: "Rescoped mid-pass", type: "task", acceptance: "- [ ] a" });
 
-    await nextSecond();
+    await nextBdSecond();
     const observedAtMs = Date.now(); // the patrol reads the board here…
 
-    await nextSecond();
+    await nextBdSecond();
     // …somebody rescopes the subject here. A description edit, because that is what bd's own write
     // stamp moves — the fact every premise check downstream reads.
     await beads.update(repo, ticket, { description: "Goal: actually, there is more to do here." });
 
-    await nextSecond();
+    await nextBdSecond();
     const proposal = await file(
       {
         kind: "stale",

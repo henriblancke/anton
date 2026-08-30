@@ -3,6 +3,25 @@
  * One helper so ticket detail, tickets list, and epic detail never diverge in wording.
  */
 
+/**
+ * The one locale every user-facing date and time in anton is formatted in (anton-icda).
+ *
+ * Pinned rather than host-derived, because a host-derived locale is not one locale: `toLocale*` with
+ * no locale resolves to the *server's* during SSR and the *browser's* on the client, so any client
+ * component that server-renders can hydrate to different text. Pinning settles that by construction
+ * instead of asking every call site to prove it never SSRs, and keeps dates identical across tests,
+ * screenshots, and machines whatever `LANG` the server booted under. anton's UI is English-only —
+ * i18n is deliberately out of scope — so a host locale would only reorder dates beneath labels that
+ * stay English regardless.
+ *
+ * The **timezone** is deliberately NOT pinned. anton runs on the operator's own machine, so times
+ * should read in their own clock; that axis can't diverge the way locale can.
+ *
+ * Enforced by lint (`no-restricted-syntax` in eslint.config.mjs) so new call sites can't drift back
+ * to the host locale. See docs/ui-brief.md → Foundations.
+ */
+export const DISPLAY_LOCALE = "en-US";
+
 /** Compact "3m ago" / "2h ago" / "5d ago" from an ISO timestamp. `null` when unparseable. */
 export function formatRelativeTime(iso: string | null | undefined, now = Date.now()): string | null {
   if (!iso) return null;
@@ -20,7 +39,7 @@ export function formatExactTime(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) return null;
-  return new Date(ms).toLocaleString(undefined, {
+  return new Date(ms).toLocaleString(DISPLAY_LOCALE, {
     dateStyle: "medium",
     timeStyle: "short",
   });

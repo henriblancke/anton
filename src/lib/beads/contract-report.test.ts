@@ -29,6 +29,11 @@ const ticket = (over: Partial<Bead> = {}): Bead => ({
   ...over,
 });
 
+/** The rubric written into the DESCRIPTION too — the shape the form rate asks for, and the one the
+ * fixture deliberately lacks (its acceptance lives only in bd's field, like most of the board). */
+const withRubric = (description: string) =>
+  `${description}\n\n## Acceptance Criteria\n- [ ] it works`;
+
 /** Drop one `## <heading>` block, leaving the rest intact — how each gap under test is created. */
 function without(description: string, heading: string): string {
   const lines = description.split("\n");
@@ -174,6 +179,91 @@ describe("buildContractReport", () => {
   });
 });
 
+// The second question over the same beads: does the DESCRIPTION alone carry the contract? A bead
+// whose rubric lives only in bd's field passes the gate and falls short here — that is the drift
+// this rate exists to make visible.
+describe("buildContractReport form rate", () => {
+  const withAcceptance = (over: Partial<Bead> = {}) =>
+    ticket({ ...over, description: withRubric(over.description ?? SHAPED) });
+
+  it("divides by the same denominator as the contract rate", () => {
+    const report = buildContractReport([
+      withAcceptance({ id: "anton-f", issue_type: "feature" }),
+      // Exempt and unread beads are not judged, so neither rate may count them.
+      ticket({ id: "anton-l", issue_type: "learning", parent: "anton-f", description: "" }),
+      { id: "anton-p", title: "A projection", status: "open", issue_type: "task", parent: "anton-f" },
+    ]);
+    expect(report.judged).toBe(1);
+    expect(report.form).toMatchObject({ conformant: 1, rows: [] });
+    expect(report.form.bySection).toEqual([]);
+  });
+
+  it("faults a bead whose acceptance lives only in bd's field, without blocking it", () => {
+    const report = buildContractReport([ticket({ id: "anton-fieldonly" })]);
+    expect(report).toMatchObject({ judged: 1, conformant: 1, blocking: 0, advisory: 0 });
+    expect(report.form.conformant).toBe(0);
+    expect(report.form.rows).toEqual([
+      {
+        id: "anton-fieldonly",
+        title: "A shaped ticket",
+        issueType: "task",
+        status: "open",
+        missing: ["Acceptance"],
+      },
+    ]);
+  });
+
+  // The exit code is `report.blocking`, so form drift must leave it at zero however wide it gets.
+  it("keeps the exit-code counters untouched by form gaps", () => {
+    const report = buildContractReport([
+      ticket({ id: "anton-a" }),
+      ticket({ id: "anton-b" }),
+      withAcceptance({ id: "anton-c" }),
+    ]);
+    expect(report).toMatchObject({ judged: 3, conformant: 3, blocked: 0, blocking: 0, advisory: 0 });
+    expect(report.form.rows.map((r) => r.id)).toEqual(["anton-a", "anton-b"]);
+  });
+
+  it("tallies each absent section and lists the messiest bead first", () => {
+    const report = buildContractReport([
+      ticket({ id: "anton-tidy" }),
+      ticket({ id: "anton-messy", description: without(without(SHAPED, "Verify"), "Goal") }),
+      withAcceptance({ id: "anton-also", description: without(SHAPED, "Verify") }),
+    ]);
+    expect(report.form.rows.map((r) => [r.id, r.missing])).toEqual([
+      ["anton-messy", ["Acceptance", "Goal", "Verify"]],
+      ["anton-also", ["Verify"]],
+      ["anton-tidy", ["Acceptance"]],
+    ]);
+    expect(report.form.bySection).toEqual([
+      { section: "Acceptance", count: 2 },
+      { section: "Verify", count: 2 },
+      { section: "Goal", count: 1 },
+    ]);
+  });
+
+  // An epic answers for its own two sections, not a ticket's five — the form judgement is tiered
+  // exactly as the gate is.
+  it("judges a runnable epic on its outcome and Success Criteria", () => {
+    const report = buildContractReport([
+      {
+        id: "anton-e",
+        title: "An outcome",
+        status: "open",
+        issue_type: "epic",
+        description: "Reports are shareable outside the app.",
+        acceptance_criteria: "- [ ] every report has a public link",
+        labels: ["area:reports"],
+        ...STAMPS,
+      },
+      withAcceptance({ id: "anton-t", parent: "anton-e" }),
+    ]);
+    expect(report.form.rows.map((r) => [r.id, r.missing])).toEqual([
+      ["anton-e", ["Success Criteria"]],
+    ]);
+  });
+});
+
 describe("formatContractReport", () => {
   it("states the switch-on is safe when the board is clean", () => {
     const text = formatContractReport(buildContractReport([ticket()]));
@@ -195,6 +285,47 @@ describe("formatContractReport", () => {
     expect(text).toContain("anton-a  [task/open]  Needs a rubric");
     expect(text).toMatch(/BLOCKING {2}Acceptance/);
     expect(text).toMatch(/advisory {2}Context/);
+  });
+
+  it("prints the form rate over the contract rate's denominator and names what each lacks", () => {
+    const text = formatContractReport(
+      buildContractReport([
+        ticket({ id: "anton-a", title: "Rubric in bd's field" }),
+        ticket({ id: "anton-b", description: withRubric(SHAPED) }),
+      ]),
+    );
+    expect(text).toContain("2/2 run-gated beads conformant (100%)");
+    expect(text).toContain("form     1/2 descriptions carry every section (50%) — Acceptance 1");
+    expect(text).toContain("anton-a  [task/open]  Rubric in bd's field");
+    expect(text).toContain("missing   Acceptance");
+    expect(text).toContain("Never blocking, never in the exit code");
+  });
+
+  // A board with no violations still reports its form gaps: the switch-on verdict and the form rate
+  // are separate readings, and the clean-board message must not swallow the second.
+  it("reports form gaps beside the clean-board verdict", () => {
+    const text = formatContractReport(buildContractReport([ticket({ id: "anton-a" })]));
+    expect(text).toContain("No violations.");
+    expect(text).toContain("form     0/1 descriptions carry every section (0%)");
+    expect(text).toContain("anton-a  [task/open]");
+    expect(text).toContain("a form gap alone never withholds a run.");
+    expect(text).not.toContain("BLOCKING above");
+  });
+
+  it("keeps the BLOCKING caveat only when a bead is listed BLOCKING above", () => {
+    const text = formatContractReport(
+      buildContractReport([ticket({ id: "anton-a", acceptance_criteria: undefined })]),
+    );
+    expect(text).toContain("BLOCKING 1 across 1 bead(s)");
+    expect(text).toContain("bead listed BLOCKING above is refused all the same.");
+  });
+
+  it("says nothing about form when every description carries the contract", () => {
+    const text = formatContractReport(
+      buildContractReport([ticket({ description: withRubric(SHAPED) })]),
+    );
+    expect(text).toContain("form     1/1 descriptions carry every section (100%)");
+    expect(text).not.toContain("missing ");
   });
 
   it("prefixes the headline with the board when several are reported", () => {

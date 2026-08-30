@@ -13,15 +13,21 @@ import { eq } from "drizzle-orm";
 
 import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
-import { LABELS, type Bead } from "../beads/bd";
+import { LABELS, type Bead, type Gate } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
+import { blockedByPoison } from "./errors";
 import type { Clock } from "./queue";
 
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
 const syncMock = vi.fn<(cwd: string) => Promise<void>>();
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
+/**
+ * The gates the pass re-reads: open-only before escalating a `needs-human` finding, and `--all` when
+ * it has to tell whether a poison-parked job's blocker was a human gate at all.
+ */
+const gateListMock = vi.fn<(cwd: string, opts?: { all?: boolean }) => Promise<Gate[]>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -33,6 +39,7 @@ vi.mock("../beads/bd", async () => {
       note: (...args: [string, string, string]) => noteMock(...args),
       sync: (...args: [string]) => syncMock(...args),
       pull: (...args: [string]) => pullMock(...args),
+      gateList: (...args: [string, { all?: boolean }?]) => gateListMock(...args),
     },
   };
 });
@@ -48,7 +55,24 @@ vi.mock("./queue", async () => {
   return { ...actual, getJob: (...args: Parameters<typeof actual.getJob>) => getJobMock(...args) };
 });
 
+/**
+ * The one escalation WRITE the pass makes on its own initiative, wrapped so a test can make it fail:
+ * retirement is best-effort, so a settle that throws must cost the row, never the pass.
+ */
+const settleEscalationMock = vi.fn<typeof import("../escalations").settleEscalation>();
+
+vi.mock("../escalations", async () => {
+  const actual = await vi.importActual<typeof import("../escalations")>("../escalations");
+  return {
+    ...actual,
+    settleEscalation: (...args: Parameters<typeof actual.settleEscalation>) =>
+      settleEscalationMock(...args),
+  };
+});
+
 const { getJob: realGetJob } = await vi.importActual<typeof import("./queue")>("./queue");
+const { settleEscalation: realSettleEscalation } =
+  await vi.importActual<typeof import("../escalations")>("../escalations");
 const { resumeEpic, unstickPass } = await import("./unstick");
 
 const NOW = 1_700_000_000_000;
@@ -65,6 +89,18 @@ let t: TestDb;
 /** An epic on the board as the pass expects to find it: open, with no run-lease label. */
 function openEpic(id: string): Bead {
   return { id, title: id, status: "open", issue_type: "epic", labels: [] };
+}
+
+/** An open human gate as `bd gate list` returns it — still waiting on a person. */
+function openGate(id: string): Gate {
+  return {
+    id,
+    title: `Ad-hoc gate ${id}`,
+    status: "open",
+    issue_type: "gate",
+    await_type: "human",
+    created_at: new Date(NOW - 3 * HOUR).toISOString(),
+  };
 }
 
 /** The live PR the pass re-reads before escalating a `stale-pr` finding. Idle by default. */
@@ -95,8 +131,12 @@ beforeEach(() => {
   noteMock.mockResolvedValue(undefined);
   syncMock.mockResolvedValue(undefined);
   pullMock.mockResolvedValue(undefined);
+  // Every gate these tests reference, still open. The pass re-reads the open gates before escalating
+  // a `needs-human` finding, so a gate missing from this list reads as RESOLVED and settles the wait.
+  gateListMock.mockResolvedValue(["g-1", "g-2"].map(openGate));
   prActivityMock.mockResolvedValue(prActivity());
   getJobMock.mockImplementation(realGetJob);
+  settleEscalationMock.mockImplementation(realSettleEscalation);
 });
 
 afterEach(() => {
@@ -125,14 +165,17 @@ function seedReport(...findings: RunHealthFinding[]): Promise<void> {
 }
 
 /** A settled job the report's `exhausted-job` finding points at, re-read before escalating. */
-function seedJob(id: string, o: { status: string; attempts: number; lastError: string }): void {
+function seedJob(
+  id: string,
+  o: { status: string; attempts: number; lastError: string; epicBeadId?: string },
+): void {
   t.db
     .insert(schema.jobs)
     .values({
       id,
       type: "execute-epic",
       projectId: "p1",
-      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "e-9" }),
+      payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: o.epicBeadId ?? "e-9" }),
       status: o.status,
       attempts: o.attempts,
       lastError: o.lastError,
@@ -168,6 +211,19 @@ function seedExhaustedJobReport(...jobIds: string[]): Promise<void> {
       beadId: "e-9",
     })),
   );
+}
+
+function seedHumanGateReport(gateId: string): Promise<void> {
+  return seedReport({
+    kind: "needs-human",
+    key: `needs-human:${gateId}`,
+    reason: "waiting on a human 3h: the founder wants to see the design first",
+    since: NOW - 3 * HOUR,
+    ageMs: 3 * HOUR,
+    gateId,
+    beadId: "t-1",
+    targetBeadId: "e-2",
+  });
 }
 
 function parkedRunFinding(runId: string, beadId: string, reason: string): RunHealthFinding {
@@ -622,6 +678,26 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(escalationRows()).toEqual([]);
   });
 
+  it("never escalates a park whose epic an operator cancelled, however many sweeps see it", async () => {
+    // A cancel settles the JOB and clears the lease, but the run row stays parked with the error
+    // that stopped it — so the sweep reports this finding forever. Escalating it asks the founder to
+    // re-decide a stop they already made, every hour, with an Abandon that would close their bead.
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    seedJob("j-cancelled", {
+      status: "cancelled",
+      attempts: 1,
+      lastError: "cancelled by operator",
+      epicBeadId: "e-2",
+    });
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+    expect(await sweep()).toMatchObject({ escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+  });
+
   it("escalates an agent failure once across two sweeps, and never enqueues", async () => {
     seedParkedRun("r-2", "e-2", "agent exited 1");
     await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
@@ -796,6 +872,137 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(escalationRows().map((r) => r.jobId).sort()).toEqual(["j-10", "j-9"]);
   });
 
+  it("points a human-gate escalation at the RUN TARGET, not the ticket the gate blocks", async () => {
+    // The resume button acts on `epicBeadId`, and jobs are keyed by run target — pointing it at the
+    // gated ticket would enqueue work execute-epic never dispatches on its own.
+    await seedReport({
+      kind: "needs-human",
+      key: "needs-human:g-1",
+      reason: "waiting on a human 3h: the founder wants to see the design first",
+      since: NOW - 3 * HOUR,
+      ageMs: 3 * HOUR,
+      gateId: "g-1",
+      beadId: "t-1",
+      targetBeadId: "e-2",
+    });
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 0, escalated: 1, held: 0 });
+    expect(escalationRows()[0]).toMatchObject({
+      findingKey: "needs-human:g-1",
+      kind: "needs-human",
+      beadId: "t-1", // where the wait is visible on the board — and where the note lands
+      epicBeadId: "e-2",
+    });
+    expect(jobRows()).toEqual([]); // a human gate is never auto-resumed
+  });
+
+  it("names NO run target for a gate hung on work anton doesn't run", async () => {
+    // A founder can gate anything — a molecule step, a bead this board read doesn't carry — and the
+    // detector reports that wait with no `targetBeadId`. Falling back to the gated bead would point
+    // resolve-and-resume at something execute-epic cannot run; empty lets it close the gate and stop.
+    await seedReport({
+      kind: "needs-human",
+      key: "needs-human:g-2",
+      reason: "waiting on a human 1h: no reason recorded on the gate",
+      since: NOW - HOUR,
+      ageMs: HOUR,
+      gateId: "g-2",
+      beadId: "step-3",
+    });
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 1 });
+    expect(escalationRows()[0]).toMatchObject({ beadId: "step-3", epicBeadId: null });
+  });
+
+  it("holds a human-gate finding whose gate was resolved between the sweep and now", async () => {
+    // The sweep runs on the hour and this pass at :10, so a founder who answers inside that gap would
+    // otherwise get "Waiting on you" for a wait they already ended — and nothing retires it: later
+    // reports just omit the finding while the escalation it opened stays on the board.
+    gateListMock.mockResolvedValue([openGate("g-2")]);
+    await seedHumanGateReport("g-1");
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1 });
+    expect(escalationRows()).toEqual([]);
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("retires an OPEN gate wait once the gate is answered, even though the report has moved on", async () => {
+    // The window the pre-raise re-check can't see: the founder answers AFTER the row was raised, so
+    // the next sweep simply omits the finding and no later pass ever visits it again. Without this
+    // the board would show "Waiting on you" for a wait that ended, and the only answers offered
+    // would resolve an already-closed gate and restart work nobody asked to restart.
+    await seedHumanGateReport("g-1");
+    expect(await sweep()).toMatchObject({ escalated: 1, settled: 0 });
+
+    gateListMock.mockResolvedValue([openGate("g-2")]);
+    await seedReport(); // the gate is answered: the sweep no longer reports it at all
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    // Idempotent, like every other verb here: the second pass has nothing left to settle.
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+  });
+
+  it("retires an open gate wait whose gate was resolved rather than deleted", async () => {
+    // `bd gate list` defaults to open gates, but a resolved one that still shows up is over just the
+    // same — judged by the sweep's own detector, so the two can't drift on what an open wait is.
+    await seedHumanGateReport("g-1");
+    await sweep();
+
+    gateListMock.mockResolvedValue([{ ...openGate("g-1"), status: "closed" }]);
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps an open gate wait when the gate list can't be read", async () => {
+    // Fails OPEN both ways: bd's silence is no evidence a wait ended, so the row stays on the board
+    // and the next pass reconciles it.
+    await seedHumanGateReport("g-1");
+    await sweep();
+
+    gateListMock.mockRejectedValue(new Error("bd exploded"));
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("leaves an open gate wait alone while its gate is still waiting on somebody", async () => {
+    await seedHumanGateReport("g-1");
+    await sweep();
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("settles nothing for escalations of other kinds, whatever the gates say", async () => {
+    // Only a `needs-human` row hangs on a gate; a parked run's escalation is answered by the founder
+    // and must never be retired by an unrelated gate resolving.
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    await seedReport(parkedRunFinding("r-2", "e-2", "parked 4h ago: agent exited 1"));
+    await sweep();
+
+    gateListMock.mockResolvedValue([]);
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+    expect(gateListMock).toHaveBeenCalledTimes(0); // no gate wait open, so no gate read either
+  });
+
+  it("escalates on the report's word when the gate list can't be read", async () => {
+    // Fails OPEN, like the PR and job re-checks: an unreadable board is no evidence a wait ended, and
+    // a missed escalation strands the very human this finding exists to find.
+    gateListMock.mockRejectedValue(new Error("bd exploded"));
+    await seedHumanGateReport("g-1");
+
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 1, held: 0 });
+    expect(escalationRows()[0]).toMatchObject({ findingKey: "needs-human:g-1" });
+  });
+
   it("raises a fresh escalation once a resolved one no longer covers the stall", async () => {
     // The open-only partial index is what allows this: a stall that recurs after the founder settled
     // it must be able to reach them again rather than being silenced by its own history.
@@ -812,6 +1019,315 @@ describe("non-resumable parks produce exactly one escalation and no enqueue", ()
     expect(await sweep()).toMatchObject({ escalated: 1 });
     expect(escalationRows().filter((r) => r.status === "open")).toHaveLength(1);
     expect(escalationRows()).toHaveLength(2);
+  });
+});
+
+// A sweep from BEFORE the dedupe raised both halves of one wait: the gate, and the job that
+// poison-parked on it. Suppression retires the finding, never the row — so without reconciliation the
+// "retries spent" escalation outlives the gate for good, carrying an Abandon that would cancel work
+// the gate is merely waiting on.
+describe("a legacy exhausted-job escalation that is really a gate's wait", () => {
+  /** The row such a sweep left behind: an open `exhausted-job` on a blocked-run poison park. */
+  function seedGateBlockedEscalation(jobId: string, ...blockers: string[]): void {
+    const reason =
+      "execute-epic job parked without retrying (permanent failure): " +
+      blockedByPoison("e-9", blockers).message;
+    t.db
+      .insert(schema.escalations)
+      .values({
+        id: `esc-${jobId}`,
+        projectId: "p1",
+        findingKey: `exhausted-job:${jobId}`,
+        kind: "exhausted-job",
+        reason,
+        beadId: "e-9",
+        jobId,
+        since: secDate(NOW - 4 * HOUR),
+        evidenceJson: JSON.stringify({ kind: "exhausted-job", jobId, reason }),
+        status: "open",
+        raisedAt: secDate(NOW - 4 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+  }
+
+  /** `gate list` answers the two questions differently: open-only by default, everything on `--all`. */
+  function gates(open: Gate[], all: Gate[]): void {
+    gateListMock.mockImplementation(async (_cwd, opts) => (opts?.all ? all : open));
+  }
+
+  it("retires the row while the gate is still open — the gate wait already carries it", async () => {
+    seedGateBlockedEscalation("j-9", "g-1");
+    await seedReport(); // suppressed: the sweep reports the gate, never the job
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    // Idempotent, like every other verb here.
+    expect(await sweep()).toMatchObject({ settled: 0 });
+  });
+
+  it("retires the row once the gate has been answered, when nothing reports it any more", async () => {
+    // The other end of the gate's life: it resolved, gate-check resumed the job, and the sweep has
+    // nothing to report — but only a listing that outlives the gate can say the blocker WAS a gate.
+    gates([], [{ ...openGate("g-1"), status: "closed" }]);
+    seedGateBlockedEscalation("j-9", "g-1");
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps a row whose job is ALSO held by an ordinary prerequisite", async () => {
+    // Answering the gate won't free that job, and nothing else would ever surface it. The job is
+    // seeded still parked, so the general retirement has live evidence the stall is real — the row
+    // survives on the merits, not on nobody looking.
+    seedJob("j-9", { status: "parked", attempts: 1, lastError: "poison: blocked" });
+    seedGateBlockedEscalation("j-9", "g-1", "anton-dep");
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("keeps a row the report still carries — a job parked after its gate was answered", async () => {
+    // The sweep reports that one again (nothing suppresses it), so retiring it here would settle and
+    // re-raise the same stall every pass.
+    seedJob("j-9", { status: "parked", attempts: 1, lastError: "poison: blocked" });
+    await seedReport({
+      kind: "exhausted-job",
+      key: "exhausted-job:j-9",
+      reason: "execute-epic job parked without retrying (permanent failure): blocked",
+      since: NOW - 4 * HOUR,
+      ageMs: 4 * HOUR,
+      jobId: "j-9",
+      beadId: "e-9",
+    });
+    seedGateBlockedEscalation("j-9", "g-1");
+
+    expect(await sweep()).toMatchObject({ settled: 0, held: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("keeps every row when the full gate list can't be read", async () => {
+    // Fails OPEN, like every other re-check here: bd's silence is no evidence the row is a duplicate.
+    gateListMock.mockRejectedValue(new Error("bd exploded"));
+    seedJob("j-9", { status: "parked", attempts: 1, lastError: "poison: blocked" });
+    seedGateBlockedEscalation("j-9", "g-1");
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+  });
+
+  it("leaves an ordinary exhausted-job row alone — it names no blockers at all", async () => {
+    // Its job is still parked out of attempts, so this row is a live stall: the gate path has no
+    // business with it, and the general retirement's re-check keeps it.
+    seedJob("j-8", { status: "parked", attempts: 3, lastError: "failed 3×: tests failed" });
+    t.db
+      .insert(schema.escalations)
+      .values({
+        id: "esc-plain",
+        projectId: "p1",
+        findingKey: "exhausted-job:j-8",
+        kind: "exhausted-job",
+        reason: "execute-epic job parked after 3/3 attempts: tests failed",
+        jobId: "j-8",
+        since: secDate(NOW - 4 * HOUR),
+        evidenceJson: "{}",
+        status: "open",
+        raisedAt: secDate(NOW - 4 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+    expect(gateListMock).not.toHaveBeenCalled(); // no candidate, so no gate read either
+  });
+});
+
+// An escalation must leave the board when the stall it reports ends (anton-9elp). `classifyFinding`
+// only ever visits findings in the CURRENT report, so the moment a condition clears its finding
+// vanishes from the report and the row it raised becomes unreachable — open forever, claiming a
+// stall that is over, until the strip stops reading as a list of things that need a decision.
+describe("open escalations are retired once the stall they report ends", () => {
+  /** An open escalation of any kind, as an earlier pass left it behind. */
+  function seedEscalation(o: {
+    id: string;
+    kind: RunHealthFinding["kind"];
+    findingKey: string;
+    reason: string;
+    beadId?: string;
+    runId?: string;
+    jobId?: string;
+    /** The detector's extra evidence — where a stale PR's number lives, as it does in production. */
+    evidence?: Record<string, unknown>;
+  }): void {
+    t.db
+      .insert(schema.escalations)
+      .values({
+        id: o.id,
+        projectId: "p1",
+        findingKey: o.findingKey,
+        kind: o.kind,
+        reason: o.reason,
+        beadId: o.beadId,
+        runId: o.runId,
+        jobId: o.jobId,
+        since: secDate(NOW - 4 * HOUR),
+        evidenceJson: JSON.stringify({
+          kind: o.kind,
+          key: o.findingKey,
+          reason: o.reason,
+          beadId: o.beadId,
+          ...o.evidence,
+        }),
+        status: "open",
+        raisedAt: secDate(NOW - 4 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+  }
+
+  function seedStalePrEscalation(): void {
+    seedEscalation({
+      id: "esc-pr",
+      kind: "stale-pr",
+      findingKey: "stale-pr:e-3:42",
+      reason: "PR #42 idle 3d with the target still in review",
+      beadId: "e-3",
+      evidence: { prNumber: 42, prUrl: "https://github.com/o/r/pull/42" },
+    });
+  }
+
+  const rowById = (id: string) => escalationRows().find((r) => r.id === id);
+
+  it("retires a merged PR's row and a cancelled job's row in one pass", async () => {
+    // The two orphans measured on the real board: a `stale-pr` whose PR landed, and an
+    // `exhausted-job` whose job an operator cancelled. Neither is reported any more, and before this
+    // nothing would ever have visited either again.
+    prActivityMock.mockResolvedValue(prActivity({ state: "MERGED" }));
+    seedStalePrEscalation();
+    seedJob("j-9", { status: "cancelled", attempts: 3, lastError: "cancelled by operator" });
+    seedEscalation({
+      id: "esc-job",
+      kind: "exhausted-job",
+      findingKey: "exhausted-job:j-9",
+      reason: "execute-epic job parked after 3/3 attempts: tests failed",
+      beadId: "e-9",
+      jobId: "j-9",
+    });
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 2 });
+    expect(rowById("esc-pr")).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    expect(rowById("esc-job")).toMatchObject({ status: "resolved", resolution: "dismissed" });
+    // Idempotent, like every other verb here: the second pass has nothing left to retire.
+    expect(await sweep()).toMatchObject({ settled: 0 });
+  });
+
+  it("retires a parked-run row once its run is no longer parked", async () => {
+    // The run resumed, failed, or finished — the same evidence `classifyFinding` holds a stale
+    // parked-run finding on, applied to the row the report has stopped carrying.
+    t.db
+      .insert(schema.runs)
+      .values({
+        id: "r-2",
+        projectId: "p1",
+        epicBeadId: "e-2",
+        status: "done",
+        startedAt: secDate(NOW - 5 * HOUR),
+        updatedAt: secDate(NOW - HOUR),
+      })
+      .run();
+    seedEscalation({
+      id: "esc-run",
+      kind: "parked-run",
+      findingKey: "parked-run:r-2",
+      reason: "parked 4h ago: agent exited 1",
+      beadId: "e-2",
+      runId: "r-2",
+    });
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 1 });
+    expect(rowById("esc-run")).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("leaves a row open whose stall is still live, however quiet the report has gone", async () => {
+    // The report going quiet is a reason to RE-CHECK, never a verdict — a suppression or a threshold
+    // change would otherwise dismiss stalls nobody has fixed.
+    seedParkedRun("r-2", "e-2", "agent exited 1");
+    seedEscalation({
+      id: "esc-run",
+      kind: "parked-run",
+      findingKey: "parked-run:r-2",
+      reason: "parked 4h ago: agent exited 1",
+      beadId: "e-2",
+      runId: "r-2",
+    });
+    seedJob("j-9", { status: "parked", attempts: 3, lastError: "failed 3×: tests failed" });
+    seedEscalation({
+      id: "esc-job",
+      kind: "exhausted-job",
+      findingKey: "exhausted-job:j-9",
+      reason: "execute-epic job parked after 3/3 attempts: tests failed",
+      beadId: "e-9",
+      jobId: "j-9",
+    });
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ findings: 0, settled: 0 });
+    expect(escalationRows().map((r) => r.status)).toEqual(["open", "open"]);
+    // Idempotent in the other direction too: repeated passes over the same live stalls settle nothing.
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(escalationRows().map((r) => r.status)).toEqual(["open", "open"]);
+  });
+
+  it("keeps a stale-pr row the PR re-read can't reach — silence is no evidence a stall ended", async () => {
+    // Fails OPEN, the same posture the raise path takes: a gh outage must not dismiss a stall the
+    // founder still has to decide.
+    prActivityMock.mockRejectedValue(new Error("gh unavailable"));
+    seedStalePrEscalation();
+    await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 0 });
+    expect(rowById("esc-pr")).toMatchObject({ status: "open" });
+  });
+
+  it("leaves a row the report STILL carries alone, so a live stall can't churn settle-raise", async () => {
+    // The PR merges between two sweeps while the report still names it: the re-check would say the
+    // stall ended, but retiring a reported row means settling what the next pass re-raises, hourly.
+    // Holding is enough — the sweep drops the finding, and the pass after that retires the row.
+    await seedStalePrReport();
+    expect(await sweep()).toMatchObject({ escalated: 1, settled: 0 });
+
+    prActivityMock.mockResolvedValue(prActivity({ state: "MERGED" }));
+    expect(await sweep()).toMatchObject({ findings: 1, escalated: 0, held: 1, settled: 0 });
+    expect(escalationRows()[0]).toMatchObject({ status: "open" });
+
+    await seedReport(); // the sweep has caught up: the finding is gone, so the row is retired
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("keeps the row when the settle write fails, and still makes the resume it came for", async () => {
+    // Best-effort by construction: retirement runs before the resumes, so a write that throws must
+    // cost the row alone — not the pass, and not the work it was about to restart.
+    settleEscalationMock.mockRejectedValueOnce(new Error("database is locked"));
+    prActivityMock.mockResolvedValue(prActivity({ state: "MERGED" }));
+    seedStalePrEscalation();
+    seedParkedRun("r-1", "e-1", "usage-limit");
+    await seedReport(parkedRunFinding("r-1", "e-1", "parked 4h ago: usage-limit"));
+
+    expect(await sweep()).toMatchObject({ findings: 1, resumed: 1, settled: 0 });
+    expect(rowById("esc-pr")).toMatchObject({ status: "open" });
+    expect(jobRows()).toHaveLength(1);
+
+    // The next pass reconciles what this one deferred.
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(rowById("esc-pr")).toMatchObject({ status: "resolved", resolution: "dismissed" });
   });
 });
 
@@ -892,7 +1408,7 @@ describe("a mixed report", () => {
 describe("an idle pass", () => {
   it("does nothing at all when the sweep has never run for this project", async () => {
     // run-health ships off by default, so "no report" is the normal state, not an error.
-    expect(await sweep()).toEqual({ findings: 0, resumed: 0, escalated: 0, held: 0 });
+    expect(await sweep()).toEqual({ findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 });
     expect(jobRows()).toEqual([]);
     expect(listMock).not.toHaveBeenCalled();
   });

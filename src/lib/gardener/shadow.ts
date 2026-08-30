@@ -20,7 +20,11 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { planApply, toBdStampGrid, type ApplyMoment } from "./apply";
-import { autonomyFor, type ProposalAutonomyPolicy } from "./autonomy";
+import {
+  autonomyFor,
+  type ProposalAutonomyPolicy,
+  type ProposalTrackRecord,
+} from "./autonomy";
 import {
   planOf,
   type GardenerDetectionKind,
@@ -29,6 +33,7 @@ import {
   type RetireVerb,
 } from "./detections";
 import type { EmittedProposal } from "./emit";
+import { passRecordLine, type ShadowVerdict } from "./record";
 
 /** What the shadow decided for one proposal — `error` is anton failing to decide, never a verdict. */
 export type ShadowOutcome = "apply" | "settled" | "refuse" | "error";
@@ -59,6 +64,15 @@ export interface ShadowInput {
   /** What the pass just filed — shadowed in the order it was filed. */
   created: EmittedProposal[];
   policy: ProposalAutonomyPolicy;
+  /**
+   * What this board's settled proposals say about each kind (anton-m29g) — read off the caller's own
+   * snapshot, alongside the policy, and threaded through to `autonomyFor` so the shadow set is picked
+   * by the identical resolver the pass acts on rather than by a second reading of the policy.
+   *
+   * The earned floor gates `apply` alone: a kind set to `shadow` is unaffected by its record and
+   * reaches here unchanged — which is how an unearned kind builds one in the first place.
+   */
+  record: ProposalTrackRecord;
   /** The pass's own board snapshot stamp: what every premise check dates "since we asked" against. */
   observedAtMs?: number;
   nowMs: number;
@@ -73,19 +87,18 @@ export interface ShadowInput {
  * The proposals this policy would shadow — the manual-move floor already applied by `autonomyFor`.
  *
  * `apply` is deliberately NOT shadowed: an armed kind is meant to be written, not described, so
- * routing it here would report a move as hypothetical that the pass is trusted to make. The armed
- * path does not exist yet (anton-lmps ships the shadow half), so until it does, a kind set to
- * `apply` — reachable only by a direct settings API call, since the UI offers the radio disabled —
- * behaves as `propose`. That is the safe direction to be wrong in: it files the ask and writes
- * nothing.
+ * routing it here would report a move as hypothetical that the pass is about to make for real. That
+ * branch is armed.ts's (anton-4ab3), and the two levels are disjoint by construction — a kind
+ * resolves to exactly one of them, so no proposal is ever both described and applied.
  */
 function shadowable(
   created: EmittedProposal[],
   policy: ProposalAutonomyPolicy,
+  record: ProposalTrackRecord,
 ): Array<{ proposal: EmittedProposal; plan: GardenerPlan }> {
   return created.flatMap((proposal) => {
     const plan = planOf(proposal.detection);
-    return autonomyFor(plan.kind, plan, policy) === "shadow" ? [{ proposal, plan }] : [];
+    return autonomyFor(plan.kind, plan, policy, record) === "shadow" ? [{ proposal, plan }] : [];
   });
 }
 
@@ -98,7 +111,7 @@ function shadowable(
  * would report a verdict the armed pass would not have reached.
  */
 export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[]> {
-  const targets = shadowable(input.created, input.policy);
+  const targets = shadowable(input.created, input.policy, input.record);
   if (targets.length === 0 || input.signal?.aborted) return [];
 
   let board: Bead[];
@@ -157,7 +170,8 @@ function decide(
   }
 }
 
-const VERDICT: Record<ShadowOutcome, string> = {
+/** Typed through record.ts's vocabulary, so a reworded verdict is a type error, not a silent one. */
+const VERDICT: Record<ShadowOutcome, ShadowVerdict> = {
   apply: "WOULD APPLY",
   settled: "ALREADY SETTLED",
   refuse: "WOULD REFUSE",
@@ -166,12 +180,7 @@ const VERDICT: Record<ShadowOutcome, string> = {
 
 /** One line per proposal, so a pass's whole shadow reads as a list in the session log. */
 function lineOf(record: ShadowRecord): string {
-  const verb = record.retireAs ? `${record.move}/${record.retireAs}` : record.move;
-  const counterpart = record.target ? ` → ${record.target}` : "";
-  return (
-    `SHADOW ${record.proposal} (${record.kind}) ${verb} ` +
-    `${record.subjects.join(", ")}${counterpart} — ${VERDICT[record.outcome]}: ${record.detail}`
-  );
+  return passRecordLine({ mode: "shadow", ...record, verdict: VERDICT[record.outcome] });
 }
 
 /**
