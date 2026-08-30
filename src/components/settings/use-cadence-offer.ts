@@ -155,9 +155,6 @@ export function useCadenceOffer({
     // Captured AFTER our own withdrawal moved it, so restorability below asks only whether something
     // ELSE withdrew the question while this write was open.
     const at = generation.current;
-    // Recorded with the withdrawal, not after the write: a disable can only take the arm's offer off
-    // screen if it is on record before that arm's response gets to open one.
-    const priorIntent = armingIntent.current;
     if (id === AUTOPILOT_ARMING_AUTOMATION) armingIntent.current = next;
 
     const stored = await write();
@@ -170,7 +167,20 @@ export function useCadenceOffer({
     // for something else: that click is the current premise, not this failure.
     if (!stored) {
       const restored = id === AUTOPILOT_ARMING_AUTOMATION && armingIntent.current === next;
-      if (restored) armingIntent.current = priorIntent;
+      // Read off the row this failure just rolled back, never off the intent this click replaced:
+      // that prior intent can be an optimistic value from an earlier click that failed as well —
+      // an enable then a disable, queued together and both rejected, would restore `armed` on the
+      // strength of an arm that never happened and offer a daily cadence under a picker that is
+      // still off. The reverted row is what the server confirmed.
+      if (restored) {
+        armingIntent.current = rows.current[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true;
+        // With the picker confirmed off, a question opened while this arm was open — the OTHER half
+        // of the coupling writes a different row, so it can land and ask inside that window — is
+        // standing on an arm that never happened. Withdrawn rather than left on screen, and the
+        // generation bump stops an answer still in flight from putting it back (see
+        // {@link restorable}, which reads the coupled row and cannot see the picker).
+        if (!armingIntent.current) withdraw();
+      }
       if (withdrawn && restorable(withdrawn, at)) setOffer(withdrawn);
       // Nothing to put back, but the toggle can still have SUPPRESSED a question that was therefore
       // never asked at all: a disarm that raced an arm, or a product-master disable clicked while an

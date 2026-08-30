@@ -264,6 +264,115 @@ describe("enabling product-master under an already armed picker", () => {
 });
 
 /**
+ * Two picker toggles queued on the same row, neither of which reaches the server. The intent the
+ * second one restores has to come from the row the failure rolled back to, not from the value the
+ * first click optimistically left behind — that value describes an arm that never happened.
+ */
+describe("an arm and a disarm queued together, both failing", () => {
+  it("leaves the picker disarmed and asks nothing", async () => {
+    const { result, rows } = render(disarmed());
+
+    // The arm goes out first and is still open when the operator changes their mind.
+    let failArm!: (ok: boolean) => void;
+    let arm!: Promise<void>;
+    act(() => {
+      arm = result.current.aroundToggle("board-picker", true, () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: true, cron: "*/10 * * * *" } };
+        return new Promise<boolean>((resolve) => {
+          failArm = resolve;
+        });
+      });
+    });
+
+    let failDisarm!: (ok: boolean) => void;
+    let disarm!: Promise<void>;
+    act(() => {
+      disarm = result.current.aroundToggle("board-picker", false, () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: false, cron: "*/10 * * * *" } };
+        return new Promise<boolean>((resolve) => {
+          failDisarm = resolve;
+        });
+      });
+    });
+
+    // Both are rejected, and the row rolls back to the disabled picker the server still holds.
+    await act(async () => {
+      failArm(false);
+      await arm;
+    });
+    await act(async () => {
+      rows.current = { ...rows.current, "board-picker": { enabled: false, cron: "*/10 * * * *" } };
+      failDisarm(false);
+      await disarm;
+    });
+
+    expect(result.current.offer).toBeNull();
+
+    // And the stale intent must not survive to be read by the OTHER half of the coupling either.
+    await act(() =>
+      result.current.aroundToggle("product-master", true, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("takes back a question the other half of the coupling asked while the arm was open", async () => {
+    const { result, rows } = render({
+      "board-picker": { enabled: false, cron: "*/10 * * * *" },
+      "product-master": { enabled: false, cron: WEEKLY },
+    });
+
+    let failArm!: (ok: boolean) => void;
+    let arm!: Promise<void>;
+    act(() => {
+      arm = result.current.aroundToggle("board-picker", true, () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: true, cron: "*/10 * * * *" } };
+        return new Promise<boolean>((resolve) => {
+          failArm = resolve;
+        });
+      });
+    });
+
+    // product-master writes its own row, so its enable can land while the arm is still open — and
+    // it asks, because the picker reads as armed.
+    await act(() =>
+      result.current.aroundToggle("product-master", true, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return true;
+      }),
+    );
+    expect(result.current.offer).not.toBeNull();
+
+    await act(async () => {
+      rows.current = { ...rows.current, "board-picker": { enabled: false, cron: "*/10 * * * *" } };
+      failArm(false);
+      await arm;
+    });
+
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("still restores the arm when the row goes back to armed", async () => {
+    const { result, rows } = render({
+      "board-picker": { enabled: true, cron: "*/10 * * * *" },
+      "product-master": { enabled: true, cron: WEEKLY },
+    });
+
+    await act(() =>
+      result.current.aroundToggle("board-picker", false, async () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: false, cron: "*/10 * * * *" } };
+        rows.current = { ...rows.current, "board-picker": { enabled: true, cron: "*/10 * * * *" } };
+        return false;
+      }),
+    );
+
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+});
+
+/**
  * A toggle that fails while an ANSWER is in flight. The offer is already off screen, so the toggle
  * withdraws nothing and the answer's own failure reads the optimistic row and declines to restore —
  * which leaves the operator with a live premise and no question unless the failed toggle re-asks.
