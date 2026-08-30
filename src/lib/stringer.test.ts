@@ -1320,6 +1320,50 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/legacy/notes.rb");
     });
 
+    // MDX is a program: a component imported and rendered only from a docs page has a real caller,
+    // and discounting the whole file as prose leaves that component reported dead every night. Its
+    // markdown body still is prose, so only the shapes MDX executes may count.
+    it("counts an MDX import and render, and not the prose or the fenced example around it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/notes.mdx":
+          "Widget was removed in favour of Panel.\n\n{/* Widget shipped here once */}\n\n" +
+          "```tsx\nimport { Widget } from '../src/ui/widget';\n```\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // A file anton has no grammar for still has block comments: `.sql` writes them `/* ... */`, and
+    // their continuation lines carry no marker for the line test to see. Accepting one as code
+    // deletes a genuine finding — while a real call below the block still has to count.
+    it("tracks block comments in a file anton has no grammar for, and still counts its callers", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "db/notes.sql": "/*\nneverCalled was removed\n*/\nSELECT 1;\n",
+        "db/caller.sql": "/*\nneverCalled is called below.\n*/\nSELECT neverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("db/caller.sql");
+      expect(result.deadcode.dropped[0].reason).not.toContain("db/notes.sql");
+    });
+
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
       const repo = initRepo({
         "src/lib/types.ts": "export type ScanPass = { id: string };\n",

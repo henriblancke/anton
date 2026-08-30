@@ -58,20 +58,21 @@ const UNUSED_TITLE = /^\s*unused\s+[\w-]+\s*:\s*([A-Za-z_$][\w$]*)/i;
 /**
  * Files that are prose by construction. A symbol named in documentation is being described, not
  * called, and a doc outliving its code is the ordinary case rather than evidence the code is live.
+ * `.mdx` is not one of them: it imports and renders components, so it is read as code below.
  */
-const PROSE_FILE = /\.(?:md|mdx|markdown|txt|rst|adoc|org)$/i;
+const PROSE_FILE = /\.(?:md|markdown|txt|rst|adoc|org)$/i;
 
 /**
  * A line opening with a comment marker in *some* language, for a file whose language anton has no
  * grammar for below. It is the union across languages, so a marker one language doesn't share is
  * still read as prose — `;` is a Lisp comment and an ASI guard, and without knowing the file this
  * has to assume the reading that keeps a signal anton cannot disprove. Only the start of the
- * trimmed line is checked, for the same reason.
+ * trimmed line is checked, for the same reason; what a line test cannot see — the continuation
+ * lines of a block — is `UNKNOWN_SYNTAX` below.
  */
 const COMMENT_LINE = /^(?:\/\/|\/\*|\*\/|\*|#|--|;|%|<!--|"""|''')/;
 
 interface CommentSyntax {
-  files: RegExp;
   /** Markers that comment out the rest of their line. */
   line: string[];
   /** Delimiter pairs that span lines, opener then closer. */
@@ -92,7 +93,11 @@ interface CommentSyntax {
  * hit be judged where it actually sits. Only the grammars stringer's collectors meet are tracked;
  * a language without one falls back to the union line test above.
  */
-const COMMENT_SYNTAX: CommentSyntax[] = [
+interface FileSyntax extends CommentSyntax {
+  files: RegExp;
+}
+
+const COMMENT_SYNTAX: FileSyntax[] = [
   {
     files: /\.(?:[cm]?[jt]sx?|go|java|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
     line: ["//"],
@@ -124,6 +129,18 @@ const COMMENT_SYNTAX: CommentSyntax[] = [
     ],
   },
   {
+    // MDX is a program, not a document: `import { Widget } from './widget'` and `<Widget />` name a
+    // real caller. What is inert is the JSX comment and anything in backticks — an inline span or a
+    // fenced example shows the symbol rather than calling it. The rest of the body is markdown, so
+    // a hit surviving this is judged again by `referencesMdx`.
+    files: /\.mdx$/i,
+    line: [],
+    block: [
+      ["{/*", "*/}"],
+      ["`", "`"],
+    ],
+  },
+  {
     files: /\.(?:py|pyi)$/i,
     line: ["#"],
     block: [
@@ -147,8 +164,26 @@ const COMMENT_SYNTAX: CommentSyntax[] = [
   },
 ];
 
+/**
+ * The grammar for a file whose language anton tracks none for. Line comments stay with the union
+ * line test above, read only at the start of a line, because `;` and `--` end statements in as many
+ * languages as they open comments in. What needs real state is the block: a symbol named on a
+ * continuation line of an open `/*` in a `.sql` file carries no marker of its own, so a line test
+ * reads it as a call and deletes a finding that was right. The pairs are the union across
+ * languages — a delimiter one of them doesn't share still opens a comment, and every mistake in
+ * that direction ends in "this hit is prose", which leaves a signal standing rather than dropping
+ * one.
+ */
+const UNKNOWN_SYNTAX: CommentSyntax = {
+  line: [],
+  block: [
+    ["/*", "*/"],
+    ["<!--", "-->"],
+  ],
+};
+
 /** The grammar to read a file with, or undefined when anton tracks none for its language. */
-function commentSyntaxOf(file: string): CommentSyntax | undefined {
+function commentSyntaxOf(file: string): FileSyntax | undefined {
   return COMMENT_SYNTAX.find((syntax) => syntax.files.test(file));
 }
 
@@ -274,15 +309,45 @@ function maskComments(text: string, syntax: CommentSyntax): string[] {
  */
 const WORD_CHAR = /[0-9A-Za-z_$#]/;
 
-/** Whether the line still writes the symbol as a whole word once its comments are blanked out. */
-function referencesWord(line: string | undefined, symbol: string): boolean {
+/**
+ * Whether the line still writes the symbol as a whole word once its comments are blanked out.
+ * `isCode` narrows a whole-word hit further by what precedes it on the line, for a file whose
+ * comments are not the only thing on it that isn't code.
+ */
+function referencesWord(
+  line: string | undefined,
+  symbol: string,
+  isCode?: (head: string) => boolean,
+): boolean {
   if (line === undefined) return false;
   for (let at = line.indexOf(symbol); at >= 0; at = line.indexOf(symbol, at + 1)) {
     const before = at > 0 ? line[at - 1] : "";
     const after = line[at + symbol.length] ?? "";
-    if (!WORD_CHAR.test(before) && !WORD_CHAR.test(after)) return true;
+    if (WORD_CHAR.test(before) || WORD_CHAR.test(after)) continue;
+    if (!isCode || isCode(line.slice(0, at))) return true;
   }
   return false;
+}
+
+/** Files read as MDX — markdown prose around code that runs. */
+const MDX_FILE = /\.mdx$/i;
+
+/** MDX's ESM block: the only place an import or export can stand. */
+const MDX_ESM_LINE = /^\s*(?:import|export)\b/;
+
+/** A JSX tag opening right where the symbol starts — `<Widget`, `</Widget`. */
+const MDX_TAG = /<\/?\s*$/;
+
+/**
+ * Whether an MDX line uses the symbol or merely names it. MDX executes three shapes — an
+ * `import`/`export` statement, a JSX tag, and a braced expression — and everything else in the file
+ * is markdown, where a name is being described. Discounting the whole file instead (as `PROSE_FILE`
+ * once did) throws away the import that renders a component, and the signal about a live component
+ * goes on costing the health record a debt point every night.
+ */
+function referencesMdx(line: string | undefined, symbol: string): boolean {
+  if (line !== undefined && MDX_ESM_LINE.test(line)) return referencesWord(line, symbol);
+  return referencesWord(line, symbol, (head) => MDX_TAG.test(head) || head.includes("{"));
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -351,7 +416,8 @@ type CandidateHits = Map<string, number[]>;
  * Documentation files are discounted here without reading anything — a name written in prose is not
  * a reference. So is a line opening with a comment marker, but only in a file whose language anton
  * has no grammar for: the rest are judged against their own text, where a comment opened mid-line
- * and the middle of a block are both visible and `;` is not mistaken for a marker.
+ * and the middle of a block are both visible and `;` is not mistaken for a marker. An unrecognized
+ * file's block comments are still tracked when it is read below.
  *
  * A name inside a string literal or a same-named local declaration still counts: grep cannot tell
  * those from a call, and only a parser could.
@@ -376,8 +442,10 @@ function candidateHits(stdout: string): CandidateHits {
 
 /**
  * The files holding at least one hit that still writes the symbol as code once the comments around
- * it are blanked out. A file is read only when anton knows its language and it carries a hit, and
- * the masked text is cached across symbols because one busy file answers for many of them.
+ * it are blanked out. A file is read only when it carries a hit — with its own grammar when anton
+ * tracks one, and with the union fallback when it doesn't, since an unrecognized extension is no
+ * reason to read the middle of a block comment as a call. The masked text is cached across symbols
+ * because one busy file answers for many of them.
  *
  * A file anton cannot read proves nothing: without its text there is no evidence the hit is a call,
  * and an unproven caller must not delete a finding.
@@ -390,11 +458,7 @@ async function codeReferencingFiles(
 ): Promise<string[]> {
   const files: string[] = [];
   for (const [file, lines] of hits) {
-    const syntax = commentSyntaxOf(file);
-    if (!syntax) {
-      files.push(file);
-      continue;
-    }
+    const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
     if (!masked.has(file)) {
       try {
         const text = await readFile(join(repoPath, file), "utf8");
@@ -404,7 +468,8 @@ async function codeReferencingFiles(
       }
     }
     const code = masked.get(file);
-    if (code && lines.some((line) => referencesWord(code[line - 1], symbol))) files.push(file);
+    const references = MDX_FILE.test(file) ? referencesMdx : referencesWord;
+    if (code && lines.some((line) => references(code[line - 1], symbol))) files.push(file);
   }
   return files;
 }
