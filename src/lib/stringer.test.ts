@@ -2923,6 +2923,39 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 type");
     });
 
+    // `import` is an ordinary COMMAND in shell — ImageMagick's `import -window root shot.png` takes
+    // a screenshot — not a static dependency. Read as one, a duplicated block of captures is dropped
+    // as if it were a specifier list and the repeated runtime behaviour never reaches triage.
+    it("reads shell's `import` as the command it is, not as an import declaration", async () => {
+      const repo = writeRepo({
+        "scripts/capture.sh": [
+          "#!/usr/bin/env bash",
+          "import -window root shot-one.png",
+          "import -window root shot-two.png",
+          "import -window root shot-three.png",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/capture.sh", 2]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the TypeScript specifier list beside it is still dropped, so the gate is by
+      // LANGUAGE rather than the recognizer having been removed.
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/capture.sh" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // A file anton could not READ is not a file that is GONE: `EACCES`, `EMFILE` and the like say
     // nothing about the block, so the signal keeps its place instead of being dropped as rewritten
     // away. Here the unreadable path is a directory — an `EISDIR` that needs no permission games.

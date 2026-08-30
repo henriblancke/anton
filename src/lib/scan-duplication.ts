@@ -81,6 +81,33 @@ const RAW_STRING_EXTENSIONS = [".rs"];
  */
 const TYPE_DECLARATION_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".go", ".rs"];
 
+/**
+ * Where a leading `import` DECLARES a dependency rather than naming a command. In shell it is an
+ * ordinary executable — ImageMagick's `import -window root shot.png` grabs a screenshot — so a
+ * duplicated block of those would be filed as a specifier list and dropped. An ALLOW-list for the
+ * same reason as the type one above: a language anton has no rule for keeps its signals rather than
+ * losing them to TypeScript's grammar.
+ */
+const IMPORT_DECLARATION_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".py",
+  ".pyi",
+  ".go",
+  ".java",
+  ".kt",
+  ".kts",
+  ".scala",
+  ".swift",
+  ".dart",
+];
+
 /** One duplication signal the filter removed, and the proof that removed it. */
 export interface DroppedDuplication {
   /** The file stringer named, as it spelled it. */
@@ -873,6 +900,7 @@ function classifyLines(
     nestedComments: boolean;
     boundBareImport: boolean;
     rawStrings: boolean;
+    importDeclarations: boolean;
     typeDeclarations: boolean;
   },
 ): LineClass[] {
@@ -1134,7 +1162,7 @@ function classifyLines(
     }
 
     const kind =
-      IMPORT_START.test(line) || FROM_IMPORT_START.test(line)
+      opts.importDeclarations && (IMPORT_START.test(line) || FROM_IMPORT_START.test(line))
         ? "import"
         : opts.typeDeclarations && TYPE_START.test(line)
           ? "type"
@@ -1251,6 +1279,7 @@ function sourceIndex(repoPath: string) {
         nestedComments: NESTED_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         boundBareImport: BOUND_BARE_IMPORT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         rawStrings: RAW_STRING_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        importDeclarations: IMPORT_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         typeDeclarations: TYPE_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
