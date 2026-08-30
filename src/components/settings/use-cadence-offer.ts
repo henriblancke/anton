@@ -97,6 +97,12 @@ export function useCadenceOffer({
   // offer that does not exist yet, and the arm's response — which reports the row as armed — can
   // still land first. Only the last click says whether an offer's premise is still standing.
   const armingIntent = useRef(initialRows[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true);
+  // Counts the hand cadence edits that still stand for the coupled row — in flight, or landed. An
+  // edit is the operator choosing the cadence themselves, which ends the question; only one that
+  // rolled back gives it back, and so takes its count with it. An answer failing afterwards reads
+  // this to tell a premise that is still the question's from one that is the operator's own later
+  // choice, which the generation alone cannot say (every withdrawal moves it, whatever the cause).
+  const handEdits = useRef(0);
   // Seeded rather than opened by an effect: the premise is entirely in the rows this render was
   // given, so a question left unanswered is on screen in the first paint — no flash of a panel that
   // then grows a row, and the same markup on the server and the client.
@@ -226,9 +232,17 @@ export function useCadenceOffer({
     // back to the cadence the offer was derived from reads as restorable, so a failed answer would
     // resurrect a question the operator has since answered by hand — and this edit landing would
     // not take it away, because it withdrew nothing.
-    if (id === CADENCE_COUPLED_AUTOMATION) withdraw();
+    if (id === CADENCE_COUPLED_AUTOMATION) {
+      handEdits.current += 1;
+      withdraw();
+    }
     const stored = await write();
-    if (!stored && id === CADENCE_COUPLED_AUTOMATION) ask();
+    if (!stored && id === CADENCE_COUPLED_AUTOMATION) {
+      // The edit never reached the server, so it superseded nothing: the count goes back before the
+      // re-ask, or an answer failing afterwards would read this rollback as the operator's choice.
+      handEdits.current -= 1;
+      ask();
+    }
   }
 
   /**
@@ -239,14 +253,24 @@ export function useCadenceOffer({
    * to retry. It stays gone if the question stopped applying while the PATCH was open — the picker
    * disarmed, the row edited by hand, product-master switched off — because that question is dead on
    * its own terms and a failed write is no reason to resurrect it (see {@link restorable}).
+   *
+   * A withdrawal that was itself rolled back is the one case the captured offer cannot answer, so
+   * the premise is re-derived from the live rows instead of dropped: a disarm clicked and refused
+   * while this PATCH was open takes the question off screen, and its own recovery reads THIS write's
+   * optimistic daily cron and stays silent — leaving an armed picker, a weekly product-master and
+   * nothing on screen. A hand edit is the exception, because that is the operator choosing the
+   * cadence themselves rather than a premise flickering.
    */
   async function accept() {
     const pending = offer;
     if (!pending) return;
     const at = generation.current;
+    const superseded = handEdits.current;
     setOffer(null);
     const stored = await setCron(pending.automationId, pending.cron);
-    if (!stored && restorable(pending, at)) setOffer(pending);
+    if (stored) return;
+    if (restorable(pending, at)) setOffer(pending);
+    else if (handEdits.current === superseded) ask();
   }
 
   /**
@@ -264,8 +288,12 @@ export function useCadenceOffer({
    * optimistic opt-out is what kept that withdrawal's recovery silent.
    */
   async function decline() {
+    // No question on screen, no answer to record: a stray click — a double-fire, or one racing a
+    // withdrawal — must not persist an opt-out the operator was never shown.
     const pending = offer;
+    if (!pending) return;
     const at = generation.current;
+    const superseded = handEdits.current;
     setOffer(null);
     keepWeekly.current = true;
     try {
@@ -281,12 +309,11 @@ export function useCadenceOffer({
       // PATCH was open — and THIS write is what silenced that withdrawal's own recovery, because
       // every re-ask reads the optimistic opt-out above and stays quiet. Dropping the question here
       // too would leave an armed picker, a weekly product-master, no persisted opt-out and nothing
-      // on screen until a reload. Re-derived from the live rows, so a picker disarmed or a cadence
-      // retimed in that window still ends the question.
-      if (pending) {
-        if (restorable(pending, at)) setOffer(pending);
-        else ask();
-      }
+      // on screen until a reload. Re-derived from the live rows, so a picker disarmed in that window
+      // still ends the question — and skipped outright for a hand edit that stands, because the
+      // operator has since chosen that cadence themselves.
+      if (restorable(pending, at)) setOffer(pending);
+      else if (handEdits.current === superseded) ask();
       toast.error(err instanceof Error ? err.message : "Failed to save your answer");
     }
   }

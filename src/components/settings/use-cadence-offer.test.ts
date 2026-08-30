@@ -26,7 +26,7 @@ function render(seed: Rows, keepWeekly = false) {
   const { result } = renderHook(() =>
     useCadenceOffer({ rows, initialRows: seed, keepWeekly, patchSettings, setCron }),
   );
-  return { result, rows, setCron };
+  return { result, rows, setCron, patchSettings };
 }
 
 /** The board-picker off, product-master running weekly — the state an arm opens the offer from. */
@@ -662,5 +662,115 @@ describe("an arm and a coupled enable clicked together, the enable failing", () 
     });
 
     expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+});
+
+/**
+ * A withdrawal that was itself rolled back, taken while an ANSWER was in flight. The toggle's own
+ * recovery reads the answer's optimistic row and stays silent, so the answer failing is the last
+ * chance to notice the question is live again — the alternative is an armed picker, a weekly
+ * product-master, no opt-out and nothing on screen until a reload.
+ */
+describe("an accept that fails after a disarm failed first", () => {
+  const armed = (): Rows => ({
+    "board-picker": { enabled: true, cron: "*/10 * * * *" },
+    "product-master": { enabled: true, cron: WEEKLY },
+  });
+
+  it("re-opens the question the disarm's own recovery could not put back", async () => {
+    const rows = { current: armed() };
+    let failAccept!: (ok: boolean) => void;
+    const { result } = renderHook(() =>
+      useCadenceOffer({
+        rows,
+        initialRows: rows.current,
+        keepWeekly: false,
+        patchSettings: vi.fn(async () => new Response("{}", { status: 200 })),
+        setCron: vi.fn(() => {
+          rows.current = { ...rows.current, "product-master": { enabled: true, cron: DAILY } };
+          return new Promise<boolean>((resolve) => {
+            failAccept = resolve;
+          });
+        }),
+      }),
+    );
+    expect(result.current.offer).not.toBeNull();
+
+    let accepting!: Promise<void>;
+    act(() => {
+      accepting = result.current.accept();
+    });
+    expect(result.current.offer).toBeNull();
+
+    // The disarm never reaches the server. It withdrew the question anyway, and its recovery is
+    // silent because the accept has optimistically moved the row off weekly.
+    await act(() =>
+      result.current.aroundToggle("board-picker", false, async () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: false, cron: "*/10 * * * *" } };
+        rows.current = { ...rows.current, "board-picker": { enabled: true, cron: "*/10 * * * *" } };
+        return false;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+
+    // The cadence PATCH fails too and the row goes back to weekly — armed picker, weekly
+    // product-master, nothing answered.
+    await act(async () => {
+      rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+      failAccept(false);
+      await accepting;
+    });
+
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+
+  it("stays silent when the disarm landed — nothing consumes the priorities any more", async () => {
+    const rows = { current: armed() };
+    let failAccept!: (ok: boolean) => void;
+    const { result } = renderHook(() =>
+      useCadenceOffer({
+        rows,
+        initialRows: rows.current,
+        keepWeekly: false,
+        patchSettings: vi.fn(async () => new Response("{}", { status: 200 })),
+        setCron: vi.fn(() => {
+          rows.current = { ...rows.current, "product-master": { enabled: true, cron: DAILY } };
+          return new Promise<boolean>((resolve) => {
+            failAccept = resolve;
+          });
+        }),
+      }),
+    );
+
+    let accepting!: Promise<void>;
+    act(() => {
+      accepting = result.current.accept();
+    });
+
+    await act(() =>
+      result.current.aroundToggle("board-picker", false, async () => {
+        rows.current = { ...rows.current, "board-picker": { enabled: false, cron: "*/10 * * * *" } };
+        return true;
+      }),
+    );
+
+    await act(async () => {
+      rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+      failAccept(false);
+      await accepting;
+    });
+
+    expect(result.current.offer).toBeNull();
+  });
+});
+
+describe("an answer given with no question on screen", () => {
+  it("records no opt-out — a stray decline must not answer for the operator", async () => {
+    const { result, patchSettings } = render(disarmed());
+    expect(result.current.offer).toBeNull();
+
+    await act(() => result.current.decline());
+
+    expect(patchSettings).not.toHaveBeenCalled();
   });
 });
