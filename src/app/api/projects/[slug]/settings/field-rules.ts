@@ -16,14 +16,14 @@ export const reject = <V>(error: string): FieldResult<V> => ({ ok: false, error 
 /** `null` / `""` mean "clear back to the default" for every settings key, never "store empty". */
 export const isClear = (raw: unknown): boolean => raw == null || raw === "";
 
+/** Strict on type: a JSON body carries real numbers, so `"3"` / `true` are client bugs, not input. */
 export function integerInRange(range: { min: number; max: number }): FieldParser<number> {
   return (raw, key) => {
     if (isClear(raw)) return accept(undefined);
-    const n = typeof raw === "number" ? raw : Number(raw);
-    if (!Number.isInteger(n) || n < range.min || n > range.max) {
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < range.min || raw > range.max) {
       return reject(`${key} must be an integer in [${range.min}, ${range.max}]`);
     }
-    return accept(n);
+    return accept(raw);
   };
 }
 

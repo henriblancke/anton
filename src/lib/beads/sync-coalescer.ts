@@ -239,11 +239,14 @@ interface RepoSync {
  * push failed (recorded backlog) OR when this process has not yet reconciled the repo; a caught-up,
  * already-reconciled repo stays pull-only and quiet. A durable "push" always retries the push,
  * regardless of the (possibly stale) count.
+ *
+ * Reads the raw record: planning needs only the backlog count, and stall detection is a read the
+ * board owns — routing through getSyncStatus would fire its stall log from a planning call.
  */
 function planPass(cwd: string, request: SyncRequest, reconciled: boolean): PlannedPass {
   const mode: SyncMode =
     request === "backstop"
-      ? getSyncStatus(cwd).unpushedCount > 0 || !reconciled
+      ? rawStatus(cwd).unpushedCount > 0 || !reconciled
         ? "full"
         : "pull"
       : request === "push"
