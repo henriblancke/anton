@@ -574,6 +574,44 @@ function ownershipNote(
 }
 
 /**
+ * Return a rerunnable preserved ticket to a claimable `open`, and answer the sentence its note must
+ * add when that did not happen (empty once the ticket is claimable).
+ *
+ * The re-read is the point (anton-67xj). `bead` comes off the sweep's snapshot and a PR can sit in
+ * review for days: if another worker claimed, reopened onto its own path, or closed this ticket in
+ * that window, writing `open` would downgrade their live work — or reopen finished work and
+ * advertise it for a second run — on the strength of a status that was already stale. So the
+ * transition lands only on a ticket a fresh read still finds exactly where the run left it and held
+ * by nobody but that run (which is nobody at all once the release above succeeded). Anything else is
+ * another worker's state: left alone, and named in the note instead.
+ *
+ * A read that fails writes nothing either — the snapshot is not evidence enough to move a status —
+ * and falls back to the same manual remedy a failed write leaves behind.
+ */
+async function reopenPreserved(
+  repo: string,
+  bead: Bead,
+  runOwner: string | undefined,
+): Promise<string> {
+  const manualRemedy = (status: string): string =>
+    ` Its status is also still \`${status}\`, which bd refuses to claim, so a run would stop at ` +
+    `that gate: clear it with \`bd update ${bead.id} --status open\`.`;
+  if (bead.status === "open") return "";
+  const fresh = await beads.show(repo, bead.id).catch(() => undefined);
+  if (!fresh) return manualRemedy(bead.status);
+  if (fresh.status === "open") return "";
+  const owner = ownerOf(fresh);
+  if (fresh.status !== bead.status || (owner !== undefined && owner !== runOwner))
+    return (
+      ` Its status is now \`${fresh.status}\`${owner ? ` under ${owner}` : ""} — that changed after ` +
+      `the run stopped it, so anton left the status alone rather than reopening a ticket someone ` +
+      `else has moved on.`
+    );
+  const reopened = await safe(() => beads.setStatus(repo, bead.id, "open"));
+  return reopened ? "" : manualRemedy(fresh.status);
+}
+
+/**
  * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, rehome the
  * ones it did not ({@link undeliveredAtMerge}) onto a fresh run target, drop the `stage:in-review`
  * label, remove the merged branch + its worktree, and finalize the run row.
@@ -681,10 +719,7 @@ export async function finalizeMergedEpic(args: {
     // could run. The parent makes the ticket reachable; the status is what makes it runnable. A
     // ticket already `open` (a dependent skipped behind the timeout) is left untouched, and one on
     // the manual path stays `blocked` on purpose — it must not become runnable.
-    const stillBlocked =
-      rerun.has(bead.id) &&
-      bead.status !== "open" &&
-      !(await safe(() => beads.setStatus(repo, bead.id, "open")));
+    const statusNote = rerun.has(bead.id) ? await reopenPreserved(repo, bead, runOwner) : "";
     await safe(() =>
       beads.note(
         repo,
@@ -713,10 +748,7 @@ export async function finalizeMergedEpic(args: {
               foreignOwner,
               blocksClaim: ", so no other operator can claim it",
             }) +
-            (stillBlocked
-              ? ` Its status is also still \`${bead.status}\`, which bd refuses to claim, so a ` +
-                `run would stop at that gate: clear it with \`bd update ${bead.id} --status open\`.`
-              : ""),
+            statusNote,
       ),
     );
   }

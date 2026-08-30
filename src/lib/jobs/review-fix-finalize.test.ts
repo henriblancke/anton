@@ -20,8 +20,11 @@ const reparentMock = vi.fn();
 const deleteMock = vi.fn();
 const unassignMock = vi.fn();
 const setStatusMock = vi.fn();
+const showMock = vi.fn();
 /** id → current assignee, so the claim guard's CAS (show → unassign → show) reads a live board. */
 const assignees = new Map<string, string>();
+/** id → current status, so the re-read before a status write sees the board, not the snapshot. */
+const statuses = new Map<string, string>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -37,8 +40,7 @@ vi.mock("../beads/bd", async () => {
       delete: (...args: unknown[]) => deleteMock(...args),
       unassign: (...args: unknown[]) => unassignMock(...args),
       setStatus: (...args: unknown[]) => setStatusMock(...args),
-      show: async (_repo: string, id: string) =>
-        ({ id, title: id, status: "open", labels: [], assignee: assignees.get(id) }) as Bead,
+      show: (...args: unknown[]) => showMock(...args),
     },
   };
 });
@@ -57,8 +59,11 @@ vi.mock("../runs", () => ({
 
 const { finalizeMergedEpic, undeliveredAtMerge } = await import("./review-fix");
 
-const bead = (id: string, status = "open", labels: string[] = []): Bead =>
-  ({ id, title: id, status, labels }) as Bead;
+/** Seeds the live board with the same status, so a re-read agrees with the snapshot by default. */
+const bead = (id: string, status = "open", labels: string[] = []): Bead => {
+  statuses.set(id, status);
+  return { id, title: id, status, labels } as Bead;
+};
 
 /** A bead reserved by `owner`, seeded into the live-board map the claim CAS re-reads. */
 const claimed = (b: Bead, owner: string): Bead => {
@@ -95,10 +100,23 @@ describe("finalizeMergedEpic", () => {
     reparentMock.mockReset().mockResolvedValue(undefined);
     deleteMock.mockReset().mockResolvedValue(undefined);
     assignees.clear();
+    statuses.clear();
     unassignMock.mockReset().mockImplementation(async (_repo: string, id: string) => {
       assignees.delete(id);
     });
     setStatusMock.mockReset().mockResolvedValue(undefined);
+    showMock
+      .mockReset()
+      .mockImplementation(
+        async (_repo: string, id: string) =>
+          ({
+            id,
+            title: id,
+            status: statuses.get(id) ?? "open",
+            labels: [],
+            assignee: assignees.get(id),
+          }) as Bead,
+      );
   });
 
   it("closes the still-open children and the target in one batch, children first", async () => {
@@ -285,6 +303,45 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [bead("t2", "open", ["not-delivered"])]);
 
     expect(setStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen a ticket another worker claimed after the sweep (anton-67xj)", async () => {
+    // `bead.status` is the sweep's snapshot and a PR can sit in review for days. An operator who
+    // picked this ticket up in that window is mid-run: writing `open` over their claim would
+    // downgrade live work and advertise it for a second run.
+    const preserved = bead("t2", "blocked", ["not-delivered"]);
+    statuses.set("t2", "in_progress");
+    assignees.set("t2", "op-2");
+
+    await finalize(bead("epic-1"), [preserved]);
+
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("Its status is now `in_progress` under op-2");
+  });
+
+  it("does not reopen a ticket that closed after the sweep read the board", async () => {
+    // Someone finished this work by hand while the PR sat in review — reopening it would put
+    // completed work back on the queue as claimable.
+    const preserved = bead("t2", "blocked", ["not-delivered"]);
+    statuses.set("t2", "closed");
+
+    await finalize(bead("epic-1"), [preserved]);
+
+    expect(setStatusMock).not.toHaveBeenCalled();
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("Its status is now `closed`");
+    expect(note).not.toContain("--status open");
+  });
+
+  it("names the manual remedy when the ticket cannot be re-read", async () => {
+    // No fresh read means no evidence the snapshot still holds, and the snapshot alone is not
+    // enough to move a status — so the write is skipped and the operator gets the command.
+    showMock.mockRejectedValue(new Error("bd show: DB locked"));
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("`bd update t2 --status open`");
   });
 
   it("names the manual remedy when the blocked status cannot be cleared", async () => {
