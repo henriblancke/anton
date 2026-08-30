@@ -1366,6 +1366,49 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // An ESM statement can wrap without opening a delimiter on its first line — `export default`
+    // with the component under it. MDX ends that block at the blank line, so the continuation is
+    // code and the prose after the blank line is not; closing it on its opening line reads the
+    // caller as markdown and leaves the component reported dead.
+    it("counts an MDX ESM continuation that opens no delimiter, and stops at the blank line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/layout.mdx": "export default\n  Widget()\n",
+        "docs/notes.mdx": "export const slug = 'notes'\n\nWidget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/layout.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // JSX lets a comment's braces stand off its `/* */`. Matching only the attached `{/*` leaves
+    // the span unmasked, and the `{` in front of it then proves the prose is an expression —
+    // erasing a finding that was right.
+    it("masks an MDX comment written with spaces inside its braces", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/notes.mdx": "{ /* Widget was removed in favour of Panel */ }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {

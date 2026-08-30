@@ -133,10 +133,16 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     // real caller. What is inert is the JSX comment and anything in backticks — an inline span or a
     // fenced example shows the symbol rather than calling it. The rest of the body is markdown, so
     // a hit surviving this is judged again by `referencesMdx`.
+    //
+    // The comment is read as bare `/* */` rather than `{/* */}`: JSX lets the braces stand off
+    // (`{ /* Widget was removed */ }`), and a grammar spelled with them attached leaves that span
+    // unmasked, where the leading `{` then proves the prose is an expression and erases a true
+    // finding. `/*` outside a braced expression is markdown text, so the widened marker can only
+    // blank prose — the direction that keeps a signal rather than dropping one.
     files: /\.mdx$/i,
     line: [],
     block: [
-      ["{/*", "*/}"],
+      ["/*", "*/"],
       ["`", "`"],
     ],
   },
@@ -359,6 +365,11 @@ const MDX_TAG = /<\/?\s*$/;
  * A blank line closes whatever is open. MDX separates its blocks that way, so an unbalanced brace
  * in prose can only mislead its own paragraph rather than every line below it — the bound that
  * matters, since reading prose as code is what deletes a true finding.
+ *
+ * That blank line is the only thing that closes the ESM block, because it is the only thing MDX
+ * itself closes one with: an `import`/`export` block runs to the next empty line and is parsed
+ * whole. Ending it on its opening line instead — whenever that line balanced its delimiters, or
+ * carried none — reads `export default` with `Widget()` under it as markdown and misses the caller.
  */
 function mdxOpenLines(code: string[]): boolean[] {
   const open: boolean[] = [];
@@ -379,7 +390,6 @@ function mdxOpenLines(code: string[]): boolean[] {
       else if (char === "}" || (esm && (char === ")" || char === "]")))
         depth = Math.max(0, depth - 1);
     }
-    if (esm && depth === 0) esm = false;
   }
   return open;
 }
