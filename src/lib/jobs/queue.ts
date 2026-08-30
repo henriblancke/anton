@@ -304,12 +304,20 @@ export async function resumableExecuteEpicId(
   return rows[0]?.id;
 }
 
+/** One operator cancel: which job was stopped, and when (anton-rgso). */
+export interface CancelledJob {
+  id: string;
+  /** `updatedAt` on the cancelled row — when the operator pressed stop. */
+  at: number;
+}
+
 /**
- * When an operator CANCELLED each of a project's execute-epic jobs, keyed by epic (anton-rgso).
+ * The execute-epic jobs an operator CANCELLED in this project, keyed by epic (anton-rgso).
  *
  * `cancelled` is the one terminal status that is a DECISION rather than an outcome — a person saying
- * stop — so the consecutive-failure breaker has to be able to subtract it from what it counts. Runs
- * carry no job id, so the epic plus the instant is the join the breaker matches a run against.
+ * stop — so the consecutive-failure breaker has to be able to subtract it from what it counts. The
+ * job ID is what a run matches on (`runs.job_id`); the instant is the fallback join for run rows
+ * written before that column existed.
  *
  * Every cancel is returned rather than only the latest: an epic an operator stopped twice would
  * otherwise leave the earlier run counted as a failure by the very reading that exists to excuse it.
@@ -318,9 +326,10 @@ export async function resumableExecuteEpicId(
 export async function cancelledExecuteEpicJobs(
   db: AntonDb,
   projectId: string,
-): Promise<Map<string, number[]>> {
+): Promise<Map<string, CancelledJob[]>> {
   const rows = await db
     .select({
+      id: schema.jobs.id,
       epicBeadId: sql<string | null>`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`,
       updatedAt: schema.jobs.updatedAt,
     })
@@ -332,13 +341,14 @@ export async function cancelledExecuteEpicJobs(
         eq(schema.jobs.status, "cancelled"),
       ),
     );
-  const byEpic = new Map<string, number[]>();
+  const byEpic = new Map<string, CancelledJob[]>();
   for (const row of rows) {
     const at = toMs(row.updatedAt);
     if (!row.epicBeadId || at === undefined) continue;
+    const cancel = { id: row.id, at };
     const seen = byEpic.get(row.epicBeadId);
-    if (seen) seen.push(at);
-    else byEpic.set(row.epicBeadId, [at]);
+    if (seen) seen.push(cancel);
+    else byEpic.set(row.epicBeadId, [cancel]);
   }
   return byEpic;
 }

@@ -37,7 +37,10 @@ async function project(settings: Record<string, unknown> = {}): Promise<void> {
   });
 }
 
-/** A run that started `startedMinutes` in and settled ten minutes later. */
+/**
+ * A run that started `startedMinutes` in and settled ten minutes later. `job` names the job behind
+ * it — omitted for a row written before that column existed, which is what pins the legacy join.
+ */
 async function run(input: {
   id: string;
   epic: string;
@@ -45,6 +48,7 @@ async function run(input: {
   startedMinutes: number;
   error?: string;
   ticket?: string;
+  job?: string;
 }): Promise<void> {
   const startedAt = new Date(T0 + input.startedMinutes * MINUTE);
   const endedAt = new Date(T0 + (input.startedMinutes + 10) * MINUTE);
@@ -53,6 +57,7 @@ async function run(input: {
     projectId: PROJECT,
     epicBeadId: input.epic,
     ticketBeadId: input.ticket,
+    jobId: input.job,
     status: input.status,
     error: input.error,
     startedAt,
@@ -61,10 +66,14 @@ async function run(input: {
   });
 }
 
-/** A job an operator force-stopped `atMinutes` in — the cancel the breaker must subtract. */
-async function cancelledJob(epic: string, atMinutes: number): Promise<void> {
+/**
+ * A job an operator force-stopped `atMinutes` in — the cancel the breaker must subtract. Returns
+ * the job id, which is what a run written with `job` is matched on.
+ */
+async function cancelledJob(epic: string, atMinutes: number): Promise<string> {
+  const id = `job-${epic}-${atMinutes}`;
   await t.db.insert(schema.jobs).values({
-    id: `job-${epic}-${atMinutes}`,
+    id,
     type: "execute-epic",
     projectId: PROJECT,
     payloadJson: JSON.stringify({ epicBeadId: epic }),
@@ -72,6 +81,7 @@ async function cancelledJob(epic: string, atMinutes: number): Promise<void> {
     runAt: new Date(T0),
     updatedAt: new Date(T0 + atMinutes * MINUTE),
   });
+  return id;
 }
 
 function bead(id: string, labels: string[] = []): Bead {
@@ -118,9 +128,52 @@ describe("checkFailureStreak", () => {
     expect(await activeDisarm(t.db, PROJECT)).toBeUndefined();
   });
 
+  it("does not count a parked run whose job was cancelled long after it last moved", async () => {
+    // The case a timestamp window cannot see: the job parked (usage limit, awaiting the operator),
+    // so the run stopped moving, and the operator stopped it hours later. Matched on the job id the
+    // run carries, so the delay is irrelevant.
+    await project();
+    await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
+    await run({
+      id: "r2",
+      epic: "anton-b",
+      status: "parked",
+      startedMinutes: 15,
+      error: "usage limit",
+      job: "job-anton-b-600",
+    });
+    await run({ id: "r3", epic: "anton-c", status: "failed", startedMinutes: 30, error: "boom" });
+    await cancelledJob("anton-b", 600);
+
+    expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
+    expect(await activeDisarm(t.db, PROJECT)).toBeUndefined();
+  });
+
+  it("still counts a run when the cancel was of a DIFFERENT job on its epic", async () => {
+    // A queued retry the operator stopped before it ever ran, cancelled inside the earlier run's
+    // slack window. The id join refuses it; the timestamp window alone would have excused the
+    // failure it never touched.
+    await project();
+    await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
+    await run({
+      id: "r2",
+      epic: "anton-b",
+      status: "failed",
+      startedMinutes: 15,
+      error: "boom",
+      job: "job-anton-b-1",
+    });
+    await run({ id: "r3", epic: "anton-c", status: "failed", startedMinutes: 30, error: "boom" });
+    await cancelledJob("anton-b", 25);
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2", "r3"]);
+  });
+
   it("does not count a run whose job the operator cancelled", async () => {
     await project();
     await threeFailures();
+    // Rows from before `runs.job_id` existed, so the epic + the instant is all there is to join on.
     // The middle run's epic was force-stopped while that run was executing.
     await cancelledJob("anton-b", 20);
 

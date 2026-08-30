@@ -427,6 +427,9 @@ process.exit(0);`),
       const run3 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic3)!;
       expect(run3.status).toBe("parked");
       expect(existsSync(run3.worktreePath!)).toBe(true);
+      // The run names the job behind it (anton-rgso): that id is what a later cancel of this parked
+      // job is matched on, however long after the park the operator gets to it.
+      expect(run3.jobId).toBe(jobId);
       // A score this attempt earned before it parked. The resume reuses this row, so it must not
       // survive into the next attempt — the score breaker reads one score per row and would judge
       // an attempt that never reached review on a number it never earned.
@@ -463,6 +466,8 @@ process.exit(0);`),
       // The gate is off in this fixture, so this attempt earned no score — and the parked row's
       // stale one was cleared rather than inherited.
       expect(run3b[0].reviewScore).toBeNull();
+      // The resume rewrote it to the job that carried the attempt — here the same rescheduled row.
+      expect(run3b[0].jobId).toBe(jobId);
 
       // Both tickets closed; the already-closed ticket was SKIPPED on resume (invoked once total),
       // while the previously-quota'd ticket was invoked twice (quota + resumed success).

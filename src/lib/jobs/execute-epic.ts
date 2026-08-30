@@ -352,6 +352,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         id: runId,
         projectId,
         epicBeadId,
+        jobId: ctx.jobId,
         branch,
         model: settings.model,
         status: "running",
@@ -362,7 +363,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // previous attempt's number — and the score breaker, which reads one score per row, would
       // judge this attempt on a review it never had and could re-latch the disarm a human just
       // cleared. Cleared here, and rewritten by the gate the moment this attempt is reviewed.
-      await updateRun(db, clock, runId, { status: "running", error: null, reviewScore: null });
+      // `jobId` moves with the attempt (anton-rgso): a resume is a NEW job over the same row, and a
+      // cancel the operator raises from here names that job, not the one that first parked.
+      await updateRun(db, clock, runId, {
+        status: "running",
+        jobId: ctx.jobId,
+        error: null,
+        reviewScore: null,
+      });
     }
 
     // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels this

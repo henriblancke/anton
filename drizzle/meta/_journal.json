@@ -148,6 +148,13 @@
       "when": 1788050421756,
       "tag": "0020_thankful_sharon_carter",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1788076296734,
+      "tag": "0021_careless_leopardon",
+      "breakpoints": true
     }
   ]
 }

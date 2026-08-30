@@ -48,6 +48,12 @@ export interface RunDetail extends RunSummary {
   leaseExpiresAt?: number;
   error?: string;
   /**
+   * The execute-epic job behind this attempt (anton-rgso) — how the failure breaker tells an
+   * operator's cancel from a real failure, whenever that cancel landed. Absent on rows written
+   * before the column existed.
+   */
+  jobId?: string;
+  /**
    * The self-review score THIS attempt earned (anton-cekf), 0-10. Absent on a run whose review gate
    * never reported one — a run that failed before it, or one whose score write never landed — which
    * is a GAP in the project's score series, never a zero.

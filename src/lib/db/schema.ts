@@ -26,6 +26,12 @@ export const runs = sqliteTable("runs", {
   projectId: text("project_id").notNull().references(() => projects.id),
   epicBeadId: text("epic_bead_id").notNull(),
   ticketBeadId: text("ticket_bead_id"),
+  // The execute-epic job currently behind this run (anton-rgso), rewritten when a resume picks the
+  // parked row back up. The durable half of "did an operator stop this attempt": a cancel is
+  // recorded on the JOB and never on the run, and the two stamps can be days apart — a job parked on
+  // a usage limit is cancelled whenever the operator gets to it — so a timestamp match cannot tell
+  // that cancel from a genuine failure. Null on rows written before this column existed.
+  jobId: text("job_id"),
   worktreePath: text("worktree_path"),
   branch: text("branch"),
   model: text("model"),

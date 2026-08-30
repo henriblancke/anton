@@ -8,7 +8,7 @@
  * owns is the two facts a run row cannot answer about itself:
  *
  *   • whether an operator CANCELLED the job behind it, which jobs/queue.ts records on the job and
- *     never on the run (runs carry no job id, so the epic plus the instant is the join);
+ *     never on the run (the run names its job, so the job id is the join);
  *   • whether the work it carried was ABANDONED, which lives on the board.
  *
  * Getting those two wrong in opposite directions is the failure mode worth the extra reads: counting
@@ -38,7 +38,7 @@ import {
 } from "../autopilot-disarm";
 import { getProjectSettings, resolveFailureBreaker } from "../projects";
 import { listRecentRunOutcomes, type RunDetail } from "../runs";
-import { cancelledExecuteEpicJobs, type AntonDb, type Clock } from "./queue";
+import { cancelledExecuteEpicJobs, type AntonDb, type CancelledJob, type Clock } from "./queue";
 
 /**
  * How far back the breaker looks, at minimum. Wider than any sane threshold so that cancels and
@@ -48,35 +48,45 @@ import { cancelledExecuteEpicJobs, type AntonDb, type Clock } from "./queue";
 const MIN_STREAK_WINDOW = 20;
 
 /**
- * How long after a run last moved a cancel may still be its own.
+ * How long after a run last moved a cancel may still be its own — the LEGACY join only.
  *
  * A cancel terminalizes the JOB and the handler settles the RUN a moment later, so the two stamps
  * are close but not equal, and both are stored second-granular. The window is [run started, run last
- * moved + slack] rather than an instant because that is the interval during which a cancel could
- * only have been of THIS run: an epic an operator stops again later starts a new run first, and its
- * cancel falls outside the earlier run's window.
+ * moved + slack] rather than an instant for that reason.
+ *
+ * It is a fallback because the interval is only right for a run the cancel INTERRUPTED. A job parked
+ * or queued for retry stops moving its run and then waits — for the quota window, for the operator —
+ * so a cancel raised hours later, which is the ordinary case for a park, falls outside every window
+ * this slack could sensibly draw. Rows carrying a `jobId` are matched on it instead; only rows
+ * written before that column existed reach here.
  */
 const CANCEL_MATCH_SLACK_MS = 60_000;
 
 /**
- * Whether an operator cancel landed inside this run's window.
+ * Whether an operator cancelled the job behind this run.
  *
- * `nextAttemptStartMs` is when the SAME epic's next attempt started, and it closes this run's window
- * early. Without it a retry that begins inside the slack — an epic requeued seconds after the last
- * one settled — shares that instant with the attempt before it, so one cancel of the retry would
- * also silence the earlier genuine failure and shorten the streak the breaker fires on.
+ * The join is the run's own `jobId` — the job that started or last resumed this attempt — so a
+ * cancel counts as this run's however long after the run last moved the operator raised it, and a
+ * cancel of some OTHER job of the same epic (a queued attempt stopped before it ever ran) counts as
+ * nothing here. Exact in both directions, which the window below can only approximate.
+ *
+ * `nextAttemptStartMs` bounds the legacy window: it is when the SAME epic's next attempt started.
+ * Without it a retry that begins inside the slack — an epic requeued seconds after the last one
+ * settled — shares that instant with the attempt before it, so one cancel of the retry would also
+ * silence the earlier genuine failure and shorten the streak the breaker fires on.
  */
 function wasCancelled(
   run: RunDetail,
-  cancels: readonly number[] | undefined,
+  cancels: readonly CancelledJob[] | undefined,
   nextAttemptStartMs: number | undefined,
 ): boolean {
   if (!cancels?.length) return false;
+  if (run.jobId !== undefined) return cancels.some((cancel) => cancel.id === run.jobId);
   const from = (run.startedAt ?? run.updatedAt) * 1000;
   const until = (run.endedAt ?? run.updatedAt) * 1000 + CANCEL_MATCH_SLACK_MS;
   const beforeNextAttempt = (at: number) =>
     nextAttemptStartMs === undefined || at < nextAttemptStartMs;
-  return cancels.some((at) => at >= from && at <= until && beforeNextAttempt(at));
+  return cancels.some(({ at }) => at >= from && at <= until && beforeNextAttempt(at));
 }
 
 /** The board's won't-do beads, by id — a lookup rather than a scan per run. */

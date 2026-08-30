@@ -29,6 +29,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     projectId: "p1",
     epicBeadId: "e-1",
     ticketBeadId: null,
+    jobId: null,
     worktreePath: null,
     branch: null,
     model: null,

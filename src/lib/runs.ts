@@ -85,6 +85,7 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
     ...toSummary(row),
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
     error: row.error ?? undefined,
+    jobId: row.jobId ?? undefined,
     reviewScore: row.reviewScore ?? undefined,
     formula: row.formula ?? undefined,
     formulaVariant: row.formulaVariant ?? undefined,
@@ -110,6 +111,8 @@ export interface CreateRunInput {
   id: string;
   projectId: string;
   epicBeadId: string;
+  /** The execute-epic job starting this attempt (anton-rgso) — see the column's own note. */
+  jobId?: string;
   ticketBeadId?: string;
   worktreePath?: string;
   branch?: string;
@@ -125,6 +128,7 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     id: input.id,
     projectId: input.projectId,
     epicBeadId: input.epicBeadId,
+    jobId: input.jobId,
     ticketBeadId: input.ticketBeadId,
     worktreePath: input.worktreePath,
     branch: input.branch,
@@ -139,6 +143,8 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
 
 export type RunPatch = Partial<{
   status: RunStatus;
+  /** Rewritten on every resume: the job behind the attempt is the one a cancel would name. */
+  jobId: string | null;
   ticketBeadId: string | null;
   worktreePath: string | null;
   branch: string | null;
