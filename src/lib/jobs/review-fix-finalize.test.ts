@@ -19,6 +19,7 @@ const createMock = vi.fn();
 const reparentMock = vi.fn();
 const deleteMock = vi.fn();
 const unassignMock = vi.fn();
+const setStatusMock = vi.fn();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -33,6 +34,7 @@ vi.mock("../beads/bd", async () => {
       reparent: (...args: unknown[]) => reparentMock(...args),
       delete: (...args: unknown[]) => deleteMock(...args),
       unassign: (...args: unknown[]) => unassignMock(...args),
+      setStatus: (...args: unknown[]) => setStatusMock(...args),
     },
   };
 });
@@ -81,6 +83,7 @@ describe("finalizeMergedEpic", () => {
     reparentMock.mockReset().mockResolvedValue(undefined);
     deleteMock.mockReset().mockResolvedValue(undefined);
     unassignMock.mockReset().mockResolvedValue(undefined);
+    setStatusMock.mockReset().mockResolvedValue(undefined);
   });
 
   it("closes the still-open children and the target in one batch, children first", async () => {
@@ -201,6 +204,31 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
 
     expect(unassignMock).not.toHaveBeenCalled();
+  });
+
+  it("reopens the ticket the timeout left blocked, so the follow-up target can claim it", async () => {
+    // Rehoming alone advertises a rerun the operator cannot start: bd refuses to claim a `blocked`
+    // bead, so approving the follow-up would park every attempt at execute-epic's claim gate.
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(setStatusMock).toHaveBeenCalledWith("/repo", "t2", "open");
+    expect(noteMock.mock.calls[0][2]).not.toContain("--status open");
+  });
+
+  it("leaves an already-open preserved ticket's status alone", async () => {
+    // A dependent skipped behind the timeout never left `open` — it is claimable as it stands.
+    await finalize(bead("epic-1"), [bead("t2", "open", ["not-delivered"])]);
+
+    expect(setStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("names the manual remedy when the blocked status cannot be cleared", async () => {
+    setStatusMock.mockRejectedValue(new Error("bd update: DB locked"));
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(noteMock.mock.calls[0][2]).toContain("`bd update t2 --status open`");
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
   });
 
   it("closes a leaf target marked not-delivered rather than preserving itself", async () => {

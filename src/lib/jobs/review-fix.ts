@@ -594,9 +594,9 @@ export async function finalizeMergedEpic(args: {
   );
   if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
-  // 1b. Rehome the preserved tickets under a NEW run target, then say on each of them that the
-  //     feature shipped without it — the operator meets this ticket long after the run that skipped
-  //     it, under a target that now reads as done.
+  // 1b. Rehome the preserved tickets under a NEW run target, hand each one back in a claimable
+  //     state, then say on each of them that the feature shipped without it — the operator meets
+  //     this ticket long after the run that skipped it, under a target that now reads as done.
   //
   //     Rehoming is what makes the instruction actionable (anton-67xj). Left where they are these
   //     tickets are unreachable: a task/bug WITH a parent is never a run target (beads.isRunTarget),
@@ -611,6 +611,13 @@ export async function finalizeMergedEpic(args: {
     // follow-up — so the rerun path the note advertises works only once ownership is cleared. When
     // it cannot be, the note says so rather than pointing at a target no one can claim through.
     const stillOwned = ownerOf(bead) && !(await safe(() => beads.unassign(repo, bead.id)));
+    // Return the ticket to a claimable status. A timed-out one carries `blocked` from the run that
+    // stopped it, and bd refuses to claim a bead in that status — so an operator who approves the
+    // follow-up target would watch every attempt die at execute-epic's claim gate before this work
+    // could run. The parent makes the ticket reachable; the status is what makes it runnable. A
+    // ticket already `open` (a dependent skipped behind the timeout) is left untouched.
+    const stillBlocked =
+      bead.status !== "open" && !(await safe(() => beads.setStatus(repo, bead.id, "open")));
     await safe(() =>
       beads.note(
         repo,
@@ -627,6 +634,10 @@ export async function finalizeMergedEpic(args: {
           (stillOwned
             ? ` It is also still assigned to ${ownerOf(bead)} and could not be released, so no ` +
               `other operator can claim it: clear that with \`bd assign ${bead.id} ""\`.`
+            : "") +
+          (stillBlocked
+            ? ` Its status is also still \`${bead.status}\`, which bd refuses to claim, so a run ` +
+              `would stop at that gate: clear it with \`bd update ${bead.id} --status open\`.`
             : ""),
       ),
     );
