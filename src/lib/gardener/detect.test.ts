@@ -283,6 +283,37 @@ describe("parentless clusters", () => {
     expect(detection.subjects).toEqual(["anton-a1", "anton-a2"]);
   });
 
+  /**
+   * A curated label is a person's answer to "what is this about" — but an answer the CARD never gave
+   * says nothing about where the work belongs. The pair agrees about payments; the card only brushes
+   * them on `router`, which is the one-incidental-word match the two-term rule exists to refuse.
+   */
+  it("says nothing when the card is outside the area label the pair agrees on", () => {
+    expect(
+      detect([
+        ...carrying("anton-router", "Router shell rewrite", { title: "Router shell smoke test" }),
+        bead("anton-a1", { title: "Router guard for refunds", labels: ["area:payments"] }),
+        bead("anton-a2", { title: "Router retry on capture", labels: ["area:payments"] }),
+      ]),
+    ).toEqual([]);
+  });
+
+  // Refusing the card's area-blind match must not blind the detector to a subject it DOES state: the
+  // pair is still grouped on the two title terms it holds with the card.
+  it("still groups an area-labelled pair on the title subject the card states", () => {
+    const detection = only(
+      detect([
+        ...carrying("anton-router", "Router retry shell", { title: "Router retry smoke test" }),
+        bead("anton-a1", { title: "Router retry guard for refunds", labels: ["area:payments"] }),
+        bead("anton-a2", { title: "Router retry on capture", labels: ["area:payments"] }),
+      ]),
+    );
+
+    expect(detection.target).toBe("anton-router");
+    expect(detection.subjects).toEqual(["anton-a1", "anton-a2"]);
+    expect(detection.evidence.join("\n")).toContain('anton-router states "retry", "router" too');
+  });
+
   it("says nothing about a single parentless bead — one bead is not a cluster", () => {
     expect(detect([...homes, bead("anton-p1", { title: "Escalation banner copy" })])).toEqual([]);
   });

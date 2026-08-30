@@ -89,8 +89,8 @@ export function detectContainerOrphans(index: BoardIndex, nowMs: number): Garden
 export const MIN_CLUSTER_SIZE = 2;
 
 /**
- * How many INFERRED title terms a cluster and its home must hold in common before the match counts
- * as subject matter.
+ * How many INFERRED title terms a cluster must hold in common — at least one of them with its home
+ * — before the match counts as subject matter.
  *
  * Two, because one is a coincidence. This detector used to accept ONE term and call it distinctive
  * whenever exactly one open card carried it — but a board of a few dozen cards makes almost every
@@ -195,17 +195,27 @@ export function topicKeys(bead: Bead): Set<string> {
 const isCuratedKey = (key: string): boolean => key.startsWith(AREA_PREFIX);
 
 /**
- * Does this set of keys amount to shared SUBJECT MATTER, or is it just words two titles happen to
- * have in common? The whole difference between a proposal a founder acts on and one they close
- * unread, so it is stated once, here.
+ * Does this shared subject amount to SUBJECT MATTER THE HOME IS IN, or is it just words some titles
+ * happen to have in common? The whole difference between a proposal a founder acts on and one they
+ * close unread, so it is stated once, here — and asked of the home, not only of the group, because a
+ * subject the home has no part in cannot be the reason work belongs under it.
  *
  * A curated `area:` label is a person's own answer to "what is this about", so one carries the claim
- * by itself. An inferred title term is a guess, and a single guess is noise at board scale — hence
- * {@link MIN_SHARED_TERMS} of them.
+ * by itself — but only when the HOME wears it too. Two beads both labelled `area:payments` whose
+ * titles happen to share `router` with an unrelated home agree with each other about payments and
+ * with the home about nothing; the curated label would otherwise wave through a home match resting
+ * on one incidental word, which is the bar this rule exists to raise.
+ *
+ * Failing that, the claim rests on inferred title terms — guesses, and a single guess is noise at
+ * board scale, hence {@link MIN_SHARED_TERMS} of them. The home states at least one (structurally
+ * the anchor `topicGroups` formed the group around), which is the shape of the one proposal in the
+ * declined sweep that the founder applied: a "complexity hotspot" pair under the complexity card.
  */
-function statesSubjectMatter(shared: ReadonlySet<string>): boolean {
+function statesSubjectMatter(shared: ReadonlySet<string>, homeKeys: ReadonlySet<string>): boolean {
   const keys = [...shared];
-  return keys.some(isCuratedKey) || keys.length >= MIN_SHARED_TERMS;
+  if (keys.some((key) => isCuratedKey(key) && homeKeys.has(key))) return true;
+  const inferred = keys.filter((key) => !isCuratedKey(key));
+  return inferred.length >= MIN_SHARED_TERMS && inferred.some((key) => homeKeys.has(key));
 }
 
 /** A parentless bead the cluster rule considers, with its topic read once. */
@@ -222,7 +232,10 @@ interface TopicGroup {
   members: Bead[];
   /** Every key EVERY member carries — what the group agrees it is about. */
   shared: string[];
-  /** The part of that subject the home states as well. Never empty: the anchor is always in it. */
+  /**
+   * The part of that subject the home states as well — what qualified the group under this home, not
+   * a decoration on it ({@link statesSubjectMatter}). Never empty: the anchor is always in it.
+   */
   held: string[];
 }
 
@@ -232,8 +245,8 @@ interface TopicGroup {
  *
  * Agreement is the whole fix. Matching each bead against the home on its own private word let five
  * beads sharing nothing but `epic` read as one cluster; requiring the intersection of the members'
- * keys to state subject matter means the group has to be about one thing before it is proposed as
- * one card's tickets.
+ * keys to state subject matter the home shares means the group has to be about one thing, and the
+ * home about that thing, before it is proposed as one card's tickets.
  *
  * Agreement is asked of a GROUP, not of everything the anchor happens to reach. Two beads that state
  * "escalation banner" between them are a cluster whether or not an unrelated "escalation timeout"
@@ -253,7 +266,7 @@ function topicGroups(homeKeys: Set<string>, candidates: Candidate[]): TopicGroup
   for (const anchor of [...homeKeys].sort()) {
     const members = candidates.filter((c) => c.keys.has(anchor));
     if (members.length < MIN_CLUSTER_SIZE) continue;
-    for (const group of agreeingSubsets(members)) {
+    for (const group of agreeingSubsets(members, homeKeys)) {
       const identity = groupIdentity(group);
       if (seen.has(identity)) continue;
       seen.add(identity);
@@ -293,8 +306,13 @@ const groupIdentity = (group: Candidate[]): string =>
     .join("+");
 
 /**
- * The subsets of one anchor's matches that state a subject between them: the whole set when it
- * already agrees, and otherwise the sub-groups each further shared key forms.
+ * The subsets of one anchor's matches that state a subject between them AND with the home: the whole
+ * set when it already agrees, and otherwise the sub-groups each further shared key forms.
+ *
+ * The home is asked here rather than of the finished group because the two questions are one: a set
+ * whose agreement rests on a subject the home has no part in can still contain a sub-group that
+ * agrees on one the home does state, and filtering afterwards would discard the pair without ever
+ * looking for it.
  *
  * Partitioning by a key rather than searching for maximal agreeing subsets on purpose — the SUBJECT
  * is what an approver checks, so a group is named by the two terms it holds ("escalation" plus
@@ -302,15 +320,18 @@ const groupIdentity = (group: Candidate[]): string =>
  * walked sorted, so a patrol's groups do not depend on the order the board was read in; a
  * membership two keys both reach is folded by the caller, which has to fold across anchors anyway.
  */
-function agreeingSubsets(members: Candidate[]): Candidate[][] {
-  if (statesSubjectMatter(intersectKeys(members.map((m) => m.keys)))) return [members];
+function agreeingSubsets(members: Candidate[], homeKeys: Set<string>): Candidate[][] {
+  const agrees = (group: Candidate[]): boolean =>
+    statesSubjectMatter(intersectKeys(group.map((m) => m.keys)), homeKeys);
+
+  if (agrees(members)) return [members];
 
   const subsets: Candidate[][] = [];
   const secondary = new Set(members.flatMap((m) => [...m.keys]));
   for (const key of [...secondary].sort()) {
     const subset = members.filter((m) => m.keys.has(key));
     if (subset.length < MIN_CLUSTER_SIZE) continue;
-    if (!statesSubjectMatter(intersectKeys(subset.map((m) => m.keys)))) continue;
+    if (!agrees(subset)) continue;
     subsets.push(subset);
   }
   return subsets;
@@ -457,9 +478,11 @@ export function carrierPaths(
  * "Obvious" is three things, and a claim needs all three (anton-9hpp — the rule this replaced needed
  * none of them and was declined nine times in eleven):
  *
- *   • THE GROUP AGREES. The loose beads state one subject BETWEEN THEM ({@link statesSubjectMatter}),
- *     not a different word each against the card. Rarity is not topic: a board of a few dozen cards
- *     makes almost every word unique to one, which is how `epic` became a home signal.
+ *   • THE GROUP AGREES, AND THE CARD IS IN ON IT. The loose beads state one subject BETWEEN THEM and
+ *     the card states the part that qualifies it ({@link statesSubjectMatter}) — not a different word
+ *     each against the card, and not a subject of their own the card only brushes. Rarity is not
+ *     topic: a board of a few dozen cards makes almost every word unique to one, which is how `epic`
+ *     became a home signal.
  *   • THE CARD IS A CONTAINER. It already carries tickets. A leaf feature is one PR's worth of work,
  *     and hanging a cluster off it turns somebody's card into somebody else's epic; "already files
  *     work of this kind" is the far stronger home signal, and the same index answers it.
