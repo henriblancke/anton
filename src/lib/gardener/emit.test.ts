@@ -227,6 +227,28 @@ describe("the proposal bead", () => {
     expect(draft.acceptance).toMatch(/DECLINED/);
   });
 
+  // A membership is a SET, and for the kind whose identity is its TARGET the hash no longer guards
+  // the list (anton-9hpp) — so the canonical form has to be deduped at emission, which is the bar
+  // `parseGardenerPlan` then holds every plan to on read.
+  it("files a subject list as a set — a bead named twice is one member", () => {
+    const detection = makeDetection({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-l2", "anton-l1", "anton-l2"],
+      target: "anton-card",
+      summary: "anton-l1 and anton-l2 state one subject — re-parent them under anton-card",
+      evidence: ["anton-card already carries anton-card-t"],
+    });
+
+    const draft = proposalDraft(detection);
+    expect(detection.subjects).toEqual(["anton-l1", "anton-l2"]);
+    // And it reads back: the plan a duplicate would have written is one apply refuses outright.
+    expect(proposalPlanOf({ labels: draft.labels, metadata: draft.metadata })?.subjects).toEqual([
+      "anton-l1",
+      "anton-l2",
+    ]);
+  });
+
   it("carries its MOVE as metadata, so applying it never has to parse the prose (anton-1t3n)", () => {
     const detection = reparent();
     const draft = proposalDraft(detection);

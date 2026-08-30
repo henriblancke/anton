@@ -13,6 +13,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { parseGardenerPlan, proposalFingerprint } from "./detections";
 import {
   apply,
@@ -144,6 +145,16 @@ describe("the plan a proposal carries — read strictly, because it decides what
     expect(parseGardenerPlan(reordered)).toEqual(reordered);
   });
 
+  // …and a set has no repeats. The target-identified kind is the one the hash cannot catch this on,
+  // and it is also the one that counts its subjects: `groupedUnder` would read one bead listed twice
+  // as two members, so a single bead already under the home would settle as an applied cluster no
+  // detector ever derived.
+  it("rejects a subject named twice, which a target's own identity cannot catch", () => {
+    expect(parseGardenerPlan({ ...CLUSTER, subjects: ["anton-a", "anton-a"] })).toBeUndefined();
+    // The same bar on the kinds whose hash would have caught it anyway — one rule, not two.
+    expect(parseGardenerPlan({ ...REPARENT, subjects: ["anton-a", "anton-a"] })).toBeUndefined();
+  });
+
   /**
    * The rollout (anton-9hpp): a cluster proposal filed BEFORE the claim moved to its target hashes
    * the membership it was found with. Rejecting it would strand every one already open — apply would
@@ -247,6 +258,66 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ).rejects.toMatchObject({
       failure: "refused",
       message: expect.stringContaining("no longer reads as applied"),
+    });
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  /**
+   * A cluster whose every surviving member somebody already filed under the home settles without a
+   * step — so the per-step premise locks (apply-steps.ts `lockedBeads`) never run, and the settlement
+   * is the only thing standing between the container claim and a proposal closed as applied over it.
+   * `deleteTicket` takes the deleted ticket's own lock and no other, so neither end of the plan
+   * orders that write against this one.
+   *
+   * Asserted as the lock rather than through a staged race, like the step's own: the harm is exactly
+   * that the window is invisible to a fresh read.
+   */
+  it("takes the write lock of the carriers a settled cluster's home premise rests on", async () => {
+    // The direct carrier, and then the bead a nested one reaches the home THROUGH — deleting the
+    // intermediate cuts the carrier loose without touching the carrier itself.
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const cases: [string, Bead[]][] = [
+      [CARRIED.id, [CARD, CARRIED]],
+      [note.id, [CARD, note, child("anton-t0", note.id)]],
+    ];
+    for (const [held, home] of cases) {
+      resetSeam();
+      const proposal = proposalFor(CLUSTER);
+      const board = [...home, child("anton-a", CARD.id), child("anton-b", CARD.id), proposal];
+      let release = () => {};
+      const queued = withBeadWriteLock(REPO, held, () => new Promise<void>((r) => (release = r)));
+
+      const run = apply(proposal, board);
+      try {
+        await new Promise((r) => setTimeout(r, 10));
+        expect(calls, `${held} was not held`).toEqual([]);
+      } finally {
+        release();
+        await queued;
+      }
+      await expect(run).resolves.toMatchObject({ changed: [] });
+    }
+  });
+
+  // And the settlement counts the SAME narrowed set the locks cover. A ticket filed under the home
+  // since the decision is one nothing here holds, so letting it carry the container premise would
+  // restore the very race the locks close — the counted carrier can be deleted a moment later.
+  it("refuses to settle a cluster whose home swapped its ticket for one nothing locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set(CARRIED.id, bead(CARRIED.id)); // the counted ticket is detached…
+    liveBeads.set("anton-t1", child("anton-t1", CARD.id)); // …and an unlocked one takes its place
+
+    await expect(
+      apply(proposal, [
+        CARD,
+        CARRIED,
+        child("anton-a", CARD.id),
+        child("anton-b", CARD.id),
+        proposal,
+      ]),
+    ).rejects.toMatchObject({
+      failure: "refused",
+      message: expect.stringContaining("no longer carries the tickets this proposal was decided against"),
     });
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });

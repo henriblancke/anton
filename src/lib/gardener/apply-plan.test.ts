@@ -783,6 +783,10 @@ describe("planApply — what an approval means against the board as it now is", 
           status: "settled",
           // Named from the members that ARE there: anton-c never reached the target.
           summary: "anton-a, anton-b already sit under anton-card",
+          // Writing nothing is not resting on nothing: the summary still claims anton-card is a
+          // container, so the settlement carries the tickets that premise was counted from — the
+          // beads apply.ts has to lock and re-count before it closes the ask (`settleUnwritten`).
+          carried: { carriers: [CARRIED.id], carrierPaths: [] },
         });
       });
 

@@ -287,7 +287,11 @@ export function makeDetection(input: DetectionInput): GardenerDetection {
   }
   const detailError = detailViolation(input.kind, input.detail);
   if (detailError) throw new Error(detailError);
-  const subjects = [...input.subjects].sort();
+  // Deduped as well as sorted, so a detection's subject list is a SET: one bead named twice is one
+  // member, and the kind whose identity no longer covers that list (see {@link ClaimIdentity}) would
+  // otherwise let the repeat count twice towards MIN_CLUSTER_SIZE. Canonical here, required on read
+  // ({@link parseGardenerPlan}).
+  const subjects = [...new Set(input.subjects)].sort();
   const subjectKey = detectionSubjectKey(input.kind, subjects, input.target, input.detail);
   return {
     kind: input.kind,
@@ -517,7 +521,7 @@ const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
  * `retireAs` is required exactly when the move is `retire` and forbidden otherwise, which is the
  * same invariant {@link GardenerDetection} documents; a retire with no verb has no safe default.
  *
- * Two checks bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
+ * Three checks bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
  * one ask and have another execute:
  *   • the fingerprint is RECOMPUTED from the parsed kind/subjects/target and must match the field
  *     carried alongside them — editing the subjects or the target of a proposal now invalidates it
@@ -525,7 +529,9 @@ const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
  *     identity, the target still is — see {@link ClaimIdentity});
  *   • the move and retirement verb must be the ones {@link CANONICAL_MOVE} pairs with the kind,
  *     which is what covers the two fields the hash can't (a `stale` bead reads as a defer, so it
- *     must not execute a close).
+ *     must not execute a close);
+ *   • the subjects must be DISTINCT, which is what covers the list the hash stops guarding for a
+ *     target-identified kind — a bead named twice is not two members of anything.
  */
 export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -543,6 +549,11 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
   const subjects = raw.subjects;
   if (!Array.isArray(subjects) || subjects.length === 0) return undefined;
   if (!subjects.every((s) => typeof s === "string" && s.length > 0)) return undefined;
+  // A subject list is a SET, and emission writes it as one ({@link makeDetection}) — so a repeat is
+  // an edit, and for the kind whose identity is its target the fingerprint no longer catches it. Left
+  // standing, one bead listed twice counts twice towards MIN_CLUSTER_SIZE and a single bead already
+  // under the home settles as an applied cluster no detector would derive.
+  if (new Set(subjects as string[]).size !== subjects.length) return undefined;
 
   const target = raw.target;
   if (target !== undefined && (typeof target !== "string" || !target)) return undefined;
