@@ -78,6 +78,11 @@ interface CommentSyntax {
   block: [string, string][];
   /** Whether an opener met inside an open block nests rather than reading as ordinary text. */
   nested?: boolean;
+  /**
+   * Whether the block delimiters are only delimiters at the start of a line. Ruby's `=begin` /
+   * `=end` are, so `total =begin_of_month` is an assignment rather than a comment that never closes.
+   */
+  anchored?: boolean;
 }
 
 /**
@@ -127,7 +132,16 @@ const COMMENT_SYNTAX: CommentSyntax[] = [
     ],
   },
   {
-    files: /\.(?:rb|sh|bash|zsh|ya?ml|toml)$/i,
+    // Ruby's block comment is a pair of line-anchored markers rather than an inline delimiter, and
+    // it is the only comment `#` cannot express: without it the continuation lines of a `=begin`
+    // block read as code, and prose naming a symbol proves a caller that isn't there.
+    files: /\.(?:rb|rake|gemspec)$/i,
+    line: ["#"],
+    block: [["=begin", "=end"]],
+    anchored: true,
+  },
+  {
+    files: /\.(?:sh|bash|zsh|ya?ml|toml)$/i,
     line: ["#"],
     block: [],
   },
@@ -150,8 +164,8 @@ function nextComment(
     if (at >= 0 && (!found || at < found.at)) found = { at, marker };
   }
   for (const [opener, closer] of syntax.block) {
-    const at = line.indexOf(opener, from);
-    if (at >= 0 && (!found || at < found.at)) found = { at, marker: opener, closer };
+    const at = syntax.anchored ? (line.startsWith(opener) ? 0 : -1) : line.indexOf(opener, from);
+    if (at >= from && (!found || at < found.at)) found = { at, marker: opener, closer };
   }
   return found;
 }
@@ -186,7 +200,15 @@ function closeBlock(
   from: number,
   open: OpenBlock,
   nested: boolean,
+  anchored: boolean,
 ): { at: number; closed: boolean } {
+  // A line-anchored closer ends the comment only as the line's first token, and the rest of that
+  // line is the comment's too — Ruby ignores whatever trails `=end`.
+  if (anchored) {
+    return from === 0 && line.startsWith(open.closer)
+      ? { at: line.length, closed: true }
+      : { at: line.length, closed: false };
+  }
   let at = from;
   while (at < line.length) {
     const nestAt = nested ? line.indexOf(open.opener, at) : -1;
@@ -217,7 +239,13 @@ function maskComments(text: string, syntax: CommentSyntax): string[] {
     let at = 0;
     while (at < line.length) {
       if (open) {
-        const { at: end, closed } = closeBlock(line, at, open, syntax.nested === true);
+        const { at: end, closed } = closeBlock(
+          line,
+          at,
+          open,
+          syntax.nested === true,
+          syntax.anchored === true,
+        );
         spans.push([at, end]);
         at = end;
         if (closed) open = undefined;

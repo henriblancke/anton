@@ -1298,6 +1298,28 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.rs");
     });
 
+    // Ruby's block comment is `=begin`/`=end`, not `#`. Reading it with `#` alone leaves the block's
+    // continuation lines looking like code, so prose naming the symbol proves a caller that isn't
+    // there — and a real Ruby call below the block still has to count.
+    it("reads a Ruby =begin block as prose and still counts a Ruby caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/legacy/notes.rb":
+          "=begin\nneverCalled ran the old nightly.\n=end # neverCalled went with it\nkept = 1\n",
+        "src/legacy/caller.rb": "=begin\nneverCalled is called below.\n=end\nneverCalled()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/legacy/caller.rb");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/legacy/notes.rb");
+    });
+
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
       const repo = initRepo({
         "src/lib/types.ts": "export type ScanPass = { id: string };\n",
