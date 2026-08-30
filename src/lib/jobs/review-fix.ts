@@ -100,6 +100,14 @@ export interface ReviewFixDeps {
 
 const IN_REVIEW = LABELS.stage("in-review");
 
+/**
+ * Metadata key stamping a follow-up run target with the merged target it was created for
+ * ({@link applyRehome}) — the identity that makes the rehome retryable (PR #199). `beads.create` is
+ * a persistent write and every step after it can be interrupted, so a retried finalization looks
+ * the stamp up on the board and reuses the follow-up it already made rather than orphaning it.
+ */
+const REHOME_OF = "rehomeOf";
+
 /** Handlers get no logger from the runner; fall back to console so swallowed errors are visible. */
 const consoleLog: RunnerLogger = {
   info: (m, meta) => console.log(`[review-fix] ${m}`, meta ?? ""),
@@ -756,7 +764,7 @@ async function reopenPreserved(
     (owner !== undefined && owner !== runOwner)
   )
     return (
-      ` Its status is now \`${fresh.status}\`${owner ? ` under ${owner}` : ""} — that changed after ` +
+      ` Its status is \`${fresh.status}\`${owner ? ` under ${owner}` : ""} — the board changed after ` +
       `the run stopped it, so anton left the status alone rather than reopening a ticket someone ` +
       `else has moved on.`
     );
@@ -802,7 +810,10 @@ export async function finalizeMergedEpic(args: {
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;
-  /** The full board — only for resolving the follow-up epic's `area:` ({@link areaLabelOf}). */
+  /**
+   * The full board — the follow-up epic's `area:` ({@link areaLabelOf}) and the follow-up an
+   * interrupted earlier finalization already created for this target ({@link REHOME_OF}).
+   */
   all: Bead[];
 }): Promise<void> {
   const { db, clock, repo, projectId, epic, children, branch, all } = args;
@@ -899,7 +910,7 @@ export async function finalizeMergedEpic(args: {
     rerunnable,
     preserved,
     children,
-    areaLabelOf(epic, all),
+    all,
   );
 
   // Only once the moves have landed can a ticket say where it ended up, so the notes come last.
@@ -1024,8 +1035,8 @@ export async function finalizeMergedEpic(args: {
   //    prevent. Closing last means a stop anywhere before this line leaves the epic open and still
   //    `stage:in-review`, and the whole finalization re-runs next sweep: a rehomed ticket has left
   //    the subtree, so it is neither rehomed nor re-noted twice (which is why step 1 finishes with
-  //    that ticket BEFORE it moves), and the remainder of a partly-done rehome gets a follow-up
-  //    target of its own.
+  //    that ticket BEFORE it moves), and the remainder of a partly-done rehome lands on the
+  //    follow-up the interrupted sweep already made (`REHOME_OF`) rather than a second one.
   //
   //    The target is never itself "preserved": a leaf run target marked undelivered has no merged
   //    PR to finalize, and excluding it from the close would leave `stage:in-review` on forever,
@@ -1159,6 +1170,11 @@ async function planRehome(
  * still open, still noted with the manual remedy — rather than aborting a finalization whose closes
  * have already landed. An epic that ends up with no children at all is deleted again, since a
  * childless epic is a poison run rather than a home.
+ *
+ * The follow-up itself is created at most once per merged target (PR #199): it carries a
+ * {@link REHOME_OF} stamp naming the target, so a finalization that was interrupted after the
+ * create — and re-runs from the top on the next sweep, since the target is still open — finds that
+ * epic on the board and moves the remaining tickets onto it instead of leaving it childless.
  */
 async function applyRehome(
   repo: string,
@@ -1168,7 +1184,7 @@ async function applyRehome(
   rerunnable: Bead[],
   preserved: Bead[],
   subtree: Bead[],
-  area: string | undefined,
+  all: Bead[],
 ): Promise<Rehomed> {
   const none: Rehomed = {
     moved: new Set(),
@@ -1178,25 +1194,47 @@ async function applyRehome(
   };
   if (rerunnable.length === 0) return none;
   const ids = rerunnable.map((b) => b.id).join(", ");
+  // The follow-up a previous, interrupted finalization already created for this target (PR #199).
+  // `beads.create` lands on the board for good, and everything after it — the detaches, the moves,
+  // the empty-target cleanup — can be cut short: a worker that stops between them leaves a childless
+  // epic, and the next sweep (which re-selects this still-open target and finalizes from the top)
+  // would create a SECOND one and strand the first there permanently. Reusing it also keeps a
+  // partly-done rehome's remainder with the tickets that already moved, under one target instead of
+  // two. Only an untouched one: once a human has approved it or an operator claimed it, it is a run
+  // of its own, and adding tickets to a live run's set is the drift that parks it — that one gets a
+  // fresh follow-up, exactly as before.
+  const reused = all.find(
+    (b) =>
+      b.metadata?.[REHOME_OF] === epic.id &&
+      b.status !== "closed" &&
+      ownerOf(b) === undefined &&
+      !(b.labels ?? []).includes(LABELS.approved),
+  );
+  const area = areaLabelOf(epic, all);
   let followUp: string;
-  try {
-    followUp = await beads.create(repo, {
-      title: `${epic.title} — undelivered tickets`,
-      type: "epic",
-      // The roadmap groups by `area:`, and the contract wants exactly one: inherit the merged
-      // target's so the follow-up lands in the same column its work was always meant to ship in.
-      labels: area ? [area] : [],
-      description:
-        `The pull request for ${epic.id} merged without ${ids}. The run that opened it ran out of ` +
-        `time, so that work is in no diff — this epic is its home, because a ticket parented to an ` +
-        `already-merged target is not something anton can run.\n\n` +
-        `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
-        `first if the timeout means they were too big.`,
-      acceptance: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
-    });
-  } catch {
-    return none;
-  }
+  if (reused) followUp = reused.id;
+  else
+    try {
+      followUp = await beads.create(repo, {
+        title: `${epic.title} — undelivered tickets`,
+        type: "epic",
+        // The roadmap groups by `area:`, and the contract wants exactly one: inherit the merged
+        // target's so the follow-up lands in the same column its work was always meant to ship in.
+        labels: area ? [area] : [],
+        // Written in the SAME call as the bead, so no window exists in which the follow-up is on
+        // the board without the stamp a retry finds it by.
+        metadata: { [REHOME_OF]: epic.id },
+        description:
+          `The pull request for ${epic.id} merged without ${ids}. The run that opened it ran out ` +
+          `of time, so that work is in no diff — this epic is its home, because a ticket parented ` +
+          `to an already-merged target is not something anton can run.\n\n` +
+          `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
+          `first if the timeout means they were too big.`,
+        acceptance: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
+      });
+    } catch {
+      return none;
+    }
   const { takeable } = plan;
   const moved = new Set<string>();
   const nested = new Map<string, string>();
@@ -1289,11 +1327,21 @@ async function applyRehome(
   // Only DIRECT children need a write — detaching one carries its own descendants with it — and a
   // detach that does not land pins the ancestor exactly as an undelivered descendant does: a move
   // anton cannot make safe must not happen at all.
+  //
+  // An ancestor pass 1a found STALE is skipped for the same reason it is: it is not moving, so
+  // there is nothing to take the child off — and it now belongs to whoever claimed or reparented
+  // it, so detaching their descendant would rewrite an edge inside somebody else's subtree.
   const preservedIds = new Set(preserved.map((b) => b.id));
   for (const bead of subtree) {
     if (preservedIds.has(bead.id)) continue;
     const parentId = beads.parentOf(bead);
-    if (!parentId || !takeable.has(parentId) || pinned.has(parentId)) continue;
+    if (
+      !parentId ||
+      !takeable.has(parentId) ||
+      pinned.has(parentId) ||
+      stale.has(parentId)
+    )
+      continue;
     const shipped = await readFresh(bead.id);
     // Still the sweep's evidence until the board confirms it: a ticket another operator has since
     // moved off this ancestor rides on nothing, and detaching would rewrite an edge that is theirs.
@@ -1320,8 +1368,11 @@ async function applyRehome(
       moved.add(mover.id);
   }
   if (moved.size > 0) return { id: followUp, moved, nested, pinned, stale };
-  // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
-  await safe(() => beads.delete(repo, followUp));
+  // Nothing moved — the epic is a childless run target no one asked for. Take it back off the
+  // board, unless it is a REUSED follow-up an earlier sweep already moved tickets onto: deleting
+  // that one would take their only home with it.
+  if (!reused || !all.some((b) => beads.parentOf(b) === followUp))
+    await safe(() => beads.delete(repo, followUp));
   return { moved: new Set(), nested, pinned, stale };
 }
 

@@ -279,6 +279,94 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("could NOT be rehomed");
   });
 
+  it("reuses the follow-up an interrupted sweep already created (PR #199)", async () => {
+    // `beads.create` is a persistent write, and the sweep that made this one stopped before it
+    // could move anything onto it. The target is still open, so finalization re-runs from the top —
+    // creating a second follow-up here would leave the first childless on the board forever.
+    const leftover = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [leftover],
+    );
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-7");
+    expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-7");
+  });
+
+  it("stamps the follow-up with the target it was created for", async () => {
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    // Written in the create itself: a stamp that arrives in a second write leaves a window in
+    // which a retry cannot recognize its own follow-up.
+    expect(createMock.mock.calls[0][1].metadata).toEqual({
+      rehomeOf: "epic-1",
+    });
+  });
+
+  it("creates a fresh follow-up when the leftover one is already a run of its own", async () => {
+    // A human approved it, so it is somebody's target now — adding tickets to a live run's set is
+    // the drift that parks it.
+    const approved = {
+      ...bead("epic-7", "open", ["approved"]),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [approved],
+    );
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
+  });
+
+  it("keeps a reused follow-up that already carries an earlier sweep's tickets", async () => {
+    // Nothing reached it THIS time, but the sweep that made it moved t9 onto it — deleting the
+    // childless-target way would take that ticket's only home with it.
+    reparentMock.mockRejectedValue(new Error("bd update: DB locked"));
+    const leftover = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    const carried = { ...bead("t9"), parent: "epic-7" } as Bead;
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [leftover, carried],
+    );
+
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("could NOT be rehomed");
+  });
+
+  it("deletes a reused follow-up that is still childless", async () => {
+    reparentMock.mockRejectedValue(new Error("bd update: DB locked"));
+    const leftover = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [leftover],
+    );
+
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-7");
+  });
+
   it("releases the reservation the skipping run still holds on a preserved ticket", async () => {
     // The rerun path the note advertises only works if the ticket can be claimed again: a claim
     // that outlived its run hides it from `bd ready --unassigned` and refuses the claim cascade of
@@ -726,6 +814,26 @@ describe("finalizeMergedEpic", () => {
     // Still handed back claimable, with the manual remedy named — the pinned lane exactly.
     expect(setStatusMock.mock.calls).toEqual([["/repo", "t2", "open"]]);
     expect(noteMock.mock.calls[0][2]).toContain("t3 still hangs off it");
+  });
+
+  it("does not detach a delivered child from an ancestor that went stale (PR #199)", async () => {
+    // Another operator gave t2 a target of their own in the window before the writes, so pass 1a
+    // marks it stale and it never moves. Its delivered child t3 must not be detached either: that
+    // subtree is theirs now, and the detach would rewrite an edge inside the run they are executing.
+    setStatusMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") parents.set("t2", "epic-9");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3")),
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(noteMock.mock.calls[0][2]).toContain(
+      "another operator moved it under epic-9",
+    );
   });
 
   it("leaves a ticket whose ANCESTOR another operator reparented since the sweep (anton-67xj)", async () => {
