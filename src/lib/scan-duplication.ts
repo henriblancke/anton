@@ -147,9 +147,18 @@ const STRUCTURAL_LINE = /^(?:[[\](){}<>,;:]+|<\/[A-Za-z][\w.:-]*>[,;)]*|\/>[,;)]
  * Go's grouped `import (` keeps its place: gofmt separates the keyword from the paren, and a paren
  * with nothing after it on the line opens a specifier list. The spaced call form (`import ("./x")`)
  * is excluded by its argument, as before.
+ *
+ * A block comment between the keyword and the paren is trivia the call still runs through —
+ * `import /* webpackIgnore: true *\/ ("./plugin")` is how a bundler is told what to do with a
+ * runtime load. It settles the paren on its own: a comment in that position is the loader-hint
+ * idiom, never Go's specifier list, so the argument may wrap to the next line as it may after a
+ * bare `import(`.
  */
-const IMPORT_START =
-  /^import\b(?!\(|\s*(?:\(\s*\S|\.))|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
+const INLINE_BLOCK_COMMENT = String.raw`\/\*(?:[^*]|\*(?!\/))*\*\/`;
+const IMPORT_START = new RegExp(
+  String.raw`^import\b(?!\(|(?:\s*${INLINE_BLOCK_COMMENT})+\s*\(|\s*(?:\(\s*\S|\.))` +
+    String.raw`|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']`,
+);
 
 /**
  * Python's other import spelling — `from package import name`, `from . import sibling`, and the
@@ -640,6 +649,10 @@ const TYPE_RESUMED = /^(?:[|&?:]|extends\b)/;
  * terminator: a repo that writes no semicolons ends `type Status = "ready" | "done"` with the line,
  * and a union of inline objects (`| { mode: "dev" }`) closes a brace on every member without ending
  * anything. Only an unfinished line, or one the NEXT line continues, keeps the alias open.
+ *
+ * Python's explicit line join is the one continuation that opens no bracket either — `from package
+ * import first, \` carries its remaining names on the lines below with a depth of zero. Ending the
+ * statement there hands a specifier list to the filter as executable code.
  */
 function continues(
   kind: "import" | "type",
@@ -648,6 +661,7 @@ function continues(
   next: string,
 ): boolean {
   if (depth > 0) return true;
+  if (line.endsWith("\\")) return true;
   if (kind === "import" || line.endsWith(";")) return false;
   return TYPE_UNFINISHED.test(line) || TYPE_RESUMED.test(next);
 }

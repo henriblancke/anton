@@ -1260,6 +1260,39 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("4 import");
     });
 
+    // A bundler hint sits between the keyword and the paren — `import /* webpackIgnore: true */
+    // ('./plugin')`. The comment is trivia; the call still loads a module and drives the promise
+    // chain hanging off it, so a window of them is duplicated wiring triage can act on.
+    it("reads a dynamic import() behind a magic comment as the call it is", async () => {
+      const repo = writeRepo({
+        "src/lazy.ts": [
+          "export function load(register: (m: unknown) => void) {",
+          "  import /* webpackIgnore: true */ ('./alpha').then(register);",
+          "  import /* webpackIgnore: true */ ('./beta').then(register);",
+          "  import /* webpackIgnore: true */ ('./gamma').then(register);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/static.ts": [
+          "import { alpha } from './alpha';",
+          "import { beta } from './beta';",
+          "import { gamma } from './gamma';",
+          "export const all = [alpha, beta, gamma];",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/lazy.ts", 2]], 3),
+        clone([["src/static.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/lazy.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/static.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // A parameter NAME declares; a parameter DEFAULT runs on every call. A signature whose whole
     // list is `x = build()` is duplicated computation, however much it looks like a props list.
     it("counts a parameter list of defaults as code and one of bare names as a declaration", async () => {
@@ -1897,6 +1930,31 @@ describe("scan", () => {
       ]);
       expect(result.duplication.dropped[0].reason).toContain("3 import");
       expect(result.duplication.dropped[1].reason).toContain("5 import");
+    });
+
+    // Python's other way of wrapping an import opens no bracket at all: a trailing `\` joins the
+    // next line explicitly. Ended at the join, the names below it read as executable code and a
+    // repeated specifier list reaches triage.
+    it("continues a Python import across an explicit line join", async () => {
+      const repo = writeRepo({
+        "src/joined.py": [
+          "from package.module import first, \\",
+          "    second, \\",
+          "    third",
+          "",
+        ].join("\n"),
+        "src/work.py": ["total = compute(rows)", "report(total)", "flush(report)", ""].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/joined.py", 1]], 3),
+        clone([["src/work.py", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/work.py" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/joined.py" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
     // A Python docstring is prose with no comment marker on its lines, and it routinely quotes
