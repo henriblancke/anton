@@ -1500,6 +1500,27 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // An MDX expression closes on the line that opened it: in `Current: {version}. Widget was
+    // removed.` the symbol is markdown prose, not code. Accepting any earlier `{` reads that
+    // sentence as executable, calls the page a caller, and deletes a true finding.
+    it("counts an MDX symbol only while its expression is still open", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "Rendered with {Widget()} on the page.\n",
+        "docs/notes.mdx": "Current: {version}. Widget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
     // A page importing a namespace renders through it — `<UI.Widget />` — and may name the symbol
     // nowhere else. Reading the member tag as prose reports a component that ships on every page.
     it("counts an MDX component rendered through a namespace import", async () => {
@@ -1632,6 +1653,27 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
       expect(result.deadcode.dropped[0].reason).not.toContain("public/braced.html");
+    });
+
+    // A template expression closes on its own line too — `<p>{version} Widget was removed</p>`
+    // renders the symbol as text once `}` has run. Reading any earlier `{` as executable context
+    // lets a committed page prove its own caller and erase a genuinely unused symbol.
+    it("counts a markup symbol only while its expression is still open", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.svelte": "<p>{Widget(version)} shipped</p>\n",
+        "src/ui/notes.svelte": "<p>{version} Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.svelte");
     });
 
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the

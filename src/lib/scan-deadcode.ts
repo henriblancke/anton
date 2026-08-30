@@ -472,6 +472,21 @@ function maskMdxProse(text: string): string {
 const TAG_HEAD = /<\/?\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
 
 /**
+ * Whether the text before the symbol leaves a braced expression open. An expression closes on the
+ * line that opened it — `<p>{version} Widget was removed</p>` renders `Widget` as text once `}`
+ * has run — so accepting any earlier `{` reads that prose as code, calls the page a caller, and
+ * deletes a true finding about a genuinely unused symbol.
+ */
+function insideExpression(head: string): boolean {
+  let depth = 0;
+  for (const char of head) {
+    if (char === "{") depth += 1;
+    else if (char === "}") depth = Math.max(0, depth - 1);
+  }
+  return depth > 0;
+}
+
+/**
  * Which lines of an MDX file start inside a block that is still executing — an expression or an
  * ESM statement left open by an earlier line. Both shapes wrap: `{` on its own line with `Widget()`
  * under it, or a named import spread over three. Judging each line alone reads those continuations
@@ -529,7 +544,7 @@ function mdxOpenLines(code: string[], raw: string[]): boolean[] {
  */
 function referencesMdx(line: string | undefined, symbol: string, open = false): boolean {
   if (line !== undefined && (open || MDX_ESM_LINE.test(line))) return referencesWord(line, symbol);
-  return referencesWord(line, symbol, (head) => TAG_HEAD.test(head) || head.includes("{"));
+  return referencesWord(line, symbol, (head) => TAG_HEAD.test(head) || insideExpression(head));
 }
 
 /**
@@ -643,7 +658,7 @@ function referencesMarkup(line: string | undefined, symbol: string, code: CodeSp
       TAG_HEAD.test(markup) ||
       ATTR_VALUE.test(markup) ||
       DIRECTIVE_HEAD.test(markup) ||
-      markup.includes("{")
+      insideExpression(markup)
     );
   });
 }
