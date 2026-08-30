@@ -2114,6 +2114,32 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // A file emptied out holds no lines at all — the empty element `split` hands back for a source
+    // with no newline in it is not a line. Counted, two locations in emptied files vote as readable
+    // blank blocks and outvote the one that still holds the clone.
+    it("treats a location in an emptied file as gone rather than as a blank block", async () => {
+      const repo = writeRepo({
+        "src/kept.ts": ["export const rate = compute(hits) / span;", ""].join("\n"),
+        "src/emptied-a.ts": "",
+        "src/emptied-b.ts": "",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone(
+          [
+            ["src/kept.ts", 1],
+            ["src/emptied-a.ts", 1],
+            ["src/emptied-b.ts", 1],
+          ],
+          1,
+        ),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/kept.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // `/[/*]/` carries the two characters of a comment opener inside a character class. Read as one,
     // it runs a comment over every line below it and the executable clone under it is dropped unread.
     it("steps over a regex literal whose character class holds a comment opener", async () => {
@@ -2262,6 +2288,32 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toMatchObject([{ FilePath: "src/gate.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // The `)` that closes a control-flow head hands to a STATEMENT, not to a value — `if (enabled)
+    // /[/*]/.test(value);` runs a regex test as its body. Read as division, the `/*` inside the
+    // character class opens a comment that runs to the end of the file and every real duplication
+    // window below it is dropped unread.
+    it("reads a slash after a control-flow head as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/enabled.ts": [
+          "export function check(enabled: boolean, value: string) {",
+          "  if (enabled) /[/*]/.test(value);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/enabled.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/enabled.ts", Line: 3 }]);
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
@@ -2643,6 +2695,36 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals.map((s) => s.FilePath)).toEqual(["src/inline.ts", "src/tail.ts"]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // Rust nests its block comments, and commenting out a block that already holds one is how the
+    // nesting arises. Closed at the INNER `*/`, the still-commented remainder reads as syntax: the
+    // `let load = (` inside it opens a parameter list nothing closes, and every executable line past
+    // the real `*/` inherits `signature` and is dropped as a declaration.
+    it("closes a nested block comment on the delimiter that matches it, where the language nests", async () => {
+      const repo = writeRepo({
+        "src/loader.rs": [
+          "/* disabled while the loader moves:",
+          "/* the old path, kept for reference */",
+          "let load = (path,",
+          "    mode,",
+          "*/",
+          "fn split(value: &str) {",
+          "    emit(value);",
+          "    flush(value);",
+          "    report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/loader.rs", 7]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/loader.rs", Line: 7 }]);
       expect(result.duplication).toEqual({ dropped: [] });
     });
 

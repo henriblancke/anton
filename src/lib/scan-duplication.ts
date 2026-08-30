@@ -44,6 +44,13 @@ const HASH_COMMENT_EXTENSIONS = [".py", ".sh", ".bash", ".zsh", ".rb", ".yaml", 
 const SPACED_HASH_EXTENSIONS = [".sh", ".bash", ".zsh", ".yaml", ".yml"];
 
 /**
+ * Where a block comment NESTS — Rust, Swift, Scala and Kotlin close an outer `/*` only on the closer
+ * that MATCHES it. Everywhere else the first closer ends the comment however many openers preceded
+ * it, and counting depth there would run the comment past its close over the rest of the file.
+ */
+const NESTED_COMMENT_EXTENSIONS = [".rs", ".swift", ".scala", ".kt", ".kts"];
+
+/**
  * Where `"""` / `'''` opens a string that spans lines. Python only: in a shell or YAML file the same
  * three characters are an empty string beside a quote, and reading them as an opener would swallow
  * the rest of the file.
@@ -280,10 +287,37 @@ function afterQuoted(line: string, start: number): number {
   return line.length;
 }
 
+/** The heads whose parenthesized clause is followed by a STATEMENT rather than by more expression. */
+const CONTROL_HEAD = /\b(?:if|for|while)\s*$/;
+
+/**
+ * Whether the text ends with the `)` that CLOSES a control-flow head — `if (enabled)`, `for (…)`,
+ * `while (…)`. Every other `)` ends a value, so a `/` behind it divides; these hand to a statement,
+ * and `if (enabled) /[/*]/.test(value);` runs a regex test as its body. Read as division, the `/*`
+ * inside that character class opens a comment that swallows every line below.
+ *
+ * The paren is matched backwards rather than assumed, because a call closes one too and
+ * `compute(a) / 2` divides. Only the head's own `(` decides, so the keyword is read at the position
+ * that balances — `if (has(a)) /re/.test(b)` finds `if`, `compute(a) / 2` finds nothing.
+ */
+function closesControlHead(before: string): boolean {
+  if (!before.endsWith(")")) return false;
+  let depth = 0;
+  for (let i = before.length - 1; i >= 0; i -= 1) {
+    if (before[i] === ")") depth += 1;
+    else if (before[i] === "(") {
+      depth -= 1;
+      if (depth === 0) return CONTROL_HEAD.test(before.slice(0, i));
+    }
+  }
+  return false;
+}
+
 /**
  * Whether the `/` at `start` OPENS a regex literal rather than divides — `REGEX_PREFIX` read
  * against the text BEHIND the slash, for the scanners that walk a line character by character
- * instead of matching it whole.
+ * instead of matching it whole, plus the one prefix a regex cannot express: the `)` of a
+ * control-flow head, which takes a balanced scan backwards to tell from a call's.
  */
 function opensRegex(line: string, start: number): boolean {
   const raw = line.slice(0, start);
@@ -293,6 +327,7 @@ function opensRegex(line: string, start: number): boolean {
   // is read against, so whether anything WAS trimmed is the whole distinction between `value < /re/`
   // and a closing tag.
   if (raw.length > before.length && COMPARISON_PREFIX.test(before)) return true;
+  if (closesControlHead(before)) return true;
   return REGEX_PREFIX.test(before);
 }
 
@@ -582,18 +617,54 @@ function hasInlineBody(tail: string): boolean {
 }
 
 /**
- * What is left of a line once the block comments it OPENS are stripped — `""` when the line is
- * nothing but comment, `undefined` when the comment runs past it. A line that closes its comment
- * and then calls something still executes, so the suffix is classified rather than read as prose.
+ * Walk a line already INSIDE a block comment: how many levels it leaves open, and what follows the
+ * delimiter that closed the last one.
+ *
+ * Depth is carried rather than a flag because Rust, Swift, Scala and Kotlin NEST — an outer `/*`
+ * closes only on the closer that matches it. Commenting out a block that already holds a comment is
+ * how the nesting arises at all, so closing at the inner delimiter hands the still-commented
+ * remainder over as syntax: a `let load = (` inside it opens a parameter list nothing ever closes,
+ * and every executable line past the real closer inherits `signature` and is dropped as a
+ * declaration.
  */
-function afterBlockComment(line: string): string | undefined {
+function insideBlockComment(
+  line: string,
+  depth: number,
+  nested: boolean,
+): { depth: number; rest: string } {
+  let level = depth;
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === "*" && line[i + 1] === "/") {
+      level -= 1;
+      i += 2;
+      if (level === 0) return { depth: 0, rest: line.slice(i) };
+      continue;
+    }
+    if (nested && line[i] === "/" && line[i + 1] === "*") {
+      level += 1;
+      i += 2;
+      continue;
+    }
+    i += 1;
+  }
+  return { depth: level, rest: "" };
+}
+
+/**
+ * What is left of a line once the block comments it OPENS are stripped — `""` when the line is
+ * nothing but comment — and how many comment levels it leaves running past its end. A line that
+ * closes its comment and then calls something still executes, so the suffix is classified rather
+ * than read as prose.
+ */
+function afterBlockComment(line: string, nested: boolean): { depth: number; rest: string } {
   let rest = line;
   while (rest.startsWith("/*")) {
-    const close = rest.indexOf("*/", 2);
-    if (close < 0) return undefined;
-    rest = rest.slice(close + 2).trim();
+    const walked = insideBlockComment(rest.slice(2), 1, nested);
+    if (walked.depth > 0) return { depth: walked.depth, rest: "" };
+    rest = walked.rest.trim();
   }
-  return rest;
+  return { depth: 0, rest };
 }
 
 /**
@@ -623,7 +694,8 @@ function withoutHashComment(line: string, spaced: boolean): string {
  * Where a block comment OPENS on this line and is never closed on it — `value: string, /* why`.
  * Quoted strings, templates, regex literals and `//` notes are stepped over, so a `/*` inside any
  * of them opens nothing, and a comment that closes is skipped past so a later opener is still
- * found. `-1` when the line leaves no comment running.
+ * found. An opener of `-1` means the line leaves no comment running; `depth` is what it leaves open
+ * where comments nest, since an outer `/*` holding an inner one needs two closers to end.
  *
  * Without it the prose below such a line is read as syntax: an unmatched `(` inside the comment
  * holds `statement` in `signature` or `import` past the real declaration, and every executable
@@ -631,7 +703,7 @@ function withoutHashComment(line: string, spaced: boolean): string {
  * same reason in reverse: `pattern = /[/*]/` carries the two characters of an opener inside a
  * character class, and reading them as one would file every line below it as prose.
  */
-function unclosedBlockComment(line: string): number {
+function unclosedBlockComment(line: string, nested: boolean): { opener: number; depth: number } {
   let i = 0;
   while (i < line.length) {
     const char = line[i];
@@ -639,11 +711,11 @@ function unclosedBlockComment(line: string): number {
       i = afterQuoted(line, i);
       continue;
     }
-    if (char === "/" && line[i + 1] === "/") return -1;
+    if (char === "/" && line[i + 1] === "/") return { opener: -1, depth: 0 };
     if (char === "/" && line[i + 1] === "*") {
-      const close = line.indexOf("*/", i + 2);
-      if (close < 0) return i;
-      i = close + 2;
+      const walked = insideBlockComment(line.slice(i + 2), 1, nested);
+      if (walked.depth > 0) return { opener: i, depth: walked.depth };
+      i = line.length - walked.rest.length;
       continue;
     }
     // Checked AFTER the comment forms, since a `/*` at a position where a regex could begin is a
@@ -657,7 +729,7 @@ function unclosedBlockComment(line: string): number {
     }
     i += 1;
   }
-  return -1;
+  return { opener: -1, depth: 0 };
 }
 
 /**
@@ -668,10 +740,17 @@ function unclosedBlockComment(line: string): number {
  */
 function classifyLines(
   source: string,
-  opts: { hashComments: boolean; spacedHash: boolean; tripleQuotes: boolean },
+  opts: {
+    hashComments: boolean;
+    spacedHash: boolean;
+    tripleQuotes: boolean;
+    nestedComments: boolean;
+  },
 ): LineClass[] {
   const classes: LineClass[] = [];
-  let inComment = false;
+  // How many block comments are open, not whether one is: where they nest, an inner `*/` closes only
+  // the level it opened.
+  let commentDepth = 0;
   // Backticks delimit a multiline literal only where the language has one — JS/TS and Go. In a
   // `#`-comment language the same character is shell substitution or prose, so it opens nothing.
   const templates = !opts.hashComments;
@@ -696,21 +775,24 @@ function classifyLines(
   const lines = source.split("\n");
   // A file's terminal newline TERMINATES its last line rather than starting another, but `split`
   // hands one back as an empty element. Counted, it pads every file by a line, and a window that
-  // runs one line off the end reads as complete — the truncated remnant `readWindow` refuses.
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  // runs one line off the end reads as complete — the truncated remnant `readWindow` refuses. An
+  // EMPTY file is the same rule at its limit: it holds no lines at all, and counting the element
+  // `split` invents for it would let a stale one-line location vote as a readable blank block —
+  // two of those outvote the location that still holds the clone and the signal is dropped.
+  if (lines[lines.length - 1] === "") lines.pop();
 
   for (let index = 0; index < lines.length; index += 1) {
     let line = lines[index].trim();
     const next = lines[index + 1]?.trim() ?? "";
 
-    if (inComment) {
-      const close = line.indexOf("*/");
-      if (close < 0) {
+    if (commentDepth > 0) {
+      const walked = insideBlockComment(line, commentDepth, opts.nestedComments);
+      commentDepth = walked.depth;
+      if (commentDepth > 0) {
         classes.push("comment");
         continue;
       }
-      inComment = false;
-      line = line.slice(close + 2).trim();
+      line = walked.rest.trim();
       if (line === "") {
         classes.push("comment");
         continue;
@@ -752,18 +834,18 @@ function classifyLines(
       continue;
     }
     if (line.startsWith("/*")) {
-      const rest = afterBlockComment(line);
-      if (rest === undefined) {
+      const opened = afterBlockComment(line, opts.nestedComments);
+      if (opened.depth > 0) {
         classes.push("comment");
-        inComment = true;
+        commentDepth = opened.depth;
         continue;
       }
-      if (rest === "") {
+      if (opened.rest === "") {
         classes.push("comment");
         continue;
       }
       // The comment closed and something followed it: that suffix is what the line does.
-      line = rest;
+      line = opened.rest;
     }
 
     // A template this line OPENS and does not close: blank its text now, so the delimiters inside it
@@ -791,9 +873,9 @@ function classifyLines(
     // start. What precedes the opener is still what the line does; everything after it is prose the
     // lines below inherit, so the state has to be raised here or their delimiters count as syntax.
     if (blockComments) {
-      const opener = unclosedBlockComment(line);
+      const { opener, depth: opened } = unclosedBlockComment(line, opts.nestedComments);
       if (opener >= 0) {
-        inComment = true;
+        commentDepth = opened;
         line = line.slice(0, opener).trim();
         if (line === "") {
           classes.push("comment");
@@ -1005,6 +1087,7 @@ function sourceIndex(repoPath: string) {
         hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         spacedHash: SPACED_HASH_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        nestedComments: NESTED_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
     cache.set(path, result);
