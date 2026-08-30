@@ -1781,6 +1781,44 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // The attributes clause may be wrapped over several lines. The module is still fetched and
+    // evaluated, so the whole statement runs — reading its continuation lines as a specifier list
+    // would drop a duplicated runtime load.
+    it("keeps a side-effect import whose attributes clause is wrapped over lines", async () => {
+      const repo = writeRepo({
+        "src/register.ts": [
+          'import "./schema.json" with {',
+          '  type: "json"',
+          "};",
+          'import "./locale.json" with {',
+          '  type: "json"',
+          "};",
+          "export const ready = true;",
+          "",
+        ].join("\n"),
+        "src/bound.ts": [
+          'import schema from "./schema.json" with {',
+          '  type: "json"',
+          "};",
+          'import locale from "./locale.json" with {',
+          '  type: "json"',
+          "};",
+          "export const used = [schema, locale];",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/register.ts", 1]], 3),
+        clone([["src/bound.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/register.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/bound.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // Go spells the side-effect import `_ "pkg"` — the blank name exists to run the package's
     // `init()` and bind nothing. Both spellings of it register drivers on load, so a repeated window
     // of them is duplicated setup; only the list that actually binds names is a declaration.
@@ -1983,6 +2021,31 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toMatchObject([{ FilePath: "src/regex.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // A slash after an expression keyword can only OPEN a regex — `throw /[/*]/` throws one. Read as
+    // division, its `/*` opens a comment that runs to the end of the file and every real duplication
+    // window below it is dropped unread.
+    it("reads a slash after an expression keyword as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/guard.ts": [
+          "export function guard(value: string) {",
+          "  if (!value) throw /[/*]/;",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/guard.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/guard.ts", Line: 3 }]);
       expect(result.duplication).toEqual({ dropped: [] });
     });
 

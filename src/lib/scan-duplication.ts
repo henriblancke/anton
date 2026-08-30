@@ -146,6 +146,14 @@ const SIDE_EFFECT_IMPORT =
   /^import\s+(?:_\s+)?(["'`])[^"'`]+\1(?:\s+(?:with|assert)\s*\{[^{}]*\})?\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
 
 /**
+ * The same statement with its attributes clause left OPEN — `import "./data.json" with {` over a
+ * wrapped attribute list. The module is fetched and evaluated exactly as the single-line form is, so
+ * the whole statement computes; matched only by `IMPORT_START`, its lines would file a duplicated
+ * runtime load with the specifier lists and drop it.
+ */
+const SIDE_EFFECT_IMPORT_OPEN = /^import\s+(["'`])[^"'`]+\1\s+(?:with|assert)\s*\{[^{}]*$/;
+
+/**
  * One blank specifier inside Go's grouped `import (` list — `_ "github.com/lib/pq"`, or the raw
  * string `` _ `github.com/lib/pq` ``. Same side effect as the single-line form, so it must not
  * inherit the enclosing list's `import` class: a window of driver registrations is executable
@@ -167,21 +175,32 @@ const ARROW_START = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*
 const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+)?;$/;
 
 /**
+ * The keywords a `/` can only BEGIN a regex after. Each one expects an EXPRESSION next and yields no
+ * value of its own, so the grammar forbids division there — `throw /[/*]/` is a thrown regex, and
+ * reading its slash as division leaves the `/*` inside the character class to open a comment that
+ * swallows every line below. The whole expression-prefix set is listed rather than the few that came
+ * up, since a keyword missing from it costs the rest of the file.
+ */
+const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|delete|void|yield|await|new|else|do|in|of)`;
+
+/**
  * A regex literal, and only where a `/` can BEGIN one: at the start of a line, or after an opener,
- * a separator, an operator or `return`. After a value — `)`, `]`, an identifier — the same `/`
- * divides, and blanking `a / b(c) / d` would eat the parens it spans. The prefix is captured rather
- * than looked behind so the scan resumes after it, and the body admits an escape or a character
- * class so `/[/]/` and `/\(/` both close where they actually close.
+ * a separator, an operator or an expression keyword. After a value — `)`, `]`, an identifier — the
+ * same `/` divides, and blanking `a / b(c) / d` would eat the parens it spans. The prefix is
+ * captured rather than looked behind so the scan resumes after it, and the body admits an escape or
+ * a character class so `/[/]/` and `/\(/` both close where they actually close.
  *
  * Without this a parameter default like `pattern = /\(/` leaves an unmatched `(` for `parenDelta`
  * to count, the signature never closes on its real `)`, and every statement below it reads as more
  * parameter list — turning a genuine clone of runtime work into a declaration and dropping it.
  */
-const REGEX_LITERAL =
-  /(^|=>|[([{,;:=!&|?]|\breturn|\bcase|\btypeof)(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*/g;
+const REGEX_LITERAL = new RegExp(
+  String.raw`(^|=>|[([{,;:=!&|?]|${EXPRESSION_KEYWORDS})(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
+  "g",
+);
 
 /** The same prefixes, anchored to the END of the text before a `/` — the one rule, read backwards. */
-const REGEX_PREFIX = /(?:=>|[([{,;:=!&|?]|\b(?:return|case|typeof))$/;
+const REGEX_PREFIX = new RegExp(String.raw`(?:=>|[([{,;:=!&|?]|${EXPRESSION_KEYWORDS})$`);
 
 /**
  * Strip what would confuse brace counting: comments, string bodies and regex literals. Block
@@ -530,6 +549,9 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   let template: TemplateFrame[] = [];
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
+  // Whether the open import is a side-effect one: held as an `import` so it terminates on its own
+  // brace, but every line of it runs, so none of them votes as a declaration.
+  let sideEffect = false;
   // Where the open signature started, and whether its arrow is still owed. `const x = (` reads as a
   // parameter list until the closing paren says otherwise, so the lines it claimed must be
   // reachable to hand back when no `=>` arrives.
@@ -656,10 +678,12 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         }
         continue;
       }
-      classes.push(statement === "import" && BLANK_IMPORT_SPEC.test(line) ? "code" : statement);
+      const runs = statement === "import" && (sideEffect || BLANK_IMPORT_SPEC.test(line));
+      classes.push(runs ? "code" : statement);
       depth += braceDelta(line);
       if (!continues(statement, line, depth, next)) {
         statement = undefined;
+        sideEffect = false;
         depth = 0;
       }
       continue;
@@ -692,6 +716,15 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
 
     if (SIDE_EFFECT_IMPORT.test(line)) {
       classes.push("code");
+      continue;
+    }
+    if (SIDE_EFFECT_IMPORT_OPEN.test(line)) {
+      classes.push("code");
+      depth = braceDelta(line);
+      if (continues("import", line, depth, next)) {
+        statement = "import";
+        sideEffect = true;
+      } else depth = 0;
       continue;
     }
 
