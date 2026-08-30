@@ -7,6 +7,11 @@
  * And what that transaction may contain (anton-67xj.1): the children the run never delivered — the
  * ones it blocked, and the ones left waiting behind them — stay open, or the merge silently retires
  * work a human still has to run.
+ *
+ * And when it may run (PR #199): last. A closed run target is invisible to the next sweep whatever
+ * labels it carries, so the close has to follow every other finalization write — otherwise a stop
+ * between them leaves the undelivered children stranded under a merged target with nothing on the
+ * board left to retry.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
@@ -57,9 +62,12 @@ vi.mock("../git/worktree", () => ({
   createWorktree: vi.fn(),
 }));
 
+const findOpenRunMock = vi.fn();
+const updateRunMock = vi.fn();
+
 vi.mock("../runs", () => ({
-  findOpenRunForEpic: vi.fn().mockResolvedValue(null),
-  updateRun: vi.fn(),
+  findOpenRunForEpic: (...args: unknown[]) => findOpenRunMock(...args),
+  updateRun: (...args: unknown[]) => updateRunMock(...args),
 }));
 
 const { finalizeMergedEpic, undeliveredAtMerge } = await import("./review-fix");
@@ -132,6 +140,8 @@ describe("finalizeMergedEpic", () => {
         assignees.delete(id);
       });
     setStatusMock.mockReset().mockResolvedValue(undefined);
+    findOpenRunMock.mockReset().mockResolvedValue(null);
+    updateRunMock.mockReset().mockResolvedValue(undefined);
     showMock.mockReset().mockImplementation(
       async (_repo: string, id: string) =>
         ({
@@ -826,6 +836,38 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
       "stage:in-review",
     ]);
+  });
+
+  it("closes the target only after the preserved tickets are rehomed (PR #199)", async () => {
+    await finalize(bead("epic-1"), [
+      bead("t1"),
+      bead("t2", "blocked", [LABELS.notDelivered]),
+    ]);
+
+    // The close is what ends this epic: inReviewEpics drops a CLOSED run target whatever labels it
+    // carries, so a stop between the close and the rehome would strand t2 under a merged target
+    // anton cannot run, with nothing left on the board to re-select and retry.
+    const closedAt = batchMock.mock.invocationCallOrder[0];
+    expect(reparentMock.mock.invocationCallOrder[0]).toBeLessThan(closedAt);
+    expect(noteMock.mock.invocationCallOrder[0]).toBeLessThan(closedAt);
+    expect(untagMock.mock.invocationCallOrder[0]).toBeGreaterThan(closedAt);
+  });
+
+  it("leaves the target open and in review when finalization fails before the close", async () => {
+    findOpenRunMock.mockRejectedValue(new Error("db: connection lost"));
+
+    await expect(
+      finalize(bead("epic-1"), [
+        bead("t1"),
+        bead("t2", "blocked", [LABELS.notDelivered]),
+      ]),
+    ).rejects.toThrow("connection lost");
+
+    // Nothing closed and the label survives, so the next sweep re-selects this epic and finalizes
+    // again from the top — the rehomed t2 has left the subtree, so it is not rehomed twice.
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
   });
 
   it("keeps stage:in-review when the transaction fails, so the next sweep retries", async () => {

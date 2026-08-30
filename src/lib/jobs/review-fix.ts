@@ -765,18 +765,23 @@ async function reopenPreserved(
 }
 
 /**
- * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, rehome the
- * ones it did not ({@link undeliveredAtMerge}) onto a fresh run target, drop the `stage:in-review`
- * label, remove the merged branch + its worktree, and finalize the run row.
+ * Finalize an epic whose PR merged: rehome the child tickets it did NOT deliver
+ * ({@link undeliveredAtMerge}) onto a fresh run target, remove the merged branch + its worktree,
+ * finalize the run row, and only then close the epic + the children it delivered and drop the
+ * `stage:in-review` label.
  *
- * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
- * next review-fix sweep no longer treats the epic as in-review (inReviewEpics filters it out), so it
- * is never finalized twice; if a close fails transiently the label is left in place and the epic is
- * re-selected next sweep to retry. Every step here is individually safe to repeat — already-closed
- * beads are skipped, removeWorktree
- * is a no-op when the worktree/branch are already gone (execute-epic removes the worktree at PR
- * open, so it is usually already gone by merge time), and an already-finalized run leaves no open
- * run to touch.
+ * That order is the resumability contract. Closing the target is what ends this epic's life on the
+ * board — inReviewEpics excludes a closed run target whatever labels it still carries — so the close
+ * comes last, after every step that a stop mid-finalization would otherwise leave permanently
+ * undone. Up to that line the epic stays open and `stage:in-review`, and the next review-fix sweep
+ * re-selects it and finalizes again from the top; past it, the epic is done and is never finalized
+ * twice.
+ *
+ * Which makes every step individually safe to repeat: already-closed beads are skipped, a rehomed
+ * ticket has left the target's subtree so it is neither rehomed nor re-noted on a second pass,
+ * removeWorktree is a no-op when the worktree/branch are already gone (execute-epic removes the
+ * worktree at PR open, so it is usually already gone by merge time), and an already-finalized run
+ * leaves no open run to touch.
  */
 export async function finalizeMergedEpic(args: {
   db: AntonDb;
@@ -796,50 +801,26 @@ export async function finalizeMergedEpic(args: {
 }): Promise<void> {
   const { db, clock, repo, projectId, epic, children, branch, all } = args;
 
-  // 1. Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
-  //    first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
-  //    half-closed unit no reader can interpret. Only drop the in-review stage once that
-  //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
-  //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
-  //    orphaning a still-open ticket/epic behind a run already marked done.
-  //
-  //    A merged PR does NOT mean every child shipped in it (anton-67xj). A run that absorbed a
-  //    ticket timeout opens its PR for the work that DID land and leaves the rest undelivered —
-  //    those beads are in no diff, so closing them here would file work that was never done as
-  //    shipped and lose it silently, against the note on the bead telling the operator to run it.
-  //    They are left open instead, and rehomed for a rerun when nothing of theirs can be in the
-  //    diff (1b); the target itself still closes, since the PR it
-  //    points at is merged and terminal. The target is never itself "preserved": a leaf run target
-  //    marked undelivered has no merged PR to finalize, and excluding it from the close would leave
-  //    `stage:in-review` on forever, re-selecting this epic on every sweep.
+  // A merged PR does NOT mean every child shipped in it (anton-67xj). A run that absorbed a ticket
+  // timeout opens its PR for the work that DID land and leaves the rest undelivered — those beads
+  // are in no diff, so closing them with the target would file work that was never done as shipped
+  // and lose it silently, against the note on the bead telling the operator to run it. They are
+  // left open instead, and rehomed for a rerun when nothing of theirs can be in the diff (1).
   const undelivered = undeliveredAtMerge(children);
   const preserved = children.filter(
     (b) => b.id !== epic.id && b.status !== "closed" && undelivered.has(b.id),
   );
-  const skip = new Set(preserved.map((b) => b.id));
-  const stillOpen = new Map(
-    [...children, epic]
-      .filter((b) => b.status !== "closed" && !skip.has(b.id))
-      .map((b) => [b.id, b]),
-  ); // by id: a leaf run target is its own ticket, so it can appear on both sides
-  const closed = await safe(() =>
-    beads.batch(
-      repo,
-      [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
-    ),
-  );
-  if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
-  // 1b. Rehome the preserved tickets that are safe to RE-RUN under a NEW run target, hand each one
-  //     back in a claimable state, then say on each of them that the feature shipped without it —
-  //     the operator meets this ticket long after the run that skipped it, under a target that now
-  //     reads as done.
+  // 1. Rehome the preserved tickets that are safe to RE-RUN under a NEW run target, hand each one
+  //    back in a claimable state, then say on each of them that the feature shipped without it —
+  //    the operator meets this ticket long after the run that skipped it, under a target that now
+  //    reads as done.
   //
-  //     Rehoming is what makes the instruction actionable (anton-67xj). Left where they are these
-  //     tickets are unreachable: a task/bug WITH a parent is never a run target (beads.isRunTarget),
-  //     and the parent they hang off has just closed carrying a MERGED PR ref, which execute-epic
-  //     short-circuits on as an already-finished run. So neither the ticket nor its old home can be
-  //     claimed, and "re-run this" would mean restructuring the board by hand.
+  //    Rehoming is what makes the instruction actionable (anton-67xj). Left where they are these
+  //    tickets are unreachable: a task/bug WITH a parent is never a run target (beads.isRunTarget),
+  //    and the parent they hang off closes below carrying a MERGED PR ref, which execute-epic
+  //    short-circuits on as an already-finished run. So neither the ticket nor its old home can be
+  //    claimed, and "re-run this" would mean restructuring the board by hand.
   // The actor the finished run reserved its children for: execute-epic's claim cascade assigns every
   // child to the same operator it claimed the target for, so the target's own assignee names it.
   const runOwner = ownerOf(epic);
@@ -988,6 +969,40 @@ export async function finalizeMergedEpic(args: {
       endedAt: clock.now(),
       error: null,
     });
+
+  // 4. Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
+  //    first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
+  //    half-closed unit no reader can interpret. Only drop the in-review stage once that
+  //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
+  //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
+  //    orphaning a still-open ticket/epic behind a run already marked done.
+  //
+  //    LAST on purpose, after every other finalization write (PR #199 review). It is the CLOSE, not
+  //    the label, that makes this epic undiscoverable: inReviewEpics drops a closed run target
+  //    whatever labels it carries, so anything left undone once the target is closed can never be
+  //    retried — a stop between the close and the rehome above would strand the undelivered
+  //    children under a merged target anton cannot run, which is the exact failure 1 exists to
+  //    prevent. Closing last means a stop anywhere before this line leaves the epic open and still
+  //    `stage:in-review`, and the whole finalization re-runs next sweep: a rehomed ticket has left
+  //    the subtree, so it is neither rehomed nor re-noted twice, and the remainder of a partly-done
+  //    rehome gets a follow-up target of its own.
+  //
+  //    The target is never itself "preserved": a leaf run target marked undelivered has no merged
+  //    PR to finalize, and excluding it from the close would leave `stage:in-review` on forever,
+  //    re-selecting this epic on every sweep.
+  const skip = new Set(preserved.map((b) => b.id));
+  const stillOpen = new Map(
+    [...children, epic]
+      .filter((b) => b.status !== "closed" && !skip.has(b.id))
+      .map((b) => [b.id, b]),
+  ); // by id: a leaf run target is its own ticket, so it can appear on both sides
+  const closed = await safe(() =>
+    beads.batch(
+      repo,
+      [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
+    ),
+  );
+  if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 }
 
 /**
