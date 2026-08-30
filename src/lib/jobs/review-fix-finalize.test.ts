@@ -84,21 +84,33 @@ const waitsOn = (id: string, blocker: string, status = "open"): Bead =>
     dependencies: [{ issue_id: id, depends_on_id: blocker, type: "blocks" }],
   }) as Bead;
 
+/**
+ * A ticket nested under another TICKET rather than directly under the run target — the shape
+ * `runTickets` hands a run at arbitrary depth. Seeds both the snapshot link and the live board.
+ */
+const under = (parent: string, b: Bead): Bead => {
+  parents.set(b.id, parent);
+  return { ...b, parent } as Bead;
+};
+
 /** `rest` is the rest of the board — the product epic a feature target hangs off, say. */
 const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) => {
-  // Children hang off the target they were run under, unless a case seeded a takeover.
-  for (const c of children) {
-    if (c.id !== epic.id && !parents.has(c.id)) parents.set(c.id, epic.id);
-  }
+  // Children hang off the target they were run under (the snapshot the sweep read), unless a case
+  // nested them explicitly. `parents` is the LIVE board, so a case can seed a takeover there alone.
+  const linked = children.map((c) => {
+    if (c.id === epic.id) return c;
+    if (!parents.has(c.id)) parents.set(c.id, epic.id);
+    return { ...c, parent: c.parent ?? epic.id } as Bead;
+  });
   return finalizeMergedEpic({
     db: {} as never,
     clock: { now: () => 0 } as never,
     repo: "/repo",
     projectId: "p1",
     epic,
-    children,
+    children: linked,
     branch: "anton/epic-1",
-    all: [epic, ...children, ...rest],
+    all: [epic, ...linked, ...rest],
   });
 };
 
@@ -448,6 +460,85 @@ describe("finalizeMergedEpic", () => {
     const note = noteMock.mock.calls[0][2];
     expect(note).toContain("Another operator moved it under epic-9");
     expect(note).not.toContain("--parent <new-epic>");
+  });
+
+  it("rehomes a ticket nested under a DELIVERED ticket (anton-67xj)", async () => {
+    // bd nesting is arbitrary-depth, so a run owns descendants whose parent is another ticket. t2
+    // shipped and closes with the merge; t3 hangs off it and did not. Judging belonging by the
+    // direct parent read t3 as work another operator had moved, so it was left beneath a merged,
+    // closed target with no run path left to reach it.
+    await finalize(bead("epic-1"), [
+      bead("t2"),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([
+      { op: "close", id: "t2" },
+      { op: "close", id: "epic-1" },
+    ]);
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t3", "epic-2"]]);
+    expect(setStatusMock).toHaveBeenCalledWith("/repo", "t3", "open");
+    expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+  });
+
+  it("moves a nested ticket with its parent rather than flattening it (anton-67xj)", async () => {
+    // Both are undelivered, so the whole sub-tree moves: only the ROOT is reparented and t3 rides
+    // along on t2, which keeps the nesting its work was scoped in. It must still be reopened —
+    // treating it as another operator's move skipped that, leaving a `blocked` ticket bd refuses
+    // to claim under a follow-up nobody could run it from.
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+    expect(setStatusMock.mock.calls).toEqual([
+      ["/repo", "t2", "open"],
+      ["/repo", "t3", "open"],
+    ]);
+    expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+    const nested = noteMock.mock.calls[1][2];
+    expect(nested).toContain("stays nested under t2");
+    expect(nested).toContain("moved onto epic-2");
+    expect(nested).not.toContain("Another operator moved it");
+  });
+
+  it("gives a nested ticket its own home when its parent's reparent fails", async () => {
+    // The ride-along is decided on what actually MOVED: a parent bd refused to move is still stuck
+    // under the merged target, so following it would strand the descendant too.
+    reparentMock.mockImplementation(async (_r: string, id: string) => {
+      if (id === "t2") throw new Error("bd update: DB locked");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "t2", "epic-2"],
+      ["/repo", "t3", "epic-2"],
+    ]);
+    expect(noteMock.mock.calls[0][2]).toContain("could NOT be rehomed");
+    expect(noteMock.mock.calls[1][2]).toContain("now lives under epic-2");
+  });
+
+  it("leaves a nested ticket another operator moved out of the subtree", async () => {
+    // Ancestry, not "has a parent that isn't the epic": the fresh read puts t3 under a target
+    // outside this run, which is still somebody else's work to own.
+    const nestedTicket = under("t2", bead("t3", "blocked", ["not-delivered"]));
+    parents.set("t3", "epic-9");
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      nestedTicket,
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+    expect(setStatusMock.mock.calls).toEqual([["/repo", "t2", "open"]]);
+    expect(noteMock.mock.calls[1][2]).toContain(
+      "Another operator moved it under epic-9",
+    );
   });
 
   it("reruns a marker-bearing ticket the timeout left in_progress (anton-67xj)", async () => {

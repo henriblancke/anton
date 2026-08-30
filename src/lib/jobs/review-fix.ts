@@ -848,6 +848,7 @@ export async function finalizeMergedEpic(args: {
     repo,
     epic,
     rerunnable,
+    children,
     areaLabelOf(epic, all),
     runOwner,
   );
@@ -940,13 +941,17 @@ export async function finalizeMergedEpic(args: {
                     `rather than queueing a rerun on top of it. Once that is settled, ` +
                     `move it onto a fresh run target (\`bd update ${bead.id} --parent ` +
                     `<new-epic>\`) to have anton pick the work back up.`
-                  : followUp.id && followUp.moved.has(bead.id)
-                    ? `It now lives under ${followUp.id}, a fresh run target — approve that target ` +
-                      `to have anton pick this work back up.`
-                    : `It could NOT be rehomed onto a fresh run target, so nothing anton runs ` +
-                      `reaches it yet: move it under a new epic ` +
-                      `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent to make ` +
-                      `it a run target of its own.`) +
+                  : followUp.id && followUp.nested.has(bead.id)
+                    ? `It stays nested under ${followUp.nested.get(bead.id)}, which anton moved ` +
+                      `onto ${followUp.id}, a fresh run target — approve that target to have anton ` +
+                      `pick this work back up.`
+                    : followUp.id && followUp.moved.has(bead.id)
+                      ? `It now lives under ${followUp.id}, a fresh run target — approve that ` +
+                        `target to have anton pick this work back up.`
+                      : `It could NOT be rehomed onto a fresh run target, so nothing anton runs ` +
+                        `reaches it yet: move it under a new epic ` +
+                        `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent to ` +
+                        `make it a run target of its own.`) +
               ownershipNote(bead, owner, {
                 stillOwned,
                 foreignOwner,
@@ -989,6 +994,11 @@ export async function finalizeMergedEpic(args: {
  * that gate exists for. It carries the epic-tier contract (an outcome and Success Criteria) so the
  * approve route and execute-epic's own gate admit it rather than refusing a target anton wrote.
  *
+ * Nesting is preserved: only the ROOTS of the rehomed forest are reparented, and a ticket that
+ * hangs off another moving ticket rides along on it. `subtree` is the run's whole ticket set
+ * (runTickets), which is what tells a legitimately nested ticket apart from one another operator
+ * moved onto a target of their own.
+ *
  * Best-effort, like every other write here: a failure leaves the tickets parented where they were —
  * still open, still noted with the manual remedy — rather than aborting a finalization whose closes
  * have already landed. An epic that ends up with no children at all is deleted again, since a
@@ -998,11 +1008,13 @@ async function rehomePreserved(
   repo: string,
   epic: Bead,
   rerunnable: Bead[],
+  subtree: Bead[],
   area: string | undefined,
   runOwner: string | undefined,
 ): Promise<Rehomed> {
   const none: Rehomed = {
     moved: new Set(),
+    nested: new Map(),
     elsewhere: new Map(),
     changed: new Map(),
   };
@@ -1028,18 +1040,41 @@ async function rehomePreserved(
     return none;
   }
   const moved = new Set<string>();
+  const nested = new Map<string, string>();
   const elsewhere = new Map<string, string | undefined>();
   const changed = new Map<string, string>();
+
+  // Belonging is ANCESTRY, not the direct parent (anton-67xj). A run owns every working-layer
+  // descendant of its target (runTickets), and bd nesting is arbitrary-depth — so a ticket hanging
+  // off another ticket is legitimately part of this run while its parent is not the epic. Reading
+  // the direct parent filed every one of those as work another operator had moved: a nested ticket
+  // whose parent shipped stayed stranded under the merged target, and one whose parent moved too
+  // followed it without ever passing through reopenPreserved, so nothing could claim it.
+  const bySubtreeId = new Map(subtree.map((b) => [b.id, b]));
+  const ridesOnTarget = (fresh: Bead): boolean => {
+    const seen = new Set<string>([fresh.id]);
+    let parentId = beads.parentOf(fresh);
+    while (parentId && !seen.has(parentId)) {
+      if (parentId === epic.id) return true;
+      seen.add(parentId); // a parent cycle terminates rather than hanging finalization
+      const parent = bySubtreeId.get(parentId);
+      if (!parent) return false; // the chain left the run's own subtree — another target owns it
+      parentId = beads.parentOf(parent);
+    }
+    return false;
+  };
+
+  // Pass 1 — re-read every candidate and decide which ones the follow-up may still take
+  // (anton-67xj). `rerunnable` comes off the sweep's snapshot and a PR can sit in review for days:
+  // if another operator has reparented this ticket onto a target of their own since, moving it here
+  // steals it out from under a run that may already be executing it — which then trips that run's
+  // own ticket-set drift check and parks it. A read that fails moves nothing either, for the same
+  // reason the status write doesn't: the snapshot is not evidence enough on its own.
+  const takeable = new Map<string, Bead>();
   for (const bead of rerunnable) {
-    // Re-read the ticket before moving it (anton-67xj). `rerunnable` comes off the sweep's snapshot
-    // and a PR can sit in review for days: if another operator has reparented this ticket onto a
-    // target of their own since, moving it here steals it out from under a run that may already be
-    // executing it — which then trips that run's own ticket-set drift check and parks it. A read
-    // that fails moves nothing either, for the same reason the status write doesn't: the snapshot
-    // is not evidence enough on its own.
     const fresh = await beads.show(repo, bead.id).catch(() => undefined);
     if (!fresh) continue;
-    if (beads.parentOf(fresh) !== epic.id) {
+    if (!ridesOnTarget(fresh)) {
       elsewhere.set(bead.id, beads.parentOf(fresh));
       continue;
     }
@@ -1064,13 +1099,49 @@ async function rehomePreserved(
       changed.set(bead.id, stateOf(fresh));
       continue;
     }
-    if (await safe(() => beads.reparent(repo, bead.id, followUp)))
-      moved.add(bead.id);
+    takeable.set(bead.id, fresh);
   }
-  if (moved.size > 0) return { id: followUp, moved, elsewhere, changed };
+
+  // Pass 2 — move them ancestors first. A ticket whose own parent is moving rides along on it
+  // rather than being flattened onto the follow-up: the nesting is how its work was scoped, and
+  // reparenting it separately would hand the same subtree two homes. Ordering is what makes that
+  // safe — the ride-along is decided on what actually MOVED, so a parent whose reparent bd refused
+  // leaves its descendant to take a home of its own rather than staying stranded behind it.
+  for (const fresh of ancestorsFirst(takeable)) {
+    const parentId = beads.parentOf(fresh);
+    if (parentId && moved.has(parentId)) {
+      nested.set(fresh.id, parentId);
+      moved.add(fresh.id);
+      continue;
+    }
+    if (await safe(() => beads.reparent(repo, fresh.id, followUp)))
+      moved.add(fresh.id);
+  }
+  if (moved.size > 0) return { id: followUp, moved, nested, elsewhere, changed };
   // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
   await safe(() => beads.delete(repo, followUp));
-  return { moved: new Set(), elsewhere, changed };
+  return { moved: new Set(), nested, elsewhere, changed };
+}
+
+/**
+ * The beads of a rehome set ordered so a ticket always follows every ancestor that is moving with
+ * it — depth within the set, which is stable under a sort that preserves board order among peers.
+ */
+function ancestorsFirst(takeable: Map<string, Bead>): Bead[] {
+  const depth = (bead: Bead): number => {
+    const seen = new Set<string>([bead.id]);
+    let steps = 0;
+    let parentId = beads.parentOf(bead);
+    while (parentId && !seen.has(parentId)) {
+      const parent = takeable.get(parentId);
+      if (!parent) break;
+      seen.add(parentId); // a parent cycle terminates rather than hanging finalization
+      steps++;
+      parentId = beads.parentOf(parent);
+    }
+    return steps;
+  };
+  return [...takeable.values()].sort((a, b) => depth(a) - depth(b));
 }
 
 /** A ticket's live state as a note fragment: the status, and who holds it when anyone does. */
@@ -1106,11 +1177,18 @@ function areaLabelOf(bead: Bead, all: Bead[]): string | undefined {
 /** Where {@link rehomePreserved} got to: the new target's id, and which tickets actually reached it. */
 interface Rehomed {
   id?: string;
+  /** Every ticket that ended up beneath the follow-up — reparented onto it, or {@link nested}. */
   moved: Set<string>;
   /**
-   * Tickets a fresh read found under a DIFFERENT parent — another operator rehomed them while the
-   * PR sat in review. Left exactly where they are, and told apart from a move that merely failed:
-   * their note must not hand the operator a `--parent` command that would undo that.
+   * Ticket id → the ticket it stayed nested under, which anton moved onto the follow-up. These
+   * reached the new target without a reparent of their own, so their note must name the parent
+   * they ride on rather than claim they sit directly under the follow-up.
+   */
+  nested: Map<string, string>;
+  /**
+   * Tickets a fresh read found outside the merged target's subtree — another operator rehomed them
+   * while the PR sat in review. Left exactly where they are, and told apart from a move that merely
+   * failed: their note must not hand the operator a `--parent` command that would undo that.
    */
   elsewhere: Map<string, string | undefined>;
   /**
