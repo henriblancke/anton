@@ -30,6 +30,7 @@
  */
 import { existsSync } from "node:fs";
 import { beads, LABELS, ownerOf, type BatchOp, type Bead } from "../beads/bd";
+import { releaseChildren } from "../beads/child-assign";
 import { runClaude } from "../claude/driver";
 import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
 import {
@@ -552,6 +553,26 @@ export function undeliveredAtMerge(children: Bead[]): Set<string> {
 }
 
 /**
+ * What a preserved ticket's note says about a reservation finalization did not clear — either an
+ * assignee that is not the run's own (deliberately left alone) or this run's own claim that bd
+ * refused to release. Silent when ownership is settled. `blocksClaim` is the per-lane consequence
+ * clause, since only the rerun lane is stopped by a stale claim.
+ */
+function ownershipNote(
+  bead: Bead,
+  owner: string | undefined,
+  args: { stillOwned: boolean; foreignOwner: boolean; blocksClaim: string },
+): string {
+  if (!args.stillOwned) return "";
+  return args.foreignOwner
+    ? ` It is also assigned to ${owner}, not to the actor this run reserved it for — anton ` +
+        `releases only its own claim, so that reservation was left intact${args.blocksClaim}. If ` +
+        `it is stale, clear it with \`bd assign ${bead.id} ""\`.`
+    : ` It is also still assigned to ${owner} and could not be released${args.blocksClaim}: clear ` +
+        `that with \`bd assign ${bead.id} ""\`.`;
+}
+
+/**
  * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, rehome the
  * ones it did not ({@link undeliveredAtMerge}) onto a fresh run target, drop the `stage:in-review`
  * label, remove the merged branch + its worktree, and finalize the run row.
@@ -625,6 +646,9 @@ export async function finalizeMergedEpic(args: {
   const rerunnable = preserved.filter(safeToRerunAtMerge);
   const followUp = await rehomePreserved(repo, epic, rerunnable);
   const rerun = new Set(rerunnable.map((b) => b.id));
+  // The actor the finished run reserved its children for: execute-epic's claim cascade assigns every
+  // child to the same operator it claimed the target for, so the target's own assignee names it.
+  const runOwner = ownerOf(epic);
   for (const bead of preserved) {
     // Release the reservation the run that skipped this ticket still holds. Its own unassign at
     // skip time is best-effort (and older runs had none), and a claim that outlives its run hides
@@ -633,7 +657,21 @@ export async function finalizeMergedEpic(args: {
     // it cannot be, the note says so rather than pointing at a target no one can claim through.
     // A ticket on the manual path is released too: nobody is running it, and a dead run's claim
     // only misreports who owns the review it is waiting for.
-    const stillOwned = ownerOf(bead) && !(await safe(() => beads.unassign(repo, bead.id)));
+    //
+    // ONLY this run's own claim, matched by actor and swapped under a CAS (anton-67xj). A PR can sit
+    // in review for days, and an operator who picked a preserved ticket up in that window is doing
+    // live work: clearing THAT assignee would advertise their ticket as claimable and invite a
+    // second run of it. So an owner that is not the run's own — including any owner at all when the
+    // run had no identity to reserve under — is left exactly as it is and named in the note
+    // instead. The CAS closes the same window one step narrower: `bead` came off the sweep's
+    // snapshot, so a takeover that landed since it was read loses nothing here either.
+    const owner = ownerOf(bead);
+    const foreignOwner = owner !== undefined && owner !== runOwner;
+    const released =
+      owner !== undefined &&
+      !foreignOwner &&
+      (await releaseChildren(repo, [bead.id], owner)).released.length > 0;
+    const stillOwned = owner !== undefined && !released;
     // Return the ticket to a claimable status. A timed-out one carries `blocked` from the run that
     // stopped it, and bd refuses to claim a bead in that status — so an operator who approves the
     // follow-up target would watch every attempt die at execute-epic's claim gate before this work
@@ -657,10 +695,7 @@ export async function finalizeMergedEpic(args: {
             `the branch against the note ` +
             `above, then close this by hand if it is complete, or file the remainder as a new ` +
             `ticket.` +
-            (stillOwned
-              ? ` It is also still assigned to ${ownerOf(bead)} and could not be released: clear ` +
-                `that with \`bd assign ${bead.id} ""\`.`
-              : "")
+            ownershipNote(bead, owner, { stillOwned, foreignOwner, blocksClaim: "" })
           : `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
             `deliver it (see the note above), so none of its work is in that diff. Left open on ` +
             `purpose: closing it here would file work that was never done as shipped. ` +
@@ -670,10 +705,11 @@ export async function finalizeMergedEpic(args: {
               : `It could NOT be rehomed onto a fresh run target, so nothing anton runs reaches ` +
                 `it yet: move it under a new epic (\`bd update ${bead.id} --parent <new-epic>\`) ` +
                 `or clear its parent to make it a run target of its own.`) +
-            (stillOwned
-              ? ` It is also still assigned to ${ownerOf(bead)} and could not be released, so no ` +
-                `other operator can claim it: clear that with \`bd assign ${bead.id} ""\`.`
-              : "") +
+            ownershipNote(bead, owner, {
+              stillOwned,
+              foreignOwner,
+              blocksClaim: ", so no other operator can claim it",
+            }) +
             (stillBlocked
               ? ` Its status is also still \`${bead.status}\`, which bd refuses to claim, so a ` +
                 `run would stop at that gate: clear it with \`bd update ${bead.id} --status open\`.`

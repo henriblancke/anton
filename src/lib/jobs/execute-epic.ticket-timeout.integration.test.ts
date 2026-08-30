@@ -23,6 +23,9 @@
  *    without it would have the merge close never-written work as shipped.
  * 7. **A STALE marker that will not clear halts it too** (anton-67xj). The mirror failure: a run
  *    that delivers a ticket still carrying the label has the merge treat that work as undelivered.
+ * 8. **A held tail a rolled-back timeout ALSO skipped does not park the run** (anton-67xj). A
+ *    cross-run blocker is no longer why that ticket cannot run, so parking on it would strand the
+ *    independent commits behind a resume that could not dispatch it either.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -396,6 +399,103 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       const files = filesOnBranch(run.branch!);
       expect(files).toContain("AGENT_WORK.md");
       expect(files).not.toContain("HALF_WRITTEN.md");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      process.env.ANTON_GH_BIN = okGh;
+      await patchSettings({ ticketTimeoutMinutes: undefined });
+    }
+  });
+
+  it("does not park on a held tail that a rolled-back timeout also skipped (anton-67xj)", async () => {
+    // The park this closes: a ticket gated by a CROSS-RUN blocker never enters the dispatch loop, so
+    // it never entered the skipped set either — and the held tail parked the run unconditionally,
+    // stranding every independent commit behind a wait that decides nothing. The blocker is no
+    // longer why that ticket cannot run: its in-run prerequisite timed out and was rolled off the
+    // branch, so the resume the park promises could not dispatch it either.
+    const target = await beads.create(repo, {
+      title: "Held cascade",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nHeld cascade",
+    });
+    await beads.approve(repo, target);
+    const upstream = await beads.create(repo, {
+      title: "Upstream feature",
+      type: "feature",
+      acceptance: "work file exists",
+    });
+    const upstreamTicket = createTicket(repo, { title: "Upstream ticket", parent: upstream });
+    const mk = (title: string) => createTicket(repo, { title, parent: target });
+    const stalls = mk("Ticket that cannot converge");
+    const independent = mk("Ticket that owes the stalled one nothing");
+    const tail = mk("Ticket held cross-run AND built on the stalled one");
+    // Both reasons at once: a blocker in ANOTHER run target (the hold) and one inside this run (the
+    // ordering edge whose timeout turns it into a skip).
+    await beads.link(repo, tail, upstreamTicket, "blocks");
+    await beads.link(repo, tail, stalls, "blocks");
+
+    const invLog = join(sandbox, "held-cascade-inv.jsonl");
+    const claude = writeBin(
+      binDir,
+      "claude-hang-held-cascade",
+      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const bodyDump = join(sandbox, "held-cascade-pr-body.txt");
+    const bodyGh = writeBin(
+      binDir,
+      "gh-body-held-cascade",
+      `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
+console.log('https://github.com/acme/repo/pull/43');process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+
+    await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    process.env.ANTON_GH_BIN = bodyGh;
+    try {
+      const jobId = await driveEpicRun(runner, { projectId, epicBeadId: target });
+
+      // The run SHIPPED rather than parking: the independent commit reached a human as a PR.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === target)!;
+      expect(run.status).toBe("done");
+      expect((await beads.show(repo, independent)).status).toBe("closed");
+      expect(beads.getPrRef(await beads.show(repo, target)) ?? null).not.toBeNull();
+
+      // The held tail was still never dispatched — the guard against running on a premise that is
+      // not on the branch is untouched.
+      expect(readFileSync(invLog, "utf8")).not.toContain(tail);
+
+      // …and it is marked as work this PR does not contain, so the merge that closes the rest of
+      // the feature leaves it open instead of filing it as shipped.
+      const skipped = await beads.show(repo, tail);
+      expect(skipped.status).toBe("open");
+      expect(skipped.assignee ?? null).toBeNull();
+      expect(skipped.labels ?? []).toContain("not-delivered");
+      expect(JSON.stringify(skipped)).toContain(stalls);
+
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain(independent);
+      expect(body).not.toContain(tail);
+      expect(body).not.toContain(stalls);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       process.env.ANTON_GH_BIN = okGh;

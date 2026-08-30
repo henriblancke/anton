@@ -20,6 +20,8 @@ const reparentMock = vi.fn();
 const deleteMock = vi.fn();
 const unassignMock = vi.fn();
 const setStatusMock = vi.fn();
+/** id → current assignee, so the claim guard's CAS (show → unassign → show) reads a live board. */
+const assignees = new Map<string, string>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -35,6 +37,8 @@ vi.mock("../beads/bd", async () => {
       delete: (...args: unknown[]) => deleteMock(...args),
       unassign: (...args: unknown[]) => unassignMock(...args),
       setStatus: (...args: unknown[]) => setStatusMock(...args),
+      show: async (_repo: string, id: string) =>
+        ({ id, title: id, status: "open", labels: [], assignee: assignees.get(id) }) as Bead,
     },
   };
 });
@@ -55,6 +59,12 @@ const { finalizeMergedEpic, undeliveredAtMerge } = await import("./review-fix");
 
 const bead = (id: string, status = "open", labels: string[] = []): Bead =>
   ({ id, title: id, status, labels }) as Bead;
+
+/** A bead reserved by `owner`, seeded into the live-board map the claim CAS re-reads. */
+const claimed = (b: Bead, owner: string): Bead => {
+  assignees.set(b.id, owner);
+  return { ...b, assignee: owner } as Bead;
+};
 
 /** A ticket that waits on `blocker` — the `blocks` edge bd carries inline on the dependent. */
 const waitsOn = (id: string, blocker: string, status = "open"): Bead =>
@@ -82,7 +92,10 @@ describe("finalizeMergedEpic", () => {
     createMock.mockReset().mockResolvedValue("epic-2");
     reparentMock.mockReset().mockResolvedValue(undefined);
     deleteMock.mockReset().mockResolvedValue(undefined);
-    unassignMock.mockReset().mockResolvedValue(undefined);
+    assignees.clear();
+    unassignMock.mockReset().mockImplementation(async (_repo: string, id: string) => {
+      assignees.delete(id);
+    });
     setStatusMock.mockReset().mockResolvedValue(undefined);
   });
 
@@ -181,9 +194,9 @@ describe("finalizeMergedEpic", () => {
     // The rerun path the note advertises only works if the ticket can be claimed again: a claim
     // that outlived its run hides it from `bd ready --unassigned` and refuses the claim cascade of
     // whoever approves the follow-up target.
-    const reserved = { ...bead("t2", "blocked", ["not-delivered"]), assignee: "op-1" } as Bead;
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
 
-    await finalize(bead("epic-1"), [reserved]);
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
 
     expect(unassignMock).toHaveBeenCalledWith("/repo", "t2");
     expect(noteMock.mock.calls[0][2]).not.toContain("still assigned");
@@ -191,9 +204,9 @@ describe("finalizeMergedEpic", () => {
 
   it("names the manual remedy when the reservation cannot be released", async () => {
     unassignMock.mockRejectedValue(new Error("bd assign: DB locked"));
-    const reserved = { ...bead("t2", "blocked", ["not-delivered"]), assignee: "op-1" } as Bead;
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
 
-    await finalize(bead("epic-1"), [reserved]);
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
 
     // Finalization still completes; the note must not advertise a rerun the operator cannot start.
     expect(noteMock.mock.calls[0][2]).toContain("still assigned to op-1");
@@ -204,6 +217,43 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
 
     expect(unassignMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves an assignee that is not the run's own intact (anton-67xj)", async () => {
+    // A PR can sit in review for days. An operator who claimed this preserved ticket in that window
+    // is doing live work — clearing their reservation would advertise it as claimable and invite a
+    // duplicate run of the very ticket they hold.
+    const takenOver = claimed(bead("t2", "blocked", ["not-delivered"]), "op-2");
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [takenOver]);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("assigned to op-2");
+    expect(note).toContain("not to the actor this run reserved it for");
+  });
+
+  it("keeps a takeover that landed after the sweep read the board", async () => {
+    // The snapshot still names the run's own actor, so the actor test alone would clear it. The CAS
+    // re-reads under the claim lock and loses to whoever holds it now.
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+    assignees.set("t2", "op-2"); // takeover landed between the sweep's read and here
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("still assigned to op-1");
+  });
+
+  it("leaves every assignee alone when the run had no identity to reserve under", async () => {
+    // No operator identity means execute-epic ran no claim cascade at all, so nothing here is this
+    // run's to release — whoever owns the ticket owns it for some other reason.
+    const owned = claimed(bead("t2", "blocked", ["not-delivered"]), "op-2");
+
+    await finalize(bead("epic-1"), [owned]);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain("assigned to op-2");
   });
 
   it("reopens the ticket the timeout left blocked, so the follow-up target can claim it", async () => {
@@ -262,9 +312,9 @@ describe("finalizeMergedEpic", () => {
 
   it("releases a stale claim on a ticket held for manual review", async () => {
     // Nobody is running it, so a dead run's claim only misreports who owns the review it waits for.
-    const reserved = { ...bead("t2", "blocked"), assignee: "op-1" } as Bead;
+    const reserved = claimed(bead("t2", "blocked"), "op-1");
 
-    await finalize(bead("epic-1"), [reserved]);
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
 
     expect(unassignMock).toHaveBeenCalledWith("/repo", "t2");
     expect(noteMock.mock.calls[0][2]).not.toContain("still assigned");

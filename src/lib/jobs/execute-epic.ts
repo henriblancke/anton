@@ -1254,6 +1254,51 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // whose commit was already on the branch still counts as delivered.
       let skipCause = new Map<string, SkipCause>();
       const skipped = new Map<string, SkipCause>();
+      // Hand a ticket this run will NOT dispatch back to the board, and say so on it. Shared by the
+      // dispatch loop below and by the held tail (4a), which reaches the same verdict for a ticket a
+      // cross-run blocker also holds — one writer, so the two paths can never leave a skipped ticket
+      // in different states. `doneOnBoard` is the caller's answer to "closed elsewhere, commit
+      // absent here"; only that case needs the reopen.
+      const recordSkipped = async (ticket: Bead, skipping: SkipCause, doneOnBoard: boolean) => {
+        skipped.set(ticket.id, skipping);
+        // Closed on another machine but its commit never reached this branch, and now it will
+        // never be regenerated here — reopen it, or the board advertises work no PR contains.
+        // Required, not best-effort: merge finalization only preserves and rehomes children that
+        // are still OPEN, so a ticket left closed here is recorded as shipped by the very merge
+        // that proves it never was — the `not-delivered` marker below cannot rescue it.
+        if (doneOnBoard && ticket.status === "closed") {
+          if (!(await mustPersist(() => beads.reopen(repo, ticket.id)))) {
+            throw new PoisonEpic(
+              `${ticket.id} is closed on the board but its commit is on no branch here, and it ` +
+                `was skipped because ${skipping.stopped} ran out of time — bd would not reopen ` +
+                `it, so the merge of this run's pull request would file work no diff contains ` +
+                `as shipped. Check the beads DB, then resume the run`,
+            );
+          }
+        }
+        // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
+        // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
+        await safe(() => beads.unassign(repo, ticket.id));
+        // …and mark it as work this run did NOT deliver, which is what stops merge finalization
+        // from closing it as shipped when the PR for the rest of the feature lands (anton-67xj).
+        // That marker is finalization's only input, so it is not best-effort: a run that cannot
+        // record it must not go on to open a PR whose merge would then file this ticket as
+        // shipped. Retry, then park for a human rather than proceed on an unwritten fact.
+        if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
+          throw new PoisonEpic(
+            `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+              `not record \`${LABELS.notDelivered}\` on it — the run stopped rather than open a ` +
+              `pull request whose merge would close this undelivered ticket as shipped. Check ` +
+              `the beads DB, then resume the run`,
+          );
+        }
+        await safe(() => beads.note(repo, ticket.id, skipNote(skipping)));
+        console.warn(
+          `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
+            `${skipping.waitingOn}, whose work was rolled back when ${skipping.stopped} ran out ` +
+            `of time`,
+        );
+      };
       for (const ticket of dispatchable) {
         assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
         // A ticket marked done on the board — a closed epic child, or a standalone target moved to
@@ -1287,44 +1332,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // re-gates below, which must not park a run over a ticket that is no longer going to run.
         const skipping = skipCause.get(ticket.id);
         if (skipping) {
-          skipped.set(ticket.id, skipping);
-          // Closed on another machine but its commit never reached this branch, and now it will
-          // never be regenerated here — reopen it, or the board advertises work no PR contains.
-          // Required, not best-effort: merge finalization only preserves and rehomes children that
-          // are still OPEN, so a ticket left closed here is recorded as shipped by the very merge
-          // that proves it never was — the `not-delivered` marker below cannot rescue it.
-          if (doneOnBoard && ticket.status === "closed") {
-            if (!(await mustPersist(() => beads.reopen(repo, ticket.id)))) {
-              throw new PoisonEpic(
-                `${ticket.id} is closed on the board but its commit is on no branch here, and it ` +
-                  `was skipped because ${skipping.stopped} ran out of time — bd would not reopen ` +
-                  `it, so the merge of this run's pull request would file work no diff contains ` +
-                  `as shipped. Check the beads DB, then resume the run`,
-              );
-            }
-          }
-          // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
-          // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
-          await safe(() => beads.unassign(repo, ticket.id));
-          // …and mark it as work this run did NOT deliver, which is what stops merge finalization
-          // from closing it as shipped when the PR for the rest of the feature lands (anton-67xj).
-          // That marker is finalization's only input, so it is not best-effort: a run that cannot
-          // record it must not go on to open a PR whose merge would then file this ticket as
-          // shipped. Retry, then park for a human rather than proceed on an unwritten fact.
-          if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
-            throw new PoisonEpic(
-              `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
-                `not record \`${LABELS.notDelivered}\` on it — the run stopped rather than open a ` +
-                `pull request whose merge would close this undelivered ticket as shipped. Check ` +
-                `the beads DB, then resume the run`,
-            );
-          }
-          await safe(() => beads.note(repo, ticket.id, skipNote(skipping)));
-          console.warn(
-            `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
-              `${skipping.waitingOn}, whose work was rolled back when ${skipping.stopped} ran out ` +
-              `of time`,
-          );
+          await recordSkipped(ticket, skipping, doneOnBoard);
           continue;
         }
         // Done on the board but the commit is missing from this branch (cross-machine resume): the
@@ -1405,16 +1413,34 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     same false success one ticket down. So park: the committed work stays on the branch, the
       //     held tickets stay open and unrun, and the resume that follows the blocker landing walks
       //     this same branch — skipping what already committed — and opens the single PR then.
-      if (held.length > 0) {
+      //     A held ticket that ALSO sits behind a rolled-back timeout is the one exception
+      //     (anton-67xj): the blocker is no longer the reason it can't run — the mechanism it was
+      //     written against was rolled off the branch, and the ticket that owned it is `blocked`,
+      //     which bd refuses to claim. So the resume this park promises could not dispatch it
+      //     either, and parking would strand the commits the run's independent tickets already made
+      //     behind a wait that decides nothing. Only tickets held for a reason a resume can clear
+      //     hold the run.
+      const stillHeld = held.filter((t) => !skipCause.has(t.id));
+      if (stillHeld.length > 0) {
         throw new BlockedTailError(
           blockedTailReason(epicBeadId, {
             blockers: freshReadiness.blockers,
+            // Every held ticket, including the timeout-skipped ones: the run parks either way, and
+            // the operator reading the park is owed the whole tail rather than half of it.
             held: held.map((t) => t.id),
             ran: dispatchable
               .filter((t) => !rolledBack.has(t.id) && !skipped.has(t.id))
               .map((t) => t.id),
           }),
         );
+      }
+      // The run proceeds, so the held tail is now work this run did not deliver and must say so on
+      // its own beads — otherwise the merge of the PR opening below closes it as shipped. Recorded
+      // only once the park above is ruled out, so a run that still parks leaves the board untouched.
+      // `doneOnBoard: false` — the epic graph puts closed children in neither the ready nor the held
+      // set, so a held ticket is open by construction and has no cross-machine close to undo.
+      for (const ticket of held) {
+        await recordSkipped(ticket, skipCause.get(ticket.id)!, false);
       }
 
       // 4b. The RUN phase of the walk (anton-lnkt): every formula step after the commit, in the

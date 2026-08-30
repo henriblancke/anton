@@ -182,6 +182,22 @@ describe("runReadiness — what a partially-gated run may start (anton-1two)", (
     expect(r.gated.sort()).toEqual(["t-2", "t-3"]);
   });
 
+  it("holds a child gated cross-run even when its OTHER blocker is work this run does", () => {
+    // The premise of the held-tail/timeout overlap (anton-67xj): t-2 waits on t-9 in another feature
+    // AND on its own sibling t-1, so it lands in the HELD set and never enters the dispatch loop —
+    // which is why a timeout on t-1 has to be reconciled against the held tail, not just the loop.
+    const board = [
+      feature("F1"),
+      feature("F2"),
+      child("t-1", "F1"),
+      child("t-2", "F1", { dependencies: [blocks("t-2", "t-9"), blocks("t-2", "t-1")] }),
+      child("t-9", "F2"),
+    ];
+    const r = runReadiness(board, "F1", true);
+    expect(r.runnable).toBe(true);
+    expect(r.gated).toEqual(["t-2"]);
+  });
+
   it("refuses the run only when NO child can start", () => {
     const board = [
       feature("F1"),
