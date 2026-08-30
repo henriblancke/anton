@@ -2049,6 +2049,57 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // An arithmetic operator leads an expression too — `prefix + /[/*]/.source` concatenates a
+    // regex source. Read as division, the `/*` inside the character class opens a comment that runs
+    // to the end of the file and every real duplication window below it is dropped unread.
+    it("reads a slash after an arithmetic operator as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/marker.ts": [
+          'export const marker = prefix + /[/*]/.source + "tail";',
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/marker.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/marker.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // `hits++ / span` divides — the trailing `+` is a postfix operator that yields a value, not one
+    // that leads an expression. Read as a regex opener, the invented literal runs to the next slash
+    // and eats the `)` between them, leaving the parenthesized expression open over the live code
+    // below it — every line of which then reads as a parameter list and is dropped.
+    it("reads a slash after a postfix increment as division, not as a regex", async () => {
+      const repo = writeRepo({
+        "src/ratio.ts": [
+          "export function ratio(hits: number, span: number, limit: number) {",
+          "  const rate = (hits++ / span) / limit;",
+          "  emit(rate);",
+          "  flush(rate);",
+          "  report(rate);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/ratio.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // `const x = (` opens a parameter list or a parenthesized expression, and only the closing line
     // says which: a `=>` cannot be pushed past it. Without that check a window of calls reads as a
     // props list and a real duplicate of runtime work is thrown away unread.

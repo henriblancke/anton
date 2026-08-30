@@ -184,6 +184,19 @@ const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+
 const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|delete|void|yield|await|new|else|do|in|of)`;
 
 /**
+ * The punctuation the same rule covers: openers, separators, and the binary and unary operators
+ * that expect an expression next. Arithmetic counts as much as assignment — `prefix + /[/*]/.source`
+ * concatenates a regex source, and reading that slash as division leaves the `/*` inside the
+ * character class to open a comment over the rest of the file.
+ *
+ * `++`/`--` are excluded, since `i++ / 2` divides: the trailing `+` there is a postfix operator that
+ * DOES yield a value. `<` and `>` are excluded for the opposite reason — a comparison against a
+ * regex literal does not occur, while `</div>` and `/>` do on every JSX line, and reading a closing
+ * tag as a regex opener would blank the brackets between two tags on one line.
+ */
+const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^]|(?<!\+)\+|(?<!-)-`;
+
+/**
  * A regex literal, and only where a `/` can BEGIN one: at the start of a line, or after an opener,
  * a separator, an operator or an expression keyword. After a value — `)`, `]`, an identifier — the
  * same `/` divides, and blanking `a / b(c) / d` would eat the parens it spans. The prefix is
@@ -195,12 +208,12 @@ const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|
  * parameter list — turning a genuine clone of runtime work into a declaration and dropping it.
  */
 const REGEX_LITERAL = new RegExp(
-  String.raw`(^|=>|[([{,;:=!&|?]|${EXPRESSION_KEYWORDS})(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
+  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS})(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
   "g",
 );
 
 /** The same prefixes, anchored to the END of the text before a `/` — the one rule, read backwards. */
-const REGEX_PREFIX = new RegExp(String.raw`(?:=>|[([{,;:=!&|?]|${EXPRESSION_KEYWORDS})$`);
+const REGEX_PREFIX = new RegExp(String.raw`(?:${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS})$`);
 
 /**
  * Strip what would confuse brace counting: comments, string bodies and regex literals. Block
