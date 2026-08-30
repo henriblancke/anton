@@ -29,7 +29,7 @@ import { eq } from "drizzle-orm";
 import { beads, gateReason, type Gate } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import * as schema from "../db/schema";
-import { armHumanGate } from "./execute-epic";
+import { armHumanGate, HUMAN_GATE_ARMED_LABEL } from "./execute-epic";
 import { getJob, park } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
@@ -206,6 +206,10 @@ process.exit(0);`),
     expect(await armHumanGate(repo, feature.id, ask)).toBe(first); // same ask ⇒ same wait
     expect((await gatesBlocking(feature.id)).map((g) => g.id)).toEqual([first]);
 
+    // The label is what makes the supersede below anton's to make — a gate without it reads as a
+    // person's own hold. Asserted against real bd because the write is a `bd update` on a GATE bead.
+    expect((await gatesBlocking(feature.id))[0].labels ?? []).toContain(HUMAN_GATE_ARMED_LABEL);
+
     const newer = "actually MARKER_ZONE needs a DNS record first";
     const second = await armHumanGate(repo, feature.id, newer);
     expect(second).not.toBe(first);
@@ -218,6 +222,23 @@ process.exit(0);`),
     expect(gateReason(open[0])).toBe(newer);
     const all = await beads.gateList(repo, { all: true });
     expect(all.find((g) => g.id === first)?.status).toBe("closed");
+  });
+
+  it("arms beside a hold a person created rather than resolving someone else's gate", async () => {
+    // A hand-made `bd gate create --blocks <target>` is a founder's "stop until I say so". It looks
+    // exactly like a stale anton wait — a human gate with a different reason — so only the label
+    // anton stamps on its own keeps this ask from auto-releasing someone's explicit hold.
+    const feature = await approvedFeature("Held by hand");
+    const hold = await beads.gateCreate(repo, {
+      blocks: feature.id,
+      type: "human",
+      reason: "hold: MARKER_HOLD until the contract is signed",
+    });
+
+    const armed = await armHumanGate(repo, feature.id, "the sandbox key MARKER_KEY is not mine to make");
+
+    const open = await gatesBlocking(feature.id);
+    expect(open.map((g) => g.id).sort()).toEqual([armed, hold].sort());
   });
 
   it("refuses an epic target loudly instead of littering the board with a gate that blocks nothing", async () => {

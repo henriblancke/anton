@@ -2206,28 +2206,47 @@ export function humanGateReason(targetId: string, ask: string | undefined): stri
 }
 
 /**
+ * Marks a human gate ANTON armed for an ask of its own — the only ones a later arm may supersede.
+ * Without it every open human gate on the target reads as anton's leftover, and a hold a person put
+ * there by hand (`bd gate create --blocks <target>`, the "stop until I say so" gesture) would be
+ * auto-resolved by the next ask — breaking the one contract this gate flavour has, that nothing but
+ * an explicit human action ends it.
+ */
+export const HUMAN_GATE_ARMED_LABEL = "gate-armed";
+
+/**
  * What arming this target's human wait has to do, from the board alone: the open gate that already
- * carries THIS ask (`open` — reuse it, a second gate would race it), and every other open human gate
- * on the target (`stale` — its ask no longer applies).
+ * carries THIS ask (`open` — reuse it, a second gate would race it), anton's own earlier waits
+ * (`stale` — their ask no longer applies, so they are superseded), and every other open human gate
+ * on the target (`held` — a person's own hold, reported but never touched).
  *
  * ALL the stale gates, not the first, for the reason mergeGatePlan resolves all of its own: a
  * `gateResolve` that failed on an earlier run leaves a superseded gate open ALONGSIDE the live one,
  * and dependency order says nothing about which is seen first. It costs more here than it does
  * there — a human gate is a real blocker, so one left behind keeps the target unrunnable until
  * someone finds it by hand.
+ *
+ * `open` matches on the ask alone, label or not: an arm whose tag write was lost still created that
+ * gate, and reusing it is what keeps the arm re-entrant. Ownership only ever narrows what may be
+ * CLOSED, never what may be reused.
  */
 export function humanGatePlan(
   board: Bead[],
   targetId: string,
   reason: string,
-): { stale: Gate[]; open: Gate | undefined } {
+): { stale: Gate[]; held: Gate[]; open: Gate | undefined } {
   const byId = new Map(board.map((b) => [b.id, b]));
   const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
     .filter((d) => d.type === "blocks")
     .map((d) => byId.get(d.depends_on_id))
     .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isHumanGate(b));
   const open = armed.find((g) => gateReason(g)?.trim() === reason.trim());
-  return { stale: armed.filter((g) => g !== open), open };
+  const superseded = armed.filter((g) => g !== open);
+  return {
+    stale: superseded.filter((g) => g.labels?.includes(HUMAN_GATE_ARMED_LABEL) ?? false),
+    held: superseded.filter((g) => !(g.labels?.includes(HUMAN_GATE_ARMED_LABEL) ?? false)),
+    open,
+  };
 }
 
 /**
@@ -2248,15 +2267,20 @@ export function humanGatePlan(
  *
  *   • THIS ask ALREADY ARMED — return that gate's id, create nothing. Two gates for one ask is one
  *     dead wait: resolving either leaves the target blocked by the other.
- *   • A DIFFERENT ask armed — this run stopped for a new reason, so the old wait is superseded and
- *     resolved here. Nothing else ever would, and it blocks the target while it lives.
+ *   • A DIFFERENT ask ANTON armed — this run stopped for a new reason, so the old wait is superseded
+ *     and resolved here. Nothing else ever would, and it blocks the target while it lives.
+ *   • A DIFFERENT ask A PERSON armed — left exactly where it is. A hand-made human gate is a hold
+ *     only its author may release; superseding it would let this run resume through someone's
+ *     explicit stop.
  *
- * THROWS when the gate cannot be created — or when the board cannot be read, since arming blind is
- * how the duplicate wait gets made — so the caller settles the run LOUDLY instead of parking it: a
- * park with no gate is a wait nothing can end, and a park behind two gates is one resolving cannot.
- * An epic target is the first case up front — bd refuses a gate edge onto one ("epics can only block
- * other epics") and a failed `gate create` still leaves an orphan gate bead behind, so it is refused
- * here rather than attempted.
+ * THROWS when the gate cannot be created, when a superseded gate cannot be resolved, or when the
+ * board cannot be read (arming blind is how the duplicate wait gets made) — so the caller settles
+ * the run LOUDLY instead of parking it. All three are the same failure: a park is only meaningful if
+ * resolving the gate it names makes the target runnable, and it does not when there is no gate, when
+ * a twin blocks the target, or when anton's own superseded wait is still open beside it. An epic
+ * target is the first case up front — bd refuses a gate edge onto one ("epics can only block other
+ * epics") and a failed `gate create` still leaves an orphan gate bead behind, so it is refused here
+ * rather than attempted.
  */
 export async function armHumanGate(
   repo: string,
@@ -2280,24 +2304,43 @@ export async function armHumanGate(
     );
   }
 
-  const { stale, open } = humanGatePlan(board, targetId, reason);
+  const { stale, held, open } = humanGatePlan(board, targetId, reason);
 
   for (const gate of stale) {
     const resolved = await safe(() =>
       beads.gateResolve(repo, gate.id, `superseded — ${targetId} now waits on a newer ask`),
     );
-    // Nothing else will ever close it, and it is a real blocker while it lives — say so rather than
-    // leaving the target waiting on an ask no one is answering.
+    // Nothing else will ever close it, and it is a real blocker while it lives — so a park behind it
+    // is a wait resolving the named gate cannot end. Abort the arm instead: the run settles FAILED
+    // carrying the ask, which a person can still act on.
     if (!resolved) {
-      console.warn(
-        `[execute-epic] could not resolve ${targetId}'s superseded human gate ${gate.id} — it stays ` +
-          `open alongside the current ask and keeps blocking the target`,
+      throw new Error(
+        `could not resolve ${targetId}'s superseded human gate ${gate.id} — it would stay open ` +
+          `beside the current ask, so resolving the new gate could not release the run`,
       );
     }
   }
+  // A person's own hold is not anton's to close, and it keeps blocking the target after this ask is
+  // answered — the park would otherwise read as though one `bd gate resolve` resumes the run.
+  for (const gate of held) {
+    console.warn(
+      `[execute-epic] ${targetId} also waits on human gate ${gate.id}, which anton did not arm — ` +
+        `left open; the run resumes only once that hold is resolved too`,
+    );
+  }
   if (open) return open.id; // this ask is already with a human — a second gate would race it
 
-  return await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
+  const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
+  // Best-effort, unlike everything above: the gate exists and carries the ask, so the park is
+  // already valid. A lost tag only costs a later arm the right to supersede this wait — it reads as
+  // a person's hold and stays open, which is the safe direction for a gate only a human ends.
+  if (!(await safe(() => beads.tag(repo, gateId, [HUMAN_GATE_ARMED_LABEL])))) {
+    console.warn(
+      `[execute-epic] could not label ${targetId}'s human gate ${gateId} ` +
+        `(${HUMAN_GATE_ARMED_LABEL}) — a later ask will leave it open instead of superseding it`,
+    );
+  }
+  return gateId;
 }
 
 /**

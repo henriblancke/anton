@@ -14,6 +14,7 @@ import {
   mergeGatePlan,
   humanGatePlan,
   humanGateReason,
+  HUMAN_GATE_ARMED_LABEL,
   reviewParkMessage,
   runReadiness,
   runTargetDrift,
@@ -722,8 +723,13 @@ describe("humanGatePlan", () => {
       issue_type: "gate",
       await_type: "human",
       description: `Ad-hoc gate blocking f-1\n\nReason: ${reason}`,
+      labels: [HUMAN_GATE_ARMED_LABEL],
       ...o,
     }) as Gate;
+
+  /** The other author: a hold a person hung on the target by hand, carrying no anton label. */
+  const handHeld = (id: string, reason: string, o: Partial<Gate> = {}): Gate =>
+    gate(id, reason, { labels: [], ...o });
 
   const target = (...gateIds: string[]): Bead =>
     ({
@@ -734,7 +740,7 @@ describe("humanGatePlan", () => {
     }) as Bead;
 
   it("creates the wait when the target carries none", () => {
-    expect(humanGatePlan([target()], "f-1", ASK)).toEqual({ stale: [], open: undefined });
+    expect(humanGatePlan([target()], "f-1", ASK)).toEqual({ stale: [], held: [], open: undefined });
   });
 
   it("reuses the gate already carrying this ask rather than racing it with a second", () => {
@@ -746,7 +752,27 @@ describe("humanGatePlan", () => {
   it("supersedes a gate whose ask no longer applies", () => {
     const plan = humanGatePlan([target("g-old"), gate("g-old", "an older ask")], "f-1", ASK);
     expect(plan.stale.map((g) => g.id)).toEqual(["g-old"]);
+    expect(plan.held).toEqual([]);
     expect(plan.open).toBeUndefined();
+  });
+
+  it("leaves a hold a person armed alone, however stale its reason looks", () => {
+    // The contract this protects: `bd gate create --blocks f-1` is a founder's "stop until I say
+    // so". Reading it as anton's leftover would auto-resolve someone's explicit hold the moment an
+    // agent stopped for an unrelated ask.
+    const board = [target("g-mine", "g-theirs"), gate("g-mine", "an older ask"), handHeld("g-theirs", "hold: talking to legal")];
+    const plan = humanGatePlan(board, "f-1", ASK);
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-mine"]);
+    expect(plan.held.map((g) => g.id)).toEqual(["g-theirs"]);
+  });
+
+  it("still reuses an anton gate whose label write was lost, rather than arming a twin", () => {
+    // Ownership narrows what may be CLOSED, never what may be reused: an arm that created the gate
+    // and then failed to tag it must still re-enter onto that same wait.
+    const plan = humanGatePlan([target("g-1"), handHeld("g-1", ASK)], "f-1", ASK);
+    expect(plan.open?.id).toBe("g-1");
+    expect(plan.stale).toEqual([]);
+    expect(plan.held).toEqual([]);
   });
 
   it("resolves EVERY stale gate even when the live one is seen first", () => {
@@ -773,7 +799,7 @@ describe("humanGatePlan", () => {
       { ...board[0], dependencies: [{ issue_id: "f-1", depends_on_id: "g-related", type: "related" }] } as Bead,
       board[2],
     ];
-    expect(humanGatePlan(related, "f-1", ASK)).toEqual({ stale: [], open: undefined });
+    expect(humanGatePlan(related, "f-1", ASK)).toEqual({ stale: [], held: [], open: undefined });
   });
 
   it("matches the ask an agent that named none gets, so that gate is reused too", () => {
