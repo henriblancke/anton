@@ -1409,6 +1409,27 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // An MDX ESM block is JavaScript, so `//` opens a comment there. The prose behind it sits on a
+    // line already read as executable, where it proves a caller that isn't there — and the block
+    // has to survive that comment, so a real reference under it still counts.
+    it("masks a line comment inside an MDX ESM block and still counts the reference under it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/notes.mdx": "export const meta = {\n  // Widget was removed in favour of Panel\n  title: 'Notes',\n};\n",
+        "docs/layout.mdx": "export const layout = {\n  // rendered below\n  render: Widget,\n};\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/layout.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {

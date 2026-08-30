@@ -139,8 +139,13 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     // unmasked, where the leading `{` then proves the prose is an expression and erases a true
     // finding. `/*` outside a braced expression is markdown text, so the widened marker can only
     // blank prose — the direction that keeps a signal rather than dropping one.
+    //
+    // `//` for the same reason: an ESM block and a braced expression are JavaScript, where a
+    // `// Widget was removed` sits on a line `mdxOpenLines` has already called executable, and
+    // reading that prose as a call erases a true finding. In the markdown body `//` is a URL at
+    // worst, and blanking the tail of one only leaves a signal standing.
     files: /\.mdx$/i,
-    line: [],
+    line: ["//"],
     block: [
       ["/*", "*/"],
       ["`", "`"],
@@ -370,14 +375,18 @@ const MDX_TAG = /<\/?\s*$/;
  * itself closes one with: an `import`/`export` block runs to the next empty line and is parsed
  * whole. Ending it on its opening line instead — whenever that line balanced its delimiters, or
  * carried none — reads `export default` with `Widget()` under it as markdown and misses the caller.
+ *
+ * Blankness is read from `raw`, the file before masking: a line masking emptied held a comment
+ * inside the block, not the empty line MDX ends a block at, and closing on it drops the rest of an
+ * `export const meta = {` back to markdown.
  */
-function mdxOpenLines(code: string[]): boolean[] {
+function mdxOpenLines(code: string[], raw: string[]): boolean[] {
   const open: boolean[] = [];
   let depth = 0;
   let esm = false;
-  for (const line of code) {
+  for (const [index, line] of code.entries()) {
     open.push(depth > 0 || esm);
-    if (!line.trim()) {
+    if (!raw[index]?.trim()) {
       depth = 0;
       esm = false;
       continue;
@@ -533,7 +542,10 @@ async function codeReferencingFiles(
       try {
         const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
         const code = maskComments(text, syntax);
-        masked.set(file, MDX_FILE.test(file) ? { code, open: mdxOpenLines(code) } : { code });
+        masked.set(
+          file,
+          MDX_FILE.test(file) ? { code, open: mdxOpenLines(code, text.split("\n")) } : { code },
+        );
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
         // "proves no caller" and let the pass finish on a verdict nobody asked for.
