@@ -120,14 +120,15 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
 
 /**
  * The beads a CLUSTER re-parent's two board-derived premises are read off, beyond its own two ends:
- * every member the grouping is recomputed over, and the home's own tickets the container bar is
- * counted from. Neither is written to, and neither is derivable from the step's ends — which is why
- * the decision carries them (apply-plan.ts `ClusterPremise`) and why they are locked (see
- * {@link lockedBeads}).
+ * every member the grouping is recomputed over, the home's own tickets the container bar is counted
+ * from, and the beads those tickets reach the home THROUGH — a carrier attributed to the home
+ * across an intermediate is only as durable as that intermediate. None is written to, and none is
+ * derivable from the step's ends — which is why the decision carries them (apply-plan.ts
+ * `ClusterPremise`) and why they are locked (see {@link lockedBeads}).
  */
 function premiseBeadsOf(step: ApplyStep): string[] {
   const cluster = step.verb === "reparent" ? step.cluster : undefined;
-  return cluster ? [...cluster.members, ...cluster.carriers] : [];
+  return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
 }
 
 /**
@@ -139,8 +140,11 @@ function premiseBeadsOf(step: ApplyStep): string[] {
  * member other than this step's subject can be retitled or relabelled by `updateTicket` after the
  * board read, so the grouping passes on a title that is already gone — and a home's last qualifying
  * ticket can be removed by `deleteTicket`, which takes that ticket's lock and no other, so the
- * home's own lock never orders the deletion against the container bar. Held, both writes either land
- * before the read (and it refuses) or queue behind this one.
+ * home's own lock never orders the deletion against the container bar. The carriers' PATHS earn the
+ * lock by the same deletion: `cardOf` walks the whole parent chain, so deleting a bead between a
+ * carrier and the home leaves that carrier riding no card at all — the container premise gone
+ * without the carrier itself being touched. Held, all three writes either land before the read (and
+ * it refuses) or queue behind this one.
  */
 function lockedBeads(step: ApplyStep): string[] {
   return [step.id, counterpartOf(step), ownerOf(step)?.id, ...premiseBeadsOf(step)].filter(
@@ -329,10 +333,11 @@ async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
  * three-member cluster whose first member was retitled after its move pass every later step and
  * settle over a bead beneath a card it no longer belongs to.
  *
- * One bargain remains, a level up: a carrier attributed to the home THROUGH an intermediate bead is
- * only as ordered as that bead. Re-homing one takes the home's own lock as its ticket owner, but
- * deleting one takes its own lock alone, and it is caught only as the fresh read happens to see it —
- * the same bargain {@link assertOwnerUnchanged} strikes.
+ * A carrier attributed to the home THROUGH an intermediate bead is only as ordered as that bead, so
+ * the premise names the whole PATH and this step locks it too (apply-plan.ts
+ * `ClusterPremise.carrierPaths`): deleting an intermediate takes its own lock alone, and it would
+ * otherwise cut the carrier's route to the home between this read and the write — leaving the bar
+ * satisfied by a ticket the board no longer files under the home at all.
  *
  * The count ignores every id the ask NAMED rather than the members left to move: an earlier step of
  * this same cluster has already landed under the home, and letting it count would let the ask prove

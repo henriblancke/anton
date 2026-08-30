@@ -34,6 +34,7 @@ import {
 import { impliesOrdering } from "./relink";
 import {
   carriedTickets,
+  carrierPaths,
   groupedUnder,
   isClusterTier,
   MIN_CARRIED_TICKETS,
@@ -172,6 +173,17 @@ export interface ClusterPremise {
    * would restore exactly the race the list exists to close.
    */
   carriers: string[];
+  /**
+   * The beads those carriers reach the home THROUGH — every ancestor between a carrier and the home
+   * that is not itself a carrier (reparent.ts `carrierPaths`).
+   *
+   * A carrier proves nothing on its own: `cardOf` walks the whole parent chain, so a ticket counted
+   * under the home reaches it only while every bead on that path survives. Deleting one takes that
+   * bead's own lock alone, so the write half locks the path as well as its ends — otherwise the
+   * container bar could pass on a carrier whose route to the home is cut between the read and the
+   * write, which is the leaf-card landing the bar exists to stop.
+   */
+  carrierPaths: string[];
 }
 
 /**
@@ -551,10 +563,12 @@ function regroupSurvivors(
   });
   const grouped = groupedUnder(home, [...moving, ...inPlace]);
   const named = new Set(plan.subjects);
+  const carriers = carriedTickets(index, home.id, named);
   const cluster: ClusterPremise = {
     named: [...named],
     members: [...grouped].sort(),
-    carriers: carriedTickets(index, home.id, named),
+    carriers,
+    carrierPaths: carrierPaths(index, home.id, carriers),
   };
   return {
     steps: steps.filter((step) => grouped.has(step.id)).map((step) => ({ ...step, cluster })),

@@ -412,6 +412,43 @@ export function carriedTickets(
 }
 
 /**
+ * The beads a carried ticket reaches its card THROUGH — every ancestor strictly between the two, for
+ * every ticket in `carriers`, minus the carriers themselves.
+ *
+ * A carrier's attribution is only as durable as its path: `cardOf` walks the whole parent chain, so
+ * delete one bead on it and the ticket dangles under nothing and carries the home no more. That
+ * deletion takes the intermediate's OWN lock and no other (`ticket-detail.ts` `deleteTicket`), so
+ * without these ids the write half's container re-check rests on beads nothing serializes — it could
+ * pass on a carrier whose route to the home is severed a moment later, landing the cluster on a leaf
+ * card after all. Named so the write half can lock them alongside the carriers themselves
+ * (apply-plan.ts {@link ClusterPremise.carrierPaths}, apply-steps.ts `lockedBeads`).
+ *
+ * A ticket-tier intermediate is already a carrier in its own right, and already locked; what this
+ * adds is the beads {@link carriedTickets} never counts — an exempt-type or container ancestor
+ * sitting between a ticket and its card.
+ */
+export function carrierPaths(
+  index: BoardIndex,
+  cardId: string,
+  carriers: readonly string[],
+): string[] {
+  const held = new Set(carriers);
+  const path = new Set<string>();
+  for (const id of carriers) {
+    const seen = new Set<string>([id]);
+    const carrier = index.byId.get(id);
+    let parentId = carrier ? beads.parentOf(carrier) : undefined;
+    while (parentId && parentId !== cardId && !seen.has(parentId)) {
+      seen.add(parentId);
+      if (!held.has(parentId)) path.add(parentId);
+      const parent = index.byId.get(parentId);
+      parentId = parent ? beads.parentOf(parent) : undefined;
+    }
+  }
+  return [...path].sort();
+}
+
+/**
  * Parentless working-layer beads that share one obvious card home. Each is technically a legal
  * standalone run target ("an epic-of-one"), so the smell is not the shape of any single bead — it is
  * a HANDFUL of them orbiting the same feature, which means the board is showing a pile of chips

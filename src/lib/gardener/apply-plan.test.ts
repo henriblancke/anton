@@ -76,12 +76,15 @@ describe("planApply — what an approval means against the board as it now is", 
           observedAtMs: Date.parse(FILED),
           // The two premises the WRITE re-asks under its locks: the ids to keep out of the home's
           // carried-ticket count, the membership to re-group, and the home's own pre-existing
-          // tickets the container bar is counted over (apply-steps.ts `assertClusterHolds`). None
-          // is readable from the step's two ends alone, and each names a bead the write must lock.
+          // tickets the container bar is counted over, plus the beads those tickets reach the home
+          // through — empty here, this one sits directly under the card (apply-steps.ts
+          // `assertClusterHolds`). None is readable from the step's two ends alone, and each names a
+          // bead the write must lock.
           cluster: {
             named: ["anton-a", "anton-b"],
             members: ["anton-a", "anton-b"],
             carriers: [CARRIED.id],
+            carrierPaths: [],
           },
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
@@ -98,6 +101,7 @@ describe("planApply — what an approval means against the board as it now is", 
             named: ["anton-a", "anton-b"],
             members: ["anton-a", "anton-b"],
             carriers: [CARRIED.id],
+            carrierPaths: [],
           },
         },
       ],
@@ -330,6 +334,26 @@ describe("planApply — what an approval means against the board as it now is", 
         step.verb === "reparent" ? step.cluster?.carriers : undefined,
       );
       expect(carriers).toEqual([[CARRIED.id]]);
+    });
+
+    // A carrier reaches the home through whatever sits between them, and an intermediate the count
+    // never sees — an exempt type is no ticket of anybody's — is deleted under its own lock alone.
+    // So the premise records the PATH as well as its ends, which is what lets the write half hold it
+    // (apply-steps.ts `lockedBeads`) instead of trusting it to survive until the write.
+    it("records the beads a nested carrier reaches the home through", () => {
+      const decision = decide(CLUSTER, [
+        CARD,
+        child("anton-note", CARD.id, { issue_type: "learning" }),
+        child("anton-t0", "anton-note"),
+        bead("anton-a"),
+        bead("anton-b"),
+      ]);
+      expect(decision.status).toBe("apply");
+      const premise = (decision.status === "apply" ? decision.steps : []).map((step) =>
+        step.verb === "reparent" ? step.cluster : undefined,
+      )[0];
+      expect(premise?.carriers).toEqual(["anton-t0"]);
+      expect(premise?.carrierPaths).toEqual(["anton-note"]);
     });
 
     it("refuses a home that is not a board card — the state the proposal exists to fix", () => {

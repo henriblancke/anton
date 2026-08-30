@@ -285,6 +285,31 @@ describe("under the write lock — what a decided step re-asks before it lands",
   });
 
   /**
+   * The same claim one level up. A carrier reaches the home through every bead between them
+   * (`cardOf` walks the whole chain), so an intermediate the container count never sees — an exempt
+   * type is nobody's ticket — carries the premise just as the ticket does, and `deleteTicket` takes
+   * its own lock and no other. Unheld, it could go between the board read and the write, cutting the
+   * carrier loose and landing the cluster on a leaf card with the bar still reading as satisfied.
+   */
+  it("takes the write lock of the beads a nested carrier reaches the home through", async () => {
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const nested = child("anton-t0", note.id);
+    const proposal = proposalFor(CLUSTER);
+    let release = () => {};
+    const queued = withBeadWriteLock(REPO, note.id, () => new Promise<void>((r) => (release = r)));
+
+    const run = apply(proposal, [CARD, note, nested, bead("anton-a"), bead("anton-b"), proposal]);
+    try {
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls, `${note.id} was not held`).toEqual([]);
+    } finally {
+      release();
+      await queued;
+    }
+    await expect(run).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+  });
+
+  /**
    * The MEMBERS' half of the same claim. A title or `area:` edit takes the bead's own lock
    * (`ticket-detail.ts` `updateTicket`), which this step holds for the subject and the home — and it
    * is invisible to every other bar here: the bead stays open, unclaimed, unmoved and the right
