@@ -495,7 +495,9 @@ const deliveredAtMerge = (b: Bead | undefined): boolean =>
  * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. Two narrower
  * sub-shapes — a timeout that fired after the commit, and a post-commit failure — do leave work on
  * the branch; they are held back for the same reason all the same, because their note asks a human
- * to review and close by hand, not because nothing landed. A ticket the run SKIPPED behind one of
+ * to review and close by hand, not because nothing landed. Held back is as far as it goes for them:
+ * {@link safeToRerunAtMerge} keeps them off the rerun path, since their work is in the diff. A
+ * ticket the run SKIPPED behind one of
  * those says so in its `not-delivered` label instead: it was never dispatched, so it keeps the
  * `open` status the board keeps offering it under and carries no other mark of its own.
  *
@@ -511,6 +513,21 @@ const deliveredAtMerge = (b: Bead | undefined): boolean =>
  * exception (deliveredAtMerge): closed on a won't-do, with no commit behind it, so the walk passes
  * straight through to whatever waited on it.
  */
+/**
+ * Of the children a merge preserves ({@link undeliveredAtMerge}), the ones anton may hand back to
+ * the queue — nothing of theirs can be in the merged diff, so re-running them cannot redo shipped
+ * work. Everything else stays on the manual-review path the run's own note already asks for.
+ *
+ * `not-delivered` is the only positive evidence of absence there is, and a run writes it exactly
+ * when it rolled the ticket's work back or never dispatched it — a timeout or a failure that fired
+ * AFTER the commit deliberately omits it, because that commit is on the branch. So a `blocked`
+ * child without the marker is one whose work the merge may already carry (post-commit timeout,
+ * post-commit failure) or one a human must rule on anyway (zero delivery, agent-declared blocked):
+ * reopening and rehoming it would advertise a rerun that duplicates or conflicts with the diff.
+ * Everything else here is `open` — a dependent that was never dispatched — and is rerunnable.
+ */
+const safeToRerunAtMerge = (b: Bead): boolean => beads.isNotDelivered(b) || b.status !== "blocked";
+
 export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const byId = new Map(children.map((c) => [c.id, c]));
   const keep = new Set(
@@ -575,7 +592,8 @@ export async function finalizeMergedEpic(args: {
   //    ticket timeout opens its PR for the work that DID land and leaves the rest undelivered —
   //    those beads are in no diff, so closing them here would file work that was never done as
   //    shipped and lose it silently, against the note on the bead telling the operator to run it.
-  //    They are left open and rehomed instead (1b); the target itself still closes, since the PR it
+  //    They are left open instead, and rehomed for a rerun when nothing of theirs can be in the
+  //    diff (1b); the target itself still closes, since the PR it
   //    points at is merged and terminal. The target is never itself "preserved": a leaf run target
   //    marked undelivered has no merged PR to finalize, and excluding it from the close would leave
   //    `stage:in-review` on forever, re-selecting this epic on every sweep.
@@ -594,51 +612,72 @@ export async function finalizeMergedEpic(args: {
   );
   if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 
-  // 1b. Rehome the preserved tickets under a NEW run target, hand each one back in a claimable
-  //     state, then say on each of them that the feature shipped without it — the operator meets
-  //     this ticket long after the run that skipped it, under a target that now reads as done.
+  // 1b. Rehome the preserved tickets that are safe to RE-RUN under a NEW run target, hand each one
+  //     back in a claimable state, then say on each of them that the feature shipped without it —
+  //     the operator meets this ticket long after the run that skipped it, under a target that now
+  //     reads as done.
   //
   //     Rehoming is what makes the instruction actionable (anton-67xj). Left where they are these
   //     tickets are unreachable: a task/bug WITH a parent is never a run target (beads.isRunTarget),
   //     and the parent they hang off has just closed carrying a MERGED PR ref, which execute-epic
   //     short-circuits on as an already-finished run. So neither the ticket nor its old home can be
   //     claimed, and "re-run this" would mean restructuring the board by hand.
-  const followUp = await rehomePreserved(repo, epic, preserved);
+  const rerunnable = preserved.filter(safeToRerunAtMerge);
+  const followUp = await rehomePreserved(repo, epic, rerunnable);
+  const rerun = new Set(rerunnable.map((b) => b.id));
   for (const bead of preserved) {
     // Release the reservation the run that skipped this ticket still holds. Its own unassign at
     // skip time is best-effort (and older runs had none), and a claim that outlives its run hides
     // the ticket from `bd ready --unassigned` and refuses the claim cascade of whoever approves the
     // follow-up — so the rerun path the note advertises works only once ownership is cleared. When
     // it cannot be, the note says so rather than pointing at a target no one can claim through.
+    // A ticket on the manual path is released too: nobody is running it, and a dead run's claim
+    // only misreports who owns the review it is waiting for.
     const stillOwned = ownerOf(bead) && !(await safe(() => beads.unassign(repo, bead.id)));
     // Return the ticket to a claimable status. A timed-out one carries `blocked` from the run that
     // stopped it, and bd refuses to claim a bead in that status — so an operator who approves the
     // follow-up target would watch every attempt die at execute-epic's claim gate before this work
     // could run. The parent makes the ticket reachable; the status is what makes it runnable. A
-    // ticket already `open` (a dependent skipped behind the timeout) is left untouched.
+    // ticket already `open` (a dependent skipped behind the timeout) is left untouched, and one on
+    // the manual path stays `blocked` on purpose — it must not become runnable.
     const stillBlocked =
-      bead.status !== "open" && !(await safe(() => beads.setStatus(repo, bead.id, "open")));
+      rerun.has(bead.id) &&
+      bead.status !== "open" &&
+      !(await safe(() => beads.setStatus(repo, bead.id, "open")));
     await safe(() =>
       beads.note(
         repo,
         bead.id,
-        `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
-          `deliver it (see the note above), so none of its work is in that diff. Left open on ` +
-          `purpose: closing it here would file work that was never done as shipped. ` +
-          (followUp.moved.has(bead.id)
-            ? `It now lives under ${followUp.id}, a fresh run target — approve that target to have ` +
-              `anton pick this work back up.`
-            : `It could NOT be rehomed onto a fresh run target, so nothing anton runs reaches it ` +
-              `yet: move it under a new epic (\`bd update ${bead.id} --parent <new-epic>\`) or ` +
-              `clear its parent to make it a run target of its own.`) +
-          (stillOwned
-            ? ` It is also still assigned to ${ownerOf(bead)} and could not be released, so no ` +
-              `other operator can claim it: clear that with \`bd assign ${bead.id} ""\`.`
-            : "") +
-          (stillBlocked
-            ? ` Its status is also still \`${bead.status}\`, which bd refuses to claim, so a run ` +
-              `would stop at that gate: clear it with \`bd update ${bead.id} --status open\`.`
-            : ""),
+        !rerun.has(bead.id)
+          ? `anton: the pull request for ${epic.id} merged while this ticket was still ` +
+            `\`${bead.status}\` — the run stopped it and carried on (see the note above). It is ` +
+            `NOT marked \`${LABELS.notDelivered}\`, so whatever it committed before it stopped is ` +
+            `in that merged diff. Left on the board rather than closed, and deliberately NOT ` +
+            `queued for a rerun: re-running it would redo work the merge already shipped. Review ` +
+            `the branch against the note ` +
+            `above, then close this by hand if it is complete, or file the remainder as a new ` +
+            `ticket.` +
+            (stillOwned
+              ? ` It is also still assigned to ${ownerOf(bead)} and could not be released: clear ` +
+                `that with \`bd assign ${bead.id} ""\`.`
+              : "")
+          : `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
+            `deliver it (see the note above), so none of its work is in that diff. Left open on ` +
+            `purpose: closing it here would file work that was never done as shipped. ` +
+            (followUp.id && followUp.moved.has(bead.id)
+              ? `It now lives under ${followUp.id}, a fresh run target — approve that target to ` +
+                `have anton pick this work back up.`
+              : `It could NOT be rehomed onto a fresh run target, so nothing anton runs reaches ` +
+                `it yet: move it under a new epic (\`bd update ${bead.id} --parent <new-epic>\`) ` +
+                `or clear its parent to make it a run target of its own.`) +
+            (stillOwned
+              ? ` It is also still assigned to ${ownerOf(bead)} and could not be released, so no ` +
+                `other operator can claim it: clear that with \`bd assign ${bead.id} ""\`.`
+              : "") +
+            (stillBlocked
+              ? ` Its status is also still \`${bead.status}\`, which bd refuses to claim, so a ` +
+                `run would stop at that gate: clear it with \`bd update ${bead.id} --status open\`.`
+              : ""),
       ),
     );
   }
@@ -656,10 +695,11 @@ export async function finalizeMergedEpic(args: {
 }
 
 /**
- * Move the tickets a merged PR did not contain under a NEW epic, and answer that epic's id
- * (undefined when there is nothing to rehome, or bd refused). An epic with no `feature` children is
- * a run target, so the preserved work becomes claimable and runnable again — see the caller for why
- * leaving it under the merged target does not.
+ * Move the tickets a merged PR did not contain, and that are safe to run again
+ * ({@link safeToRerunAtMerge}), under a NEW epic — and answer that epic's id (undefined when there
+ * is nothing to rehome, or bd refused). An epic with no `feature` children is a run target, so the
+ * preserved work becomes claimable and runnable again — see the caller for why leaving it under the
+ * merged target does not.
  *
  * Deliberately NOT `approved`: approval is the founder's gate, and re-running work a run already
  * failed to deliver — after a timeout, possibly needing re-scoping first — is exactly the decision
@@ -671,10 +711,10 @@ export async function finalizeMergedEpic(args: {
  * have already landed. An epic that ends up with no children at all is deleted again, since a
  * childless epic is a poison run rather than a home.
  */
-async function rehomePreserved(repo: string, epic: Bead, preserved: Bead[]): Promise<Rehomed> {
+async function rehomePreserved(repo: string, epic: Bead, rerunnable: Bead[]): Promise<Rehomed> {
   const none: Rehomed = { moved: new Set() };
-  if (preserved.length === 0) return none;
-  const ids = preserved.map((b) => b.id).join(", ");
+  if (rerunnable.length === 0) return none;
+  const ids = rerunnable.map((b) => b.id).join(", ");
   let followUp: string;
   try {
     followUp = await beads.create(repo, {
@@ -695,7 +735,7 @@ async function rehomePreserved(repo: string, epic: Bead, preserved: Bead[]): Pro
     return none;
   }
   const moved = new Set<string>();
-  for (const bead of preserved) {
+  for (const bead of rerunnable) {
     if (await safe(() => beads.reparent(repo, bead.id, followUp))) moved.add(bead.id);
   }
   if (moved.size > 0) return { id: followUp, moved };

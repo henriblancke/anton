@@ -231,6 +231,45 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
   });
 
+  it("keeps a ticket stopped AFTER its commit off the rerun path", async () => {
+    // A post-commit timeout (or post-commit failure) leaves the bead `blocked` but deliberately
+    // WITHOUT `not-delivered`, because the commit it made is on the merged branch. Reopening and
+    // rehoming it would advertise a rerun that redoes shipped work; it stays where it is, blocked,
+    // on the manual-review path its own note already asks for.
+    await finalize(bead("epic-1"), [bead("t1"), bead("t2", "blocked")]);
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+    // Still not closed — the merge does not get to decide a ticket a human has to rule on.
+    expect(batchMock.mock.calls[0][1]).toEqual([
+      { op: "close", id: "t1" },
+      { op: "close", id: "epic-1" },
+    ]);
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("NOT queued for a rerun");
+    expect(note).not.toContain("merged WITHOUT this ticket");
+  });
+
+  it("still rehomes the tickets skipped behind a post-commit timeout", async () => {
+    // Only the timed-out ticket's own work is in the diff. t3 was never dispatched, so it carries
+    // no marker and no commit — the lane split must keep it runnable rather than strand it too.
+    await finalize(bead("epic-1"), [bead("t2", "blocked"), waitsOn("t3", "t2")]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t3", "epic-2"]]);
+    expect(noteMock.mock.calls[1][2]).toContain("now lives under epic-2");
+  });
+
+  it("releases a stale claim on a ticket held for manual review", async () => {
+    // Nobody is running it, so a dead run's claim only misreports who owns the review it waits for.
+    const reserved = { ...bead("t2", "blocked"), assignee: "op-1" } as Bead;
+
+    await finalize(bead("epic-1"), [reserved]);
+
+    expect(unassignMock).toHaveBeenCalledWith("/repo", "t2");
+    expect(noteMock.mock.calls[0][2]).not.toContain("still assigned");
+  });
+
   it("closes a leaf target marked not-delivered rather than preserving itself", async () => {
     // A leaf run target is its own ticket, so it appears on both sides. Excluding it from the close
     // would leave `stage:in-review` on forever and re-select it on every sweep.
