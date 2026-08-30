@@ -20,6 +20,8 @@ export interface ScheduleLastRun {
   outcome: ScheduleRunOutcome;
   /** Epoch SECONDS — when the fire settled. */
   at: number;
+  /** Epoch SECONDS — when the scheduler enqueued this fire; comparable with the row's `lastRunAt`. */
+  enqueuedAt: number;
   /** One short line: what it did, or why it failed. */
   note?: string;
 }
@@ -319,24 +321,27 @@ function AutomationTableRow({
  * stamped when the scheduler ENQUEUES (jobs/scheduler.ts), `lastRun` is the newest job that has
  * SETTLED (lib/schedule-runs.ts). While a fire is running — minutes, for the long passes — the
  * outcome beside it is the PREVIOUS fire's, so pinning it to a two-minute-old timestamp reads as
- * "it just succeeded" (or just failed). An outcome is only the newest fire's when it settled at or
- * after that fire was enqueued; otherwise the fire is still in flight and says so, and the older
- * result is dated to its own run. A FIRST fire has no older result to date, and still says it is in
- * flight — otherwise the automation's very first execution is indistinguishable from a bare
- * timestamp with nothing behind it.
+ * "it just succeeded" (or just failed). The two are matched on ENQUEUE time, not settlement: an
+ * outcome is this fire's only when the job behind it was enqueued by the same tick that stamped
+ * `lastRunAt`. Settlement cannot decide it — an operator resuming a week-old parked fire settles it
+ * today, after the fire now running was enqueued. Otherwise the fire is still in flight and says
+ * so, and the older result is dated to when THAT fire ran — the same clock as the headline, so a
+ * resumed week-old failure reads as a week old and not as something that just happened. A FIRST
+ * fire has no older result to date, and still says it is in flight — otherwise the automation's
+ * very first execution is indistinguishable from a bare timestamp with nothing behind it.
  */
 function LastRunCell({ state, now }: { state: AutomationScheduleState; now: number }) {
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;
 
   const previous = state.lastRun;
-  const settled = previous !== undefined && previous.at >= state.lastRunAt;
+  const settled = previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
   const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
 
   const detail = settled
     ? (previous.note ?? style?.label)
     : previous
       ? `in progress · ${OUTCOME_STYLES[previous.outcome].label} ${formatRelativeTime(
-          new Date(previous.at * 1000).toISOString(),
+          new Date(previous.enqueuedAt * 1000).toISOString(),
           now,
         )}`
       : "in progress";

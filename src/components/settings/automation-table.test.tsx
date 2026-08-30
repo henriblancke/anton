@@ -234,7 +234,12 @@ describe("the automation rows", () => {
     renderTable({
       "nightly-stringer": {
         lastRunAt: NOW_SEC() - 3 * 3600 - 60,
-        lastRun: { outcome: "ok", at: NOW_SEC() - 3 * 3600 - 60, note: "triaged 4 signal(s)" },
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
       },
     });
     expect(screen.getByText("3h ago")).toBeTruthy();
@@ -245,7 +250,12 @@ describe("the automation rows", () => {
     renderTable({
       "run-health": {
         lastRunAt: NOW_SEC() - 60,
-        lastRun: { outcome: "noop", at: NOW_SEC() - 60, note: "no stalls found" },
+        lastRun: {
+          outcome: "noop",
+          at: NOW_SEC() - 60,
+          enqueuedAt: NOW_SEC() - 60,
+          note: "no stalls found",
+        },
       },
     });
     expect(screen.getByText("no stalls found")).toBeTruthy();
@@ -257,7 +267,12 @@ describe("the automation rows", () => {
     renderTable({
       "run-health": {
         lastRunAt: NOW_SEC() - 120,
-        lastRun: { outcome: "failed", at: NOW_SEC() - 120, note: "gh: not authenticated" },
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 120,
+          enqueuedAt: NOW_SEC() - 120,
+          note: "gh: not authenticated",
+        },
       },
     });
     expect(screen.getByText("gh: not authenticated")).toBeTruthy();
@@ -281,7 +296,12 @@ describe("the automation rows", () => {
     renderTable({
       "nightly-stringer": {
         lastRunAt: NOW_SEC() - 120,
-        lastRun: { outcome: "ok", at: NOW_SEC() - 3 * 3600 - 60, note: "triaged 4 signal(s)" },
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
       },
     });
 
@@ -295,7 +315,12 @@ describe("the automation rows", () => {
     renderTable({
       "run-health": {
         lastRunAt: NOW_SEC() - 120,
-        lastRun: { outcome: "failed", at: NOW_SEC() - 26 * 3600, note: "gh: not authenticated" },
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 26 * 3600,
+          enqueuedAt: NOW_SEC() - 26 * 3600,
+          note: "gh: not authenticated",
+        },
       },
     });
 
@@ -311,12 +336,32 @@ describe("the automation rows", () => {
     renderTable({
       "nightly-stringer": {
         lastRunAt: firedAt,
-        lastRun: { outcome: "ok", at: firedAt + 90, note: "triaged 4 signal(s)" },
+        lastRun: { outcome: "ok", at: firedAt + 90, enqueuedAt: firedAt, note: "triaged 4 signal(s)" },
       },
     });
 
     expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
     expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // The outcomes are matched on ENQUEUE time, not settlement: an operator resuming a week-old parked
+  // fire settles it today, AFTER the fire now running was enqueued. Comparing settlement times would
+  // hand that stale failure to the running fire as its verdict.
+  it("does not hand a running fire the verdict of an older fire resumed after it started", () => {
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 30,
+          enqueuedAt: NOW_SEC() - 7 * 86_400,
+          note: "bd exited 1",
+        },
+      },
+    });
+
+    expect(screen.queryByText("bd exited 1")).toBeNull();
+    expect(screen.getByText("in progress · failed 7d ago")).toBeTruthy();
   });
 
   // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —

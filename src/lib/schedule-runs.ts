@@ -25,6 +25,13 @@ export interface ScheduleLastRun {
   outcome: ScheduleRunOutcome;
   /** Epoch SECONDS — when the job settled, which is the fire's END, not its start. */
   at: number;
+  /**
+   * Epoch SECONDS — when the scheduler ENQUEUED this fire. The schedule's own `lastRunAt` is
+   * stamped from the same tick, so this is what says whether this outcome belongs to the fire the
+   * row is showing or to an earlier one. Settlement time cannot answer that: a resumed fire settles
+   * after fires that came later than it.
+   */
+  enqueuedAt: number;
   /** One short line: what it did, or why it failed. */
   note?: string;
 }
@@ -48,15 +55,18 @@ export function toScheduleLastRun(row: {
   outcomeNote: string | null;
   lastError: string | null;
   at: number;
+  enqueuedAt: number;
 }): ScheduleLastRun {
   const at = Number(row.at);
-  if (row.status === "cancelled") return { outcome: "cancelled", at };
+  const enqueuedAt = Number(row.enqueuedAt);
+  if (row.status === "cancelled") return { outcome: "cancelled", at, enqueuedAt };
   if (row.status === "parked" || row.status === "failed") {
-    return { outcome: "failed", at, note: summarizeNote(row.lastError) };
+    return { outcome: "failed", at, enqueuedAt, note: summarizeNote(row.lastError) };
   }
   return {
     outcome: row.outcome === "noop" ? "noop" : "ok",
     at,
+    enqueuedAt,
     note: summarizeNote(row.outcomeNote),
   };
 }
@@ -74,7 +84,9 @@ const SCHEDULE_ID = sql<string>`json_extract(${schema.jobs.payloadJson}, '$.sche
  * "Newest" is measured on `created_at`, the immutable ENQUEUE time, not on `updated_at`: an operator
  * resuming a long-parked fire re-stamps its `updated_at`, so ordering by settlement would let a
  * fire from last week displace the one that ran an hour ago. The settlement time is still what the
- * column dates, so it rides along as a bare column of the row `max()` chose.
+ * column dates, so it rides along as a bare column of the row `max()` chose — and the enqueue time
+ * rides along too, because that is what the UI matches against the schedule's `lastRunAt` to tell
+ * this fire's outcome from a still-running one's.
  */
 export async function lastRunsBySchedule(
   projectId: string,

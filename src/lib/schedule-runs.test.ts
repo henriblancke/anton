@@ -33,12 +33,16 @@ beforeAll(async () => {
 afterAll(() => fileDb.cleanup());
 
 describe("toScheduleLastRun", () => {
+  // Enqueue and settlement are deliberately different instants: the mapper must carry BOTH, since
+  // the UI matches the fire on when it was enqueued and dates it by when it settled.
+  const ENQUEUED = NOW - 30;
   const row = (over: Partial<Parameters<typeof runs.toScheduleLastRun>[0]> = {}) => ({
     status: "done",
     outcome: "ok" as string | null,
     outcomeNote: null as string | null,
     lastError: null as string | null,
     at: NOW,
+    enqueuedAt: ENQUEUED,
     ...over,
   });
 
@@ -46,6 +50,7 @@ describe("toScheduleLastRun", () => {
     expect(runs.toScheduleLastRun(row({ outcomeNote: "closed 2 gate(s)" }))).toEqual({
       outcome: "ok",
       at: NOW,
+      enqueuedAt: ENQUEUED,
       note: "closed 2 gate(s)",
     });
   });
@@ -54,13 +59,14 @@ describe("toScheduleLastRun", () => {
     expect(runs.toScheduleLastRun(row({ outcome: "noop", outcomeNote: "no gate closed" }))).toEqual({
       outcome: "noop",
       at: NOW,
+      enqueuedAt: ENQUEUED,
       note: "no gate closed",
     });
   });
 
   it("reads a parked job as failed, carrying why", () => {
     const got = runs.toScheduleLastRun(row({ status: "parked", outcome: null, lastError: "bd exited 1" }));
-    expect(got).toEqual({ outcome: "failed", at: NOW, note: "bd exited 1" });
+    expect(got).toEqual({ outcome: "failed", at: NOW, enqueuedAt: ENQUEUED, note: "bd exited 1" });
   });
 
   it("reads a failed job as failed", () => {
@@ -70,15 +76,21 @@ describe("toScheduleLastRun", () => {
   // An operator killing a job is neither a result nor a fault; folding it into either would put a
   // red row in front of the person who caused it deliberately.
   it("keeps an operator cancel out of the failure count", () => {
-    expect(runs.toScheduleLastRun(row({ status: "cancelled", outcome: null })).outcome).toBe(
-      "cancelled",
-    );
+    expect(runs.toScheduleLastRun(row({ status: "cancelled", outcome: null }))).toEqual({
+      outcome: "cancelled",
+      at: NOW,
+      enqueuedAt: ENQUEUED,
+    });
   });
 
   // Rows that settled before the outcome column existed, and handlers that report no effect, are
   // the same claim: it ran and did not fail. That is `ok`, and nothing more.
   it("reads a completed job with no reported outcome as ok with no note", () => {
-    expect(runs.toScheduleLastRun(row({ outcome: null }))).toEqual({ outcome: "ok", at: NOW });
+    expect(runs.toScheduleLastRun(row({ outcome: null }))).toEqual({
+      outcome: "ok",
+      at: NOW,
+      enqueuedAt: ENQUEUED,
+    });
   });
 });
 
@@ -148,10 +160,16 @@ describe("lastRunsBySchedule", () => {
     const byId = await runs.lastRunsBySchedule(PROJECT_ID);
 
     expect(Object.keys(byId).sort()).toEqual(["s-1", "s-2"]);
-    expect(byId["s-1"]).toEqual({ outcome: "noop", at: NOW - 60, note: "no gate closed" });
+    expect(byId["s-1"]).toEqual({
+      outcome: "noop",
+      at: NOW - 60,
+      enqueuedAt: NOW - 60,
+      note: "no gate closed",
+    });
     expect(byId["s-2"]).toEqual({
       outcome: "failed",
       at: NOW - 10,
+      enqueuedAt: NOW - 10,
       note: "gh: not authenticated",
     });
   });
@@ -180,7 +198,29 @@ describe("lastRunsBySchedule", () => {
     expect(byId["s-resumed"]).toEqual({
       outcome: "ok",
       at: NOW - 3500,
+      enqueuedAt: NOW - 3600,
       note: "closed 1 gate(s)",
+    });
+  });
+
+  // The case the enqueue time exists for: the newest fire is still RUNNING, so the only settled row
+  // is an old one an operator resumed today. Its settlement time is newer than the running fire's
+  // enqueue; only its own enqueue time can tell the UI this outcome is not that fire's.
+  it("dates a resumed fire by its enqueue time even when it settled after a newer fire started", async () => {
+    await job({
+      scheduleId: "s-inflight",
+      status: "failed",
+      lastError: "bd exited 1",
+      createdAt: NOW - 7 * 86_400,
+      updatedAt: NOW - 30,
+    });
+    await job({ scheduleId: "s-inflight", status: "running", createdAt: NOW - 120, updatedAt: NOW - 120 });
+
+    expect((await runs.lastRunsBySchedule(PROJECT_ID))["s-inflight"]).toEqual({
+      outcome: "failed",
+      at: NOW - 30,
+      enqueuedAt: NOW - 7 * 86_400,
+      note: "bd exited 1",
     });
   });
 
@@ -238,6 +278,7 @@ describe("listSchedules carries the last fire's outcome", () => {
     expect(byType["gate-check"].lastRun).toEqual({
       outcome: "noop",
       at: NOW - 600,
+      enqueuedAt: NOW - 600,
       note: "no gate closed",
     });
     expect(byType["gardener"].lastRun).toBeUndefined();
