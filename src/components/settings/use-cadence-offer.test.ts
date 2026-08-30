@@ -202,6 +202,60 @@ describe("a hand cadence edit while an answer is in flight", () => {
     });
     expect(result.current.offer).toBeNull();
   });
+
+  it("re-opens the question a failed edit could not put back under an optimistic decline", async () => {
+    const rows = {
+      current: {
+        "board-picker": { enabled: true, cron: "*/10 * * * *" },
+        "product-master": { enabled: true, cron: WEEKLY },
+      } as Rows,
+    };
+    let failDecline!: (res: Response) => void;
+    const patchSettings = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          failDecline = resolve;
+        }),
+    );
+    const { result } = renderHook(() =>
+      useCadenceOffer({
+        rows,
+        initialRows: rows.current,
+        keepWeekly: false,
+        patchSettings,
+        setCron: vi.fn(async () => true),
+      }),
+    );
+    expect(result.current.offer).not.toBeNull();
+
+    // The decline goes out and is still open when the operator retimes product-master by hand.
+    let declining!: Promise<void>;
+    act(() => {
+      declining = result.current.decline();
+    });
+    expect(result.current.offer).toBeNull();
+
+    // The edit fails FIRST, rolling the row back to the cadence the question is about — but its own
+    // re-ask reads the decline's optimistic opt-out and stays silent, and it withdrew the question
+    // this decline is holding, so the answer's captured offer is no longer restorable either.
+    await act(() =>
+      result.current.aroundSetCron("product-master", async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: HAND_PICKED } };
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return false;
+      }),
+    );
+    expect(result.current.offer).toBeNull();
+
+    // The decline then fails too: the opt-out goes back, and the question is live again — armed
+    // picker, product-master enabled and weekly — with nothing else left to put it on screen.
+    await act(async () => {
+      failDecline(new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
+      await declining;
+    });
+
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
 });
 
 /**

@@ -259,7 +259,9 @@ export function useCadenceOffer({
    * and shown the outcome of it succeeding; the offer has to be back where they can answer it again.
    * Only while it is still a live question, though — the picker can be disarmed and product-master
    * disabled or retimed while this write is open, and none of those leave anything to re-ask (see
-   * {@link restorable}).
+   * {@link restorable}). A withdrawal this panel made in that window is the one case the captured
+   * offer cannot answer, so it is re-derived from the live rows instead of dropped: this write's own
+   * optimistic opt-out is what kept that withdrawal's recovery silent.
    */
   async function decline() {
     const pending = offer;
@@ -275,7 +277,16 @@ export function useCadenceOffer({
       toast.success(`${CADENCE_COUPLED_AUTOMATION} stays weekly`);
     } catch (err) {
       keepWeekly.current = false;
-      if (pending && restorable(pending, at)) setOffer(pending);
+      // Restorable puts the exact question back. When it is not, something withdrew it while this
+      // PATCH was open — and THIS write is what silenced that withdrawal's own recovery, because
+      // every re-ask reads the optimistic opt-out above and stays quiet. Dropping the question here
+      // too would leave an armed picker, a weekly product-master, no persisted opt-out and nothing
+      // on screen until a reload. Re-derived from the live rows, so a picker disarmed or a cadence
+      // retimed in that window still ends the question.
+      if (pending) {
+        if (restorable(pending, at)) setOffer(pending);
+        else ask();
+      }
       toast.error(err instanceof Error ? err.message : "Failed to save your answer");
     }
   }

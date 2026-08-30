@@ -11,7 +11,7 @@
  */
 import { approvalGaps, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { swapUnderLock } from "../beads/claim";
+import { swapUnderLock, type SwapResult } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { resolveOperator } from "../operator";
@@ -204,8 +204,7 @@ export async function applyStep(
     await assertStartHolds(repo, step);
     const write = await lockedWrite(repo, step);
     signal?.throwIfAborted();
-    await runStep(repo, write);
-    return true;
+    return runStep(repo, write);
   });
 }
 
@@ -650,21 +649,26 @@ function ownerStarted(
   return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${doing} would abort it when its claim reaches a bead the board no longer holds`;
 }
 
-/** The bd verb each step resolves to — the only place this module spawns a write. */
-async function runStep(repo: string, step: ApplyStep): Promise<void> {
+/**
+ * The bd verb each step resolves to — the only place this module spawns a write. Answers whether it
+ * LANDED one: only an approve can reach here and find nothing left to write (see
+ * {@link grantApproval}); every other verb writes unconditionally, because the states that make them
+ * no-ops are caught by {@link alreadySatisfied} before the fences ever run.
+ */
+async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
   switch (step.verb) {
     case "reparent":
       await beads.reparent(repo, step.id, step.parent);
-      return;
+      return true;
     case "link":
       // `bd link a b` = b blocks a, which is the direction the detection states.
       await beads.link(repo, step.id, step.blocker, "blocks");
-      return;
+      return true;
     case "reprioritize":
       // Priority alone — no `currentLabels`, so `buildUpdateArgs` diffs no managed prefix and the
       // bead's `approved` / `stage:*` / `source:*` labels are untouched by the write.
       await beads.update(repo, step.id, { priority: step.priority });
-      return;
+      return true;
     case "unapprove":
       // The note FIRST, then the label. Two writes, and only this order is safe to fail between: a
       // note that lands without the untag leaves the approval standing beside an explanation the
@@ -672,19 +676,18 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
       // of the queue saying nothing about why.
       await beads.note(repo, step.id, step.note);
       await beads.untag(repo, step.id, [LABELS.approved]);
-      return;
+      return true;
     case "approve":
-      await grantApproval(repo, step.id);
-      return;
+      return grantApproval(repo, step.id);
     case "close":
       await beads.close(repo, step.id, step.reason);
-      return;
+      return true;
     case "supersede":
       await beads.supersede(repo, step.id, step.replacement);
-      return;
+      return true;
     case "defer":
       await beads.defer(repo, step.id);
-      return;
+      return true;
   }
 }
 
@@ -716,8 +719,11 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
  * the CAS then reports success without writing, because the end state is already what we asked for.
  * Releasing on that path would unassign a claim this apply never made, cancelling somebody else's
  * start in the name of undoing ours.
+ *
+ * Answers whether the gate was granted HERE: a label that landed in the swap's own window makes this
+ * a no-op with a reservation to hand back, which is {@link grantedByAnother}'s question.
  */
-async function grantApproval(repo: string, id: string): Promise<void> {
+async function grantApproval(repo: string, id: string): Promise<boolean> {
   const operator = await resolveOperator();
   const swap = await swapUnderLock(repo, id)(undefined, operator);
   if (!swap.ok) {
@@ -725,6 +731,7 @@ async function grantApproval(repo: string, id: string): Promise<void> {
       `${id} was claimed by ${swap.owner ?? "another writer"} since this proposal was decided — approving it now would start a run on work somebody else has reserved`,
     );
   }
+  if (await grantedByAnother(repo, id, swap, operator)) return false;
   try {
     await beads.approve(repo, id);
   } catch (err) {
@@ -734,6 +741,39 @@ async function grantApproval(repo: string, id: string): Promise<void> {
       `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
     );
   }
+  return true;
+}
+
+/**
+ * Did somebody else grant the gate in the window this CAS just closed? Then the ask is answered, and
+ * the reservation the swap may have taken is handed back rather than kept.
+ *
+ * The label is the one bar no fence above can hold: {@link assertStillStartable} delegates to the
+ * picker's eligibility, which ignores `approved` by design (an approved target is precisely what the
+ * picker offers), so the gap between the subject's re-read and this swap is open to a shell
+ * `bd label` that takes no in-process lock. The swap's own bead is the newest read there is — the
+ * post-write one when it wrote — so asking it here is what makes that window narrow enough to matter.
+ *
+ * Settling rather than refusing, and releasing rather than keeping, is {@link alreadySatisfied}'s
+ * promise held under the lock: the GATE is the whole ask, so their grant is the outcome, and an
+ * unreserved one belongs in the picker's pool where they left it — not converted into this machine's
+ * reservation, which bars every other machine from the work they opened up. Only a swap that WROTE
+ * is unwound, for the reason the label rollback gives: an identity we share with the other anton
+ * processes on this box means a no-op swap is somebody else's claim.
+ */
+async function grantedByAnother(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+): Promise<boolean> {
+  if (!beads.isApproved(swap.bead)) return false;
+  if (swap.wrote && !(await releaseReservation(repo, id, operator))) {
+    throw new Error(
+      `${id} was approved by another writer while this start was reserving it, and the reservation could not be handed back — it is assigned to ${operator ?? "this machine"}, which bars every other machine from picking up work somebody else opened`,
+    );
+  }
+  return true;
 }
 
 /**

@@ -875,6 +875,45 @@ describe("the product master's moves", () => {
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
 
+    it("hands the reservation back when another writer granted the gate mid-swap", async () => {
+      // The one bar no fence above can hold: the start fence delegates to the picker's eligibility,
+      // which ignores `approved` by design — so a shell `bd label`, taking no in-process lock, can
+      // land between the subject's re-read and the CAS. Keeping the claim would convert somebody
+      // else's unreserved grant into this machine's reservation, which is the takeover the settled
+      // path promises never to make.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) {
+          liveBeads.set("anton-a", startable({ labels: [LABELS.approved] }));
+        }
+      };
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      // Taken, then handed straight back — and no second grant written over theirs.
+      expect(calls.slice(0, 2)).toEqual(["assign anton-a operator-1", "assign anton-a "]);
+      expect(calls.filter((c) => c.startsWith("approve"))).toEqual([]);
+      // Nothing landed, so the proposal settles over a board this apply has nothing to roll back on.
+      expect(result.changed).toEqual([]);
+    });
+
+    it("leaves a grant another anton process both reserved and labelled", async () => {
+      // Same window, reached through the CAS's idempotent no-op: the other process shares this
+      // machine's identity, so the swap writes nothing — and a release here would unassign a
+      // reservation this apply never took, cancelling that process's start.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) {
+          liveBeads.set("anton-a", startable({ assignee: "operator-1", labels: [LABELS.approved] }));
+        }
+      };
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      expect(calls.filter((c) => !c.startsWith("note") && !c.startsWith("close"))).toEqual([]);
+      expect(result.changed).toEqual([]);
+    });
+
     it("hands the reservation back when the label write fails, so the retry sees what we saw", async () => {
       // The one order this pair is unsafe to half-apply in. A claim standing without `approved` is a
       // target the picker's own eligibility bars from EVERY holder, this machine's included — so
