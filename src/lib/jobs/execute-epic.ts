@@ -37,7 +37,7 @@ import {
   type WorktreeState,
 } from "../git/ops";
 import { prNumberFromRef } from "../git/pr";
-import { createWorktree, findWorktree, type Worktree } from "../git/worktree";
+import { createWorktree, findWorktree, worktreePathFor, type Worktree } from "../git/worktree";
 import { releaseRunResources } from "./worktree-reaper";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
@@ -571,22 +571,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // Routed through the same teardown as every other terminal exit (anton-hrun.1) rather than a
           // bare removal: this is a `done` outcome like any other, so it owes the same branch policy (a
           // merged PR on a closed bead takes the branch with it) and the same session account.
+          //
+          // A prior attempt that DID tear its checkout down leaves branch-only residue, which owes
+          // that same policy — so an absent checkout falls back to the synthetic descriptor the
+          // teardown accepts (as review-fix's finalize does): a merged PR on a settled target takes
+          // the branch here, instead of leaving it for the next scheduled sweep.
           // Best-effort — a run whose PR is already open must not fail over a cleanup.
           await safe(async () => {
-            const staleWorktree = await findWorktree(repo, branch);
-            if (staleWorktree) {
-              await releaseRunResources({
-                db,
-                clock,
-                ctx,
-                projectId,
-                runId,
-                repoPath: repo,
-                worktree: staleWorktree,
-                beadId: epicBeadId,
-                status: "done",
-              });
-            }
+            const staleWorktree: Worktree = (await findWorktree(repo, branch)) ?? {
+              path: worktreePathFor(repo, branch),
+              branch,
+              baseBranch: branch,
+              repoPath: repo,
+            };
+            await releaseRunResources({
+              db,
+              clock,
+              ctx,
+              projectId,
+              runId,
+              repoPath: repo,
+              worktree: staleWorktree,
+              beadId: epicBeadId,
+              status: "done",
+            });
           });
           await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
           return;

@@ -466,6 +466,52 @@ process.exit(0);`,
     expect(beads.getPrRef(after)).toBe("gh-77");
   });
 
+  it("hands back the leftover BRANCH on the PR-ref short-circuit when the checkout is already gone", async () => {
+    // anton-hrun.1 review (thread PRRT_kwDOTWcq8c6dfU5B): the prior attempt already tore its
+    // worktree down, so the only residue left is the run branch that carried the PR. A later
+    // shortcut that finds the PR merged and the target closed owes that branch back — the teardown
+    // takes a synthetic descriptor for branch-only residue, so cleanup must not be conditional on a
+    // checkout still existing, or the branch lingers until a scheduled sweep happens to catch it.
+    const bugId = await beads.create(repo, {
+      title: "Merged, checkout already gone",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve branch-only teardown on the idempotent path.",
+    });
+    await beads.approve(repo, bugId);
+    await beads.setPrRef(repo, bugId, "gh-91");
+    await beads.close(repo, bugId, "merged");
+    await beads.sync(repo);
+    const branch = `anton/${bugId}`;
+    execFileSync("git", ["-C", repo, "branch", branch]);
+    expect(await findWorktree(repo, branch)).toBeNull(); // branch-only residue: no checkout left
+
+    // gh reports the PR MERGED and no open PR on the branch — the state that lets the teardown take
+    // the branch. `pr create` booms so a fall-through to the PR step fails instead of short-circuiting.
+    const mergedGh = writeBin(
+      binDir,
+      "gh-merged-hrun",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){process.stdout.write(JSON.stringify({state:'MERGED',url:'https://github.com/acme/repo/pull/91',number:91})+'\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='list'){process.stdout.write('[]\\n');process.exit(0);}
+if(a[0]==='pr'&&a[1]==='create'){console.error('gh boom: must not reach PR step');process.exit(1);}
+process.exit(0);`,
+    );
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = mergedGh;
+    try {
+      const job = await driveEpicRun(makeEpicRunner(ctx), { projectId, epicBeadId: bugId });
+      expect((await getJob(tdb.db, job))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+    }
+
+    const branchesNow = execFileSync("git", ["-C", repo, "branch", "--list", branch], {
+      encoding: "utf8",
+    });
+    expect(branchesNow.trim()).toBe(""); // the branch was released, not left for the daily sweep
+  });
+
   it("retries (does not false-complete) when a target's PR ref state can't be read", async () => {
     // anton-jz1 review (thread PRRT_kwDOTWcq8c6SBg3n): a set PR ref only proves completion when
     // its PR is confirmed OPEN or MERGED. An UNKNOWN state (gh down / unparseable ref) is proof of

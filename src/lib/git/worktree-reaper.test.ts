@@ -467,6 +467,54 @@ suite("the sweep over real residue (real git)", () => {
     expect(candidates).toEqual([]);
   });
 
+  it("drops a run row's recorded path once git says another branch is checked out there", async () => {
+    // A historical run's branch outlives its checkout, and the path it remembers is later reused by
+    // another run. Removal is by path and `git worktree remove --force` never checks what is on it,
+    // so carrying the stale path would delete the LIVE checkout — uncommitted work and all — while
+    // reaping the old branch. The old row must contribute branch-only residue.
+    const live = await createWorktree({ repoPath: repo, branch: "anton/anton-new" });
+    execFileSync("git", ["-C", repo, "branch", "anton/anton-stale"]);
+
+    try {
+      const candidates = reapCandidates({
+        repoPath: repo,
+        worktrees: await listWorktrees(repo),
+        branches: ["anton/anton-stale", "anton/anton-new"],
+        runs: [
+          // The stale row still points at what is now `anton/anton-new`'s checkout.
+          { branch: "anton/anton-stale", worktreePath: live.path, status: "done", epicBeadId: "anton-stale" },
+          { branch: live.branch, worktreePath: live.path, status: "done", epicBeadId: "anton-new" },
+        ],
+        beadStatus: () => "settled",
+        branchPrefix: "anton",
+      });
+
+      const stale = candidates.find((c) => c.branch === "anton/anton-stale");
+      expect(stale).toMatchObject({ beadId: "anton-stale", path: undefined });
+      // The branch that actually owns the checkout keeps it — the guard drops the stale claim only.
+      expect(candidates.find((c) => c.branch === live.branch)?.path).toBe(live.path);
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", live.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", "anton/anton-new", "anton/anton-stale"]);
+    }
+  });
+
+  it("keeps a run row's path when git has no record of it — the pruned orphan is still ours to reap", () => {
+    const orphan = join(worktreesRoot, "anton-anton-orphan");
+    const candidates = reapCandidates({
+      repoPath: repo,
+      worktrees: [],
+      branches: ["anton/anton-orphan"],
+      runs: [
+        { branch: "anton/anton-orphan", worktreePath: orphan, status: "done", epicBeadId: "anton-orphan" },
+      ],
+      beadStatus: () => "settled",
+      branchPrefix: "anton",
+    });
+
+    expect(candidates[0].path).toBe(orphan);
+  });
+
   it("finds a branch with no run row at all — the residue a recreated anton.db leaves", () => {
     const candidates = reapCandidates({
       repoPath: repo,

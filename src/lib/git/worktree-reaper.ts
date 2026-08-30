@@ -210,6 +210,20 @@ export function reapCandidates(input: {
   const liveBranches = new Set(
     runs.filter((r) => r.status === "running" || r.status === "queued").map((r) => r.branch),
   );
+  // Git is the only authority on what a path holds NOW. A run row remembers where its checkout was,
+  // and removal is by path (`git worktree remove --force <path>`, which never checks what is on it):
+  // a path since reused for another branch would be deleted with that branch's uncommitted work. So
+  // a recorded path is carried only while git still attributes it to this branch — otherwise the row
+  // contributes branch-only residue. A path git has NO record of is not someone else's either: that
+  // is the pruned-registration orphan this sweep exists to reclaim, and `removeWorktree` proves
+  // ownership of it from its own `.git` marker before deleting anything.
+  const recordAtPath = new Map(worktrees.map((wt) => [resolve(wt.path), wt]));
+  const pathStillOurs = (branch: string, path: string | null): string | undefined => {
+    if (!path) return undefined;
+    const record = recordAtPath.get(resolve(path));
+    if (!record) return path;
+    return record.branch === branch ? path : undefined;
+  };
 
   const candidates = new Map<string, ReapCandidate>();
   const add = (c: ReapCandidate) => {
@@ -232,7 +246,7 @@ export function reapCandidates(input: {
     if (!r.branch || !(checkedOut.has(r.branch) || existingBranches.has(r.branch))) continue;
     add({
       branch: r.branch,
-      path: r.worktreePath ?? undefined,
+      path: pathStillOurs(r.branch, r.worktreePath),
       beadId: r.epicBeadId,
       runLive: liveBranches.has(r.branch),
       bead: beadStatus(r.epicBeadId),
