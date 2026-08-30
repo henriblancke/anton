@@ -69,6 +69,12 @@ export interface ReapEntry {
 export interface ReapReport {
   reaped: ReapEntry[];
   skipped: ReapEntry[];
+  /**
+   * The sweep stopped on its abort signal with candidates still unjudged. The caller must surface it
+   * as a FAILED attempt: a partial sweep returned as success marks the job done and leaves the rest
+   * of the residue until the next daily schedule.
+   */
+  aborted?: boolean;
 }
 
 /** A worktree/branch pair the sweep found, before anything is decided about it. */
@@ -363,8 +369,20 @@ export async function reapWorktrees(args: {
   signal?: AbortSignal;
 }): Promise<ReapReport> {
   const report: ReapReport = { reaped: [], skipped: [] };
+  const refused = (candidate: ReapCandidate, why: string): ReapEntry => ({
+    branch: candidate.branch,
+    path: candidate.path,
+    beadId: candidate.beadId,
+    outcome: "refused",
+    reason: `skipped ${candidate.path ?? candidate.branch}: ${why}`,
+    worktreeRemoved: false,
+    branchDeleted: false,
+  });
   for (const candidate of args.candidates) {
-    if (args.signal?.aborted) break;
+    if (args.signal?.aborted) {
+      report.aborted = true;
+      break;
+    }
     // Only a candidate that is otherwise reapable can cost a `gh` call: everything else is decided
     // before the PR is relevant, and a sweep over an idle project must stay free.
     const settled =
@@ -380,29 +398,32 @@ export async function reapWorktrees(args: {
     }
     // The second cancellation check, and the one that matters: the `gh` lookup above can run for
     // seconds, and nothing has been destroyed yet.
-    if (args.signal?.aborted) break;
+    if (args.signal?.aborted) {
+      report.aborted = true;
+      break;
+    }
     // Re-read and delete as ONE step under the branch's lock (anton-hrun.1). The check is worthless
     // if a run can check the branch out between it and the removal: the sweep would then force-remove
     // a live checkout, uncommitted work and all. Holding the lock across both makes the starting run
     // either visible to the re-read or blocked until the removal is done.
     const entry = await withBranchLock(args.repoPath, candidate.branch, async () => {
       const stale = await args.revalidate?.(candidate);
-      if (stale) {
-        return {
-          branch: candidate.branch,
-          path: candidate.path,
-          beadId: candidate.beadId,
-          outcome: "refused",
-          reason: `skipped ${candidate.path ?? candidate.branch}: ${stale}`,
-          worktreeRemoved: false,
-          branchDeleted: false,
-        } satisfies ReapEntry;
-      }
+      if (stale) return refused(candidate, stale);
+      // Waiting for the lock and re-reading the board are both slow, and the next line deletes: a
+      // cancel that arrived across either of them must stop the sweep HERE, not one candidate later.
+      if (args.signal?.aborted) return refused(candidate, "the sweep was cancelled before deletion");
       return applyPlan(args.repoPath, candidate, plan);
     });
     // Classified on the outcome, never the plan: a checkout locked between planning and removal is
     // refused, and reporting that as reaped would claim work the sweep did not do.
     (entry.outcome === "acted" ? report.reaped : report.skipped).push(entry);
+    // Re-checked after the entry is recorded rather than left to the next iteration: an abort during
+    // the LAST candidate has no next iteration to notice it, and would report a partial sweep as one
+    // that judged everything.
+    if (args.signal?.aborted) {
+      report.aborted = true;
+      break;
+    }
   }
   return report;
 }

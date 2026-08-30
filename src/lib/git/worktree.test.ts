@@ -296,6 +296,52 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  it("SKIPS a checkout locked between the pre-check and the removal, instead of deleting it", async () => {
+    // The remaining TOCTOU window: nothing is locked when the removal is decided, and another tool
+    // takes the lock while `git worktree remove --force` is in flight. Git refuses that removal in
+    // exactly the same words as a moved repo's, so every refusal used to fall into the orphan
+    // `rm -rf` — destroying the uncommitted work the new lock exists to protect.
+    const branch = "anton/run-locked-race";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    writeFileSync(join(wt.path, "in-progress.txt"), "another tool's work\n");
+
+    // A git that takes the lock DURING the removal it then refuses — the race, made deterministic.
+    const shimDir = mkdtempSync(join(tmpdir(), "anton-wt-shim-"));
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(shimDir, "git"),
+      [
+        "#!/bin/sh",
+        'if [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then',
+        `  gitdir=$(sed -n 's/^gitdir: //p' "$6/.git")`,
+        `  printf 'supacode\\n' > "$gitdir/locked"`,
+        '  echo "fatal: cannot remove a locked working tree" >&2',
+        "  exit 1",
+        "fi",
+        `exec ${realGit} "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${prevPath ?? ""}`;
+
+    try {
+      const removal = await removeWorktree(wt, { deleteBranch: true });
+
+      expect(removal.removed).toBe(false);
+      expect(removal.branchDeleted).toBe(false);
+      expect(removal.skipped).toMatch(/locked by another owner \(supacode\)/);
+      expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      rmSync(shimDir, { recursive: true, force: true });
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+      await removeWorktree(wt, { deleteBranch: true });
+    }
+  });
+
   it("removes a verified orphan when the main repository metadata is gone", async () => {
     const orphanRepo = mkdtempSync(join(tmpdir(), "anton-wt-orphan-repo-"));
     const orphanPath = mkdtempSync(join(tmpdir(), "anton-wt-orphan-checkout-"));

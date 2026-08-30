@@ -531,6 +531,12 @@ export async function removeWorktree(
     try {
       await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
     } catch {
+      // git refuses a checkout another tool locked in exactly the same way it fails on a moved repo,
+      // and a lock taken after the pre-check above lands here. Re-read it before the fallback: the
+      // recursive delete is for a STALE registration, never for a checkout someone just claimed —
+      // that owner's uncommitted work is precisely what the lock says must not be destroyed.
+      const raced = await removalBlocker(wt);
+      if (raced) return { removed: false, skipped: raced, branchDeleted: false };
       // The main repository may have been moved or partially deleted before anton is asked to
       // forget it. In that case git cannot remove the worktree, but the checkout is still ours if
       // its .git file points into this repo's worktree administration directory. Remove only that

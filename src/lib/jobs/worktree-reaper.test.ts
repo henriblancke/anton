@@ -214,6 +214,68 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
     }
   });
 
+  it("FAILS the attempt when the sweep is cut short, after logging what it did release", async () => {
+    await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+    await tdb.db.delete(schema.runs).where(eq(schema.runs.projectId, projectId));
+    const first = await createWorktree({ repoPath: repo, branch: "anton/anton-cut1" });
+    const second = await createWorktree({ repoPath: repo, branch: "anton/anton-cut2" });
+    for (const [beadId, wt] of [
+      ["anton-cut1", first],
+      ["anton-cut2", second],
+    ] as const) {
+      await tdb.db.insert(schema.runs).values({
+        id: randomUUID(),
+        projectId,
+        epicBeadId: beadId,
+        branch: wt.branch,
+        worktreePath: wt.path,
+        status: "done",
+      });
+    }
+
+    const board = [
+      { id: "anton-cut1", status: "closed" },
+      { id: "anton-cut2", status: "closed" },
+    ] as Bead[];
+    const controller = new AbortController();
+    const handler = makeWorktreeReaperHandler({
+      db: tdb.db,
+      clock: systemClock,
+      readBoard: async () => board,
+      // The runner's no-progress timeout (or an operator's cancel) lands mid-sweep.
+      lookupPr: async (_repo: string, branch: string) => {
+        if (branch === second.branch) controller.abort();
+        return {};
+      },
+      showBead: async (_repo, id) => ({ status: board.find((b) => b.id === id)?.status ?? "open" }),
+    });
+
+    try {
+      // The runner only turns an aborted attempt into a failure when the handler THROWS: returning
+      // the partial report marked the job successful and left the rest of the residue for tomorrow.
+      await expect(
+        handler({ ...ctx(await jobRow()), signal: controller.signal }),
+      ).rejects.toThrow(/stopped before judging every candidate/);
+
+      expect(existsSync(first.path)).toBe(false);
+      expect(existsSync(second.path)).toBe(true);
+
+      // What it did release is still accounted for — the retry must not re-report it.
+      const sessions = await tdb.db
+        .select()
+        .from(schema.sessions)
+        .where(eq(schema.sessions.projectId, projectId));
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].status).toBe("failed");
+      expect(readFileSync(sessions[0].logPath!, "utf8")).toContain("anton/anton-cut1");
+    } finally {
+      await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
+      await tdb.db.delete(schema.runs).where(eq(schema.runs.projectId, projectId));
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", second.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", second.branch]);
+    }
+  });
+
   it("puts a run's teardown account on the RUN's timeline, not on the job's stream", async () => {
     await tdb.db.delete(schema.sessions).where(eq(schema.sessions.projectId, projectId));
     const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-tdn" });

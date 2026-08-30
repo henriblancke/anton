@@ -331,11 +331,48 @@ suite("the sweep over real residue (real git)", () => {
 
       expect(report.reaped.map((e) => e.branch)).toEqual(["anton/anton-stop1"]);
       expect(report.skipped).toEqual([]);
+      // The partial account must SAY it is partial: the caller turns it into a failed attempt, and a
+      // sweep reported as successful strands the unjudged residue until the next daily schedule.
+      expect(report.aborted).toBe(true);
       expect(existsSync(second.path)).toBe(true);
       expect(branches()).toContain("anton/anton-stop2");
     } finally {
       execFileSync("git", ["-C", repo, "worktree", "remove", "--force", second.path]);
       execFileSync("git", ["-C", repo, "branch", "-D", second.branch]);
+    }
+  });
+
+  it("stops on a cancel that lands INSIDE the lock, after the re-read and before the deletion", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-stop3" });
+    const candidates = [
+      { branch: wt.branch, path: wt.path, beadId: "anton-stop3", runLive: false, bead: "settled" as const },
+    ];
+    const controller = new AbortController();
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates,
+        lookupPr: noPr,
+        // Waiting for the branch lock and re-reading the board are both slow, and the cancel lands
+        // across them — after the last check the sweep used to make, and before the deletion.
+        revalidate: async () => {
+          controller.abort();
+          return undefined;
+        },
+        signal: controller.signal,
+      });
+
+      expect(report.reaped).toEqual([]);
+      expect(report.skipped.map((e) => e.reason)).toEqual([
+        expect.stringContaining("the sweep was cancelled before deletion"),
+      ]);
+      expect(report.aborted).toBe(true);
+      expect(existsSync(wt.path)).toBe(true);
+      expect(branches()).toContain("anton/anton-stop3");
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
     }
   });
 

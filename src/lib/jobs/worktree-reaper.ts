@@ -129,7 +129,9 @@ export async function releaseRunResources(args: {
     });
     await session.log(
       formatReapReport(
-        { reaped: [entry], skipped: [] },
+        // Classified off the outcome exactly as the sweep's report is: a teardown the checkout's
+        // holder refused released nothing and does not belong in the reaped column.
+        entry.outcome === "acted" ? { reaped: [entry], skipped: [] } : { reaped: [], skipped: [entry] },
         `worktree-reaper: run ${args.beadId} settled as ${args.status}`,
       ),
     );
@@ -240,9 +242,13 @@ export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler 
       // candidates; what it already released is still reported below.
       signal: ctx.signal,
     });
-    if (report.reaped.length === 0 && report.skipped.length === 0) return;
-
-    await session.log(formatReapReport(report, `worktree-reaper: ${reapSummary(report)}`));
-    await session.end("done");
+    if (report.reaped.length > 0 || report.skipped.length > 0) {
+      await session.log(formatReapReport(report, `worktree-reaper: ${reapSummary(report)}`));
+      await session.end(report.aborted ? "failed" : "done");
+    }
+    // Thrown AFTER the partial account is written, because the runner only turns a timed-out or
+    // cancelled attempt into a failure when the handler throws. Returning here would mark the job
+    // successful and strand the unjudged residue until the next daily sweep.
+    if (report.aborted) throw new Error("worktree-reaper: sweep stopped before judging every candidate");
   };
 }
