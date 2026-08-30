@@ -158,6 +158,17 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     anchored: true,
   },
   {
+    // SQL's line comment is `--`, which the unknown-language fallback cannot read: `--` is as often
+    // a decrement operator, so it is only a marker where the file says so. Without this grammar a
+    // trailing `-- neverCalled was removed` reads as a call and deletes a true finding. Blocks are
+    // read as nesting because PostgreSQL nests them; a dialect that doesn't only ends up holding a
+    // comment open longer, which leaves a signal standing rather than dropping one.
+    files: /\.(?:sql|psql|pgsql|ddl)$/i,
+    line: ["--"],
+    block: [["/*", "*/"]],
+    nested: true,
+  },
+  {
     files: /\.(?:sh|bash|zsh|ya?ml|toml)$/i,
     line: ["#"],
     block: [],
@@ -339,14 +350,52 @@ const MDX_ESM_LINE = /^\s*(?:import|export)\b/;
 const MDX_TAG = /<\/?\s*$/;
 
 /**
+ * Which lines of an MDX file start inside a block that is still executing — an expression or an
+ * ESM statement left open by an earlier line. Both shapes wrap: `{` on its own line with `Widget()`
+ * under it, or a named import spread over three. Judging each line alone reads those continuations
+ * as markdown and misses the caller they name, which is how a live component keeps costing the
+ * health record a debt point.
+ *
+ * A blank line closes whatever is open. MDX separates its blocks that way, so an unbalanced brace
+ * in prose can only mislead its own paragraph rather than every line below it — the bound that
+ * matters, since reading prose as code is what deletes a true finding.
+ */
+function mdxOpenLines(code: string[]): boolean[] {
+  const open: boolean[] = [];
+  let depth = 0;
+  let esm = false;
+  for (const line of code) {
+    open.push(depth > 0 || esm);
+    if (!line.trim()) {
+      depth = 0;
+      esm = false;
+      continue;
+    }
+    if (depth === 0 && !esm && MDX_ESM_LINE.test(line)) esm = true;
+    for (const char of line) {
+      // Only braces hold an expression open; an import's list can also wrap in `(` or `[`, which
+      // are ordinary punctuation in the markdown around it.
+      if (char === "{" || (esm && (char === "(" || char === "["))) depth += 1;
+      else if (char === "}" || (esm && (char === ")" || char === "]")))
+        depth = Math.max(0, depth - 1);
+    }
+    if (esm && depth === 0) esm = false;
+  }
+  return open;
+}
+
+/**
  * Whether an MDX line uses the symbol or merely names it. MDX executes three shapes — an
  * `import`/`export` statement, a JSX tag, and a braced expression — and everything else in the file
  * is markdown, where a name is being described. Discounting the whole file instead (as `PROSE_FILE`
  * once did) throws away the import that renders a component, and the signal about a live component
  * goes on costing the health record a debt point every night.
+ *
+ * `open` is the same three shapes seen from the line above: inside one of them the whole line is
+ * code, so nothing more has to precede the symbol on it.
  */
-function referencesMdx(line: string | undefined, symbol: string): boolean {
-  if (line !== undefined && MDX_ESM_LINE.test(line)) return referencesWord(line, symbol);
+function referencesMdx(line: string | undefined, symbol: string, open = false): boolean {
+  if (line !== undefined && (open || MDX_ESM_LINE.test(line))) return referencesWord(line, symbol);
   return referencesWord(line, symbol, (head) => MDX_TAG.test(head) || head.includes("{"));
 }
 
@@ -408,6 +457,13 @@ function kindOf(signal: ScanSignal): string {
 /** The `git grep` hits that could be a reference: the lines to check, by file. */
 type CandidateHits = Map<string, number[]>;
 
+/** A file read once and reused across symbols: its comments blanked, plus MDX's cross-line state. */
+interface MaskedFile {
+  code: string[];
+  /** MDX only: whether each line starts inside a block an earlier line left open. */
+  open?: boolean[];
+}
+
 /**
  * The hits that survive the cheap prose tests, by file. `git grep -n -z` writes one record per hit
  * as `path\0line\0text\n`, so a file is judged by its hits rather than by appearing in a filename
@@ -454,22 +510,34 @@ async function codeReferencingFiles(
   repoPath: string,
   symbol: string,
   hits: CandidateHits,
-  masked: Map<string, string[] | undefined>,
+  masked: Map<string, MaskedFile | undefined>,
+  abort?: AbortSignal,
 ): Promise<string[]> {
   const files: string[] = [];
   for (const [file, lines] of hits) {
+    // The reads are the rest of the check once grep has answered, and a busy symbol has many of
+    // them: a job cancelled here must stop rather than read out the list it no longer owes anyone.
+    abort?.throwIfAborted();
     const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
     if (!masked.has(file)) {
       try {
-        const text = await readFile(join(repoPath, file), "utf8");
-        masked.set(file, maskComments(text, syntax));
+        const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
+        const code = maskComments(text, syntax);
+        masked.set(file, MDX_FILE.test(file) ? { code, open: mdxOpenLines(code) } : { code });
       } catch {
+        // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
+        // "proves no caller" and let the pass finish on a verdict nobody asked for.
+        abort?.throwIfAborted();
         masked.set(file, undefined);
       }
     }
-    const code = masked.get(file);
-    const references = MDX_FILE.test(file) ? referencesMdx : referencesWord;
-    if (code && lines.some((line) => references(code[line - 1], symbol))) files.push(file);
+    const entry = masked.get(file);
+    if (!entry) continue;
+    const references = (line: number): boolean =>
+      MDX_FILE.test(file)
+        ? referencesMdx(entry.code[line - 1], symbol, entry.open?.[line - 1] === true)
+        : referencesWord(entry.code[line - 1], symbol);
+    if (lines.some(references)) files.push(file);
   }
   return files;
 }
@@ -503,7 +571,7 @@ function excludePathspecs(exclude: readonly string[]): string[] {
 async function filesMentioning(
   repoPath: string,
   symbol: string,
-  masked: Map<string, string[] | undefined>,
+  masked: Map<string, MaskedFile | undefined>,
   pathspecs: string[],
   abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
@@ -515,7 +583,7 @@ async function filesMentioning(
       maxBuffer: 64 * 1024 * 1024,
       signal: abort,
     });
-    return await codeReferencingFiles(repoPath, symbol, candidateHits(stdout), masked);
+    return await codeReferencingFiles(repoPath, symbol, candidateHits(stdout), masked, abort);
   } catch (err) {
     // A cancelled job is not an unsearchable tree. Reporting the kill as `unavailable` would let the
     // scan finish and record the pass, holding up shutdown and the `--delta` baseline unwind — so
@@ -559,7 +627,7 @@ export async function filterDeadcodeSignals(
   const pathspecs = excludePathspecs(opts.exclude ?? []);
   const seen = new Map<string, string[]>();
   /** One read per file, however many symbols land in it. */
-  const masked = new Map<string, string[] | undefined>();
+  const masked = new Map<string, MaskedFile | undefined>();
   const verdicts = new Map<ScanSignal, string>();
   let unavailable: string | undefined;
   let unchecked = 0;
@@ -600,6 +668,11 @@ export async function filterDeadcodeSignals(
       `${symbol} is referenced in ${shown.join(", ")}${rest > 0 ? ` (+${rest} more)` : ""}`,
     );
   }
+
+  // Cancellation between the last grep and the verdict still cancels the pass: the loop only checks
+  // on its way into a symbol, so without this an abort arriving during the final symbol's reads
+  // would return a result the caller stopped waiting for and let the scan record itself.
+  abort?.throwIfAborted();
 
   if (unavailable) return { kept: signals, deadcode: { dropped: [], unavailable } };
 

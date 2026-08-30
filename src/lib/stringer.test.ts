@@ -1343,14 +1343,36 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
-    // A file anton has no grammar for still has block comments: `.sql` writes them `/* ... */`, and
-    // their continuation lines carry no marker for the line test to see. Accepting one as code
-    // deletes a genuine finding — while a real call below the block still has to count.
-    it("tracks block comments in a file anton has no grammar for, and still counts its callers", async () => {
+    // MDX wraps. An import list runs over three lines and an expression opens its `{` on one of
+    // its own, so the line naming the component carries neither the keyword nor the brace. Reading
+    // each line alone misses the caller and the component goes on being reported dead.
+    it("counts an MDX caller written across lines, and still not the prose beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/imports.mdx": "import {\n  Widget,\n} from '../src/ui/widget';\n",
+        "docs/expression.mdx": "{\n  Widget()\n}\n",
+        "docs/notes.mdx": "Widget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/imports.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/expression.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // SQL comments out the rest of a line with `--`, which can open after code: the line test the
+    // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
+    it("masks a SQL comment opened after code, and still counts the call beside one", async () => {
       const repo = initRepo({
         "src/lib/orphan.ts": "export function neverCalled() {}\n",
-        "db/notes.sql": "/*\nneverCalled was removed\n*/\nSELECT 1;\n",
-        "db/caller.sql": "/*\nneverCalled is called below.\n*/\nSELECT neverCalled();\n",
+        "db/notes.sql": "SELECT 1; -- neverCalled was removed\n",
+        "db/caller.sql": "SELECT neverCalled(); -- still wired up\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/lib/orphan.ts", "neverCalled"),
@@ -1362,6 +1384,27 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
       expect(result.deadcode.dropped[0].reason).toContain("db/caller.sql");
       expect(result.deadcode.dropped[0].reason).not.toContain("db/notes.sql");
+    });
+
+    // A file anton has no grammar for still has block comments: `.hcl` writes them `/* ... */`, and
+    // their continuation lines carry no marker for the line test to see. Accepting one as code
+    // deletes a genuine finding — while a real call below the block still has to count.
+    it("tracks block comments in a file anton has no grammar for, and still counts its callers", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "infra/notes.hcl": "/*\nneverCalled was removed\n*/\nlocals {}\n",
+        "infra/caller.hcl": "/*\nneverCalled is called below.\n*/\nvalue = neverCalled()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("infra/caller.hcl");
+      expect(result.deadcode.dropped[0].reason).not.toContain("infra/notes.hcl");
     });
 
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
