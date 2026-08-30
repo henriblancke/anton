@@ -35,6 +35,13 @@ const FILE_BUDGET = 500;
 /** Languages where `#` starts a comment. In TS/JS a leading `#` is a private class field — code. */
 const HASH_COMMENT_EXTENSIONS = [".py", ".sh", ".bash", ".zsh", ".rb", ".yaml", ".yml", ".toml"];
 
+/**
+ * Where `"""` / `'''` opens a string that spans lines. Python only: in a shell or YAML file the same
+ * three characters are an empty string beside a quote, and reading them as an opener would swallow
+ * the rest of the file.
+ */
+const TRIPLE_QUOTE_EXTENSIONS = [".py", ".pyi"];
+
 /** One duplication signal the filter removed, and the proof that removed it. */
 export interface DroppedDuplication {
   /** The file stringer named, as it spelled it. */
@@ -343,6 +350,60 @@ function maskTemplate(
   return { text, stack: frames };
 }
 
+/** The delimiters a Python string can span lines behind. */
+const TRIPLE_QUOTES = ['"""', "'''"] as const;
+type TripleQuote = (typeof TRIPLE_QUOTES)[number];
+
+/**
+ * Blank the triple-quoted strings a line carries, INCLUDING the one it leaves open — Python's
+ * docstrings and its SQL constants. A `#`-comment file has no template masker and no block-comment
+ * state, so without this the prose inside a docstring reaches the declaration classifiers as syntax:
+ * an example `from package import (` in one opens `import` state that no real `)` ever closes, and
+ * every executable window below it inherits the class and is dropped as a specifier list.
+ *
+ * Single quotes and `#` notes are stepped over rather than parsed, so neither an apostrophe in prose
+ * nor a `"""` inside a comment opens anything. The open delimiter is returned so the next line
+ * resumes behind the one that opened — `'''` does not close a `"""`.
+ */
+function maskTripleQuoted(
+  line: string,
+  open: TripleQuote | undefined,
+): { text: string; open: TripleQuote | undefined } {
+  let quote = open;
+  let text = quote ? '""' : "";
+  let i = 0;
+  while (i < line.length) {
+    if (quote) {
+      // A backslash defers the next character even in a raw string, where it stays in the value but
+      // still cannot end it.
+      if (line[i] === "\\") i += 2;
+      else if (line.startsWith(quote, i)) {
+        quote = undefined;
+        i += 3;
+      } else i += 1;
+      continue;
+    }
+    const opener = TRIPLE_QUOTES.find((delimiter) => line.startsWith(delimiter, i));
+    if (opener) {
+      quote = opener;
+      text += '""';
+      i += 3;
+      continue;
+    }
+    const char = line[i];
+    if (char === "#") break;
+    if (char === "'" || char === '"') {
+      const end = afterQuoted(line, i);
+      text += line.slice(i, end);
+      i = end;
+      continue;
+    }
+    text += char;
+    i += 1;
+  }
+  return { text, open: quote };
+}
+
 /** Net nesting a line opens, over the brackets given — `stripNoise`d, so a brace in a string is not one. */
 function nestingDelta(line: string, open: string, close: string): number {
   const text = stripNoise(line);
@@ -549,7 +610,10 @@ function unclosedBlockComment(line: string): number {
  * inside an interface body — is only knowable from the lines above it. A bare `readFile,` is an
  * import specifier or a function call depending entirely on what opened above it.
  */
-function classifyLines(source: string, opts: { hashComments: boolean }): LineClass[] {
+function classifyLines(
+  source: string,
+  opts: { hashComments: boolean; tripleQuotes: boolean },
+): LineClass[] {
   const classes: LineClass[] = [];
   let inComment = false;
   // Backticks delimit a multiline literal only where the language has one — JS/TS and Go. In a
@@ -560,6 +624,8 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   const blockComments = !opts.hashComments;
   // Empty outside a template; the frames of one it is inside, outermost first.
   let template: TemplateFrame[] = [];
+  // The triple-quote delimiter an open Python string is behind; undefined outside one.
+  let tripleQuote: TripleQuote | undefined;
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
   // Whether the open import is a side-effect one: held as an `import` so it terminates on its own
@@ -607,6 +673,18 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
         continue;
       }
     }
+    // Inside an open triple-quoted string the line is raw text, exactly as template text is: a
+    // docstring's prose declares nothing and its delimiters are not syntax. Read before the comment
+    // and blank tests, since a docstring line starting with `#` is not a comment.
+    if (tripleQuote) {
+      const masked = maskTripleQuoted(line, tripleQuote);
+      tripleQuote = masked.open;
+      line = masked.text.trim();
+      if (tripleQuote || line === "") {
+        classes.push("code");
+        continue;
+      }
+    }
     if (line === "") {
       classes.push("blank");
       continue;
@@ -639,6 +717,16 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
       const masked = maskTemplate(line, template);
       if (masked.stack.length > 0) {
         template = masked.stack;
+        line = masked.text.trim();
+      }
+    }
+
+    // The same for a docstring or a multiline constant this line OPENS: blank its text now, so the
+    // delimiters inside it never reach the import and signature classifiers below.
+    if (opts.tripleQuotes) {
+      const masked = maskTripleQuoted(line, undefined);
+      if (masked.open) {
+        tripleQuote = masked.open;
         line = masked.text.trim();
       }
     }
@@ -854,6 +942,7 @@ function sourceIndex(repoPath: string) {
       status: "read",
       lines: classifyLines(source, {
         hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
     cache.set(path, result);

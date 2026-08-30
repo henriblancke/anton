@@ -1899,6 +1899,46 @@ describe("scan", () => {
       expect(result.duplication.dropped[1].reason).toContain("5 import");
     });
 
+    // A Python docstring is prose with no comment marker on its lines, and it routinely quotes
+    // example code. Untracked, an example `from package import (` opens import state that no real
+    // `)` closes, and every executable window below it in the file is dropped as a specifier list.
+    it("tracks a Python docstring so an import example inside it cannot swallow the code below", async () => {
+      const repo = writeRepo({
+        "src/docstring.py": [
+          "def load(rows):",
+          '    """Load rows.',
+          "",
+          "    Example:",
+          "        from package.module import (",
+          '    """',
+          "    total = compute(rows)",
+          "    report(total)",
+          "    flush(report)",
+          "",
+        ].join("\n"),
+        "src/grouped.py": [
+          "from package.module import (",
+          "    parse_bd_version,",
+          "    preflight_bd,",
+          "    resolve_bd_bin,",
+          ")",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/docstring.py", 7]], 3),
+        clone([["src/grouped.py", 1]], 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the real specifier list beside it is still dropped, so the survivor is the
+      // docstring state rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/docstring.py" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/grouped.py" }]);
+      expect(result.duplication.dropped[0].reason).toContain("5 import");
+    });
+
     // A block comment can open AFTER code — `value: string, /* why`. Left unread, the prose below it
     // counts as syntax: its unmatched `(` holds the parameter list open past the real `)` and files
     // every call in the body as more parameter list.
