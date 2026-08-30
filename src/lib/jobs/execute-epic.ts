@@ -1695,7 +1695,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // back for. It cannot settle as "nothing was written" — the id has to reach the operator.
         let stranded: StrandedHumanGateError | undefined;
         try {
-          gate = await armHumanGate(repo, epicBeadId, e.ask, ctx.signal);
+          gate = await armHumanGate(repo, epicBeadId, e, ctx.signal);
         } catch (failure) {
           if (failure instanceof StrandedHumanGateError) stranded = failure;
           gateError = failure instanceof Error ? failure.message : String(failure);
@@ -2283,12 +2283,33 @@ async function armMergeGate(
 // ── human wait (anton-287p) ──
 
 /**
+ * An ask as its TICKET raised it — the two halves a gate reason is composed from.
+ * {@link NeedsHumanError} satisfies it structurally, so the run's catch passes the error itself.
+ */
+export interface HumanAsk {
+  /** The ticket that raised the ask — where an ANSWER goes, as a human note. */
+  ticketId: string;
+  /** The agent's ask, verbatim. Undefined when it named none. */
+  ask: string | undefined;
+}
+
+/**
  * The reason a human gate carries for THIS ask — the string the gate is identified by, so the arm
  * can tell "this ask is already with someone" from "the ask has changed". Shared by the plan and
  * the create so the two can never disagree about what an armed gate looks like.
+ *
+ * It NAMES the asking ticket (PR #205 review), because the gate's reason is the only evidence the
+ * ask leaves on the board: the gate blocks the RUN TARGET, so a feature with several children gives
+ * the escalation surface no way back to the child that stopped — and an answer left on the feature
+ * never reaches the resumed session, which reads human notes off the ticket it re-dispatches.
+ *
+ * `<ticket> needs a human: <ask>` is a SHAPE, not just prose: the escalation surface reads the
+ * ticket back off it (`askOf`, jobs/run-health.ts), so the two are pinned by a test each.
  */
-export function humanGateReason(targetId: string, ask: string | undefined): string {
-  return ask ?? `${targetId} stopped for a human, but the agent named no ask`;
+export function humanGateReason(targetId: string, { ticketId, ask }: HumanAsk): string {
+  return `${ticketId} needs a human: ${
+    ask ?? `${targetId} stopped for a human, but the agent named no ask`
+  }`;
 }
 
 /**
@@ -2399,7 +2420,8 @@ export interface ArmedHumanGate {
 export async function armHumanGate(
   repo: string,
   targetId: string,
-  ask: string | undefined,
+  /** The ask AND the ticket that raised it — both go into the gate's reason (PR #205 review). */
+  ask: HumanAsk,
   /** The run's LIVE cancellation signal, re-read immediately before every board write below. */
   signal?: AbortSignal,
 ): Promise<ArmedHumanGate> {
@@ -2651,6 +2673,12 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
  *     gate is the durable half (run-health reports an open human gate from the instant it opens)
  *     and the job parks LOUDLY naming it, rather than retrying into a park that says "blocked".
  *
+ * The first two are decided by the LIVE signal alone, never by whether the write landed (PR #205
+ * review): a kill can arrive inside a settle that then rejects too, and reading the failure first
+ * would report a stopped run as an ordinary armed ask, with its gate blocking a target nobody
+ * returns to. So cancellation is checked first, and the park write's own failure — still true of
+ * the row when the corrective write fails as well — rides out alongside it.
+ *
  * The second write in the cancelled outcome can fail the same way, and then only the message
  * changes: the unwind's verdict on the gate already happened, so it is carried through
  * ({@link unsettledCancelledAskMessage}) instead of being restated as still armed.
@@ -2663,7 +2691,7 @@ export async function settleArmedAsk(args: {
   /** The error the run's catch received, for the cancelled form of the ask. */
   raw: unknown;
   gate: ArmedHumanGate;
-  /** The run's LIVE cancellation signal, re-read AFTER the settle write. */
+  /** The run's LIVE cancellation signal, re-read AFTER the park write — landed or not. */
   signal: AbortSignal;
   now: () => number;
   /** Write the row, answering with the failure message when the write did not land. */
@@ -2671,15 +2699,20 @@ export async function settleArmedAsk(args: {
 }): Promise<unknown> {
   const { targetId, ask, raw, gate, signal, settle } = args;
   let thrown: unknown = ask;
-  let unsettled = await settle({
+  const parkFailure = await settle({
     status: "parked",
     error: needsHumanParkMessage(ask, gate.gateId, gate.held),
   });
+  let unsettled = parkFailure;
   // Whether the cancelled unwind below already decided what the board holds. Its verdict — gate
   // taken back, or gate stranded — is the truth about the gate even if the corrective row write
   // then fails, so the still-armed message must not overwrite it.
   let cancelled = false;
-  if (!unsettled && signal.aborted) {
+  // The kill is read INDEPENDENTLY of whether the park write landed (PR #205 review): a force-kill
+  // that arrives inside a settle which then also rejects (SQLITE_BUSY) is still a cancelled run, and
+  // gating the unwind on the write would report it as an ordinary armed ask — leaving the gate this
+  // run created blocking a target nobody is coming back for.
+  if (signal.aborted) {
     cancelled = true;
     const undone = gate.undo ? await gate.undo() : false;
     // Undone, nothing on the board carries the ask — which is exactly what the cancelled form of
@@ -2699,11 +2732,15 @@ export async function settleArmedAsk(args: {
             ),
           ),
         );
-    unsettled = await settle({
+    const corrective = await settle({
       status: "failed",
       error: thrown instanceof Error ? thrown.message : String(thrown),
       endedAt: args.now(),
     });
+    // The corrective write is the row's last word: when it lands the row is right and a failed park
+    // write before it is spent history. When it does not, BOTH failures are still true of the row,
+    // so both ride out in the error rather than only the one that happened last.
+    unsettled = corrective && parkFailure ? `${parkFailure}, then ${corrective}` : corrective;
   }
   if (unsettled) {
     console.error(

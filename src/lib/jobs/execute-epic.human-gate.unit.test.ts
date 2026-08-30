@@ -60,7 +60,12 @@ const {
 } = await import("./execute-epic");
 
 const REPO = "/tmp/anton";
+const TICKET = "t-1";
 const ASK = "the staging DB password has to be rotated by a person";
+/** The ask AND the ticket that raised it — what the run's catch hands the arm. */
+const ASKED = { ticketId: TICKET, ask: ASK };
+/** The reason the arm composes onto the gate: the ask, prefixed by the ticket that raised it. */
+const REASON = `${TICKET} needs a human: ${ASK}`;
 
 /** A target blocked by the given gates, as a board read returns it. */
 const target = (...gateIds: string[]): Bead =>
@@ -101,10 +106,10 @@ it("pulls the shared board before it plans, so a gate another machine armed is v
   });
   loadAllIssuesMock.mockImplementation(async () => {
     order.push("read");
-    return [target("g-elsewhere"), gate("g-elsewhere", ASK, [])];
+    return [target("g-elsewhere"), gate("g-elsewhere", REASON, [])];
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-elsewhere",
     held: [],
   });
@@ -119,7 +124,7 @@ it("refuses to arm on a board it could not refresh, rather than planning against
   // the ask, which a person can act on; a duplicate human gate is a wait no resolve can end.
   pullMock.mockRejectedValue(new Error("dolt pull: remote unreachable"));
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).rejects.toThrow("could not be refreshed");
+  await expect(armHumanGate(REPO, "f-1", ASKED)).rejects.toThrow("could not be refreshed");
   expect(loadAllIssuesMock).not.toHaveBeenCalled();
   expect(gateCreateMock).not.toHaveBeenCalled();
 });
@@ -128,7 +133,7 @@ it("reads the board strictly, so a failed gate listing can never read as 'nothin
   loadAllIssuesMock.mockResolvedValue([]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-new",
     held: [],
     undo: expect.any(Function),
@@ -139,7 +144,7 @@ it("reads the board strictly, so a failed gate listing can never read as 'nothin
 it("refuses to arm on a board it could not read, rather than stacking a second wait on the same ask", async () => {
   loadAllIssuesMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).rejects.toThrow("database is locked");
+  await expect(armHumanGate(REPO, "f-1", ASKED)).rejects.toThrow("database is locked");
   expect(gateCreateMock).not.toHaveBeenCalled();
 });
 
@@ -147,7 +152,7 @@ it("labels the gate it arms, so a later ask can tell its own leftover from a per
   loadAllIssuesMock.mockResolvedValue([target()]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  await armHumanGate(REPO, "f-1", ASK);
+  await armHumanGate(REPO, "f-1", ASKED);
   expect(tagMock).toHaveBeenCalledWith(REPO, "g-new", [HUMAN_GATE_ARMED_LABEL]);
 });
 
@@ -156,7 +161,7 @@ it("still parks on the gate when the label write is lost — the ask is already 
   gateCreateMock.mockResolvedValue("g-new");
   tagMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-new",
     held: [],
     undo: expect.any(Function),
@@ -171,7 +176,7 @@ it("aborts when its own superseded gate cannot be resolved, instead of parking b
   gateCreateMock.mockResolvedValue("g-new");
   gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  const failure = await armHumanGate(REPO, "f-1", ASK).catch((e) => e);
+  const failure = await armHumanGate(REPO, "f-1", ASKED).catch((e) => e);
   expect(failure).toBeInstanceOf(StrandedHumanGateError);
   expect(failure.gateIds).toEqual(["g-new", "g-old"]);
   expect(failure.message).toContain("bd gate resolve g-old");
@@ -186,7 +191,7 @@ it("arms the replacement BEFORE retiring the wait it supersedes", async () => {
 
   // No `undo` past the retire: `g-old` is closed, so taking `g-new` back would leave the target
   // with no wait at all on an ask nobody answered.
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-new",
     held: [],
     undo: undefined,
@@ -204,7 +209,7 @@ it("leaves the superseded wait open when the replacement cannot be created", asy
   loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
   gateCreateMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).rejects.toThrow("database is locked");
+  await expect(armHumanGate(REPO, "f-1", ASKED)).rejects.toThrow("database is locked");
   expect(gateResolveMock).not.toHaveBeenCalled();
 });
 
@@ -218,7 +223,7 @@ it("keeps the superseded wait when the kill lands inside `gate create` and the n
     return "g-new";
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateResolveMock).toHaveBeenCalledTimes(1);
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
 });
@@ -233,7 +238,7 @@ it("lets the armed gate stand when the kill lands inside the supersede, and name
     controller.abort();
   });
 
-  const failure = await armHumanGate(REPO, "f-1", ASK, controller.signal).catch((e) => e);
+  const failure = await armHumanGate(REPO, "f-1", ASKED, controller.signal).catch((e) => e);
   expect(failure).toBeInstanceOf(StrandedHumanGateError);
   expect(failure.gateIds).toEqual(["g-new"]);
   expect(gateResolveMock).toHaveBeenCalledTimes(1); // only the supersede — g-new is never undone
@@ -245,11 +250,11 @@ it("retires the superseded wait on the REUSE path too, behind the gate already c
   // after the named gate is resolved.
   loadAllIssuesMock.mockResolvedValue([
     target("g-mine", "g-old"),
-    gate("g-mine", ASK),
+    gate("g-mine", REASON),
     gate("g-old", "an older ask"),
   ]);
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({ gateId: "g-mine", held: [] });
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({ gateId: "g-mine", held: [] });
   expect(gateCreateMock).not.toHaveBeenCalled();
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-old", expect.stringMatching(/superseded/));
 });
@@ -264,7 +269,7 @@ it("never resolves a human gate anton did not arm, and reports it back for the p
   ]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-new",
     held: ["g-theirs"],
     undo: expect.any(Function),
@@ -282,7 +287,7 @@ it("creates no gate when the run is killed while the board is being read (anton-
     return [target()];
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateCreateMock).not.toHaveBeenCalled();
 });
 
@@ -295,7 +300,7 @@ it("leaves its own superseded gate alone when the kill lands mid-read, rather th
     return [target("g-old"), gate("g-old", "an older ask")];
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateResolveMock).not.toHaveBeenCalled();
   expect(gateCreateMock).not.toHaveBeenCalled();
 });
@@ -311,7 +316,7 @@ it("undoes the gate it just created when the kill lands inside `gate create` (an
     return "g-new";
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
   expect(tagMock).not.toHaveBeenCalled(); // nothing is left to label
 });
@@ -327,7 +332,7 @@ it("names the gate it could not undo, because nothing else ever will", async () 
   });
   gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  const failure = await armHumanGate(REPO, "f-1", ASK, controller.signal).catch((e) => e);
+  const failure = await armHumanGate(REPO, "f-1", ASKED, controller.signal).catch((e) => e);
   expect(failure).toBeInstanceOf(StrandedHumanGateError);
   expect(failure.gateId).toBe("g-new");
   expect(failure.message).toContain("bd gate resolve g-new");
@@ -344,7 +349,7 @@ it("undoes the gate when the kill lands inside the label write, the last uninter
     controller.abort();
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
 });
 
@@ -357,7 +362,7 @@ it("names the gate it could not undo after a kill inside the label write", async
   });
   gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
 
-  const failure = await armHumanGate(REPO, "f-1", ASK, controller.signal).catch((e) => e);
+  const failure = await armHumanGate(REPO, "f-1", ASKED, controller.signal).catch((e) => e);
   expect(failure).toBeInstanceOf(StrandedHumanGateError);
   expect(failure.gateId).toBe("g-new");
 });
@@ -369,10 +374,10 @@ it("refuses to REUSE an armed gate when the kill lands mid-read, rather than par
   const controller = new AbortController();
   loadAllIssuesMock.mockImplementation(async () => {
     controller.abort();
-    return [target("g-mine"), gate("g-mine", ASK)];
+    return [target("g-mine"), gate("g-mine", REASON)];
   });
 
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
   expect(gateResolveMock).not.toHaveBeenCalled();
   expect(gateCreateMock).not.toHaveBeenCalled();
 });
@@ -382,7 +387,7 @@ it("arms as usual while the run is still live", async () => {
   gateCreateMock.mockResolvedValue("g-new");
 
   const controller = new AbortController();
-  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).resolves.toEqual({
     gateId: "g-new",
     held: [],
     undo: expect.any(Function),
@@ -396,7 +401,7 @@ it("offers the caller an undo for the gate it created, for a kill that lands aft
   loadAllIssuesMock.mockResolvedValue([target()]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  const armed = await armHumanGate(REPO, "f-1", ASK);
+  const armed = await armHumanGate(REPO, "f-1", ASKED);
   await expect(armed.undo!()).resolves.toBe(true);
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
 });
@@ -405,15 +410,15 @@ it("reports an undo that failed, so the caller names the gate instead of assumin
   loadAllIssuesMock.mockResolvedValue([target()]);
   gateCreateMock.mockResolvedValue("g-new");
 
-  const armed = await armHumanGate(REPO, "f-1", ASK);
+  const armed = await armHumanGate(REPO, "f-1", ASKED);
   gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
   await expect(armed.undo!()).resolves.toBe(false);
 });
 
 it("offers NO undo for a wait an earlier attempt armed — it is not this run's to take back", async () => {
-  loadAllIssuesMock.mockResolvedValue([target("g-mine"), gate("g-mine", ASK)]);
+  loadAllIssuesMock.mockResolvedValue([target("g-mine"), gate("g-mine", REASON)]);
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-mine",
     held: [],
     undo: undefined,
@@ -423,11 +428,11 @@ it("offers NO undo for a wait an earlier attempt armed — it is not this run's 
 it("reports a person's hold beside a wait it REUSES, not only beside one it creates", async () => {
   loadAllIssuesMock.mockResolvedValue([
     target("g-mine", "g-theirs"),
-    gate("g-mine", ASK),
+    gate("g-mine", REASON),
     gate("g-theirs", "hold: talking to legal", []),
   ]);
 
-  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
     gateId: "g-mine",
     held: ["g-theirs"],
   });
@@ -670,4 +675,83 @@ it("keeps the STRANDED verdict when the corrective write fails after a mid-park 
   expect((thrown as Error).message).toContain("bd gate resolve g-new");
   expect((thrown as Error).message).toContain("re-run the target");
   expect((thrown as Error).message).toContain("database is locked");
+});
+
+it("unwinds the cancellation even when the park write ITSELF failed", async () => {
+  // The window the old `!unsettled && signal.aborted` missed (PR #205 review): a force-kill can land
+  // inside a settle that then also rejects (SQLITE_BUSY), and gating the unwind on the write having
+  // landed reported that stopped run as an ordinary armed ask — leaving the gate this run created
+  // blocking a target nobody is coming back for.
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      if (row.patches.length === 1) {
+        controller.abort(); // the kill lands while the park write is failing
+        return "SQLITE_BUSY: database is locked";
+      }
+      return undefined;
+    },
+  };
+  let undone = false;
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: {
+      gateId: "g-new",
+      held: [],
+      undo: async () => {
+        undone = true;
+        return true;
+      },
+    },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(undone).toBe(true);
+  expect(row.patches.map((p) => p.status)).toEqual(["parked", "failed"]);
+  // The corrective write landed, so the row is accurate and the failed park before it is spent
+  // history: the ask reached no gate, and nothing sends the operator to `bd gate resolve`.
+  expect(String(row.patches[1].error)).toContain("armed NO gate");
+  expect((thrown as Error).message).toContain("armed NO gate");
+  expect((thrown as Error).message).not.toContain("bd gate resolve g-new");
+  expect((thrown as Error).message).not.toContain("database is locked");
+});
+
+it("carries BOTH write failures when the corrective write fails after a failed park write", async () => {
+  // Neither write landed, so both are still true of the row — the run history may say anything at
+  // all, and the error is the only place the operator learns what the board actually holds.
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      if (row.patches.length === 1) {
+        controller.abort();
+        return "SQLITE_BUSY: the park write";
+      }
+      return "SQLITE_BUSY: the corrective write";
+    },
+  };
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    // No `undo` — the arm superseded an older wait, so the gate stands and has to be named.
+    gate: { gateId: "g-new", held: [] },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect((thrown as Error).name).toBe("PoisonError");
+  expect((thrown as Error).message).toContain("bd gate resolve g-new");
+  expect((thrown as Error).message).toContain("the park write");
+  expect((thrown as Error).message).toContain("the corrective write");
 });

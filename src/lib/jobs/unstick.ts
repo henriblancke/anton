@@ -437,12 +437,15 @@ export async function resumeEpic(
  */
 export function escalationNote(finding: RunHealthFinding, escalationId: string): string {
   const reason = finding.reason.replace(/\s+/g, " ").trim();
+  // This note lands on the RUN TARGET, so an ask has to name the ticket it came from: the resumed
+  // session reads its steering off that ticket's own notes, and one left here reaches no dispatch.
+  const answer = finding.askBeadId ? ` Answer on ${finding.askBeadId}, as a note.` : "";
   // The escalation id is stamped in because bd notes are append-only with no dedupe: if the note
   // lands but `markEscalationNoted` doesn't, the next pass writes it again, and the token is what
   // tells a human reading the bead that the two entries are one escalation rather than two stalls.
   return (
-    `anton: escalated a ${finding.kind} [${escalationId.slice(0, 8)}] — ${reason}. Nothing will ` +
-    `retry this automatically; resume or abandon it from the anton board.`
+    `anton: escalated a ${finding.kind} [${escalationId.slice(0, 8)}] — ${reason}.${answer} ` +
+    `Nothing will retry this automatically; resume or abandon it from the anton board.`
   );
 }
 

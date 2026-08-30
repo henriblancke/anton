@@ -805,9 +805,17 @@ describe("humanGatePlan", () => {
   });
 
   it("matches the ask an agent that named none gets, so that gate is reused too", () => {
-    const reason = humanGateReason("f-1", undefined);
+    const reason = humanGateReason("f-1", { ticketId: "t-1", ask: undefined });
     const plan = humanGatePlan([target("g-1"), gate("g-1", reason)], "f-1", reason);
     expect(plan.open?.id).toBe("g-1");
+  });
+
+  it("names the asking TICKET in the reason, not just the target the gate blocks", () => {
+    // The gate blocks the run target, so on a feature with several children its own id is the only
+    // thing the escalation surface could otherwise recover (PR #205 review) — and an answer left on
+    // the feature reaches no dispatch: the resumed session reads notes off the ticket it re-runs.
+    expect(humanGateReason("f-1", { ticketId: "t-9", ask: ASK })).toBe(`t-9 needs a human: ${ASK}`);
+    expect(humanGateReason("f-1", { ticketId: "t-9", ask: undefined })).toContain("t-9 needs a human:");
   });
 });
 

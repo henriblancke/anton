@@ -151,6 +151,10 @@ process.exit(0);`),
       expect(gates[0].await_type).toBe("human");
       expect(gates[0].status).not.toBe("closed");
       expect(gates[0].description ?? "").toContain(ask);
+      // …and NAMES the child that raised it (PR #205 review). The gate blocks the FEATURE, so
+      // without this the escalation surface can only point at the feature — while an answer only
+      // steers the resumed session from the ticket it re-dispatches.
+      expect(gateReason(gates[0])).toBe(`${feature.ticket} needs a human: ${ask}`);
 
       // The run is PARKED (not done, not failed) with no endedAt — it is waiting on a person, and
       // the resume reuses this row. Its error names the ask and the command that releases it.
@@ -215,9 +219,10 @@ process.exit(0);`),
     const ask = "the staging DB password MARKER_PW has to be rotated by a person";
     const feature = await approvedFeature("Needs a rotation");
 
-    const { gateId: first } = await armHumanGate(repo, feature.id, ask);
+    const asked = { ticketId: feature.ticket, ask };
+    const { gateId: first } = await armHumanGate(repo, feature.id, asked);
     // same ask ⇒ same wait
-    expect((await armHumanGate(repo, feature.id, ask)).gateId).toBe(first);
+    expect((await armHumanGate(repo, feature.id, asked)).gateId).toBe(first);
     expect((await gatesBlocking(feature.id)).map((g) => g.id)).toEqual([first]);
 
     // The label is what makes the supersede below anton's to make — a gate without it reads as a
@@ -225,7 +230,10 @@ process.exit(0);`),
     expect((await gatesBlocking(feature.id))[0].labels ?? []).toContain(HUMAN_GATE_ARMED_LABEL);
 
     const newer = "actually MARKER_ZONE needs a DNS record first";
-    const { gateId: second } = await armHumanGate(repo, feature.id, newer);
+    const { gateId: second } = await armHumanGate(repo, feature.id, {
+      ticketId: feature.ticket,
+      ask: newer,
+    });
     expect(second).not.toBe(first);
 
     // One open wait, carrying the current ask. Nothing else would ever have closed the old one:
@@ -233,7 +241,7 @@ process.exit(0);`),
     // would block this target on an ask nobody is answering.
     const open = await gatesBlocking(feature.id);
     expect(open.map((g) => g.id)).toEqual([second]);
-    expect(gateReason(open[0])).toBe(newer);
+    expect(gateReason(open[0])).toBe(`${feature.ticket} needs a human: ${newer}`);
     const all = await beads.gateList(repo, { all: true });
     expect(all.find((g) => g.id === first)?.status).toBe("closed");
   });
@@ -249,7 +257,10 @@ process.exit(0);`),
       reason: "hold: MARKER_HOLD until the contract is signed",
     });
 
-    const armed = await armHumanGate(repo, feature.id, "the sandbox key MARKER_KEY is not mine to make");
+    const armed = await armHumanGate(repo, feature.id, {
+      ticketId: feature.ticket,
+      ask: "the sandbox key MARKER_KEY is not mine to make",
+    });
 
     const open = await gatesBlocking(feature.id);
     expect(open.map((g) => g.id).sort()).toEqual([armed.gateId, hold].sort());
@@ -263,7 +274,9 @@ process.exit(0);`),
     // gate bead behind, blocking nothing. Refusing up front is what keeps a retry from filing one
     // orphan per attempt.
     const before = (await beads.gateList(repo, { all: true })).length;
-    await expect(armHumanGate(repo, ctx.epicId, "an ask an epic cannot carry")).rejects.toThrow(
+    await expect(
+      armHumanGate(repo, ctx.epicId, { ticketId: "t-1", ask: "an ask an epic cannot carry" }),
+    ).rejects.toThrow(
       /is an epic/,
     );
     expect((await beads.gateList(repo, { all: true })).length).toBe(before);

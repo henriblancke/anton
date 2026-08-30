@@ -385,6 +385,30 @@ describe("detectOpenHumanGates", () => {
     expect(finding.ageMs).toBe(3 * HOUR);
   });
 
+  it("recovers the asking TICKET from a gate anton armed, and strips it off the reason", () => {
+    // The gate blocks the RUN TARGET, so on a feature with several children nothing else on the
+    // board says which one stopped (PR #205 review) — and an answer only steers the resumed session
+    // from that child's notes. anton stamps it into the reason; this is the read back.
+    const armed = gate("g-1", {
+      description: "Ad-hoc gate blocking f-1\n\nReason: t-1 needs a human: which region do we bill from?",
+    });
+
+    const [finding] = detectOpenHumanGates([armed], gatedBoard(), NOW);
+
+    expect(finding.askBeadId).toBe("t-1");
+    // Read once, not twice: the row prints the reason, and a "t-1 needs a human:" left inside it
+    // would repeat the id the row already shows on its own.
+    expect(finding.reason).toContain("which region do we bill from?");
+    expect(finding.reason).not.toContain("needs a human:");
+  });
+
+  it("leaves a hand-made gate's reason whole — a person's hold names no asking ticket", () => {
+    const [finding] = detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW);
+
+    expect(finding.askBeadId).toBeUndefined();
+    expect(finding.reason).toContain("needs a design call");
+  });
+
   it("says so plainly when the gate carries no reason, rather than reporting nothing", () => {
     const bare = gate("g-1", { description: "Ad-hoc gate blocking t-1" });
 

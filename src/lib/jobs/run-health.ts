@@ -281,6 +281,23 @@ function gateReason(gate: Gate): string | undefined {
 }
 
 /**
+ * The ticket anton stamped on the gate when it armed the ask (`<ticket> needs a human: <ask>`,
+ * jobs/execute-epic.ts), split off the reason so the row can NAME it.
+ *
+ * It is the only way back to that ticket (PR #205 review): the gate blocks the RUN TARGET, so on a
+ * feature with several children the blocked bead says nothing about which child stopped — and an
+ * answer belongs on the child, whose notes the resumed session reads as binding steering. A gate a
+ * person hung by hand carries no such prefix and keeps its reason whole.
+ */
+const ARMED_ASK = /^(\S+) needs a human:\s*/;
+
+function askOf(reason: string | undefined): { askBeadId?: string; reason?: string } {
+  const match = reason ? ARMED_ASK.exec(reason) : null;
+  if (!match || !reason) return { reason };
+  return { askBeadId: match[1], reason: reason.slice(match[0].length) || undefined };
+}
+
+/**
  * OPEN human gates — the one stall class that is stuck BY DESIGN. Every other detector reports work
  * that stopped by accident; a human gate is a wait somebody asked for, and precisely because bd will
  * never resolve it (`bd gate check` skips `human` entirely) it waits forever unless a person is told
@@ -296,6 +313,9 @@ function gateReason(gate: Gate): string | undefined {
  * anton actually re-enqueues, which for a gated ticket is its feature, not the ticket. A gate whose
  * blocked bead has no run target above it (pipeline plumbing, or a bead this board read doesn't
  * carry) still reports: the wait is real even when anton cannot map it to a run.
+ *
+ * A fourth, for ANSWERING rather than resuming: the ticket that raised the ask ({@link askOf}),
+ * which none of the three above recover on a feature with several children.
  */
 export function detectOpenHumanGates(
   gates: Gate[],
@@ -313,17 +333,19 @@ export function detectOpenHumanGates(
     const created = gate.created_at ? Date.parse(gate.created_at) : NaN;
     const since = Number.isNaN(created) ? nowMs : created;
     const ageMs = Math.max(0, nowMs - since);
+    const { askBeadId, reason } = askOf(gateReason(gate));
     findings.push({
       kind: "needs-human",
       // Keyed on the GATE, which is the stall: stable across sweeps (bd ids never change), so one
       // wait raises one escalation however many times the sweep runs.
       key: `needs-human:${gate.id}`,
-      reason: `waiting on a human ${humanAge(ageMs)}: ${gateReason(gate) ?? "no reason recorded on the gate"}`,
+      reason: `waiting on a human ${humanAge(ageMs)}: ${reason ?? "no reason recorded on the gate"}`,
       since,
       ageMs,
       gateId: gate.id,
       beadId: blocked?.id,
       targetBeadId: target?.id,
+      askBeadId,
     });
   }
   return findings;

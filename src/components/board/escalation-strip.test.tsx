@@ -202,6 +202,19 @@ describe("EscalationStrip", () => {
     expect(hints[0]!.textContent).toContain("resolving the gate carries no answer back");
   });
 
+  it("NAMES the ticket the answer goes on when the gate recorded it", () => {
+    // "the ticket" is ambiguous the moment a feature has more than one child, and the note only
+    // steers the resumed session from the child that raised the ask — one left on the feature
+    // reaches no dispatch at all, so the same question comes back on resume.
+    renderStrip([
+      escalation({ kind: "needs-human", gateId: "g-1", askBeadId: "anton-9k", runId: undefined }),
+    ]);
+
+    const hint = screen.getByText(/belongs on/).textContent ?? "";
+    expect(hint).toContain("anton-9k");
+    expect(hint).not.toContain("belongs on the ticket");
+  });
+
   it("answers a wait on a person with resolve-and-resume, and never with Dismiss", () => {
     // Dismiss would settle the row while leaving the gate open — an acknowledged wait that nothing
     // ends, re-raised on every sweep. Abandon stays: "I'm not doing this" is a real answer.
