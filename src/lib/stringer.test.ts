@@ -1343,6 +1343,53 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // A code example is fenced with three or more backticks OR tildes, and the delimiter is the
+    // fence rather than the backticks inside it. Pairing backticks one at a time sees no fence in
+    // `~~~~tsx` and pairs an even-length one off against itself, so the example's `<Widget />`
+    // reads as a rendered tag and erases a finding that was right.
+    it("reads a tilde fence and an even-length backtick fence as an example, not a caller", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/tilde.mdx": "How it looked:\n\n~~~~tsx\n<Widget />\n~~~~\n",
+        "docs/even.mdx": "How it looked:\n\n````tsx\n<Widget />\n````\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/tilde.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/even.mdx");
+    });
+
+    // An inline code span runs from a backtick run to the next run of the same length, so a doubled
+    // span shows a tag rather than rendering one — and a fence only closes on its own character, so
+    // a tilde row inside a backtick block is body text rather than the end of the example.
+    it("reads a doubled inline span and a foreign fence line as example text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/span.mdx": "Render it with ``<Widget />`` on the page.\n",
+        "docs/mixed.mdx": "```tsx\n~~~\n<Widget />\n```\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/span.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/mixed.mdx");
+    });
+
     // MDX wraps. An import list runs over three lines and an expression opens its `{` on one of
     // its own, so the line naming the component carries neither the keyword nor the brace. Reading
     // each line alone misses the caller and the component goes on being reported dead.

@@ -130,9 +130,10 @@ const COMMENT_SYNTAX: FileSyntax[] = [
   },
   {
     // MDX is a program, not a document: `import { Widget } from './widget'` and `<Widget />` name a
-    // real caller. What is inert is the JSX comment and anything in backticks — an inline span or a
-    // fenced example shows the symbol rather than calling it. The rest of the body is markdown, so
-    // a hit surviving this is judged again by `referencesMdx`.
+    // real caller. What is inert is the JSX comment; the code spans and fenced examples that also
+    // show a symbol rather than calling it are blanked before this by `maskMdxProse`, which reads
+    // markdown's fences as fences instead of pairing backticks one at a time. The rest of the body
+    // is markdown, so a hit surviving this is judged again by `referencesMdx`.
     //
     // The comment is read as bare `/* */` rather than `{/* */}`: JSX lets the braces stand off
     // (`{ /* Widget was removed */ }`), and a grammar spelled with them attached leaves that span
@@ -146,10 +147,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     // worst, and blanking the tail of one only leaves a signal standing.
     files: /\.mdx$/i,
     line: ["//"],
-    block: [
-      ["/*", "*/"],
-      ["`", "`"],
-    ],
+    block: [["/*", "*/"]],
   },
   {
     files: /\.(?:py|pyi)$/i,
@@ -357,6 +355,97 @@ const MDX_FILE = /\.mdx$/i;
 /** MDX's ESM block: the only place an import or export can stand. */
 const MDX_ESM_LINE = /^\s*(?:import|export)\b/;
 
+/**
+ * A markdown fence, opening or closing: up to three spaces of indent, then a run of three or more
+ * backticks or tildes, then the info string. Fences are the delimiter a code example actually
+ * carries, and pairing backticks one at a time cannot see one — `~~~~tsx` holds no backtick at all
+ * and an even-length ```` ```` ```` pairs off against itself, leaving `<Widget />` in the example
+ * looking like a rendered tag and erasing a finding that was right.
+ */
+const MDX_FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+
+/** The whole line replaced by spaces — same length, so a hit's offsets still line up. */
+function blankAll(line: string): string {
+  return " ".repeat(line.length);
+}
+
+/** The index just past the run of backticks starting at `at`. */
+function backtickRunEnd(line: string, at: number): number {
+  let end = at;
+  while (line[end] === "`") end += 1;
+  return end;
+}
+
+/** Where the run of exactly `length` backticks that closes a code span ends, if one does. */
+function closingBacktickRun(line: string, from: number, length: number): number | undefined {
+  let at = from;
+  while (at < line.length) {
+    const next = line.indexOf("`", at);
+    if (next < 0) break;
+    const end = backtickRunEnd(line, next);
+    if (end - next === length) return end;
+    at = end;
+  }
+  return undefined;
+}
+
+/**
+ * The line with its inline code spans blanked. A span opens on a run of backticks and closes on the
+ * next run of the same length, so ``` ``<Widget />`` ``` is one span rather than two bare pairs with
+ * live code between them. An unopened-looking run — one nothing closes — is blanked to the end of
+ * the line: over-blanking hides a caller and leaves a signal standing, which is the direction this
+ * filter errs in everywhere.
+ */
+function maskMdxCodeSpans(line: string): string {
+  const spans: [number, number][] = [];
+  let at = 0;
+  while (at < line.length) {
+    const open = line.indexOf("`", at);
+    if (open < 0) break;
+    const openEnd = backtickRunEnd(line, open);
+    const close = closingBacktickRun(line, openEnd, openEnd - open);
+    spans.push([open, close ?? line.length]);
+    if (close === undefined) break;
+    at = close;
+  }
+  return blankSpans(line, spans);
+}
+
+/**
+ * An MDX file with everything markdown holds out of the program blanked: fenced code blocks and
+ * inline code spans. Both show a symbol rather than calling it, and both have to be read as
+ * markdown spells them — a fence runs from its opening run of backticks or tildes to the first line
+ * closing it with at least as many of the same character, whatever sits in between.
+ *
+ * Indented code blocks are not read, because MDX does not have them: indentation there is JSX and
+ * ESM continuation, and blanking it would hide the wrapped caller `mdxOpenLines` exists to find.
+ */
+function maskMdxProse(text: string): string {
+  let fence: string | undefined;
+  return text
+    .split("\n")
+    .map((line) => {
+      const marker = MDX_FENCE.exec(line);
+      if (fence !== undefined) {
+        const closes =
+          marker !== null &&
+          marker[1].startsWith(fence[0]) &&
+          marker[1].length >= fence.length &&
+          marker[2].trim() === "";
+        if (closes) fence = undefined;
+        return blankAll(line);
+      }
+      // A backtick fence's info string cannot itself hold a backtick: ``` ```a` ``` is an inline
+      // span, not a fence, and opening one there would blank the rest of the file.
+      if (marker && (marker[1].startsWith("~") || !marker[2].includes("`"))) {
+        fence = marker[1];
+        return blankAll(line);
+      }
+      return maskMdxCodeSpans(line);
+    })
+    .join("\n");
+}
+
 /** A JSX tag opening right where the symbol starts — `<Widget`, `</Widget`. */
 const MDX_TAG = /<\/?\s*$/;
 
@@ -538,14 +627,14 @@ async function codeReferencingFiles(
     // them: a job cancelled here must stop rather than read out the list it no longer owes anyone.
     abort?.throwIfAborted();
     const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
+    const isMdx = MDX_FILE.test(file);
     if (!masked.has(file)) {
       try {
         const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
-        const code = maskComments(text, syntax);
-        masked.set(
-          file,
-          MDX_FILE.test(file) ? { code, open: mdxOpenLines(code, text.split("\n")) } : { code },
-        );
+        // MDX's markdown — its fences and code spans — is blanked before the JSX comment grammar
+        // runs, so a `/*` or `//` shown inside an example can't open a comment across the program.
+        const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
+        masked.set(file, isMdx ? { code, open: mdxOpenLines(code, text.split("\n")) } : { code });
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
         // "proves no caller" and let the pass finish on a verdict nobody asked for.
@@ -556,7 +645,7 @@ async function codeReferencingFiles(
     const entry = masked.get(file);
     if (!entry) continue;
     const references = (line: number): boolean =>
-      MDX_FILE.test(file)
+      isMdx
         ? referencesMdx(entry.code[line - 1], symbol, entry.open?.[line - 1] === true)
         : referencesWord(entry.code[line - 1], symbol);
     if (lines.some(references)) files.push(file);
