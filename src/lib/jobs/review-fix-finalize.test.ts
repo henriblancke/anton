@@ -491,6 +491,59 @@ describe("finalizeMergedEpic", () => {
     expect(note).not.toContain("--parent <new-epic>");
   });
 
+  it("does not move a ticket claimed between the plan and the reparent (PR #199)", async () => {
+    // The plan cleared t2, and then anton's OWN release and reopen writes — bd round-trips on a
+    // board other operators share — left a window before the move. A claim that lands in it makes
+    // t2 somebody's live work, and moving it would advertise that work under a second target.
+    setStatusMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") assignees.set("t2", "op-2");
+    });
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("between planning the move and making it");
+    expect(note).toContain("under op-2");
+  });
+
+  it("does not move a ticket reparented between the plan and the reparent (PR #199)", async () => {
+    // Same window, the other write: another operator gave t2 a target of their own, so the ancestry
+    // the plan validated is stale and the move would steal it back out of their run.
+    setStatusMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") parents.set("t2", "epic-9");
+    });
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("another operator moved it under epic-9");
+    expect(note).not.toContain("--parent <new-epic>");
+  });
+
+  it("pins an ancestor whose descendant was claimed in that window (PR #199)", async () => {
+    // A reparent carries the whole subtree, so a ticket taken over mid-finalization has to stop its
+    // ancestor moving too — otherwise t3 rides onto the follow-up on t2's edge, exactly the move
+    // the re-read refused to make directly.
+    setStatusMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t3") assignees.set("t3", "op-2");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(noteMock.mock.calls[0][2]).toContain("t3 still hangs off it");
+    expect(noteMock.mock.calls[1][2]).toContain(
+      "between planning the move and making it",
+    );
+  });
+
   it("rehomes a ticket nested under a DELIVERED ticket (anton-67xj)", async () => {
     // bd nesting is arbitrary-depth, so a run owns descendants whose parent is another ticket. t2
     // shipped and closes with the merge; t3 hangs off it and did not. Judging belonging by the
