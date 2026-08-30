@@ -180,6 +180,9 @@ const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+
 const REGEX_LITERAL =
   /(^|=>|[([{,;:=!&|?]|\breturn|\bcase|\btypeof)(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*/g;
 
+/** The same prefixes, anchored to the END of the text before a `/` — the one rule, read backwards. */
+const REGEX_PREFIX = /(?:=>|[([{,;:=!&|?]|\b(?:return|case|typeof))$/;
+
 /**
  * Strip what would confuse brace counting: comments, string bodies and regex literals. Block
  * comments go too, and not only the ones a line opens with — a declaration closed by a trailing
@@ -209,6 +212,32 @@ function afterQuoted(line: string, start: number): number {
     else if (line[i] === quote) return i + 1;
   }
   return line.length;
+}
+
+/**
+ * Whether the `/` at `start` OPENS a regex literal rather than divides — `REGEX_PREFIX` read
+ * against the text BEHIND the slash, for the scanners that walk a line character by character
+ * instead of matching it whole.
+ */
+function opensRegex(line: string, start: number): boolean {
+  const before = line.slice(0, start).trimEnd();
+  return before === "" || REGEX_PREFIX.test(before);
+}
+
+/**
+ * Where the regex literal opened at `start` ends, escapes and character classes and all — `-1` when
+ * it never closes on the line, which proves the slash was not one (the grammar forbids the break).
+ */
+function afterRegex(line: string, start: number): number {
+  let inClass = false;
+  for (let i = start + 1; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === "\\") i += 1;
+    else if (inClass) inClass = char !== "]";
+    else if (char === "[") inClass = true;
+    else if (char === "/") return i + 1;
+  }
+  return -1;
 }
 
 /**
@@ -443,13 +472,15 @@ function afterBlockComment(line: string): string | undefined {
 
 /**
  * Where a block comment OPENS on this line and is never closed on it — `value: string, /* why`.
- * Quoted strings, templates and `//` notes are stepped over, so a `/*` inside any of them opens
- * nothing, and a comment that closes is skipped past so a later opener is still found. `-1` when
- * the line leaves no comment running.
+ * Quoted strings, templates, regex literals and `//` notes are stepped over, so a `/*` inside any
+ * of them opens nothing, and a comment that closes is skipped past so a later opener is still
+ * found. `-1` when the line leaves no comment running.
  *
  * Without it the prose below such a line is read as syntax: an unmatched `(` inside the comment
  * holds `statement` in `signature` or `import` past the real declaration, and every executable
- * window under it classifies as declarative and is dropped unread.
+ * window under it classifies as declarative and is dropped unread. A regex is stepped over for the
+ * same reason in reverse: `pattern = /[/*]/` carries the two characters of an opener inside a
+ * character class, and reading them as one would file every line below it as prose.
  */
 function unclosedBlockComment(line: string): number {
   let i = 0;
@@ -465,6 +496,15 @@ function unclosedBlockComment(line: string): number {
       if (close < 0) return i;
       i = close + 2;
       continue;
+    }
+    // Checked AFTER the comment forms, since a `/*` at a position where a regex could begin is a
+    // comment in the grammar too. A slash that opens nothing that closes is left as division.
+    if (char === "/" && opensRegex(line, i)) {
+      const end = afterRegex(line, i);
+      if (end > 0) {
+        i = end;
+        continue;
+      }
     }
     i += 1;
   }
@@ -497,6 +537,11 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   let arrow: "owed" | "settled" | "absent" = "settled";
 
   const lines = source.split("\n");
+  // A file's terminal newline TERMINATES its last line rather than starting another, but `split`
+  // hands one back as an empty element. Counted, it pads every file by a line, and a window that
+  // runs one line off the end reads as complete — the truncated remnant `readWindow` refuses.
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+
   for (let index = 0; index < lines.length; index += 1) {
     let line = lines[index].trim();
     const next = lines[index + 1]?.trim() ?? "";

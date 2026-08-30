@@ -1928,6 +1928,64 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // A remnant one line SHORT of the window is still a remnant. A file's terminal newline is not a
+    // further line, so counting the empty element `split` hands back for it would let two such
+    // comment tails vote as full blocks and outvote the location that still holds the clone.
+    it("ignores a remnant one line short of the window despite the file's terminal newline", async () => {
+      const repo = writeRepo({
+        "src/live.ts": [
+          "export function arrange(sandbox: string) {",
+          "  mkdirSync(join(sandbox, 'repo'));",
+          "  execFileSync('git', ['init', '-q', sandbox]);",
+          "  writeFileSync(join(sandbox, 'README.md'), '# sandbox');",
+          "  return sandbox;",
+          "}",
+          "",
+        ].join("\n"),
+        "src/remnant-a.ts": ["// what is left of the block", "// after the rewrite", ""].join("\n"),
+        "src/remnant-b.ts": ["// what is left of the block", "// after the rewrite", ""].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone(
+          [
+            ["src/live.ts", 2],
+            ["src/remnant-a.ts", 1],
+            ["src/remnant-b.ts", 1],
+          ],
+          3,
+        ),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/live.ts" }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // `/[/*]/` carries the two characters of a comment opener inside a character class. Read as one,
+    // it runs a comment over every line below it and the executable clone under it is dropped unread.
+    it("steps over a regex literal whose character class holds a comment opener", async () => {
+      const repo = writeRepo({
+        "src/regex.ts": [
+          "export const separator = /[/*]/;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/regex.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/regex.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // `const x = (` opens a parameter list or a parenthesized expression, and only the closing line
     // says which: a `=>` cannot be pushed past it. Without that check a window of calls reads as a
     // props list and a real duplicate of runtime work is thrown away unread.
@@ -2238,7 +2296,7 @@ describe("scan", () => {
         ].join("\n"),
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
-        clone([["src/panel.tsx", 5]], 4),
+        clone([["src/panel.tsx", 5]], 3),
       ]);
 
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
