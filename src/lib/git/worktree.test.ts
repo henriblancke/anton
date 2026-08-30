@@ -691,6 +691,40 @@ suite("worktree manager (real git)", () => {
     await removeWorktree(wt, { deleteBranch: true });
   });
 
+  it("REFUSES a second in-process claim on a branch NOT yet materialized (first claimant wins)", async () => {
+    // Two review-fix jobs for one epic — a project sweep and gate-check's targeted fix — race the
+    // same PR branch before its checkout exists. Refusing the claim itself is what keeps the fix
+    // exclusive: refusing only at createWorktree would leave both holders in the map and fail BOTH.
+    const branch = "anton/run-claim-second-owner";
+    let done!: () => void;
+    const using = new Promise<void>((r) => (done = r));
+    let active!: () => void;
+    const claimTaken = new Promise<void>((r) => (active = r));
+
+    let created: Worktree | undefined;
+    const claiming = withWorktreeClaim(repo, branch, "review-fix#job-a", () => {
+      active();
+      return using;
+    });
+    await claimTaken;
+
+    try {
+      await expect(
+        withWorktreeClaim(repo, branch, "review-fix#job-b", async () => {}),
+      ).rejects.toThrow(/review-fix#job-a is using the checkout/);
+      // The refused job left nothing behind: the first holder still owns the branch outright, so it
+      // materializes its own checkout as usual.
+      created = await createWorktree({ repoPath: repo, branch, claimedBy: "review-fix#job-a" });
+      expect(existsSync(created.path)).toBe(true);
+    } finally {
+      done();
+      await claiming;
+    }
+
+    expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
+    if (created) await removeWorktree(created, { deleteBranch: true });
+  });
+
   it("REFUSES to claim a checkout another owner has locked", async () => {
     const branch = "anton/run-claim-foreign-lock";
     const wt = await createWorktree({ repoPath: repo, branch });

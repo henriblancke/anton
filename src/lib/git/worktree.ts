@@ -203,6 +203,13 @@ export async function withWorktreeClaim<T>(
 ): Promise<T> {
   const key = branchKey(repoPath, branch);
   await withBranchLock(repoPath, branch, async () => {
+    // First claimant wins. Refusing here — not at the createWorktree that follows — is what makes
+    // the claim exclusive even before the checkout exists: two jobs that both claimed an unmaterialized
+    // branch would each see the other in `holders` and BOTH be refused their own checkout.
+    const other = (worktreeClaims.get(key) ?? []).find((h) => h !== owner);
+    if (other) {
+      throw new Error(`[worktree] cannot claim ${branch} for ${owner}: ${other} is using the checkout`);
+    }
     worktreeClaims.set(key, [...(worktreeClaims.get(key) ?? []), owner]);
     try {
       await lockClaimedWorktree(repoPath, branch, owner);

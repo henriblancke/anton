@@ -152,8 +152,17 @@ export function inReviewEpics(
 /**
  * Who this job is, as the worktree claim records it. The same name goes to `createWorktree`, which
  * refuses to hand a claimed checkout to anyone but its holder.
+ *
+ * The job id is part of it because "review-fix" alone is not one holder: the project-wide sweep and
+ * a gate-check's targeted fix for the same epic are two jobs that `enqueueReviewFixIfAbsent`
+ * deliberately allows to coexist, and a claim they share is no claim at all — `conflictingClaim`
+ * only rejects a holder whose owner differs from the caller, so the second job would reuse the
+ * checkout and interleave its fetch/merge/claude/commit/push with the first's in one directory.
+ * Distinct owners make that the conflict it is; the readable prefix keeps refusal logs legible.
  */
-const CLAIM_OWNER = "review-fix";
+export function claimOwnerFor(jobId: string): string {
+  return `review-fix#${jobId}`;
+}
 
 /** Build the runner handler bound to a db/clock. Register it as the "review-fix" handler. */
 export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
@@ -259,10 +268,11 @@ async function handleEpic(args: {
   // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
   // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
   // the commit and push behind it.
-  await withWorktreeClaim(repo, branch, CLAIM_OWNER, async () => {
+  const claimOwner = claimOwnerFor(ctx.jobId);
+  await withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
     // sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number });
+    const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number, claimOwner });
 
     await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
   });
@@ -283,15 +293,17 @@ async function prepareFixWorktree(args: {
   baseBranch: string | undefined;
   pr: PrReview;
   number: number;
+  /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
+  claimOwner: string;
 }): Promise<{ worktree: Worktree; conflicts: string[] }> {
-  const { ctx, repo, branch, settings, baseBranch, pr, number } = args;
+  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } = args;
 
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
     baseBranch: settings.baseBranch,
     warm: false,
-    claimedBy: CLAIM_OWNER,
+    claimedBy: claimOwner,
   });
   // Fail loudly here rather than letting a missing worktree ride through the best-effort git steps
   // below — `safe()` swallows their errors, so the first thing to actually report the problem would
