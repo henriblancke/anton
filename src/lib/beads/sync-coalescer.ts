@@ -446,7 +446,7 @@ export function createDoltSync(
 // it, say) would go untested until the process restarted. A new key hands the reloaded code its own
 // engine; the old one stays reachable to whatever still holds it, which is the whole of what is
 // given up — only in dev, where a reload is the point. Bump it whenever a pass's behaviour changes.
-const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync.v2");
+const DOLT_SYNC_KEY = Symbol.for("anton.beads.doltSync.v3");
 export const doltSync = ((
   globalThis as unknown as Record<symbol, ReturnType<typeof createDoltSync>>
 )[DOLT_SYNC_KEY] ??= createDoltSync());

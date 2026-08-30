@@ -209,7 +209,7 @@ describe("runDoltSync — server mode is a no-op (anton-0tul)", () => {
    */
   it("ignores the engine a hot-reloaded process left under the previous singleton key", async () => {
     const dir = repo({ dolt_mode: "server", dolt_server_host: "h", dolt_server_port: 3306 });
-    const legacy = Symbol.for("anton.beads.doltSync");
+    const legacy = Symbol.for("anton.beads.doltSync.v2");
     const g = globalThis as unknown as Record<symbol, unknown>;
     let stale = 0;
     g[legacy] = () => {
