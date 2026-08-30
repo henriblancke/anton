@@ -456,17 +456,45 @@ export function carrierPaths(
   const held = new Set(carriers);
   const path = new Set<string>();
   for (const id of carriers) {
-    const seen = new Set<string>([id]);
-    const carrier = index.byId.get(id);
-    let parentId = carrier ? beads.parentOf(carrier) : undefined;
-    while (parentId && parentId !== cardId && !seen.has(parentId)) {
-      seen.add(parentId);
-      if (!held.has(parentId)) path.add(parentId);
-      const parent = index.byId.get(parentId);
-      parentId = parent ? beads.parentOf(parent) : undefined;
+    for (const step of pathToCard(index, cardId, id) ?? []) {
+      if (!held.has(step)) path.add(step);
     }
   }
   return [...path].sort();
+}
+
+/**
+ * The beads strictly between one carrier and `cardId`, in walk order — or undefined when the chain
+ * never reaches the card, which is a carrier that no longer carries it at all.
+ */
+function pathToCard(index: BoardIndex, cardId: string, carrierId: string): string[] | undefined {
+  const seen = new Set<string>([carrierId]);
+  const path: string[] = [];
+  const carrier = index.byId.get(carrierId);
+  let parentId = carrier ? beads.parentOf(carrier) : undefined;
+  while (parentId && !seen.has(parentId)) {
+    if (parentId === cardId) return path;
+    seen.add(parentId);
+    path.push(parentId);
+    const parent = index.byId.get(parentId);
+    parentId = parent ? beads.parentOf(parent) : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The carriers whose CURRENT route to the card runs entirely through `held` — the ones a caller
+ * holding those beads can prove nothing is about to cut. A carrier re-parented onto an intermediate
+ * outside the set since {@link carrierPaths} named its route still reaches the card, and drops out
+ * here anyway; why that matters is apply-plan.ts `heldCarriers`.
+ */
+export function carriersOnHeldPaths(
+  index: BoardIndex,
+  cardId: string,
+  carriers: readonly string[],
+  held: ReadonlySet<string>,
+): string[] {
+  return carriers.filter((id) => pathToCard(index, cardId, id)?.every((step) => held.has(step)));
 }
 
 /**

@@ -513,7 +513,9 @@ function affectedBeads(plan: GardenerPlan, carried?: CarriedPremise): string[] {
  * `carried` narrows the home's container bar to the tickets the caller holds locked, for the reason
  * a step narrows it (apply-plan.ts `homeCarriesNothing`'s `only`): counting freely would let a
  * ticket filed since — which nothing here serializes — carry a premise, while the carrier that
- * actually earned it is deleted a moment later.
+ * actually earned it is deleted a moment later. The whole premise rather than its ids, because a
+ * carrier only counts while its route to the home also runs through beads this lock covers
+ * (apply-plan.ts `heldCarriers`).
  */
 async function settledDrifted(
   repo: string,
@@ -528,12 +530,7 @@ async function settledDrifted(
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;
   }
-  const now = planApply(
-    plan,
-    board,
-    { ...at, nowMs: Date.now() },
-    carried && new Set(carried.carriers),
-  );
+  const now = planApply(plan, board, { ...at, nowMs: Date.now() }, carried);
   switch (now.status) {
     case "settled":
       return undefined;

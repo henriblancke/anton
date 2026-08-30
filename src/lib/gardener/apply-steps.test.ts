@@ -255,6 +255,43 @@ describe("under the write lock — what a decided step re-asks before it lands",
   });
 
   /**
+   * The same claim about the carrier's ROUTE. A carrier re-parented onto another intermediate under
+   * the same home since the filing still rides the home, so the count keeps it — but it reaches the
+   * home through a bead this step never locked, and `deleteTicket` takes only that bead's own lock.
+   * Left counted, the premise rests on a route that can be cut between the locked read and the
+   * write, which is the leaf-card landing the recorded paths exist to stop.
+   */
+  it("refuses a cluster whose carrier now reaches the home through a bead this step never locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    // An exempt-type bead is filed under the home and the carrier moved beneath it — the carrier
+    // itself never leaves anton-card, so nothing but its recorded path can see the change.
+    liveBeads.set("anton-note", child("anton-note", CARD.id, { issue_type: "learning" }));
+    liveBeads.set(CARRIED.id, child(CARRIED.id, "anton-note"));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  // A carrier moved onto an intermediate the decision ALREADY recorded is a route this step holds
+  // end to end, so it still counts — the narrowing drops unlocked paths, not every re-parent.
+  it("still counts a carrier that moved onto a bead its recorded path already names", async () => {
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const nested = child("anton-t0", note.id);
+    const proposal = proposalFor(CLUSTER);
+    // The carrier is re-parented straight onto the card, shortening a route this step locks whole.
+    liveBeads.set(nested.id, child(nested.id, CARD.id));
+
+    await expect(
+      apply(proposal, [CARD, note, nested, bead("anton-a"), bead("anton-b"), proposal]),
+    ).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+  });
+
+  /**
    * The re-checks above are only worth their board read if the beads they read cannot move while
    * they run — so the step locks the whole cluster premise, not just its own two ends. A PARTNER's
    * title is what proves the subject still shares a subject with the home, and the home's own ticket

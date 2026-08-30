@@ -35,6 +35,7 @@ import { impliesOrdering } from "./relink";
 import {
   carriedTickets,
   carrierPaths,
+  carriersOnHeldPaths,
   groupedUnder,
   isClusterTier,
   MIN_CARRIED_TICKETS,
@@ -176,6 +177,11 @@ export interface CarriedPremise {
    * bead's own lock alone, so the write half locks the path as well as its ends — otherwise the
    * container bar could pass on a carrier whose route to the home is cut between the read and the
    * write, which is the leaf-card landing the bar exists to stop.
+   *
+   * The route recorded here is the one that gets locked, so it is also the only route a carrier may
+   * still count on: one re-parented onto a different intermediate under the same home reaches it
+   * through beads this apply never held, and drops out of the count (reparent.ts
+   * `carriersOnHeldPaths`).
    */
   carrierPaths: string[];
 }
@@ -318,16 +324,16 @@ export interface ApplyMoment {
  * instead of the fault. Premise is re-derived from `plan.kind`, which the fingerprint binds, rather
  * than from filing-time state the plan would have to carry.
  *
- * `held` is the carried tickets the CALLER holds the write locks on, and narrows the home's
- * container bar to them — the same narrowing a step makes under its own locks (apply-steps.ts
- * `assertClusterHolds`). A caller holding no locks passes nothing and the bar counts freely, which
- * is right for a decision taken against a snapshot: it is deciding, not writing.
+ * `held` is the carried premise the CALLER holds the write locks on, and narrows the home's
+ * container bar to it ({@link heldCarriers}) — the same narrowing a step makes under its own locks
+ * (apply-steps.ts `assertClusterHolds`). A caller holding no locks passes nothing and the bar counts
+ * freely, which is right for a decision taken against a snapshot: it is deciding, not writing.
  */
 export function planApply(
   plan: GardenerPlan,
   board: Bead[],
   at: ApplyMoment,
-  held?: ReadonlySet<string>,
+  held?: CarriedPremise,
 ): ApplyDecision {
   const index = indexBoard(board);
   switch (plan.move) {
@@ -358,7 +364,7 @@ function planReparent(
   plan: GardenerPlan,
   index: BoardIndex,
   at: ApplyMoment,
-  held?: ReadonlySet<string>,
+  held?: CarriedPremise,
 ): ApplyDecision {
   // A container-orphan detection with no single obvious home deliberately files WITHOUT a target —
   // it asks the approver to pick one. Approving it as-is would have to invent that answer.
@@ -385,7 +391,7 @@ function homeRefusal(
   target: Bead,
   index: BoardIndex,
   at: ApplyMoment,
-  held?: ReadonlySet<string>,
+  held?: CarriedPremise,
 ): string | undefined {
   // The home's own state — settled, or owned by a run. Shared with the under-lock re-check in
   // `applyStep`, so the snapshot decision and the write refuse the same home for the same reason.
@@ -425,16 +431,44 @@ function homeRefusal(
  * `parentless-cluster` alone: no other kind chose its home on this evidence.
  *
  * `held` narrows the count to the tickets a locked caller can prove nothing is deleting under it
- * (see {@link homeCarriesNothing}'s `only`).
+ * (see {@link homeCarriesNothing}'s `only` and {@link heldCarriers}).
  */
 function homeStoppedCarrying(
   plan: GardenerPlan,
   home: Bead,
   index: BoardIndex,
-  held?: ReadonlySet<string>,
+  held?: CarriedPremise,
 ): string | undefined {
   if (plan.kind !== "parentless-cluster") return undefined;
-  return homeCarriesNothing(home, index, new Set(plan.subjects), held);
+  return homeCarriesNothing(
+    home,
+    index,
+    new Set(plan.subjects),
+    held && heldCarriers(index, home.id, held),
+  );
+}
+
+/**
+ * The carriers of a recorded premise a locked caller may still count — the ones whose CURRENT route
+ * to the home runs entirely through beads that premise names, and so entirely through beads the
+ * caller locked (reparent.ts {@link carriersOnHeldPaths}).
+ *
+ * The recorded ids alone are not enough. A carrier re-parented onto a different intermediate beneath
+ * the SAME home between the filing and the locks still rides the home, so `cardOf` keeps counting
+ * it — but it now reaches the home through a bead nothing here holds, and `deleteTicket` takes only
+ * the deleted bead's own lock. That intermediate can go between the locked read and the write,
+ * severing the home's last carrier and landing the cluster on a leaf card: the exact race
+ * {@link CarriedPremise.carrierPaths} exists to close, re-opened by a move the carrier's own lock
+ * never ordered against. Dropping the carrier refuses instead, which is what every other premise
+ * change here does.
+ */
+export function heldCarriers(
+  index: BoardIndex,
+  homeId: string,
+  premise: CarriedPremise,
+): Set<string> {
+  const locked = new Set([...premise.carriers, ...premise.carrierPaths]);
+  return new Set(carriersOnHeldPaths(index, homeId, premise.carriers, locked));
 }
 
 /**

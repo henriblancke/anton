@@ -27,6 +27,7 @@ import {
   DOING,
   EVIDENCE_PREMISE,
   home,
+  heldCarriers,
   homeCarriesNothing,
   homeClaimed,
   HOME_STANDING,
@@ -337,7 +338,11 @@ async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
  * the premise names the whole PATH and this step locks it too (apply-plan.ts
  * `ClusterPremise.carrierPaths`): deleting an intermediate takes its own lock alone, and it would
  * otherwise cut the carrier's route to the home between this read and the write — leaving the bar
- * satisfied by a ticket the board no longer files under the home at all.
+ * satisfied by a ticket the board no longer files under the home at all. Which is why the count is
+ * narrowed to the carriers still reaching the home through THOSE beads (reparent.ts
+ * `carriersOnHeldPaths`) rather than to the recorded ids: a carrier re-parented onto a different
+ * intermediate under the same home since the filing reads as carrying it, on a route this step
+ * never locked, and the same deletion cuts it a moment later.
  *
  * The count ignores every id the ask NAMED rather than the members left to move: an earlier step of
  * this same cluster has already landed under the home, and letting it count would let the ask prove
@@ -348,7 +353,8 @@ function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
   if (!cluster) return;
   const target = board.byId.get(step.parent);
   if (!target) throw new SubjectMovedError(missing(step.parent));
-  const leaf = homeCarriesNothing(target, board, new Set(cluster.named), new Set(cluster.carriers));
+  const carriers = heldCarriers(board, step.parent, cluster);
+  const leaf = homeCarriesNothing(target, board, new Set(cluster.named), carriers);
   if (leaf) throw new SubjectMovedError(leaf);
   // The step's own filing stamp rides along: dropping a member a run claimed since asks the same
   // dated question the decision asked of it, so a claim the plan already saw is not read as news.
