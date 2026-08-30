@@ -684,6 +684,47 @@ suite("the sweep over real residue (real git)", () => {
     expect(existsSync(wt.path)).toBe(false);
   });
 
+  it("still checks for an open PR when the only lock is a DEAD claim's leftovers", async () => {
+    // The lock is reapable, but reapable is not unowned: suppressing the PR lookup because *some*
+    // lock was present deleted a branch the reviewer's PR still points at.
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-dead" });
+    execFileSync("git", [
+      "-C",
+      repo,
+      "worktree",
+      "lock",
+      "--reason",
+      `anton-claim review-fix pid=${DEAD_PID} host=${hostname()}`,
+      wt.path,
+    ]);
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates: [
+          {
+            branch: wt.branch,
+            path: wt.path,
+            beadId: "anton-dead",
+            lock: `anton-claim review-fix pid=${DEAD_PID} host=${hostname()}`,
+            runLive: false,
+            bead: "settled" as const,
+          },
+        ],
+        lookupPr: async () => ({ pr: { url: "u", ref: "gh-7" } }),
+      });
+
+      // The crashed claim's checkout is reclaimed; the branch its open PR needs is not.
+      expect(existsSync(wt.path)).toBe(false);
+      expect(branches()).toContain("anton/anton-dead");
+      expect(report.reaped.map((e) => e.reason)).toEqual([
+        expect.stringContaining("still carries open PR gh-7"),
+      ]);
+    } finally {
+      execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
+    }
+  });
+
   it("the sweep spares a claimed checkout even when everything else says residue", async () => {
     const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-clm2" });
     let done!: () => void;

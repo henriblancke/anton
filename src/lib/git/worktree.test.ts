@@ -54,6 +54,29 @@ suite("worktree manager (real git)", () => {
   const listPorcelain = () =>
     execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
 
+  /**
+   * A `git` ahead of the real one on PATH, applying `rules` (sh, with `$FLAG` free for a one-shot
+   * marker file) before delegating. How a transient git failure is made deterministic.
+   */
+  function gitShim(rules: string[]): { restore: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), "anton-wt-shim-"));
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(
+      join(dir, "git"),
+      ["#!/bin/sh", `FLAG=${join(dir, "tried")}`, ...rules, `exec ${realGit} "$@"`, ""].join("\n"),
+      { mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${dir}:${prevPath ?? ""}`;
+    return {
+      restore: () => {
+        if (prevPath === undefined) delete process.env.PATH;
+        else process.env.PATH = prevPath;
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
   beforeAll(() => {
     repo = mkdtempSync(join(tmpdir(), "anton-wt-repo-"));
     worktreesRoot = mkdtempSync(join(tmpdir(), "anton-wt-root-"));
@@ -550,6 +573,69 @@ suite("worktree manager (real git)", () => {
       execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
       await removeWorktree(wt, { deleteBranch: true });
     }
+  });
+
+  it("FAILS the claim when git cannot install its lock, instead of running unprotected", async () => {
+    // The map entry is invisible to a second anton process: without the git lock, its teardown
+    // force-removes the very checkout the claim exists to protect, uncommitted fix and all.
+    const branch = "anton/run-claim-lock-fails";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    const shim = gitShim(['if [ "$3" = "worktree" ] && [ "$4" = "lock" ]; then', "  exit 1", "fi"]);
+
+    let ran = false;
+    try {
+      await expect(
+        withWorktreeClaim(repo, branch, "review-fix", async () => {
+          ran = true;
+        }),
+      ).rejects.toThrow(/could not lock/);
+    } finally {
+      shim.restore();
+    }
+
+    expect(ran).toBe(false);
+    // The rolled-back map entry matters as much as the throw: a phantom claim would make every
+    // later teardown in this process refuse the checkout forever.
+    expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
+    await removeWorktree(wt, { deleteBranch: true });
+  });
+
+  it("REFUSES to claim a checkout another owner has locked", async () => {
+    const branch = "anton/run-claim-foreign-lock";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    execFileSync("git", ["-C", repo, "worktree", "lock", "--reason", "supacode", wt.path]);
+
+    await expect(withWorktreeClaim(repo, branch, "review-fix", async () => {})).rejects.toThrow(
+      /locked by another owner \(supacode\)/,
+    );
+    expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
+
+    execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+    await removeWorktree(wt, { deleteBranch: true });
+  });
+
+  it("RETRIES a release git transiently refuses, so the claim is never left stranded", async () => {
+    // The lock names this still-running process, so a swallowed unlock failure reads as a live claim
+    // to every later reaper pass — leaking the worktree and its branch until anton restarts.
+    const branch = "anton/run-claim-release-retry";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    const shim = gitShim([
+      'if [ "$3" = "worktree" ] && [ "$4" = "unlock" ] && [ ! -f "$FLAG" ]; then',
+      '  touch "$FLAG"',
+      "  exit 1",
+      "fi",
+    ]);
+
+    try {
+      await withWorktreeClaim(repo, branch, "review-fix", async () => {
+        expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(true);
+      });
+    } finally {
+      shim.restore();
+    }
+
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(false);
+    await removeWorktree(wt, { deleteBranch: true });
   });
 
   it("leaves an arbitrary directory untouched when orphan ownership cannot be proven", async () => {

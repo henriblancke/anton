@@ -100,6 +100,23 @@ export interface ReapCandidate {
 export type OpenPrNotice = string | undefined;
 
 /**
+ * Why a lock keeps the checkout, or undefined when it does not stand in the sweep's way. A dead
+ * anton claim's lock is leftovers, not another owner: honouring it would turn one crashed process
+ * into a checkout and branch that leak forever — and `removeWorktree` breaks that lock and no other.
+ *
+ * The single answer both {@link planReap} and the sweep's PR lookup read. Deciding reapability twice
+ * let them disagree: a dead claim's lock suppressed the PR check while the plan went on to delete,
+ * so a branch still backing an open PR was reaped anyway.
+ */
+function lockKeepReason(lock: string | undefined): string | undefined {
+  if (lock === undefined) return undefined;
+  const claim = liveClaimLock(lock);
+  if (claim) return describeClaimLock(claim);
+  if (!parseClaimLock(lock)) return `locked by another owner (${lock || "no reason given"})`;
+  return undefined;
+}
+
+/**
  * What the janitor sweep may do to residue. Conservative by construction: it removes only what it
  * can prove nothing is using — the run is not executing, the bead is settled, no open PR — and
  * reports every other candidate rather than guessing.
@@ -108,16 +125,8 @@ export function planReap(candidate: ReapCandidate, openPr: OpenPrNotice): ReapPl
   const keep = (reason: string): ReapPlan => ({ removeWorktree: false, deleteBranch: false, reason });
   const bead = candidate.beadId ?? "its bead";
 
-  if (candidate.lock !== undefined) {
-    const claim = liveClaimLock(candidate.lock);
-    if (claim) return keep(describeClaimLock(claim));
-    // A dead anton claim's lock is leftovers, not another owner: honouring it would turn one crashed
-    // process into a checkout and branch that leak forever. Only that case falls through — and
-    // `removeWorktree` breaks that lock and no other.
-    if (!parseClaimLock(candidate.lock)) {
-      return keep(`locked by another owner (${candidate.lock || "no reason given"})`);
-    }
-  }
+  const heldByLock = lockKeepReason(candidate.lock);
+  if (heldByLock) return keep(heldByLock);
   if (candidate.runLive) return keep("a run is executing on it");
   if (candidate.bead === "open") return keep(`${bead} is still open`);
   if (candidate.bead === "unknown") return keep("no bead on the board owns it");
@@ -436,7 +445,9 @@ export async function reapWorktrees(args: {
     // Only a candidate that is otherwise reapable can cost a `gh` call: everything else is decided
     // before the PR is relevant, and a sweep over an idle project must stay free.
     const settled =
-      candidate.lock === undefined && !candidate.runLive && candidate.bead === "settled";
+      lockKeepReason(candidate.lock) === undefined &&
+      !candidate.runLive &&
+      candidate.bead === "settled";
     const openPr = settled
       ? await openPrNotice(args.repoPath, candidate.branch, args.lookupPr)
       : undefined;

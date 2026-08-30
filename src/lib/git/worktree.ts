@@ -204,7 +204,15 @@ export async function withWorktreeClaim<T>(
   const key = branchKey(repoPath, branch);
   await withBranchLock(repoPath, branch, async () => {
     worktreeClaims.set(key, [...(worktreeClaims.get(key) ?? []), owner]);
-    await lockClaimedWorktree(repoPath, branch, owner);
+    try {
+      await lockClaimedWorktree(repoPath, branch, owner);
+    } catch (err) {
+      // The map entry alone protects nothing outside this process, so a claim that could not be
+      // recorded on the checkout is no claim: drop it and fail rather than run the fix in a
+      // directory a second anton is still free to force-remove.
+      dropClaim(key, owner);
+      throw err;
+    }
   });
   try {
     return await fn();
@@ -212,52 +220,96 @@ export async function withWorktreeClaim<T>(
     // Under the branch lock again, so the git lock is lifted and the map cleared as one step no
     // teardown can read halfway through.
     await withBranchLock(repoPath, branch, async () => {
-      const held = worktreeClaims.get(key) ?? [];
-      const rest = held.filter((_, i) => i !== held.indexOf(owner));
-      if (rest.length > 0) {
-        worktreeClaims.set(key, rest);
-        return;
-      }
-      worktreeClaims.delete(key);
-      await releaseClaimLock(repoPath, branch);
+      if (dropClaim(key, owner)) await releaseClaimLock(repoPath, branch);
     });
   }
 }
 
+/** Drop one holder's in-process claim. True when it was the last, so the git lock may come off. */
+function dropClaim(key: string, owner: string): boolean {
+  const held = worktreeClaims.get(key) ?? [];
+  const at = held.indexOf(owner);
+  const rest = at === -1 ? held : held.filter((_, i) => i !== at);
+  if (rest.length > 0) {
+    worktreeClaims.set(key, rest);
+    return false;
+  }
+  worktreeClaims.delete(key);
+  return true;
+}
+
 /**
- * Put the claim on the checkout itself, where another process can see it. Best-effort by shape: at
- * claim time the checkout usually does not exist yet (review-fix claims the branch, then
+ * Put the claim on the checkout itself, where another process can see it. Applies only once the
+ * checkout exists — at claim time it usually does not (review-fix claims the branch, then
  * materializes it), and {@link createWorktree} takes the lock for the live claim the moment it does.
+ *
+ * Throws when the lock cannot be installed. The git lock is the ONLY half of the claim a second
+ * anton can read, so proceeding without it means running the fix in a directory another process's
+ * teardown is still free to force-remove, uncommitted work and all — a failure to record the claim
+ * has to fail the claim.
  */
 async function lockClaimedWorktree(repoPath: string, branch: string, owner: string): Promise<void> {
-  const record = (await listWorktrees(repoPath).catch(() => [])).find(
-    (r) => !r.isMain && r.branch === branch,
-  );
+  const record = (await listWorktrees(repoPath)).find((r) => !r.isMain && r.branch === branch);
   if (!record) return; // not materialized yet — createWorktree locks it when it is
   if (record.locked) {
-    // Another tool's lock is never ours to break, and a live claim already says what we want said.
-    if (!parseClaimLock(record.lockReason) || liveClaimLock(record.lockReason)) return;
+    const live = liveClaimLock(record.lockReason);
+    // This process's own claim already says what we want said — a second holder needs no second lock.
+    if (live && live.pid === process.pid && live.host === hostname()) return;
+    // Another anton's live claim, or another tool's lock, is never ours to break or to write over.
+    if (live) throw new Error(`[worktree] cannot claim ${record.path} for ${owner}: ${describeClaimLock(live)}`);
+    if (!parseClaimLock(record.lockReason)) {
+      throw new Error(
+        `[worktree] cannot claim ${record.path} for ${owner}: it is locked by another owner ` +
+          `(${record.lockReason || "no reason given"})`,
+      );
+    }
     await unlockWorktree(repoPath, record.path); // a dead claim's leftovers
   }
   try {
     await git(repoPath, ["worktree", "lock", "--reason", claimLockReason(owner), record.path]);
   } catch (err) {
-    console.warn(
+    throw new Error(
       `[worktree] could not lock ${record.path} for ${owner}'s claim, so a second anton process ` +
-        `cannot see it and may remove the checkout: ${gitError(err)}`,
+        `could not see it and might remove the checkout: ${gitError(err)}`,
     );
   }
 }
 
-/** Lift only THIS process's own claim lock: another anton may since have taken the checkout over. */
+/** How hard a released claim tries to come off before an operator has to be told about it. */
+const CLAIM_RELEASE_ATTEMPTS = 3;
+const CLAIM_RELEASE_BACKOFF_MS = 100;
+
+/**
+ * Lift only THIS process's own claim lock: another anton may since have taken the checkout over.
+ *
+ * Retried, because the lock names a pid that is still running: a transient `git` failure here leaves
+ * every later reaper pass — in this process and every other — reading the leftovers as a live claim,
+ * leaking the worktree and its branch until anton restarts. A release that still cannot be proven is
+ * reported loudly with the command that clears it by hand, never swallowed.
+ */
 async function releaseClaimLock(repoPath: string, branch: string): Promise<void> {
-  const record = (await listWorktrees(repoPath).catch(() => [])).find(
-    (r) => !r.isMain && r.branch === branch && r.locked,
-  );
-  const claim = parseClaimLock(record?.lockReason);
-  if (record && claim?.pid === process.pid && claim.host === hostname()) {
-    await unlockWorktree(repoPath, record.path);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= CLAIM_RELEASE_ATTEMPTS; attempt++) {
+    try {
+      const record = (await listWorktrees(repoPath)).find(
+        (r) => !r.isMain && r.branch === branch && r.locked,
+      );
+      const claim = parseClaimLock(record?.lockReason);
+      if (!record || claim?.pid !== process.pid || claim.host !== hostname()) return;
+      await git(repoPath, ["worktree", "unlock", record.path]);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (attempt < CLAIM_RELEASE_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, CLAIM_RELEASE_BACKOFF_MS * attempt));
+      }
+    }
   }
+  console.error(
+    `[worktree] could not release this process's claim on ${branch} after ${CLAIM_RELEASE_ATTEMPTS} ` +
+      `attempts, so every reaper pass will keep reading it as in use — clear it with ` +
+      `\`git -C ${repoPath} worktree unlock ${worktreePathFor(repoPath, branch)}\`: ${gitError(lastError)}`,
+  );
 }
 
 /** Best-effort `git worktree unlock` — a lock that outlives its holder must not be permanent. */
