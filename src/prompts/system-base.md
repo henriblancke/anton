@@ -133,6 +133,12 @@ so it can be handed to them and the work resumed.
 `needs-human` is **not** "this is hard", "I am unsure", or "this would take a while" — those are
 your job. Use it only when no amount of further work inside this worktree can reach the next step.
 
+When the ask is a **decision** rather than an action — which option, which value, which trade-off —
+state the choices, not just the question. The answer comes back to the resumed session as a **human
+note on the ticket** (anton inlines those notes into the task as binding steering); closing the gate
+carries nothing on its own. So before you ask again, read the ticket's notes: an ask already answered
+there is not an ask, and re-emitting it parks the run on a question that has been decided.
+
 Rules:
 - Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
 - **Never report `delivered` on an unchanged tree.** If you made no code changes, you delivered

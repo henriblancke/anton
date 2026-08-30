@@ -2367,9 +2367,9 @@ export interface ArmedHumanGate {
  *
  * Re-entrant (anton-287p.4), because a park is not the only way this is reached: a settle lost after
  * the gate landed, a resume, or a fresh worktree on another machine all re-run the arm against a
- * board that may already carry the wait. Read fresh and STRICTLY — the run's own snapshot predates
- * any gate an earlier attempt armed, and a gate listing that failed must never read as "nothing
- * armed" — then mirror the merge gate's shape:
+ * board that may already carry the wait. PULLED and then read fresh and STRICTLY — the run's own
+ * snapshot predates any gate an earlier attempt (or another machine) armed, and a gate listing that
+ * failed must never read as "nothing armed" — then mirror the merge gate's shape:
  *
  *   • THIS ask ALREADY ARMED — return that gate's id, create nothing. Two gates for one ask is one
  *     dead wait: resolving either leaves the target blocked by the other.
@@ -2387,8 +2387,8 @@ export interface ArmedHumanGate {
  * stands — it is the target's only blocker by then — and every still-open id rides out in the
  * error), when a kill lands anywhere from the board read through the label write (a gate this run
  * created is undone first, which is safe only while the superseded wait is still open; one it was
- * only reusing is left where it stands), or when the board cannot be read (arming blind
- * is how the duplicate wait gets made) — so the caller settles
+ * only reusing is left where it stands), or when the shared board cannot be refreshed or read
+ * (arming blind is how the duplicate wait gets made) — so the caller settles
  * the run LOUDLY instead of parking it. All three are the same failure: a park is only meaningful if
  * resolving the gate it names makes the target runnable, and it does not when there is no gate, when
  * a twin blocks the target, or when anton's own superseded wait is still open beside it. An epic
@@ -2445,6 +2445,27 @@ export async function armHumanGate(
       `the run was cancelled while ${during}, and gate ${gateId} could not be resolved`,
     );
   };
+  // Refresh from the SHARED board first, and refuse the arm when that cannot be done (PR #205
+  // review). The run's own step-0 pull is a whole run old by the time an ask lands here, and on a
+  // shared board another machine — or an operator — can have armed a human gate for this target in
+  // between. Planned against a stale local working set that gate is invisible, so the strict read
+  // below reports the target as bare and this arm creates a SECOND wait, which the run's next sync
+  // then publishes: the same duplicate the read is strict to prevent, and the park would name only
+  // the new one. `beads.pull` resolves for a board with no remote and for a shared server (nothing
+  // to reconcile in either), so a rejection means exactly "anton cannot establish that it is looking
+  // at the current board" — which is not a board to arm a human wait against.
+  try {
+    await beads.pull(repo);
+  } catch (e) {
+    throw new Error(
+      `refusing to arm ${targetId}'s human gate — the shared board could not be refreshed (${
+        e instanceof Error ? e.message : String(e)
+      }), so a wait another machine already armed for this ask would be invisible and this arm ` +
+        `would stack a second one beside it`,
+      { cause: e },
+    );
+  }
+
   // STRICT, and no catch: this read is the ONLY thing that can tell "the ask is already with
   // someone" from "nothing is armed", and bd omits gate beads from every ordinary listing — so a
   // best-effort read that lost its `--type gate` leg would report an armed board as bare and create
@@ -2570,14 +2591,27 @@ export async function armHumanGate(
 }
 
 /**
- * The park reason on the run row: the agent's ask, and the command(s) that release the run.
+ * The park reason on the run row: the agent's ask, WHERE its answer goes, and the command(s) that
+ * release the run.
+ *
+ * Where the answer goes is load-bearing for the asks that are a DECISION rather than an action (PR
+ * #205 review). Resolving the gate records only that the wait ended — it carries nothing back — so a
+ * resumed session handed the same inputs asks the same question again, and "choose A or B" becomes a
+ * permanent resolve/re-arm loop. The channel that DOES reach it is the ticket's human notes: anton
+ * inlines them into the dispatch prompt as binding steering (steps/prompts.ts), so an answer left
+ * there is read by the very session that re-runs this work. Naming it here is what makes resolving
+ * the gate mean "answered" instead of "asked again".
  *
  * Every open human gate is named, not just anton's own. A person's hand-made hold keeps blocking the
  * target after this ask is answered, so a message promising one `bd gate resolve` resumes the run
  * sends the operator down a path that leaves it parked, with nothing naming what still holds it.
  */
 function needsHumanParkMessage(e: NeedsHumanError, gateId: string, held: string[]): string {
-  const base = `${e.message} Answer it, then \`bd gate resolve ${gateId}\``;
+  const base =
+    `${e.message} If answering means telling the run something — a decision, a value, which ` +
+    `option to take — leave that answer as a note on ${e.ticketId} first: the resumed session reads ` +
+    `human notes as binding steering, while the gate carries nothing back. Then ` +
+    `\`bd gate resolve ${gateId}\``;
   return held.length > 0
     ? `${base}. ${held.length} other open human gate(s) on this target were not armed by anton ` +
         `(${held.join(", ")}) — the run resumes only once those are resolved too.`

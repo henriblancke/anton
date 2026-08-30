@@ -243,6 +243,18 @@ function EscalationRow({ slug, escalation }: { slug: string; escalation: Escalat
             remembering what they wanted to check, is deciding on exactly this sentence. Clipping it
             would leave a row that can only be answered by going and reading it somewhere else. */}
         <p className="text-xs text-muted-foreground">{escalation.reason}</p>
+        {/* Where an ANSWER goes, on the one row that can have one. Resume closes the gate and
+            re-queues the work — it carries nothing back — so an ask that is a decision ("A or B?")
+            resolves into a session with the same inputs, which asks it again. The channel that does
+            reach that session is the ticket's notes, which anton inlines into the dispatch as
+            binding steering; without this line the founder answers into a loop. */}
+        {request ? (
+          <p className="text-[11px] text-subtle">
+            Answering with information — a decision, a value, which option — belongs on the ticket
+            as a note before you resume: the resumed session reads notes as binding steering, while
+            resolving the gate carries no answer back.
+          </p>
+        ) : null}
         {!escalation.noted && escalation.beadId ? (
           <p className="text-[11px] text-subtle">
             The bd note for this escalation hasn&apos;t landed yet — anton retries it on the next

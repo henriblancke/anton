@@ -188,6 +188,20 @@ describe("EscalationStrip", () => {
     expect(labels).toEqual(["Waiting on you", "Waiting on you", "Parked run", "Stale PR"]);
   });
 
+  it("tells the founder where an ANSWER goes, on the request rows and only there", () => {
+    // Resume closes the gate and re-queues the work; it carries nothing back (PR #205 review). So an
+    // ask that is a decision resolves into a session with the same inputs, which asks it again —
+    // unless the answer is left where that session reads it, on the ticket as a note.
+    renderStrip([
+      escalation({ id: "esc-1", kind: "needs-human", gateId: "g-1", runId: undefined }),
+      escalation({ id: "esc-2", kind: "parked-run" }),
+    ]);
+
+    const hints = screen.getAllByText(/belongs on the ticket\s+as a note before you resume/);
+    expect(hints).toHaveLength(1);
+    expect(hints[0]!.textContent).toContain("resolving the gate carries no answer back");
+  });
+
   it("answers a wait on a person with resolve-and-resume, and never with Dismiss", () => {
     // Dismiss would settle the row while leaving the gate open — an acknowledged wait that nothing
     // ends, re-raised on every sweep. Abandon stays: "I'm not doing this" is a real answer.

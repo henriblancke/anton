@@ -30,6 +30,7 @@ const loadAllIssuesMock = vi.fn();
 const gateCreateMock = vi.fn();
 const gateResolveMock = vi.fn();
 const tagMock = vi.fn();
+const pullMock = vi.fn();
 
 vi.mock("../beads/issues", async () => {
   const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
@@ -45,6 +46,7 @@ vi.mock("../beads/bd", async () => {
       gateCreate: (...args: unknown[]) => gateCreateMock(...args),
       gateResolve: (...args: unknown[]) => gateResolveMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
+      pull: (...args: unknown[]) => pullMock(...args),
     },
   };
 });
@@ -86,6 +88,40 @@ beforeEach(() => {
   gateCreateMock.mockReset();
   gateResolveMock.mockReset().mockResolvedValue(undefined);
   tagMock.mockReset().mockResolvedValue(undefined);
+  pullMock.mockReset().mockResolvedValue(undefined);
+});
+
+it("pulls the shared board before it plans, so a gate another machine armed is visible", async () => {
+  // The run's step-0 pull is a whole run old by the time an ask lands here (PR #205 review): a
+  // human gate armed elsewhere since then lives only on the remote, and planning against the stale
+  // local working set would read the target as bare and arm a SECOND wait for the same ask.
+  const order: string[] = [];
+  pullMock.mockImplementation(async () => {
+    order.push("pull");
+  });
+  loadAllIssuesMock.mockImplementation(async () => {
+    order.push("read");
+    return [target("g-elsewhere"), gate("g-elsewhere", ASK, [])];
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK)).resolves.toEqual({
+    gateId: "g-elsewhere",
+    held: [],
+  });
+  expect(order).toEqual(["pull", "read"]);
+  expect(pullMock).toHaveBeenCalledWith(REPO);
+  expect(gateCreateMock).not.toHaveBeenCalled();
+});
+
+it("refuses to arm on a board it could not refresh, rather than planning against a stale copy", async () => {
+  // A pull that rejects means anton cannot establish it is looking at the current board — the one
+  // state in which "nothing is armed" is unprovable. Failing here settles the run FAILED carrying
+  // the ask, which a person can act on; a duplicate human gate is a wait no resolve can end.
+  pullMock.mockRejectedValue(new Error("dolt pull: remote unreachable"));
+
+  await expect(armHumanGate(REPO, "f-1", ASK)).rejects.toThrow("could not be refreshed");
+  expect(loadAllIssuesMock).not.toHaveBeenCalled();
+  expect(gateCreateMock).not.toHaveBeenCalled();
 });
 
 it("reads the board strictly, so a failed gate listing can never read as 'nothing armed'", async () => {
@@ -428,6 +464,10 @@ it("parks the run behind the gate and throws the ask while the run is still live
 
   expect(row.patches).toEqual([{ status: "parked", error: expect.stringContaining(ASK) }]);
   expect(row.patches[0].error).toContain("bd gate resolve g-new");
+  // An ask that is a DECISION needs somewhere for the answer to LAND (PR #205 review): resolving
+  // the gate carries nothing back, so the park names the ticket whose human notes the resumed
+  // session reads — otherwise the same question is asked again on resume, forever.
+  expect(row.patches[0].error).toContain("note on t-1");
   expect(thrown).toBeInstanceOf(NeedsHumanError);
 });
 
