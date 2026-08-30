@@ -261,7 +261,12 @@ process.stdin.on('end',()=>{
     // The file the prompt NAMES — the artifact triage actually opens — carries only the survivor.
     const inv = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8").trim().split("\n").pop()!;
     const prompt = (JSON.parse(inv) as { prompt: string }).prompt;
-    const scanFile = /scan file to triage is: (\S+)/.exec(prompt)![1];
+    const match = /scan file to triage is: (\S+)/.exec(prompt);
+    expect(
+      match,
+      `prompt did not contain expected 'scan file to triage is: <path>' — got:\n${prompt}`,
+    ).not.toBeNull();
+    const scanFile = match![1];
     const handed = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { Source: string }[] };
     expect(handed.signals.map((s) => s.Source)).toEqual(["todo"]);
     expect(readFileSync(scanFile, "utf8")).not.toContain("phantom.db");
