@@ -970,6 +970,67 @@ describe("the product master's moves", () => {
       );
       expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
     });
+
+    it("withdraws a grant that landed on a reservation taken while the label was written", async () => {
+      // The window past the CAS: the swap verified the reservation, and a shell `bd assign` lands
+      // while `bd label` is still running. `approved` locks that reservation, so keeping it would
+      // start a run on work the start fence itself bars — held by somebody else.
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      // Refused, not failed: the label came straight back off, so the board is where the ask found it.
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate while this start was being approved — the grant was withdrawn/,
+      );
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        `untag anton-a ${LABELS.approved}`,
+      ]);
+      // Their reservation is theirs: ours is already gone, so nothing here unassigns it.
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+    });
+
+    it("names the grant it could not withdraw from under the new holder", async () => {
+      failOn.set("untag:anton-a", 1);
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate while this start was being approved and the `approved` label could not be withdrawn/,
+      );
+    });
+
+    it("leaves the grant standing when the target cannot be re-read after it", async () => {
+      // A read that failed proves nothing, and untagging on it would withdraw a sound approval — or,
+      // with the claim still ours, strand the bead as a reservation no retry can clear. The run that
+      // starts on it re-asserts ownership for itself before it works.
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", undefined);
+      });
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      expect(result.changed).toEqual(["anton-a"]);
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      expect(warn.mock.calls[0]?.[0]).toMatch(
+        /anton-a was approved but could not be re-read to confirm it is still reserved for operator-1/,
+      );
+      warn.mockRestore();
+    });
   });
 
   it("refuses a split with an answer, because anton will not write new contracts on its own", async () => {

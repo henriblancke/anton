@@ -11,7 +11,7 @@
  */
 import { approvalGaps, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { swapUnderLock, type SwapResult } from "../beads/claim";
+import { ownerOf as claimHolder, swapUnderLock, type SwapResult } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { resolveOperator } from "../operator";
@@ -720,6 +720,10 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
  * Releasing on that path would unassign a claim this apply never made, cancelling somebody else's
  * start in the name of undoing ours.
  *
+ * The label is not the last word either: the reservation it locks can still be taken while the label
+ * write itself is open, so {@link assertReservationHeld} re-reads the target afterwards and undoes a
+ * grant that landed on somebody else's claim.
+ *
  * Answers whether the gate was granted HERE: a label that landed in the swap's own window makes this
  * a no-op with a reservation to hand back, which is {@link grantedByAnother}'s question.
  */
@@ -741,7 +745,71 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
       `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
     );
   }
+  await assertReservationHeld(repo, id, operator);
   return true;
+}
+
+/**
+ * Re-read the target once the label has landed and refuse a grant that ended up on somebody else's
+ * reservation — the last window of the pair, and the one no fence above can see.
+ *
+ * The swap's post-write read is the newest thing the CAS has, and `beads.approve` is a whole bd
+ * invocation later. A teammate's `bd assign` from a shell takes no in-process lock, so a claim
+ * landing in that window is invisible to every check this step made — and because `approved` is what
+ * LOCKS the reservation (the claim route refuses to touch an approved target), returning success
+ * here would settle the ask over work reserved by somebody the eligibility bars refused outright
+ * ({@link assertStillStartable} bars every holder). Asserting the assignee after the label is what
+ * makes the window narrow enough to matter, exactly as {@link grantedByAnother} does for the label.
+ *
+ * A LOCAL re-read, not the cross-machine settle `beads.claimVerified` pays: a claim published from
+ * another machine is fenced where it counts, at pickup — that protocol waits out its propagation
+ * window and re-asserts the assignee before a run works the target — so sleeping one out here, under
+ * every write lock this step holds, would stall the other writers on this board to re-decide
+ * something the runner decides again anyway. What only this read can catch is the writer sharing
+ * this board right now.
+ *
+ * The grant is UNDONE rather than kept: withdrawing the label puts the board back where the proposal
+ * found it, and the reservation needs no unwinding — a foreign owner means our claim is already
+ * gone. A bead we could not re-read is left approved and merely reported: untagging on a read that
+ * proves nothing would withdraw a sound approval, and if the claim is still ours it would strand the
+ * bead as a reservation no retry can clear (see {@link grantApproval}).
+ */
+async function assertReservationHeld(
+  repo: string,
+  id: string,
+  operator: string | undefined,
+): Promise<void> {
+  const live = await beads.show(repo, id).catch(() => undefined);
+  if (!live) {
+    console.warn(
+      `gardener: ${id} was approved but could not be re-read to confirm it is still reserved for ${operator ?? "nobody"} — a run only starts on it after re-asserting ownership itself (beads.claimVerified)`,
+    );
+    return;
+  }
+  const holder = claimHolder(live);
+  if (!holder || holder === operator) return;
+  if (await withdrawGrant(repo, id)) {
+    throw new SubjectMovedError(
+      `${id} was claimed by ${holder} while this start was being approved — the grant was withdrawn, so the board is back where this proposal found it`,
+    );
+  }
+  throw new Error(
+    `${id} was claimed by ${holder} while this start was being approved and the \`${LABELS.approved}\` label could not be withdrawn — it now reads as approved work under a reservation this apply never checked, so a run nobody authorised can start on it`,
+  );
+}
+
+/**
+ * Take the grant back off, and say whether the board took it. Never throws, for the reason
+ * {@link releaseReservation} does not: the caller is already reporting why the start failed, and an
+ * undo that raised a second error would replace that reason with its own.
+ */
+async function withdrawGrant(repo: string, id: string): Promise<boolean> {
+  try {
+    await beads.untag(repo, id, [LABELS.approved]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
