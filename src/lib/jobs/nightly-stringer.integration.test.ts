@@ -260,6 +260,10 @@ process.stdin.on('end',()=>{
 
     // The file the prompt NAMES — the artifact triage actually opens — carries only the survivor.
     const inv = readFileSync(join(sandbox, "claude-argv.jsonl"), "utf8").trim().split("\n").pop()!;
+    expect(
+      inv,
+      "claude-argv.jsonl was empty or contained only blank lines — claude was never invoked",
+    ).toBeTruthy();
     const prompt = (JSON.parse(inv) as { prompt: string }).prompt;
     const match = /scan file to triage is: (\S+)/.exec(prompt);
     expect(
