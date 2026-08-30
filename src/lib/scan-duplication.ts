@@ -44,18 +44,31 @@ const HASH_COMMENT_EXTENSIONS = [".py", ".sh", ".bash", ".zsh", ".rb", ".yaml", 
 const SPACED_HASH_EXTENSIONS = [".sh", ".bash", ".zsh", ".yaml", ".yml"];
 
 /**
- * Where a block comment NESTS — Rust, Swift, Scala and Kotlin close an outer `/*` only on the closer
- * that MATCHES it. Everywhere else the first closer ends the comment however many openers preceded
- * it, and counting depth there would run the comment past its close over the rest of the file.
+ * Where a block comment NESTS — Rust, Swift, Scala, Kotlin and Dart close an outer `/*` only on the
+ * closer that MATCHES it. Everywhere else the first closer ends the comment however many openers
+ * preceded it, and counting depth there would run the comment past its close over the rest of the
+ * file.
  */
-const NESTED_COMMENT_EXTENSIONS = [".rs", ".swift", ".scala", ".kt", ".kts"];
+const NESTED_COMMENT_EXTENSIONS = [".rs", ".swift", ".scala", ".kt", ".kts", ".dart"];
 
 /**
- * Where `"""` / `'''` opens a string that spans lines. Python only: in a shell or YAML file the same
- * three characters are an empty string beside a quote, and reading them as an opener would swallow
- * the rest of the file.
+ * Where `"""` and `'''` BOTH open a string that spans lines — Python's docstrings, Dart's multiline
+ * literals. A file named by neither this list nor the one below has no such form at all: in a shell
+ * or YAML file the same three characters are an empty string beside a quote, and reading them as an
+ * opener would swallow the rest of the file.
  */
-const TRIPLE_QUOTE_EXTENSIONS = [".py", ".pyi"];
+const TRIPLE_QUOTE_EXTENSIONS = [".py", ".pyi", ".dart"];
+
+/**
+ * Where only `"""` opens one — Kotlin's raw strings, Java's text blocks, Scala and Swift. A `'''`
+ * there is a quote beside a char literal rather than an opener. Each of these parses imports, so an
+ * embedded fixture quoting `import (` inside a multiline string would otherwise open import state
+ * that no real `)` closes, and every executable window past the closing delimiter is dropped.
+ */
+const DOUBLE_TRIPLE_QUOTE_EXTENSIONS = [".kt", ".kts", ".java", ".scala", ".swift"];
+
+/** Where `<<WORD` opens a heredoc whose payload is input rather than syntax — the shells. */
+const HEREDOC_EXTENSIONS = [".sh", ".bash", ".zsh"];
 
 /**
  * Where a quoted import path with no alias BINDS a name — Go, where `import "fmt"` binds `fmt`.
@@ -354,8 +367,12 @@ function afterQuoted(line: string, start: number): number {
   return line.length;
 }
 
-/** The heads whose parenthesized clause is followed by a STATEMENT rather than by more expression. */
-const CONTROL_HEAD = /\b(?:if|for|while)\s*$/;
+/**
+ * The heads whose parenthesized clause is followed by a STATEMENT rather than by more expression.
+ * `for await` is the same head with its async spelling — the `await` there is part of the loop, not
+ * an operator yielding a value, so its clause hands to a statement exactly as a plain `for` does.
+ */
+const CONTROL_HEAD = /\b(?:if|for(?:\s+await)?|while)\s*$/;
 
 /**
  * Whether the text ends with the `)` that CLOSES a control-flow head — `if (enabled)`, `for (…)`,
@@ -485,24 +502,31 @@ function maskTemplate(
   return { text, stack: frames };
 }
 
-/** The delimiters a Python string can span lines behind. */
+/** The delimiters a string can span lines behind. */
 const TRIPLE_QUOTES = ['"""', "'''"] as const;
 type TripleQuote = (typeof TRIPLE_QUOTES)[number];
 
+/** The half of them Kotlin, Java, Scala and Swift open a multiline string with. */
+const DOUBLE_TRIPLE_QUOTES: readonly TripleQuote[] = ['"""'];
+
 /**
  * Blank the triple-quoted strings a line carries, INCLUDING the one it leaves open — Python's
- * docstrings and its SQL constants. A `#`-comment file has no template masker and no block-comment
- * state, so without this the prose inside a docstring reaches the declaration classifiers as syntax:
- * an example `from package import (` in one opens `import` state that no real `)` ever closes, and
- * every executable window below it inherits the class and is dropped as a specifier list.
+ * docstrings and its SQL constants, Kotlin's raw strings, Java's text blocks. Such a string holds
+ * arbitrary text, and a fixture inside one routinely quotes source: an example `import (` in it
+ * would otherwise reach the declaration classifiers as syntax, opening `import` state that no real
+ * `)` ever closes, and every executable window past the closing delimiter inherits the class and is
+ * dropped as a specifier list.
  *
- * Single quotes and `#` notes are stepped over rather than parsed, so neither an apostrophe in prose
- * nor a `"""` inside a comment opens anything. The open delimiter is returned so the next line
- * resumes behind the one that opened — `'''` does not close a `"""`.
+ * Single quotes and comments are stepped over rather than parsed, so neither an apostrophe in prose
+ * nor a `"""` inside a note opens anything — read with the marker the language actually uses, since
+ * a `#` cuts a line in Python and means nothing in Kotlin. The open delimiter is returned so the
+ * next line resumes behind the one that opened — `'''` does not close a `"""`.
  */
 function maskTripleQuoted(
   line: string,
   open: TripleQuote | undefined,
+  delimiters: readonly TripleQuote[],
+  hashComments: boolean,
 ): { text: string; open: TripleQuote | undefined } {
   let quote = open;
   let text = quote ? '""' : "";
@@ -518,7 +542,7 @@ function maskTripleQuoted(
       } else i += 1;
       continue;
     }
-    const opener = TRIPLE_QUOTES.find((delimiter) => line.startsWith(delimiter, i));
+    const opener = delimiters.find((delimiter) => line.startsWith(delimiter, i));
     if (opener) {
       quote = opener;
       text += '""';
@@ -526,7 +550,17 @@ function maskTripleQuoted(
       continue;
     }
     const char = line[i];
-    if (char === "#") break;
+    if (hashComments) {
+      if (char === "#") break;
+    } else if (char === "/" && line[i + 1] === "/") break;
+    else if (char === "/" && line[i + 1] === "*") {
+      const close = line.indexOf("*/", i + 2);
+      // An unclosed opener leaves the rest of the line as prose; the caller keeps the text it has.
+      if (close < 0) break;
+      text += line.slice(i, close + 2);
+      i = close + 2;
+      continue;
+    }
     if (char === "'" || char === '"') {
       const end = afterQuoted(line, i);
       text += line.slice(i, end);
@@ -844,6 +878,35 @@ function withoutHashComment(line: string, spaced: boolean): string {
 }
 
 /**
+ * A heredoc opener and the word that ends it — `<<EOF`, `<<-'SQL'`, `<< "END"`, `<<\END`. Sticky, so
+ * it is read at one position rather than searched for. `<<<` is a herestring, which carries its
+ * whole value on the line and opens nothing, so both neighbours of the `<<` are checked.
+ */
+const HEREDOC_OPEN = /(?<!<)<<(?!<)-?\s*(?:(["'])([A-Za-z_]\w*)\1|\\?([A-Za-z_]\w*))/y;
+
+/**
+ * The heredocs a line opens, in the order their payloads arrive — one command can open two
+ * (`cmd <<A <<B`). Quoted strings are stepped over, so a `<<EOF` inside one opens nothing.
+ */
+function heredocDelimiters(line: string): string[] {
+  const found: string[] = [];
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === "'" || char === '"') {
+      i = afterQuoted(line, i) - 1;
+      continue;
+    }
+    if (char !== "<") continue;
+    HEREDOC_OPEN.lastIndex = i;
+    const opened = HEREDOC_OPEN.exec(line);
+    if (!opened) continue;
+    found.push(opened[2] ?? opened[3]);
+    i = HEREDOC_OPEN.lastIndex - 1;
+  }
+  return found;
+}
+
+/**
  * Where a block comment OPENS on this line and is never closed on it — `value: string, /* why`.
  * Quoted strings, templates, regex literals and `//` notes are stepped over, so a `/*` inside any
  * of them opens nothing, and a comment that closes is skipped past so a later opener is still
@@ -896,7 +959,8 @@ function classifyLines(
   opts: {
     hashComments: boolean;
     spacedHash: boolean;
-    tripleQuotes: boolean;
+    tripleQuotes: readonly TripleQuote[] | undefined;
+    heredocs: boolean;
     nestedComments: boolean;
     boundBareImport: boolean;
     rawStrings: boolean;
@@ -921,10 +985,14 @@ function classifyLines(
   // Which spelling of the side-effect import this language uses: Go's requires the blank name,
   // since its bare quoted form binds the package instead.
   const sideEffectImport = opts.boundBareImport ? BLANK_IMPORT : SIDE_EFFECT_IMPORT;
+  // The delimiters this language opens a multiline string with; empty where it has no such form.
+  const tripleQuotes = opts.tripleQuotes ?? [];
   // Empty outside a template; the frames of one it is inside, outermost first.
   let template: TemplateFrame[] = [];
-  // The triple-quote delimiter an open Python string is behind; undefined outside one.
+  // The triple-quote delimiter an open multiline string is behind; undefined outside one.
   let tripleQuote: TripleQuote | undefined;
+  // The terminator words of the heredocs still owed a payload, in the order they were opened.
+  const heredocs: string[] = [];
   // How many `#` the open Rust raw string's closer must carry; undefined outside one.
   let rawString: number | undefined;
   let depth = 0;
@@ -950,6 +1018,16 @@ function classifyLines(
   for (let index = 0; index < lines.length; index += 1) {
     let line = lines[index].trim();
     const next = lines[index + 1]?.trim() ?? "";
+
+    // Inside a heredoc the line is the command's INPUT, not shell syntax — exactly as template and
+    // raw-string text is. A payload quoting `function fake(` would otherwise open a parameter list
+    // that no `)` closes, and every command past the terminator inherits `signature` and is dropped
+    // as a declaration. Read first, since payload text leading with `#` is not a comment either.
+    if (heredocs.length > 0) {
+      if (line === heredocs[0]) heredocs.shift();
+      classes.push("code");
+      continue;
+    }
 
     if (commentDepth > 0) {
       const walked = insideBlockComment(line, commentDepth, opts.nestedComments);
@@ -993,7 +1071,7 @@ function classifyLines(
     // docstring's prose declares nothing and its delimiters are not syntax. Read before the comment
     // and blank tests, since a docstring line starting with `#` is not a comment.
     if (tripleQuote) {
-      const masked = maskTripleQuoted(line, tripleQuote);
+      const masked = maskTripleQuoted(line, tripleQuote, tripleQuotes, opts.hashComments);
       tripleQuote = masked.open;
       line = masked.text.trim();
       if (tripleQuote || line === "") {
@@ -1037,6 +1115,18 @@ function classifyLines(
       }
     }
 
+    // A docstring, a text block or a multiline constant this line OPENS: blank its text now, so the
+    // delimiters inside it never reach the import and signature classifiers below. Ahead of the
+    // template masker for the same reason the raw string is: the text holds ANY character, and a
+    // backtick inside one would otherwise open a template that runs past the string's own close.
+    if (tripleQuotes.length > 0) {
+      const masked = maskTripleQuoted(line, undefined, tripleQuotes, opts.hashComments);
+      if (masked.open) {
+        tripleQuote = masked.open;
+        line = masked.text.trim();
+      }
+    }
+
     // A template this line OPENS and does not close: blank its text now, so the delimiters inside it
     // never reach `parenDelta`. One that closes on its own line is left as written — `stripNoise`
     // masks it wherever a delta is counted, and the raw text is what the import patterns read.
@@ -1044,16 +1134,6 @@ function classifyLines(
       const masked = maskTemplate(line, template);
       if (masked.stack.length > 0) {
         template = masked.stack;
-        line = masked.text.trim();
-      }
-    }
-
-    // The same for a docstring or a multiline constant this line OPENS: blank its text now, so the
-    // delimiters inside it never reach the import and signature classifiers below.
-    if (opts.tripleQuotes) {
-      const masked = maskTripleQuoted(line, undefined);
-      if (masked.open) {
-        tripleQuote = masked.open;
         line = masked.text.trim();
       }
     }
@@ -1077,6 +1157,11 @@ function classifyLines(
     // documented`. Cut here, before any delta is counted, so the prose after the marker cannot hold
     // a wrapped import open over the executable lines below it.
     if (opts.hashComments) line = withoutHashComment(line, opts.spacedHash);
+
+    // A heredoc this line opens: its payload starts on the NEXT line, so the opener itself still
+    // classifies as the command it is. Read after the `#` cut, so one quoted in a note opens
+    // nothing.
+    if (opts.heredocs) heredocs.push(...heredocDelimiters(line));
 
     if (statement) {
       if (statement === "signature") {
@@ -1275,7 +1360,12 @@ function sourceIndex(repoPath: string) {
       lines: classifyLines(source, {
         hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         spacedHash: SPACED_HASH_EXTENSIONS.some((ext) => rel.endsWith(ext)),
-        tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext))
+          ? TRIPLE_QUOTES
+          : DOUBLE_TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext))
+            ? DOUBLE_TRIPLE_QUOTES
+            : undefined,
+        heredocs: HEREDOC_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         nestedComments: NESTED_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         boundBareImport: BOUND_BARE_IMPORT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         rawStrings: RAW_STRING_EXTENSIONS.some((ext) => rel.endsWith(ext)),

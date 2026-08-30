@@ -2890,6 +2890,148 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 type");
     });
 
+    // Kotlin, Java, Scala, Swift and Dart all spell a multiline string `"""`, and all five parse
+    // imports. Untracked, an `import (` quoted inside one opens import state that no real `)`
+    // closes, and every executable window past the closing delimiter is dropped as a specifier list.
+    it("tracks a Kotlin multiline string so a declaration inside it cannot swallow the code below", async () => {
+      const repo = writeRepo({
+        "src/fixture.kt": [
+          "fun load(rows: List<Row>) {",
+          '    val header = """',
+          "import (",
+          '    "fmt"',
+          '""".trimIndent()',
+          "    val total = compute(rows)",
+          "    report(total)",
+          "    flush(total)",
+          "}",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/fixture.kt", 6]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the specifier list beside it is still dropped, so the survivor is the
+      // multiline-string state rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/fixture.kt", Line: 6 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // Dart nests its block comments as Rust does. Closed at the INNER `*/`, the still-commented
+    // `import (` below it opens import state that no real `)` closes, and every executable line past
+    // the outer closer inherits it and is dropped as a specifier list.
+    it("nests Dart block comments, so a commented import cannot swallow the code below", async () => {
+      const repo = writeRepo({
+        "lib/loader.dart": [
+          "/* disabled while the loader moves:",
+          "/* the old path, kept for reference */",
+          "import (",
+          "*/",
+          "void split(String value) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["lib/loader.dart", 6]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "lib/loader.dart", Line: 6 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // A shell heredoc's payload is the command's INPUT, and generating source is what one is for.
+    // Untracked, a `function fake(` in that payload opens a parameter list no `)` closes, and every
+    // command past the terminator inherits `signature` and is dropped as a declaration.
+    it("tracks a shell heredoc so a function header in its payload cannot swallow the commands below", async () => {
+      const repo = writeRepo({
+        "scripts/publish.sh": [
+          "#!/usr/bin/env bash",
+          "cat <<'EOF' > /tmp/sample.js",
+          "function fake(",
+          "  value,",
+          "EOF",
+          "upload /tmp/sample.js",
+          "notify team",
+          "flush queue",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/publish.sh", 6]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/publish.sh", Line: 6 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // `for await (…)` hands to a STATEMENT exactly as a plain `for` does, so a regex may follow its
+    // closing paren. Read as division, the `/*` inside the character class opens a comment that
+    // swallows every line below and drops the executable windows there as prose.
+    it("reads a regex after a `for await` head, not as the block comment its class spells", async () => {
+      const repo = writeRepo({
+        "src/stream.ts": [
+          "export async function scan(rows: AsyncIterable<string>) {",
+          "  for await (const row of rows) /[/*]/.test(row);",
+          "  const total = compute(rows);",
+          "  report(total);",
+          "  flush(total);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/stream.ts", 3]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/stream.ts", Line: 3 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // `type` is an executable BUILTIN in shell — `type git` asks whether a command is on the PATH —
     // not an erased declaration. Read as one, a duplicated block of availability checks is dropped
     // as if it were a field list and the real clone never reaches triage.
