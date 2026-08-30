@@ -1555,6 +1555,37 @@ describe("scan", () => {
       expect(result.duplication.dropped[1].reason).toContain("4 signature");
     });
 
+    // The same complete function written with a BRACED body: the parameter list closes on `) {` and
+    // the work happens below it. The window holds the whole definition, so its parameter lines must
+    // not outvote it — while a window cut off at the header still declares.
+    it("keeps a window holding a multiline signature and the braced body it opens", async () => {
+      const repo = writeRepo({
+        "src/execute.ts": [
+          "export function execute(",
+          "  job: Job,",
+          "  repo: string,",
+          "  logger: Logger,",
+          "  signal: AbortSignal,",
+          ") {",
+          "  return run(job, repo, logger, signal);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        // The whole function — five signature lines, the statement they wrap, and the closing brace.
+        clone([["src/execute.ts", 1]], 8),
+        // The header alone: the body lives below the window, so nothing in it computes.
+        clone([["src/execute.ts", 1]], 6),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: expect.stringContaining("8 lines") }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/execute.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("6 signature");
+    });
+
     // The `=>` a closing line carries may belong to its RETURN TYPE, where nothing runs. Reading it
     // as an expression body would count the line as code and keep a signal over a bare signature.
     it("reads a return type carrying `=>` as a signature, not as an expression body", async () => {
@@ -1703,6 +1734,38 @@ describe("scan", () => {
           'import { resolveBdBin } from "./bd-bin"; // path',
           'import { preflightBd } from "./bd-bin"; // guard',
           "export const used = [parseBdVersion, resolveBdBin, preflightBd];",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/register.ts", 1]], 3),
+        clone([["src/bound.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/register.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/bound.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // An import-attributes clause tells the loader how to parse the module; it binds nothing, so the
+    // statement still runs on load. Reading `with { … }` as a specifier list would file duplicated
+    // setup with the declarations and delete it.
+    it("keeps side-effect imports that carry an attributes clause", async () => {
+      const repo = writeRepo({
+        "src/register.ts": [
+          'import "./schema.json" with { type: "json" };',
+          'import "./locale.json" with { type: "json" };',
+          'import "./limits.json" assert { type: "json" };',
+          "export const ready = true;",
+          "",
+        ].join("\n"),
+        "src/bound.ts": [
+          'import schema from "./schema.json" with { type: "json" };',
+          'import locale from "./locale.json" with { type: "json" };',
+          'import limits from "./limits.json" with { type: "json" };',
+          "export const used = [schema, locale, limits];",
           "",
         ].join("\n"),
       });

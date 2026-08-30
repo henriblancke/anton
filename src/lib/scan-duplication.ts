@@ -134,12 +134,16 @@ const TYPE_START =
  * declaration. Go's raw-string spelling of the path (`` import _ `net/http/pprof` ``) is the same
  * statement, so the delimiter is matched as a pair rather than assumed to be a quote.
  *
+ * An import-attributes clause — `import "./data.json" with { type: "json" }`, or the older
+ * `assert` spelling — binds nothing either: it only tells the loader how to parse what it loads.
+ * The module is still fetched and evaluated, so the line computes as the bare form does.
+ *
  * The trailing comment is part of the idiom — `import "./register"; // install hooks` is how the
  * side effect gets named at all, and rejecting it would file the window with the specifier lists.
  * It is matched after the quoted specifier, so a `//` inside a URL import stays inside the string.
  */
 const SIDE_EFFECT_IMPORT =
-  /^import\s+(?:_\s+)?(["'`])[^"'`]+\1\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
+  /^import\s+(?:_\s+)?(["'`])[^"'`]+\1(?:\s+(?:with|assert)\s*\{[^{}]*\})?\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
 
 /**
  * One blank specifier inside Go's grouped `import (` list — `_ "github.com/lib/pq"`, or the raw
@@ -800,6 +804,21 @@ function describeBlock(classes: LineClass[]): string {
 }
 
 /**
+ * Whether the window shows a parameter list AND the braced body it opens — the multiline spelling of
+ * what a `body` line proves on one line. `) {` opens a body that runs on the lines below it, and
+ * those read as ordinary `code`, so without this the parameter lines above them outvote the very
+ * function they belong to.
+ *
+ * A `code` line INSIDE the list is a parameter DEFAULT and must not count: the line that closes the
+ * list always follows it and is itself a `signature`, so only a statement past the LAST signature
+ * line is body.
+ */
+function holdsBracedBody(classes: LineClass[]): boolean {
+  const closing = classes.lastIndexOf("signature");
+  return closing >= 0 && classes.lastIndexOf("code") > closing;
+}
+
+/**
  * Whether one window is code at all. `blank` and `structural` lines count for neither side — a
  * closing brace is as at home in a clone of real logic as in a clone of an interface — so the
  * question is whether the block's CONTENT lines do work or merely declare. A tie goes to the
@@ -808,14 +827,15 @@ function describeBlock(classes: LineClass[]): string {
  * A window with NO content line at all — nothing but blanks and closers — is not code either, and
  * is reported in those terms rather than as a block that declares.
  *
- * The majority is overridden by one line only: a `body`. A window holding a function's whole
- * executable body is a duplicated FUNCTION, parameter list and all, however many parameter lines
- * precede it — real duplicated computation an operator can extract. That is not the case a stray
- * literal default makes (`budgetAware = false`, which computes nothing), so the override is tied to
- * a recognized body rather than to any `code` line at all.
+ * The majority is overridden by the function's body, however the source spells it: a `body` line
+ * carries it on the line that closes the parameter list, and a braced body carries it in the
+ * statements BELOW that line. Either way the window holds a duplicated FUNCTION, parameter list and
+ * all, however many parameter lines precede it — real duplicated computation an operator can
+ * extract. That is not the case a stray literal default makes (`budgetAware = false`, which
+ * computes nothing), so the override is tied to a body rather than to any `code` line at all.
  */
 function isCodeBlock(classes: LineClass[]): boolean {
-  if (classes.includes("body")) return true;
+  if (classes.includes("body") || holdsBracedBody(classes)) return true;
   const code = classes.filter((cls) => cls === "code").length;
   const declarative = classes.filter((cls) => DECLARATIVE.has(cls)).length;
   return code > 0 && code >= declarative;
