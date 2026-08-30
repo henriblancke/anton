@@ -11,7 +11,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PREFLIGHT_TTL_MS, createDoltSync, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
+import { PREFLIGHT_TTL_MS, getSyncStatus, resetServerPreflight, runDoltSync } from "./bd";
+import { createDoltSync } from "./sync-coalescer";
 import { isServerMode, pinBoardMode, readBoardMode, resetBoardModeCache } from "./board-mode";
 import { BOARD_READ_PROBE } from "./config.mjs";
 

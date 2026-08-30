@@ -6,7 +6,6 @@ import {
   buildCookArgs,
   buildPruneArgs,
   buildUpdateArgs,
-  createDoltSync,
   getSyncStatus,
   getSyncStatusToken,
   isBenignSyncOutput,
@@ -20,6 +19,7 @@ import {
   type Bead,
 } from "./bd";
 import { refreshIssueSnapshot, resetIssueSnapshots } from "./snapshot";
+import { createDoltSync } from "./sync-coalescer";
 
 const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
 
