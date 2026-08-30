@@ -2594,6 +2594,71 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // Go's bare `import "fmt"` BINDS `fmt` — the blank name is what makes an import a side effect
+    // there. Reading the bare form as one keeps a duplicated window of ordinary single-line imports
+    // as executable setup, where the grouped spelling of the same imports is already filtered.
+    it("reads single-line Go imports without the blank alias as bound declarations", async () => {
+      const repo = writeRepo({
+        "src/single-bound.go": [
+          "package main",
+          'import "fmt"',
+          'import "net/http"',
+          'import "os"',
+          "",
+        ].join("\n"),
+        "src/single-blank.go": [
+          "package main",
+          'import _ "github.com/lib/pq"',
+          'import _ "net/http/pprof"',
+          'import _ "gocloud.dev/blob/s3blob"',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/single-bound.go", 2]], 3),
+        clone([["src/single-blank.go", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/single-blank.go"]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/single-bound.go" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // `//` marks a comment only where the language says so. Python spells floor division `//`, so a
+    // wrapped expression leads two computing lines with one — read as prose they outvote the line
+    // above and a genuine clone of arithmetic is dropped as non-code.
+    it("reads a leading `//` as floor division in a hash-comment language", async () => {
+      const repo = writeRepo({
+        "src/ratio.py": [
+          "def ratio(total, divisor, scale):",
+          "    return (",
+          "        total",
+          "        // divisor",
+          "        // scale",
+          "    )",
+          "",
+        ].join("\n"),
+        "src/notes.ts": [
+          "export const ready = true;",
+          "// the reporter starts here",
+          "// and stops on the next tick",
+          "// which is what this note is for",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.py", 3]], 3),
+        clone([["src/notes.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/ratio.py"]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/notes.ts" }]);
+    });
+
     // A backtick opens a template only where one can open. Inside a quoted string or a trailing
     // comment it is text, and reading it as an opener would file every line below it as template
     // text — turning whole parameter lists into code and keeping the windows this filter is for.

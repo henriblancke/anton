@@ -57,6 +57,14 @@ const NESTED_COMMENT_EXTENSIONS = [".rs", ".swift", ".scala", ".kt", ".kts"];
  */
 const TRIPLE_QUOTE_EXTENSIONS = [".py", ".pyi"];
 
+/**
+ * Where a quoted import path with no alias BINDS a name — Go, where `import "fmt"` binds `fmt`.
+ * Only the blank spelling `import _ "…"` runs purely for its side effect there. Everywhere else the
+ * bare form binds nothing and IS the side-effect import, so reading Go's by the same rule would keep
+ * a duplicated window of ordinary bound imports as executable setup.
+ */
+const BOUND_BARE_IMPORT_EXTENSIONS = [".go"];
+
 /** One duplication signal the filter removed, and the proof that removed it. */
 export interface DroppedDuplication {
   /** The file stringer named, as it spelled it. */
@@ -151,10 +159,8 @@ const TYPE_START =
  * load: registering a plugin, installing a polyfill. That runs, so the line computes rather than
  * declares, and a window of them is duplicated setup triage can act on.
  *
- * Go spells the same intent `import _ "net/http/pprof"`: the blank name exists precisely to run the
- * package's `init()` and bind nothing. A named alias (`import fmt2 "fmt"`) binds and stays a
- * declaration. Go's raw-string spelling of the path (`` import _ `net/http/pprof` ``) is the same
- * statement, so the delimiter is matched as a pair rather than assumed to be a quote.
+ * This is the spelling for languages where a bare quoted path binds NO name. Go is not one of them
+ * — `import "fmt"` binds `fmt` — so it gets its own pattern below rather than sharing this one.
  *
  * An import-attributes clause — `import "./data.json" with { type: "json" }`, or the older
  * `assert` spelling — binds nothing either: it only tells the loader how to parse what it loads.
@@ -165,7 +171,16 @@ const TYPE_START =
  * It is matched after the quoted specifier, so a `//` inside a URL import stays inside the string.
  */
 const SIDE_EFFECT_IMPORT =
-  /^import\s+(?:_\s+)?(["'`])[^"'`]+\1(?:\s+(?:with|assert)\s*\{[^{}]*\})?\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
+  /^import\s+(["'`])[^"'`]+\1(?:\s+(?:with|assert)\s*\{[^{}]*\})?\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
+
+/**
+ * Go spells the same intent `import _ "net/http/pprof"`: the blank name exists precisely to run the
+ * package's `init()` and bind nothing. The `_` is REQUIRED here — `import "fmt"` binds the package's
+ * own name and is a declaration like the grouped bound list, and a named alias (`import fmt2 "fmt"`)
+ * binds too. Go's raw-string spelling of the path (`` import _ `net/http/pprof` ``) is the same
+ * statement, so the delimiter is matched as a pair rather than assumed to be a quote.
+ */
+const BLANK_IMPORT = /^import\s+_\s+(["'`])[^"'`]+\1\s*(?:\/\/.*|\/\*.*)?$/;
 
 /**
  * The same statement with its attributes clause left OPEN — `import "./data.json" with {` over a
@@ -745,6 +760,7 @@ function classifyLines(
     spacedHash: boolean;
     tripleQuotes: boolean;
     nestedComments: boolean;
+    boundBareImport: boolean;
   },
 ): LineClass[] {
   const classes: LineClass[] = [];
@@ -757,6 +773,13 @@ function classifyLines(
   // Same boundary for `/* … */`: in a `#`-comment language a `/*` is a path or a glob (`rm /tmp/*`),
   // and reading it as a comment opener would swallow the rest of the file.
   const blockComments = !opts.hashComments;
+  // And for `//`, which marks a comment only where the language says so. Python spells floor
+  // division `//`, so a wrapped expression (`value = (total\n  // divisor\n)`) leads lines that
+  // plainly compute with one; read as prose they would drop the window as non-code.
+  const slashComments = !opts.hashComments;
+  // Which spelling of the side-effect import this language uses: Go's requires the blank name,
+  // since its bare quoted form binds the package instead.
+  const sideEffectImport = opts.boundBareImport ? BLANK_IMPORT : SIDE_EFFECT_IMPORT;
   // Empty outside a template; the frames of one it is inside, outermost first.
   let template: TemplateFrame[] = [];
   // The triple-quote delimiter an open Python string is behind; undefined outside one.
@@ -829,11 +852,11 @@ function classifyLines(
     }
     // A leading `*` is NOT read as comment text here: every line of a block comment is already
     // claimed by the `inComment` branch above, so outside one it is a multiplication continuation.
-    if (line.startsWith("//") || (opts.hashComments && line.startsWith("#"))) {
+    if ((slashComments && line.startsWith("//")) || (opts.hashComments && line.startsWith("#"))) {
       classes.push("comment");
       continue;
     }
-    if (line.startsWith("/*")) {
+    if (blockComments && line.startsWith("/*")) {
       const opened = afterBlockComment(line, opts.nestedComments);
       if (opened.depth > 0) {
         classes.push("comment");
@@ -958,7 +981,7 @@ function classifyLines(
       continue;
     }
 
-    if (SIDE_EFFECT_IMPORT.test(line)) {
+    if (sideEffectImport.test(line)) {
       classes.push("code");
       continue;
     }
@@ -1088,6 +1111,7 @@ function sourceIndex(repoPath: string) {
         spacedHash: SPACED_HASH_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         nestedComments: NESTED_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        boundBareImport: BOUND_BARE_IMPORT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
     cache.set(path, result);
