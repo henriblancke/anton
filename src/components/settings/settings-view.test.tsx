@@ -904,6 +904,49 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect((screen.getByRole("button", { name: "Reset" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  /**
+   * Two writes to one row are queued, so the second one's call-time view of the row is the FIRST
+   * one's optimistic guess — never the server's. Rolling back to that snapshot leaves the table
+   * reporting a state the server never held, with no error left on screen to explain it.
+   */
+  it("rolls a failed write back to the server's row, not to a queued write's guess", async () => {
+    let failDisable: (() => void) | undefined;
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      (_input, init) => {
+        if (init?.method !== "PATCH") {
+          return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+        }
+        const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+        const refused = () =>
+          new Response(JSON.stringify({ error: `${patch.enabled ? "enable" : "disable"} refused` }), {
+            status: 500,
+          });
+        // The disable is held so the enable is clicked while it is still open.
+        if (patch.enabled === false) {
+          return new Promise<Response>((resolve) => {
+            failDisable = () => resolve(refused());
+          });
+        }
+        return Promise.resolve(refused());
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderView({}, [], stringer());
+
+    const toggle = () => screen.getByRole("switch", { name: "nightly-stringer" });
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle());
+    await waitFor(() => expect(failDisable).toBeTruthy());
+    fireEvent.click(toggle());
+    failDisable!();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disable refused"));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("enable refused"));
+    // Neither write landed, so the row reads what the server still holds: on.
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+  });
+
   it("keeps the enable toggle patching schedules.enabled as before", async () => {
     const fetchMock = stubSchedulePatch({
       type: "gardener",
@@ -1714,6 +1757,51 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     expect(offer()).toBeNull();
     expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
       "false",
+    );
+  });
+
+  it("asks the question a failed disarm suppressed, once the picker turns out to be armed", async () => {
+    let finishArm: (() => void) | undefined;
+    let failDisarm: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = (row: Record<string, unknown>) =>
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...row } }));
+      if (patch.type !== "board-picker") return Promise.resolve(stored(patch));
+      // Both picker writes are held, so the test decides when each answer lands — the disarm's is
+      // a refusal.
+      return new Promise<Response>((resolve) => {
+        if (patch.enabled === true) finishArm = () => resolve(stored({ cron: "*/10 * * * *", ...patch }));
+        else
+          failDisarm = () =>
+            resolve(new Response(JSON.stringify({ error: "picker store down" }), { status: 500 }));
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(finishArm).toBeTruthy());
+
+    // Disarm with the arm still open: the arm lands first and its question is rightly suppressed,
+    // because the operator's last click asked for the picker to be off.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    finishArm!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
+    await waitFor(() => expect(failDisarm).toBeTruthy());
+    expect(offer()).toBeNull();
+
+    // Then the disarm refuses. The picker is armed after all, and the question that click
+    // suppressed was never asked at all — left unasked, only cycling the toggle would get it back.
+    failDisarm!();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("picker store down"));
+    await waitFor(() => expect(offer()).toBeTruthy());
+    expect(offer()!.textContent).toContain("Daily at 06:00");
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "true",
     );
   });
 

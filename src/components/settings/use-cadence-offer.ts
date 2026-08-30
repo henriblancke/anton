@@ -163,10 +163,13 @@ export function useCadenceOffer({
     // strength of a disarm that never happened. Both are skipped when a later toggle has since asked
     // for something else: that click is the current premise, not this failure.
     if (!stored) {
-      if (id === AUTOPILOT_ARMING_AUTOMATION && armingIntent.current === next) {
-        armingIntent.current = priorIntent;
-      }
+      const restored = id === AUTOPILOT_ARMING_AUTOMATION && armingIntent.current === next;
+      if (restored) armingIntent.current = priorIntent;
       if (withdrawn && restorable(withdrawn, at)) setOffer(withdrawn);
+      // A disarm that never landed leaves the picker armed with nothing to put back — and if it
+      // raced an arm, it also suppressed that arm's own question, which was therefore never asked
+      // at all. Re-open it from the live rows; `ask()` stays silent unless the premise still holds.
+      else if (restored && armingIntent.current) ask();
     }
     // Arming the picker is the one toggle that changes what ANOTHER automation's staleness costs, so
     // it is the one toggle that opens an offer — and only an offer. Asked only once the arm LANDED:

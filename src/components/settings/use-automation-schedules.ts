@@ -70,6 +70,11 @@ export function useAutomationSchedules({
   // on what the coupled row says NOW — the operator can disable product-master or edit its time
   // while a PATCH is open.
   const rows = useRef(state);
+  // The last row the SERVER confirmed, per automation — what a failed write must roll back to. The
+  // call-time snapshot cannot serve: writes to one row are queued, so a second toggle clicked while
+  // the first is still open reads the first's OPTIMISTIC value and would restore that on failure,
+  // leaving the table reporting a state the server never held.
+  const committed = useRef(state);
   const writes = useRef<WriteGuard>({ inFlight: 0, completed: 0 });
   // The tail of this panel's PATCHes against each row, so it never has two open on one — a cadence
   // accept and a toggle land on the same automation, and each carries only its own field. The route
@@ -109,11 +114,15 @@ export function useAutomationSchedules({
     writes.current.inFlight += 1;
     try {
       const stored = await queueRowWrite(rowWrites, id, () => putSchedule(slug, id, patch));
+      // The patch landed, so it is server truth now — from the echoed row when the route sends one,
+      // and from the fields this write asked for when it does not.
+      const confirmed = stored ?? { ...committed.current[id], ...patch };
+      committed.current = { ...committed.current, [id]: confirmed };
       if (stored) update((p) => ({ ...p, [id]: stored }));
       toast.success(message);
       return true;
     } catch (err) {
-      update((p) => ({ ...p, [id]: reverted(p[id], prev, patch) }));
+      update((p) => ({ ...p, [id]: reverted(p[id], committed.current[id], patch) }));
       toast.error(err instanceof Error ? err.message : `Failed to update ${id}`);
       return false;
     } finally {
@@ -294,18 +303,18 @@ function withTimes(state: ScheduleState, rows: AutomationSchedule[]): ScheduleSt
 }
 
 /**
- * Undo only the fields this patch wrote. Restoring the whole `prev` snapshot would also roll back a
- * concurrent patch for the same automation (toggle while a cadence save is in flight), leaving the
- * row wrong until reload.
+ * Undo only the fields this patch wrote, back to what the server last confirmed. Restoring the whole
+ * `committed` row would also roll back a concurrent patch for the same automation (toggle while a
+ * cadence save is in flight), leaving the row wrong until reload.
  */
 function reverted(
   current: AutomationScheduleState,
-  prev: AutomationScheduleState,
+  committed: AutomationScheduleState,
   patch: SchedulePatch,
 ): AutomationScheduleState {
   return {
     ...current,
-    ...(patch.cron !== undefined ? { cron: prev.cron } : {}),
-    ...(patch.enabled !== undefined ? { enabled: prev.enabled } : {}),
+    ...(patch.cron !== undefined ? { cron: committed.cron } : {}),
+    ...(patch.enabled !== undefined ? { enabled: committed.enabled } : {}),
   };
 }
