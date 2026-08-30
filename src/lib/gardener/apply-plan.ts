@@ -33,11 +33,11 @@ import {
 } from "./detections";
 import { impliesOrdering } from "./relink";
 import {
+  carriedTickets,
   groupedUnder,
   isClusterTier,
   MIN_CARRIED_TICKETS,
   MIN_CLUSTER_SIZE,
-  ticketsPerCard,
 } from "./reparent";
 
 /**
@@ -149,15 +149,29 @@ export type ReparentStep = Extract<ApplyStep, { verb: "reparent" }>;
  * already filing work of this kind under it, and the members stating one subject between them.
  *
  * Recorded per step because the write half sees one step at a time, and neither premise is a fact
- * about the bead being moved. Two lists rather than one: the count has to ignore every id the ask
+ * about the bead being moved. Three lists rather than one: the count has to ignore every id the ask
  * NAMES — including the ones it has already dropped, which somebody may have filed under the home by
- * hand — while the grouping is asked of the members the decision actually kept.
+ * hand — while the grouping is asked of the members the decision actually kept, and both premises
+ * name beads the write half has to LOCK before it can re-ask them of anything (apply-steps.ts
+ * `lockedBeads`).
  */
 export interface ClusterPremise {
   /** Every id the proposal named, excluded from the home's carried-ticket count. */
   named: string[];
   /** The members the decision's regrouping kept — moving and already in place. */
   members: string[];
+  /**
+   * The home's own pre-existing tickets, as the decision found them — the beads its CONTAINER
+   * premise rests on, and the set the write half re-asks that premise over while holding their
+   * locks (`homeCarriesNothing`'s `only`).
+   *
+   * A count would not survive the trip: the write half has to name the beads to lock them, and an
+   * unnamed ticket can be deleted out from under the re-check between the board read and the write.
+   * Narrower than "whatever the home carries at the write" on purpose — a ticket filed under the
+   * home in the meantime is nothing this approval holds a lock on, so letting it carry the premise
+   * would restore exactly the race the list exists to close.
+   */
+  carriers: string[];
 }
 
 /**
@@ -376,15 +390,27 @@ function homeStoppedCarrying(
  * prove its own premise with the very move it is asking for — as would an EARLIER step of the same
  * cluster, which is why the write half re-asks this with the same set (apply-steps.ts
  * `assertClusterHolds`) rather than with whatever is left to move.
+ *
+ * `only` narrows the count to the tickets the caller HOLDS THE LOCKS ON, and the write half always
+ * passes it (see {@link ClusterPremise.carriers}). Counting freely there would leave the premise
+ * resting on beads nothing serialized: `deleteTicket` takes the deleted ticket's own lock and no
+ * other (`ticket-detail.ts`), so the home's lock does not order a deletion against this read, and
+ * the last qualifying ticket could go between the board read and the write — landing the cluster on
+ * a leaf card after all. Restricted to the locked set, a ticket that still counts here cannot be
+ * deleted, re-homed or retyped until this step has written, because all three take its own lock.
  */
 export function homeCarriesNothing(
   home: Bead,
   index: BoardIndex,
   named: ReadonlySet<string>,
+  only?: ReadonlySet<string>,
 ): string | undefined {
-  const carried = ticketsPerCard(index, named).get(home.id) ?? 0;
-  if (carried >= MIN_CARRIED_TICKETS) return undefined;
-  return `${home.id} carries no tickets of its own any more — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if ${home.id} is still the right home`;
+  const carried = carriedTickets(index, home.id, named).filter((id) => only?.has(id) ?? true);
+  if (carried.length >= MIN_CARRIED_TICKETS) return undefined;
+  const lost = only
+    ? `no longer carries the tickets this proposal was decided against`
+    : `carries no tickets of its own any more`;
+  return `${home.id} ${lost} — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if ${home.id} is still the right home`;
 }
 
 /** A subject no longer part of the claim: the board answered it after the proposal was filed. */
@@ -522,7 +548,12 @@ function regroupSurvivors(
     return subject ? [subject] : [];
   });
   const grouped = groupedUnder(home, [...moving, ...inPlace]);
-  const cluster: ClusterPremise = { named: [...plan.subjects], members: [...grouped].sort() };
+  const named = new Set(plan.subjects);
+  const cluster: ClusterPremise = {
+    named: [...named],
+    members: [...grouped].sort(),
+    carriers: carriedTickets(index, home.id, named),
+  };
   return {
     steps: steps.filter((step) => grouped.has(step.id)).map((step) => ({ ...step, cluster })),
     dropped: steps.filter((step) => !grouped.has(step.id)).map((step) => step.id),

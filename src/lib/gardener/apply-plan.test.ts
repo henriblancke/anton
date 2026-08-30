@@ -75,9 +75,14 @@ describe("planApply — what an approval means against the board as it now is", 
           kind: "parentless-cluster",
           observedAtMs: Date.parse(FILED),
           // The two premises the WRITE re-asks under its locks: the ids to keep out of the home's
-          // carried-ticket count, and the membership to re-group (apply-steps.ts
-          // `assertClusterHolds`). Neither is readable from the step's two ends alone.
-          cluster: { named: ["anton-a", "anton-b"], members: ["anton-a", "anton-b"] },
+          // carried-ticket count, the membership to re-group, and the home's own pre-existing
+          // tickets the container bar is counted over (apply-steps.ts `assertClusterHolds`). None
+          // is readable from the step's two ends alone, and each names a bead the write must lock.
+          cluster: {
+            named: ["anton-a", "anton-b"],
+            members: ["anton-a", "anton-b"],
+            carriers: [CARRIED.id],
+          },
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
         {
@@ -89,7 +94,11 @@ describe("planApply — what an approval means against the board as it now is", 
           parentClaim: "",
           kind: "parentless-cluster",
           observedAtMs: Date.parse(FILED),
-          cluster: { named: ["anton-a", "anton-b"], members: ["anton-a", "anton-b"] },
+          cluster: {
+            named: ["anton-a", "anton-b"],
+            members: ["anton-a", "anton-b"],
+            carriers: [CARRIED.id],
+          },
         },
       ],
     });

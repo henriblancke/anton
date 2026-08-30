@@ -118,16 +118,40 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
   }
 }
 
-/** Every bead this step rests on, and so every lock it has to hold to write at all. */
+/**
+ * The beads a CLUSTER re-parent's two board-derived premises are read off, beyond its own two ends:
+ * every member the grouping is recomputed over, and the home's own tickets the container bar is
+ * counted from. Neither is written to, and neither is derivable from the step's ends — which is why
+ * the decision carries them (apply-plan.ts `ClusterPremise`) and why they are locked (see
+ * {@link lockedBeads}).
+ */
+function premiseBeadsOf(step: ApplyStep): string[] {
+  const cluster = step.verb === "reparent" ? step.cluster : undefined;
+  return cluster ? [...cluster.members, ...cluster.carriers] : [];
+}
+
+/**
+ * Every bead this step rests on, and so every lock it has to hold to write at all.
+ *
+ * The two ends and the ticket owner are the beads it WRITES to or points at; the cluster premise
+ * beads are the ones it READS to decide whether it may write at all, and they earn the same lock for
+ * the same reason. Without them {@link assertClusterHolds} re-reads state nothing serializes: a
+ * member other than this step's subject can be retitled or relabelled by `updateTicket` after the
+ * board read, so the grouping passes on a title that is already gone — and a home's last qualifying
+ * ticket can be removed by `deleteTicket`, which takes that ticket's lock and no other, so the
+ * home's own lock never orders the deletion against the container bar. Held, both writes either land
+ * before the read (and it refuses) or queue behind this one.
+ */
 function lockedBeads(step: ApplyStep): string[] {
-  return [step.id, counterpartOf(step), ownerOf(step)?.id].filter(
+  return [step.id, counterpartOf(step), ownerOf(step)?.id, ...premiseBeadsOf(step)].filter(
     (id): id is string => id !== undefined,
   );
 }
 
 /**
- * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart and
- * a retirement's ticket owner — and re-judged against reads taken from inside those locks.
+ * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart, a
+ * retirement's ticket owner, and a cluster's members and carried tickets ({@link premiseBeadsOf}) —
+ * and re-judged against reads taken from inside those locks.
  *
  * `planApply` decides against the caller's board snapshot, which is already seconds old by the time
  * the first bd write spawns — and the thing it is guarding against, a runner publishing a lease or
@@ -264,14 +288,22 @@ async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
  * asks whether the beads are open, unclaimed, unmoved and the right tier, all of which the writes
  * that falsify these leave untouched.
  *
- * Both order against locks this step holds. The home's last ticket leaves by a RE-PARENT, which
- * takes the home's own lock as the ticket's ticket owner (see {@link ownerOf}), so either that move
- * lands first and this read finds the card a leaf, or it queues behind this write. The grouping is
- * read from titles and `area:` labels, edited under the bead's own lock (`ticket-detail.ts`
- * `updateTicket`) — held here for the subject and the home, which is where a rename does the damage:
- * it lands work under a card it no longer shares a subject with. An edit to ANOTHER member is
- * outside these locks and caught only as the fresh read happens to see it, the same bargain
- * {@link assertOwnerUnchanged} strikes.
+ * Both order against locks this step holds, and both need locks BEYOND its own two ends, which is
+ * why {@link lockedBeads} takes the whole membership and the home's carried tickets as well. The
+ * home's last ticket leaves by a re-parent — which takes the home's own lock as the ticket's ticket
+ * owner (see {@link ownerOf}) — but also by a `deleteTicket`, which takes only the deleted ticket's
+ * lock, so the container bar is asked over the CARRIERS the decision recorded and this step holds
+ * (apply-plan.ts `homeCarriesNothing`'s `only`) rather than over whatever the board happens to show.
+ * The grouping is read from titles and `area:` labels, edited under the bead's own lock
+ * (`ticket-detail.ts` `updateTicket`) — held here for every member, not just the subject, because a
+ * rename does its damage from either end: the partner that proves the subject still shares a topic
+ * can be the one edited away, and when that partner is already in place no later step is left to
+ * refuse and roll the cluster back.
+ *
+ * One bargain remains, a level up: a carrier attributed to the home THROUGH an intermediate bead is
+ * only as ordered as that bead. Re-homing one takes the home's own lock as its ticket owner, but
+ * deleting one takes its own lock alone, and it is caught only as the fresh read happens to see it —
+ * the same bargain {@link assertOwnerUnchanged} strikes.
  *
  * The count ignores every id the ask NAMED rather than the members left to move: an earlier step of
  * this same cluster has already landed under the home, and letting it count would let the ask prove
@@ -282,7 +314,7 @@ function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
   if (!cluster) return;
   const target = board.byId.get(step.parent);
   if (!target) throw new SubjectMovedError(missing(step.parent));
-  const leaf = homeCarriesNothing(target, board, new Set(cluster.named));
+  const leaf = homeCarriesNothing(target, board, new Set(cluster.named), new Set(cluster.carriers));
   if (leaf) throw new SubjectMovedError(leaf);
   const members = cluster.members.flatMap((id) => {
     const member = board.byId.get(id);

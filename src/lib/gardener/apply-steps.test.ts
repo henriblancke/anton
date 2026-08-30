@@ -16,6 +16,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import {
   apply,
   applyWith,
@@ -45,6 +46,7 @@ import {
   planFor,
   proposalFor,
   record,
+  REPO,
   REPARENT,
   resetSeam,
   runCard,
@@ -192,10 +194,10 @@ describe("under the write lock — what a decided step re-asks before it lands",
   });
 
   /**
-   * The CONTAINER half of a cluster's "obvious home" (reparent.ts `MIN_CARRIED_TICKETS`), and the
-   * write that revokes it takes this same lock: the home's last ticket leaves by a re-parent, whose
-   * ticket owner IS this card. Left with the snapshot, both approvals pass and the cluster lands on
-   * a leaf feature — one PR's worth of work turned into somebody else's epic.
+   * The CONTAINER half of a cluster's "obvious home" (reparent.ts `MIN_CARRIED_TICKETS`), re-asked
+   * over the tickets the decision recorded and the step LOCKS. Left with the snapshot, both
+   * approvals pass and the cluster lands on a leaf feature — one PR's worth of work turned into
+   * somebody else's epic.
    */
   it("refuses a cluster whose home lost its last ticket since the snapshot", async () => {
     const proposal = proposalFor(CLUSTER);
@@ -207,7 +209,7 @@ describe("under the write lock — what a decided step re-asks before it lands",
     ).rejects.toMatchObject({ failure: "refused" });
 
     expect(calls).toEqual([
-      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card carries no tickets of its own any more — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
     ]);
   });
 
@@ -222,13 +224,64 @@ describe("under the write lock — what a decided step re-asks before it lands",
       if (call === "reparent anton-a anton-card") liveBeads.set(CARRIED.id, bead(CARRIED.id));
     });
 
-    await expect(apply(proposal, board)).rejects.toThrow(/carries no tickets of its own any more/);
+    await expect(apply(proposal, board)).rejects.toThrow(
+      /no longer carries the tickets this proposal was decided against/,
+    );
 
     expect(calls.slice(0, 2)).toEqual([
       "reparent anton-a anton-card",
       "reparent anton-a anton-old", // rolled back: the cluster never had a home to land on
     ]);
     expect(calls.some((c) => c.startsWith("reparent anton-b"))).toBe(false);
+  });
+
+  // …and neither may a ticket that landed under the home AFTER the decision. `deleteTicket` takes
+  // the deleted ticket's own lock and no other, so the home's lock does not order a deletion against
+  // this read — which is why the bar is asked over the CARRIERS the decision recorded and this step
+  // locks. A newcomer is a bead nothing here holds, so counting it would leave the premise resting
+  // on a ticket that can vanish between the read and the write.
+  it("refuses a cluster whose home swapped its ticket for one this step never locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set(CARRIED.id, bead(CARRIED.id)); // the counted ticket is detached…
+    liveBeads.set("anton-t1", child("anton-t1", CARD.id)); // …and an unlocked one takes its place
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  /**
+   * The re-checks above are only worth their board read if the beads they read cannot move while
+   * they run — so the step locks the whole cluster premise, not just its own two ends. A PARTNER's
+   * title is what proves the subject still shares a subject with the home, and the home's own ticket
+   * is what proves it is a container at all; both are edited or deleted under their own per-bead
+   * locks (`ticket-detail.ts`), and neither is the subject, the home or the ticket owner.
+   *
+   * Asserted as the lock itself rather than through a staged race, because the harm is precisely
+   * that the window is invisible to a fresh read: hold the bead, and nothing may be written until it
+   * is released.
+   */
+  it("takes the write lock of every cluster member and carried ticket, not just its own two ends", async () => {
+    for (const held of ["anton-b", CARRIED.id]) {
+      resetSeam();
+      const proposal = proposalFor(CLUSTER);
+      let release = () => {};
+      const queued = withBeadWriteLock(REPO, held, () => new Promise<void>((r) => (release = r)));
+
+      const run = apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]);
+      try {
+        await new Promise((r) => setTimeout(r, 10));
+        expect(calls, `${held} was not held`).toEqual([]);
+      } finally {
+        release();
+        await queued;
+      }
+      await expect(run).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+    }
   });
 
   /**

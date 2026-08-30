@@ -363,6 +363,29 @@ export function ticketsPerCard(
 }
 
 /**
+ * WHICH tickets one card carries, by the same attribution {@link ticketsPerCard} counts them with.
+ *
+ * The ids rather than the count, because an approval has to hold them: the write half locks the
+ * tickets its home's container premise rests on and re-asks the bar over those beads alone
+ * (apply-plan.ts `homeCarriesNothing`'s `only`, apply-steps.ts `lockedBeads`). A count is not
+ * lockable; a list is.
+ */
+export function carriedTickets(
+  index: BoardIndex,
+  cardId: string,
+  ignore?: ReadonlySet<string>,
+): string[] {
+  return index.all
+    .filter(
+      (bead) =>
+        !ignore?.has(bead.id) &&
+        isRunTicket(bead, index.cards) &&
+        index.cards.cardOf(bead) === cardId,
+    )
+    .map((bead) => bead.id);
+}
+
+/**
  * Parentless working-layer beads that share one obvious card home. Each is technically a legal
  * standalone run target ("an epic-of-one"), so the smell is not the shape of any single bead — it is
  * a HANDFUL of them orbiting the same feature, which means the board is showing a pile of chips
