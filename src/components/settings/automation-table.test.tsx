@@ -283,7 +283,7 @@ describe("the automation rows", () => {
   // result to date it against. Without saying "in progress" the row is a bare timestamp, and the
   // automation's first execution looks like one that reported nothing at all.
   it("shows a first fire with no settled result as in progress", () => {
-    renderTable({ "run-health": { lastRunAt: NOW_SEC() - 120 } });
+    renderTable({ "run-health": { enabled: true, lastRunAt: NOW_SEC() - 120 } });
     expect(screen.getByText("2m ago")).toBeTruthy();
     expect(screen.getByText("in progress")).toBeTruthy();
     expect(screen.queryByText("nothing to do")).toBeNull();
@@ -295,6 +295,7 @@ describe("the automation rows", () => {
   it("does not credit a still-running fire with the previous fire's result", () => {
     renderTable({
       "nightly-stringer": {
+        enabled: true,
         lastRunAt: NOW_SEC() - 120,
         lastRun: {
           outcome: "ok",
@@ -314,6 +315,7 @@ describe("the automation rows", () => {
   it("does not blame a running fire for yesterday's failure", () => {
     renderTable({
       "run-health": {
+        enabled: true,
         lastRunAt: NOW_SEC() - 120,
         lastRun: {
           outcome: "failed",
@@ -327,6 +329,34 @@ describe("the automation rows", () => {
     expect(screen.queryByText("gh: not authenticated")).toBeNull();
     expect(screen.queryByText("failed —")).toBeNull();
     expect(screen.getByText(/^in progress · failed 1d ago$/)).toBeTruthy();
+  });
+
+  // Disabling a schedule leaves an already enqueued job queued and unleased (jobs/runner.ts) while
+  // preserving `lastRunAt`, so the unsettled reading would otherwise claim a handler is running for
+  // as long as the automation stays off.
+  it("calls an unsettled fire held, not in progress, while the automation is off", () => {
+    renderTable({ "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120 } });
+
+    expect(screen.getByText("held · automation off")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  it("dates the previous outcome behind a held fire without crediting it", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: false,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+
+    expect(screen.getByText("held · automation off · ok 3h ago")).toBeTruthy();
+    expect(screen.queryByText("triaged 4 signal(s)")).toBeNull();
   });
 
   // The mirror check: a settled fire always settles at or after it was enqueued, so the in-flight
@@ -350,6 +380,7 @@ describe("the automation rows", () => {
   it("does not hand a running fire the verdict of an older fire resumed after it started", () => {
     renderTable({
       "nightly-stringer": {
+        enabled: true,
         lastRunAt: NOW_SEC() - 120,
         lastRun: {
           outcome: "failed",

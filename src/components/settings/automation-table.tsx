@@ -60,6 +60,13 @@ const OUTCOME_STYLES: Record<ScheduleRunOutcome, { dot: string; label: string; t
  */
 const IN_FLIGHT_STYLE = { dot: "bg-stage-implementing", text: "text-muted-foreground" };
 
+/**
+ * A fire enqueued before the switch went off. The runner leaves jobs for a disabled schedule queued
+ * and unleased (jobs/runner.ts), so nothing is running — grey, like the row's own off dot, because
+ * this is the state the operator chose and not one to chase.
+ */
+const HELD_STYLE = { dot: "bg-stage-backlog", text: "text-subtle" };
+
 /** What one automation is, and what makes it inert. */
 export interface AutomationSpec {
   id: string;
@@ -299,7 +306,7 @@ function AutomationTableRow({
       </td>
 
       <td className="px-2.5 py-2 align-middle font-mono text-[11.5px] tabular-nums whitespace-nowrap text-muted-foreground">
-        <LastRunCell state={state} now={now} />
+        <LastRunCell state={state} now={now} on={on} />
       </td>
 
       <td className="px-2.5 py-2 text-right align-middle">
@@ -331,22 +338,37 @@ function AutomationTableRow({
  * week-old failure reads as a week old and not as something that just happened. A FIRST fire has no
  * older result to date, and still says it is in flight — otherwise the automation's very first
  * execution is indistinguishable from a bare timestamp with nothing behind it.
+ *
+ * An unsettled fire is only IN FLIGHT while the switch is on. Disabling a schedule leaves an already
+ * enqueued job queued and unleased (jobs/runner.ts) while preserving `lastRunAt`, so an off row
+ * would otherwise claim a handler is running for as long as the automation stays off. It says it is
+ * held instead — waiting on the switch, not on a worker.
  */
-function LastRunCell({ state, now }: { state: AutomationScheduleState; now: number }) {
+function LastRunCell({
+  state,
+  now,
+  on,
+}: {
+  state: AutomationScheduleState;
+  now: number;
+  on: boolean;
+}) {
   if (!state.lastRunAt) return <span className="text-subtle">never</span>;
 
   const previous = state.lastRun;
   const settled = previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
   const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
+  const pending = on ? "in progress" : "held · automation off";
+  const pendingStyle = on ? IN_FLIGHT_STYLE : HELD_STYLE;
 
   const detail = settled
     ? (previous.note ?? style?.label)
     : previous
-      ? `in progress · ${OUTCOME_STYLES[previous.outcome].label} ${formatRelativeTime(
+      ? `${pending} · ${OUTCOME_STYLES[previous.outcome].label} ${formatRelativeTime(
           new Date(previous.enqueuedAt * 1000).toISOString(),
           now,
         )}`
-      : "in progress";
+      : pending;
   // The failure note is an error message and can outrun the column; the tooltip keeps it, including
   // for the older fire whose note the in-flight line has no room to spell out.
   const title = settled ? detail : previous?.note ? `${detail} — ${previous.note}` : detail;
@@ -355,7 +377,7 @@ function LastRunCell({ state, now }: { state: AutomationScheduleState; now: numb
     <span className="flex flex-col gap-0.5">
       <span className="flex items-center gap-1.5">
         <span
-          className={cn("size-1.5 shrink-0 rounded-full", style?.dot ?? IN_FLIGHT_STYLE.dot)}
+          className={cn("size-1.5 shrink-0 rounded-full", style?.dot ?? pendingStyle.dot)}
           aria-hidden="true"
         />
         <span title={formatInstant(state.lastRunAt)}>
@@ -366,7 +388,7 @@ function LastRunCell({ state, now }: { state: AutomationScheduleState; now: numb
         <span
           className={cn(
             "max-w-[15rem] truncate text-[10.5px]",
-            style?.text ?? IN_FLIGHT_STYLE.text,
+            style?.text ?? pendingStyle.text,
           )}
           title={title}
         >
