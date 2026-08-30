@@ -777,11 +777,17 @@ async function reopenPreserved(
  * re-selects it and finalizes again from the top; past it, the epic is done and is never finalized
  * twice.
  *
- * Which makes every step individually safe to repeat: already-closed beads are skipped, a rehomed
- * ticket has left the target's subtree so it is neither rehomed nor re-noted on a second pass,
+ * Which makes every step individually safe to repeat: already-closed beads are skipped,
  * removeWorktree is a no-op when the worktree/branch are already gone (execute-epic removes the
  * worktree at PR open, so it is usually already gone by merge time), and an already-finalized run
  * leaves no open run to touch.
+ *
+ * The rehome is the one step a later sweep can NOT resume, and the ordering inside step 1 is what
+ * pays for that (PR #199): a reparented ticket has left the target's subtree, so the next sweep's
+ * `runTickets` no longer carries it and nothing still owed to it would ever be done. So the move is
+ * the LAST thing done to a ticket — it is released and reopened first, while it is still where a
+ * re-run of this function would find it. Only its note is written after, and a missing note is the
+ * one thing that costs nobody a claim.
  */
 export async function finalizeMergedEpic(args: {
   db: AntonDb;
@@ -811,9 +817,9 @@ export async function finalizeMergedEpic(args: {
     (b) => b.id !== epic.id && b.status !== "closed" && undelivered.has(b.id),
   );
 
-  // 1. Rehome the preserved tickets that are safe to RE-RUN under a NEW run target, hand each one
-  //    back in a claimable state, then say on each of them that the feature shipped without it —
-  //    the operator meets this ticket long after the run that skipped it, under a target that now
+  // 1. Hand each preserved ticket that is safe to RE-RUN back in a claimable state, move those
+  //    under a NEW run target, then say on each of them that the feature shipped without it — the
+  //    operator meets this ticket long after the run that skipped it, under a target that now
   //    reads as done.
   //
   //    Rehoming is what makes the instruction actionable (anton-67xj). Left where they are these
@@ -825,16 +831,22 @@ export async function finalizeMergedEpic(args: {
   // child to the same operator it claimed the target for, so the target's own assignee names it.
   const runOwner = ownerOf(epic);
   const rerunnable = preserved.filter((b) => safeToRerunAtMerge(b, runOwner));
-  const followUp = await rehomePreserved(
-    repo,
-    epic,
-    rerunnable,
-    preserved,
-    children,
-    areaLabelOf(epic, all),
-    runOwner,
-  );
+  // Decide the rehome first, apply it last (PR #199). planRehome writes nothing: it answers which
+  // tickets the follow-up may still take, and which ones another operator has moved out of the
+  // target or moved on in place since the sweep — the verdicts the setup below must not overwrite.
+  const plan = await planRehome(repo, epic, rerunnable, children, runOwner);
   const rerun = new Set(rerunnable.map((b) => b.id));
+
+  // Every preserved ticket is made claimable BEFORE it leaves the merged target's subtree
+  // (PR #199). The reparent is the step that makes finalization unresumable for that one ticket:
+  // the next sweep re-derives the children from the target (runTickets), and a moved ticket is no
+  // longer among them, so anything still owed to it can never be picked up again. Owing it a
+  // release or a reopen is exactly the state the rehome exists to prevent — a `blocked` or
+  // still-assigned ticket under the un-approved follow-up parks every claim at execute-epic's
+  // gate, and no sweep would ever come back for it. So the setup runs here, while the ticket is
+  // still where the next sweep would find it; only the note, which has nothing to say until the
+  // move lands, waits for it.
+  const settled = new Map<string, PreservedSetup>();
   for (const bead of preserved) {
     // Release the reservation the run that skipped this ticket still holds. Its own unassign at
     // skip time is best-effort (and older runs had none), and a claim that outlives its run hides
@@ -865,16 +877,37 @@ export async function finalizeMergedEpic(args: {
     // ticket already `open` (a dependent skipped behind the timeout) is left untouched, and one on
     // the manual path stays `blocked` on purpose — it must not become runnable.
     // …unless another operator moved it out of this target since the sweep read the board
-    // (rehomePreserved): the ticket is theirs now, and its status is part of the state they are
+    // (planRehome): the ticket is theirs now, and its status is part of the state they are
     // running it in.
     // …or moved on in place: a ticket someone has since claimed, closed or snoozed keeps the status
     // they put it in, so the reopen is skipped for the same reason the reparent was.
-    const takenOver = followUp.elsewhere.has(bead.id);
-    const movedOn = followUp.changed.get(bead.id);
+    const takenOver = plan.elsewhere.has(bead.id);
+    const movedOn = plan.changed.get(bead.id);
     const statusNote =
       rerun.has(bead.id) && !takenOver && !movedOn
         ? await reopenPreserved(repo, bead, runOwner)
         : "";
+    settled.set(bead.id, { owner, stillOwned, foreignOwner, statusNote });
+  }
+
+  // Claimable now, so the tickets the plan cleared can take their new home.
+  const followUp = await applyRehome(
+    repo,
+    epic,
+    plan,
+    rerunnable,
+    preserved,
+    children,
+    areaLabelOf(epic, all),
+  );
+
+  // Only once the moves have landed can a ticket say where it ended up, so the notes come last.
+  for (const bead of preserved) {
+    const { owner, stillOwned, foreignOwner, statusNote } = settled.get(
+      bead.id,
+    )!;
+    const takenOver = plan.elsewhere.has(bead.id);
+    const movedOn = plan.changed.get(bead.id);
     // Three lanes, three different things to tell the operator who meets this ticket later: the
     // rerun lane, the post-commit lane (no marker — its work IS in the merged diff), and a ticket
     // whose status is somebody's own decision, which anton neither reruns nor asks a human to
@@ -914,7 +947,7 @@ export async function finalizeMergedEpic(args: {
               `open on purpose: closing it here would file work that was never done as shipped. ` +
               (takenOver
                 ? `Another operator moved it under ` +
-                  `${followUp.elsewhere.get(bead.id) ?? "a different target"} while the pull ` +
+                  `${plan.elsewhere.get(bead.id) ?? "a different target"} while the pull ` +
                   `request was in review, so anton left it there rather than rehoming it — that ` +
                   `target owns this work now.`
                 : movedOn
@@ -984,8 +1017,9 @@ export async function finalizeMergedEpic(args: {
   //    children under a merged target anton cannot run, which is the exact failure 1 exists to
   //    prevent. Closing last means a stop anywhere before this line leaves the epic open and still
   //    `stage:in-review`, and the whole finalization re-runs next sweep: a rehomed ticket has left
-  //    the subtree, so it is neither rehomed nor re-noted twice, and the remainder of a partly-done
-  //    rehome gets a follow-up target of its own.
+  //    the subtree, so it is neither rehomed nor re-noted twice (which is why step 1 finishes with
+  //    that ticket BEFORE it moves), and the remainder of a partly-done rehome gets a follow-up
+  //    target of its own.
   //
   //    The target is never itself "preserved": a leaf run target marked undelivered has no merged
   //    PR to finalize, and excluding it from the close would leave `stage:in-review` on forever,
@@ -1006,11 +1040,111 @@ export async function finalizeMergedEpic(args: {
 }
 
 /**
- * Move the tickets a merged PR did not contain, and that are safe to run again
- * ({@link safeToRerunAtMerge}), under a NEW epic — and answer that epic's id (undefined when there
- * is nothing to rehome, or bd refused). An epic with no `feature` children is a run target, so the
- * preserved work becomes claimable and runnable again — see the caller for why leaving it under the
- * merged target does not.
+ * Pass 1 of the rehome, and the only part of it that writes nothing: decide which of the
+ * `rerunnable` tickets a follow-up target may still take, and record what disqualified the rest.
+ *
+ * Split out from {@link applyRehome} so the caller can finish each ticket's setup before the
+ * reparent detaches it (PR #199) — and because these verdicts are what tells that setup which
+ * tickets have become somebody else's to decide about.
+ *
+ * `rerunnable` comes off the sweep's snapshot and a PR can sit in review for days: if another
+ * operator has reparented a ticket onto a target of their own since, moving it here steals it out
+ * from under a run that may already be executing it — which then trips that run's own ticket-set
+ * drift check and parks it. A read that fails moves nothing either, for the same reason the status
+ * write doesn't: the snapshot is not evidence enough on its own.
+ */
+async function planRehome(
+  repo: string,
+  epic: Bead,
+  rerunnable: Bead[],
+  subtree: Bead[],
+  runOwner: string | undefined,
+): Promise<RehomePlan> {
+  const plan: RehomePlan = {
+    takeable: new Map(),
+    elsewhere: new Map(),
+    changed: new Map(),
+    fresh: new Map(),
+  };
+  if (rerunnable.length === 0) return plan;
+
+  // Belonging is ANCESTRY, not the direct parent (anton-67xj). A run owns every working-layer
+  // descendant of its target (runTickets), and bd nesting is arbitrary-depth — so a ticket hanging
+  // off another ticket is legitimately part of this run while its parent is not the epic. Reading
+  // the direct parent filed every one of those as work another operator had moved: a nested ticket
+  // whose parent shipped stayed stranded under the merged target, and one whose parent moved too
+  // followed it without ever passing through reopenPreserved, so nothing could claim it.
+  // The whole chain is re-read, not just the candidate. `subtree` is the sweep's snapshot, and an
+  // ANCESTOR another operator reparented since carries every ticket beneath it out of this run:
+  // resolving the walk from the snapshot answers "still on the merged target" for work that is now
+  // somebody else's, and reparents it out of their target into this follow-up. Every read is
+  // memoised — and the memo carries over into applyRehome — so a chain shared by several candidates
+  // costs one `bd show` per bead, not one per walk.
+  const bySubtreeId = new Map(subtree.map((b) => [b.id, b]));
+  const readFresh = memoisedShow(repo, plan.fresh);
+  const ridesOnTarget = async (
+    candidate: Bead,
+  ): Promise<"target" | "elsewhere" | "unknown"> => {
+    const seen = new Set<string>([candidate.id]);
+    let parentId = beads.parentOf(candidate);
+    while (parentId && !seen.has(parentId)) {
+      if (parentId === epic.id) return "target";
+      seen.add(parentId); // a parent cycle terminates rather than hanging finalization
+      if (!bySubtreeId.has(parentId)) return "elsewhere"; // left the subtree — another target owns it
+      const parent = await readFresh(parentId);
+      if (!parent) return "unknown"; // an unreadable link proves nothing either way
+      parentId = beads.parentOf(parent);
+    }
+    return "elsewhere";
+  };
+
+  for (const bead of rerunnable) {
+    const candidate = await readFresh(bead.id);
+    if (!candidate) continue;
+    const belonging = await ridesOnTarget(candidate);
+    // An unreadable ancestor decides nothing — neither that the ticket still rides on the merged
+    // target nor that somebody took it — so it moves nothing and claims neither in its note.
+    if (belonging === "unknown") continue;
+    if (belonging === "elsewhere") {
+      plan.elsewhere.set(bead.id, beads.parentOf(candidate));
+      continue;
+    }
+    // The parent is only half of what went stale. In the same window the ticket can have been
+    // claimed, closed or snoozed in place, or taken over by another operator — and a rerun lane
+    // earned by the snapshot is not one the board still grants: moving a now-active ticket hands a
+    // second run the work someone is doing, and moving a closed one puts finished work under a
+    // follow-up branch that carries no commit for it, which execute-epic then reads as a
+    // cross-machine resume and runs again. So the allowlist is re-applied to the fresh read, and a
+    // claim that changed hands since the snapshot disqualifies it however it reads.
+    //
+    // Ownership is checked here on its own, not left to the allowlist: `safeToRerunAtMerge` weighs
+    // the assignee only on the `in_progress` lane, so an `open` or `blocked` ticket another
+    // operator had already reserved BEFORE the sweep read the board passes it — and reads as no
+    // takeover either, since the snapshot carries the same foreign owner. Reparenting that one
+    // advertises work somebody holds under a second target. Any owner but the dead run's own is a
+    // live reservation, whenever it landed.
+    const freshOwner = ownerOf(candidate);
+    const heldByOther = freshOwner !== undefined && freshOwner !== runOwner;
+    const tookOver = freshOwner !== undefined && freshOwner !== ownerOf(bead);
+    if (!safeToRerunAtMerge(candidate, runOwner) || heldByOther || tookOver) {
+      plan.changed.set(bead.id, stateOf(candidate));
+      continue;
+    }
+    plan.takeable.set(bead.id, candidate);
+  }
+  return plan;
+}
+
+/**
+ * Apply the {@link planRehome} verdicts: move the tickets a merged PR did not contain, and that are
+ * safe to run again ({@link safeToRerunAtMerge}), under a NEW epic — and answer that epic's id
+ * (undefined when there is nothing to rehome, or bd refused). An epic with no `feature` children is
+ * a run target, so the preserved work becomes claimable and runnable again — see the caller for why
+ * leaving it under the merged target does not.
+ *
+ * Every ticket this moves has already been released and reopened by the caller (PR #199): a
+ * reparent takes the ticket out of the merged target's subtree, so no later sweep can finish a step
+ * this one leaves undone.
  *
  * Deliberately NOT `approved`: approval is the founder's gate, and re-running work a run already
  * failed to deliver — after a timeout, possibly needing re-scoping first — is exactly the decision
@@ -1031,20 +1165,18 @@ export async function finalizeMergedEpic(args: {
  * have already landed. An epic that ends up with no children at all is deleted again, since a
  * childless epic is a poison run rather than a home.
  */
-async function rehomePreserved(
+async function applyRehome(
   repo: string,
   epic: Bead,
+  plan: RehomePlan,
   rerunnable: Bead[],
   preserved: Bead[],
   subtree: Bead[],
   area: string | undefined,
-  runOwner: string | undefined,
 ): Promise<Rehomed> {
   const none: Rehomed = {
     moved: new Set(),
     nested: new Map(),
-    elsewhere: new Map(),
-    changed: new Map(),
     pinned: new Map(),
   };
   if (rerunnable.length === 0) return none;
@@ -1068,90 +1200,15 @@ async function rehomePreserved(
   } catch {
     return none;
   }
+  const { takeable } = plan;
   const moved = new Set<string>();
   const nested = new Map<string, string>();
-  const elsewhere = new Map<string, string | undefined>();
-  const changed = new Map<string, string>();
-
-  // Belonging is ANCESTRY, not the direct parent (anton-67xj). A run owns every working-layer
-  // descendant of its target (runTickets), and bd nesting is arbitrary-depth — so a ticket hanging
-  // off another ticket is legitimately part of this run while its parent is not the epic. Reading
-  // the direct parent filed every one of those as work another operator had moved: a nested ticket
-  // whose parent shipped stayed stranded under the merged target, and one whose parent moved too
-  // followed it without ever passing through reopenPreserved, so nothing could claim it.
-  // The whole chain is re-read, not just the candidate. `subtree` is the sweep's snapshot, and an
-  // ANCESTOR another operator reparented since carries every ticket beneath it out of this run:
-  // resolving the walk from the snapshot answers "still on the merged target" for work that is now
-  // somebody else's, and reparents it out of their target into this follow-up. Every read is
-  // memoised, so a chain shared by several candidates costs one `bd show` per bead, not one per walk.
   const bySubtreeId = new Map(subtree.map((b) => [b.id, b]));
-  const fresh = new Map<string, Bead | undefined>();
-  const readFresh = async (id: string): Promise<Bead | undefined> => {
-    if (!fresh.has(id))
-      fresh.set(id, await beads.show(repo, id).catch(() => undefined));
-    return fresh.get(id);
-  };
+  const readFresh = memoisedShow(repo, plan.fresh);
   const liveParentOf = async (bead: Bead): Promise<string | undefined> =>
     beads.parentOf((await readFresh(bead.id)) ?? bead);
-  const ridesOnTarget = async (
-    candidate: Bead,
-  ): Promise<"target" | "elsewhere" | "unknown"> => {
-    const seen = new Set<string>([candidate.id]);
-    let parentId = beads.parentOf(candidate);
-    while (parentId && !seen.has(parentId)) {
-      if (parentId === epic.id) return "target";
-      seen.add(parentId); // a parent cycle terminates rather than hanging finalization
-      if (!bySubtreeId.has(parentId)) return "elsewhere"; // left the subtree — another target owns it
-      const parent = await readFresh(parentId);
-      if (!parent) return "unknown"; // an unreadable link proves nothing either way
-      parentId = beads.parentOf(parent);
-    }
-    return "elsewhere";
-  };
 
-  // Pass 1 — re-read every candidate and decide which ones the follow-up may still take
-  // (anton-67xj). `rerunnable` comes off the sweep's snapshot and a PR can sit in review for days:
-  // if another operator has reparented this ticket onto a target of their own since, moving it here
-  // steals it out from under a run that may already be executing it — which then trips that run's
-  // own ticket-set drift check and parks it. A read that fails moves nothing either, for the same
-  // reason the status write doesn't: the snapshot is not evidence enough on its own.
-  const takeable = new Map<string, Bead>();
-  for (const bead of rerunnable) {
-    const candidate = await readFresh(bead.id);
-    if (!candidate) continue;
-    const belonging = await ridesOnTarget(candidate);
-    // An unreadable ancestor decides nothing — neither that the ticket still rides on the merged
-    // target nor that somebody took it — so it moves nothing and claims neither in its note.
-    if (belonging === "unknown") continue;
-    if (belonging === "elsewhere") {
-      elsewhere.set(bead.id, beads.parentOf(candidate));
-      continue;
-    }
-    // The parent is only half of what went stale. In the same window the ticket can have been
-    // claimed, closed or snoozed in place, or taken over by another operator — and a rerun lane
-    // earned by the snapshot is not one the board still grants: moving a now-active ticket hands a
-    // second run the work someone is doing, and moving a closed one puts finished work under a
-    // follow-up branch that carries no commit for it, which execute-epic then reads as a
-    // cross-machine resume and runs again. So the allowlist is re-applied to the fresh read, and a
-    // claim that changed hands since the snapshot disqualifies it however it reads.
-    //
-    // Ownership is checked here on its own, not left to the allowlist: `safeToRerunAtMerge` weighs
-    // the assignee only on the `in_progress` lane, so an `open` or `blocked` ticket another
-    // operator had already reserved BEFORE the sweep read the board passes it — and reads as no
-    // takeover either, since the snapshot carries the same foreign owner. Reparenting that one
-    // advertises work somebody holds under a second target. Any owner but the dead run's own is a
-    // live reservation, whenever it landed.
-    const freshOwner = ownerOf(candidate);
-    const heldByOther = freshOwner !== undefined && freshOwner !== runOwner;
-    const tookOver = freshOwner !== undefined && freshOwner !== ownerOf(bead);
-    if (!safeToRerunAtMerge(candidate, runOwner) || heldByOther || tookOver) {
-      changed.set(bead.id, stateOf(candidate));
-      continue;
-    }
-    takeable.set(bead.id, candidate);
-  }
-
-  // Pass 1b — a reparent is an edge on the ANCESTOR alone (anton-67xj). A ticket pass 1 refused
+  // Pass 1b — a reparent is an edge on the ANCESTOR alone (anton-67xj). A ticket the plan refused
   // keeps its own parent, so moving that parent carries it onto the follow-up regardless: a
   // reservation another operator holds, or a status a human set, ends up advertised under a target
   // anton wrote — and the note telling them anton left it under the merged target becomes false. So
@@ -1220,11 +1277,10 @@ async function rehomePreserved(
     if (await safe(() => beads.reparent(repo, mover.id, followUp)))
       moved.add(mover.id);
   }
-  if (moved.size > 0)
-    return { id: followUp, moved, nested, elsewhere, changed, pinned };
+  if (moved.size > 0) return { id: followUp, moved, nested, pinned };
   // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
   await safe(() => beads.delete(repo, followUp));
-  return { moved: new Set(), nested, elsewhere, changed, pinned };
+  return { moved: new Set(), nested, pinned };
 }
 
 /**
@@ -1278,17 +1334,13 @@ function areaLabelOf(bead: Bead, all: Bead[]): string | undefined {
   return undefined;
 }
 
-/** Where {@link rehomePreserved} got to: the new target's id, and which tickets actually reached it. */
-interface Rehomed {
-  id?: string;
-  /** Every ticket that ended up beneath the follow-up — reparented onto it, or {@link nested}. */
-  moved: Set<string>;
+/** What {@link planRehome} decided, before any of it is applied. */
+interface RehomePlan {
   /**
-   * Ticket id → the ticket it stayed nested under, which anton moved onto the follow-up. These
-   * reached the new target without a reparent of their own, so their note must name the parent
-   * they ride on rather than claim they sit directly under the follow-up.
+   * Ticket id → its fresh read, for the ones a follow-up target may still take. The reads the moves
+   * are made against, so pass 2 never reparents on the strength of the sweep's snapshot alone.
    */
-  nested: Map<string, string>;
+  takeable: Map<string, Bead>;
   /**
    * Tickets a fresh read found outside the merged target's subtree — another operator rehomed them
    * while the PR sat in review. Left exactly where they are, and told apart from a move that merely
@@ -1301,6 +1353,21 @@ interface Rehomed {
    * they are, status untouched, and named by their live state in the note.
    */
   changed: Map<string, string>;
+  /** The memoised `bd show` reads, carried into {@link applyRehome} so no bead is read twice. */
+  fresh: Map<string, Bead | undefined>;
+}
+
+/** Where {@link applyRehome} got to: the new target's id, and which tickets actually reached it. */
+interface Rehomed {
+  id?: string;
+  /** Every ticket that ended up beneath the follow-up — reparented onto it, or {@link nested}. */
+  moved: Set<string>;
+  /**
+   * Ticket id → the ticket it stayed nested under, which anton moved onto the follow-up. These
+   * reached the new target without a reparent of their own, so their note must name the parent
+   * they ride on rather than claim they sit directly under the follow-up.
+   */
+  nested: Map<string, string>;
   /**
    * Ticket id → the preserved ticket hanging off it that anton is NOT moving. Reparenting would
    * carry that descendant onto the follow-up on its own parent edge, so the ancestor stays under
@@ -1309,7 +1376,38 @@ interface Rehomed {
   pinned: Map<string, string>;
 }
 
+/**
+ * What a preserved ticket's setup settled before the rehome detached it, held over so its note can
+ * be written afterwards — once {@link applyRehome} has said where the ticket ended up.
+ */
+interface PreservedSetup {
+  /** The assignee the sweep read, which the note names when the reservation outlived finalization. */
+  owner: string | undefined;
+  /** The reservation is still in place: this run's own claim that bd refused to release, or a foreign one. */
+  stillOwned: boolean;
+  /** That reservation belongs to someone other than the run — deliberately left alone. */
+  foreignOwner: boolean;
+  /** The sentence the note adds when the ticket did not reach a claimable status (empty once it did). */
+  statusNote: string;
+}
+
 // ── helpers ──
+
+/**
+ * A `bd show` reader backed by `memo`, so a bead read by several ancestry walks — and by both
+ * halves of the rehome — costs one call. A read that fails memoises `undefined`: the caller treats
+ * "unreadable" as evidence of nothing rather than retrying it per walk.
+ */
+function memoisedShow(
+  repo: string,
+  memo: Map<string, Bead | undefined>,
+): (id: string) => Promise<Bead | undefined> {
+  return async (id) => {
+    if (!memo.has(id))
+      memo.set(id, await beads.show(repo, id).catch(() => undefined));
+    return memo.get(id);
+  };
+}
 
 /** Run a best-effort side effect, swallowing failures. Returns true iff `fn` completed. */
 async function safe(fn: () => Promise<unknown>): Promise<boolean> {

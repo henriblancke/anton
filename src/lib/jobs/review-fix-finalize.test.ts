@@ -356,6 +356,25 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).not.toContain("--status open");
   });
 
+  it("finishes a ticket's setup before detaching it from the merged target (PR #199)", async () => {
+    // A reparent takes the ticket out of `runTickets(all, epic.id)`, so the next sweep's
+    // finalization never sees it again — whatever is still owed to it after the move is owed
+    // forever. A ticket left `blocked`, or still assigned, beneath the un-approved follow-up parks
+    // every claim at execute-epic's gate, so both writes have to land while the ticket is still
+    // where a re-run of finalization would find it.
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    const detached = reparentMock.mock.invocationCallOrder[0];
+    expect(detached).toBeGreaterThan(0);
+    expect(unassignMock.mock.invocationCallOrder[0]).toBeLessThan(detached);
+    expect(setStatusMock.mock.invocationCallOrder[0]).toBeLessThan(detached);
+    // …and the note, which cannot name a home until the move lands, still comes after it.
+    expect(noteMock.mock.invocationCallOrder[0]).toBeGreaterThan(detached);
+    expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
+  });
+
   it("leaves an already-open preserved ticket's status alone", async () => {
     // A dependent skipped behind the timeout never left `open` — it is claimable as it stands.
     await finalize(bead("epic-1"), [bead("t2", "open", ["not-delivered"])]);
@@ -672,7 +691,9 @@ describe("finalizeMergedEpic", () => {
     expect(reparentMock).not.toHaveBeenCalled();
     expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
     expect(setStatusMock).not.toHaveBeenCalled();
-    expect(noteMock.mock.calls[0][2]).toContain("Another operator moved it under t2");
+    expect(noteMock.mock.calls[0][2]).toContain(
+      "Another operator moved it under t2",
+    );
   });
 
   it("moves nothing when an ancestor in the chain cannot be re-read", async () => {
