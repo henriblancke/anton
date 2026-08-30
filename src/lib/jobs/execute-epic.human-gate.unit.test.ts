@@ -133,6 +133,45 @@ it("never resolves a human gate anton did not arm, and reports it back for the p
   expect(gateResolveMock).not.toHaveBeenCalled();
 });
 
+it("creates no gate when the run is killed while the board is being read (anton-287p)", async () => {
+  // The window the settle's own signal read cannot cover: the strict board read is an uninterruptible
+  // await, so a force-kill landing inside it arrives AFTER the caller sampled a live signal. Arming
+  // anyway would leave a killed run's target blocked by a gate only a person can clear.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockImplementation(async () => {
+    controller.abort();
+    return [target()];
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateCreateMock).not.toHaveBeenCalled();
+});
+
+it("leaves its own superseded gate alone when the kill lands mid-read, rather than clearing the target's only wait", async () => {
+  // Resolving the older ask while arming nothing would hand the target back to `bd ready` on an ask
+  // nobody answered — the opposite failure from the duplicate gate, and just as permanent.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockImplementation(async () => {
+    controller.abort();
+    return [target("g-old"), gate("g-old", "an older ask")];
+  });
+
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateResolveMock).not.toHaveBeenCalled();
+  expect(gateCreateMock).not.toHaveBeenCalled();
+});
+
+it("arms as usual while the run is still live", async () => {
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockResolvedValue("g-new");
+
+  const controller = new AbortController();
+  await expect(armHumanGate(REPO, "f-1", ASK, controller.signal)).resolves.toEqual({
+    gateId: "g-new",
+    held: [],
+  });
+});
+
 it("reports a person's hold beside a wait it REUSES, not only beside one it creates", async () => {
   loadAllIssuesMock.mockResolvedValue([
     target("g-mine", "g-theirs"),

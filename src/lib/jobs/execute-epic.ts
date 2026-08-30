@@ -1628,6 +1628,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // branches on the distinction (the release runs the same for either error), so the late read
       // costs nothing earlier.
       const e = askSettleError(raw, ctx.signal);
+      // What the runner finally sees. Only the ask branch rewrites it — a kill can land INSIDE the
+      // arm, after the read above (anton-287p) — so the row and the thrown error keep telling the
+      // same story.
+      let thrown: unknown = e;
       // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
@@ -1651,10 +1655,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // `bd gate resolve` can end, and it would sit in the waiting-on-a-person surface forever. It
         // settles FAILED instead — the ask still reaches the operator, through a run state that
         // reads as needing attention rather than as patience.
+        //
+        // The arm gets the LIVE signal, not the sampled verdict above: it awaits the board (a strict
+        // read, then any supersede) before it writes, so a force-kill arriving in that window would
+        // otherwise still land a gate — the very state askSettleError exists to prevent. It refuses
+        // the write in that case, and the ask settles in its cancelled form here.
         let gate: { gateId: string; held: string[] } | undefined;
         let gateError: string | undefined;
         try {
-          gate = await armHumanGate(repo, epicBeadId, e.ask);
+          gate = await armHumanGate(repo, epicBeadId, e.ask, ctx.signal);
         } catch (failure) {
           gateError = failure instanceof Error ? failure.message : String(failure);
           console.error(
@@ -1662,14 +1671,25 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `only through this run's error (${gateError})`,
           );
         }
-        await updateRun(
-          db,
-          clock,
-          runId,
-          gate
-            ? { status: "parked", error: needsHumanParkMessage(e, gate.gateId, gate.held) }
-            : { status: "failed", error: ungatedAskMessage(e, gateError), endedAt: clock.now() },
-        );
+        if (!gate && ctx.signal.aborted) {
+          // Killed mid-arm — not a gate failure. Nothing was written, so this settles exactly like a
+          // kill that beat the ask to the catch: no gate, no park, the ask carried in the error.
+          thrown = askSettleError(raw, ctx.signal);
+          await updateRun(db, clock, runId, {
+            status: "failed",
+            error: thrown instanceof Error ? thrown.message : String(thrown),
+            endedAt: clock.now(),
+          });
+        } else {
+          await updateRun(
+            db,
+            clock,
+            runId,
+            gate
+              ? { status: "parked", error: needsHumanParkMessage(e, gate.gateId, gate.held) }
+              : { status: "failed", error: ungatedAskMessage(e, gateError), endedAt: clock.now() },
+          );
+        }
       } else if (e instanceof BlockedTailError) {
         // Parked, not failed, for the same reason as a blocked review below: this run delivered the
         // tickets it could and is waiting on work outside it, so the row must stay open for the
@@ -1687,7 +1707,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           endedAt: clock.now(),
         });
       }
-      throw e; // let the runner apply job-level durability
+      throw thrown; // let the runner apply job-level durability
     } finally {
       // Stop refreshing and drop the run-liveness lease now that this attempt has stopped executing
       // (anton-jz1). Clearing on EVERY settle path — done, parked, failed — is what lets a Force run
@@ -2303,8 +2323,24 @@ export async function armHumanGate(
   repo: string,
   targetId: string,
   ask: string | undefined,
+  /** The run's LIVE cancellation signal, re-read immediately before every board write below. */
+  signal?: AbortSignal,
 ): Promise<{ gateId: string; held: string[] }> {
   const reason = humanGateReason(targetId, ask);
+  // A kill can only be observed between awaits, and this function awaits the board twice before it
+  // writes anything — so the caller's pre-arm read of the signal is already stale here (anton-287p).
+  // Re-read it before each write instead: a gate armed after an operator stopped the run blocks the
+  // target until someone clears it by hand, for a wait nobody is waiting on. Refusing the SUPERSEDE
+  // matters for the same reason in reverse — resolving the older ask while arming nothing would
+  // leave the target with no wait at all, silently runnable again on an ask nobody answered.
+  const refuseIfCancelled = () => {
+    if (signal?.aborted) {
+      throw new Error(
+        `refusing to arm ${targetId}'s human gate — the run was cancelled while the board was ` +
+          `read; a gate armed now would block the target with nobody waiting on it`,
+      );
+    }
+  };
   // STRICT, and no catch: this read is the ONLY thing that can tell "the ask is already with
   // someone" from "nothing is armed", and bd omits gate beads from every ordinary listing — so a
   // best-effort read that lost its `--type gate` leg would report an armed board as bare and create
@@ -2323,6 +2359,7 @@ export async function armHumanGate(
 
   const { stale, held, open } = humanGatePlan(board, targetId, reason);
 
+  if (stale.length > 0) refuseIfCancelled();
   for (const gate of stale) {
     const resolved = await safe(() =>
       beads.gateResolve(repo, gate.id, `superseded — ${targetId} now waits on a newer ask`),
@@ -2349,6 +2386,7 @@ export async function armHumanGate(
   // this ask is already with a human — a second gate would race it
   if (open) return { gateId: open.id, held: heldIds };
 
+  refuseIfCancelled();
   const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
   // Best-effort, unlike everything above: the gate exists and carries the ask, so the park is
   // already valid. A lost tag only costs a later arm the right to supersede this wait — it reads as
