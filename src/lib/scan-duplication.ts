@@ -131,20 +131,23 @@ const TYPE_START =
  *
  * Go spells the same intent `import _ "net/http/pprof"`: the blank name exists precisely to run the
  * package's `init()` and bind nothing. A named alias (`import fmt2 "fmt"`) binds and stays a
- * declaration.
+ * declaration. Go's raw-string spelling of the path (`` import _ `net/http/pprof` ``) is the same
+ * statement, so the delimiter is matched as a pair rather than assumed to be a quote.
  *
  * The trailing comment is part of the idiom — `import "./register"; // install hooks` is how the
  * side effect gets named at all, and rejecting it would file the window with the specifier lists.
  * It is matched after the quoted specifier, so a `//` inside a URL import stays inside the string.
  */
-const SIDE_EFFECT_IMPORT = /^import\s+(?:_\s+)?["'][^"']+["']\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
+const SIDE_EFFECT_IMPORT =
+  /^import\s+(?:_\s+)?(["'`])[^"'`]+\1\s*;?\s*(?:\/\/.*|\/\*.*)?$/;
 
 /**
- * One blank specifier inside Go's grouped `import (` list — `_ "github.com/lib/pq"`. Same side
- * effect as the single-line form, so it must not inherit the enclosing list's `import` class: a
- * window of driver registrations is executable setup, not a specifier list.
+ * One blank specifier inside Go's grouped `import (` list — `_ "github.com/lib/pq"`, or the raw
+ * string `` _ `github.com/lib/pq` ``. Same side effect as the single-line form, so it must not
+ * inherit the enclosing list's `import` class: a window of driver registrations is executable
+ * setup, not a specifier list.
  */
-const BLANK_IMPORT_SPEC = /^_\s+["'][^"']+["']\s*(?:\/\/.*|\/\*.*)?$/;
+const BLANK_IMPORT_SPEC = /^_\s+(["'`])[^"'`]+\1\s*(?:\/\/.*|\/\*.*)?$/;
 
 /** `function foo(` / `export async function foo(` — a declaration header, not a call. */
 const FUNCTION_START = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
@@ -177,18 +180,17 @@ const REGEX_LITERAL =
  * Strip what would confuse brace counting: comments, string bodies and regex literals. Block
  * comments go too, and not only the ones a line opens with — a declaration closed by a trailing
  * block comment holding a brace would otherwise have that brace counted, keeping the import open
- * over every function below it. Strings are blanked first, so a comment opener inside one is not
- * read as a comment; regexes go LAST, so prose that happens to hold a `/…/` is already gone and
- * cannot be read as one. Crude on purpose — the only thing riding on it is where a multi-line
- * import or type declaration ends, and an unbalanced count there classifies a line as
- * `type`/`import` rather than dropping anything on its own.
- *
- * It matches quotes PAIRWISE within one line, so a template literal that runs past its line is
- * beyond it — `maskTemplate` carries that state across lines before this ever sees the text.
+ * over every function below it. Templates go FIRST, through the same masker that carries them
+ * across lines, because they nest — pairing backticks with a regex would read a nested literal's
+ * opener as the outer one's close and hand the text between them over as syntax. Quotes are
+ * blanked next, so a comment opener inside one is not read as a comment; regexes go LAST, so prose
+ * that happens to hold a `/…/` is already gone and cannot be read as one. Crude on purpose — the
+ * only thing riding on it is where a multi-line import or type declaration ends, and an unbalanced
+ * count there classifies a line as `type`/`import` rather than dropping anything on its own.
  */
 function stripNoise(line: string): string {
-  return line
-    .replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/g, '""')
+  return maskTemplate(line, []).text
+    .replace(/(["'])(?:\\.|(?!\1)[^\\])*\1/g, '""')
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/\/\/.*$/, "")
     .replace(/\/\*.*$/, "")
@@ -206,34 +208,60 @@ function afterQuoted(line: string, start: number): number {
 }
 
 /**
+ * One level of the nesting a template opens: its raw TEXT, or the expression of a `${…}` inside it.
+ * An expression can open templates of its own, so what closes an outer literal is the backtick that
+ * matches it — not the next one on the line. `depth` tracks the braces the expression opens, so the
+ * `}` that ends it is told apart from the ones inside an object it builds.
+ */
+type TemplateFrame = { kind: "text" } | { kind: "expression"; depth: number };
+
+/**
  * Blank the template literals a line carries, INCLUDING the one it leaves open. A multiline
- * template is raw text, but `stripNoise` can only pair quotes within a line, so a parameter default
- * whose template opens with `raw (` hands that `(` to `parenDelta` as syntax: the parameter list
- * never closes on its real `)`, and every statement below it inherits `signature` — dropping a
- * genuine clone of runtime work.
+ * template is raw text, but a `(` in that text would otherwise reach `parenDelta` as syntax: a
+ * parameter list whose default opens with `raw (` never closes on its real `)`, and every statement
+ * below it inherits `signature` — dropping a genuine clone of runtime work.
+ *
+ * Nesting is tracked rather than closing on every unescaped backtick, because a template's
+ * interpolation may hold another template (`` `outer ${`inner (`} tail` ``). Read pairwise, the
+ * nested opener closes the outer literal and exposes its raw `(` — the very leak this exists to
+ * stop. The whole construct is blanked, interpolations and all: a `${…}` holds a complete
+ * expression, so its own delimiters balance and hiding them costs nothing.
  *
  * Quoted strings and comments are stepped over rather than parsed, so a backtick sitting inside a
- * quoted string or a trailing `//` note opens nothing. Crude like its neighbours: an interpolation
- * holding its own template closes the outer one early, which costs a stray word of text and
- * nothing else.
+ * quoted string or a trailing `//` note opens nothing. The stack is returned so the next line
+ * resumes exactly where this one stopped.
  */
-function maskTemplate(line: string, open: boolean): { text: string; open: boolean } {
-  let text = open ? '""' : "";
-  let inTemplate = open;
+function maskTemplate(
+  line: string,
+  stack: readonly TemplateFrame[],
+): { text: string; stack: TemplateFrame[] } {
+  const frames: TemplateFrame[] = stack.map((frame) => ({ ...frame }));
+  let text = frames.length > 0 ? '""' : "";
   let i = 0;
   while (i < line.length) {
     const char = line[i];
-    if (inTemplate) {
+    const top = frames[frames.length - 1];
+    if (top?.kind === "text") {
       if (char === "\\") i += 2;
-      else {
-        if (char === "`") inTemplate = false;
+      else if (char === "`") {
+        frames.pop();
         i += 1;
-      }
+      } else if (char === "$" && line[i + 1] === "{") {
+        frames.push({ kind: "expression", depth: 0 });
+        i += 2;
+      } else i += 1;
       continue;
     }
     if (char === "`") {
-      inTemplate = true;
-      text += '""';
+      frames.push({ kind: "text" });
+      if (frames.length === 1) text += '""';
+      i += 1;
+      continue;
+    }
+    if (top?.kind === "expression" && (char === "{" || char === "}")) {
+      if (char === "{") top.depth += 1;
+      else if (top.depth > 0) top.depth -= 1;
+      else frames.pop();
       i += 1;
       continue;
     }
@@ -244,10 +272,10 @@ function maskTemplate(line: string, open: boolean): { text: string; open: boolea
       const close = line.indexOf("*/", i + 2);
       end = close < 0 ? line.length : close + 2;
     }
-    text += line.slice(i, end);
+    if (frames.length === 0) text += line.slice(i, end);
     i = end;
   }
-  return { text, open: inTemplate };
+  return { text, stack: frames };
 }
 
 /** Net nesting a line opens, over the brackets given — `stripNoise`d, so a brace in a string is not one. */
@@ -454,7 +482,8 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
   // Same boundary for `/* … */`: in a `#`-comment language a `/*` is a path or a glob (`rm /tmp/*`),
   // and reading it as a comment opener would swallow the rest of the file.
   const blockComments = !opts.hashComments;
-  let inTemplate = false;
+  // Empty outside a template; the frames of one it is inside, outermost first.
+  let template: TemplateFrame[] = [];
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
   // Where the open signature started, and whether its arrow is still owed. `const x = (` reads as a
@@ -485,11 +514,11 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     // syntax, so it never reaches the delta counters and votes as code — the side that keeps the
     // signal. Read before the comment and blank tests, since a line of template text that happens
     // to start with `//` is not prose.
-    if (inTemplate) {
-      const masked = maskTemplate(line, true);
-      inTemplate = masked.open;
+    if (template.length > 0) {
+      const masked = maskTemplate(line, template);
+      template = masked.stack;
       line = masked.text.trim();
-      if (inTemplate || line === "") {
+      if (template.length > 0 || line === "") {
         classes.push("code");
         continue;
       }
@@ -520,11 +549,12 @@ function classifyLines(source: string, opts: { hashComments: boolean }): LineCla
     }
 
     // A template this line OPENS and does not close: blank its text now, so the delimiters inside it
-    // never reach `parenDelta`. One that closes on its own line needs nothing — `stripNoise` pairs it.
+    // never reach `parenDelta`. One that closes on its own line is left as written — `stripNoise`
+    // masks it wherever a delta is counted, and the raw text is what the import patterns read.
     if (templates) {
-      const masked = maskTemplate(line, false);
-      if (masked.open) {
-        inTemplate = true;
+      const masked = maskTemplate(line, template);
+      if (masked.stack.length > 0) {
+        template = masked.stack;
         line = masked.text.trim();
       }
     }

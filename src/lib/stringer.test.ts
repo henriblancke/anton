@@ -2032,6 +2032,90 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 signature");
     });
 
+    // A template's interpolation can hold another template. Read pairwise, the nested opener closes
+    // the outer literal and its raw `(` reaches the paren counter as syntax — the parameter list
+    // never closes on its real `)`, and every statement below it reads as more parameter list.
+    it("closes a template on its own backtick, not on one nested in its interpolation", async () => {
+      const repo = writeRepo({
+        "src/nested.ts": [
+          "export function nested(",
+          "  input: string,",
+          "  label = `outer ${`inner (`} tail`,",
+          ") {",
+          "  doAlpha(input);",
+          "  doBeta(input);",
+          "  doGamma(input);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/wrapped.ts": [
+          "export function wrapped(",
+          "  label = `outer ${`inner (`} tail`,",
+          "  suffix: string,",
+          "  trailer: string,",
+          "  extra: string,",
+          ") {",
+          "  return join(label, suffix, trailer, extra);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/nested.ts", 5]], 3),
+        clone([["src/wrapped.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The statements below the nested template are code, so their clone survives...
+      expect(result.signals).toMatchObject([{ FilePath: "src/nested.ts" }]);
+      // ...while the parameter list holding it still reads as one.
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/wrapped.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
+    // Go spells an import path with a raw string just as readily as with a quoted one, and a blank
+    // import written that way exists for the same reason: to run the package's `init()`. Reading
+    // the raw-string spelling as a specifier list drops a window of executable registrations.
+    it("keeps Go blank imports written as raw strings, single-line and grouped", async () => {
+      const repo = writeRepo({
+        "src/raw.go": [
+          "package main",
+          "import _ `github.com/lib/pq`",
+          "import _ `net/http/pprof`",
+          "import _ `gocloud.dev/blob/s3blob`",
+          "",
+        ].join("\n"),
+        "src/rawgroup.go": [
+          "import (",
+          "\t_ `github.com/lib/pq`",
+          "\t_ `net/http/pprof`",
+          "\t_ `gocloud.dev/blob/s3blob`",
+          ")",
+          "",
+        ].join("\n"),
+        "src/rawbound.go": [
+          "import (",
+          "\t`fmt`",
+          "\t`net/http`",
+          "\t`os`",
+          ")",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/raw.go", 2]], 3),
+        clone([["src/rawgroup.go", 2]], 3),
+        clone([["src/rawbound.go", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/raw.go", "src/rawgroup.go"]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/rawbound.go" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // A backtick opens a template only where one can open. Inside a quoted string or a trailing
     // comment it is text, and reading it as an opener would file every line below it as template
     // text — turning whole parameter lists into code and keeping the windows this filter is for.
