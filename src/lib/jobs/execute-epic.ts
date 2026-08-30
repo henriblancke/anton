@@ -2616,6 +2616,10 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
  *     nothing at all carrying the ask, and a supersede the arm already retired makes it worse. The
  *     gate is the durable half (run-health reports an open human gate from the instant it opens)
  *     and the job parks LOUDLY naming it, rather than retrying into a park that says "blocked".
+ *
+ * The second write in the cancelled outcome can fail the same way, and then only the message
+ * changes: the unwind's verdict on the gate already happened, so it is carried through
+ * ({@link unsettledCancelledAskMessage}) instead of being restated as still armed.
  */
 export async function settleArmedAsk(args: {
   /** The run target the gate blocks. */
@@ -2637,7 +2641,12 @@ export async function settleArmedAsk(args: {
     status: "parked",
     error: needsHumanParkMessage(ask, gate.gateId, gate.held),
   });
+  // Whether the cancelled unwind below already decided what the board holds. Its verdict — gate
+  // taken back, or gate stranded — is the truth about the gate even if the corrective row write
+  // then fails, so the still-armed message must not overwrite it.
+  let cancelled = false;
   if (!unsettled && signal.aborted) {
+    cancelled = true;
     const undone = gate.undo ? await gate.undo() : false;
     // Undone, nothing on the board carries the ask — which is exactly what the cancelled form of
     // the error says. Standing, the gate blocks the target with no run coming back for it, so the
@@ -2664,10 +2673,16 @@ export async function settleArmedAsk(args: {
   }
   if (unsettled) {
     console.error(
-      `[execute-epic] ${targetId}: human gate ${gate.gateId} is armed but the run row could ` +
-        `not be settled (${unsettled})`,
+      `[execute-epic] ${targetId}: the run row could not be settled (${unsettled}) — ` +
+        (cancelled
+          ? `the cancelled unwind's verdict on human gate ${gate.gateId} stands`
+          : `human gate ${gate.gateId} is armed`),
     );
-    thrown = new PoisonEpic(unsettledAskMessage(ask, gate.gateId, unsettled));
+    thrown = new PoisonEpic(
+      cancelled
+        ? unsettledCancelledAskMessage(thrown, unsettled)
+        : unsettledAskMessage(ask, gate.gateId, unsettled),
+    );
   }
   return thrown;
 }
@@ -2683,6 +2698,22 @@ function unsettledAskMessage(e: NeedsHumanError, gateId: string, failure: string
     `IS armed and carries the ask, but this run's row could not be settled as parked ` +
     `(${failure}), so the run history does not show the wait. Answer the ask, then ` +
     `\`bd gate resolve ${gateId}\` — that still releases the target and resumes the run.`
+  );
+}
+
+/**
+ * The FAILURE reason when a cancelled unwind already settled what the board holds and only the
+ * corrective row write failed. Its verdict is carried through verbatim rather than replaced by
+ * {@link unsettledAskMessage}, which would contradict it: after a successful undo there is no gate
+ * left to resolve, and telling the operator to close one would leave them waiting on an id that no
+ * longer exists while the row still reads as parked.
+ */
+function unsettledCancelledAskMessage(cancelled: unknown, failure: string): string {
+  const verdict = cancelled instanceof Error ? cancelled.message : String(cancelled);
+  return (
+    `${verdict} (The run was cancelled mid-park and its row could not then be settled as failed — ` +
+    `${failure} — so the run history may still read as parked; the state described above is the ` +
+    `accurate one.)`
   );
 }
 

@@ -556,3 +556,78 @@ it("keeps the gate and parks the JOB loudly when the row cannot be settled at al
   expect((thrown as Error).message).toContain("bd gate resolve g-new");
   expect((thrown as Error).message).toContain("database is locked");
 });
+
+it("keeps the UNDONE verdict when the corrective write fails after a mid-park kill", async () => {
+  // The undo landed — no gate carries the ask any more — but the row write that records that
+  // failed. Reporting the gate as armed would send the operator to `bd gate resolve` for an id
+  // that no longer exists, and leave them waiting on a resume that is never coming.
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      if (row.patches.length === 1) {
+        controller.abort(); // the kill lands while the park is being written
+        return undefined;
+      }
+      return "SQLITE_BUSY: database is locked";
+    },
+  };
+  let undone = false;
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: {
+      gateId: "g-new",
+      held: [],
+      undo: async () => {
+        undone = true;
+        return true;
+      },
+    },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect(undone).toBe(true);
+  expect(row.patches.map((p) => p.status)).toEqual(["parked", "failed"]);
+  expect((thrown as Error).name).toBe("PoisonError");
+  expect((thrown as Error).message).toContain("armed NO gate");
+  expect((thrown as Error).message).toContain("database is locked");
+  expect((thrown as Error).message).not.toContain("bd gate resolve g-new");
+});
+
+it("keeps the STRANDED verdict when the corrective write fails after a mid-park kill", async () => {
+  // Undoing was unsafe, so the gate stands with no run coming back for it. The id must still reach
+  // the operator, alongside the row write that could not record any of it.
+  const controller = new AbortController();
+  const row = {
+    patches: [] as Record<string, unknown>[],
+    settle: async (patch: Record<string, unknown>) => {
+      row.patches.push(patch);
+      if (row.patches.length === 1) {
+        controller.abort();
+        return undefined;
+      }
+      return "SQLITE_BUSY: database is locked";
+    },
+  };
+
+  const thrown = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [] },
+    signal: controller.signal,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect((thrown as Error).name).toBe("PoisonError");
+  expect((thrown as Error).message).toContain("bd gate resolve g-new");
+  expect((thrown as Error).message).toContain("re-run the target");
+  expect((thrown as Error).message).toContain("database is locked");
+});
