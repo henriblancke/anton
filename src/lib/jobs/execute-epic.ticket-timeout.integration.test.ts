@@ -406,6 +406,71 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     }
   });
 
+  it("leaves a skipped ticket another operator took over reserved to them (anton-67xj)", async () => {
+    // The reservation this protects: the run's claim cascade assigned every child to itself at the
+    // start, but an operator can take one over while the run is still working. Handing the ticket
+    // back with a blind `bd assign <id> ""` would clear THEIR reservation and advertise work that
+    // is already in flight — so the release is owner-checked, and a takeover keeps its owner.
+    const epicId = await beads.create(repo, {
+      title: "Takeover",
+      type: "epic",
+      acceptance: "work file exists",
+      description: "## Goal\nTakeover",
+    });
+    await beads.approve(repo, epicId);
+    const mk = (title: string) => createTicket(repo, { title, parent: epicId });
+    const stalls = mk("Takeover ticket that cannot converge");
+    const independent = mk("Takeover ticket that owes the stalled one nothing");
+    const dependent = mk("Takeover ticket that builds on the stalled one");
+    await beads.link(repo, dependent, stalls, "blocks");
+
+    const invLog = join(sandbox, "takeover-inv.jsonl");
+    const realBd = resolveBdBin();
+    // The takeover happens INSIDE the run — after the cascade reserved the dependent, before the
+    // timeout skips it — which is exactly the window a snapshot-based unassign would clobber.
+    const claude = writeBin(
+      binDir,
+      "claude-hang-takeover",
+      fakeClaudeReadingStdin(`const {spawnSync}=require('child_process');
+const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  spawnSync(${JSON.stringify(realBd)},['assign',${JSON.stringify(dependent)},'op-2'],{cwd:${JSON.stringify(repo)},stdio:'ignore'});
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    try {
+      await driveEpicRun(runner, { projectId, epicBeadId: epicId });
+
+      // Skipped as before — but handed back to the operator who took it, not to nobody.
+      const skipped = await beads.show(repo, dependent);
+      expect(skipped.assignee).toBe("op-2");
+      expect(skipped.labels ?? []).toContain("not-delivered");
+      const invoked = readFileSync(invLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(invoked).not.toContain(dependent);
+      // The run still shipped the independent work: the reservation is a claim question, not a
+      // reason to stop.
+      expect((await beads.show(repo, independent)).status).toBe("closed");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      await patchSettings({ ticketTimeoutMinutes: undefined });
+    }
+  });
+
   it("does not park on a held tail that a rolled-back timeout also skipped (anton-67xj)", async () => {
     // The park this closes: a ticket gated by a CROSS-RUN blocker never enters the dispatch loop, so
     // it never entered the skipped set either — and the held tail parked the run unconditionally,

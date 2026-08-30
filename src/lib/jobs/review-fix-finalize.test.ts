@@ -25,6 +25,8 @@ const showMock = vi.fn();
 const assignees = new Map<string, string>();
 /** id → current status, so the re-read before a status write sees the board, not the snapshot. */
 const statuses = new Map<string, string>();
+/** id → current parent, so the re-read before a reparent sees the board, not the snapshot. */
+const parents = new Map<string, string | undefined>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -79,8 +81,12 @@ const waitsOn = (id: string, blocker: string, status = "open"): Bead =>
   }) as Bead;
 
 /** `rest` is the rest of the board — the product epic a feature target hangs off, say. */
-const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) =>
-  finalizeMergedEpic({
+const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) => {
+  // Children hang off the target they were run under, unless a case seeded a takeover.
+  for (const c of children) {
+    if (c.id !== epic.id && !parents.has(c.id)) parents.set(c.id, epic.id);
+  }
+  return finalizeMergedEpic({
     db: {} as never,
     clock: { now: () => 0 } as never,
     repo: "/repo",
@@ -90,6 +96,7 @@ const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) =>
     branch: "anton/epic-1",
     all: [epic, ...children, ...rest],
   });
+};
 
 describe("finalizeMergedEpic", () => {
   beforeEach(() => {
@@ -101,6 +108,7 @@ describe("finalizeMergedEpic", () => {
     deleteMock.mockReset().mockResolvedValue(undefined);
     assignees.clear();
     statuses.clear();
+    parents.clear();
     unassignMock.mockReset().mockImplementation(async (_repo: string, id: string) => {
       assignees.delete(id);
     });
@@ -115,6 +123,7 @@ describe("finalizeMergedEpic", () => {
             status: statuses.get(id) ?? "open",
             labels: [],
             assignee: assignees.get(id),
+            parent: parents.get(id),
           }) as Bead,
       );
   });
@@ -371,6 +380,43 @@ describe("finalizeMergedEpic", () => {
     const note = noteMock.mock.calls[0][2];
     expect(note).toContain("NOT queued for a rerun");
     expect(note).not.toContain("merged WITHOUT this ticket");
+  });
+
+  it("keeps a snoozed ticket off the rerun path (anton-67xj)", async () => {
+    // An operator deferred this preserved ticket while the PR sat in review — a snooze is a human's
+    // own decision about when the work happens. Rehoming and reopening it would erase that and put
+    // the ticket straight back under a runnable target.
+    await finalize(bead("epic-1"), [bead("t2", "deferred", ["not-delivered"])]);
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+    // Still preserved, and the note tells the truth about why it is parked rather than claiming its
+    // work is in the merged diff.
+    expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "epic-1" }]);
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("merged WITHOUT this ticket");
+    expect(note).toContain("Its status is `deferred`");
+    expect(note).toContain("did NOT queue it for a rerun");
+  });
+
+  it("leaves a ticket another operator reparented under their target (anton-67xj)", async () => {
+    // `rerunnable` is the sweep's snapshot; the reparent is a write days later. Moving this ticket
+    // into the follow-up would steal it out of a target that may already be running it — and that
+    // run would then park on its own ticket-set drift check.
+    const preserved = bead("t2", "blocked", ["not-delivered"]);
+    parents.set("t2", "epic-9");
+
+    await finalize(bead("epic-1"), [preserved]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    // Nothing reached the follow-up, so the empty target it would have been is taken back off the board.
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    // Its status is part of the state that other target runs it in — left alone too.
+    expect(setStatusMock).not.toHaveBeenCalled();
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("Another operator moved it under epic-9");
+    expect(note).not.toContain("--parent <new-epic>");
   });
 
   it("still rehomes the tickets skipped behind a post-commit timeout", async () => {

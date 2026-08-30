@@ -526,9 +526,15 @@ const deliveredAtMerge = (b: Bead | undefined): boolean =>
  * child without the marker is one whose work the merge may already carry (post-commit timeout,
  * post-commit failure) or one a human must rule on anyway (zero delivery, agent-declared blocked):
  * reopening and rehoming it would advertise a rerun that duplicates or conflicts with the diff.
- * Everything else here is `open` — a dependent that was never dispatched — and is rerunnable.
+ *
+ * So the lane is an ALLOWLIST of the two states that earn a rerun, never "not blocked" (anton-67xj):
+ * `open` — a dependent that was never dispatched — and `blocked` carrying the marker, the timed-out
+ * ticket whose work was rolled back. Any other status a preserved ticket can be in is somebody's own
+ * decision about it — a `deferred` snooze, a live `in_progress` claim — and rehoming or reopening
+ * one would overwrite that decision with a rerun nobody asked for.
  */
-const safeToRerunAtMerge = (b: Bead): boolean => beads.isNotDelivered(b) || b.status !== "blocked";
+const safeToRerunAtMerge = (b: Bead): boolean =>
+  b.status === "open" || (b.status === "blocked" && beads.isNotDelivered(b));
 
 export function undeliveredAtMerge(children: Bead[]): Set<string> {
   const byId = new Map(children.map((c) => [c.id, c]));
@@ -719,36 +725,59 @@ export async function finalizeMergedEpic(args: {
     // could run. The parent makes the ticket reachable; the status is what makes it runnable. A
     // ticket already `open` (a dependent skipped behind the timeout) is left untouched, and one on
     // the manual path stays `blocked` on purpose — it must not become runnable.
-    const statusNote = rerun.has(bead.id) ? await reopenPreserved(repo, bead, runOwner) : "";
+    // …unless another operator moved it out of this target since the sweep read the board
+    // (rehomePreserved): the ticket is theirs now, and its status is part of the state they are
+    // running it in.
+    const takenOver = followUp.elsewhere.has(bead.id);
+    const statusNote =
+      rerun.has(bead.id) && !takenOver ? await reopenPreserved(repo, bead, runOwner) : "";
+    // Three lanes, three different things to tell the operator who meets this ticket later: the
+    // rerun lane, the post-commit lane (no marker — its work IS in the merged diff), and a ticket
+    // whose status is somebody's own decision, which anton neither reruns nor asks a human to
+    // review against the branch.
+    const decidedElsewhere = !rerun.has(bead.id) && beads.isNotDelivered(bead);
     await safe(() =>
       beads.note(
         repo,
         bead.id,
-        !rerun.has(bead.id)
-          ? `anton: the pull request for ${epic.id} merged while this ticket was still ` +
-            `\`${bead.status}\` — the run stopped it and carried on (see the note above). It is ` +
-            `NOT marked \`${LABELS.notDelivered}\`, so whatever it committed before it stopped is ` +
-            `in that merged diff. Left on the board rather than closed, and deliberately NOT ` +
-            `queued for a rerun: re-running it would redo work the merge already shipped. Review ` +
-            `the branch against the note ` +
-            `above, then close this by hand if it is complete, or file the remainder as a new ` +
-            `ticket.` +
+        decidedElsewhere
+          ? `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
+            `deliver it (see the note above), so none of its work is in that diff. Its status is ` +
+            `\`${bead.status}\`, which is someone's own decision about this ticket rather than ` +
+            `the run's, so anton left it under ${epic.id} and did NOT queue it for a rerun. Once ` +
+            `that is settled, move it onto a fresh run target ` +
+            `(\`bd update ${bead.id} --parent <new-epic>\`) to have anton pick the work back up.` +
             ownershipNote(bead, owner, { stillOwned, foreignOwner, blocksClaim: "" })
-          : `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did not ` +
-            `deliver it (see the note above), so none of its work is in that diff. Left open on ` +
-            `purpose: closing it here would file work that was never done as shipped. ` +
-            (followUp.id && followUp.moved.has(bead.id)
-              ? `It now lives under ${followUp.id}, a fresh run target — approve that target to ` +
-                `have anton pick this work back up.`
-              : `It could NOT be rehomed onto a fresh run target, so nothing anton runs reaches ` +
-                `it yet: move it under a new epic (\`bd update ${bead.id} --parent <new-epic>\`) ` +
-                `or clear its parent to make it a run target of its own.`) +
-            ownershipNote(bead, owner, {
-              stillOwned,
-              foreignOwner,
-              blocksClaim: ", so no other operator can claim it",
-            }) +
-            statusNote,
+          : !rerun.has(bead.id)
+            ? `anton: the pull request for ${epic.id} merged while this ticket was still ` +
+              `\`${bead.status}\` — the run stopped it and carried on (see the note above). It ` +
+              `is NOT marked \`${LABELS.notDelivered}\`, so whatever it committed before it ` +
+              `stopped is in that merged diff. Left on the board rather than closed, and ` +
+              `deliberately NOT queued for a rerun: re-running it would redo work the merge ` +
+              `already shipped. Review the branch against the note above, then close this by hand ` +
+              `if it is complete, or file the remainder as a new ticket.` +
+              ownershipNote(bead, owner, { stillOwned, foreignOwner, blocksClaim: "" })
+            : `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did ` +
+              `not deliver it (see the note above), so none of its work is in that diff. Left ` +
+              `open on purpose: closing it here would file work that was never done as shipped. ` +
+              (takenOver
+                ? `Another operator moved it under ` +
+                  `${followUp.elsewhere.get(bead.id) ?? "a different target"} while the pull ` +
+                  `request was in review, so anton left it there rather than rehoming it — that ` +
+                  `target owns this work now.`
+                : followUp.id && followUp.moved.has(bead.id)
+                  ? `It now lives under ${followUp.id}, a fresh run target — approve that target ` +
+                    `to have anton pick this work back up.`
+                  : `It could NOT be rehomed onto a fresh run target, so nothing anton runs ` +
+                    `reaches it yet: move it under a new epic ` +
+                    `(\`bd update ${bead.id} --parent <new-epic>\`) or clear its parent to make ` +
+                    `it a run target of its own.`) +
+              ownershipNote(bead, owner, {
+                stillOwned,
+                foreignOwner,
+                blocksClaim: ", so no other operator can claim it",
+              }) +
+              statusNote,
       ),
     );
   }
@@ -788,7 +817,7 @@ async function rehomePreserved(
   rerunnable: Bead[],
   area: string | undefined,
 ): Promise<Rehomed> {
-  const none: Rehomed = { moved: new Set() };
+  const none: Rehomed = { moved: new Set(), elsewhere: new Map() };
   if (rerunnable.length === 0) return none;
   const ids = rerunnable.map((b) => b.id).join(", ");
   let followUp: string;
@@ -811,13 +840,26 @@ async function rehomePreserved(
     return none;
   }
   const moved = new Set<string>();
+  const elsewhere = new Map<string, string | undefined>();
   for (const bead of rerunnable) {
+    // Re-read the parent before moving it (anton-67xj). `rerunnable` comes off the sweep's snapshot
+    // and a PR can sit in review for days: if another operator has reparented this ticket onto a
+    // target of their own since, moving it here steals it out from under a run that may already be
+    // executing it — which then trips that run's own ticket-set drift check and parks it. A read
+    // that fails moves nothing either, for the same reason the status write doesn't: the snapshot
+    // is not evidence enough on its own.
+    const fresh = await beads.show(repo, bead.id).catch(() => undefined);
+    if (!fresh) continue;
+    if (beads.parentOf(fresh) !== epic.id) {
+      elsewhere.set(bead.id, beads.parentOf(fresh));
+      continue;
+    }
     if (await safe(() => beads.reparent(repo, bead.id, followUp))) moved.add(bead.id);
   }
-  if (moved.size > 0) return { id: followUp, moved };
+  if (moved.size > 0) return { id: followUp, moved, elsewhere };
   // Nothing moved — the new epic is an empty run target no one asked for. Take it back off the board.
   await safe(() => beads.delete(repo, followUp));
-  return none;
+  return { moved: new Set(), elsewhere };
 }
 
 /**
@@ -848,6 +890,12 @@ function areaLabelOf(bead: Bead, all: Bead[]): string | undefined {
 interface Rehomed {
   id?: string;
   moved: Set<string>;
+  /**
+   * Tickets a fresh read found under a DIFFERENT parent — another operator rehomed them while the
+   * PR sat in review. Left exactly where they are, and told apart from a move that merely failed:
+   * their note must not hand the operator a `--parent` command that would undo that.
+   */
+  elsewhere: Map<string, string | undefined>;
 }
 
 // ── helpers ──

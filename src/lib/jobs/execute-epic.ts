@@ -1278,7 +1278,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         }
         // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
         // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
-        await safe(() => beads.unassign(repo, ticket.id));
+        //
+        // ONLY this run's own reservation, under the cascade's compare-and-swap (anton-67xj).
+        // `tickets` is the run's snapshot, taken before any dispatch: an operator who took this
+        // ticket over between the cascade and this skip is doing live work, and an unconditional
+        // unassign would advertise their ticket as claimable and invite a second run of it.
+        const reservedFor = childCascade?.actor;
+        if (reservedFor) await safe(() => releaseChildren(repo, [ticket.id], reservedFor));
         // …and mark it as work this run did NOT deliver, which is what stops merge finalization
         // from closing it as shipped when the PR for the rest of the feature lands (anton-67xj).
         // That marker is finalization's only input, so it is not best-effort: a run that cannot
