@@ -48,8 +48,13 @@ export interface CadenceOfferControl {
 }
 
 /**
- * Offer to raise product-master from weekly to daily when — and only when — the operator arms the
- * board-picker (anton-3xa9).
+ * Offer to raise product-master from weekly to daily while — and only while — the board-picker is
+ * armed and the operator has not answered (anton-3xa9).
+ *
+ * The arm opens the question, but leaving the page does not answer it: the offer is seeded on mount
+ * from the same premise, so a reload does not lose a question the operator never resolved. Only an
+ * answer ends it — accept moves the cadence off weekly, decline records the standing opt-out — and
+ * both are read back here, so a restored offer cannot become a nag.
  *
  * Every decision here is taken against the LIVE rows rather than a render's snapshot, because the
  * decisions happen after an await: the operator can disarm the picker, disable product-master,
@@ -57,12 +62,19 @@ export interface CadenceOfferControl {
  */
 export function useCadenceOffer({
   rows,
+  initialRows,
   keepWeekly: declined,
   patchSettings,
   setCron,
 }: {
   /** The live automation rows — the source of truth a decision taken after an await reads. */
   rows: RefObject<Record<string, AutomationScheduleState>>;
+  /**
+   * The same rows as a plain value, for the two decisions taken at MOUNT — what the picker was
+   * already set to, and whether a question is standing. Read from the value rather than the ref
+   * because a render may not read a ref, and at mount the two say the same thing anyway.
+   */
+  initialRows: Record<string, AutomationScheduleState>;
   /** The operator's standing answer from a previous session; absent = never asked. */
   keepWeekly: boolean;
   /** A settings PATCH, queued behind the form's own writes. */
@@ -70,7 +82,6 @@ export function useCadenceOffer({
   /** Write one row's cadence, answering whether it landed. */
   setCron: (id: string, cron: string) => Promise<boolean>;
 }): CadenceOfferControl {
-  const [offer, setOffer] = useState<CadenceOffer | null>(null);
   // The standing answer is persisted the moment it is given — this panel saves immediately, and an
   // opt-out that waited for the Save button would be re-asked on the next arm by anyone who
   // navigated away. A ref rather than state because nothing renders it and the reads that matter
@@ -85,7 +96,13 @@ export function useCadenceOffer({
   // cannot answer that after an await: a disable clicked while the arm is still open withdraws an
   // offer that does not exist yet, and the arm's response — which reports the row as armed — can
   // still land first. Only the last click says whether an offer's premise is still standing.
-  const armingIntent = useRef(rows.current[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true);
+  const armingIntent = useRef(initialRows[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true);
+  // Seeded rather than opened by an effect: the premise is entirely in the rows this render was
+  // given, so a question left unanswered is on screen in the first paint — no flash of a panel that
+  // then grows a row, and the same markup on the server and the client.
+  const [offer, setOffer] = useState<CadenceOffer | null>(() =>
+    offerFor(initialRows, declined, initialRows[AUTOPILOT_ARMING_AUTOMATION]?.enabled === true),
+  );
 
   /**
    * Withdraw the pending question because something invalidated it, rather than because it was
@@ -113,28 +130,13 @@ export function useCadenceOffer({
   }
 
   /**
-   * Open the offer, if there is anything to offer.
-   *
-   * Silent in four cases, each of which would make it a lie or a nag: the operator already answered
-   * `keep weekly`; they have since asked for the picker to be off, so nothing consumes what
-   * product-master judges; product-master is off, so its output feeds nothing and its cadence is
-   * moot; or its cadence is not weekly — already daily-or-faster, or hand-written, and neither is
-   * ours to rewrite (see {@link dailyEquivalentOf}).
+   * Open the offer against the live premise, if there is anything to offer. A premise that no longer
+   * holds leaves the screen as it is rather than clearing it — every caller asks to ADD a question,
+   * and taking one away is {@link withdraw}'s job, which moves the generation with it.
    */
   function ask() {
-    if (keepWeekly.current) return;
-    if (!armingIntent.current) return;
-    const coupled = rows.current[CADENCE_COUPLED_AUTOMATION];
-    if (coupled?.enabled !== true) return;
-    const daily = dailyEquivalentOf(coupled.cron);
-    if (!daily) return;
-    setOffer({
-      automationId: CADENCE_COUPLED_AUTOMATION,
-      cron: daily,
-      reason: CADENCE_OFFER_REASON,
-      acceptLabel: "Raise to daily",
-      declineLabel: "Keep weekly",
-    });
+    const next = offerFor(rows.current, keepWeekly.current, armingIntent.current);
+    if (next) setOffer(next);
   }
 
   async function aroundToggle(id: string, next: boolean, write: () => Promise<boolean>) {
@@ -252,4 +254,35 @@ export function useCadenceOffer({
   }
 
   return { offer, aroundToggle, aroundSetCron, accept, decline };
+}
+
+/**
+ * The question this premise justifies, or `null` when there is none to ask.
+ *
+ * Silent in four cases, each of which would make the offer a lie or a nag: the operator already
+ * answered `keep weekly`; the picker is (or has just been asked to be) off, so nothing consumes what
+ * product-master judges; product-master is off, so its output feeds nothing and its cadence is moot;
+ * or its cadence is not weekly — already daily-or-faster, or hand-written, and neither is ours to
+ * rewrite (see {@link dailyEquivalentOf}).
+ *
+ * Pure, because it answers the same question at two moments that share no state: the mount that
+ * restores an unanswered offer, and every later {@link useCadenceOffer.ask} against the live rows.
+ */
+function offerFor(
+  rows: Record<string, AutomationScheduleState>,
+  keepWeekly: boolean,
+  armed: boolean,
+): CadenceOffer | null {
+  if (keepWeekly || !armed) return null;
+  const coupled = rows[CADENCE_COUPLED_AUTOMATION];
+  if (coupled?.enabled !== true) return null;
+  const daily = dailyEquivalentOf(coupled.cron);
+  if (!daily) return null;
+  return {
+    automationId: CADENCE_COUPLED_AUTOMATION,
+    cron: daily,
+    reason: CADENCE_OFFER_REASON,
+    acceptLabel: "Raise to daily",
+    declineLabel: "Keep weekly",
+  };
 }

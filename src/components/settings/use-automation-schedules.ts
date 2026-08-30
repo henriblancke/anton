@@ -141,6 +141,7 @@ export function useAutomationSchedules({
 
   const cadence = useCadenceOffer({
     rows,
+    initialRows: state,
     keepWeekly: keepProductMasterWeekly,
     patchSettings,
     setCron,

@@ -24,7 +24,7 @@ function render(seed: Rows, keepWeekly = false) {
   const patchSettings = vi.fn(async () => new Response("{}", { status: 200 }));
   const setCron = vi.fn(async () => true);
   const { result } = renderHook(() =>
-    useCadenceOffer({ rows, keepWeekly, patchSettings, setCron }),
+    useCadenceOffer({ rows, initialRows: seed, keepWeekly, patchSettings, setCron }),
   );
   return { result, rows, setCron };
 }
@@ -133,5 +133,49 @@ describe("a hand cadence edit that lands", () => {
     );
 
     expect(result.current.offer).toBeNull();
+  });
+});
+
+/**
+ * The question survives the operator walking away from it. Nothing about "the picker is armed and
+ * product-master still runs weekly" expires when the page unmounts, and only an ANSWER — accept, so
+ * the cadence is no longer weekly; decline, so the opt-out is on record — ends it.
+ */
+describe("a remount with the question unanswered", () => {
+  /** The board-picker armed, product-master still weekly — an offer left standing by a reload. */
+  const armed = (over: Partial<AutomationScheduleState> = {}): Rows => ({
+    "board-picker": { enabled: true, cron: "*/10 * * * *" },
+    "product-master": { enabled: true, cron: WEEKLY, ...over },
+  });
+
+  it("restores it from the persisted answer and the live rows", () => {
+    const { result } = render(armed());
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+
+  it("still answers — a restored offer is the same question, not a read-only banner", async () => {
+    const { result, setCron } = render(armed());
+    await act(() => result.current.accept());
+    expect(setCron).toHaveBeenCalledWith("product-master", DAILY);
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("stays silent once the operator has said keep weekly", () => {
+    const { result } = render(armed(), true);
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("stays silent when the picker is not armed", () => {
+    const { result } = render(disarmed());
+    expect(result.current.offer).toBeNull();
+  });
+
+  it("stays silent when product-master is off, or already runs daily-or-faster", () => {
+    expect(render(armed({ enabled: false })).result.current.offer).toBeNull();
+    cleanup();
+    expect(render(armed({ cron: DAILY })).result.current.offer).toBeNull();
+    cleanup();
+    // A hand-written expression is not ours to rewrite — there is no "the same time, but daily".
+    expect(render(armed({ cron: "0 0,12 * * 1-5" })).result.current.offer).toBeNull();
   });
 });
