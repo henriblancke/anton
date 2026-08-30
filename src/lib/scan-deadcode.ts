@@ -446,8 +446,13 @@ function maskMdxProse(text: string): string {
     .join("\n");
 }
 
-/** A JSX tag opening right where the symbol starts — `<Widget`, `</Widget`. */
-const MDX_TAG = /<\/?\s*$/;
+/**
+ * A tag opening right where the symbol starts — `<Widget`, `</Widget`, `<UI.Widget`. The member
+ * prefix counts because JSX resolves `<UI.Widget />` to the same binding a bare tag would: a page
+ * that imports a namespace and renders through it may name the symbol nowhere else, and reading
+ * that tag as prose reports a rendered component dead.
+ */
+const TAG_HEAD = /<\/?\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
 
 /**
  * Which lines of an MDX file start inside a block that is still executing — an expression or an
@@ -458,7 +463,10 @@ const MDX_TAG = /<\/?\s*$/;
  *
  * A blank line closes whatever is open. MDX separates its blocks that way, so an unbalanced brace
  * in prose can only mislead its own paragraph rather than every line below it — the bound that
- * matters, since reading prose as code is what deletes a true finding.
+ * matters, since reading prose as code is what deletes a true finding. An expression whose braces
+ * really do span the blank line loses its depth here and the caller under it goes uncounted: that
+ * costs one signal that stands, where trusting the brace costs findings across the rest of the
+ * file, so the bound is kept deliberately.
  *
  * That blank line is the only thing that closes the ESM block, because it is the only thing MDX
  * itself closes one with: an `import`/`export` block runs to the next empty line and is parsed
@@ -504,7 +512,86 @@ function mdxOpenLines(code: string[], raw: string[]): boolean[] {
  */
 function referencesMdx(line: string | undefined, symbol: string, open = false): boolean {
   if (line !== undefined && (open || MDX_ESM_LINE.test(line))) return referencesWord(line, symbol);
-  return referencesWord(line, symbol, (head) => MDX_TAG.test(head) || head.includes("{"));
+  return referencesWord(line, symbol, (head) => TAG_HEAD.test(head) || head.includes("{"));
+}
+
+/**
+ * Files read as markup — HTML and the single-file component formats built on it. Comment masking
+ * blanks what `<!-- -->` hides and nothing else, so `<p>neverCalled was removed</p>` survives it
+ * intact and reads as a call: a committed doc page or template would then delete a true finding
+ * about a genuinely unused symbol. Their text is judged like MDX's markdown instead.
+ */
+const MARKUP_FILE = /\.(?:html?|xml|svg|vue|svelte|astro)$/i;
+
+/** Astro puts its module in a `---` fence at the top of the file, above any markup. */
+const ASTRO_FILE = /\.astro$/i;
+const ASTRO_FENCE = /^---\s*$/;
+
+/** A `<script>` or `</script>` tag, with whatever attributes it carries (`<script lang="ts">`). */
+const SCRIPT_TAG = /<(\/?)script\b[^>]*?(\/?)>/gi;
+
+/** Inside an attribute value opened on this line — `onclick="neverCalled()"`, `@click='go'`. */
+const ATTR_VALUE = /=\s*["'][^"']*$/;
+
+/**
+ * A framework directive taking a bare binding rather than a braced one: Svelte's `use:enhance` and
+ * Vue's `v-on:click` name a real caller with no other code around them. Only the known prefixes
+ * count — accepting any `word:` would read `the helper: neverCalled ran nightly` as a call.
+ */
+const DIRECTIVE_HEAD =
+  /(?:^|[\s"'])(?:use|on|bind|transition|in|out|animate|class|style|slot|v-[\w-]+):\s*$/;
+
+/**
+ * Which lines of a markup file are program text rather than markup: the body of a `<script>`
+ * element, or an Astro frontmatter block. Those are where a component gets imported, so judging
+ * them by markup's rules would miss the import that proves the symbol live.
+ *
+ * Read from the masked lines, so a `<script>` shown inside a comment opens nothing.
+ */
+function markupCodeLines(code: string[], file: string): boolean[] {
+  const frontmatterEnd = ASTRO_FILE.test(file) ? astroFrontmatterEnd(code) : -1;
+  const lines: boolean[] = [];
+  let script = false;
+  for (const [index, line] of code.entries()) {
+    // A whole element written on one line (`<script>go()</script>`) leaves that line executable
+    // while closing the block under it.
+    let executable = script || index <= frontmatterEnd;
+    for (const [, closing, selfClosing] of line.matchAll(SCRIPT_TAG)) {
+      executable = true;
+      script = closing !== "/" && selfClosing !== "/";
+    }
+    lines.push(executable);
+  }
+  return lines;
+}
+
+/** The last line of the Astro frontmatter fence, or -1 when the file opens with markup. */
+function astroFrontmatterEnd(code: string[]): number {
+  const open = code.findIndex((line) => line.trim() !== "");
+  if (open < 0 || !ASTRO_FENCE.test(code[open] ?? "")) return -1;
+  const close = code.findIndex((line, index) => index > open && ASTRO_FENCE.test(line));
+  // An unclosed fence is not a module: reading the rest of the file as code would let its markup
+  // text prove a caller, which is the direction that deletes a true finding.
+  return close;
+}
+
+/**
+ * Whether a markup line uses the symbol or merely renders it. Outside a script block the file is
+ * a template, where only three shapes run: a tag name, an attribute value, and a braced expression
+ * (`{count}` in Svelte and Astro, `{{ count }}` in Vue). Text between the tags is what the page
+ * shows a reader, so a name there describes the symbol rather than calling it.
+ */
+function referencesMarkup(line: string | undefined, symbol: string, code = false): boolean {
+  if (code) return referencesWord(line, symbol);
+  return referencesWord(
+    line,
+    symbol,
+    (head) =>
+      TAG_HEAD.test(head) ||
+      ATTR_VALUE.test(head) ||
+      DIRECTIVE_HEAD.test(head) ||
+      head.includes("{"),
+  );
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -568,8 +655,11 @@ type CandidateHits = Map<string, number[]>;
 /** A file read once and reused across symbols: its comments blanked, plus MDX's cross-line state. */
 interface MaskedFile {
   code: string[];
-  /** MDX only: whether each line starts inside a block an earlier line left open. */
-  open?: boolean[];
+  /**
+   * For a file where prose and program are interleaved, which lines are already code: an MDX line
+   * inside a block an earlier line left open, or a markup line inside a `<script>` element.
+   */
+  executable?: boolean[];
 }
 
 /**
@@ -628,13 +718,21 @@ async function codeReferencingFiles(
     abort?.throwIfAborted();
     const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
     const isMdx = MDX_FILE.test(file);
+    const isMarkup = !isMdx && MARKUP_FILE.test(file);
     if (!masked.has(file)) {
       try {
         const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
         // MDX's markdown — its fences and code spans — is blanked before the JSX comment grammar
         // runs, so a `/*` or `//` shown inside an example can't open a comment across the program.
         const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
-        masked.set(file, isMdx ? { code, open: mdxOpenLines(code, text.split("\n")) } : { code });
+        masked.set(file, {
+          code,
+          executable: isMdx
+            ? mdxOpenLines(code, text.split("\n"))
+            : isMarkup
+              ? markupCodeLines(code, file)
+              : undefined,
+        });
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
         // "proves no caller" and let the pass finish on a verdict nobody asked for.
@@ -644,10 +742,13 @@ async function codeReferencingFiles(
     }
     const entry = masked.get(file);
     if (!entry) continue;
-    const references = (line: number): boolean =>
-      isMdx
-        ? referencesMdx(entry.code[line - 1], symbol, entry.open?.[line - 1] === true)
-        : referencesWord(entry.code[line - 1], symbol);
+    const references = (line: number): boolean => {
+      const text = entry.code[line - 1];
+      const executable = entry.executable?.[line - 1] === true;
+      if (isMdx) return referencesMdx(text, symbol, executable);
+      if (isMarkup) return referencesMarkup(text, symbol, executable);
+      return referencesWord(text, symbol);
+    };
     if (lines.some(references)) files.push(file);
   }
   return files;

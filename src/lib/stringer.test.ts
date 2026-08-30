@@ -1477,6 +1477,93 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // A page importing a namespace renders through it — `<UI.Widget />` — and may name the symbol
+    // nowhere else. Reading the member tag as prose reports a component that ships on every page.
+    it("counts an MDX component rendered through a namespace import", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import * as UI from '../src/ui/widget';\n\n<UI.Widget />\n",
+        "docs/notes.mdx": "Widget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // Comment masking leaves an HTML file's rendered text intact, where a name is being shown to a
+    // reader rather than called. A committed page describing a removed symbol would otherwise prove
+    // its own caller and delete a true finding; a `<script>` in the same file still calls.
+    it("does not count a symbol rendered as markup text, and still counts a script that calls it", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "public/notes.html": "<h1>API</h1>\n<p>neverCalled was removed from the old API</p>\n",
+        "public/app.html": "<body>\n<script>\n  neverCalled();\n</script>\n</body>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // ...and a template is not prose either: a rendered tag and an attribute value each name a
+    // real caller, so the same rule that discounts markup text must still count them.
+    it("counts a component rendered as a tag or called from an attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/page.svelte": "<main>\n  <Widget />\n</main>\n",
+        "src/ui/app.vue": '<template>\n  <button @click="Widget()">go</button>\n</template>\n',
+        "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.svelte");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/app.vue");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // The two shapes with no code punctuation around them at all: a Svelte directive binding
+    // (`use:enhance`) and an Astro frontmatter import, which sits above the markup rather than in
+    // a `<script>`. Both name the symbol as plainly as a call does.
+    it("counts a template directive and an Astro frontmatter import", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/form.svelte": "<form use:Widget>\n</form>\n",
+        "src/pages/index.astro":
+          "---\nimport { Widget } from '../ui/widget';\n---\n<main>hello</main>\n",
+        "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/form.svelte");
+      expect(result.deadcode.dropped[0].reason).toContain("src/pages/index.astro");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {
