@@ -87,12 +87,17 @@ const STRUCTURAL_LINE = /^(?:[[\](){}<>,;:]+|<\/[A-Za-z][\w.:-]*>[,;)]*|\/>[,;)]
 
 /**
  * `import …`, `export { … } from …`, `export * from …` — the statement's first line. A dynamic
- * `import("./plugin").then(register)` is excluded: it loads a module at runtime and drives whatever
- * comes after it, so it computes. Go's `import (` block keeps its place — a paren with nothing after
- * it opens a specifier list, not a call.
+ * `import("./plugin")` is excluded: it loads a module at runtime and drives whatever comes after it,
+ * so it computes — and it is excluded on the paren ALONE, not on what follows, because the argument
+ * may sit on the next line (`import(\n  "./plugin"\n).then(register)`). Reading that opener as an
+ * import would hold the whole runtime expression below it in import state and drop the window.
+ *
+ * Go's grouped `import (` keeps its place: gofmt separates the keyword from the paren, and a paren
+ * with nothing after it on the line opens a specifier list. The spaced call form (`import ("./x")`)
+ * is excluded by its argument, as before.
  */
 const IMPORT_START =
-  /^import\b(?!\s*(?:\(\s*\S|\.))|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
+  /^import\b(?!\(|\s*(?:\(\s*\S|\.))|^export\s+(?:type\s+)?[{*]|^export\b[^;]*\bfrom\s*["']/;
 
 /**
  * Python's other import spelling — `from package import name`, `from . import sibling`, and the

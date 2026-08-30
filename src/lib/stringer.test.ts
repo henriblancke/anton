@@ -1221,6 +1221,45 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // The argument of a dynamic import can sit on the next line. The opener alone must settle it:
+    // reading `import(` as a declaration holds the `).then(register)` below it in import state and
+    // drops a window of live module wiring. Go's grouped `import (` still declares.
+    it("reads a dynamic import() whose argument wraps to the next line as code", async () => {
+      const repo = writeRepo({
+        "src/wiring.ts": [
+          "export function load(register: (m: unknown) => void) {",
+          "  import(",
+          "    './alpha'",
+          "  ).then(register);",
+          "  import(",
+          "    './beta'",
+          "  ).then(register);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/deps.go": [
+          "package main",
+          "",
+          "import (",
+          '\t"fmt"',
+          '\t"os"',
+          '\t"strings"',
+          ")",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/wiring.ts", 2]], 6),
+        clone([["src/deps.go", 3]], 4),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/wiring.ts" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.go" }]);
+      expect(result.duplication.dropped[0].reason).toContain("4 import");
+    });
+
     // A parameter NAME declares; a parameter DEFAULT runs on every call. A signature whose whole
     // list is `x = build()` is duplicated computation, however much it looks like a props list.
     it("counts a parameter list of defaults as code and one of bare names as a declaration", async () => {
