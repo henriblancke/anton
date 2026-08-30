@@ -520,6 +520,36 @@ describe("finalizeMergedEpic", () => {
     );
   });
 
+  it("does not reparent a ticket another operator held before the sweep (anton-67xj)", async () => {
+    // The rerun allowlist weighs the assignee only on the in_progress lane, so a `blocked` ticket
+    // reserved by someone else reads as rerunnable — and as no takeover either, since the snapshot
+    // carries the same owner. Moving it advertises work op-2 holds under a second target.
+    const held = claimed(bead("t2", "blocked", ["not-delivered"]), "op-2");
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [held]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(unassignMock).not.toHaveBeenCalled();
+    const note = noteMock.mock.calls[0][2];
+    expect(note).toContain("Its status is now `blocked` under op-2");
+    expect(note).not.toContain("now lives under");
+    expect(note).toContain("assigned to op-2");
+  });
+
+  it("does not reparent a ticket held by anyone when the run had no identity", async () => {
+    // No runOwner means nothing anton reserved, so any assignee at all is somebody else's.
+    const held = claimed(bead("t2", "blocked", ["not-delivered"]), "op-2");
+
+    await finalize(bead("epic-1"), [held]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain(
+      "Its status is now `blocked` under op-2",
+    );
+  });
+
   it("still rehomes the tickets skipped behind a post-commit timeout", async () => {
     // Only the timed-out ticket's own work is in the diff. t3 was never dispatched, so it carries
     // no marker and no commit — the lane split must keep it runnable rather than strand it too.

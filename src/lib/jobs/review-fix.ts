@@ -935,9 +935,9 @@ export async function finalizeMergedEpic(args: {
                   `request was in review, so anton left it there rather than rehoming it — that ` +
                   `target owns this work now.`
                 : movedOn
-                  ? `Its status is now ${movedOn} — that changed while the pull request was in ` +
-                    `review, so anton left it under ${epic.id}, status untouched, rather than ` +
-                    `queueing a rerun on top of someone else's decision. Once that is settled, ` +
+                  ? `Its status is now ${movedOn} — someone's own decision about this ticket ` +
+                    `rather than the run's, so anton left it under ${epic.id}, status untouched, ` +
+                    `rather than queueing a rerun on top of it. Once that is settled, ` +
                     `move it onto a fresh run target (\`bd update ${bead.id} --parent ` +
                     `<new-epic>\`) to have anton pick the work back up.`
                   : followUp.id && followUp.moved.has(bead.id)
@@ -1050,9 +1050,17 @@ async function rehomePreserved(
     // follow-up branch that carries no commit for it, which execute-epic then reads as a
     // cross-machine resume and runs again. So the allowlist is re-applied to the fresh read, and a
     // claim that changed hands since the snapshot disqualifies it however it reads.
+    //
+    // Ownership is checked here on its own, not left to the allowlist: `safeToRerunAtMerge` weighs
+    // the assignee only on the `in_progress` lane, so an `open` or `blocked` ticket another
+    // operator had already reserved BEFORE the sweep read the board passes it — and reads as no
+    // takeover either, since the snapshot carries the same foreign owner. Reparenting that one
+    // advertises work somebody holds under a second target. Any owner but the dead run's own is a
+    // live reservation, whenever it landed.
     const freshOwner = ownerOf(fresh);
+    const heldByOther = freshOwner !== undefined && freshOwner !== runOwner;
     const tookOver = freshOwner !== undefined && freshOwner !== ownerOf(bead);
-    if (!safeToRerunAtMerge(fresh, runOwner) || tookOver) {
+    if (!safeToRerunAtMerge(fresh, runOwner) || heldByOther || tookOver) {
       changed.set(bead.id, stateOf(fresh));
       continue;
     }
@@ -1106,8 +1114,9 @@ interface Rehomed {
    */
   elsewhere: Map<string, string | undefined>;
   /**
-   * Tickets a fresh read no longer finds rerunnable — claimed, closed or snoozed since the sweep.
-   * Left where they are, status untouched, and named by their live state in the note.
+   * Tickets a fresh read no longer finds rerunnable — claimed, closed or snoozed since the sweep,
+   * or reserved by an operator other than the run's own whenever that claim landed. Left where
+   * they are, status untouched, and named by their live state in the note.
    */
   changed: Map<string, string>;
 }
