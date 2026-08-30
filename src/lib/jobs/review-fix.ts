@@ -149,6 +149,12 @@ export function inReviewEpics(
   });
 }
 
+/**
+ * Who this job is, as the worktree claim records it. The same name goes to `createWorktree`, which
+ * refuses to hand a claimed checkout to anyone but its holder.
+ */
+const CLAIM_OWNER = "review-fix";
+
 /** Build the runner handler bound to a db/clock. Register it as the "review-fix" handler. */
 export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
   const db = deps.db;
@@ -253,7 +259,7 @@ async function handleEpic(args: {
   // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
   // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
   // the commit and push behind it.
-  await withWorktreeClaim(repo, branch, "review-fix", async () => {
+  await withWorktreeClaim(repo, branch, CLAIM_OWNER, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
     // sync it with origin, and pre-merge the base if GitHub reports a conflict.
     const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number });
@@ -280,7 +286,13 @@ async function prepareFixWorktree(args: {
 }): Promise<{ worktree: Worktree; conflicts: string[] }> {
   const { ctx, repo, branch, settings, baseBranch, pr, number } = args;
 
-  const worktree = await createWorktree({ repoPath: repo, branch, baseBranch: settings.baseBranch, warm: false });
+  const worktree = await createWorktree({
+    repoPath: repo,
+    branch,
+    baseBranch: settings.baseBranch,
+    warm: false,
+    claimedBy: CLAIM_OWNER,
+  });
   // Fail loudly here rather than letting a missing worktree ride through the best-effort git steps
   // below — `safe()` swallows their errors, so the first thing to actually report the problem would
   // be `spawn <claude> ENOENT` from the cwd, which names the wrong culprit entirely (anton-2wvb).

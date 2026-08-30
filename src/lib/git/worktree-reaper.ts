@@ -435,6 +435,13 @@ export async function reapWorktrees(args: {
    * candidates rather than run the remaining deletions to completion.
    */
   signal?: AbortSignal;
+  /**
+   * Reported after each candidate is judged, so the caller can prove the sweep is still moving. A
+   * project with many settled candidates pays one `gh` lookup each, and the runner measures its
+   * no-progress timeout from the last heartbeat: without this, a sweep whose lookups outlast that
+   * window is cancelled at the same prefix on every retry and never reaches the residue behind it.
+   */
+  onProgress?: () => Promise<void>;
 }): Promise<ReapReport> {
   const report: ReapReport = { reaped: [], skipped: [] };
   for (const candidate of args.candidates) {
@@ -455,6 +462,7 @@ export async function reapWorktrees(args: {
     // A plan that deletes nothing needs neither the re-read nor the lock — the entry only records why.
     if (!plan.removeWorktree && !plan.deleteBranch) {
       report.skipped.push(await applyPlan(args.repoPath, candidate, plan));
+      await args.onProgress?.();
       continue;
     }
     // The second cancellation check, and the one that matters: the `gh` lookup above can run for
@@ -479,6 +487,7 @@ export async function reapWorktrees(args: {
     // Classified on the outcome, never the plan: a checkout locked between planning and removal is
     // refused, and reporting that as reaped would claim work the sweep did not do.
     (entry.outcome === "acted" ? report.reaped : report.skipped).push(entry);
+    await args.onProgress?.();
     // Re-checked after the entry is recorded rather than left to the next iteration: an abort during
     // the LAST candidate has no next iteration to notice it, and would report a partial sweep as one
     // that judged everything.

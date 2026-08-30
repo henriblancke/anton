@@ -338,6 +338,38 @@ suite("the sweep over real residue (real git)", () => {
     }
   });
 
+  it("reports progress after EVERY candidate, so a long sweep is never timed out at the same prefix", async () => {
+    // Each settled candidate costs a `gh` lookup of its own; the runner measures its no-progress
+    // timeout from the last heartbeat, so a sweep that reports once would be cancelled at the same
+    // prefix on every retry and never reach the residue behind it.
+    const reapable = await createWorktree({ repoPath: repo, branch: "anton/anton-beat1" });
+    const kept = await createWorktree({ repoPath: repo, branch: "anton/anton-beat2" });
+    const candidates = [
+      { branch: reapable.branch, path: reapable.path, beadId: "anton-beat1", runLive: false, bead: "settled" as const },
+      // A candidate the plan keeps still has to count as progress — most of a big sweep is skips.
+      { branch: kept.branch, path: kept.path, beadId: "anton-beat2", runLive: false, bead: "open" as const },
+    ];
+    let beats = 0;
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates,
+        lookupPr: noPr,
+        onProgress: async () => {
+          beats += 1;
+        },
+      });
+
+      expect(beats).toBe(candidates.length);
+      expect(report.reaped.map((e) => e.branch)).toEqual(["anton/anton-beat1"]);
+      expect(report.skipped.map((e) => e.branch)).toEqual(["anton/anton-beat2"]);
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", kept.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", kept.branch]);
+    }
+  });
+
   it("stops on an aborted job instead of running the remaining deletions", async () => {
     const first = await createWorktree({ repoPath: repo, branch: "anton/anton-stop1" });
     const second = await createWorktree({ repoPath: repo, branch: "anton/anton-stop2" });

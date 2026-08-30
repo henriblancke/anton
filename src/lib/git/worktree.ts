@@ -332,16 +332,46 @@ export function worktreeClaimHolder(repoPath: string, branch: string): string | 
 }
 
 /**
+ * The job already holding this branch's checkout when someone OTHER than that holder asks for it,
+ * or undefined when the caller may have it. Both halves of the claim are consulted, because each
+ * covers what the other cannot: this process's map, and the `git worktree lock` a second anton
+ * process leaves — the only evidence of a claim that survives crossing a process boundary.
+ *
+ * Our own process's lock is deliberately not a conflict on its own: the map above is the live
+ * answer for it, and a lock this process failed to release (see {@link releaseClaimLock}) must not
+ * lock the branch out of every later run until anton restarts.
+ */
+function conflictingClaim(
+  holders: string[],
+  record: WorktreeRecord | undefined,
+  caller: string | undefined,
+): string | undefined {
+  const other = holders.find((h) => h !== caller);
+  if (other) return `${other} is using the checkout`;
+  const live = record?.locked ? liveClaimLock(record.lockReason) : undefined;
+  if (live && !(live.pid === process.pid && live.host === hostname())) return describeClaimLock(live);
+  return undefined;
+}
+
+/**
  * Create (or reuse) an isolated worktree + branch off `baseBranch` (default: the repo's current
  * HEAD branch). Idempotent: if a worktree for `branch` already exists it is returned as-is
  * (supports crash recovery / resumable runs). `warm: true` runs project setup (deps install — see
  * {@link resolveWarmCommand}), and is a no-op when nothing is needed.
+ *
+ * Reuse is refused while ANOTHER job holds the checkout (see {@link withWorktreeClaim}). Handing
+ * the same directory to two jobs is worse than failing the second: review-fix and an execute run
+ * would drive git, claude, tests and commits over one working tree, interleaving each other's
+ * edits. The claim holder itself says so with `claimedBy` — it materializes its own checkout under
+ * its claim, and refusing that would deadlock the very job the claim is for.
  */
 export async function createWorktree(opts: {
   repoPath: string;
   branch: string;
   baseBranch?: string;
   warm?: boolean;
+  /** The claim holder this checkout is being created for, when the caller is one (`review-fix`). */
+  claimedBy?: string;
   /** Abort an in-flight install so an operator's kill doesn't hold the run's slot for the full warm timeout. */
   signal?: AbortSignal;
 }): Promise<Worktree> {
@@ -353,8 +383,18 @@ export async function createWorktree(opts: {
   const wt = await withBranchLock(repoPath, branch, async (): Promise<Worktree> => {
     // A claim can be held before the checkout exists (review-fix claims, then materializes), and the
     // git lock that makes it visible to another anton process can only be taken once it does.
-    const claimed = worktreeClaims.get(branchKey(repoPath, branch))?.[0];
-    const existing = await findWorktree(repoPath, branch);
+    const holders = worktreeClaims.get(branchKey(repoPath, branch)) ?? [];
+    const record = (await listWorktrees(repoPath)).find((r) => r.branch === branch);
+    const conflict = conflictingClaim(holders, record, opts.claimedBy);
+    if (conflict) {
+      throw new Error(
+        `[worktree] refusing to hand ${branch}'s checkout to a second job: ${conflict}`,
+      );
+    }
+    const claimed = holders[0];
+    const existing: Worktree | null = record
+      ? { path: record.path, branch, baseBranch: branch, repoPath }
+      : null;
     // A registration can outlive its checkout: `git worktree list` reports an administrative record,
     // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
     // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
@@ -701,10 +741,13 @@ function judgeLock(reason: string | undefined, source?: string): RemovalGuard {
  * precisely the statement that it must not.
  *
  * Or the path is no longer this branch's. Removal is by path and `--force` never checks what is on
- * it, so a path re-registered to another branch between a caller's `listWorktrees` snapshot and this
- * call would be deleted with that branch's uncommitted work. Only a DIFFERENT branch blocks: a record
- * git reports with no branch (a detached HEAD) is still the checkout anton made, and a caller with no
- * branch to compare — project teardown removes by recorded path alone — is unaffected.
+ * it, so a path re-registered between a caller's `listWorktrees` snapshot and this call would be
+ * deleted with whatever uncommitted work is on it. ANY registration that is not exactly this branch
+ * blocks, including a detached HEAD: a reaper reaching a historical run's canonical path with a
+ * branch-only candidate cannot tell anton's own checkout from a replacement someone else put there,
+ * and the two cost opposite amounts to get wrong — an unreapable checkout is one skipped line in the
+ * sweep's report, a wrongly reaped one is somebody's work. A caller with no branch to compare —
+ * project teardown removes by recorded path alone — is unaffected.
  *
  * An unreadable listing erases that evidence, so for a checkout still ON DISK it fails CLOSED: the
  * lock is re-read from the admin directory, and one that can be neither proven nor ruled out is left
@@ -726,8 +769,9 @@ async function removalBlocker(wt: Worktree): Promise<RemovalGuard> {
   }
   const record = records.find((r) => resolve(r.path) === target);
   if (record?.locked) return judgeLock(record.lockReason);
-  if (wt.branch && record?.branch && record.branch !== wt.branch) {
-    return { blocker: `git registers ${record.branch} at that checkout now, not ${wt.branch}` };
+  if (wt.branch && record && record.branch !== wt.branch) {
+    const holder = record.branch ? record.branch : "a detached checkout";
+    return { blocker: `git registers ${holder} at that checkout now, not ${wt.branch}` };
   }
   return {};
 }

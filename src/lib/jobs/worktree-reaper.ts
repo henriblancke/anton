@@ -269,6 +269,11 @@ export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler 
       // An operator's cancel (or the runner's no-progress timeout) must stop the sweep between
       // candidates; what it already released is still reported below.
       signal: ctx.signal,
+      // Each judged candidate is progress. A project with a lot of settled residue pays a `gh`
+      // lookup per candidate, and the no-progress timeout runs from the last heartbeat: without
+      // one per candidate the sweep is cancelled at the same prefix on every retry, and the
+      // residue behind it is never reached.
+      onProgress: () => ctx.heartbeat(),
     });
     if (report.reaped.length > 0 || report.skipped.length > 0) {
       await session.log(formatReapReport(report, `worktree-reaper: ${reapSummary(report)}`));

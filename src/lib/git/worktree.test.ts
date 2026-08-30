@@ -451,6 +451,95 @@ suite("worktree manager (real git)", () => {
     await removeWorktree(wt, { deleteBranch: true });
   });
 
+  it("SKIPS a path git now holds as a DETACHED checkout, which is no longer this branch's", async () => {
+    // A historical run's canonical path reused by a detached checkout carries NO branch, so an
+    // association re-read that only compares branch names would read it as "still ours" and let
+    // `--force` delete somebody else's uncommitted work.
+    const gone = "anton/run-detached-gone";
+    const wt = await createWorktree({ repoPath: repo, branch: gone });
+    writeFileSync(join(wt.path, "in-progress.txt"), "the replacement's work\n");
+    execFileSync("git", ["-C", wt.path, "checkout", "--detach"]);
+
+    try {
+      const removal = await removeWorktree(
+        { path: wt.path, branch: gone, baseBranch: gone, repoPath: repo },
+        { deleteBranch: true },
+      );
+
+      expect(removal.removed).toBe(false);
+      expect(removal.branchDeleted).toBe(false);
+      expect(removal.skipped).toBe(
+        `git registers a detached checkout at that checkout now, not ${gone}`,
+      );
+      expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", gone]);
+    }
+  });
+
+  it("REFUSES to hand a claimed checkout to a second job, which would run two agents in one tree", async () => {
+    // review-fix holds the claim; an execute run asking for the same branch must fail rather than
+    // drive git, claude and tests over the working tree the fix is being written in.
+    const branch = "anton/run-claim-reuse";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    let done!: () => void;
+    const using = new Promise<void>((r) => (done = r));
+    let active!: () => void;
+    const claimTaken = new Promise<void>((r) => (active = r));
+
+    const claiming = withWorktreeClaim(repo, branch, "review-fix", () => {
+      active();
+      return using;
+    });
+    await claimTaken;
+
+    try {
+      await expect(createWorktree({ repoPath: repo, branch })).rejects.toThrow(
+        /review-fix is using the checkout/,
+      );
+      // The holder itself still gets it: review-fix claims the branch, then materializes it.
+      expect((await createWorktree({ repoPath: repo, branch, claimedBy: "review-fix" })).path).toBe(
+        wt.path,
+      );
+    } finally {
+      done();
+      await claiming;
+    }
+
+    await removeWorktree(wt, { deleteBranch: true });
+  });
+
+  it("REFUSES reuse while ANOTHER anton process's claim lock is on the checkout", async () => {
+    // The in-process map is empty in the second process, so the git lock is the only evidence the
+    // checkout is in use — and reuse that ignores it mixes two processes' work in one directory.
+    const branch = "anton/run-claim-reuse-foreign";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    execFileSync("git", [
+      "-C",
+      repo,
+      "worktree",
+      "lock",
+      "--reason",
+      `anton-claim review-fix pid=${DEAD_PID} host=some-other-box`,
+      wt.path,
+    ]);
+
+    try {
+      await expect(createWorktree({ repoPath: repo, branch })).rejects.toThrow(
+        /review-fix is using the checkout \(pid \d+ on some-other-box\)/,
+      );
+      // Not even its own owner may reuse it: that claim belongs to another process.
+      await expect(
+        createWorktree({ repoPath: repo, branch, claimedBy: "review-fix" }),
+      ).rejects.toThrow(/is using the checkout/);
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "unlock", wt.path]);
+    }
+
+    await removeWorktree(wt, { deleteBranch: true });
+  });
+
   it("takes a worktree claim only under the branch lock, so a removal in flight is never overtaken", async () => {
     const branch = "anton/run-claimed";
     let release!: () => void;
@@ -517,7 +606,9 @@ suite("worktree manager (real git)", () => {
     const materialized = new Promise<Worktree>((r) => (created = r));
 
     const claiming = withWorktreeClaim(repo, branch, "review-fix", async () => {
-      created(await createWorktree({ repoPath: repo, branch }));
+      // `claimedBy` is what tells createWorktree the caller IS the holder — exactly what review-fix
+      // passes when it materializes the checkout it just claimed.
+      created(await createWorktree({ repoPath: repo, branch, claimedBy: "review-fix" }));
       await using;
     });
     const wt = await materialized;
