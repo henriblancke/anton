@@ -400,17 +400,25 @@ describe("actOnEscalation — the pre-settle board read", () => {
 
   // `readTargetState` awaits a bd pull that can take seconds; a resume landing inside that window
   // republishes the stalled run's own id, which the lease check exempts as this escalation's own.
+  // The read is held OPEN rather than flipping the restart as it returns: flipping on return is
+  // also satisfied by a check made before the read is awaited, which would miss exactly the resume
+  // that lands while the real bd pull is still in flight.
   it("re-checks the local restart AFTER the board read, not only before it", async () => {
     open();
+    const read = deferred();
     readTargetState.mockImplementation(async () => {
-      restartedLocally.mockReturnValue(true);
+      await read.promise;
       return "clear";
     });
 
-    expect(await actOnEscalation(project, "esc-1", "abandon")).toEqual({
-      ok: false,
-      reason: "contested",
-    });
+    const acting = actOnEscalation(project, "esc-1", "abandon");
+    await flush();
+    // The pre-read check has already answered false; the resume lands inside the pull's window.
+    restartedLocally.mockReturnValue(true);
+    read.resolve();
+
+    expect(await acting).toEqual({ ok: false, reason: "contested" });
+    expect(actOnBead).not.toHaveBeenCalled();
   });
 
   // A gate outlives a reparent, so the frozen ancestor is not what either verb acts on — the veto

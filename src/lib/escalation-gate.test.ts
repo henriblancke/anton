@@ -255,11 +255,37 @@ describe("answerGateWait — resume closes the gate FIRST", () => {
     expect(loadAllIssues).toHaveBeenCalledWith("/tmp/p1", { strictGates: true });
   });
 
-  it("marks the resumed gate handed back, and nudges the marks out to teammates", async () => {
-    await answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+  // The resume is held OPEN: the mark says the resume LANDED, and a mark written while it is still
+  // in flight makes gate-check skip a closed gate over a run that may never have started.
+  it("marks the resumed gate handed back only once the resume lands, and nudges the marks out", async () => {
+    const resume = deferred();
+    actOnBead.mockImplementation(async () => {
+      await resume.promise;
+      return "enqueued";
+    });
 
+    const answering = answerGateWait(project, "resume", view(), "g-1", "anton-e1");
+    await settle();
+
+    expect(beadsTag).not.toHaveBeenCalled();
+    expect(nudgeSync).not.toHaveBeenCalledWith(project, "gate-resumed");
+    resume.resolve();
+
+    await answering;
     expect(beadsTag).toHaveBeenCalledWith("/tmp/p1", "g-1", [GATE_RESUMED_LABEL]);
     expect(nudgeSync).toHaveBeenCalledWith(project, "gate-resumed");
+  });
+
+  // A resume that threw leaves the gate closed and UNMARKED on purpose — that pair is exactly what
+  // gate-check re-dispatches from, and it is the module's only recovery path for a failed resume.
+  it("leaves the gates unmarked when the resume rejects", async () => {
+    actOnBead.mockRejectedValue(new Error("bd: write conflict"));
+
+    await expect(answerGateWait(project, "resume", view(), "g-1", "anton-e1")).rejects.toThrow(
+      "bd: write conflict",
+    );
+    expect(beadsTag).not.toHaveBeenCalled();
+    expect(nudgeSync).not.toHaveBeenCalledWith(project, "gate-resumed");
   });
 
   // Two waits on one target are answered one at a time; the run this marks releases both, so a
