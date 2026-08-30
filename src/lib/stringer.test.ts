@@ -1389,6 +1389,29 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
     });
 
+    // `git grep -w` breaks a word on `$` and `#`, but JavaScript spells identifiers with both, so
+    // grep hands back `$mount` and `this.#mount` for a search on `mount`. Reading those as callers
+    // deletes a true finding — while the `boot` call in the same file still has to count, so the
+    // rejection is the boundary rule and not a file the check never read.
+    it("reads `$` and `#` as identifier characters rather than word boundaries", async () => {
+      const repo = initRepo({
+        "src/lib/mount.ts": "export function mount() {}\n",
+        "src/lib/boot.ts": "export function boot() {}\n",
+        "src/lib/other.ts": "export const $mount = 1;\nexport const mount$ = 2;\n",
+        "src/lib/klass.ts":
+          "import { boot } from './boot';\nexport class K {\n  #mount() {}\n  run() {\n    this.#mount();\n    boot();\n  }\n}\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("src/lib/mount.ts", "mount"),
+        unused("src/lib/boot.ts", "boot"),
+      ]);
+
+      expect(result.kept).toMatchObject([{ Title: "Unused function: mount" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "boot" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/klass.ts");
+    });
+
     // The budget stops a baseline pass from spending a nightly on greps, but a truncated pass that
     // says nothing reads exactly like a verified one — the health record would count findings the
     // tree was never asked about.

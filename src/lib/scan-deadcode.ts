@@ -265,8 +265,14 @@ function maskComments(text: string, syntax: CommentSyntax): string[] {
   });
 }
 
-/** Word characters as `git grep -w` counts them, so this reads a hit the way grep found it. */
-const WORD_CHAR = /[0-9A-Za-z_]/;
+/**
+ * Word characters as `git grep -w` counts them, plus the two grep breaks a word on that a
+ * JavaScript identifier is spelled with: `$mount`, `mount$` and `this.#mount` are names of their
+ * own, not the symbol `mount`. Reading grep's boundaries literally makes any of them a caller and
+ * deletes a true finding; counting them as word characters can only leave standing a signal anton
+ * failed to disprove, which is the direction this filter errs in everywhere else.
+ */
+const WORD_CHAR = /[0-9A-Za-z_$#]/;
 
 /** Whether the line still writes the symbol as a whole word once its comments are blanked out. */
 function referencesWord(line: string | undefined, symbol: string): boolean {
