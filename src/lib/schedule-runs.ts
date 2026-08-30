@@ -40,6 +40,20 @@ export interface ScheduleLastRun {
 /** Statuses a fire can have ENDED in. A queued/running job has no outcome to report yet. */
 const SETTLED = ["done", "parked", "failed", "cancelled"] as const;
 
+/** Statuses a fire is still IN. `running` means a worker holds the lease; `queued` means nobody does. */
+const PENDING = ["queued", "running"] as const;
+
+/**
+ * Where an unsettled fire actually is (anton-znoz). `running` = leased, a handler is executing;
+ * `queued` = enqueued and nothing has picked it up.
+ *
+ * The distinction is the only thing that separates a paused fire from a live one, and the enabled
+ * flag cannot stand in for it: the runner gates the CLAIM on the schedule's switch (jobs/runner.ts),
+ * so disabling leaves a queued job waiting unleased while an already-leased handler runs to
+ * completion regardless of the switch.
+ */
+export type SchedulePendingStatus = (typeof PENDING)[number];
+
 /** Keep an error legible in a table cell: its first line, clipped. */
 const NOTE_MAX = 90;
 
@@ -116,6 +130,37 @@ export async function lastRunsBySchedule(
   for (const row of rows) {
     if (!row.scheduleId) continue;
     byId[row.scheduleId] = toScheduleLastRun(row);
+  }
+  return byId;
+}
+
+/**
+ * The unsettled fire per schedule, for one project, keyed by schedule id.
+ *
+ * Grouped rather than listed because only the strongest status matters: with both a leased and a
+ * waiting job behind one schedule, work IS running, and reporting the queued one would understate
+ * it. Schedules with nothing in flight are simply absent.
+ */
+export async function pendingRunsBySchedule(
+  projectId: string,
+): Promise<Record<string, SchedulePendingStatus>> {
+  const rows = await getDb()
+    .select({ scheduleId: SCHEDULE_ID, status: schema.jobs.status })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.projectId, projectId),
+        inArray(schema.jobs.status, [...PENDING]),
+        sql`${SCHEDULE_ID} is not null`,
+      ),
+    )
+    .groupBy(SCHEDULE_ID, schema.jobs.status);
+
+  const byId: Record<string, SchedulePendingStatus> = {};
+  for (const row of rows) {
+    if (!row.scheduleId) continue;
+    if (row.status === "running") byId[row.scheduleId] = "running";
+    else byId[row.scheduleId] ??= "queued";
   }
   return byId;
 }

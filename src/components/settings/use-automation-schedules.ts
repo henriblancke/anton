@@ -88,7 +88,8 @@ export function useAutomationSchedules({
 /**
  * Keep the open Automation panel's next-run and last-run times live (anton-ue90).
  *
- * Only the SERVER-OWNED fields are taken from the poll — the two times and the last fire's outcome.
+ * Only the SERVER-OWNED fields are taken from the poll — the two times, the last fire's outcome and
+ * where an unsettled fire sits.
  * Cadence and enabled state are owned by this page's optimistic writes, and letting a poll land on
  * them would let a response that left the server before an edit arrive after it and quietly put the
  * old cadence back on screen — while the editor's own draft, seeded once from the `cron` prop, kept
@@ -153,6 +154,7 @@ function seedRows(schedules: AutomationSchedule[], defaultCrons: Record<string, 
           nextRunAt: row?.nextRunAt,
           lastRunAt: row?.lastRunAt,
           lastRun: row?.lastRun,
+          pendingRun: row?.pendingRun,
         },
       ];
     }),
@@ -205,6 +207,9 @@ function withTimes(state: ScheduleState, rows: AutomationSchedule[]): ScheduleSt
         nextRunAt: row.nextRunAt,
         lastRunAt: row.lastRunAt,
         lastRun: row.lastRun,
+        // Assigned, never spread-preserved: a fire that has since settled leaves no pending row, and
+        // keeping the previous value would leave the cell claiming work is still in flight.
+        pendingRun: row.pendingRun,
       };
   }
   return next;

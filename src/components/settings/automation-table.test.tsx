@@ -334,7 +334,39 @@ describe("the automation rows", () => {
   // Disabling a schedule leaves an already enqueued job queued and unleased (jobs/runner.ts) while
   // preserving `lastRunAt`, so the unsettled reading would otherwise claim a handler is running for
   // as long as the automation stays off.
-  it("calls an unsettled fire held, not in progress, while the automation is off", () => {
+  it("calls an unleased fire held, not in progress, while the automation is off", () => {
+    renderTable({
+      "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120, pendingRun: "queued" },
+    });
+
+    expect(screen.getByText("held · automation off")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // The other half of the same fact: the runner gates the CLAIM on the switch, never the handler, so
+  // a job leased before the switch went off runs to completion. Calling that held would tell an
+  // operator nothing is happening while a session is mid-flight.
+  it("keeps an already-leased fire in progress after the automation is switched off", () => {
+    renderTable({
+      "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120, pendingRun: "running" },
+    });
+
+    expect(screen.getByText("in progress")).toBeTruthy();
+    expect(screen.queryByText(/held/)).toBeNull();
+  });
+
+  // An armed schedule whose fire nothing has picked up yet is waiting on a worker, not working.
+  it("calls an unleased fire queued while the automation is on", () => {
+    renderTable({
+      "run-health": { enabled: true, lastRunAt: NOW_SEC() - 120, pendingRun: "queued" },
+    });
+
+    expect(screen.getByText("queued")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // With no pending job to read — a poll that has not landed yet — the switch is all there is.
+  it("falls back to the switch when the fire's own status is unknown", () => {
     renderTable({ "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120 } });
 
     expect(screen.getByText("held · automation off")).toBeTruthy();
@@ -345,6 +377,7 @@ describe("the automation rows", () => {
     renderTable({
       "nightly-stringer": {
         enabled: false,
+        pendingRun: "queued",
         lastRunAt: NOW_SEC() - 120,
         lastRun: {
           outcome: "ok",

@@ -12,7 +12,12 @@ import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
-import { lastRunsBySchedule, type ScheduleLastRun } from "./schedule-runs";
+import {
+  lastRunsBySchedule,
+  pendingRunsBySchedule,
+  type ScheduleLastRun,
+  type SchedulePendingStatus,
+} from "./schedule-runs";
 
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
@@ -43,6 +48,12 @@ export interface ScheduleSummary {
    * from every write path that only touches the row itself. `lastRunAt` says when; this says what.
    */
   lastRun?: ScheduleLastRun;
+  /**
+   * Where this schedule's still-unsettled fire is (anton-znoz) — absent when nothing is in flight.
+   * The switch cannot answer that: the runner gates only the claim, so a disabled schedule can hold
+   * a queued job AND a leased one that is still executing.
+   */
+  pendingRun?: SchedulePendingStatus;
 }
 
 function secDate(ms: number): Date {
@@ -147,19 +158,27 @@ export async function updateSchedule(
 
 /**
  * All schedules for a project (UI read path via shared anton.db), each carrying how its last fire
- * ended. The outcome is joined here rather than left to the caller so every path that renders a
- * schedule — the settings page's server render, the panel's poll, a PATCH response — shows the same
- * row; a patch that answered without it would blank the outcome column on every toggle.
+ * ended and where an unsettled one currently sits. Both are joined here rather than left to the
+ * caller so every path that renders a schedule — the settings page's server render, the panel's
+ * poll, a PATCH response — shows the same row; a patch that answered without them would blank the
+ * outcome column on every toggle, and a toggle is exactly when the pending fire's status decides
+ * whether the row reads as running or held.
  */
 export async function listSchedules(projectId: string): Promise<ScheduleSummary[]> {
-  const [rows, lastRuns] = await Promise.all([
+  const [rows, lastRuns, pendingRuns] = await Promise.all([
     getDb().select().from(schema.schedules).where(eq(schema.schedules.projectId, projectId)),
     lastRunsBySchedule(projectId),
+    pendingRunsBySchedule(projectId),
   ]);
   return rows.map((row) => {
     const summary = toScheduleSummary(row);
     const lastRun = lastRuns[row.id];
-    return lastRun ? { ...summary, lastRun } : summary;
+    const pendingRun = pendingRuns[row.id];
+    return {
+      ...summary,
+      ...(lastRun ? { lastRun } : {}),
+      ...(pendingRun ? { pendingRun } : {}),
+    };
   });
 }
 

@@ -26,6 +26,13 @@ export interface ScheduleLastRun {
   note?: string;
 }
 
+/**
+ * Where a still-unsettled fire sits, mirrored from the server's `SchedulePendingStatus`
+ * (lib/schedule-runs.ts). `running` = a worker holds the lease and a handler is executing;
+ * `queued` = enqueued and nothing has picked it up.
+ */
+export type SchedulePendingStatus = "queued" | "running";
+
 /** One automation's live schedule state. `enabled: null` = this project has no row for it yet. */
 export interface AutomationScheduleState {
   enabled: boolean | null;
@@ -37,6 +44,8 @@ export interface AutomationScheduleState {
   lastRunAt?: number;
   /** How that fire ended. Absent until a job this schedule enqueued has settled. */
   lastRun?: ScheduleLastRun;
+  /** Where the unsettled fire sits, if there is one. Absent when nothing is in flight. */
+  pendingRun?: SchedulePendingStatus;
 }
 
 /**
@@ -61,9 +70,9 @@ const OUTCOME_STYLES: Record<ScheduleRunOutcome, { dot: string; label: string; t
 const IN_FLIGHT_STYLE = { dot: "bg-stage-implementing", text: "text-muted-foreground" };
 
 /**
- * A fire enqueued before the switch went off. The runner leaves jobs for a disabled schedule queued
- * and unleased (jobs/runner.ts), so nothing is running — grey, like the row's own off dot, because
- * this is the state the operator chose and not one to chase.
+ * A fire enqueued before the switch went off and never leased. The runner leaves jobs for a disabled
+ * schedule queued and unleased (jobs/runner.ts), so nothing is running — grey, like the row's own
+ * off dot, because this is the state the operator chose and not one to chase.
  */
 const HELD_STYLE = { dot: "bg-stage-backlog", text: "text-subtle" };
 
@@ -339,10 +348,15 @@ function AutomationTableRow({
  * older result to date, and still says it is in flight — otherwise the automation's very first
  * execution is indistinguishable from a bare timestamp with nothing behind it.
  *
- * An unsettled fire is only IN FLIGHT while the switch is on. Disabling a schedule leaves an already
- * enqueued job queued and unleased (jobs/runner.ts) while preserving `lastRunAt`, so an off row
- * would otherwise claim a handler is running for as long as the automation stays off. It says it is
- * held instead — waiting on the switch, not on a worker.
+ * What an unsettled fire is DOING is read from the job, not from the switch. The runner gates the
+ * CLAIM on the schedule's enabled flag (jobs/runner.ts): disabling leaves an unleased job queued
+ * while `lastRunAt` stays stamped — so the switch alone would have an off row claim a handler is
+ * running for as long as the automation stays off — but it never aborts a handler that already
+ * holds the lease, so the switch alone would equally call a live run "held". `pendingRun` is the
+ * fact that separates them: leased is in progress whatever the switch says, unleased under an off
+ * switch is held, and unleased under an on switch is queued and waiting for a worker. With no
+ * pending job to read (a poll that hasn't landed yet) the switch is all there is, and decides as
+ * before.
  */
 function LastRunCell({
   state,
@@ -358,8 +372,13 @@ function LastRunCell({
   const previous = state.lastRun;
   const settled = previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
   const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
-  const pending = on ? "in progress" : "held · automation off";
-  const pendingStyle = on ? IN_FLIGHT_STYLE : HELD_STYLE;
+  const held = state.pendingRun !== "running" && !on;
+  const pending = held
+    ? "held · automation off"
+    : state.pendingRun === "queued"
+      ? "queued"
+      : "in progress";
+  const pendingStyle = held ? HELD_STYLE : IN_FLIGHT_STYLE;
 
   const detail = settled
     ? (previous.note ?? style?.label)

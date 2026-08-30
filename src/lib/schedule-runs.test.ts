@@ -283,4 +283,107 @@ describe("listSchedules carries the last fire's outcome", () => {
     });
     expect(byType["gardener"].lastRun).toBeUndefined();
   });
+
+  // The switch cannot say whether a disabled schedule's fire is paused or still executing — the
+  // runner gates the claim, not the handler — so the read path has to carry the job's own status.
+  it("hands the UI read path where an unsettled fire actually sits", async () => {
+    await getDb()
+      .insert(schema.projects)
+      .values({ id: "p-live", slug: "live", name: "live", repoPath: "/tmp/live" });
+    await getDb().insert(schema.schedules).values([
+      // Switched off with its fire already leased: the handler runs on regardless.
+      {
+        id: "sched-leased",
+        projectId: "p-live",
+        type: "gate-check",
+        cron: "*/10 * * * *",
+        enabled: false,
+        lastRunAt: new Date((NOW - 120) * 1000),
+      },
+      { id: "sched-quiet", projectId: "p-live", type: "gardener", cron: "0 5 * * *", enabled: true },
+    ]);
+    await getDb()
+      .insert(schema.jobs)
+      .values({
+        id: "job-live",
+        type: "gate-check",
+        projectId: "p-live",
+        payloadJson: JSON.stringify({ projectId: "p-live", scheduleId: "sched-leased" }),
+        status: "running",
+        runAt: new Date((NOW - 120) * 1000),
+        createdAt: new Date((NOW - 120) * 1000),
+        updatedAt: new Date((NOW - 120) * 1000),
+      });
+
+    const byType = Object.fromEntries((await listSchedules("p-live")).map((s) => [s.type, s]));
+    expect(byType["gate-check"].pendingRun).toBe("running");
+    expect(byType["gardener"].pendingRun).toBeUndefined();
+  });
+});
+
+/**
+ * Where an unsettled fire sits (anton-znoz). The Automation table reads "in progress" off this and
+ * not off the enabled flag: the runner gates only the CLAIM on that flag, so an off schedule can
+ * hold a queued job that nothing is running AND a leased job that very much is.
+ */
+describe("pendingRunsBySchedule", () => {
+  const PENDING_PROJECT = "p-pending";
+  let seq = 0;
+
+  async function pendingJob(over: { scheduleId?: string; status: string; projectId?: string }) {
+    const id = `pj-${(seq += 1)}`;
+    const projectId = over.projectId ?? PENDING_PROJECT;
+    await getDb()
+      .insert(schema.jobs)
+      .values({
+        id,
+        type: "gate-check",
+        projectId,
+        payloadJson: JSON.stringify(
+          over.scheduleId ? { projectId, scheduleId: over.scheduleId } : { projectId },
+        ),
+        status: over.status,
+        runAt: new Date(NOW * 1000),
+        createdAt: new Date(NOW * 1000),
+        updatedAt: new Date(NOW * 1000),
+      });
+    return id;
+  }
+
+  beforeAll(async () => {
+    await getDb()
+      .insert(schema.projects)
+      .values({ id: PENDING_PROJECT, slug: "pending", name: "pending", repoPath: "/tmp/pending" });
+  });
+
+  it("reports the leased fire, the waiting one, and nothing for a settled schedule", async () => {
+    await pendingJob({ scheduleId: "p-running", status: "running" });
+    await pendingJob({ scheduleId: "p-queued", status: "queued" });
+    await pendingJob({ scheduleId: "p-settled", status: "done" });
+    // A job no schedule fired (execute-epic and friends) belongs to no row here.
+    await pendingJob({ status: "running" });
+
+    const byId = await runs.pendingRunsBySchedule(PENDING_PROJECT);
+    expect(byId).toEqual({ "p-running": "running", "p-queued": "queued" });
+  });
+
+  // With both behind one schedule, work IS running; answering "queued" would understate it and let
+  // the UI call a live handler held.
+  it("lets a leased fire outrank a queued one on the same schedule", async () => {
+    await pendingJob({ scheduleId: "p-both", status: "queued" });
+    await pendingJob({ scheduleId: "p-both", status: "running" });
+    await pendingJob({ scheduleId: "p-both", status: "queued" });
+
+    expect((await runs.pendingRunsBySchedule(PENDING_PROJECT))["p-both"]).toBe("running");
+  });
+
+  it("is scoped to one project", async () => {
+    await getDb()
+      .insert(schema.projects)
+      .values({ id: "p-elsewhere", slug: "elsewhere", name: "elsewhere", repoPath: "/tmp/elsewhere" });
+    await pendingJob({ scheduleId: "p-far", status: "running", projectId: "p-elsewhere" });
+
+    expect(await runs.pendingRunsBySchedule(PENDING_PROJECT)).not.toHaveProperty("p-far");
+    expect(Object.keys(await runs.pendingRunsBySchedule("p-elsewhere"))).toEqual(["p-far"]);
+  });
 });
