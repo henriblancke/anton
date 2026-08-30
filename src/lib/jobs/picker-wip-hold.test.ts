@@ -12,6 +12,7 @@ import * as schema from "../db/schema";
 import { LABELS } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import type { PrActivity } from "../git/pr";
+import { describeWipHold } from "../autopilot-wip";
 import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
 
 const PROJECT = "p1";
@@ -217,6 +218,25 @@ describe("checkWipLimit", () => {
 
     expect(hold).toBeDefined();
     expect(readPrActivity.calls.length).toBeLessThanOrEqual(4);
+    // …and the count it reports is the sample's, flagged as the lower bound it is: ten candidates
+    // were never read, and telling the operator four PRs are waiting would be wrong by ten.
+    expect(hold?.truncated).toBe(true);
+    expect(describeWipHold(hold!)).toMatch(/^at least 4 open PRs are waiting on review/);
+  });
+
+  it("does not flag truncation when every candidate was confirmed", async () => {
+    await project();
+    const board = [inReview("anton-a", 11), inReview("anton-b", 12), inReview("anton-c", 13)];
+
+    const hold = await checkWipLimit(t.db, {
+      projectId: PROJECT,
+      repoPath: REPO,
+      board,
+      readPrActivity: reader(),
+    });
+
+    expect(hold?.truncated).toBeUndefined();
+    expect(describeWipHold(hold!)).toMatch(/^3 open PRs are waiting on review/);
   });
 
   it("keeps reading past a merged PR until the limit is confirmed", async () => {

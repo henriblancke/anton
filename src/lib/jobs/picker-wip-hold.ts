@@ -98,14 +98,18 @@ const PR_READ_CONCURRENCY = 4;
  * five or fifty PRs are waiting — so a backlog costs the same handful of reads a full queue does.
  * The batch that reaches the limit is finished rather than abandoned, so an over-limit queue can
  * still report more slots than the limit, which `describeWipHold` is worded for.
+ *
+ * `truncated` is the price of that bound: candidates left unread are PRs that may well still be
+ * waiting, so the slots are a lower bound on the queue and the hold has to be described as one.
  */
 async function confirmSlots(
   read: ReadPrActivity,
   input: WipHoldInput,
   candidates: readonly { bead: Bead; prNumber: number }[],
   limit: number,
-): Promise<ReviewSlot[]> {
+): Promise<{ slots: ReviewSlot[]; truncated: boolean }> {
   const slots: ReviewSlot[] = [];
+  let confirmed = 0;
   for (let i = 0; i < candidates.length && slots.length < limit; i += PR_READ_CONCURRENCY) {
     const batch = await Promise.all(
       candidates
@@ -114,9 +118,10 @@ async function confirmSlots(
           (await occupiesQueue(read, input, prNumber)) ? { beadId: bead.id, prNumber } : undefined,
         ),
     );
+    confirmed = Math.min(i + PR_READ_CONCURRENCY, candidates.length);
     slots.push(...batch.filter((slot) => slot !== undefined));
   }
-  return slots;
+  return { slots, truncated: confirmed < candidates.length };
 }
 
 /**
@@ -139,7 +144,8 @@ export async function checkWipLimit(
   if (candidates.length < config.limit) return undefined;
 
   const read = input.readPrActivity ?? getPrActivity;
-  return detectWipHold(await confirmSlots(read, input, candidates, config.limit), config);
+  const { slots, truncated } = await confirmSlots(read, input, candidates, config.limit);
+  return detectWipHold(slots, config, truncated);
 }
 
 /**

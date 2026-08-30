@@ -30,6 +30,11 @@ describe("detectWipHold", () => {
     expect(detectWipHold(slots(5), { limit: 3 })?.slots).toHaveLength(5);
   });
 
+  it("carries the caller's truncation, so a bounded sample is never read as a total", () => {
+    expect(detectWipHold(slots(3), { limit: 3 }, true)?.truncated).toBe(true);
+    expect(detectWipHold(slots(3), { limit: 3 })?.truncated).toBeUndefined();
+  });
+
   it("never holds an empty review queue, whatever the limit", () => {
     expect(detectWipHold([], { limit: 1 })).toBeUndefined();
   });
@@ -67,6 +72,14 @@ describe("describeWipHold", () => {
     // "4 of 3" would read as a bug in anton rather than as the count it is.
     expect(describeWipHold(detectWipHold(slots(4), { limit: 3 })!)).toBe(
       "4 open PRs are waiting on review — this project pauses new work at 3 (#100, #101, #102, #103)",
+    );
+  });
+
+  it("says AT LEAST when the sample stopped short of the whole queue", () => {
+    // The confirmation stops at the limit, so a fourteen-PR backlog arrives here as four slots.
+    // Naming four would misdescribe the operator's own queue back to them.
+    expect(describeWipHold(detectWipHold(slots(4), { limit: 3 }, true)!)).toBe(
+      "at least 4 open PRs are waiting on review — this project pauses new work at 3 (#100, #101, #102, #103)",
     );
   });
 

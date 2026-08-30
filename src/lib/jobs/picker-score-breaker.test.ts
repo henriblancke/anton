@@ -8,7 +8,7 @@
  * an earlier attempt on the same target scored (which would judge a run on a review it never had,
  * and re-latch a disarm the operator had already overruled).
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { activeDisarm, disarmAutopilot, reArmAutopilot } from "../autopilot-disarm";
@@ -137,6 +137,53 @@ describe("checkScoreSlide", () => {
     await run({ id: "r3", epic: "anton-a", atMinutes: 30, score: 3 });
 
     expect(await checkScoreSlide(t.db, clock, { projectId: PROJECT })).toBeUndefined();
+  });
+
+  it("pages past one target's repeat attempts to reach the rest of the window", async () => {
+    // Two heavily retried targets can fill any fixed read on their own — twenty rows, two entries.
+    // Stopping there would report the series as short and let a third low-scoring delivery, sitting
+    // one row further back, go unread on every pass.
+    await project();
+    await run({ id: "r-c", epic: "anton-c", atMinutes: 0, score: 4 });
+    for (let i = 0; i < 10; i++) {
+      await run({ id: `r-b${i}`, epic: "anton-b", atMinutes: 1 + i, status: "failed", score: 5 });
+    }
+    for (let i = 0; i < 10; i++) {
+      await run({ id: `r-a${i}`, epic: "anton-a", atMinutes: 11 + i, status: "failed", score: 6 });
+    }
+
+    const outcome = await checkScoreSlide(t.db, clock, { projectId: PROJECT });
+
+    expect(outcome?.latched).toBe(true);
+    expect(outcome?.slide.runs.map((r) => r.targetBeadId)).toEqual([
+      "anton-c",
+      "anton-b",
+      "anton-a",
+    ]);
+    expect((await activeDisarm(t.db, PROJECT))?.detail).toBe(
+      "3 consecutive runs scored below 7/10 (4, 5, 6)",
+    );
+  });
+
+  it("stops paging at the re-arm instead of walking the whole run history", async () => {
+    // Every score this project has was already overruled. The read must reach the fence and stop —
+    // paging on would cost the whole table, every ten minutes, to learn nothing.
+    await project();
+    await threeLowRuns();
+    await checkScoreSlide(t.db, clock, { projectId: PROJECT });
+    await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
+    for (let i = 0; i < 60; i++) {
+      await run({ id: `old-${i}`, epic: `anton-old-${i}`, atMinutes: -100 + i, score: 2 });
+    }
+
+    const selects = vi.spyOn(t.db, "select");
+    expect(await checkScoreSlide(t.db, clock, { projectId: PROJECT })).toBeUndefined();
+    const reads = selects.mock.calls.length;
+    selects.mockRestore();
+
+    expect(await activeDisarm(t.db, PROJECT)).toBeUndefined();
+    // ONE page of runs, not four — plus the disarm, settings and re-arm lookups every pass makes.
+    expect(reads).toBeLessThanOrEqual(5);
   });
 
   it("skips runs still in flight rather than reading them as gaps", async () => {

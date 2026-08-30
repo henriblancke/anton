@@ -41,11 +41,15 @@ import { listRecentRunOutcomes } from "../runs";
 import type { AntonDb, Clock } from "./queue";
 
 /**
- * How far back the breaker looks, at minimum. Wider than any sane window so that the runs it skips —
- * the ones still in flight, and the repeat attempts collapsed onto one target — cannot push the
- * oldest member of the series out of the read and silently shorten it.
+ * How many run rows one page of the series read costs.
+ *
+ * The read is PAGED rather than sized once, because how many rows a window costs is not knowable
+ * before reading them: the series skips runs still in flight and collapses a target's repeat
+ * attempts onto one entry, so a project retrying two targets ten times each fills any fixed read
+ * with two entries and reports the series as short — failing open on evidence that is sitting one
+ * row further back.
  */
-const MIN_SCORE_WINDOW = 20;
+const SCORE_PAGE = 20;
 
 export interface ScoreBreakerInput {
   projectId: string;
@@ -98,6 +102,10 @@ export async function checkScoreSlide(
 /**
  * The project's finished runs with each one's own score attached, newest first — nothing from before
  * `reArmedAt`, whose scores the operator already read and overruled.
+ *
+ * Pages back until the window is full, the history runs out, or the read reaches past the re-arm.
+ * That last stop is what keeps the paging bounded: without it, a project whose overruled scores are
+ * the only ones it has would walk its whole runs table on every ten-minute pass to learn nothing.
  */
 async function readScoreSeries(
   db: AntonDb,
@@ -105,22 +113,37 @@ async function readScoreSeries(
   window: number,
   reArmedAt: number | undefined,
 ): Promise<ScoredRun[]> {
-  const read = await listRecentRunOutcomes(db, projectId, Math.max(MIN_SCORE_WINDOW, window * 3));
-  // Filtered after the read, never before it: the floor only ever drops the OLDEST rows, so the
-  // window still holds the newest `window` runs it was sized to hold.
-  const runs = read.filter((run) => settledAfterReArm(run, reArmedAt));
+  const series: ScoredRun[] = [];
   const seen = new Set<string>();
-  return runs.flatMap((run): ScoredRun[] => {
-    // A queued or running run has not been reviewed yet. Skipped rather than counted as a gap: it
-    // is not evidence the series is broken, only that it has not happened.
-    if (run.status === "queued" || run.status === "running") return [];
-    // One entry per TARGET, and it is the target's NEWEST attempt: a feature retried three times is
-    // one piece of work being judged, and counting each attempt would let a single bad review fill
-    // the window on its own. When that newest attempt left no score, the target reads as a gap —
-    // which is the honest answer, not a licence to reach back to what an older attempt scored.
-    if (seen.has(run.epicBeadId)) return [];
-    seen.add(run.epicBeadId);
-    const score = run.reviewScore;
-    return [{ id: run.id, targetBeadId: run.epicBeadId, ...(score !== undefined ? { score } : {}) }];
-  });
+  for (let offset = 0; series.length < window; offset += SCORE_PAGE) {
+    const page = await listRecentRunOutcomes(db, projectId, SCORE_PAGE, offset);
+    for (const run of page) {
+      // Filtered per row, not per page: the floor only ever drops the OLDEST rows, so dropping one
+      // costs the series nothing the next page cannot supply.
+      if (!settledAfterReArm(run, reArmedAt)) continue;
+      // A queued or running run has not been reviewed yet. Skipped rather than counted as a gap: it
+      // is not evidence the series is broken, only that it has not happened.
+      if (run.status === "queued" || run.status === "running") continue;
+      // One entry per TARGET, and it is the target's NEWEST attempt: a feature retried three times
+      // is one piece of work being judged, and counting each attempt would let a single bad review
+      // fill the window on its own. When that newest attempt left no score, the target reads as a
+      // gap — which is the honest answer, not a licence to reach back to what an older attempt
+      // scored.
+      if (seen.has(run.epicBeadId)) continue;
+      seen.add(run.epicBeadId);
+      const score = run.reviewScore;
+      series.push({
+        id: run.id,
+        targetBeadId: run.epicBeadId,
+        ...(score !== undefined ? { score } : {}),
+      });
+      if (series.length === window) break;
+    }
+    const oldest = page.at(-1);
+    if (page.length < SCORE_PAGE || oldest === undefined) break;
+    // `updatedAt` — not the fence's own `endedAt ?? updatedAt` — is what the page order is on, so
+    // it is the only value that proves every row BEHIND this one is also pre-re-arm.
+    if (reArmedAt !== undefined && oldest.updatedAt <= reArmedAt) break;
+  }
+  return series;
 }

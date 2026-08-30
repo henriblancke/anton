@@ -39,6 +39,12 @@ export interface WipHold {
   limit: number;
   /** The PRs holding the queue, by PR number ascending — a stable order for the detail line. */
   slots: ReviewSlot[];
+  /**
+   * Were there candidates the caller stopped short of confirming? A hold is a hold at the limit, so
+   * the confirmation stops there (see `picker-wip-hold.ts`) — which makes `slots` a LOWER BOUND on
+   * the queue, and the copy has to say so rather than name a count it did not finish counting.
+   */
+  truncated?: boolean;
 }
 
 /**
@@ -49,10 +55,15 @@ export interface WipHold {
 export function detectWipHold(
   slots: readonly ReviewSlot[],
   config: WipLimitConfig | undefined,
+  truncated = false,
 ): WipHold | undefined {
   if (!config || config.limit <= 0) return undefined;
   if (slots.length < config.limit) return undefined;
-  return { limit: config.limit, slots: [...slots].sort((a, b) => a.prNumber - b.prNumber) };
+  return {
+    limit: config.limit,
+    slots: [...slots].sort((a, b) => a.prNumber - b.prNumber),
+    ...(truncated ? { truncated: true } : {}),
+  };
 }
 
 /**
@@ -62,11 +73,16 @@ export function detectWipHold(
  * still reads correctly when the queue is OVER the limit: a merge gate that resolves slower than
  * runs finish can leave more PRs open than the limit, and "4 of 3" would read as a bug in anton
  * rather than as the count it is.
+ *
+ * A truncated count reads as "at least 4", because the operator with a fourteen-PR backlog is
+ * exactly the one this brake exists for — telling them four PRs are waiting, off a sample that
+ * stopped at four, would misdescribe their own queue back to them.
  */
 export function describeWipHold(hold: WipHold): string {
   const n = hold.slots.length;
   const prs = hold.slots.map((slot) => `#${slot.prNumber}`).join(", ");
-  return `${n} open PR${n === 1 ? " is" : "s are"} waiting on review — this project pauses new work at ${hold.limit} (${prs})`;
+  const count = hold.truncated ? `at least ${n}` : `${n}`;
+  return `${count} open PR${n === 1 ? " is" : "s are"} waiting on review — this project pauses new work at ${hold.limit} (${prs})`;
 }
 
 /** The hold as every surface reads it (`autopilot-breaker.ts` owns the rest of the copy). */

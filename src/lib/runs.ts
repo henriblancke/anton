@@ -303,6 +303,7 @@ function recentRunRows(
   db: AntonDb,
   projectId: string,
   limit: number,
+  offset = 0,
 ): Promise<(typeof schema.runs.$inferSelect)[]> {
   return db
     .select()
@@ -314,7 +315,8 @@ function recentRunRows(
       desc(schema.runs.startedAt),
       sql`rowid desc`,
     )
-    .limit(limit);
+    .limit(limit)
+    .offset(offset);
 }
 
 /**
@@ -323,13 +325,18 @@ function recentRunRows(
  * compares failures BY their message — that is how it tells one broken environment from several hard
  * tickets — and the score-regression one judges each attempt on the score that attempt earned.
  * db-injectable and read-only, like its sibling.
+ *
+ * `offset` pages further back in that same total order. The score breaker needs it because it
+ * collapses a target's repeat attempts onto one entry, so how many ROWS its window costs is not
+ * knowable before the read (see `jobs/picker-score-breaker.ts`).
  */
 export async function listRecentRunOutcomes(
   db: AntonDb,
   projectId: string,
   limit: number,
+  offset = 0,
 ): Promise<RunDetail[]> {
-  return (await recentRunRows(db, projectId, limit)).map(toDetail);
+  return (await recentRunRows(db, projectId, limit, offset)).map(toDetail);
 }
 
 /**
