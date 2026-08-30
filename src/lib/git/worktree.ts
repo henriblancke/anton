@@ -77,6 +77,40 @@ export function sanitizeBranch(branch: string): string {
 }
 
 /**
+ * Serialize whatever touches ONE branch's checkout — creating it, and the reaper's check-and-delete.
+ * Without it the two interleave: the sweep proves a branch is residue, a run starts and checks that
+ * very branch out, and the sweep then force-removes the fresh checkout with its uncommitted work.
+ * Under the lock the sweep's last-moment re-read either SEES the starting run, or the run waits for
+ * the removal and recreates what it needs.
+ *
+ * Per branch, so unrelated runs and sweeps still overlap, and in-process only: anton's runs and its
+ * sweeps share one job runner, which is the whole population racing here. A second anton over the
+ * same repo is still held off by git's own worktree locks and by that same re-read.
+ */
+const branchLocks = new Map<string, Promise<void>>();
+
+export async function withBranchLock<T>(
+  repoPath: string,
+  branch: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = `${resolve(repoPath)}\u0000${branch}`;
+  const prior = branchLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolveHeld) => (release = resolveHeld));
+  const chain = prior.then(() => held);
+  branchLocks.set(key, chain);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    // Nobody queued behind us, so the key is dropped: the map tracks live contention, not history.
+    if (branchLocks.get(key) === chain) branchLocks.delete(key);
+  }
+}
+
+/**
  * Create (or reuse) an isolated worktree + branch off `baseBranch` (default: the repo's current
  * HEAD branch). Idempotent: if a worktree for `branch` already exists it is returned as-is
  * (supports crash recovery / resumable runs). `warm: true` runs project setup (deps install — see
@@ -92,32 +126,34 @@ export async function createWorktree(opts: {
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
-  const existing = await findWorktree(repoPath, branch);
-  // A registration can outlive its checkout: `git worktree list` reports an administrative record,
-  // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
-  // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
-  // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
-  if (existing && existsSync(existing.path)) {
-    if (warm) await warmWorktree(existing, signal);
-    return existing;
-  }
-  // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
-  if (existing) await forgetStaleWorktree(repoPath, existing.path);
+  // Only the registration is serialized against the reaper (see withBranchLock) — warming stays
+  // outside it. A cold install runs for minutes, and by the time it starts the checkout exists and
+  // the run row already names the branch, which is what the sweep re-reads before deleting anything.
+  const wt = await withBranchLock(repoPath, branch, async (): Promise<Worktree> => {
+    const existing = await findWorktree(repoPath, branch);
+    // A registration can outlive its checkout: `git worktree list` reports an administrative record,
+    // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
+    // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
+    // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
+    if (existing && existsSync(existing.path)) return existing;
+    // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
+    if (existing) await forgetStaleWorktree(repoPath, existing.path);
 
-  const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
-  const path = worktreePathFor(repoPath, branch);
-  await mkdir(dirname(path), { recursive: true });
+    const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
+    const path = worktreePathFor(repoPath, branch);
+    await mkdir(dirname(path), { recursive: true });
 
-  if (await branchExists(repoPath, branch)) {
-    await git(repoPath, ["worktree", "add", path, branch]);
-  } else {
-    await git(repoPath, ["worktree", "add", path, "-b", branch, baseBranch]);
-  }
+    if (await branchExists(repoPath, branch)) {
+      await git(repoPath, ["worktree", "add", path, branch]);
+    } else {
+      await git(repoPath, ["worktree", "add", path, "-b", branch, baseBranch]);
+    }
 
-  // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
-  // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
-  const resolvedPath = await realpath(path);
-  const wt: Worktree = { path: resolvedPath, branch, baseBranch, repoPath };
+    // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
+    // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
+    return { path: await realpath(path), branch, baseBranch, repoPath };
+  });
+
   if (warm) await warmWorktree(wt, signal);
   return wt;
 }
@@ -389,7 +425,10 @@ async function lockedInAdminDir(wt: Worktree): Promise<boolean | undefined> {
   try {
     const marker = await readFile(join(wt.path, ".git"), "utf8");
     const gitDir = marker.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
-    return gitDir ? existsSync(join(resolve(gitDir), "locked")) : undefined;
+    // Resolved against the CHECKOUT, not the process cwd: git writes an absolute gitdir today, but a
+    // relative one (an older git, a moved repo) would otherwise be looked up under wherever anton
+    // happens to be running — and a lock that can't be found reads as "not locked".
+    return gitDir ? existsSync(join(resolve(wt.path, gitDir.trim()), "locked")) : undefined;
   } catch {
     return undefined;
   }
@@ -448,7 +487,7 @@ export async function removeWorktree(
         const gitFile = await readFile(join(wt.path, ".git"), "utf8");
         const adminRoot = resolve(wt.repoPath, ".git", "worktrees") + sep;
         const gitDir = gitFile.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
-        if (gitDir && resolve(gitDir).startsWith(adminRoot)) {
+        if (gitDir && resolve(wt.path, gitDir.trim()).startsWith(adminRoot)) {
           await rm(wt.path, { recursive: true, force: true });
         }
       } catch {

@@ -18,7 +18,13 @@ import {
   releaseRunWorktree,
   type ReapCandidate,
 } from "./worktree-reaper";
-import { createWorktree, listBranches, listWorktrees, WORKTREES_ROOT_ENV } from "./worktree";
+import {
+  createWorktree,
+  listBranches,
+  listWorktrees,
+  withBranchLock,
+  WORKTREES_ROOT_ENV,
+} from "./worktree";
 
 function candidate(over: Partial<ReapCandidate> = {}): ReapCandidate {
   return { branch: "anton/anton-0oi", beadId: "anton-0oi", runLive: false, bead: "settled", ...over };
@@ -294,6 +300,64 @@ suite("the sweep over real residue (real git)", () => {
       execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt.path]);
       execFileSync("git", ["-C", repo, "branch", "-D", wt.branch]);
     }
+  });
+
+  it("stops on an aborted job instead of running the remaining deletions", async () => {
+    const first = await createWorktree({ repoPath: repo, branch: "anton/anton-stop1" });
+    const second = await createWorktree({ repoPath: repo, branch: "anton/anton-stop2" });
+    const candidates = [first, second].map((wt) => ({
+      branch: wt.branch,
+      path: wt.path,
+      beadId: wt.branch.slice("anton/".length),
+      runLive: false,
+      bead: "settled" as const,
+    }));
+    const controller = new AbortController();
+
+    try {
+      const report = await reapWorktrees({
+        repoPath: repo,
+        candidates,
+        // The operator's cancel (or the no-progress timeout) lands while the SECOND candidate's `gh`
+        // lookup is in flight: the first candidate is already reaped and reported, and the sweep must
+        // stop before the deletion the abort interrupted.
+        lookupPr: async (_repo: string, branch: string) => {
+          if (branch === second.branch) controller.abort();
+          return {};
+        },
+        signal: controller.signal,
+      });
+
+      expect(report.reaped.map((e) => e.branch)).toEqual(["anton/anton-stop1"]);
+      expect(report.skipped).toEqual([]);
+      expect(existsSync(second.path)).toBe(true);
+      expect(branches()).toContain("anton/anton-stop2");
+    } finally {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", second.path]);
+      execFileSync("git", ["-C", repo, "branch", "-D", second.branch]);
+    }
+  });
+
+  it("holds the branch lock across the re-read and the deletion, so a starting run can't slip between", async () => {
+    const wt = await createWorktree({ repoPath: repo, branch: "anton/anton-lock" });
+    const candidates = [
+      { branch: wt.branch, path: wt.path, beadId: "anton-lock", runLive: false, bead: "settled" as const },
+    ];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    // A run that already holds the branch — the checkout it is about to create must survive.
+    const holder = withBranchLock(repo, wt.branch, () => held);
+
+    const sweeping = reapWorktrees({ repoPath: repo, candidates, lookupPr: noPr });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(existsSync(wt.path)).toBe(true);
+
+    release();
+    await holder;
+    const report = await sweeping;
+
+    expect(report.reaped.map((e) => e.branch)).toEqual([wt.branch]);
+    expect(existsSync(wt.path)).toBe(false);
   });
 
   it("reports a branch git REFUSED to delete as skipped, never as already gone", async () => {

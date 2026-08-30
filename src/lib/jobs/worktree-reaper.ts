@@ -161,6 +161,9 @@ export async function readBoardOrFail(
  * reopened in that window has a new run recreating this exact branch and checkout — which the sweep
  * would then force-remove, uncommitted work and all. Both reads fail CLOSED: a bead that cannot be
  * re-read keeps its resources.
+ *
+ * Run under the branch's lock (see `withBranchLock`), which is what makes it a proof rather than a
+ * narrower guess: a run cannot check the branch out between this read and the removal that follows.
  */
 export function makeRevalidator(args: {
   db: AntonDb;
@@ -233,6 +236,9 @@ export function makeWorktreeReaperHandler(deps: WorktreeReaperDeps): JobHandler 
       candidates,
       lookupPr: deps.lookupPr,
       revalidate: makeRevalidator({ db, projectId, repoPath: repo, showBead }),
+      // An operator's cancel (or the runner's no-progress timeout) must stop the sweep between
+      // candidates; what it already released is still reported below.
+      signal: ctx.signal,
     });
     if (report.reaped.length === 0 && report.skipped.length === 0) return;
 

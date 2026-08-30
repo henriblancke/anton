@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import {
   createWorktree,
   findWorktree,
@@ -24,6 +24,7 @@ import {
   resolveWarmCommand,
   WARM_COMMAND_ENV,
   WARM_ENV,
+  withBranchLock,
   worktreePathFor,
   WORKTREES_ROOT_ENV,
 } from "./worktree";
@@ -306,6 +307,44 @@ suite("worktree manager (real git)", () => {
     await removeWorktree({ path: orphanPath, branch, baseBranch: branch, repoPath: orphanRepo });
 
     expect(existsSync(orphanPath)).toBe(false);
+  });
+
+  it("resolves a RELATIVE gitdir against the checkout, not the process cwd", async () => {
+    const orphanRepo = mkdtempSync(join(tmpdir(), "anton-wt-relative-repo-"));
+    const orphanPath = mkdtempSync(join(tmpdir(), "anton-wt-relative-checkout-"));
+    const admin = join(orphanRepo, ".git", "worktrees", "anton-relative");
+    // Older git (and a moved repo) can leave a relative gitdir. Resolved from the process cwd it
+    // points nowhere, and ownership then reads as unprovable — the orphan is never reclaimed.
+    writeFileSync(join(orphanPath, ".git"), `gitdir: ${relative(orphanPath, admin)}\n`);
+    rmSync(orphanRepo, { recursive: true, force: true });
+
+    await removeWorktree({
+      path: orphanPath,
+      branch: "anton/relative",
+      baseBranch: "anton/relative",
+      repoPath: orphanRepo,
+    });
+
+    expect(existsSync(orphanPath)).toBe(false);
+  });
+
+  it("waits on the branch lock before registering a checkout — the reaper's half of the race", async () => {
+    const branch = "anton/run-locked-create";
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+
+    // Stand in for the sweep holding the branch while it re-reads and deletes.
+    const holder = withBranchLock(repo, branch, () => held);
+    const creating = createWorktree({ repoPath: repo, branch });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(existsSync(worktreePathFor(repo, branch))).toBe(false);
+
+    release();
+    await holder;
+    const wt = await creating;
+
+    expect(existsSync(wt.path)).toBe(true);
+    await removeWorktree(wt, { deleteBranch: true });
   });
 
   it("leaves an arbitrary directory untouched when orphan ownership cannot be proven", async () => {

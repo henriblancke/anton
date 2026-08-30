@@ -71,6 +71,7 @@ import { persistPartialReviewScores, persistReviewScores } from "./review-score"
 import {
   blockedByPoison,
   blockedTailReason,
+  isForeignRunOwner,
   isPoisonError,
   isRecoverableClaudeError,
   isUsageLimitError,
@@ -1452,10 +1453,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // run merely couldn't KEEP is not that evidence, and is in fact the only kind reachable
             // here: `assertLeaseHeld` — local expiry, `unproven` — is the gate's sole source of
             // RunAlreadyLiveError, and skipping the reconcile on it left the orphan mergeable.
-            const orphan =
-              isRunAlreadyLiveError(e) && e.conflict === "foreign"
-                ? undefined
-                : await reconcileOrphanPullRequest(repo, worktree.branch);
+            const orphan = isForeignRunOwner(e)
+              ? undefined
+              : await reconcileOrphanPullRequest(repo, worktree.branch);
             // Errors anton doesn't compose a park message for are rethrown untouched — the runner keys
             // its backoff (quota reschedule, retry) off the error's TYPE, and wrapping them would lose
             // that. What the reconcile found rides out on the run row instead (see the catch below).
@@ -1704,9 +1704,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             worktree: stoppedWorktree,
             beadId: epicBeadId,
             status: settledAs,
-            // Another machine owns this branch's run; neither its worktree nor its branch is ours
-            // to reclaim on the strength of a lease we merely could not keep.
-            foreign: isRunAlreadyLiveError(e),
+            // Only a CONFIRMED foreign owner keeps this machine's hands off the checkout — the same
+            // rule the gate's orphan reconcile applies. A lease this run merely couldn't keep
+            // (`unproven`) proves nothing about who else is running, and reading it as foreign skips
+            // the teardown of a worktree nobody else owns.
+            foreign: isForeignRunOwner(e),
           }),
         );
       }

@@ -6,7 +6,13 @@
 import { describe, expect, it } from "vitest";
 import type { Bead, BeadDep, Gate } from "../beads/bd";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
-import { blockedTailReason, poisonBlockerIds, PoisonEpic } from "./errors";
+import {
+  blockedTailReason,
+  isForeignRunOwner,
+  poisonBlockerIds,
+  PoisonEpic,
+  RunAlreadyLiveError,
+} from "./errors";
 import {
   claudeResumeDecision,
   continuationPrompt,
@@ -700,5 +706,25 @@ describe("mergeGatePlan", () => {
     ];
     expect(mergeGatePlan(board, "f-1", "9").stale.map((g) => g.id)).toEqual(["g-related"]);
     expect(mergeGatePlan(withRelated, "f-1", "9")).toEqual({ stale: [], create: true });
+  });
+});
+
+describe("isForeignRunOwner — what proves another machine owns the branch (anton-hrun.1)", () => {
+  it("accepts only a CONFIRMED foreign lease", () => {
+    expect(isForeignRunOwner(new RunAlreadyLiveError("another machine is running it", "foreign"))).toBe(
+      true,
+    );
+  });
+
+  it("refuses a lease this run merely couldn't keep — an unproven conflict names no owner", () => {
+    // The teardown and the orphan reconcile both hand the branch over on this: read as foreign, an
+    // `unproven` conflict strands a worktree and branch nobody else claims until a later sweep.
+    expect(isForeignRunOwner(new RunAlreadyLiveError("lease expired mid-run"))).toBe(false);
+    expect(isForeignRunOwner(new RunAlreadyLiveError("lease expired mid-run", "unproven"))).toBe(false);
+  });
+
+  it("refuses any other failure — a crash is not a foreign owner", () => {
+    expect(isForeignRunOwner(new Error("boom"))).toBe(false);
+    expect(isForeignRunOwner(undefined)).toBe(false);
   });
 });

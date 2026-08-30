@@ -21,6 +21,7 @@
 import { lookupOpenPullRequest, type OpenPullRequestLookup } from "./ops";
 import {
   removeWorktree,
+  withBranchLock,
   worktreePathFor,
   worktreesRootFor,
   type Worktree,
@@ -340,9 +341,16 @@ export async function reapWorktrees(args: {
   lookupPr?: typeof lookupOpenPullRequest;
   /** Re-read of the board and run rows, run only for a candidate about to be deleted. */
   revalidate?: Revalidate;
+  /**
+   * The job's abort signal. A sweep is a long sequence of destructive steps behind slow `gh`
+   * lookups, so an operator's cancel (or the runner's no-progress timeout) has to stop it between
+   * candidates rather than run the remaining deletions to completion.
+   */
+  signal?: AbortSignal;
 }): Promise<ReapReport> {
   const report: ReapReport = { reaped: [], skipped: [] };
   for (const candidate of args.candidates) {
+    if (args.signal?.aborted) break;
     // Only a candidate that is otherwise reapable can cost a `gh` call: everything else is decided
     // before the PR is relevant, and a sweep over an idle project must stay free.
     const settled =
@@ -351,22 +359,33 @@ export async function reapWorktrees(args: {
       ? await openPrNotice(args.repoPath, candidate.branch, args.lookupPr)
       : undefined;
     const plan = planReap(candidate, openPr);
-    // Same rule as the `gh` call: only a candidate something is about to happen to pays for it.
-    const stale =
-      plan.removeWorktree || plan.deleteBranch ? await args.revalidate?.(candidate) : undefined;
-    if (stale) {
-      report.skipped.push({
-        branch: candidate.branch,
-        path: candidate.path,
-        beadId: candidate.beadId,
-        outcome: "refused",
-        reason: `skipped ${candidate.path ?? candidate.branch}: ${stale}`,
-        worktreeRemoved: false,
-        branchDeleted: false,
-      });
+    // A plan that deletes nothing needs neither the re-read nor the lock — the entry only records why.
+    if (!plan.removeWorktree && !plan.deleteBranch) {
+      report.skipped.push(await applyPlan(args.repoPath, candidate, plan));
       continue;
     }
-    const entry = await applyPlan(args.repoPath, candidate, plan);
+    // The second cancellation check, and the one that matters: the `gh` lookup above can run for
+    // seconds, and nothing has been destroyed yet.
+    if (args.signal?.aborted) break;
+    // Re-read and delete as ONE step under the branch's lock (anton-hrun.1). The check is worthless
+    // if a run can check the branch out between it and the removal: the sweep would then force-remove
+    // a live checkout, uncommitted work and all. Holding the lock across both makes the starting run
+    // either visible to the re-read or blocked until the removal is done.
+    const entry = await withBranchLock(args.repoPath, candidate.branch, async () => {
+      const stale = await args.revalidate?.(candidate);
+      if (stale) {
+        return {
+          branch: candidate.branch,
+          path: candidate.path,
+          beadId: candidate.beadId,
+          outcome: "refused",
+          reason: `skipped ${candidate.path ?? candidate.branch}: ${stale}`,
+          worktreeRemoved: false,
+          branchDeleted: false,
+        } satisfies ReapEntry;
+      }
+      return applyPlan(args.repoPath, candidate, plan);
+    });
     // Classified on the outcome, never the plan: a checkout locked between planning and removal is
     // refused, and reporting that as reaped would claim work the sweep did not do.
     (entry.outcome === "acted" ? report.reaped : report.skipped).push(entry);
@@ -391,7 +410,11 @@ export async function releaseRunWorktree(args: {
   const openPr = beadSettled
     ? await openPrNotice(args.repoPath, run.branch, args.lookupPr)
     : undefined;
-  return applyPlan(args.repoPath, run, planRunTeardown(run, openPr));
+  // Under the branch's lock like the sweep's: this run has stopped, and another job (a review-fix,
+  // a retry) can be checking the same branch out right now.
+  return withBranchLock(args.repoPath, run.branch, () =>
+    applyPlan(args.repoPath, run, planRunTeardown(run, openPr)),
+  );
 }
 
 /** The session-log block for a pass: every worktree and branch reaped, and every one skipped, with why. */
