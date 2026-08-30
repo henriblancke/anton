@@ -117,13 +117,15 @@ export async function withBranchLock<T>(
 }
 
 /**
- * Who is actively USING a branch's checkout, keyed like the branch lock. The reaper proves a
- * checkout is residue from run rows and the board, so a job that writes neither — review-fix
- * re-materializes the PR branch and drives claude in it without a run row — is invisible to that
- * proof: a stopped run's teardown reads "the bead is still open, release the worktree" and
- * force-removes the directory the fix is being written in, discarding it and failing every command
- * that follows. A claim is the missing evidence, and the only thing teardown and the sweep re-read
- * for a checkout no run row names.
+ * Who is actively USING a branch's checkout, keyed like the branch lock. Both destructive policies
+ * prove a checkout is residue from RUN ROWS AND THE BOARD, and neither of those crosses a process
+ * boundary: review-fix writes no run row at all, and one anton's run rows say nothing to a second
+ * anton over the same repository. Either way the reader concludes "the bead is still open, release
+ * the worktree" and force-removes a directory somebody is working in, discarding uncommitted work
+ * and failing every command that follows. A claim is the missing evidence — the only thing a
+ * teardown and a sweep re-read about a checkout their own rows cannot account for — so every job
+ * that drives claude in a checkout holds one for as long as it is in there: an execute run for the
+ * length of the run, review-fix for the length of the fix.
  *
  * This map is only the IN-PROCESS half of the claim; the durable half is a real `git worktree lock`
  * on the checkout (see {@link withWorktreeClaim}), which is what a second anton process — whose
@@ -201,6 +203,26 @@ export async function withWorktreeClaim<T>(
   owner: string,
   fn: () => Promise<T>,
 ): Promise<T> {
+  await acquireWorktreeClaim(repoPath, branch, owner);
+  try {
+    return await fn();
+  } finally {
+    await releaseWorktreeClaim(repoPath, branch, owner);
+  }
+}
+
+/**
+ * The unscoped half of {@link withWorktreeClaim}, for a holder whose lifetime is not a callback: an
+ * execute run claims its checkout for as long as it is executing, then must GIVE THE CLAIM BACK
+ * before its own teardown — the teardown force-removes the checkout, and a live claim (this
+ * process's included) is exactly what refuses that. Prefer the scoped form wherever the claim does
+ * wrap a block; whoever calls this owes a {@link releaseWorktreeClaim} on every exit path.
+ */
+export async function acquireWorktreeClaim(
+  repoPath: string,
+  branch: string,
+  owner: string,
+): Promise<void> {
   const key = branchKey(repoPath, branch);
   await withBranchLock(repoPath, branch, async () => {
     // First claimant wins. Refusing here — not at the createWorktree that follows — is what makes
@@ -221,15 +243,24 @@ export async function withWorktreeClaim<T>(
       throw err;
     }
   });
-  try {
-    return await fn();
-  } finally {
-    // Under the branch lock again, so the git lock is lifted and the map cleared as one step no
-    // teardown can read halfway through.
-    await withBranchLock(repoPath, branch, async () => {
-      if (dropClaim(key, owner)) await releaseClaimLock(repoPath, branch);
-    });
-  }
+}
+
+/**
+ * Give back a claim taken by {@link acquireWorktreeClaim}. Idempotent — a holder that releases on
+ * its teardown path AND in a `finally` must not pay a second, spurious unlock — and taken under the
+ * branch lock, so the git lock is lifted and the map cleared as one step no teardown can read
+ * halfway through.
+ */
+export async function releaseWorktreeClaim(
+  repoPath: string,
+  branch: string,
+  owner: string,
+): Promise<void> {
+  const key = branchKey(repoPath, branch);
+  await withBranchLock(repoPath, branch, async () => {
+    if (!worktreeClaims.get(key)?.includes(owner)) return; // never held, or already given back
+    if (dropClaim(key, owner)) await releaseClaimLock(repoPath, branch);
+  });
 }
 
 /** Drop one holder's in-process claim. True when it was the last, so the git lock may come off. */
@@ -377,7 +408,11 @@ export async function createWorktree(opts: {
   branch: string;
   baseBranch?: string;
   warm?: boolean;
-  /** The claim holder this checkout is being created for, when the caller is one (`review-fix`). */
+  /**
+   * The claim holder this checkout is being created for, when the caller is one — an execute run
+   * (for the length of the run) or review-fix (for the length of the fix). The claim is installed on
+   * the checkout as part of `git worktree add`, so no window exists in which it reads as unclaimed.
+   */
   claimedBy?: string;
   /** Abort an in-flight install so an operator's kill doesn't hold the run's slot for the full warm timeout. */
   signal?: AbortSignal;
@@ -417,13 +452,15 @@ export async function createWorktree(opts: {
     const path = worktreePathFor(repoPath, branch);
     await mkdir(dirname(path), { recursive: true });
 
+    // `--lock` as part of the ADD, never a `worktree lock` after it: git documents the two-step form
+    // as racy, and this is the race that matters — between the two commands a concurrent anton's
+    // teardown reads a fresh, unlocked checkout on the expected branch and force-removes it.
+    const lockArgs = claimed ? ["--lock", "--reason", claimLockReason(claimed)] : [];
     if (await branchExists(repoPath, branch)) {
-      await git(repoPath, ["worktree", "add", path, branch]);
+      await git(repoPath, ["worktree", "add", ...lockArgs, path, branch]);
     } else {
-      await git(repoPath, ["worktree", "add", path, "-b", branch, baseBranch]);
+      await git(repoPath, ["worktree", "add", ...lockArgs, path, "-b", branch, baseBranch]);
     }
-
-    if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
 
     // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
     // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).

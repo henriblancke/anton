@@ -29,6 +29,7 @@ import {
   resetPerCaseState,
   HUMAN_NOTE,
   FakeClock,
+  fakeClaudeReadingStdin,
   writeBin,
   createExecuteEpicSandbox,
   createTicket,
@@ -247,6 +248,57 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
       (s) => s.beadId === bugId,
     );
     expect(sessions).toHaveLength(1);
+  });
+
+  it("CLAIMS its checkout for the whole run, so a second anton process cannot reap it mid-run", async () => {
+    // A run's occupancy is invisible outside this process (anton-hrun.1): a second anton over the
+    // same repository judges residue from ITS OWN run rows and the board, both of which say the bead
+    // is merely open — which reads as "release the worktree" — and would force-remove this run's
+    // checkout with its uncommitted work in it. The `git worktree lock` the claim installs is the one
+    // piece of evidence that crosses the process boundary, so it must be on the checkout for as long
+    // as claude is executing in it, and off it again by the time the run's own teardown removes it.
+    const bugId = await beads.create(repo, {
+      title: "Claim the checkout for the run",
+      type: "bug",
+      acceptance: "work file exists",
+      description: "## Goal\nProve the run holds its checkout.",
+    });
+    await beads.approve(repo, bugId);
+
+    // What a second anton would read: git's own view of the checkout, taken from inside it while
+    // claude is running.
+    const dump = join(sandbox, "claim-during-run.txt");
+    const claimClaude = writeBin(
+      binDir,
+      "claude-claimdump",
+      fakeClaudeReadingStdin(`fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+fs.writeFileSync(${JSON.stringify(dump)},require('child_process').execFileSync('git',['worktree','list','--porcelain'],{cwd:process.cwd(),encoding:'utf8'}));
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'scl'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'scl',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claimClaude;
+    try {
+      await driveEpicRun(runner, { projectId, epicBeadId: bugId });
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+    }
+
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === bugId)!;
+    expect(run.status).toBe("done");
+    // Locked, by THIS run, while it was executing — pid and all, which is what lets a second anton
+    // tell a live claim from a crashed one's leftovers.
+    expect(readFileSync(dump, "utf8")).toContain(
+      `locked anton-claim execute-epic#${run.id} pid=${process.pid}`,
+    );
+    // …and given back before the teardown, which force-removes the checkout — an operation the
+    // run's own live claim would otherwise refuse, leaking the worktree until anton restarts.
+    expect(existsSync(run.worktreePath!)).toBe(false);
+    expect(await findWorktree(repo, `anton/${bugId}`)).toBeNull();
   });
 
   it("standalone PR-step failure: stays OPEN + in-review, then resumes at the PR step without re-running claude", async () => {

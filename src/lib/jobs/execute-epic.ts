@@ -37,7 +37,14 @@ import {
   type WorktreeState,
 } from "../git/ops";
 import { prNumberFromRef } from "../git/pr";
-import { createWorktree, findWorktree, worktreePathFor, type Worktree } from "../git/worktree";
+import {
+  acquireWorktreeClaim,
+  createWorktree,
+  findWorktree,
+  releaseWorktreeClaim,
+  worktreePathFor,
+  type Worktree,
+} from "../git/worktree";
 import { releaseRunResources } from "./worktree-reaper";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
 import {
@@ -241,6 +248,15 @@ export interface ExecuteEpicDeps {
   branchPrefix?: string;
 }
 
+/**
+ * Who a run is, as its worktree claim records it. The RUN id, not the epic's: a resumed attempt takes
+ * a fresh claim of its own, and naming the run is what makes a leftover claim traceable to the
+ * attempt that took it — the same reason review-fix keys its owner by job id.
+ */
+export function claimOwnerFor(runId: string): string {
+  return `execute-epic#${runId}`;
+}
+
 /** Build the runner handler bound to a db/clock. Register it as the "execute-epic" handler. */
 export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
   const db = deps.db;
@@ -406,6 +422,22 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // outcome owes it back (anton-hrun.1), and the stopping paths live in the `catch`, outside the
     // block that created it. Null until step 2, so a run that parked before warming releases nothing.
     let runWorktree: Worktree | null = null;
+    // This attempt's claim on the checkout, held for as long as it is executing in it (anton-hrun.1)
+    // and named here so every stopping path can give it back. Null until step 2 takes it.
+    let worktreeClaim: string | null = null;
+    /**
+     * Give the checkout back. Called before every teardown — the teardown force-removes the
+     * directory, and a live claim (this run's own included) is precisely what refuses that — and
+     * again in `finally`, which is what covers the stops that KEEP the worktree: a parked run resumes
+     * in it, but is no longer executing in it, so nothing may go on reading the claim as occupancy.
+     * Idempotent, and best-effort like the teardown it precedes.
+     */
+    const releaseWorktreeHold = async () => {
+      const owner = worktreeClaim;
+      if (!owner) return;
+      worktreeClaim = null;
+      await safe(() => releaseWorktreeClaim(repo, branch, owner));
+    };
     // Publish/refresh this run's lease. Advances `leaseLabels` ONLY after the write lands (not
     // best-effort like the other bd writes): a swallowed failure that still advanced the tracked
     // label would let `finally` clear a label that isn't on the board while the real prior lease
@@ -1063,11 +1095,19 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
       // the remote-tracking ref is the accurate fork point even when the local base has drifted.
       const freshBase = await resolveFreshBase(repo, baseBranch);
+      // Claim the checkout for the whole run (anton-hrun.1). The claim's `git worktree lock` is the
+      // ONLY evidence a second anton process over this repository has that the directory is in use:
+      // its teardown and its sweep judge residue from their own run rows and the board, which say
+      // nothing about a run on this machine, so an unclaimed checkout on a still-open bead reads as
+      // "release the worktree" and is force-removed with this run's uncommitted work in it.
+      worktreeClaim = claimOwnerFor(runId);
+      await acquireWorktreeClaim(repo, branch, worktreeClaim);
       const worktree = await createWorktree({
         repoPath: repo,
         branch,
         baseBranch: freshBase,
         warm: true,
+        claimedBy: worktreeClaim,
         // A cold install can run for minutes; without the job's signal an operator's kill would wait
         // it out, holding the run's concurrency slot the whole time.
         signal: ctx.signal,
@@ -1617,7 +1657,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         error: [timeoutNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
       });
       // The branch and its PR carry the work now, so the checkout is residue; the branch survives
-      // because the target is still open in review (anton-hrun.1).
+      // because the target is still open in review (anton-hrun.1). The claim comes off first: the
+      // release below force-removes the checkout, which a live claim refuses — ours as much as
+      // anyone's, since the lock says nothing about which run inside this process took it.
+      await releaseWorktreeHold();
       await safe(() =>
         releaseRunResources({
           db,
@@ -1710,6 +1753,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // reaper reclaims.
       const stoppedWorktree = runWorktree;
       if (stoppedWorktree) {
+        // Ahead of the release for the same reason as the delivered path: this run's own claim would
+        // refuse the removal it is asking for. A park that keeps the checkout drops the claim in
+        // `finally` instead — it stops executing either way.
+        await releaseWorktreeHold();
         await safe(() =>
           releaseRunResources({
             db,
@@ -1735,6 +1782,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       }
       throw e; // let the runner apply job-level durability
     } finally {
+      // Whatever else happened, this attempt is no longer executing in the checkout, so it may not
+      // keep claiming it — a claim outliving its run would make the worktree and branch unreapable
+      // by every later pass, on this machine and every other, until anton restarts. A no-op on the
+      // paths that already released above.
+      await releaseWorktreeHold();
       // Stop refreshing and drop the run-liveness lease now that this attempt has stopped executing
       // (anton-jz1). Clearing on EVERY settle path — done, parked, failed — is what lets a Force run
       // re-trigger a stopped run immediately instead of waiting out the lease TTL; a hard crash that

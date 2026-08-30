@@ -17,9 +17,11 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import {
+  acquireWorktreeClaim,
   createWorktree,
   findWorktree,
   listWorktrees,
+  releaseWorktreeClaim,
   removeWorktree,
   resolveWarmCommand,
   WARM_COMMAND_ENV,
@@ -761,6 +763,68 @@ suite("worktree manager (real git)", () => {
 
     expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(false);
     await removeWorktree(wt, { deleteBranch: true });
+  });
+
+  it("installs a claim as part of `git worktree add`, never as a second command after it", async () => {
+    // The two-step form (add, then lock) has a window in which the checkout is registered, on the
+    // expected branch, and unlocked — exactly what a concurrent anton's teardown reads as residue
+    // and force-removes. `git worktree add --lock` closes it, so a `worktree lock` that cannot run
+    // at all must not stop the fresh checkout from carrying its claim.
+    const branch = "anton/run-claim-add-lock";
+    const owner = "execute-epic#run-add-lock";
+    const shim = gitShim(['if [ "$3" = "worktree" ] && [ "$4" = "lock" ]; then', "  exit 1", "fi"]);
+
+    let created: Worktree | undefined;
+    try {
+      await withWorktreeClaim(repo, branch, owner, async () => {
+        created = await createWorktree({ repoPath: repo, branch, claimedBy: owner });
+        expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.lockReason).toBe(
+          `anton-claim ${owner} pid=${process.pid} host=${hostname()}`,
+        );
+      });
+    } finally {
+      shim.restore();
+    }
+
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(false);
+    if (created) await removeWorktree(created, { deleteBranch: true });
+  });
+
+  it("holds an unscoped claim for a run's lifetime and gives it back exactly once", async () => {
+    // An execute run cannot wrap its claim around itself: its own teardown removes the checkout, and
+    // a live claim — its own included — is what refuses that. So it acquires and releases explicitly,
+    // on every stopping path AND in `finally`, which makes idempotent release a requirement.
+    const branch = "anton/run-claim-unscoped";
+    const owner = "execute-epic#run-1";
+    const wt = await createWorktree({ repoPath: repo, branch });
+    writeFileSync(join(wt.path, "in-progress.txt"), "the run's uncommitted work\n");
+
+    await acquireWorktreeClaim(repo, branch, owner);
+    expect(worktreeClaimHolder(repo, branch)).toBe(owner);
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.lockReason).toContain(
+      `anton-claim ${owner}`,
+    );
+
+    // What another anton's teardown does with it: consult git, and leave the run's tree alone.
+    const refused = await removeWorktree(wt, { deleteBranch: true });
+    expect(refused).toMatchObject({ removed: false, branchDeleted: false });
+    expect(refused.skipped).toContain(`${owner} is using the checkout`);
+    expect(existsSync(join(wt.path, "in-progress.txt"))).toBe(true);
+
+    await releaseWorktreeClaim(repo, branch, owner);
+    expect(worktreeClaimHolder(repo, branch)).toBeUndefined();
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(false);
+
+    // The run's `finally` arrives after the branch has moved on to review-fix: a blind second
+    // release would strip a claim this run no longer holds, handing the fix's checkout to the next
+    // teardown that comes along.
+    await acquireWorktreeClaim(repo, branch, "review-fix#job-b");
+    await releaseWorktreeClaim(repo, branch, owner);
+    expect(worktreeClaimHolder(repo, branch)).toBe("review-fix#job-b");
+    expect((await listWorktrees(repo)).find((r) => r.branch === branch)?.locked).toBe(true);
+
+    await releaseWorktreeClaim(repo, branch, "review-fix#job-b");
+    expect(await removeWorktree(wt, { deleteBranch: true })).toMatchObject({ removed: true });
   });
 
   it("leaves an arbitrary directory untouched when orphan ownership cannot be proven", async () => {
