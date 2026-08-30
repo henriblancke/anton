@@ -215,19 +215,29 @@ describe("dispatchReleased (phase 4b)", () => {
   const resume = (id: string, gateId: string) => ({ gate: gate(gateId), target: bead(id) });
 
   it("dispatches the target and marks its gate, counting the marks that landed", async () => {
-    const handedBack = await dispatchReleased(pass, [resume("t-1", "g-1")]);
+    const dispatched = await dispatchReleased(pass, [resume("t-1", "g-1")]);
 
-    expect(handedBack).toBe(1);
+    expect(dispatched).toEqual({ handedBack: 1, resumed: 1 });
     expect(await jobsOfType("execute-epic")).toEqual(["t-1"]);
     expect(tagMock).toHaveBeenCalledWith(REPO, "g-1", [GATE_RESUMED_LABEL]);
   });
 
   it("keeps going when one mark fails, and leaves that gate uncounted", async () => {
     tagMock.mockRejectedValueOnce(new Error("bd down"));
-    const handedBack = await dispatchReleased(pass, [resume("t-1", "g-1"), resume("t-2", "g-2")]);
+    const dispatched = await dispatchReleased(pass, [resume("t-1", "g-1"), resume("t-2", "g-2")]);
 
-    expect(handedBack).toBe(1);
+    // The mark is what the board push depends on; the resume is what the queue did. A failed mark
+    // must not erase a run this pass actually put back in flight.
+    expect(dispatched).toEqual({ handedBack: 1, resumed: 2 });
     expect((await jobsOfType("execute-epic")).sort()).toEqual(["t-1", "t-2"]);
+  });
+
+  it("counts no resume for a target an active job already covers", async () => {
+    await dispatchReleased(pass, [resume("t-1", "g-1")]);
+    expect(await dispatchReleased(pass, [resume("t-1", "g-1")])).toEqual({
+      handedBack: 1,
+      resumed: 0,
+    });
   });
 });
 

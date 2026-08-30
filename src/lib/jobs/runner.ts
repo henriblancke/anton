@@ -15,6 +15,7 @@
  * See DESIGN.md §4.
  */
 import {
+  BUDGET_DEFER_PREFIX,
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
@@ -345,9 +346,15 @@ export function nextAction(
  * stamps `lastError`, which survives the next lease — the refunded retries (quota, lease-held,
  * not-wired) rewind `attempts`, so the error is the only trace they leave. A human `resumeJob`
  * deliberately clears both for a clean slate, so a resumed job's next attempt reads as its first.
+ *
+ * The budget governor's `budget: ` marker is the one `lastError` that proves nothing: it is stamped
+ * on a QUEUED row that never ran and survives into its first lease, so counting it would withhold a
+ * genuine first-attempt no-op as "unknown" for every job pacing ever deferred.
  */
 export function hasPriorAttempt(job: Pick<JobRow, "attempts" | "lastError">): boolean {
-  return job.attempts > 1 || Boolean(job.lastError);
+  if (job.attempts > 1) return true;
+  if (!job.lastError) return false;
+  return !job.lastError.startsWith(BUDGET_DEFER_PREFIX);
 }
 
 /** An in-flight job's registry entry: the abort handle plus the mutable live-report handle. */
@@ -839,7 +846,7 @@ export class JobRunner {
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
-      const pacedError = `budget: ${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`;
+      const pacedError = `${BUDGET_DEFER_PREFIX}${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`;
 
       // Fully-governed types (everything except execute-epic) — held + deferred wholesale to the
       // pace boundary. There's no per-job bypass for these; the whole bucket is paced.
@@ -873,7 +880,7 @@ export class JobRunner {
           types: ["execute-epic"],
           projectId: pid,
           retryAtMs: immRetryMs,
-          lastError: `budget: ${immediate.reason} — resumes at ${new Date(immRetryMs).toISOString()}`,
+          lastError: `${BUDGET_DEFER_PREFIX}${immediate.reason} — resumes at ${new Date(immRetryMs).toISOString()}`,
           bypass: "only",
         });
         // Every execute-epic row for the project is now deferred (paced + immediate), so hold the

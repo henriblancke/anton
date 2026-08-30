@@ -275,21 +275,33 @@ export async function dispatchUngated(pass: PassContext, targets: Bead[]): Promi
   return resumed;
 }
 
+/** What phase 4b did: gates marked handed back, and runs actually put back in flight. */
+export interface ReleasedDispatch {
+  handedBack: number;
+  resumed: number;
+}
+
 /**
  * 4b. APPLY — the same resume for the gates `bd ready --gated` cannot report, marked one-shot on the
  * gate itself because a resolved gate stays on its bead forever. The mark lands AFTER the dispatch
  * decision, so a failed resume is retried next pass rather than being silently recorded as handled —
  * and every outcome is marked, including `already-active`/`job-cancelled`: the gate has done its job
- * in all four cases. Returns how many marks landed — the count that decides the dolt push, because
- * the marker is what keeps a SECOND anton sharing this board from re-dispatching the same target.
+ * in all four cases.
+ *
+ * The two counts are independent on purpose: `handedBack` (marks that landed) decides the dolt push,
+ * because the marker is what keeps a SECOND anton sharing this board from re-dispatching the same
+ * target, while `resumed` records the queue write. A resume that lands and a mark that then fails is
+ * still a pass that put a run back in flight, and must not report "nothing to do".
  */
 export async function dispatchReleased(
   pass: PassContext,
   released: PlainGateResume[],
-): Promise<number> {
+): Promise<ReleasedDispatch> {
   let handedBack = 0;
+  let resumed = 0;
   for (const { gate, target } of released) {
     const outcome = await resumeEpic(pass.db, pass.clock, pass.projectId, target.id);
+    if (outcome === "resumed-job" || outcome === "enqueued") resumed += 1;
     console.log(
       `[gate-check] ${pass.projectId}: ${target.id} released by gate ${gate.id} — ${outcome}`,
     );
@@ -300,7 +312,7 @@ export async function dispatchReleased(
       console.error(`[gate-check] failed to mark gate ${gate.id} as handed back:`, e);
     }
   }
-  return handedBack;
+  return { handedBack, resumed };
 }
 
 /**
@@ -413,8 +425,8 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     // is machine-local, and `resumeEpic`'s dedupe only sees the local job table (anton-zoh).
     const operator = await resolveOperator();
     const plan = planResumes(board, await beads.readyGated(pass.repo), nowMs, operator);
-    const resumed = await dispatchUngated(pass, plan.targets);
-    const handedBack = await dispatchReleased(pass, plan.released);
+    const ungated = await dispatchUngated(pass, plan.targets);
+    const { handedBack, resumed: releasedResumes } = await dispatchReleased(pass, plan.released);
     const finalized = await dispatchMerged(pass, plan.merged);
 
     const unmatched = unmatchedGatedReport(plan);
@@ -433,7 +445,7 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
       resolved: evaluation.resolved,
       surfaced,
       handedBack,
-      resumed,
+      resumed: ungated + releasedResumes,
       finalized,
     });
   };

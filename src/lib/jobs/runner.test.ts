@@ -10,7 +10,16 @@ import * as schema from "../db/schema";
 import { getBurnAverage, recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, SyncNotWiredError, UsageLimitError } from "./errors";
-import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
+import {
+  BUDGET_DEFER_PREFIX,
+  complete,
+  enqueue,
+  getJob,
+  park,
+  reschedule,
+  toMs,
+  type Clock,
+} from "./queue";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
   classifyError,
@@ -62,6 +71,13 @@ describe("hasPriorAttempt (durable evidence of an unfinished attempt)", () => {
   it("counts a refunded retry by the error it stamped, not by attempts", () => {
     // Quota / lease-held / not-wired rewind `attempts`, so the row's error is their only trace.
     expect(hasPriorAttempt({ attempts: 1, lastError: "usage-limit: resumes at …" })).toBe(true);
+  });
+
+  it("ignores a budget-defer marker — pacing stamps a QUEUED row that never ran", () => {
+    const lastError = `${BUDGET_DEFER_PREFIX}weekly pace — resumes at 2026-01-01T00:00:00.000Z`;
+    expect(hasPriorAttempt({ attempts: 1, lastError })).toBe(false);
+    // Once an attempt has actually run, the stale marker no longer decides it.
+    expect(hasPriorAttempt({ attempts: 2, lastError })).toBe(true);
   });
 });
 

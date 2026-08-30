@@ -931,6 +931,12 @@ export async function reschedule(
 }
 
 /**
+ * Marker `deferQueuedJobs` stamps on the rows the budget governor holds. It lands on a *queued* job
+ * that has never run, so it is a pacing note — not evidence of an attempt (see `hasPriorAttempt`).
+ */
+export const BUDGET_DEFER_PREFIX = "budget: ";
+
+/**
  * Budget-defer (anton-szld): push the `queued` jobs of `types` for a project out to `retryAtMs`, so
  * the proactive budget governor backs autonomous work off past the reset/night boundary instead of
  * only catching a `UsageLimitError` after hitting the wall. Mirrors a quota backoff's reschedule but
@@ -1009,7 +1015,7 @@ export async function resumeBudgetDeferredJobs(
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
         gt(schema.jobs.runAt, nowDate),
-        like(schema.jobs.lastError, "budget: %"),
+        like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
       ),
     )
     .returning({ id: schema.jobs.id });
