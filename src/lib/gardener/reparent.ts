@@ -268,6 +268,23 @@ function topicGroups(homeKeys: Set<string>, candidates: Candidate[]): TopicGroup
   return groups;
 }
 
+/**
+ * Which of these beads still sit in a topic group this home can host — the grouping claim
+ * {@link detectParentlessClusters} makes, re-asked of whatever is left of a cluster later.
+ *
+ * A proposal's subject list is the UNION of every group one home hosts, so an escalation pair and a
+ * docker pair ride one proposal. Losing a member of each leaves two survivors that agree about
+ * nothing, and only the detector's own predicate can say so — hence this, rather than a second
+ * reading of the rule in the module that approves the move (apply-plan.ts `regroupSurvivors`).
+ */
+export function groupedUnder(home: Bead, members: Bead[]): Set<string> {
+  const groups = topicGroups(
+    topicKeys(home),
+    members.map((bead) => ({ bead, keys: topicKeys(bead) })),
+  );
+  return new Set(groups.flatMap((group) => group.members.map((m) => m.id)));
+}
+
 /** A group's membership as one comparable string — what makes two anchors' groups the same group. */
 const groupIdentity = (group: Candidate[]): string =>
   group
@@ -418,13 +435,24 @@ function contestedMembers(hosted: Map<string, TopicGroup[]>): Set<string> {
 }
 
 /**
+ * The tiers a cluster is built FROM: working-layer work that is not itself a board card. Stated
+ * apart from {@link isClusterCandidate} because approving a proposal has to re-ask it — a member
+ * promoted to a `feature` since the filing has left the cluster, and the tier taxonomy would
+ * otherwise read the move as `feature-under-non-epic` and refuse the whole ask (apply-plan.ts
+ * `clusterMemberLeftLayer`).
+ */
+export function isClusterTier(bead: Bead): boolean {
+  const type = bead.issue_type ?? "";
+  return type === "task" || type === "bug" || type === "chore";
+}
+
+/**
  * The working layer a cluster can be built from: parentless, still wanted, and held by nobody — no
  * live run over it and no run claim on it (see {@link isFree}). A parentless task or bug IS a run
  * target, so a claim on one is a machine that has already picked it up.
  */
 function isClusterCandidate(bead: Bead, nowMs: number): boolean {
-  const type = bead.issue_type ?? "";
-  if (type !== "task" && type !== "bug" && type !== "chore") return false;
+  if (!isClusterTier(bead)) return false;
   if (beads.parentOf(bead)) return false;
   return isFree(bead, nowMs);
 }

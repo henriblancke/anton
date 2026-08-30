@@ -32,7 +32,7 @@ import {
   type GardenerPlan,
 } from "./detections";
 import { impliesOrdering } from "./relink";
-import { MIN_CLUSTER_SIZE } from "./reparent";
+import { groupedUnder, isClusterTier, MIN_CLUSTER_SIZE } from "./reparent";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -299,6 +299,10 @@ function homeRefusal(
     const subject = index.byId.get(id);
     // A subject that has left the board is `reparentSubject`'s refusal to name, not this one's.
     if (!subject) continue;
+    // Nor is one that has left the working layer: it is dropped from the move rather than moved
+    // (see {@link clusterMemberLeftLayer}), and asking the tier question of it here would refuse
+    // the whole cluster over a bead nothing is going to write to.
+    if (clusterMemberLeftLayer(plan, subject)) continue;
     const wrongTier = homeWrongTier(subject, target, index, HOME_STANDING.snapshot);
     if (wrongTier) return wrongTier;
   }
@@ -308,6 +312,11 @@ function homeRefusal(
 /** A subject no longer part of the claim: the board answered it after the proposal was filed. */
 interface Answered {
   answered: string;
+}
+
+/** A subject that already sits under the home: nothing to write, but still one of the cluster. */
+interface InPlace {
+  inPlace: Bead;
 }
 
 /**
@@ -329,29 +338,32 @@ function reparentSteps(
   index: BoardIndex,
   at: ApplyMoment,
 ): ApplyDecision {
-  const steps: ApplyStep[] = [];
+  const moves: ApplyStep[] = [];
   const answered: string[] = [];
   // Members that already sit under the home. They are written to by nobody, but they ARE the cluster
-  // the proposal asked for, so they count towards {@link clusterTooSmall}'s floor.
-  let inPlace = 0;
+  // the proposal asked for, so they count towards the subject the survivors must still state between
+  // them — a cluster half-applied by hand is still a cluster.
+  const inPlace: Bead[] = [];
   for (const id of plan.subjects) {
     const moved = reparentSubject(plan, id, home, index, at);
     if (typeof moved === "string") return { status: "refuse", reason: moved };
-    if (!moved) {
-      inPlace += 1;
-      continue;
-    }
-    if ("answered" in moved) answered.push(moved.answered);
-    else steps.push(moved);
+    if ("inPlace" in moved) inPlace.push(moved.inPlace);
+    else if ("answered" in moved) answered.push(moved.answered);
+    else moves.push(moved);
   }
-  const [firstAnswer] = answered;
+  const survivors = regroupSurvivors(plan, home, moves, inPlace, index);
+  const steps = survivors.steps;
   if (steps.length === 0) {
+    // A survivor no group reached is the cluster DISSOLVING, which is its own answer to the ask —
+    // and a better one for an approver than the board answer that started the unravelling.
+    if (survivors.dropped.length > 0) {
+      return { status: "refuse", reason: clusterDissolved(home, survivors.dropped) };
+    }
+    const [firstAnswer] = answered;
     return firstAnswer ? { status: "refuse", reason: firstAnswer } : settledInPlace(plan);
   }
-  const tooSmall = clusterTooSmall(plan, home, steps, inPlace);
-  if (tooSmall) return { status: "refuse", reason: tooSmall };
-  const skipped =
-    answered.length > 0 ? ` (${answered.length} member(s) no longer in the cluster)` : "";
+  const left = answered.length + survivors.dropped.length;
+  const skipped = left > 0 ? ` (${left} member(s) no longer in the cluster)` : "";
   return {
     status: "apply",
     steps,
@@ -359,37 +371,63 @@ function reparentSteps(
   };
 }
 
-/**
- * Why what is LEFT of a cluster is no longer a cluster, or undefined.
- *
- * `detectParentlessClusters` needs {@link MIN_CLUSTER_SIZE} loose beads agreeing on a home before it
- * will call one obvious, because a single loose bead sharing a topic with a card is the weak evidence
- * this whole detector was rebuilt to stop proposing on (anton-9hpp). Dropping answered members must
- * not smuggle that below the detector's own bar: a two-member cluster with one member re-homed
- * elsewhere is one loose bead, and the re-home may well be the newer decision that broke the grouping
- * in the first place.
- *
- * Members already sitting under the home count — the approval's outcome for them is the board's state
- * already, so a cluster half-applied by hand is still a cluster.
- *
- * Asked of `parentless-cluster` alone: it is the only kind whose claim rests on a GROUP, and the only
- * one whose fingerprint stops guarding the subject list (see detections.ts `detectionSubjectKey`), so
- * it is also the only kind whose list can be edited down to a singleton after emission.
- */
-function clusterTooSmall(
-  plan: GardenerPlan,
-  home: Bead,
-  steps: ApplyStep[],
-  inPlace: number,
-): string | undefined {
-  if (plan.kind !== "parentless-cluster") return undefined;
-  if (steps.length + inPlace >= MIN_CLUSTER_SIZE) return undefined;
-  return `${list(steps.map((s) => s.id))} is all that is left of this cluster — it takes ${MIN_CLUSTER_SIZE} beads agreeing on a home before one is obvious, and whatever answered the other members is the newer reading of where this work belongs; decline it, and re-parent by hand if ${home.id} is still the right home`;
+/** What is left of a cluster once the members that no longer state its subject are dropped. */
+interface Survivors {
+  steps: ApplyStep[];
+  /** The ids the grouping dropped — what {@link clusterDissolved} names when nothing is left. */
+  dropped: string[];
 }
 
 /**
- * What one member of a cluster resolves to: a refusal reason, the step that moves it, or undefined
- * when it already sits where the proposal wants it.
+ * The survivors re-asked the detector's own question: do these beads still state one subject their
+ * home states too (reparent.ts `groupedUnder`)?
+ *
+ * A proposal's subjects are the UNION of every topic group the home hosts, so one proposal can carry
+ * an escalation pair and a docker pair. Lose one member of each and two unrelated survivors still
+ * clear a raw {@link MIN_CLUSTER_SIZE} count, while a fresh patrol — which groups before it counts —
+ * would emit nothing at all. Counting is therefore not enough: the grouping predicate has to be
+ * recomputed over whoever is left.
+ *
+ * A member no surviving group reaches is DROPPED rather than fatal, exactly like a closed or re-homed
+ * one: its evidence left with the members it agreed with, and refusing over it would hold the pair
+ * that still agrees hostage while the target-only fingerprint suppressed their fresh proposal.
+ */
+function regroupSurvivors(
+  plan: GardenerPlan,
+  home: Bead,
+  steps: ApplyStep[],
+  inPlace: Bead[],
+  index: BoardIndex,
+): Survivors {
+  if (plan.kind !== "parentless-cluster") return { steps, dropped: [] };
+  const moving = steps.flatMap((step) => {
+    const subject = index.byId.get(step.id);
+    return subject ? [subject] : [];
+  });
+  const grouped = groupedUnder(home, [...moving, ...inPlace]);
+  return {
+    steps: steps.filter((step) => grouped.has(step.id)),
+    dropped: steps.filter((step) => !grouped.has(step.id)).map((step) => step.id),
+  };
+}
+
+/**
+ * How a cluster that no longer holds together reads to the approver who has to decide it.
+ *
+ * `detectParentlessClusters` needs {@link MIN_CLUSTER_SIZE} loose beads stating one subject their
+ * home states too before it will call a home obvious — a single loose bead sharing a topic with a
+ * card is the weak evidence this whole detector was rebuilt to stop proposing on (anton-9hpp).
+ * Dropping members must not smuggle the move below that bar, and {@link regroupSurvivors} asks the
+ * detector's own predicate rather than a count, so a two-member cluster with one member re-homed and
+ * a four-member one whose two pairs each lost a member both land here.
+ */
+function clusterDissolved(home: Bead, left: string[]): string {
+  return `${list(left)} is all that is left of this cluster — it takes ${MIN_CLUSTER_SIZE} beads stating one subject ${home.id} states too before a home is obvious, and whatever changed since the filing is the newer reading of where this work belongs; decline it, and re-parent by hand if ${home.id} is still the right home`;
+}
+
+/**
+ * What one member of a cluster resolves to: a refusal reason, the step that moves it, the answer
+ * that drops it, or the bead itself when it already sits where the proposal wants it.
  */
 function reparentSubject(
   plan: GardenerPlan,
@@ -397,7 +435,7 @@ function reparentSubject(
   home: Bead,
   index: BoardIndex,
   at: ApplyMoment,
-): string | ApplyStep | Answered | undefined {
+): string | ApplyStep | Answered | InPlace {
   const subject = index.byId.get(id);
   // A DELETED member left the cluster as surely as a closed or re-homed one, so for the kind whose
   // claim is its target it is answered rather than fatal — refusing here would hold the members
@@ -406,10 +444,13 @@ function reparentSubject(
   // ABOUT, so a missing subject is still the board changing out from under the ask.
   if (!subject) return clusterMemberDeleted(plan, id) ?? missing(id);
   const currentParent = beads.parentOf(subject) ?? "";
-  if (currentParent === home.id) return undefined; // already where the proposal wants it
+  if (currentParent === home.id) return { inPlace: subject }; // already where the proposal wants it
   // Asked before every safety bar because they are not ones: they decide whether this bead is still
   // part of the claim at all, and a bead nothing will write to cannot be unsafe to leave alone.
-  const answered = reparentPremiseGone(plan, subject, index) ?? clusterMemberGone(plan, subject, at);
+  const answered =
+    reparentPremiseGone(plan, subject, index) ??
+    clusterMemberLeftLayer(plan, subject) ??
+    clusterMemberGone(plan, subject, at);
   if (answered) return { answered };
   const barred = reparentBarred(plan, subject, home, index, at);
   if (barred) return barred;
@@ -1065,6 +1106,23 @@ function clusterMemberGone(plan: GardenerPlan, subject: Bead, at: ApplyMoment): 
     return `${subject.id} is ${settledWord(subject)} — it left the cluster after this proposal was filed`;
   }
   return subjectBusy(subject, at, DOING.reparent);
+}
+
+/**
+ * The same answer as {@link clusterMemberGone} for the member that is no longer working-layer work
+ * at all — the fourth way a bead leaves a cluster, and the one every bar around it reads as a fatal
+ * home refusal instead.
+ *
+ * `detectParentlessClusters` builds from tasks, bugs and chores (reparent.ts `isClusterTier`).
+ * Promote one to a `feature` and it becomes a board card, so {@link homeWrongTier} refuses the whole
+ * proposal as `feature-under-non-epic` before any member is judged — and the target-only fingerprint
+ * goes on suppressing the fresh proposal the surviving pair would form. Dropping it leaves the
+ * members nobody touched movable, which is what the other three answers already do.
+ */
+function clusterMemberLeftLayer(plan: GardenerPlan, subject: Bead): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  if (isClusterTier(subject)) return undefined;
+  return `${subject.id} is a ${subject.issue_type ?? "bead"} now, not the working-layer work this cluster was derived from — it left the cluster after this proposal was filed`;
 }
 
 /**

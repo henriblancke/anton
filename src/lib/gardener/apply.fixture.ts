@@ -161,8 +161,16 @@ export function applyWith(proposal: Bead, board: Bead[], actor: ApplyActor = "ap
 
 // ── fixture builders ──
 
+/**
+ * Every fixture bead states ONE subject, because a cluster approval re-derives the grouping its
+ * detection rested on (apply-plan.ts `regroupSurvivors`): a board of `anton-a`-titled beads shares
+ * no topic, so it could not have produced the cluster plans these suites approve. A case that needs
+ * the grouping BROKEN overrides the title, which is the only way it breaks in the field either.
+ */
+const SUBJECT = "escalation banner";
+
 export function bead(id: string, extra: Partial<Bead> = {}): Bead {
-  return { id, title: id, status: "open", issue_type: "task", ...extra };
+  return { id, title: `${id}: ${SUBJECT}`, status: "open", issue_type: "task", ...extra };
 }
 
 /** A bead with a parent, expressed the way `bd list --json` carries it (field + inline edge). */

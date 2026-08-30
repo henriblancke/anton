@@ -560,6 +560,10 @@ describe("planApply — what an approval means against the board as it now is", 
      * the whole plan over `anton-a` would leave that valid claim unapplyable until a human declined
      * this bead by hand. The newer decision is still never written over: `anton-a` gets no step.
      */
+    /** The members an apply decision actually writes to, in order. */
+    const moved = (decision: ReturnType<typeof decide>): string[] =>
+      decision.status === "apply" ? decision.steps.map((s) => s.id) : [];
+
     describe("a cluster member the board has answered", () => {
       /** Three members, so dropping one still leaves the detector's own MIN_CLUSTER_SIZE behind. */
       const THREE = planFor({
@@ -569,8 +573,6 @@ describe("planApply — what an approval means against the board as it now is", 
         target: CARD.id,
       });
       const rest = [CARD, bead("anton-b"), bead("anton-c")];
-      const moved = (decision: ReturnType<typeof decide>): string[] =>
-        decision.status === "apply" ? decision.steps.map((s) => s.id) : [];
 
       it("drops the member somebody re-homed and moves the ones nobody answered", () => {
         const other = bead("anton-other", { issue_type: "feature" });
@@ -627,7 +629,7 @@ describe("planApply — what an approval means against the board as it now is", 
         const other = bead("anton-other", { issue_type: "feature" });
         const board = [CARD, other, child("anton-a", other.id), bead("anton-b")];
         expect(reason(decide(CLUSTER, board))).toMatch(
-          /anton-b is all that is left of this cluster — it takes 2 beads agreeing on a home/,
+          /anton-b is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too/,
         );
       });
 
@@ -636,6 +638,71 @@ describe("planApply — what an approval means against the board as it now is", 
       it("counts a member already sitting under the home towards the minimum", () => {
         const decision = decide(CLUSTER, [CARD, child("anton-a", CARD.id), bead("anton-b")]);
         expect(moved(decision)).toEqual(["anton-b"]);
+      });
+
+      /**
+       * The fourth way a member leaves, and the one every bar around it read as a fatal HOME refusal:
+       * promoted to a `feature`, it is a board card, and the tier taxonomy rejects the move as
+       * `feature-under-non-epic` before any member is judged — taking the pair that is still a cluster
+       * down with it, while the target-only fingerprint suppressed their fresh proposal.
+       */
+      it("drops a member promoted out of the working layer since the filing", () => {
+        const decision = decide(THREE, [...rest, bead("anton-a", { issue_type: "feature" })]);
+        expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
+        expect(decision.status === "apply" ? decision.summary : "").toContain(
+          "(1 member(s) no longer in the cluster)",
+        );
+      });
+    });
+
+    /**
+     * A proposal's subjects are the UNION of every topic group its home hosts, so one target can
+     * carry an escalation pair AND a docker pair. Lose one member of each and the raw count still
+     * reads as a cluster while the survivors agree about nothing — a fresh patrol, which groups
+     * before it counts, would propose nothing at all. So the grouping is recomputed over whoever is
+     * left rather than trusted from the filing.
+     */
+    describe("a cluster whose surviving members no longer state one subject", () => {
+      const HOME = bead("anton-card", {
+        issue_type: "feature",
+        title: "Escalation banner and docker image",
+      });
+      const member = (id: string, title: string): Bead => bead(id, { title });
+      const PAIRS = planFor({
+        kind: "parentless-cluster",
+        move: "reparent",
+        subjects: ["anton-a1", "anton-a2", "anton-d1", "anton-d2"],
+        target: HOME.id,
+      });
+      const escalation = [
+        member("anton-a1", "Escalation banner rollout"),
+        member("anton-a2", "Escalation banner copy"),
+      ];
+      const docker = [
+        member("anton-d1", "Docker image cache"),
+        member("anton-d2", "Docker image build"),
+      ];
+
+      it("moves both groups while both still hold", () => {
+        const decision = decide(PAIRS, [HOME, ...escalation, ...docker]);
+        expect(moved(decision)).toEqual(["anton-a1", "anton-a2", "anton-d1", "anton-d2"]);
+      });
+
+      // One survivor from each pair reaches MIN_CLUSTER_SIZE by count alone and by nothing else.
+      it("refuses two unrelated survivors that only add up to the floor", () => {
+        const board = [HOME, escalation[0]!, docker[0]!];
+        expect(reason(decide(PAIRS, board))).toMatch(
+          /anton-a1, anton-d1 is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too/,
+        );
+      });
+
+      // …and the pair that DOES still hold is not held hostage to the survivor that no longer does.
+      it("moves the group that still holds and drops the survivor that does not", () => {
+        const decision = decide(PAIRS, [HOME, ...escalation, docker[0]!]);
+        expect(moved(decision)).toEqual(["anton-a1", "anton-a2"]);
+        expect(decision.status === "apply" ? decision.summary : "").toContain(
+          "(2 member(s) no longer in the cluster)",
+        );
       });
     });
 
