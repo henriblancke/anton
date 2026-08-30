@@ -17,6 +17,7 @@ import { parseAcceptance, parseGoal, toStandaloneItem } from "../ticket-view";
 import { detectBoard } from "./detect";
 import {
   concernedBeads,
+  fingerprintLabelOf,
   GARDENER_PLAN_KEY,
   makeDetection,
   proposalFingerprint,
@@ -417,21 +418,27 @@ describe("duplicate proposals from overlapping patrols", () => {
     // Ordered by id, not by board order: two patrols reconciling the same board concurrently must
     // pick the same survivor, or they fold each other away and no ask survives.
     expect(planReconciliation([twin("anton-p2"), twin("anton-p1")])).toEqual([
-      { fingerprint, keep: "anton-p1", fold: ["anton-p2"], held: [] },
+      {
+        fingerprint,
+        keep: "anton-p1",
+        keepLabel: fingerprint,
+        fold: [{ id: "anton-p2", label: fingerprint }],
+        held: [],
+      },
     ]);
   });
 
   it("keeps the twin a human approved, however late it was filed", () => {
     const [duplicate] = planReconciliation([twin("anton-p1"), approved("anton-p2")]);
     expect(duplicate.keep).toBe("anton-p2");
-    expect(duplicate.fold).toEqual(["anton-p1"]);
+    expect(duplicate.fold).toEqual([{ id: "anton-p1", label: fingerprint }]);
   });
 
   it("keeps the twin a run is applying rather than closing it mid-flight", () => {
     const claimed = twin("anton-p2", { status: "in_progress", assignee: "runner-1" });
     const [duplicate] = planReconciliation([twin("anton-p1"), claimed]);
     expect(duplicate.keep).toBe("anton-p2");
-    expect(duplicate.fold).toEqual(["anton-p1"]);
+    expect(duplicate.fold).toEqual([{ id: "anton-p1", label: fingerprint }]);
   });
 
   it("leaves a second APPROVED twin standing — folding one discards a decision", () => {
@@ -447,6 +454,48 @@ describe("duplicate proposals from overlapping patrols", () => {
     });
     expect(planReconciliation([twin("anton-p1"), declined])).toEqual([]);
     expect(planReconciliation([twin("anton-p1"), twin("anton-p2", { status: "closed" })])).toEqual([]);
+  });
+
+  /**
+   * The other half of the identity rollout (anton-9hpp). Suppression stops the NEXT patrol filing a
+   * fresh-format twin, but the pre-rollout asks it was filed beside are still there: several open
+   * `parentless-cluster` proposals for ONE target, each carrying the membership hash of whatever was
+   * loose the night it ran. Grouped by label they look like different claims and nothing ever folds
+   * them, so the duplicate pile target identity exists to remove would sit on the board forever.
+   * They are one claim, and each is closed against its OWN label — not the claim they grouped under.
+   */
+  it("folds pre-rollout cluster twins for one target, whatever labels they carry", async () => {
+    const [detection] = detect(CLUSTERED).filter((d) => d.kind === "parentless-cluster");
+    const legacy = (id: string, subjects: string[]): Bead => {
+      const label = proposalFingerprint(
+        "parentless-cluster",
+        `parentless-cluster:${[...subjects].sort().join("+")}>${detection.target}`,
+      );
+      return bead(id, {
+        labels: [label, ...PROPOSAL_LABELS],
+        metadata: {
+          [GARDENER_PLAN_KEY]: {
+            kind: detection.kind,
+            move: detection.move,
+            fingerprint: label,
+            subjects,
+            target: detection.target,
+          },
+        },
+      });
+    };
+    const older = legacy("anton-p1", ["anton-l1", "anton-l2"]);
+    const newer = legacy("anton-p2", ["anton-l1", "anton-l2", "anton-l3"]);
+    expect(fingerprintLabelOf(older)).not.toBe(fingerprintLabelOf(newer));
+
+    const [duplicate] = planReconciliation(onBoard(older, newer));
+
+    expect(duplicate.fingerprint).toBe(detection.fingerprint);
+    expect(duplicate.keep).toBe("anton-p1");
+    expect(duplicate.fold).toEqual([{ id: "anton-p2", label: fingerprintLabelOf(newer) }]);
+
+    const result = await reconcileDuplicateProposals(REPO, [older, newer]);
+    expect(result.folded).toEqual([{ id: "anton-p2", into: "anton-p1" }]);
   });
 
   it("closes the fold plainly, naming the survivor — never as abandoned", async () => {
