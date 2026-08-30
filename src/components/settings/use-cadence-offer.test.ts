@@ -262,3 +262,96 @@ describe("enabling product-master under an already armed picker", () => {
     expect(result.current.offer).toBeNull();
   });
 });
+
+/**
+ * A toggle that fails while an ANSWER is in flight. The offer is already off screen, so the toggle
+ * withdraws nothing and the answer's own failure reads the optimistic row and declines to restore —
+ * which leaves the operator with a live premise and no question unless the failed toggle re-asks.
+ */
+describe("a product-master toggle that does not land while an answer is in flight", () => {
+  const armed = (): Rows => ({
+    "board-picker": { enabled: true, cron: "*/10 * * * *" },
+    "product-master": { enabled: true, cron: WEEKLY },
+  });
+
+  it("re-opens the question neither the failed decline nor the failed toggle could put back", async () => {
+    const rows = { current: armed() };
+    let failDecline!: (res: Response) => void;
+    const patchSettings = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          failDecline = resolve;
+        }),
+    );
+    const { result } = renderHook(() =>
+      useCadenceOffer({
+        rows,
+        initialRows: rows.current,
+        keepWeekly: false,
+        patchSettings,
+        setCron: vi.fn(async () => true),
+      }),
+    );
+    expect(result.current.offer).not.toBeNull();
+
+    // The decline goes out and is still open when the operator switches product-master off.
+    let declining!: Promise<void>;
+    act(() => {
+      declining = result.current.decline();
+    });
+    expect(result.current.offer).toBeNull();
+
+    let failToggle!: (ok: boolean) => void;
+    let toggle!: Promise<void>;
+    act(() => {
+      toggle = result.current.aroundToggle("product-master", false, () => {
+        rows.current = { ...rows.current, "product-master": { enabled: false, cron: WEEKLY } };
+        return new Promise<boolean>((resolve) => {
+          failToggle = resolve;
+        });
+      });
+    });
+
+    // The decline fails against the optimistically disabled row: the opt-out is reverted, but there
+    // is no live question to put back yet.
+    await act(async () => {
+      failDecline(new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
+      await declining;
+    });
+    expect(result.current.offer).toBeNull();
+
+    // The toggle then fails too and product-master goes back to enabled-and-weekly under an armed
+    // picker — the unanswered question, live again.
+    await act(async () => {
+      rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+      failToggle(false);
+      await toggle;
+    });
+
+    expect(result.current.offer).toMatchObject({ automationId: "product-master", cron: DAILY });
+  });
+
+  it("stays silent when the decline landed — the operator answered, the failure is not a re-ask", async () => {
+    const rows = { current: armed() };
+    const { result } = renderHook(() =>
+      useCadenceOffer({
+        rows,
+        initialRows: rows.current,
+        keepWeekly: false,
+        patchSettings: vi.fn(async () => new Response("{}", { status: 200 })),
+        setCron: vi.fn(async () => true),
+      }),
+    );
+
+    await act(() => result.current.decline());
+    await act(() =>
+      result.current.aroundToggle("product-master", false, async () => {
+        rows.current = { ...rows.current, "product-master": { enabled: false, cron: WEEKLY } };
+        rows.current = { ...rows.current, "product-master": { enabled: true, cron: WEEKLY } };
+        return false;
+      }),
+    );
+
+    expect(result.current.offer).toBeNull();
+  });
+});

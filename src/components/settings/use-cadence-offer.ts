@@ -172,10 +172,12 @@ export function useCadenceOffer({
       const restored = id === AUTOPILOT_ARMING_AUTOMATION && armingIntent.current === next;
       if (restored) armingIntent.current = priorIntent;
       if (withdrawn && restorable(withdrawn, at)) setOffer(withdrawn);
-      // A disarm that never landed leaves the picker armed with nothing to put back — and if it
-      // raced an arm, it also suppressed that arm's own question, which was therefore never asked
-      // at all. Re-open it from the live rows; `ask()` stays silent unless the premise still holds.
-      else if (restored && armingIntent.current) ask();
+      // Nothing to put back, but the toggle can still have SUPPRESSED a question that was therefore
+      // never asked at all: a disarm that raced an arm, or a product-master disable clicked while an
+      // accept or decline was in flight — the offer was already off screen, so that click withdrew
+      // nothing, and the answer's own failure read the optimistic disabled row and declined to
+      // restore. Re-open from the live rows; `ask()` stays silent unless the premise still holds.
+      else if ((restored && armingIntent.current) || id === CADENCE_COUPLED_AUTOMATION) ask();
     }
     // The coupling is what opens an offer, and either side can be the half that completes it: the
     // arm makes product-master's staleness cost something, and enabling product-master gives an
