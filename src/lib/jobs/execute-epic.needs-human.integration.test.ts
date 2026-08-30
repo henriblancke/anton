@@ -202,8 +202,9 @@ process.exit(0);`),
     const ask = "the staging DB password MARKER_PW has to be rotated by a person";
     const feature = await approvedFeature("Needs a rotation");
 
-    const first = await armHumanGate(repo, feature.id, ask);
-    expect(await armHumanGate(repo, feature.id, ask)).toBe(first); // same ask ⇒ same wait
+    const { gateId: first } = await armHumanGate(repo, feature.id, ask);
+    // same ask ⇒ same wait
+    expect((await armHumanGate(repo, feature.id, ask)).gateId).toBe(first);
     expect((await gatesBlocking(feature.id)).map((g) => g.id)).toEqual([first]);
 
     // The label is what makes the supersede below anton's to make — a gate without it reads as a
@@ -211,7 +212,7 @@ process.exit(0);`),
     expect((await gatesBlocking(feature.id))[0].labels ?? []).toContain(HUMAN_GATE_ARMED_LABEL);
 
     const newer = "actually MARKER_ZONE needs a DNS record first";
-    const second = await armHumanGate(repo, feature.id, newer);
+    const { gateId: second } = await armHumanGate(repo, feature.id, newer);
     expect(second).not.toBe(first);
 
     // One open wait, carrying the current ask. Nothing else would ever have closed the old one:
@@ -238,7 +239,10 @@ process.exit(0);`),
     const armed = await armHumanGate(repo, feature.id, "the sandbox key MARKER_KEY is not mine to make");
 
     const open = await gatesBlocking(feature.id);
-    expect(open.map((g) => g.id).sort()).toEqual([armed, hold].sort());
+    expect(open.map((g) => g.id).sort()).toEqual([armed.gateId, hold].sort());
+    // The hold comes back with the arm so the park can name it — resolving the armed gate alone
+    // leaves the target blocked, and nothing else would tell the operator what still holds it.
+    expect(armed.held).toEqual([hold]);
   });
 
   it("refuses an epic target loudly instead of littering the board with a gate that blocks nothing", async () => {

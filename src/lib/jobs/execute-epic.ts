@@ -1642,10 +1642,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // `bd gate resolve` can end, and it would sit in the waiting-on-a-person surface forever. It
         // settles FAILED instead — the ask still reaches the operator, through a run state that
         // reads as needing attention rather than as patience.
-        let gateId: string | undefined;
+        let gate: { gateId: string; held: string[] } | undefined;
         let gateError: string | undefined;
         try {
-          gateId = await armHumanGate(repo, epicBeadId, e.ask);
+          gate = await armHumanGate(repo, epicBeadId, e.ask);
         } catch (failure) {
           gateError = failure instanceof Error ? failure.message : String(failure);
           console.error(
@@ -1657,8 +1657,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           db,
           clock,
           runId,
-          gateId
-            ? { status: "parked", error: needsHumanParkMessage(e, gateId) }
+          gate
+            ? { status: "parked", error: needsHumanParkMessage(e, gate.gateId, gate.held) }
             : { status: "failed", error: ungatedAskMessage(e, gateError), endedAt: clock.now() },
         );
       } else if (e instanceof BlockedTailError) {
@@ -2251,7 +2251,9 @@ export function humanGatePlan(
 
 /**
  * Arm the run target's HUMAN wait: a `human` gate blocking the target, whose reason IS the agent's
- * ask, verbatim. Returns the gate's id — the one command that releases the parked run.
+ * ask, verbatim. Returns that gate's id alongside the ids of every OTHER open human gate on the
+ * target — the holds a person armed, which this arm leaves untouched but which keep the target
+ * blocked, so the park message can name them instead of promising one `bd gate resolve` is enough.
  *
  * The one gate flavour nothing automates away, by design on both sides: `bd gate check` never
  * evaluates a human gate, and gate-check's expiry pass deliberately skips it (a wait on a person is
@@ -2286,7 +2288,7 @@ export async function armHumanGate(
   repo: string,
   targetId: string,
   ask: string | undefined,
-): Promise<string> {
+): Promise<{ gateId: string; held: string[] }> {
   const reason = humanGateReason(targetId, ask);
   // STRICT, and no catch: this read is the ONLY thing that can tell "the ask is already with
   // someone" from "nothing is armed", and bd omits gate beads from every ordinary listing — so a
@@ -2328,7 +2330,9 @@ export async function armHumanGate(
         `left open; the run resumes only once that hold is resolved too`,
     );
   }
-  if (open) return open.id; // this ask is already with a human — a second gate would race it
+  const heldIds = held.map((g) => g.id);
+  // this ask is already with a human — a second gate would race it
+  if (open) return { gateId: open.id, held: heldIds };
 
   const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
   // Best-effort, unlike everything above: the gate exists and carries the ask, so the park is
@@ -2340,14 +2344,22 @@ export async function armHumanGate(
         `(${HUMAN_GATE_ARMED_LABEL}) — a later ask will leave it open instead of superseding it`,
     );
   }
-  return gateId;
+  return { gateId, held: heldIds };
 }
 
 /**
- * The park reason on the run row: the agent's ask, and the one command that releases the run.
+ * The park reason on the run row: the agent's ask, and the command(s) that release the run.
+ *
+ * Every open human gate is named, not just anton's own. A person's hand-made hold keeps blocking the
+ * target after this ask is answered, so a message promising one `bd gate resolve` resumes the run
+ * sends the operator down a path that leaves it parked, with nothing naming what still holds it.
  */
-function needsHumanParkMessage(e: NeedsHumanError, gateId: string): string {
-  return `${e.message} Answer it, then \`bd gate resolve ${gateId}\` — closing that gate resumes this run.`;
+function needsHumanParkMessage(e: NeedsHumanError, gateId: string, held: string[]): string {
+  const base = `${e.message} Answer it, then \`bd gate resolve ${gateId}\``;
+  return held.length > 0
+    ? `${base}. ${held.length} other open human gate(s) on this target were not armed by anton ` +
+        `(${held.join(", ")}) — the run resumes only once those are resolved too.`
+    : `${base} — closing that gate resumes this run.`;
 }
 
 /**
