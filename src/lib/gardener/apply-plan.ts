@@ -385,9 +385,11 @@ function homeStoppedCarrying(
  * the filing and the approval would take the cluster anyway — and hanging one off a leaf card is
  * exactly what the bar exists to stop: it turns one PR's worth of work into somebody else's epic.
  *
- * `named` is every id the ask names, and they are excluded from the count. A member somebody filed
- * under the home by hand since the proposal rides that card now, so counting it would let the ask
- * prove its own premise with the very move it is asking for — as would an EARLIER step of the same
+ * `named` is every id the ask names, and they are excluded from the count — along with everything
+ * riding on them (reparent.ts `ridesOnNamed`), because `cardOf` walks the whole chain and a named
+ * member's own children reach the home only THROUGH it. A member somebody filed under the home by
+ * hand since the proposal rides that card now, so counting it or its subtree would let the ask prove
+ * its own premise with the very move it is asking for — as would an EARLIER step of the same
  * cluster, which is why the write half re-asks this with the same set (apply-steps.ts
  * `assertClusterHolds`) rather than with whatever is left to move.
  *

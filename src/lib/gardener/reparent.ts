@@ -337,6 +337,30 @@ function intersectKeys(sets: Set<string>[]): Set<string> {
 export const MIN_CARRIED_TICKETS = 1;
 
 /**
+ * Does this bead reach its card THROUGH one the caller named — or is it one of them?
+ *
+ * Naming a bead has to take its subtree with it. `cardOf` walks the WHOLE parent chain, so the
+ * moment somebody hand-files a named member under the home, every ticket beneath that member is
+ * attributed to the home too — and it reaches the home only by the move being asked for. Counting
+ * one would let the ask prove its own container premise with its own proposal subtree, which is the
+ * exact circularity dropping the members' own ids exists to close.
+ *
+ * The walk stops at the first card ancestor: that is where the attribution this mirrors stops.
+ */
+function ridesOnNamed(index: BoardIndex, bead: Bead, ignore: ReadonlySet<string>): boolean {
+  const seen = new Set<string>();
+  let current: Bead | undefined = bead;
+  while (current && !seen.has(current.id)) {
+    if (ignore.has(current.id)) return true;
+    if (index.cards.ids.has(current.id) && current.id !== bead.id) return false;
+    seen.add(current.id);
+    const parentId = beads.parentOf(current);
+    current = parentId ? index.byId.get(parentId) : undefined;
+  }
+  return false;
+}
+
+/**
  * How many tickets each board card carries, counted through the board's OWN card attribution
  * (`boardCards.cardOf`), so "rides this card" means here what it means on the board itself.
  *
@@ -344,9 +368,10 @@ export const MIN_CARRIED_TICKETS = 1;
  * of this kind under it — and a card whose eight tickets all shipped answered that question just as
  * clearly as one whose eight are open.
  *
- * `ignore` drops ids from the count. It is how the approval re-asks the bar without letting the
- * cluster's own members — which somebody may have filed under the home by hand since the proposal —
- * stand in for the pre-existing tickets that made the home obvious in the first place.
+ * `ignore` drops named ids AND everything riding on them ({@link ridesOnNamed}) from the count. It is
+ * how the approval re-asks the bar without letting the cluster's own members — which somebody may
+ * have filed under the home by hand since the proposal — stand in for the pre-existing tickets that
+ * made the home obvious in the first place.
  */
 export function ticketsPerCard(
   index: BoardIndex,
@@ -354,8 +379,8 @@ export function ticketsPerCard(
 ): Map<string, number> {
   const carried = new Map<string, number>();
   for (const bead of index.all) {
-    if (ignore?.has(bead.id)) continue;
     if (!isRunTicket(bead, index.cards)) continue;
+    if (ignore && ridesOnNamed(index, bead, ignore)) continue;
     const card = index.cards.cardOf(bead);
     if (card) carried.set(card, (carried.get(card) ?? 0) + 1);
   }
@@ -363,7 +388,8 @@ export function ticketsPerCard(
 }
 
 /**
- * WHICH tickets one card carries, by the same attribution {@link ticketsPerCard} counts them with.
+ * WHICH tickets one card carries, by the same attribution {@link ticketsPerCard} counts them with —
+ * `ignore` included, so a named member's descendants are no more evidence here than the member is.
  *
  * The ids rather than the count, because an approval has to hold them: the write half locks the
  * tickets its home's container premise rests on and re-asks the bar over those beads alone
@@ -378,9 +404,9 @@ export function carriedTickets(
   return index.all
     .filter(
       (bead) =>
-        !ignore?.has(bead.id) &&
         isRunTicket(bead, index.cards) &&
-        index.cards.cardOf(bead) === cardId,
+        index.cards.cardOf(bead) === cardId &&
+        !(ignore && ridesOnNamed(index, bead, ignore)),
     )
     .map((bead) => bead.id);
 }

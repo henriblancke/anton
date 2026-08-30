@@ -302,6 +302,36 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(refusal(decide(CLUSTER, halfApplied))).toMatch(/carries no tickets of its own/);
     });
 
+    // …nor may a member's SUBTREE stand in for it. `cardOf` walks the whole parent chain, so a
+    // hand-moved member drags its own children onto the home too — and they reach it only through
+    // the move being asked for, which is the same circularity by one more hop.
+    it("does not let a named member's descendants prove it either", () => {
+      const halfApplied = [
+        CARD,
+        child("anton-a", CARD.id),
+        child("anton-a1", "anton-a"),
+        bead("anton-b"),
+      ];
+      expect(refusal(decide(CLUSTER, halfApplied))).toMatch(/carries no tickets of its own/);
+    });
+
+    // And the same subtree is kept out of the carriers the WRITE half re-asks the bar over: a
+    // premise recorded on the proposal's own descendants would be re-proved by its own move.
+    it("records only independent carriers on the step's premise", () => {
+      const decision = decide(CLUSTER, [
+        CARD,
+        CARRIED,
+        child("anton-a", CARD.id),
+        child("anton-a1", "anton-a"),
+        bead("anton-b"),
+      ]);
+      expect(decision.status).toBe("apply");
+      const carriers = (decision.status === "apply" ? decision.steps : []).map((step) =>
+        step.verb === "reparent" ? step.cluster?.carriers : undefined,
+      );
+      expect(carriers).toEqual([[CARRIED.id]]);
+    });
+
     it("refuses a home that is not a board card — the state the proposal exists to fix", () => {
       // An epic WITH a feature child is a container: work parented to it rides no card.
       const container = bead("anton-card", { issue_type: "epic" });
