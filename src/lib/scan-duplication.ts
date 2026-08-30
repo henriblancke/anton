@@ -196,12 +196,16 @@ const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|
  * concatenates a regex source, and reading that slash as division leaves the `/*` inside the
  * character class to open a comment over the rest of the file.
  *
+ * Division is one of them: `total / /[/*]/.source.length` divides by a regex's source length, and
+ * the slash before a divisor expects an expression exactly as `+` does. The `//` and `/*` forms are
+ * recognized ahead of this rule everywhere it is read, so a comment's own slashes never reach it.
+ *
  * `++`/`--` are excluded, since `i++ / 2` divides: the trailing `+` there is a postfix operator that
  * DOES yield a value. `<` and `>` are excluded for the opposite reason — a comparison against a
  * regex literal does not occur, while `</div>` and `/>` do on every JSX line, and reading a closing
  * tag as a regex opener would blank the brackets between two tags on one line.
  */
-const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^]|(?<!\+)\+|(?<!-)-`;
+const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^/]|(?<!\+)\+|(?<!-)-`;
 
 /**
  * A regex literal, and only where a `/` can BEGIN one: at the start of a line, or after an opener,
@@ -564,6 +568,27 @@ function afterBlockComment(line: string): string | undefined {
 }
 
 /**
+ * The line with a trailing `#` note cut off — `)  # keep { documented` back to `)`. A `#`-comment
+ * file has no block-comment state and no `stripNoise` rule for the marker, so an inline note reaches
+ * the delta counters as syntax: one unmatched delimiter inside the prose holds a parenthesized
+ * import open over every executable line below it, and each is dropped as a specifier.
+ *
+ * Only a `#` that starts a word counts, so shell's `${#items[@]}` and `$#` keep their delimiters;
+ * quoted strings are stepped over, so a `#` inside one opens nothing.
+ */
+function withoutHashComment(line: string): string {
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === "'" || char === '"') {
+      i = afterQuoted(line, i) - 1;
+      continue;
+    }
+    if (char === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i).trimEnd();
+  }
+  return line;
+}
+
+/**
  * Where a block comment OPENS on this line and is never closed on it — `value: string, /* why`.
  * Quoted strings, templates, regex literals and `//` notes are stepped over, so a `/*` inside any
  * of them opens nothing, and a comment that closes is skipped past so a later opener is still
@@ -745,6 +770,11 @@ function classifyLines(
         }
       }
     }
+
+    // The same for a `#` note, which trails code as readily as it leads a line — `)  # keep {
+    // documented`. Cut here, before any delta is counted, so the prose after the marker cannot hold
+    // a wrapped import open over the executable lines below it.
+    if (opts.hashComments) line = withoutHashComment(line);
 
     if (statement) {
       if (statement === "signature") {

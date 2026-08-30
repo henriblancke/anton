@@ -1939,6 +1939,43 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("5 import");
     });
 
+    // A `#` note trails code as readily as it leads a line, and its prose is not syntax. Counted,
+    // the `{` inside `)  # keep { documented` cancels the paren that ends the import, so the state
+    // never closes and every executable window below it is dropped as a specifier list.
+    it("cuts a trailing hash note so an unmatched delimiter in it cannot hold an import open", async () => {
+      const repo = writeRepo({
+        "src/inline.py": [
+          "from package.module import (",
+          "    parse_bd_version,",
+          ")  # keep { documented",
+          "total = compute(rows)",
+          "report(total)",
+          "flush(report)",
+          "",
+        ].join("\n"),
+        "src/grouped.py": [
+          "from package.module import (",
+          "    parse_bd_version,",
+          "    preflight_bd,",
+          "    resolve_bd_bin,",
+          ")",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/inline.py", 4]], 3),
+        clone([["src/grouped.py", 1]], 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the real specifier list beside it is still dropped, so the survivor is the
+      // note being cut rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/inline.py" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/grouped.py" }]);
+      expect(result.duplication.dropped[0].reason).toContain("5 import");
+    });
+
     // A block comment can open AFTER code — `value: string, /* why`. Left unread, the prose below it
     // counts as syntax: its unmatched `(` holds the parameter list open past the real `)` and files
     // every call in the body as more parameter list.
@@ -2111,6 +2148,32 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toMatchObject([{ FilePath: "src/marker.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // A divisor is an expression too — `total / /[/*]/.source.length` divides by a regex's source
+    // length. Read as division all the way through, the `/*` inside the character class opens a
+    // comment that runs to the end of the file and every real duplication window below it is
+    // dropped unread.
+    it("reads a slash after a division operator as a regex, not as another division", async () => {
+      const repo = writeRepo({
+        "src/length.ts": [
+          "export const parts = total / /[/*]/.source.length;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/length.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/length.ts", Line: 3 }]);
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
