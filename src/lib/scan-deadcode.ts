@@ -916,9 +916,9 @@ async function filesMentioning(
  *
  * One reference in ANOTHER file is enough to keep the symbol alive: the collector's own claim is
  * that nothing references it, and a single word-boundary hit on a code line outside its declaration
- * falsifies exactly that. The declaring file is excluded because a symbol always mentions itself
- * there — counting it would drop every signal, which is the one outcome worse than counting
- * phantoms. `opts.exclude` is the scan's own exclusion set, so the search covers the files stringer
+ * falsifies exactly that. Every file this scan reports as declaring the symbol is excluded, because
+ * a symbol always mentions itself there — counting a declaration would drop every signal, which is
+ * the one outcome worse than counting phantoms. `opts.exclude` is the scan's own exclusion set, so the search covers the files stringer
  * inspected and no others — a committed build or vendor tree is not a caller of the source it copied.
  *
  * Only reached when a scan actually carries a deadcode signal, so an ordinary pass runs no git.
@@ -937,6 +937,19 @@ export async function filterDeadcodeSignals(
   if (relevant.length === 0) return { kept: signals, deadcode: { dropped: [] } };
 
   const pathspecs = excludePathspecs(opts.exclude ?? []);
+  // Every file that declares a given symbol, gathered before any grep. Two signals can name the
+  // same symbol in different files (an overload in a sibling module, a helper copied per package);
+  // excluding only the signal's own path leaves each declaration looking like the other's caller,
+  // and both genuinely dead symbols vanish from the counts.
+  const declarers = new Map<string, Set<string>>();
+  for (const signal of relevant) {
+    const symbol = symbolOf(signal);
+    const path = filePathOf(repoPath, signal);
+    if (!symbol || !path) continue;
+    const paths = declarers.get(symbol);
+    if (paths) paths.add(path);
+    else declarers.set(symbol, new Set([path]));
+  }
   const seen = new Map<string, string[]>();
   /** One read per file, however many symbols land in it. */
   const masked = new Map<string, MaskedFile | undefined>();
@@ -971,7 +984,8 @@ export async function filterDeadcodeSignals(
       seen.set(symbol, files);
     }
 
-    const callers = files.filter((file) => file !== path);
+    const declaring = declarers.get(symbol) ?? new Set([path]);
+    const callers = files.filter((file) => !declaring.has(file));
     if (callers.length === 0) continue;
     const shown = callers.slice(0, 3);
     const rest = callers.length - shown.length;

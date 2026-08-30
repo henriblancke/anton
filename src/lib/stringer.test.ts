@@ -1852,6 +1852,45 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/klass.ts");
     });
 
+    // Two dead symbols with the same name in different files each mention themselves, so excluding
+    // only the signal's own path makes each declaration read as the other's caller — silently
+    // erasing both true findings.
+    it("does not read one declaration of a symbol as a caller of its namesake", async () => {
+      const repo = initRepo({
+        "packages/a/format.ts": "export function format() {}\n",
+        "packages/b/format.ts": "export function format() {}\n",
+        "packages/b/use.ts": "export function helper() {}\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("packages/a/format.ts", "format"),
+        unused("packages/b/format.ts", "format"),
+      ]);
+
+      expect(result.kept).toHaveLength(2);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // The sibling exclusion must not swallow a real caller: a third file that calls the symbol still
+    // drops both signals, so the fix stays a declaration rule rather than a blanket mute.
+    it("still drops namesake declarations when a third file calls the symbol", async () => {
+      const repo = initRepo({
+        "packages/a/format.ts": "export function format() {}\n",
+        "packages/b/format.ts": "export function format() {}\n",
+        "packages/b/use.ts": "import { format } from './format';\nformat();\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("packages/a/format.ts", "format"),
+        unused("packages/b/format.ts", "format"),
+      ]);
+
+      expect(result.kept).toEqual([]);
+      expect(result.deadcode.dropped).toHaveLength(2);
+      expect(result.deadcode.dropped[0].reason).toContain("packages/b/use.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("format.ts");
+    });
+
     // The budget stops a baseline pass from spending a nightly on greps, but a truncated pass that
     // says nothing reads exactly like a verified one — the health record would count findings the
     // tree was never asked about.
