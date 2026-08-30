@@ -125,6 +125,12 @@ export interface RunTeardown {
   status: "done" | "failed" | "parked";
   /** The run parked on ANOTHER machine's live lease — that machine owns the branch, not this one. */
   foreign?: boolean;
+  /**
+   * The run stopped with uncommitted work it could NOT roll back, and an operator was told to clear
+   * this checkout by hand before resuming. Removal is `--force`, so releasing it would delete the
+   * very tree that instruction points at.
+   */
+  holdsPartialWork?: boolean;
   /** The bead is closed or abandoned: nothing will ever resume in this worktree. */
   beadSettled: boolean;
 }
@@ -137,11 +143,21 @@ export interface RunTeardown {
  * A PARK is the one stop that is not terminal: the run is waiting on a quota window, a blocking
  * review, or a held tail, and resumes IN THIS WORKTREE — unless its bead has since been closed or
  * abandoned, which is exactly the park nothing will come back to.
+ *
+ * The other keep is a stop that left work behind (`holdsPartialWork`): the tree is not residue the
+ * branch can recreate, it is the only copy of what a human was told to clear.
  */
 export function planRunTeardown(run: RunTeardown, openPr: OpenPrNotice): ReapPlan {
   const keep = (reason: string): ReapPlan => ({ removeWorktree: false, deleteBranch: false, reason });
 
   if (run.foreign) return keep("the run is live on another machine");
+  // Ahead of every release below, including a settled bead's: this checkout is the only copy of work
+  // the run could not roll back, and the operator's own recovery note names its path. `--force`
+  // removal would delete exactly what that note asks a human to look at. The scheduled sweep
+  // reclaims it once the bead settles and the human is done with it.
+  if (run.holdsPartialWork) {
+    return keep("it holds partial work the run could not roll back, for a human to clear");
+  }
   if (run.status === "parked" && !run.beadSettled) return keep("the run is parked and resumes here");
   if (!run.beadSettled) {
     return { removeWorktree: true, deleteBranch: false, reason: `${run.beadId} is still open` };

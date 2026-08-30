@@ -13,14 +13,15 @@
  *    so no later ticket can commit it as its own.
  * 3. **A feature where EVERY ticket times out parks.** Absorbing the timeouts is only honest while
  *    something landed; an empty PR is the false success the delivery gate already refuses.
- * 4. **A rollback that FAILS halts the run.** Carrying on past leftovers it could not remove would
- *    hand them to the next ticket's commit — the mis-attribution above, by another route.
+ * 4. **A rollback that FAILS halts the run and keeps its worktree.** Carrying on past leftovers it
+ *    could not remove would hand them to the next ticket's commit — the mis-attribution above, by
+ *    another route — and releasing the checkout would delete the work the operator is sent to clear.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
@@ -271,6 +272,19 @@ process.exit(0);`),
 
       // No PR: this run delivered nothing a reviewer should see.
       expect(beads.getPrRef(await beads.show(repo, epic.id)) ?? null).toBeNull();
+
+      // The worktree the note sends the operator to SURVIVED the run's teardown, leftovers and all.
+      // A failed run normally hands its checkout back, and that release is `--force` — it would
+      // delete the only copy of the work and point the recovery instruction at nothing. The
+      // teardown was never even attempted: a release that ran would have logged its own
+      // worktree-reaper session on this run, and the entry it recorded is what the operator would
+      // read as "this checkout is gone".
+      const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic.id)!;
+      expect(existsSync(join(run.worktreePath!, "locked", "HALF_WRITTEN.md"))).toBe(true);
+      const teardowns = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.runId === run.id && s.kind === "worktree-reaper",
+      );
+      expect(teardowns).toEqual([]);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       await patchSettings({ ticketTimeoutMinutes: undefined });

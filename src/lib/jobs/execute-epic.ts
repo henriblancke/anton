@@ -225,6 +225,15 @@ function blockedRunPoison(beadId: string, readiness: RunReadiness): PoisonEpic {
  */
 class BlockedTailError extends PoisonEpic {}
 
+/**
+ * A timed-out ticket's partial work could NOT be rolled back, so the run halted rather than let the
+ * next ticket commit the leftovers as its own (anton-t1mo). Poison (`PoisonEpic`) like the tail
+ * above, but distinguishable at the teardown: the worktree named in this error is the only copy of
+ * that work and the very path the operator is told to clear, so it must survive the run's release
+ * (`holdsPartialWork`) instead of being force-removed with the rest of a failed run's residue.
+ */
+class WorktreeDirtyError extends PoisonEpic {}
+
 export interface ExecuteEpicDeps {
   db: AntonDb;
   clock?: Clock;
@@ -1717,6 +1726,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // (`unproven`) proves nothing about who else is running, and reading it as foreign skips
             // the teardown of a worktree nobody else owns.
             foreign: isForeignRunOwner(e),
+            // A halt over unrollbackable partial work keeps its checkout: that tree is the only copy
+            // of the work, and the run's own note tells an operator to clear THIS path before
+            // resuming — a `--force` release here would delete what that instruction points at.
+            holdsPartialWork: e instanceof WorktreeDirtyError,
           }),
         );
       }
@@ -2020,7 +2033,7 @@ async function runTicket(args: {
       // nothing pauses the run, so the wrong commit lands long before an operator reads it. Halt
       // instead (poison → park) and let a human clear the tree before anything else commits.
       if (leftovers) {
-        throw new PoisonEpic(
+        throw new WorktreeDirtyError(
           `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
             `partial work could NOT be rolled back — the run's worktree (${worktreePath}) still ` +
             `carries changes that the next ticket would commit as its own, so the run stopped ` +

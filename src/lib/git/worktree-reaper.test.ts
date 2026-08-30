@@ -115,6 +115,23 @@ describe("planRunTeardown — what a stopped run owes back", () => {
     expect(plan).toMatchObject({ removeWorktree: true, deleteBranch: true });
   });
 
+  it("keeps a checkout holding work the run could not roll back — the operator was sent to it", () => {
+    const plan = planRunTeardown(
+      { ...run, status: "failed", beadSettled: false, holdsPartialWork: true },
+      undefined,
+    );
+    expect(plan).toMatchObject({ removeWorktree: false, deleteBranch: false });
+    expect(plan.reason).toContain("could not roll back");
+  });
+
+  it("keeps that checkout even once the bead settles — removal is --force, and this is the only copy", () => {
+    const plan = planRunTeardown(
+      { ...run, status: "failed", beadSettled: true, holdsPartialWork: true },
+      undefined,
+    );
+    expect(plan).toMatchObject({ removeWorktree: false, deleteBranch: false });
+  });
+
   it("touches nothing when the run is live on another machine", () => {
     const plan = planRunTeardown(
       { ...run, status: "parked", beadSettled: true, foreign: true },

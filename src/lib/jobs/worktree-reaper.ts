@@ -84,6 +84,8 @@ export function reapSummary(report: ReapReport): string {
  * Hand back a STOPPED run's worktree and branch, and record what was released and what was kept
  * (anton-hrun.1). Called on every terminal outcome — delivered, failed, killed, abandoned, and a
  * park whose bead has since settled — so no outcome but "still resumable" leaves a checkout behind.
+ * The exception is a stop that left work behind (`holdsPartialWork`): that tree is what an operator
+ * was told to clear by hand, so it is kept rather than force-removed.
  *
  * The bead's status is re-read here rather than taken from the run's own snapshot: an abandon closes
  * the bead while the run it killed is still unwinding, and a stale "open" would keep the branch of
@@ -105,6 +107,8 @@ export async function releaseRunResources(args: {
   status: RunTeardown["status"];
   /** The run stopped on ANOTHER machine's live lease — this machine touches neither resource. */
   foreign?: boolean;
+  /** The run stopped leaving uncommitted work a human was told to clear from this checkout. */
+  holdsPartialWork?: boolean;
 }): Promise<ReapEntry> {
   const entry = await releaseRunWorktree({
     repoPath: args.repoPath,
@@ -114,6 +118,7 @@ export async function releaseRunResources(args: {
       beadId: args.beadId,
       status: args.status,
       foreign: args.foreign,
+      holdsPartialWork: args.holdsPartialWork,
     },
     isBeadSettled: async () => (await beads.show(args.repoPath, args.beadId)).status === "closed",
   });
