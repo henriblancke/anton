@@ -6,7 +6,6 @@ import {
   buildCookArgs,
   buildPruneArgs,
   buildUpdateArgs,
-  createDoltSync,
   getSyncStatus,
   getSyncStatusToken,
   isBenignSyncOutput,
@@ -20,6 +19,7 @@ import {
   type Bead,
 } from "./bd";
 import { refreshIssueSnapshot, resetIssueSnapshots } from "./snapshot";
+import { createDoltSync } from "./sync-coalescer";
 
 const bead = (b: Partial<Bead>): Bead => ({ id: "x", title: "x", status: "open", ...b }) as Bead;
 
@@ -1142,6 +1142,31 @@ describe("sync stall detection (anton-jfjw.3)", () => {
     expect(stalled).toContain("stalled");
     // The badge renders a server-computed "stuck Xm" — the token must keep moving or it freezes.
     expect(getSyncStatusToken(cwd, startedAt + SYNC_STALL_MS + 120_000)).not.toBe(stalled);
+  });
+
+  it("never announces a stall for a slow pass that COMPLETED — even one that failed", async () => {
+    // Recording a failure reads the backlog count while the registry still holds this pass at
+    // `syncing`. Reading it through getSyncStatus would fire the wedged log for a pass that
+    // actually returned — the stall message exists only for passes that never come back.
+    const previous = process.env.ANTON_SYNC_STALL_MS;
+    process.env.ANTON_SYNC_STALL_MS = "1";
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cwd = `/repo-slow-failure-${Math.random()}`;
+      const sync = createDoltSync(async (_cwd, args) => {
+        await new Promise((r) => setTimeout(r, 10)); // outlives the stall window, then returns
+        if (args[1] === "push") throw execError({ stderr: "Error: push failed: reset" });
+        return "";
+      });
+
+      await sync(cwd, "full").catch(() => {});
+      expect(spy.mock.calls.filter((c) => String(c[0]).includes(cwd))).toHaveLength(0);
+      expect(getSyncStatus(cwd).unpushedCount).toBe(1); // the backlog still grows
+    } finally {
+      spy.mockRestore();
+      if (previous === undefined) delete process.env.ANTON_SYNC_STALL_MS;
+      else process.env.ANTON_SYNC_STALL_MS = previous;
+    }
   });
 
   it("clears the stall clock when a pass completes, so a later slow pass isn't born stalled", async () => {
