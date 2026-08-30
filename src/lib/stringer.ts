@@ -634,8 +634,9 @@ async function readAnnotatedSignals(
   }
 
   const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
-  // Coupling last: it reads the source of the modules a signal names, so it should never be paid for
-  // a finding the index already contradicted.
+  // Coupling before deadcode: it reads the source of the modules a signal names, so it should never
+  // be paid for a finding the index already contradicted. Deadcode last: one `git grep` per symbol
+  // is cheap but not free, so it runs over only what both filters left.
   const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, tracked);
   const { kept, deadcode } = await filterDeadcodeSignals(repoPath, coupled, {
     exclude: opts.exclude,

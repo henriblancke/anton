@@ -36,9 +36,10 @@ const DEADCODE_COLLECTOR = "deadcode";
  * How many distinct symbols one pass will search for. A scan carrying more than this is a repo
  * anton has never scanned before (a whole-repo baseline pass), and the budget bounds what a nightly
  * spends on it. Hitting it means "not checked", so the signals past it keep their place — reported,
- * not silently dropped.
+ * not silently dropped, and counted in the filter's diagnostics so a truncated pass can't be read
+ * as a verified one.
  */
-const SYMBOL_BUDGET = 200;
+export const SYMBOL_BUDGET = 200;
 
 /**
  * 30s, for the same reason `git ls-files` gets it in lib/stringer: `git grep` over an indexed tree
@@ -271,6 +272,12 @@ export interface DeadcodeFilter {
    * under-filters rather than deleting findings.
    */
   unavailable?: string;
+  /**
+   * How many signals the pass never reached, because the symbol budget ran out mid-scan. They ride
+   * through counted — but a truncated pass otherwise reads exactly like a fully verified one, so
+   * the diagnostics say how much of the scan the check never saw.
+   */
+  unchecked?: number;
 }
 
 /** The symbol a deadcode signal is about, or undefined when its title doesn't name one. */
@@ -456,9 +463,9 @@ export async function filterDeadcodeSignals(
   const masked = new Map<string, string[] | undefined>();
   const verdicts = new Map<ScanSignal, string>();
   let unavailable: string | undefined;
+  let unchecked = 0;
 
-  for (const signal of relevant) {
-    if (unavailable) break;
+  for (const [index, signal] of relevant.entries()) {
     // Before starting another symbol's grep, not just inside it: a cancelled job should not spend
     // the tree on findings nobody will read.
     abort?.throwIfAborted();
@@ -470,7 +477,12 @@ export async function filterDeadcodeSignals(
 
     let files = seen.get(symbol);
     if (!files) {
-      if (seen.size >= SYMBOL_BUDGET) break;
+      // Out of budget: this signal and everything after it is reported without a reference check,
+      // so the count of what went unverified travels with the result.
+      if (seen.size >= SYMBOL_BUDGET) {
+        unchecked = relevant.length - index;
+        break;
+      }
       const found = await filesMentioning(repoPath, symbol, masked, pathspecs, abort);
       if (!Array.isArray(found)) {
         unavailable = found.unavailable;
@@ -504,7 +516,7 @@ export async function filterDeadcodeSignals(
     });
     return false;
   });
-  return { kept, deadcode: { dropped } };
+  return { kept, deadcode: unchecked > 0 ? { dropped, unchecked } : { dropped } };
 }
 
 /**
@@ -521,12 +533,17 @@ export function describeDeadcodeFilter(filter: DeadcodeFilter): string | undefin
       `are counted unverified this pass`
     );
   }
-  if (filter.dropped.length === 0) return undefined;
+  const truncated =
+    filter.unchecked && filter.unchecked > 0
+      ? `${filter.unchecked} dead-code signal(s) were counted unchecked — the ${SYMBOL_BUDGET}-symbol ` +
+        `search budget ran out this pass`
+      : undefined;
+  if (filter.dropped.length === 0) return truncated;
   const shown = filter.dropped.slice(0, 10);
   const rest = filter.dropped.length - shown.length;
   return (
     `dropped ${filter.dropped.length} dead-code signal(s) whose symbol has callers elsewhere in ` +
     `the tree: ${shown.map((d) => `${d.path} (${d.kind} — ${d.reason})`).join("; ")}` +
-    `${rest > 0 ? ` (+${rest} more)` : ""}`
+    `${rest > 0 ? ` (+${rest} more)` : ""}${truncated ? `; ${truncated}` : ""}`
   );
 }

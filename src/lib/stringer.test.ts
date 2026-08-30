@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
-import { describeDeadcodeFilter, filterDeadcodeSignals } from "./scan-deadcode";
+import { describeDeadcodeFilter, filterDeadcodeSignals, SYMBOL_BUDGET } from "./scan-deadcode";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
@@ -1349,6 +1349,45 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
       expect(result.deadcode.unavailable).toBeTruthy();
       expect(describeDeadcodeFilter(result.deadcode)).toContain("could not be searched");
+    });
+
+    // `git grep -w` counts `$` as a non-word character, so a `$`-suffixed identifier still matches
+    // at its own boundaries — the check has to find those callers, not read the symbol as unmatched
+    // and leave a false finding standing.
+    it("finds the callers of a symbol whose name ends in `$`", async () => {
+      const repo = initRepo({
+        "src/lib/render.ts": "export function render$() {}\n",
+        "src/lib/page.ts": "import { render$ } from './render';\nrender$();\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [unused("src/lib/render.ts", "render$")]);
+
+      expect(result.kept).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "render$" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // The budget stops a baseline pass from spending a nightly on greps, but a truncated pass that
+    // says nothing reads exactly like a verified one — the health record would count findings the
+    // tree was never asked about.
+    it("reports how many signals the symbol budget left unchecked, and keeps them", async () => {
+      const repo = initRepo({
+        "src/testing/integration.ts": "export function withOperator() {}\n",
+        "src/routes/claim.test.ts": "withOperator();\n",
+      });
+      // One signal per distinct symbol fills the budget, then the one with a real caller sits past
+      // it: unchecked, so it must survive rather than be dropped.
+      const signals = [
+        ...Array.from({ length: SYMBOL_BUDGET }, (_, i) => unused("src/lib/orphan.ts", `dead${i}`)),
+        unused("src/testing/integration.ts", "withOperator"),
+      ];
+
+      const result = await filterDeadcodeSignals(repo, signals);
+
+      expect(result.kept).toHaveLength(signals.length);
+      expect(result.deadcode.dropped).toEqual([]);
+      expect(result.deadcode.unchecked).toBe(1);
+      expect(describeDeadcodeFilter(result.deadcode)).toContain("1 dead-code signal(s) were counted unchecked");
     });
 
     // A cancelled job must stop the check, not ride it out: the greps are what the shutdown waits
