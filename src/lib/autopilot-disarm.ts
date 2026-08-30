@@ -352,6 +352,13 @@ export async function lastReArmAt(db: AntonDb, projectId: string): Promise<numbe
  *
  * A run still in flight is judged on when it last moved, which keeps it out of the window until it
  * settles — exactly what "judge me on what happens next" means for work that straddles the re-arm.
+ *
+ * Every timestamp in this db is whole-second (schema.ts's `ts`/`unixepoch`), so a run settling in
+ * the SAME second as the re-arm ties, and the comparison has to break the tie one way. It goes to
+ * the fence: a tied run is dropped, not admitted. The two errors are not equal — a dropped run
+ * costs one more failure (or one more score) before a breaker fires, while an admitted one is
+ * evidence the operator may already have adjudicated, and at a threshold of 1 that re-latches the
+ * identical disarm on the very next pass and silently reverts their decision.
  */
 export function settledAfterReArm(
   run: { endedAt?: number; updatedAt: number },

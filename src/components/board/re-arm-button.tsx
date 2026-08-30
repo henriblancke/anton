@@ -35,7 +35,8 @@ export function ReArmButton({ slug }: { slug: string }) {
       toast.success("Autopilot re-armed", {
         description: body?.rearmedBy ? `Recorded as ${body.rearmedBy}.` : undefined,
       });
-      // The band is server-rendered off the latch, so a refresh is what removes it.
+      // The band is read from the server off the latch, so a refresh is what removes it — the board
+      // drops its own polled copy the moment a fresh read arrives.
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to re-arm autopilot");

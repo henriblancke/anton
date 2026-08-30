@@ -46,7 +46,10 @@ import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
-import { AutopilotBreakerBand } from "@/components/board/autopilot-breaker-header";
+import {
+  AutopilotBreakerBand,
+  AutopilotBreakerHeader,
+} from "@/components/board/autopilot-breaker-header";
 import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -59,6 +62,15 @@ const sortSelectClassName =
 /** Board freshness cadence — matches the sync engine's heartbeat so remote changes surface
  * within one beat + one poll (anton-live-sync R8). */
 const BOARD_POLL_MS = 30_000;
+
+/**
+ * Breaker freshness cadence (anton-5c8h). Slower than the cards on purpose: the read behind the band
+ * costs a board read plus a `gh pr view` per PR waiting in review, and it only ever changes when a
+ * PR merges or closes — an event no keystroke on this board produces. Half the card cadence keeps a
+ * released hold on screen for at most a minute while leaving the common case (nothing held, no PR
+ * reads at all) cheap.
+ */
+const BREAKER_POLL_MS = 60_000;
 
 export function EpicBoard({
   slug,
@@ -77,9 +89,9 @@ export function EpicBoard({
    */
   escalations?: EscalationView[];
   /**
-   * Why the autopilot has stopped filling the queue, if it has (anton-5c8h). Server-rendered by the
-   * page like the escalations beside it: a disarm is cleared by an action that reloads, and a hold
-   * changes only when a PR moves — neither is worth a place on the board's 30s poll.
+   * Why the autopilot has stopped filling the queue, if it has (anton-5c8h). The FIRST paint only:
+   * the board re-reads it on its own slower cadence (BREAKER_POLL_MS) because a hold is released by
+   * a PR merging or closing, which nothing on an open board would otherwise notice.
    *
    * A PROMISE, not a value: deciding the hold reads GitHub, and the cards must not wait on that.
    * It streams into its own Suspense boundary below.
@@ -104,6 +116,10 @@ export function EpicBoard({
   // The standalone task/bug whose detail dialog is open. Epics still deep-link to their own page;
   // standalone chips (an epic-of-one) reuse the shared TicketDialog inline.
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
+  // The polled breaker, once one has landed — `null` until then, so the server's streamed read is
+  // what the first paint uses. Wrapped rather than stored bare because `undefined` is a real answer
+  // ("the autopilot is running, show no band") and must not read as "not polled yet".
+  const [polledBreaker, setPolledBreaker] = useState<{ value?: AutopilotBreaker } | null>(null);
   // Poll guard: a poll result landing mid-drag would clobber the drag interaction; the ref
   // mirrors activeId so the polling closure sees the live value.
   const draggingRef = useRef(false);
@@ -166,6 +182,51 @@ export function EpicBoard({
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [slug, attempt, initialBoard]);
+
+  // A re-arm ends in router.refresh(), which re-renders the page and hands down a FRESH read. Drop
+  // the polled answer whenever that happens, so the band clears on the click that cleared the latch
+  // rather than a poll later.
+  useEffect(() => {
+    setPolledBreaker(null);
+  }, [breaker]);
+
+  // Keep the breaker honest while the board stays open (anton-5c8h). A hold promises it releases
+  // itself when a PR merges or closes — a thing that happens on GitHub, with nothing on this board
+  // to notice it — so the band it draws would otherwise outlive its own release until a reload.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    async function read() {
+      try {
+        const res = await fetch(`/api/projects/${slug}/autopilot/breaker`);
+        if (!res.ok) return;
+        const data = (await res.json()) as { breaker: AutopilotBreaker | null };
+        if (!cancelled) setPolledBreaker({ value: data.breaker ?? undefined });
+      } catch {
+        // A failed read keeps the band that is up. Clearing it on a network blip would tell the
+        // operator anton is running when it is frozen — the one error this band must not make.
+      }
+    }
+
+    async function poll() {
+      if (document.visibilityState === "visible") await read();
+      if (!cancelled) timer = setTimeout(() => void poll(), BREAKER_POLL_MS);
+    }
+
+    timer = setTimeout(() => void poll(), BREAKER_POLL_MS);
+    // Coming back to the tab re-reads immediately: an operator returning from merging the PR that
+    // released the hold is exactly who is looking at the band.
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && !cancelled) void read();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [slug]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -340,7 +401,11 @@ export function EpicBoard({
       {/* Its own boundary, and a null fallback: the band is late context, not a placeholder the
           operator should watch a skeleton for. */}
       <Suspense fallback={null}>
-        <AutopilotBreakerBand slug={slug} breaker={breaker} />
+        {polledBreaker ? (
+          <AutopilotBreakerHeader slug={slug} breaker={polledBreaker.value} />
+        ) : (
+          <AutopilotBreakerBand slug={slug} breaker={breaker} />
+        )}
       </Suspense>
       <EscalationStrip slug={slug} escalations={escalations} />
       {lanes ? (
