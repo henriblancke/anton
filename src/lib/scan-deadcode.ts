@@ -75,6 +75,8 @@ interface CommentSyntax {
   line: string[];
   /** Delimiter pairs that span lines, opener then closer. */
   block: [string, string][];
+  /** Whether an opener met inside an open block nests rather than reading as ordinary text. */
+  nested?: boolean;
 }
 
 /**
@@ -86,10 +88,18 @@ interface CommentSyntax {
  */
 const COMMENT_SYNTAX: CommentSyntax[] = [
   {
-    files:
-      /\.(?:[cm]?[jt]sx?|go|rs|java|kt|kts|scala|swift|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
+    files: /\.(?:[cm]?[jt]sx?|go|java|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
     line: ["//"],
     block: [["/*", "*/"]],
+  },
+  {
+    // Rust, Swift, Scala and Kotlin nest block comments: in `/* outer /* inner */ tail */` the
+    // first `*/` closes only the inner one. Reading them with the C-like grammar ends the comment
+    // early, so `tail` reads as code — a caller that isn't there, deleting a finding that was right.
+    files: /\.(?:rs|swift|scala|kt|kts)$/i,
+    line: ["//"],
+    block: [["/*", "*/"]],
+    nested: true,
   },
   {
     // PHP takes `#` as well as `//`, so it can't ride with the C-like languages, where `#` opens a
@@ -157,6 +167,42 @@ function blankSpans(line: string, spans: [number, number][]): string {
   return out + line.slice(cursor);
 }
 
+/** A block comment open across lines, and how deep its openers are stacked. */
+interface OpenBlock {
+  opener: string;
+  closer: string;
+  depth: number;
+}
+
+/**
+ * Where the open block ends on this line, and whether it ended at all. In a nesting language an
+ * opener met inside the block pushes a level, so only the closer matching the OUTERMOST opener ends
+ * the comment — without the count, the first closer releases the rest of the outer comment to be
+ * read as code.
+ */
+function closeBlock(
+  line: string,
+  from: number,
+  open: OpenBlock,
+  nested: boolean,
+): { at: number; closed: boolean } {
+  let at = from;
+  while (at < line.length) {
+    const nestAt = nested ? line.indexOf(open.opener, at) : -1;
+    const endAt = line.indexOf(open.closer, at);
+    if (endAt < 0 && nestAt < 0) break;
+    if (nestAt >= 0 && (endAt < 0 || nestAt < endAt)) {
+      open.depth += 1;
+      at = nestAt + open.opener.length;
+      continue;
+    }
+    open.depth -= 1;
+    at = endAt + open.closer.length;
+    if (open.depth === 0) return { at, closed: true };
+  }
+  return { at: line.length, closed: false };
+}
+
 /**
  * The file's lines with every comment blanked out, so a hit is read against the code actually left
  * on its line. The scan is textual: a delimiter inside a string literal opens a block that isn't
@@ -164,17 +210,16 @@ function blankSpans(line: string, spans: [number, number][]): string {
  * "this hit is prose", which leaves a signal standing rather than deleting one.
  */
 function maskComments(text: string, syntax: CommentSyntax): string[] {
-  let closer: string | undefined;
+  let open: OpenBlock | undefined;
   return text.split("\n").map((line) => {
     const spans: [number, number][] = [];
     let at = 0;
     while (at < line.length) {
-      if (closer) {
-        const end = line.indexOf(closer, at);
-        const stop = end < 0 ? line.length : end + closer.length;
-        spans.push([at, stop]);
-        at = stop;
-        if (end >= 0) closer = undefined;
+      if (open) {
+        const { at: end, closed } = closeBlock(line, at, open, syntax.nested === true);
+        spans.push([at, end]);
+        at = end;
+        if (closed) open = undefined;
         continue;
       }
       const opened = nextComment(line, at, syntax);
@@ -185,7 +230,7 @@ function maskComments(text: string, syntax: CommentSyntax): string[] {
       }
       spans.push([opened.at, opened.at + opened.marker.length]);
       at = opened.at + opened.marker.length;
-      closer = opened.closer;
+      open = { opener: opened.marker, closer: opened.closer, depth: 1 };
     }
     return blankSpans(line, spans);
   });
@@ -324,11 +369,27 @@ async function codeReferencingFiles(
 }
 
 /**
+ * The scan's exclusions as `git grep` pathspecs, so the reference check reads the file set stringer
+ * actually walked. A repo that commits its build output (`dist/bundle.js`) names every symbol it
+ * bundled; counting that copy as a caller would delete a true finding about the source stringer was
+ * pointed at and grep was not. `:(glob)` so `dist/**` keeps the glob meaning stringer gives it, and
+ * a leading `.` because git refuses a pathspec list that only excludes.
+ *
+ * Over-excluding is the safe direction: a file grep never reads proves no caller, and an unproven
+ * caller leaves the signal standing.
+ */
+function excludePathspecs(exclude: readonly string[]): string[] {
+  const globs = exclude.map((glob) => glob.trim()).filter(Boolean);
+  return globs.length === 0 ? [] : [".", ...globs.map((glob) => `:(exclude,glob)${glob}`)];
+}
+
+/**
  * Every file that references the symbol as a whole word — tracked files plus anything new that
  * isn't ignored, since a caller written today is a caller. `-F`/`-w` so a symbol carrying regex
  * punctuation (`$mount`) matches itself rather than a pattern, `-z` so a non-ASCII path comes back
  * unquoted under `core.quotePath`, `-I` so a binary blob is never read as a call site, `-n` so a
- * hit can be located in its file and judged against the comments around it.
+ * hit can be located in its file and judged against the comments around it, and the scan's own
+ * exclusions so generated and vendored trees answer for nothing.
  *
  * The caller's signal goes to the child so a cancelled job kills the grep it is waiting on instead
  * of paying out its 30s timeout.
@@ -337,14 +398,17 @@ async function filesMentioning(
   repoPath: string,
   symbol: string,
   masked: Map<string, string[] | undefined>,
+  pathspecs: string[],
   abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
   try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "--untracked", "-e", symbol],
-      { timeout: GREP_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, signal: abort },
-    );
+    const args = ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "--untracked", "-e", symbol];
+    if (pathspecs.length > 0) args.push("--", ...pathspecs);
+    const { stdout } = await execFileAsync("git", args, {
+      timeout: GREP_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      signal: abort,
+    });
     return await codeReferencingFiles(repoPath, symbol, candidateHits(stdout), masked);
   } catch (err) {
     // A cancelled job is not an unsearchable tree. Reporting the kill as `unavailable` would let the
@@ -368,7 +432,8 @@ async function filesMentioning(
  * that nothing references it, and a single word-boundary hit on a code line outside its declaration
  * falsifies exactly that. The declaring file is excluded because a symbol always mentions itself
  * there — counting it would drop every signal, which is the one outcome worse than counting
- * phantoms.
+ * phantoms. `opts.exclude` is the scan's own exclusion set, so the search covers the files stringer
+ * inspected and no others — a committed build or vendor tree is not a caller of the source it copied.
  *
  * Only reached when a scan actually carries a deadcode signal, so an ordinary pass runs no git.
  *
@@ -379,11 +444,13 @@ async function filesMentioning(
 export async function filterDeadcodeSignals(
   repoPath: string,
   signals: ScanSignal[],
-  abort?: AbortSignal,
+  opts: { exclude?: readonly string[]; abort?: AbortSignal } = {},
 ): Promise<{ kept: ScanSignal[]; deadcode: DeadcodeFilter }> {
+  const { abort } = opts;
   const relevant = signals.filter((signal) => collectorOf(signal) === DEADCODE_COLLECTOR);
   if (relevant.length === 0) return { kept: signals, deadcode: { dropped: [] } };
 
+  const pathspecs = excludePathspecs(opts.exclude ?? []);
   const seen = new Map<string, string[]>();
   /** One read per file, however many symbols land in it. */
   const masked = new Map<string, string[] | undefined>();
@@ -404,7 +471,7 @@ export async function filterDeadcodeSignals(
     let files = seen.get(symbol);
     if (!files) {
       if (seen.size >= SYMBOL_BUDGET) break;
-      const found = await filesMentioning(repoPath, symbol, masked, abort);
+      const found = await filesMentioning(repoPath, symbol, masked, pathspecs, abort);
       if (!Array.isArray(found)) {
         unavailable = found.unavailable;
         break;

@@ -1217,6 +1217,87 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
     });
 
+    // A repo that commits its build output names every symbol it bundled. stringer never walked
+    // `dist/`, so counting the copy there as a caller would delete a finding about source it DID
+    // walk — the reference check has to read the same file set the scan did.
+    it("ignores mentions in trees the scan excluded, and honours extra excludes", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "dist/bundle.js": "function neverCalled(){}\nneverCalled();\n",
+        "vendor/copy.ts": "neverCalled();\n",
+        "generated/api.ts": "neverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({
+        repoPath: repo,
+        scanFile: join(dir, "scan.json"),
+        exclude: ["generated/**"],
+      });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // ...and excluding is not the same as searching nothing: source outside the excluded trees
+    // still answers.
+    it("still counts a caller that sits outside the excluded trees", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "dist/bundle.js": "neverCalled();\n",
+        "src/lib/caller.ts": "import { neverCalled } from './orphan';\nneverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("dist/bundle.js");
+    });
+
+    // Rust and Swift nest block comments: the inner `*/` closes only the inner opener. Ending the
+    // comment there reads the outer comment's remaining prose as a call site.
+    it("keeps a nested block comment open until its outer delimiter closes", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.rs":
+          "/* outer /* inner */\nneverCalled was removed later.\n*/\nfn kept() {}\n",
+        "src/lib/notes.swift": "/* /* x */ neverCalled went too */\nlet kept = 1\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // ...and the nesting count has to end the comment where it really ends, or a Rust caller below
+    // a nested docblock stops counting.
+    it("counts a Rust caller written below a nested block comment", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.rs":
+          "/* outer /* inner */ still comment */\nfn go() { neverCalled(); }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.rs");
+    });
+
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {
       const repo = initRepo({
         "src/lib/types.ts": "export type ScanPass = { id: string };\n",
@@ -1280,11 +1361,9 @@ describe("scan", () => {
         });
 
         await expect(
-          filterDeadcodeSignals(
-            repo,
-            [unused("src/testing/integration.ts", "withOperator")],
-            AbortSignal.abort(),
-          ),
+          filterDeadcodeSignals(repo, [unused("src/testing/integration.ts", "withOperator")], {
+            abort: AbortSignal.abort(),
+          }),
         ).rejects.toMatchObject({ name: "AbortError" });
       });
 
@@ -1299,7 +1378,7 @@ describe("scan", () => {
         const filtering = filterDeadcodeSignals(
           repo,
           [unused("src/testing/integration.ts", "withOperator")],
-          ac.signal,
+          { abort: ac.signal },
         );
         ac.abort();
 
