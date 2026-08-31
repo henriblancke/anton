@@ -29,6 +29,7 @@ import {
 } from "./scan-severity";
 import {
   POLICY_BOUND_MAX,
+  POLICY_CONTROL_NAMESPACES,
   POLICY_CRITERION_VALUES_MAX,
   POLICY_LABEL_CRITERIA_MAX,
   POLICY_PRIORITY_MAX,
@@ -691,7 +692,16 @@ export function resolveValueLabels(settings: ProjectSettings): string[] {
  */
 export const pickerPolicySchema = z
   .object({
-    types: z.array(z.string().trim().min(1).max(POLICY_TEXT_MAX.type)).min(1).max(POLICY_TYPES_MAX),
+    // A membership set, so duplicate-free like every other one here: a repeat is a test the first
+    // entry already answered, and it burns a slot against POLICY_TYPES_MAX — which the editor reads
+    // as a ceiling reached, disabling every type the operator has not already selected.
+    types: z
+      .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.type))
+      .min(1)
+      .max(POLICY_TYPES_MAX)
+      .refine((ts) => new Set(ts).size === ts.length, {
+        message: "each type may be listed once",
+      }),
     // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent, so `max` is
     // the floor and `min` the ceiling.
     maxPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
@@ -707,7 +717,18 @@ export const pickerPolicySchema = z
       .array(
         z
           .object({
-            namespace: z.string().trim().min(1).max(POLICY_TEXT_MAX.namespace),
+            // Never one of anton's own bookkeeping namespaces. The editor already keeps them out of
+            // the offered criteria, and the boundary has to agree: a criterion over a namespace
+            // anton rewrites mid-run tests a label set that moves under the picker, so the symptom
+            // is "policy armed, picker starts nothing" — unreadable from the plan output.
+            namespace: z
+              .string()
+              .trim()
+              .min(1)
+              .max(POLICY_TEXT_MAX.namespace)
+              .refine((ns) => !POLICY_CONTROL_NAMESPACES.has(ns), {
+                message: "cannot constrain an anton bookkeeping namespace",
+              }),
             // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
             // why nothing on this path sorts them. Duplicate-free: a repeat is a second membership
             // test the first already answered, and under a ranking it is a value at two positions at

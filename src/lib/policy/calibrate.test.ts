@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { pickerPolicySchema } from "../projects";
-import { POLICY_BOUND_MAX, POLICY_TEXT_MAX } from "./types";
+import { POLICY_BOUND_MAX, POLICY_CONTROL_NAMESPACES, POLICY_TEXT_MAX } from "./types";
 import { boardIssueTypes, calibratePolicy, FALLBACK_POLICY, MIN_CALIBRATION_APPROVALS } from "./calibrate";
 import { namespaceOf, valueOf, type Policy } from "./types";
 
@@ -339,6 +339,35 @@ describe("POLICY_TEXT_MAX is the schema's ceiling", () => {
   it.each(cases)("accepts %s at the ceiling and rejects one above it", (_what, ceiling, build) => {
     expect(pickerPolicySchema.safeParse(build(at(ceiling))).success).toBe(true);
     expect(pickerPolicySchema.safeParse(build(at(ceiling + 1))).success).toBe(false);
+  });
+});
+
+/**
+ * The editor is not the only way into the store. What the panel refuses to author, the schema has to
+ * refuse to persist — otherwise a direct PATCH arms a policy the panel could never have produced and
+ * offers no control to undo.
+ */
+describe("pickerPolicySchema — what the editor cannot author, the API cannot store", () => {
+  it.each([...POLICY_CONTROL_NAMESPACES])("rejects a criterion over %s", (ns) => {
+    expect(pickerPolicySchema.safeParse({ labels: [{ namespace: ns, values: ["x"] }] }).success).toBe(
+      false,
+    );
+  });
+
+  it("rejects a control namespace padded to look like vocabulary", () => {
+    const policy = { labels: [{ namespace: "  stage  ", values: ["running"] }] };
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(false);
+  });
+
+  it("keeps a namespace that merely reads like one of anton's", () => {
+    const policy = { labels: [{ namespace: "staged", values: ["yes"] }] };
+    expect(pickerPolicySchema.safeParse(policy).success).toBe(true);
+  });
+
+  it("rejects a repeated issue type, including one repeated after trimming", () => {
+    expect(pickerPolicySchema.safeParse({ types: ["bug", "bug"] }).success).toBe(false);
+    expect(pickerPolicySchema.safeParse({ types: ["bug", " bug "] }).success).toBe(false);
+    expect(pickerPolicySchema.safeParse({ types: ["bug", "task"] }).success).toBe(true);
   });
 });
 
