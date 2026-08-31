@@ -898,6 +898,18 @@ export interface Gate extends Bead {
   timeout?: number;
 }
 
+/**
+ * The `--reason` a gate was created with, read back off the gate bead. bd keeps no reason field: it
+ * folds the reason into the description it composes — `Ad-hoc gate blocking <bead>\n\nReason:
+ * <reason>` (measured on bd 1.1.2), verbatim and untruncated — so this is the only way to ask what a
+ * gate is waiting FOR. Undefined when the gate carries no reason.
+ */
+export function gateReason(gate: Bead): string | undefined {
+  const marker = "\nReason: ";
+  const at = (gate.description ?? "").indexOf(marker);
+  return at === -1 ? undefined : gate.description!.slice(at + marker.length);
+}
+
 export interface GateCreateOpts {
   /** Bead the gate blocks (required by bd). */
   blocks: string;
@@ -1936,6 +1948,16 @@ export const beads = {
    */
   isMergeWaitGate: (b: Bead): b is Gate =>
     b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
+
+  /**
+   * A `human` gate — the wait anton arms on a run target whose agent reported `needs-human`
+   * (anton-287p). The opposite of the merge wait in every way that matters here: it IS a real
+   * blocker (epic-graph counts it, so nothing re-runs the target behind it), and NOTHING closes it
+   * on its own — `bd gate check` never evaluates it and gate-check's expiry pass skips it — so it
+   * ends only when a person runs `bd gate resolve`.
+   */
+  isHumanGate: (b: Bead): b is Gate =>
+    b.issue_type === "gate" && (b as Gate).await_type === "human",
 
   /**
    * Molecules whose gate has closed and whose next step is runnable — the gate-resume discovery

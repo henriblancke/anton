@@ -153,6 +153,12 @@ export interface RunTeardown {
    * very tree that instruction points at.
    */
   holdsPartialWork?: boolean;
+  /**
+   * The run stopped behind a LIVE `human` gate it armed: a person resolving that gate resumes this
+   * very attempt, in this very checkout. Independent of `status`, because the one case that needs
+   * it is a wait whose park row could NOT be written and therefore settles as `failed`.
+   */
+  awaitsHumanGate?: boolean;
   /** The bead is closed or abandoned: nothing will ever resume in this worktree. */
   beadSettled: boolean;
 }
@@ -167,7 +173,8 @@ export interface RunTeardown {
  * abandoned, which is exactly the park nothing will come back to.
  *
  * The other keep is a stop that left work behind (`holdsPartialWork`): the tree is not residue the
- * branch can recreate, it is the only copy of what a human was told to clear.
+ * branch can recreate, it is the only copy of what a human was told to clear. An armed human gate
+ * (`awaitsHumanGate`) keeps it for the same reason — the resume continues from this tree.
  */
 export function planRunTeardown(run: RunTeardown, openPr: OpenPrNotice): ReapPlan {
   const keep = (reason: string): ReapPlan => ({ removeWorktree: false, deleteBranch: false, reason });
@@ -179,6 +186,13 @@ export function planRunTeardown(run: RunTeardown, openPr: OpenPrNotice): ReapPla
   // reclaims it once the bead settles and the human is done with it.
   if (run.holdsPartialWork) {
     return keep("it holds partial work the run could not roll back, for a human to clear");
+  }
+  // A wait somebody is expected to ANSWER, which is not the same as a park that landed (PR #205
+  // review): a needs-human run whose park row could not be written settles as `failed` while its
+  // gate stands, and resolving that gate resumes this attempt in this checkout. Releasing here would
+  // force-remove the uncommitted work the resumed session continues from.
+  if (run.awaitsHumanGate && !run.beadSettled) {
+    return keep("it waits on the human gate it armed, and the resume continues here");
   }
   if (run.status === "parked" && !run.beadSettled) return keep("the run is parked and resumes here");
   if (!run.beadSettled) {

@@ -19,7 +19,7 @@ import {
   withoutGateBlockedJobs,
   type InReviewPr,
 } from "./run-health";
-import { blockedByPoison } from "./errors";
+import { blockedByPoison, parkedOnGateClause } from "./errors";
 import { POISON_PARK_PREFIX } from "./runner";
 import { sortFindings, type RunHealthFinding } from "../run-health";
 import type { RunRow } from "../runs";
@@ -391,6 +391,30 @@ describe("detectOpenHumanGates", () => {
     expect(finding.ageMs).toBe(3 * HOUR);
   });
 
+  it("recovers the asking TICKET from a gate anton armed, and strips it off the reason", () => {
+    // The gate blocks the RUN TARGET, so on a feature with several children nothing else on the
+    // board says which one stopped (PR #205 review) — and an answer only steers the resumed session
+    // from that child's notes. anton stamps it into the reason; this is the read back.
+    const armed = gate("g-1", {
+      description: "Ad-hoc gate blocking f-1\n\nReason: t-1 needs a human: which region do we bill from?",
+    });
+
+    const [finding] = detectOpenHumanGates([armed], gatedBoard(), NOW);
+
+    expect(finding.askBeadId).toBe("t-1");
+    // Read once, not twice: the row prints the reason, and a "t-1 needs a human:" left inside it
+    // would repeat the id the row already shows on its own.
+    expect(finding.reason).toContain("which region do we bill from?");
+    expect(finding.reason).not.toContain("needs a human:");
+  });
+
+  it("leaves a hand-made gate's reason whole — a person's hold names no asking ticket", () => {
+    const [finding] = detectOpenHumanGates([gate("g-1")], gatedBoard(), NOW);
+
+    expect(finding.askBeadId).toBeUndefined();
+    expect(finding.reason).toContain("needs a design call");
+  });
+
   it("says so plainly when the gate carries no reason, rather than reporting nothing", () => {
     const bare = gate("g-1", { description: "Ad-hoc gate blocking t-1" });
 
@@ -553,6 +577,53 @@ describe("withoutGateBlockedJobs", () => {
     // parked, and with no gate wait left to speak for it the finding has to come back.
     const findings = detectExhaustedJobs([blockedPark("g-1")], 3, NOW);
     expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["exhausted-job"]);
+  });
+
+  /** The park a run takes when it ARMED a human gate for its own ask (anton-287p). */
+  function armedAskPark(gateId: string, held: string[] = []): JobRow {
+    return job("j-1", {
+      attempts: 1,
+      lastError:
+        `${POISON_PARK_PREFIX} t-1 needs a human: the staging DB password has to be rotated. ` +
+        parkedOnGateClause(gateId, held),
+    });
+  }
+
+  it("drops the job an ARMED ask parked — asking a person is not a permanent failure", () => {
+    // Every successful needs-human park books a poison job beside the gate it just armed (PR #205
+    // review). Reported as well as the gate, one question to the operator arrives twice: once as
+    // the wait they answer, once as an exhausted job claiming the run failed for good.
+    const findings = [...detectExhaustedJobs([armedAskPark("g-1")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("keeps an armed-ask park whose gate is no longer open — the run is stuck with nothing to answer", () => {
+    const findings = [...detectExhaustedJobs([armedAskPark("g-2")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
+  });
+
+  it("drops an armed ask whose own gate was answered while a manual hold still blocks the target", () => {
+    // Resolving anton's gate first doesn't resume the run — the person's own gate still blocks the
+    // target — so the park is still that wait, not a permanent failure (PR #205 review).
+    const findings = [
+      ...detectExhaustedJobs([armedAskPark("g-1", ["g-2"])], 3, NOW),
+      gateWait("g-2"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("reports an armed ask once EVERY gate it names is answered — nothing else surfaces it", () => {
+    const findings = [
+      ...detectExhaustedJobs([armedAskPark("g-1", ["g-2"])], 3, NOW),
+      gateWait("g-9"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
   });
 });
 
