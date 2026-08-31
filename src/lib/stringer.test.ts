@@ -1252,6 +1252,82 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/py/module.py");
     });
 
+    // A binding taken under another name is the one import that is not a stale half: the statement
+    // holds the file's only mention of the symbol, and every use of it beside is spelled with the
+    // local name, which the searched symbol can never match. Blanking that reports a live symbol
+    // dead — while an alias nothing uses stays discounted exactly as a plain stale import is.
+    it("counts a renamed import whose local name the file still uses", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/renamed.ts":
+          "import { Widget as Renamed } from './widget';\nexport const page = () => Renamed();\n",
+        "src/ui/wrapped.ts":
+          "import {\n  Widget as Wrapped,\n} from './widget';\nexport const list = [Wrapped];\n",
+        "src/ui/cjs.js":
+          "const { Widget: Required } = require('./widget');\nmodule.exports = () => Required();\n",
+        "src/ui/stale.ts": "import { Widget as Unused } from './widget';\nexport const kept = 1;\n",
+        "src/ui/stale.js": "const { Widget: Ignored } = require('./widget');\nmodule.exports = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/renamed.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/wrapped.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/cjs.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+    });
+
+    // Python spells the rename `import Widget as Renamed`, and it reads the same way: the statement
+    // carries the only mention of the symbol, so discounting it wholesale hides the caller that
+    // keeps a live symbol out of the report.
+    it("counts a renamed Python import whose local name the file still uses", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/renamed.py": "from widget import Widget as Renamed\n\nhtml = Renamed()\n",
+        "src/py/stale.py": "from widget import Widget as Unused\n\nkept = 1\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/renamed.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/stale.py");
+    });
+
+    // Python's triple quote opens a docstring, but `f"""` opens an expression: the text between its
+    // braces runs, and `f"""{Widget()}"""` calls the symbol. Reading every triple-quoted span as a
+    // comment blanks that call and reports a live symbol dead — while the literal text around the
+    // interpolation is still prose, and a docstring is still a docstring.
+    it("reads a Python f-string interpolation as code and its docstrings as prose", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/inline.py": 'def render():\n    return f"""{Widget()}"""\n',
+        "src/py/block.py": 'def page():\n    return f"""\n    <div>{Widget()}</div>\n    """\n',
+        "src/py/doc.py": '"""\nWidget was the old renderer.\n"""\nkept = 1\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/inline.py");
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/block.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/doc.py");
+    });
+
     // A name written in prose is being described, not called. Without this the module that documents
     // a symbol keeps it alive forever, and the filter goes blind to the symbols it exists to check.
     it("does not count a name in a comment or a doc as a reference", async () => {

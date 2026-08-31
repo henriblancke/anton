@@ -94,7 +94,23 @@ interface CommentSyntax {
    * tracks no grammar for.
    */
   quotes?: string;
+  /**
+   * What has to precede a block opener for the span it opens to be an expression rather than a
+   * comment. Python's `"""` opens a docstring, but `f"""` opens an f-string: the text between its
+   * braces is a program, and `f"""{Widget()}"""` calls the symbol as plainly as bare code does.
+   * Blanking that span erases the call and reports a live symbol dead, so the prefix is read and
+   * only the literal text around each `{…}` is masked.
+   */
+  interpolated?: RegExp;
 }
+
+/**
+ * The Python string prefix that makes the triple-quoted literal after it an f-string. Only `f`
+ * decides it; `r`, `b` and `u` may ride along in any order. The prefix has to start on a word
+ * boundary, so a name that merely ends in one of those letters — `conf"""` — still opens the
+ * docstring it always did.
+ */
+const F_STRING_PREFIX = /(?:^|[^\w])[rRbBuU]*[fF][rRbBuU]*$/;
 
 /**
  * Comment grammar by file kind. Judging a hit by how its line begins gets both ends wrong: the
@@ -175,6 +191,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     // The triple-quoted forms are matched as blocks before this, so a docstring still opens where
     // it always did — only the one- and two-character literals are stepped over.
     quotes: "\"'",
+    interpolated: F_STRING_PREFIX,
   },
   {
     // Ruby's block comment is a pair of line-anchored markers rather than an inline delimiter, and
@@ -362,6 +379,59 @@ function closeBlock(
   return { at: line.length, closed: false };
 }
 
+/** An interpolated literal open across lines: what closes it, and how deep braces are stacked. */
+interface OpenFString {
+  closer: string;
+  depth: number;
+}
+
+/**
+ * Where the open f-string ends on this line, and which spans of it are literal text. An
+ * interpolation is a program, not prose: `f"""{Widget()}"""` calls the symbol, so only the text
+ * around each `{…}` is blanked. `{{` and `}}` escape a brace rather than opening or closing one,
+ * and a brace still open at the end of the line carries its depth onto the next.
+ */
+function scanFString(
+  line: string,
+  from: number,
+  open: OpenFString,
+): { at: number; closed: boolean; spans: [number, number][] } {
+  const spans: [number, number][] = [];
+  let literal = open.depth === 0 ? from : -1;
+  const blankTo = (end: number): void => {
+    if (literal >= 0 && end > literal) spans.push([literal, end]);
+    literal = -1;
+  };
+  let at = from;
+  while (at < line.length) {
+    if (open.depth > 0) {
+      if (line[at] === "{") open.depth += 1;
+      else if (line[at] === "}") {
+        open.depth -= 1;
+        if (open.depth === 0) literal = at + 1;
+      }
+      at += 1;
+      continue;
+    }
+    if (line.startsWith(open.closer, at)) {
+      const end = at + open.closer.length;
+      blankTo(end);
+      return { at: end, closed: true, spans };
+    }
+    if (line.startsWith("{{", at) || line.startsWith("}}", at)) {
+      at += 2;
+      continue;
+    }
+    if (line[at] === "{") {
+      blankTo(at);
+      open.depth = 1;
+    }
+    at += 1;
+  }
+  blankTo(line.length);
+  return { at: line.length, closed: false, spans };
+}
+
 /**
  * The file's lines with every comment blanked out, so a hit is read against the code actually left
  * on its line. The scan is textual, so it reads a line at a time and only steps over the literals
@@ -371,10 +441,18 @@ function closeBlock(
  */
 function maskComments(text: string, syntax: CommentSyntax): string[] {
   let open: OpenBlock | undefined;
+  let openF: OpenFString | undefined;
   return text.split("\n").map((line) => {
     const spans: [number, number][] = [];
     let at = 0;
     while (at < line.length) {
+      if (openF) {
+        const scan = scanFString(line, at, openF);
+        spans.push(...scan.spans);
+        at = scan.at;
+        if (scan.closed) openF = undefined;
+        continue;
+      }
       if (open) {
         const { at: end, closed } = closeBlock(
           line,
@@ -396,6 +474,10 @@ function maskComments(text: string, syntax: CommentSyntax): string[] {
       }
       spans.push([opened.at, opened.at + opened.marker.length]);
       at = opened.at + opened.marker.length;
+      if (syntax.interpolated?.test(line.slice(0, opened.at))) {
+        openF = { closer: opened.closer, depth: 0 };
+        continue;
+      }
       open = { opener: opened.marker, closer: opened.closer, depth: 1 };
     }
     return blankSpans(line, spans);
@@ -1747,6 +1829,86 @@ const IMPORT_SPAN_LINES = 40;
 const IMPORT_CONTINUES = /(?:,|\bfrom)[ \t]*$/;
 
 /**
+ * A binding an import takes under another name: where the imported symbol is written, and the local
+ * name it lands under. The mask exists to discount a binding nothing uses, but a renamed one is the
+ * opposite case — `import { Widget as Renamed } from './widget'; Renamed()` writes `Widget` just
+ * once, inside the statement being blanked, and the call beside it is spelled `Renamed`, which the
+ * searched symbol can never match. Blanking that leaves a live symbol with no caller anywhere.
+ */
+interface AliasBinding {
+  /** The line the imported name is written on. */
+  line: number;
+  /** Where the imported name starts on it. */
+  at: number;
+  /** The imported name — what a hit for the symbol matched. */
+  name: string;
+  /** The local name the binding lands under, and the only spelling the rest of the file can use. */
+  local: string;
+}
+
+/** Code with one flavour of binding blanked out, and the renamed bindings that went out with it. */
+interface MaskedCode {
+  code: string[];
+  aliases: AliasBinding[];
+}
+
+/** `X as Y` — how ESM and Python both spell a renamed binding. */
+const AS_ALIAS = /\b([A-Za-z_$][\w$]*)[ \t]+as[ \t]+([A-Za-z_$][\w$]*)/g;
+
+/** `{ X: Y }` — how a CommonJS destructuring pattern spells the same rename. */
+const KEY_ALIAS = /\b([A-Za-z_$][\w$]*)[ \t]*:[ \t]*([A-Za-z_$][\w$]*)/g;
+
+/**
+ * The renamed bindings written between `from` and `to`, read off the statement before it is
+ * blanked. The span is walked line by line so a binding list wrapped over several of them is read
+ * whole, and each name is recorded where it sits — offsets the mask preserves, so the name can be
+ * put back exactly where a hit found it.
+ */
+function aliasBindings(
+  code: readonly string[],
+  from: { line: number; at: number },
+  to: { line: number; at: number },
+  pattern: RegExp,
+): AliasBinding[] {
+  const found: AliasBinding[] = [];
+  for (let line = from.line; line <= to.line; line += 1) {
+    const text = code[line] ?? "";
+    const start = line === from.line ? from.at : 0;
+    const segment = text.slice(start, line === to.line ? to.at : text.length);
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(segment); match; match = pattern.exec(segment)) {
+      const [, name, local] = match;
+      if (name === undefined || local === undefined) continue;
+      found.push({ line, at: start + match.index, name, local });
+    }
+  }
+  return found;
+}
+
+/**
+ * The masked code with the imported name written back for every alias whose local name the file
+ * still uses somewhere. The local name inside the binding went out with the mask, so any mention of
+ * it left over is a real use — and a binding nothing uses stays blanked, which is the stale half
+ * the mask exists to discount.
+ */
+function unmaskUsedAliases(
+  source: readonly string[],
+  masked: string[],
+  aliases: readonly AliasBinding[],
+): string[] {
+  if (aliases.length === 0) return masked;
+  const used = aliases.filter((alias) => masked.some((line) => referencesWord(line, alias.local)));
+  for (const alias of used) {
+    const text = source[alias.line];
+    const line = masked[alias.line];
+    if (text === undefined || line === undefined) continue;
+    const end = alias.at + alias.name.length;
+    masked[alias.line] = line.slice(0, alias.at) + text.slice(alias.at, end) + line.slice(end);
+  }
+  return masked;
+}
+
+/**
  * Where the import declaration opened at `at` on line `from` ends: just past the closing quote of
  * its module specifier, which is the last thing a declaration writes. Undefined when no specifier
  * turns up.
@@ -1830,8 +1992,9 @@ function requireBindingEnd(
  * `const html = require('./widget').Widget()` calls the symbol on the right of that `=`, and a
  * mask that reached across it would report a live symbol dead.
  */
-function maskRequireBindings(code: readonly string[]): string[] {
+function maskRequireBindings(code: readonly string[]): MaskedCode {
   const masked = [...code];
+  const aliases: AliasBinding[] = [];
   for (let index = 0; index < masked.length; index += 1) {
     let at = 0;
     for (;;) {
@@ -1844,6 +2007,7 @@ function maskRequireBindings(code: readonly string[]): string[] {
         at = opened;
         continue;
       }
+      aliases.push(...aliasBindings(masked, { line: index, at: opened }, end, KEY_ALIAS));
       if (end.line === index) {
         masked[index] = blankSpans(masked[index], [[opened, end.at]]);
       } else {
@@ -1855,7 +2019,7 @@ function maskRequireBindings(code: readonly string[]): string[] {
       at = end.at;
     }
   }
-  return masked;
+  return { code: masked, aliases };
 }
 
 /** Files whose imports are Python statements, which name no module string to end on. */
@@ -1900,8 +2064,9 @@ function pythonImportEnd(
  * symbol it stopped calling would otherwise read as its own caller and erase a true finding — the
  * same stale half the ESM mask exists to discount.
  */
-function maskPythonImports(code: readonly string[]): string[] {
+function maskPythonImports(code: readonly string[]): MaskedCode {
   const masked = [...code];
+  const aliases: AliasBinding[] = [];
   for (let index = 0; index < masked.length; index += 1) {
     let at = 0;
     for (;;) {
@@ -1912,6 +2077,7 @@ function maskPythonImports(code: readonly string[]): string[] {
       const end = pythonImportEnd(masked, index, opened);
       if (!end) break;
       const start = opened - head[1].length;
+      aliases.push(...aliasBindings(masked, { line: index, at: start }, end, AS_ALIAS));
       if (end.line === index) {
         masked[index] = blankSpans(masked[index], [[start, end.at]]);
       } else {
@@ -1923,7 +2089,7 @@ function maskPythonImports(code: readonly string[]): string[] {
       at = end.at;
     }
   }
-  return masked;
+  return { code: masked, aliases };
 }
 
 /**
@@ -1944,10 +2110,19 @@ function maskPythonImports(code: readonly string[]): string[] {
  *
  * CommonJS `require` bindings are masked first, by `maskRequireBindings`, since a repo can spell
  * the same stale binding either way.
+ *
+ * A binding taken under another name is put back by `unmaskUsedAliases` when the file still uses
+ * that name: `import { Widget as Renamed } from './widget'` holds the file's only mention of the
+ * symbol, and the call beside it is spelled `Renamed`.
  */
 function maskImports(code: string[], file: string): string[] {
-  if (PYTHON_FILE.test(file)) return maskPythonImports(code);
-  const masked = maskRequireBindings(code);
+  if (PYTHON_FILE.test(file)) {
+    const python = maskPythonImports(code);
+    return unmaskUsedAliases(code, python.code, python.aliases);
+  }
+  const required = maskRequireBindings(code);
+  const masked = required.code;
+  const aliases = required.aliases;
   for (let index = 0; index < masked.length; index += 1) {
     IMPORT_HEAD.lastIndex = 0;
     let at = 0;
@@ -1961,6 +2136,7 @@ function maskImports(code: string[], file: string): string[] {
         at = head.index + head[0].length;
         continue;
       }
+      aliases.push(...aliasBindings(masked, { line: index, at: opened }, end, AS_ALIAS));
       if (end.line === index) {
         masked[index] = blankSpans(masked[index], [[opened, end.at]]);
       } else {
@@ -1972,7 +2148,7 @@ function maskImports(code: string[], file: string): string[] {
       at = end.at;
     }
   }
-  return masked;
+  return unmaskUsedAliases(code, masked, aliases);
 }
 
 /**
