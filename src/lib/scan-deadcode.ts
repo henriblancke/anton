@@ -642,13 +642,25 @@ const ASTRO_FILE = /\.astro$/i;
 const ASTRO_FENCE = /^---\s*$/;
 
 /**
- * Where a tag for `name` begins, opening or closing — `<script`, `</script`. Only the start,
- * because the `>` that ends it may be lines away: an attribute list wraps as ordinary formatting,
- * and a whole-tag pattern would recognize no opener at all on `<script` with `type="module">`
- * under it, leaving the body it opens unread and the import inside it uncounted.
+ * Where any tag begins, opening or closing, with the element it names — `<div`, `</script`. Every
+ * tag is walked rather than only the one being looked for, because a tag name inside another tag's
+ * quoted attribute is text a reader sees: `<div title="example <script>">` opens no script, and
+ * recognizing one there reads the rendered lines under it as program, where the page's own prose
+ * proves a caller and deletes a true finding.
+ *
+ * Only the start is matched, because the `>` that ends it may be lines away: an attribute list
+ * wraps as ordinary formatting, and a whole-tag pattern would recognize no opener at all on
+ * `<script` with `type="module">` under it, leaving the body it opens unread and the import inside
+ * it uncounted.
  */
-function elementTagStart(name: string): RegExp {
-  return new RegExp(String.raw`<(\/?)${name}\b`, "gi");
+const MARKUP_TAG = /<(\/?)([a-zA-Z][^\s/>]*)/g;
+
+/**
+ * Where `name`'s closing tag begins. Only its own close ends an element's body, so the `<` in the
+ * program it holds — `a < b`, `</` in a string — opens nothing while the body runs.
+ */
+function elementTagEnd(name: string): RegExp {
+  return new RegExp(String.raw`<\/${name}\b`, "gi");
 }
 
 /**
@@ -669,8 +681,8 @@ function markupTagEnd(line: string, at: number, quote?: string): { at: number; q
   return { at: -1, quote };
 }
 
-/** Where a `<script>` or `</script>` tag begins. */
-const SCRIPT_TAG = elementTagStart("script");
+/** The element whose body is a program rather than markup. */
+const SCRIPT_TAG = "script";
 
 /**
  * The `type` a `<script>` declares. Only a whole attribute counts, so `data-type="ld+json"` is not
@@ -702,7 +714,7 @@ function runsJavaScript(opener: string): boolean {
 }
 
 /** The same for `<style>`, whose braces are CSS rather than the template's interpolations. */
-const STYLE_TAG = elementTagStart("style");
+const STYLE_TAG = "style";
 
 /**
  * The framework directive prefixes that introduce a binding: Svelte's `use:enhance`, Vue's
@@ -830,12 +842,18 @@ function markupProgram(code: string[], file: string): MarkupProgram {
 }
 
 /**
- * Where each line sits inside the body of `tag` — the program a `<script>` holds, the CSS a
- * `<style>` holds. Both are the element's own language rather than the template's, so the markup
- * rules stop at their tags.
+ * Where each line sits inside the body of the element `name` — the program a `<script>` holds, the
+ * CSS a `<style>` holds. Both are the element's own language rather than the template's, so the
+ * markup rules stop at their tags.
  *
  * `opens` selects which bodies are reported: an element it rejects still runs to its closing tag,
  * so the ones after it are found where they are, but its own body is left out.
+ *
+ * Outside a body every tag is walked, not just `name`'s, because only walking one leaves its name
+ * recognized wherever it is spelled — including inside another tag's quoted attribute, where
+ * `<div title="example <script>">` is text rather than an element. Inside a body only `name`'s own
+ * close is looked for, the way a browser reads raw text: a `<` in the program it holds opens
+ * nothing.
  *
  * A tag is read across lines, because an attribute list wraps as ordinary formatting: `<script`
  * with `type="module">` under it opens the body its import sits in, and stopping at the line's end
@@ -845,15 +863,16 @@ function markupProgram(code: string[], file: string): MarkupProgram {
  */
 function elementBodySpans(
   code: string[],
-  tag: RegExp,
+  name: string,
   from = 0,
   opens: (opener: string) => boolean = () => true,
 ): CodeSpans[] {
+  const closeTag = elementTagEnd(name);
   const lines: CodeSpans[] = [];
   let open = false;
   let selected = true;
   /** A tag whose `>` has not arrived yet: what it has spelled, and the attribute quote it leaves open. */
-  let pending: { closing: boolean; text: string; quote?: string } | undefined;
+  let pending: { body: boolean; closing: boolean; text: string; quote?: string } | undefined;
   for (const [index, line] of code.entries()) {
     if (index < from) {
       lines.push([]);
@@ -866,17 +885,27 @@ function elementBodySpans(
     let at = 0;
     while (at <= line.length) {
       if (pending === undefined) {
-        tag.lastIndex = at;
-        const match = tag.exec(line);
-        if (!match) break;
-        pending = { closing: match[1] === "/", text: match[0] };
-        // A closing tag ends the body where it starts, whatever line its `>` lands on.
-        if (pending.closing) {
-          if (start !== undefined && selected) spans.push([start, match.index]);
+        if (start === undefined) {
+          MARKUP_TAG.lastIndex = at;
+          const match = MARKUP_TAG.exec(line);
+          if (!match) break;
+          pending = {
+            body: match[2]?.toLowerCase() === name,
+            closing: match[1] === "/",
+            text: match[0],
+          };
+          at = match.index + match[0].length;
+        } else {
+          closeTag.lastIndex = at;
+          const match = closeTag.exec(line);
+          if (!match) break;
+          // A closing tag ends the body where it starts, whatever line its `>` lands on.
+          if (selected) spans.push([start, match.index]);
           start = undefined;
           selected = true;
+          pending = { body: true, closing: true, text: match[0] };
+          at = match.index + match[0].length;
         }
-        at = match.index + match[0].length;
       }
       const end = markupTagEnd(line, at, pending.quote);
       if (end.at < 0) {
@@ -884,11 +913,11 @@ function elementBodySpans(
         pending.quote = end.quote;
         break;
       }
-      const { closing } = pending;
+      const { body, closing } = pending;
       const opener = pending.text + line.slice(at, end.at + 1);
       pending = undefined;
       at = end.at + 1;
-      if (!closing && start === undefined && !opener.endsWith("/>")) {
+      if (body && !closing && start === undefined && !opener.endsWith("/>")) {
         start = at;
         selected = opens(opener);
       }

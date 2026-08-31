@@ -1764,6 +1764,28 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
     });
 
+    // A tag name inside another tag's quoted attribute is text, not an element: `title="<script>"`
+    // opens nothing. Recognizing it as an opener makes every line under it read as program, so the
+    // page's own rendered prose proves a caller and a true finding is deleted.
+    it("does not open a script from a tag name quoted inside another tag's attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html":
+          '<div title="example <script>">shown</div>\n<p>Widget was removed</p>\n',
+        "public/app.html": "<script>\n  Widget();\n</script>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
     // A brace binds only where the format gives it meaning: `{Widget()}` invokes the symbol in a
     // single-file component, while the same braces in static HTML, XML or SVG are characters the
     // page shows. Reading those as an expression deletes a true finding.
