@@ -1494,8 +1494,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           timedOut.push({ id: e.ticketId, committed: e.committed });
           console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
           // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
-          // that landed AFTER its commit takes nothing down with it (anton-67xj).
-          skipCause = skippedDependents(timedOut, live, all);
+          // that landed AFTER its commit takes nothing down with it (anton-67xj). Walked over
+          // `tickets` rather than `live`: an abandoned ticket still sits on the `blocks` edges of
+          // the chain around it, so dropping it from the graph would cut the walk short and
+          // dispatch the tickets BEHIND it against work the rollback took off the branch.
+          skipCause = skippedDependents(timedOut, tickets, all);
         }
         // A finished ticket is progress — reported here so the runner's no-progress timeout
         // measures a wedge rather than a long-but-healthy feature (anton-t1mo).
@@ -3157,6 +3160,11 @@ export interface TicketTimeoutOutcome {
  *
  * Breadth-first from the stopped set over the run's own `blocks` edges, so a chain a→b→c skips both
  * b and c; a ticket already recorded is never revisited, which also makes a cycle terminate.
+ *
+ * `tickets` is the run's WHOLE set, ABANDONED members included (PR #199) — an abandoned ticket is a
+ * node the walk crosses, never a verdict it reports. Leaving it out of the graph would cut a→b→c at
+ * an abandoned `b` and dispatch `c` against a mechanism the rollback took off the branch; leaving it
+ * in the result would have the run skip-note a bead a human already closed.
  */
 export function skippedDependents(
   timedOut: readonly TicketTimeoutOutcome[],
@@ -3179,6 +3187,7 @@ export function skippedDependents(
       queue.push(dependent);
     }
   }
+  for (const t of tickets) if (beads.isAbandoned(t)) cause.delete(t.id);
   return cause;
 }
 

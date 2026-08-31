@@ -1443,6 +1443,17 @@ async function applyRehome(
     // Still the sweep's evidence until the board confirms it: a ticket another operator has since
     // moved off this ancestor rides on nothing, and detaching would rewrite an edge that is theirs.
     if (shipped && beads.parentOf(shipped) !== parentId) continue;
+    // The ANCESTOR is re-read at the write too (PR #199). `stale` only reflects pass 1a, and this
+    // detach is a bd round trip — plus every earlier detach — later: an ancestor another operator
+    // has claimed or reparented since is no longer moving, so there is nothing to take the child
+    // off and the detach would rewrite an edge inside their subtree. Recorded as stale exactly as
+    // 1a would have, pinning whatever above it would otherwise carry it onto the follow-up.
+    const takenAncestor = await takenSince(await reread(parentId), reread);
+    if (takenAncestor) {
+      stale.set(parentId, takenAncestor);
+      await pinAncestors(takeable.get(parentId)!);
+      continue;
+    }
     if (
       shipped &&
       !strandedByDetach(shipped, bead) &&

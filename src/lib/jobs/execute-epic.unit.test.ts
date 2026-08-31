@@ -379,6 +379,18 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     expect(cause.get("c")).toEqual({ waitingOn: "b", stopped: "a" });
   });
 
+  it("walks THROUGH an abandoned ticket rather than stopping at it (PR #199)", () => {
+    // The run never dispatches an abandoned `b`, but it still sits on the a→b→c chain: reading the
+    // graph over the live tickets alone drops both of its edges, and `c` runs against a mechanism
+    // `a`'s rollback took off the branch. It is crossed, never named — `c` is the only skip here.
+    const board = chain().map((t) =>
+      t.id === "b" ? ({ ...t, labels: ["abandoned"] } as Bead) : t,
+    );
+    const cause = skippedDependents(rolledBack("a"), board, board);
+    expect([...cause.keys()]).toEqual(["c"]);
+    expect(cause.get("c")).toEqual({ waitingOn: "b", stopped: "a" });
+  });
+
   it("leaves a ticket with no edge to the timed-out one alone — the run narrows, it does not halt", () => {
     const board = chain();
     expect(skippedDependents(rolledBack("a"), board, board).has("d")).toBe(false);

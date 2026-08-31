@@ -1049,6 +1049,31 @@ describe("finalizeMergedEpic", () => {
     );
   });
 
+  it("re-reads the ancestor at its child's detach, not just in the prepass (PR #199)", async () => {
+    // m1's own delivered child d0 is detached first, and that bd round trip is the window the claim
+    // on t2 lands in — after pass 1a cleared it. Deciding t3's detach on that prepass verdict
+    // rewrites an edge inside the subtree op-2 now owns, and strands the shipped t3 under a target
+    // anton is about to close.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "d0") assignees.set("t2", "op-2");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("m1", "blocked", ["not-delivered"]),
+      under("m1", bead("d0")),
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3")),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "d0", "epic-1"],
+      ["/repo", "m1", "epic-2"],
+    ]);
+    const note = noteFor("t2");
+    expect(note).toContain("between planning the move and making it");
+    expect(note).toContain("under op-2");
+  });
+
   it("leaves a ticket whose ANCESTOR another operator reparented since the sweep (anton-67xj)", async () => {
     // Belonging is read off the live chain, not the snapshot: t2 shipped and another operator has
     // since moved it under their own target, taking t3 with it. Resolving t2 from the sweep's
