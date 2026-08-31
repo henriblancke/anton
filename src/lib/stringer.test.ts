@@ -1512,6 +1512,37 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("apps/web/home.ts");
     });
 
+    // ...and the mapping that answers is the one governing the importing FILE. A monorepo declares
+    // `@/*` in the app that uses it, so reading only the repo root's tsconfig finds no rule there,
+    // falls back to the specifier's tail, and binds an unrelated package's default to the caller's
+    // name — inventing a caller and deleting a finding that was right.
+    it("resolves an alias through the importing app's own tsconfig, not the repo root's", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+        "apps/web/tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/src/ui/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/src/home.ts": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/src/ui/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the app's own mapping still resolves the module it does name, so the caller
+      // that binds that default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.ts");
+    });
+
     // A formatter wraps an export list as readily as an import one, leaving `Widget as default` on
     // a line whose `export {` opened above it. Read line by line the module declares no default at
     // all, so the binding its caller took is never resolved and a live symbol is reported dead.
@@ -3244,6 +3275,32 @@ describe("scan", () => {
         "src/ui/live.tsx":
           "export const Live = () => (\n  <div>\n    {ready &&\n" +
           "      <span />} {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A tag whose props wrapped ENDS on the line that names the symbol, and past that `>` the line
+    // is the element's children: `<div` closed with `>Widget was removed</div>` renders the symbol.
+    // Reading the tail as more of the attribute list leaves no element open, so the prose proves
+    // its own caller — while the interpolation written in the same place is still the call it is.
+    it("resumes JSX text past the bracket that closes a wrapped tag, and still counts a call there", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          'export const Note = () => (\n  <div\n    className="note"\n' +
+          "  >Widget was removed in favour of Panel</div>\n);\n",
+        "src/ui/live.tsx":
+          'export const Live = () => (\n  <div\n    className="live"\n' +
+          "  >{Widget()}</div>\n);\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/ui/widget.tsx", "Widget"),

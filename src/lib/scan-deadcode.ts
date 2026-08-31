@@ -1826,6 +1826,12 @@ function jsxLineStates(code: string[]): JsxLine[] {
  * its own caller and delete a true finding. Past that closing quote the line is the tag's
  * attribute list again, so the static prop after it is still what a reader sees.
  *
+ * A wrapped tag also ENDS on the line that names the symbol — `<div` with its props above and
+ * `>Widget was removed</div>` here — and past that `>` the line is the element's children rather
+ * than more of the attribute list. Reading the tail as attributes leaves no element open, so the
+ * prose behind the bracket reads as program and a paragraph naming a removed component proves its
+ * own caller. Only a `/>` opens nothing, having rendered nothing after itself.
+ *
  * The interpolations the line already closed are blanked first, along with the entities it renders,
  * so the child text resumes after a `{…}` or an `&mdash;` instead of reading as program.
  */
@@ -1845,12 +1851,26 @@ function referencesJsx(line: string | undefined, symbol: string, state: JsxLine 
     const { masked: head } = maskJsxRendered(before);
     if (wrapped !== undefined && !head.includes(wrapped)) return false;
     const inTag = wrapped !== undefined || state === "tag";
+    // The bracket that finishes the tag carried from above hands the rest of the line to that
+    // element's children, so the symbol behind it is read against the element the bracket opened.
+    const ended = inTag ? jsxTagEnd(head, wrapped) : undefined;
+    if (ended && ended.at >= 0)
+      return jsxHeadIsCode(head.slice(ended.at + 1), head[ended.at - 1] === "/" ? 0 : 1);
     if (inTag && JSX_PROP_LINE.test(head)) return false;
     if (JSX_PROP_TEXT.test(head)) return false;
-    const { net, remainder, after } = jsxTags(head);
-    const open = (inTag ? 0 : parents) + net;
-    return open <= 0 || JSX_CHILD_CODE.test(remainder.slice(after));
+    return jsxHeadIsCode(head, inTag ? 0 : parents);
   });
+}
+
+/**
+ * Whether the symbol standing behind `head` is program, given the `parents` elements open above it.
+ * Rendered text carries only as far as the prose does: past the last tag the head finishes, JSX's
+ * own delimiters mean the symbol sits inside an expression rather than in what a reader sees.
+ */
+function jsxHeadIsCode(head: string, parents: number): boolean {
+  const { net, remainder, after } = jsxTags(head);
+  const open = parents + net;
+  return open <= 0 || JSX_CHILD_CODE.test(remainder.slice(after));
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -2582,7 +2602,7 @@ async function filesMentioning(
   declaring: ReadonlySet<string>,
   masked: Map<string, MaskedFile | undefined>,
   pathspecs: string[],
-  aliases: readonly AliasRule[],
+  aliases: AliasCache,
   abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
   const hits = await grepWord(repoPath, symbol, pathspecs, abort);
@@ -2636,9 +2656,51 @@ function posix(path: string): string {
   return path.split(/[\\/]/).join("/");
 }
 
+/** The `paths` mappings this pass has already read, by the directory each governs. */
+type AliasCache = Map<string, readonly AliasRule[]>;
+
+/** No rule claims anything — shared so an unmapped directory costs no allocation. */
+const NO_ALIASES: readonly AliasRule[] = [];
+
 /**
- * Where the repo's own `paths` mapping sends `spec` — every target the rules claiming its prefix
- * expand to, and nothing when no rule claims it.
+ * The `paths` mapping that governs `file`: the nearest tsconfig at or above it that publishes one,
+ * rather than the repo root's. A monorepo declares `@/*` in the app that uses it, so resolving
+ * every importer against the root config finds no rule there, falls back to matching the
+ * specifier's tail, and reads `@/ui/widget` as the same-named module of an unrelated package —
+ * inventing a caller and deleting a true finding.
+ *
+ * Every directory walked is cached, negative answers included, so a package's config is read once
+ * however many of its files import.
+ */
+async function aliasesGoverning(
+  repoPath: string,
+  file: string,
+  cache: AliasCache,
+): Promise<readonly AliasRule[]> {
+  const walked: string[] = [];
+  let rules: readonly AliasRule[] = NO_ALIASES;
+  for (let dir = posix(dirname(file)); ; dir = posix(dirname(dir))) {
+    const cached = cache.get(dir);
+    if (cached) {
+      rules = cached;
+      break;
+    }
+    walked.push(dir);
+    const found = await readAliases(repoPath, dir);
+    if (found.length > 0) {
+      rules = found;
+      break;
+    }
+    // The repo root answers last: above it there is no config of this project's to read.
+    if (dir === "." || dir === "/" || dir === "..") break;
+  }
+  for (const dir of walked) cache.set(dir, rules);
+  return rules;
+}
+
+/**
+ * Where the `paths` mapping governing the importer sends `spec` — every target the rules claiming
+ * its prefix expand to, and nothing when no rule claims it.
  */
 function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
   const mapped: string[] = [];
@@ -2654,11 +2716,12 @@ function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
  * Whether `spec`, written in `importer`, could name `module` — both repo-relative paths.
  *
  * A relative specifier is resolved exactly, against the importing file's own directory, so it names
- * one module and no other. An ALIASED one is resolved through the repo's `paths` mapping when the
- * repo publishes one, and a rule that claims the prefix answers alone: `@/ui/widget` under
- * `"@/*": ["apps/web/*"]` is `apps/web/ui/widget` and no other module. Falling back to the tail
- * behind a mapping that already answered is how the same specifier gets read as the same-named
- * module in an unrelated package of a monorepo — inventing a caller and deleting a true finding.
+ * one module and no other. An ALIASED one is resolved through `aliases` — the mapping governing the
+ * importing file, which `aliasesGoverning` reads from the config nearest it — and a rule that
+ * claims the prefix answers alone: `@/ui/widget` under `"@/*": ["apps/web/*"]` is
+ * `apps/web/ui/widget` and no other module. Falling back to the tail behind a mapping that already
+ * answered is how the same specifier gets read as the same-named module in an unrelated package of
+ * a monorepo — inventing a caller and deleting a true finding.
  *
  * Only where no rule claims the prefix is the tail matched instead — a repo whose aliases anton
  * cannot read still imports `@/ui/widget` from the module whose path ends in `ui/widget`. The tail
@@ -2835,7 +2898,7 @@ async function defaultBindingCallers(
   declaring: ReadonlySet<string>,
   masked: Map<string, MaskedFile | undefined>,
   pathspecs: string[],
-  aliases: readonly AliasRule[],
+  aliases: AliasCache,
   abort?: AbortSignal,
 ): Promise<string[]> {
   const modules = new Map<string, DefaultExport>();
@@ -2867,7 +2930,12 @@ async function defaultBindingCallers(
       abort?.throwIfAborted();
       const entry = await maskedFile(repoPath, file, masked, abort);
       if (!entry) continue;
-      const locals = defaultBindingsOf(entry.program, file, modules, aliases);
+      const locals = defaultBindingsOf(
+        entry.program,
+        file,
+        modules,
+        await aliasesGoverning(repoPath, file, aliases),
+      );
       const used = locals.some((local) =>
         entry.code.some((line, index) => entry.references(line, local, index)),
       );
@@ -2913,9 +2981,10 @@ export async function filterDeadcodeSignals(
   if (relevant.length === 0) return { kept: signals, deadcode: { dropped: [] } };
 
   const pathspecs = excludePathspecs(opts.exclude ?? []);
-  // The repo's own `paths` mapping, read once: it is what says which module an aliased specifier
-  // names, and a monorepo holds more than one module per path tail.
-  const aliases = await readAliases(repoPath);
+  // The `paths` mappings the pass reads, one per directory that publishes one: they are what say
+  // which module an aliased specifier names, and a monorepo holds more than one module per path
+  // tail — and more than one config declaring the prefix that tells them apart.
+  const aliases: AliasCache = new Map();
   // Every file that declares a given symbol, gathered before any grep. Two signals can name the
   // same symbol in different files (an overload in a sibling module, a helper copied per package);
   // excluding only the signal's own path leaves each declaration looking like the other's caller,

@@ -139,14 +139,17 @@ export interface AliasRule {
 }
 
 /**
- * The project's path aliases, so a cycle closed by `@/lib/x` is still visible. Best-effort: a
- * tsconfig anton can't read costs alias edges (which only ever ADD proof of a real cycle, so the
- * signal is kept), never a wrong drop.
+ * The path aliases the tsconfig in `dir` publishes — the repo root's by default — so a cycle closed
+ * by `@/lib/x` is still visible. Best-effort: a tsconfig anton can't read costs alias edges (which
+ * only ever ADD proof of a real cycle, so the signal is kept), never a wrong drop.
+ *
+ * `dir` is repo-relative, and the targets come back repo-relative with it, because a monorepo
+ * declares `@/*` in the app that uses it and its `baseUrl` is that app's own directory.
  */
-export async function readAliases(repoPath: string): Promise<AliasRule[]> {
+export async function readAliases(repoPath: string, dir = "."): Promise<AliasRule[]> {
   let config: { compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> } };
   try {
-    config = JSON.parse(await readFile(join(repoPath, "tsconfig.json"), "utf8"));
+    config = JSON.parse(await readFile(join(repoPath, dir, "tsconfig.json"), "utf8"));
   } catch {
     return [];
   }
@@ -158,7 +161,7 @@ export async function readAliases(repoPath: string): Promise<AliasRule[]> {
     if (!pattern.endsWith("/*")) continue;
     const mapped = targets
       .filter((target) => target.endsWith("/*"))
-      .map((target) => normalize(join(base, target.slice(0, -2))));
+      .map((target) => normalize(join(dir, base, target.slice(0, -2))));
     if (mapped.length > 0) rules.push({ prefix: pattern.slice(0, -1), targets: mapped });
   }
   return rules;
