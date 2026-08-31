@@ -2242,6 +2242,14 @@ async function runTicket(args: {
             `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
         ),
       );
+      // Either halt below PARKS the run and tells the operator to resume it, so this ticket has to
+      // stay claimable (anton-67xj). The block above left it `blocked` — or `in_progress` and
+      // unowned, if that best-effort status write failed — and runTicket's hard claim gate refuses
+      // both, so the advertised resume would die on its own first step. Put it back at `open`, the
+      // same restore the stale-marker path performs; the note above is what carries the timeout's
+      // account to the operator, not the status. A timeout the run ABSORBS keeps `blocked`: it
+      // carries on to a PR, so nothing resumes and the block is the human's cue.
+      if (leftovers || !marked) await safe(() => beads.setStatus(repo, ticket.id, "open"));
       // The rollback is what keeps the REST of the run honest, so its failure cannot be absorbed
       // the way the timeout itself is: the next ticket captures its baseline from this same tree
       // and would commit these leftovers under its own name. The bead note can't prevent that —

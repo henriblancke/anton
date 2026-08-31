@@ -16,6 +16,7 @@
  * 4. **A rollback that FAILS halts the run and keeps its worktree.** Carrying on past leftovers it
  *    could not remove would hand them to the next ticket's commit — the mis-attribution above, by
  *    another route — and releasing the checkout would delete the work the operator is sent to clear.
+ *    Both halts leave the ticket claimable: the resume they advertise starts at a hard claim gate.
  * 5. **The tickets BEHIND a timed-out one are skipped, not dispatched** (anton-67xj). Their premise
  *    was rolled back off the branch, so dispatching them buys a zero diff and a poisoned run; the
  *    run narrows to the independent work and still opens its PR for it.
@@ -314,9 +315,12 @@ process.exit(0);`),
           .filter(Boolean);
         expect(invoked).toHaveLength(1);
 
-        // The stalled ticket is still blocked with a note that says where its work actually is.
+        // The stalled ticket carries a note that says where its work actually is — and is left
+        // CLAIMABLE, because this park tells the operator to clear the tree and resume: a ticket
+        // left `blocked` (or unowned and `in_progress`) dies on runTicket's hard claim gate.
         const stalled = await beads.show(repo, invoked[0]);
-        expect(stalled.status).toBe("blocked");
+        expect(stalled.status).toBe("open");
+        expect(ownerOf(stalled)).toBeUndefined();
         expect(JSON.stringify(stalled)).toMatch(/STILL in the run's worktree/i);
 
         // No PR: this run delivered nothing a reviewer should see.
@@ -702,9 +706,13 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
         expect(target.labels ?? []).not.toContain("stage:in-review");
 
         // The timed-out ticket still carries everything the run COULD write about it — the halt is
-        // about the missing label, not a reason to leave the operator with nothing.
+        // about the missing label, not a reason to leave the operator with nothing. And it is left
+        // CLAIMABLE: the park tells the operator to fix bd and resume, which runTicket's hard claim
+        // gate refuses on a `blocked` (or unowned `in_progress`) bead.
         const stalled = await beads.show(repo, invoked[0]);
-        expect(stalled.status).toBe("blocked");
+        expect(stalled.status).toBe("open");
+        expect(ownerOf(stalled)).toBeUndefined();
+        expect(stalled.labels ?? []).not.toContain("stage:implementing");
         expect(stalled.labels ?? []).not.toContain("not-delivered");
       } finally {
         process.env.ANTON_CLAUDE_BIN = successClaude;

@@ -912,6 +912,30 @@ describe("finalizeMergedEpic", () => {
     expect(noteFor("t2")).toContain("t3 still hangs off it");
   });
 
+  it("re-reads a delivered child at its detach, not through the prepass memo (PR #199)", async () => {
+    // a1 is an ANCESTOR of the mover t2, so pass 1a's ancestry walk already memoised it as closed.
+    // It is reopened in the window d0's own detach opens — a bd round trip on a shared board — so a
+    // detach decided on that memo moves a live a1 onto epic-1, which the closing snapshot leaves out
+    // of the batch: open beneath a closed target nothing anton runs reaches again.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "d0") statuses.set("a1", "open");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("m1", "blocked", ["not-delivered"]),
+      under("m1", bead("d0")),
+      under("m1", bead("a1", "closed")),
+      under("a1", bead("t2", "blocked", ["not-delivered"])),
+    ]);
+
+    // a1 never left m1, so m1 stays put with the reason named; t2 takes a home of its own.
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "d0", "epic-1"],
+      ["/repo", "t2", "epic-2"],
+    ]);
+    expect(noteFor("m1")).toContain("a1 still hangs off it");
+  });
+
   it("leaves a delivered descendant another operator moved off the ancestor alone", async () => {
     // The snapshot says t3 hangs off t2; the live board says it does not. Detaching it would
     // rewrite an edge that belongs to whoever moved it, and nothing rides onto the follow-up.

@@ -1435,7 +1435,11 @@ async function applyRehome(
       stale.has(parentId)
     )
       continue;
-    const shipped = await readFresh(bead.id);
+    // Memo-BYPASSING, like every other guarded write here (PR #199): pass 1a's ancestry walks read
+    // through the memo, so a delivered child that is also an ancestor of a mover is already cached
+    // by the time this detach reads it — and a stale closed/unowned copy is exactly what
+    // `strandedByDetach` clears, moving live work under a target the closing snapshot then omits.
+    const shipped = await reread(bead.id);
     // Still the sweep's evidence until the board confirms it: a ticket another operator has since
     // moved off this ancestor rides on nothing, and detaching would rewrite an edge that is theirs.
     if (shipped && beads.parentOf(shipped) !== parentId) continue;
