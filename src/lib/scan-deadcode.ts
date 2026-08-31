@@ -648,9 +648,28 @@ const DIRECTIVE = String.raw`(?:use|on|bind|transition|in|out|animate|class|styl
 
 /**
  * A directive taking a bare binding rather than a braced one: `<form use:enhance>` and
- * `<b v-on:click=go>` name a real caller with no other code around them.
+ * `<b v-on:click=go>` name a real caller with no other code around them. Matched against the head
+ * of the tag the symbol sits in, never the whole line — see `openTagHead`.
  */
 const DIRECTIVE_HEAD = new RegExp(String.raw`(?:^|[\s"'])${DIRECTIVE}:\s*$`);
+
+/**
+ * The head of the tag the text ends inside, or undefined when it ends in rendered text. A
+ * directive binds within a tag, so the sentence `<p>The old use: Widget was removed</p>` names
+ * nothing: the tag it follows has already closed, and reading its prefix as a binding calls the
+ * page a caller and deletes a true finding about a genuinely unused symbol.
+ *
+ * A line carrying no `<` at all is left as a tag head. A tag whose attributes wrap onto lines of
+ * their own — `<form` with `use:enhance` under it — is the shape the binding really takes, and
+ * telling that continuation from a wrapped paragraph would need the file's tag nesting carried
+ * across lines. The bound is kept deliberately: it costs only prose that both wraps and spells a
+ * directive prefix right before the symbol.
+ */
+function openTagHead(markup: string): string | undefined {
+  const open = markup.lastIndexOf("<");
+  if (open < 0) return markup;
+  return markup.includes(">", open) ? undefined : markup.slice(open);
+}
 
 /**
  * An attribute that carries code rather than content — a handler, a framework directive, a dynamic
@@ -802,11 +821,12 @@ function referencesMarkup(
     // above stops there too.
     const from = code.reduce((last, [, end]) => (end <= at ? end : last), 0);
     const markup = head.slice(from);
+    const tag = openTagHead(markup);
     return (
       TAG_HEAD.test(markup) ||
       ATTR_VALUE.test(markup) ||
       ATTR_VALUE_BARE.test(markup) ||
-      DIRECTIVE_HEAD.test(markup) ||
+      (tag !== undefined && DIRECTIVE_HEAD.test(tag)) ||
       insideExpression(markup, from === 0 ? depth : 0)
     );
   });

@@ -1658,6 +1658,7 @@ describe("scan", () => {
       const repo = initRepo({
         "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
         "src/ui/form.svelte": "<form use:Widget>\n</form>\n",
+        "src/ui/wrapped.svelte": "<form\n  use:Widget\n>\n</form>\n",
         "src/pages/index.astro":
           "---\nimport { Widget } from '../ui/widget';\n---\n<main>hello</main>\n",
         "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
@@ -1671,8 +1672,32 @@ describe("scan", () => {
       expect(result.signals).toEqual([]);
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/form.svelte");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/wrapped.svelte");
       expect(result.deadcode.dropped[0].reason).toContain("src/pages/index.astro");
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A directive prefix binds inside a tag. Rendered text that happens to end in one — `The old
+    // use:` before the symbol — is a sentence, and reading it as a binding lets a doc page prove
+    // its own caller and delete a true finding.
+    it("does not count a directive prefix in rendered text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/form.svelte": "<form use:Widget>\n</form>\n",
+        "public/notes.html": "<p>The old use: Widget was removed</p>\n",
+        "src/ui/notes.vue": "<template>\n  <p>Written in: Widget, now gone</p>\n</template>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/form.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
     });
 
     // A `<script>` runs between its tags, not across its line. Rendered text sharing the line with
