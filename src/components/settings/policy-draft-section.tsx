@@ -153,14 +153,18 @@ export function PolicyDraftSection({
   const [policy, setPolicy] = useState<Policy>(stored ?? draft.policy);
   const [saving, setSaving] = useState(false);
 
-  // Whether what the controls currently hold was seeded off a FAILED board read — either the first
-  // render, or a later disarm that fell back to the draft while the board was still unreadable.
-  // React keeps client state across the `router.refresh()` that eventually delivers a real read, so
-  // without this the panel would arm the failure-derived policy while the banner and rationale
-  // beside it describe the recovered one. Nothing is lost by re-seeding: saving is disabled while
-  // the board is unreadable, and every criterion is authored against a vocabulary that read
-  // returned none of.
-  const [seededBlind, setSeededBlind] = useState(boardUnavailable);
+  // Whether what the controls currently hold was seeded off a FAILED board read — a first render
+  // with nothing armed, or a later disarm that fell back to the draft while the board was still
+  // unreadable. React keeps client state across the `router.refresh()` that eventually delivers a
+  // real read, so without this the panel would arm the failure-derived policy while the banner and
+  // rationale beside it describe the recovered one. Nothing is lost by re-seeding: saving is
+  // disabled while the board is unreadable, and every criterion is authored against a vocabulary
+  // that read returned none of.
+  //
+  // An ARMED project is not blind-seeded: its controls hold the STORED policy, which came from the
+  // store and not from the failed read, so re-seeding it on recovery would discard whatever the
+  // operator edited during the outage.
+  const [seededBlind, setSeededBlind] = useState(boardUnavailable && stored === undefined);
   if (seededBlind && !boardUnavailable) {
     setSeededBlind(false);
     setPolicy(stored ?? draft.policy);

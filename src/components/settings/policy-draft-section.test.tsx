@@ -712,6 +712,35 @@ describe("a recovered board read re-seeds the controls", () => {
     );
     expect(checked("feature")).toBe("true");
   });
+
+  it("keeps an armed project's edits — the stored policy is not failure-derived", () => {
+    // Armed AND dark from the first render. The controls hold the STORED policy, which came from
+    // the store rather than the failed read, so recovery has nothing to correct. bd-native fields
+    // stay editable through the outage (they need no vocabulary), which is what makes this reachable.
+    const stored = { types: ["feature"], maxPriority: 3 };
+    const { rerender } = renderPanel({
+      stored,
+      draft: THIN,
+      issueTypes: [],
+      labelVocabulary: [],
+      boardUnavailable: true,
+    });
+    fireEvent.change(screen.getByLabelText("Minimum priority"), { target: { value: "1" } });
+
+    rerender(
+      <PolicyDraftSection
+        project={project}
+        draft={FITTED}
+        stored={stored}
+        issueTypes={["bug", "chore", "feature", "task"]}
+        labelVocabulary={VOCABULARY}
+      />,
+    );
+
+    // The outage is over and the edit survives it — re-seeding here would silently restore P3 over
+    // the operator's P1, with Save now enabled to persist the value they had just replaced.
+    expect((screen.getByLabelText("Minimum priority") as HTMLSelectElement).value).toBe("1");
+  });
 });
 
 /**

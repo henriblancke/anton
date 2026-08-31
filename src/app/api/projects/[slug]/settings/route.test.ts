@@ -850,7 +850,7 @@ describe("settings route — work policy (anton-c7iv)", () => {
   });
 
   const policy = {
-    types: ["bug", "chore"],
+    types: ["bug", "feature"],
     maxPriority: 2,
     labels: [{ namespace: "severity", values: ["critical", "major"] }],
     requireUnblocked: true,

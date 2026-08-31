@@ -13,8 +13,8 @@
  * DiscoveredNamespace.rankingCandidate} is a hint that a namespace looks like a scale, offered so the
  * operator can rank it by hand, and the values stay in OBSERVATION order regardless. And it filters
  * nothing but the machine noise {@link boardLabelVocabulary} already drops — deciding which
- * namespaces make defensible criteria belongs to the tier above (see `CONTROL_NAMESPACES` in
- * ./calibrate), not to the read that describes the board.
+ * namespaces make defensible criteria belongs to the tier above (see `POLICY_CONTROL_NAMESPACES` in
+ * ./types), not to the read that describes the board.
  */
 import { boardLabelVocabulary, type LabelUsage } from "../beads/labels";
 import type { Bead } from "../beads/types";
