@@ -2069,6 +2069,61 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
     });
 
+    // Children nest, and a sibling element closes only itself: the paragraph beside `<span>gone
+    // </span>` is still the text their `<div>` opened. Reading that `</span>` as the end of the
+    // parent's text makes the prose under it program again, so a page that merely names the symbol
+    // proves its own caller — while the interpolation beside the same sibling stays the call it is.
+    it("reads JSX text beside a nested element as prose, and still counts a call beside one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx":
+          "export const Panel = () => (\n  <div>\n    <span>gone</span>\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    <span>gone</span>\n" +
+          "    {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+    });
+
+    // A tag's props wrap onto lines of their own as ordinary formatting, and so can the value of
+    // one: the line carrying `title="Widget was removed"` has no opener on it, and the line under
+    // `title="` has neither. Judging either alone reads a static prop as program and lets it prove
+    // its own caller — while the expression prop beside them is still the call it is.
+    it("reads a static prop wrapped onto its own line as prose, and still counts one that runs", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notice.tsx":
+          "export const Notice = () => (\n  <Empty\n" +
+          '    title="Widget was removed in favour of Panel"\n  />\n);\n',
+        "src/ui/split.tsx":
+          "export const Split = () => (\n  <Empty\n" +
+          '    title="\n      Widget was removed in favour of Panel\n    "\n  />\n);\n',
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {

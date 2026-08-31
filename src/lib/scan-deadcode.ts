@@ -958,10 +958,28 @@ const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_PUNCTUATION}]*$`);
 /** Anything that makes a line program again — the closing `</p>`, an interpolation, a call. */
 const JSX_CODE = new RegExp(String.raw`[${JSX_PUNCTUATION}]`);
 
+/** The tail of a static prop — `title="Widget was removed`: the value a reader sees, not code. */
+const JSX_PROP_VALUE = String.raw`[\w-]\s*=\s*(?:"[^"<>{}]*|'[^'<>{}]*)$`;
+
 /** The symbol inside a plain string prop — `<p title="Widget was removed">` renders that too. */
-const JSX_PROP_TEXT = new RegExp(
-  String.raw`<[A-Za-z][\w.$:-]*\s[^<>]*[\w-]\s*=\s*(?:"[^"<>{}]*|'[^'<>{}]*)$`,
+const JSX_PROP_TEXT = new RegExp(String.raw`<[A-Za-z][\w.$:-]*\s[^<>]*${JSX_PROP_VALUE}`);
+
+/**
+ * That same prop on a line the tag opened above. An attribute list wraps onto lines of its own as
+ * ordinary formatting, so the opener the whole-tag test needs is a line away — and a static value
+ * judged without it reads as program, which lets a prop that merely names the symbol prove its own
+ * caller.
+ */
+const JSX_PROP_LINE = new RegExp(JSX_PROP_VALUE);
+
+/** Every tag a line finishes: one it opens, the `</p>` that ends one, the self-closing `<Icon />`. */
+const JSX_TAGS = new RegExp(
+  String.raw`${JSX_OPEN_TAG}|</(?:[A-Za-z][\w.$:-]*\s*)?>|<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?/>`,
+  "g",
 );
+
+/** A tag this line opens and leaves unfinished — `<Empty` with its props on the lines below. */
+const JSX_TAG_OPEN = /<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?$/;
 
 /**
  * The line with every `{…}` it closes blanked out, so what follows one reads as the prose it is.
@@ -995,34 +1013,107 @@ function maskJsxExpressions(line: string): string {
   return out.join("");
 }
 
+/** What the line above leaves open, which is what the line under it is reading. */
+type JsxLine =
+  /** Program — nothing above it renders. */
+  | "code"
+  /** The rendered children of a tag still open above. */
+  | "text"
+  /** The attribute list of a tag whose `>` has not arrived yet. */
+  | "tag"
+  /** A static prop's quoted value, still unterminated. */
+  | "prop";
+
 /**
- * Which lines of a JSX file start inside rendered text a tag left open above — `<p>` with
- * `Widget was removed` on the line under it. Children wrap onto lines of their own as ordinary
- * formatting, and judging that line alone finds no tag before the symbol, so a paragraph naming a
- * removed component reads as program text and deletes a true finding about a genuinely unused one.
- * MDX and markup carry the same state across their lines for the same reason.
- *
- * The run ends at the first line carrying any code punctuation — a closing `</p>`, an
- * interpolation, a call — and at a blank line, read from `raw` so a line masking emptied is not
- * mistaken for the break. A module's generics and comparisons cannot be told from tags without a
- * parser, so a line the tag test misreads (`Map<string, Widget>` closes with the same `>`) can
- * only carry prose into the lines directly under it rather than into the rest of the file:
- * misreading a program as rendered text drops real callers wholesale, which is the costlier
- * direction in the language this repo is mostly written in.
+ * The line with every tag it finishes blanked out, and how many elements those tags leave open.
+ * A sibling closes only itself: `<span>hello</span>` under a `<div>` ends its own text and not the
+ * paragraph beside it, so counting its `</span>` as the end of the parent makes the prose under it
+ * program again — and a line naming a removed component then proves its own caller.
  */
-function jsxTextLines(code: string[], raw: string[]): boolean[] {
-  const text: boolean[] = [];
-  let open = false;
+function jsxTags(line: string): { net: number; remainder: string } {
+  let net = 0;
+  const remainder = line.replace(JSX_TAGS, (tag) => {
+    if (tag.startsWith("</")) net -= 1;
+    // A self-closing element renders nothing after itself, so it opens nothing either.
+    else if (!tag.endsWith("/>")) net += 1;
+    return " ".repeat(tag.length);
+  });
+  return { net, remainder };
+}
+
+/**
+ * Where the tag open above ends on this line, and the attribute quote it still leaves open. Quoted
+ * values are walked rather than scanned for, so `title="a > b"` does not close the tag on the `>`
+ * it shows a reader, and a value that wraps is known to be still open on the line under it.
+ */
+function jsxTagEnd(text: string, quote?: string): { at: number; quote?: string } {
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at];
+    if (char === "\\") at += 1;
+    else if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+    } else if (QUOTE.test(char)) quote = char;
+    else if (char === ">") return { at };
+  }
+  return { at: -1, quote };
+}
+
+/**
+ * What each line of a JSX file starts inside — the rendered text a tag left open above (`<p>` with
+ * `Widget was removed` under it), or the attribute list of a tag whose props wrapped onto lines of
+ * their own. Both wrap as ordinary formatting, and judging such a line alone finds no tag before
+ * the symbol, so a paragraph or a `title=` naming a removed component reads as program text and
+ * deletes a true finding about a genuinely unused one. MDX and markup carry the same state across
+ * their lines for the same reason.
+ *
+ * The run ends at the first line that reads as program once its tags are blanked — a call, an
+ * interpolation, an assignment — and at a blank line, read from `raw` so a line masking emptied is
+ * not mistaken for the break. Within a run the open elements are counted rather than remembered as
+ * one flag, so a nested sibling ends its own text and not its parent's. A module's generics and
+ * comparisons cannot be told from tags without a parser, so a line the tag test misreads
+ * (`Map<string, Widget>` closes with the same `>`) can only carry prose into the lines under it
+ * until the next program line rather than into the rest of the file: misreading a program as
+ * rendered text drops real callers wholesale, which is the costlier direction in the language this
+ * repo is mostly written in. For the same reason a wrapped tag is only entered from a line that
+ * already reads as markup — `a<b` at the end of a statement opens nothing.
+ */
+function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
+  const states: JsxLine[] = [];
+  let depth = 0;
+  let tag = false;
+  let quote: string | undefined;
   for (const [index, line] of code.entries()) {
-    text.push(open);
+    states.push(tag ? (quote === undefined ? "tag" : "prop") : depth > 0 ? "text" : "code");
     if (!raw[index]?.trim()) {
-      open = false;
+      depth = 0;
+      tag = false;
+      quote = undefined;
       continue;
     }
     const rendered = maskJsxExpressions(line);
-    open = JSX_TEXT.test(rendered) || (open && !JSX_CODE.test(rendered));
+    let rest = rendered;
+    if (tag) {
+      const end = jsxTagEnd(rest, quote);
+      if (end.at < 0) {
+        quote = end.quote;
+        continue;
+      }
+      if (rest[end.at - 1] !== "/") depth += 1;
+      rest = rest.slice(end.at + 1);
+      tag = false;
+      quote = undefined;
+    }
+    const opener = JSX_TAG_OPEN.exec(rest);
+    const { net, remainder } = jsxTags(opener ? rest.slice(0, opener.index) : rest);
+    if (JSX_CODE.test(remainder)) {
+      depth = JSX_TEXT.test(rendered) ? 1 : 0;
+      continue;
+    }
+    depth = Math.max(0, depth + net);
+    tag = opener !== null;
+    quote = opener ? jsxTagEnd(opener[0]).quote : undefined;
   }
-  return text;
+  return states;
 }
 
 /**
@@ -1031,15 +1122,25 @@ function jsxTextLines(code: string[], raw: string[]): boolean[] {
  * plain string prop. `<p>Widget was removed</p>` names the symbol the way a doc page does, and
  * counting that page as a caller deletes a true finding about a genuinely unused symbol.
  *
- * `text` is that same rendered text seen from the line above. It only carries as far as the prose
- * does: the symbol has to sit before any punctuation on its line, or the line is program again —
- * see `jsxTextLines` for why that bound is kept tight. The interpolations the line already closed
- * are blanked first, so the child text resumes after a `{…}` instead of reading as program.
+ * `state` is what the lines above left open — see `jsxLineStates` for why that bound is kept tight.
+ * Rendered text carries only as far as the prose does: the symbol has to sit before any punctuation
+ * on its line, or the line is program again. Inside a wrapped tag only a static value is prose, so
+ * `body={Widget()}` on its own line still counts as the call it is; inside a value that wrapped, a
+ * quote before the symbol has already ended it.
+ *
+ * The interpolations the line already closed are blanked first, so the child text resumes after a
+ * `{…}` instead of reading as program.
  */
-function referencesJsx(line: string | undefined, symbol: string, text = false): boolean {
+function referencesJsx(line: string | undefined, symbol: string, state: JsxLine = "code"): boolean {
   return referencesWord(line, symbol, (raw) => {
     const head = maskJsxExpressions(raw);
-    return !JSX_TEXT.test(head) && !JSX_PROP_TEXT.test(head) && !(text && !JSX_CODE.test(head));
+    if (state === "prop") return QUOTE.test(head);
+    return (
+      !(state === "tag" && JSX_PROP_LINE.test(head)) &&
+      !JSX_TEXT.test(head) &&
+      !JSX_PROP_TEXT.test(head) &&
+      !(state === "text" && !JSX_CODE.test(head))
+    );
   });
 }
 
@@ -1106,8 +1207,8 @@ interface MaskedFile {
   code: string[];
   /** For MDX, which lines start inside a block — an expression or ESM statement — left open above. */
   open?: boolean[];
-  /** For JSX, which lines start inside rendered text a tag left open on an earlier line. */
-  jsx?: boolean[];
+  /** For JSX, what each line starts inside: rendered text, a wrapped tag, or its quoted value. */
+  jsx?: JsxLine[];
   /** For markup, where each line is program text: an executable `<script>` body or Astro frontmatter. */
   script?: CodeSpans[];
   /** For markup, how many braced expressions the lines above leave open at each line's start. */
@@ -1184,7 +1285,7 @@ async function codeReferencingFiles(
         masked.set(file, {
           code: markup?.code ?? code,
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
-          jsx: isJsx ? jsxTextLines(code, raw) : undefined,
+          jsx: isJsx ? jsxLineStates(code, raw) : undefined,
           script: markup?.script,
           depth: markup && markupOpenDepths(markup.code, markup.script, raw),
         });
@@ -1208,7 +1309,7 @@ async function codeReferencingFiles(
           entry.depth?.[line - 1],
           isComponent,
         );
-      if (isJsx) return referencesJsx(text, symbol, entry.jsx?.[line - 1] === true);
+      if (isJsx) return referencesJsx(text, symbol, entry.jsx?.[line - 1]);
       return referencesWord(text, symbol);
     };
     if (lines.some(references)) files.push(file);
