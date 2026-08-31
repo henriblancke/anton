@@ -1719,6 +1719,51 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
     });
 
+    // A handler's value wraps as ordinary formatting, and the browser runs it all the same: the
+    // line under `onclick="` carries no attribute of its own, so judging it alone misses the call
+    // and leaves a false dead-code signal standing. A static value that wraps the same way is
+    // still the text a reader sees.
+    it("counts a symbol inside a handler attribute whose value wrapped", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/app.html": '<button\n  onclick="\n    Widget()\n  "\n>go</button>\n',
+        "public/notes.html": '<div\n  title="\n    Widget was removed\n  "\n>gone</div>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A `<script>`'s own attributes wrap too. Reading the opener only where it fits on one line
+    // finds no opener at all, so the import and call inside the body read as markup and the live
+    // component stays reported dead — while a wrapped data script is still inert.
+    it("reads a script whose opening tag wraps onto later lines", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/page.svelte":
+          "<script\n  lang=\"ts\"\n>\n  import Widget from './widget';\n  Widget();\n</script>\n",
+        "public/notes.html":
+          '<script\n  type="application/ld+json"\n>\n{"name": "Widget"}\n</script>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
     // A brace binds only where the format gives it meaning: `{Widget()}` invokes the symbol in a
     // single-file component, while the same braces in static HTML, XML or SVG are characters the
     // page shows. Reading those as an expression deletes a true finding.
@@ -2108,6 +2153,35 @@ describe("scan", () => {
         "src/ui/split.tsx":
           "export const Split = () => (\n  <Empty\n" +
           '    title="\n      Widget was removed in favour of Panel\n    "\n  />\n);\n',
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
+    });
+
+    // A wrapped value ends at the quote that opened it, not at any quote: the apostrophe in a
+    // double-quoted `title` is prose, and reading it as the end of the value makes the sentence
+    // behind it program — which lets a page that only names the symbol prove its own caller. Past
+    // the real closing quote the line is the attribute list again, where a static prop is prose too.
+    it("ends a wrapped JSX prop at its own quote, not at an apostrophe inside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notice.tsx":
+          "export const Notice = () => (\n  <Empty\n    title=\"\n" +
+          "      It's Widget documentation, now gone\n    \"\n  />\n);\n",
+        "src/ui/split.tsx":
+          'export const Split = () => (\n  <Empty\n    body="\n      still open\n' +
+          '    " title="Widget was removed"\n  />\n);\n',
         "src/ui/live.tsx":
           "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
       });

@@ -642,21 +642,35 @@ const ASTRO_FILE = /\.astro$/i;
 const ASTRO_FENCE = /^---\s*$/;
 
 /**
- * A tag for `name`, opening or closing, with whatever attributes it carries
- * (`<script lang="ts">`). A quoted value is matched whole, so the `>` inside one —
- * `<script title="> gone">` — doesn't end the tag early and hand the rest of the attribute back as
- * element body: text a reader sees would then read as program and prove its own caller.
- *
- * The three branches are told apart by their first character, so the scan stays linear on a long
- * line rather than backtracking over it. A quote left unclosed on the line therefore matches no
- * tag at all, the same bound a tag whose attributes wrap onto the next line already has.
+ * Where a tag for `name` begins, opening or closing — `<script`, `</script`. Only the start,
+ * because the `>` that ends it may be lines away: an attribute list wraps as ordinary formatting,
+ * and a whole-tag pattern would recognize no opener at all on `<script` with `type="module">`
+ * under it, leaving the body it opens unread and the import inside it uncounted.
  */
-function elementTag(name: string): RegExp {
-  return new RegExp(String.raw`<(\/?)${name}\b(?:[^>"']|"[^"]*"|'[^']*')*?(\/?)>`, "gi");
+function elementTagStart(name: string): RegExp {
+  return new RegExp(String.raw`<(\/?)${name}\b`, "gi");
 }
 
-/** A `<script>` or `</script>` tag. */
-const SCRIPT_TAG = elementTag("script");
+/**
+ * Where the tag being read ends, scanning from `at`, and the attribute quote it still leaves open.
+ * Quoted values are walked rather than scanned for, so the `>` inside one —
+ * `<script title="> gone">` — doesn't end the tag early and hand the rest of the attribute back as
+ * element body: text a reader sees would then read as program and prove its own caller. A value
+ * that wraps is known to be still open on the line below, so its quote carries there too.
+ */
+function markupTagEnd(line: string, at: number, quote?: string): { at: number; quote?: string } {
+  for (let index = at; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+    } else if (char === '"' || char === "'") quote = char;
+    else if (char === ">") return { at: index };
+  }
+  return { at: -1, quote };
+}
+
+/** Where a `<script>` or `</script>` tag begins. */
+const SCRIPT_TAG = elementTagStart("script");
 
 /**
  * The `type` a `<script>` declares. Only a whole attribute counts, so `data-type="ld+json"` is not
@@ -688,7 +702,7 @@ function runsJavaScript(opener: string): boolean {
 }
 
 /** The same for `<style>`, whose braces are CSS rather than the template's interpolations. */
-const STYLE_TAG = elementTag("style");
+const STYLE_TAG = elementTagStart("style");
 
 /**
  * The framework directive prefixes that introduce a binding: Svelte's `use:enhance`, Vue's
@@ -751,8 +765,25 @@ const ATTR_VALUE = new RegExp(
  */
 const ATTR_VALUE_BARE = new RegExp(String.raw`(?:^|\s)${CODE_ATTR}\s*=\s*$`, "i");
 
+/**
+ * A code-carrying attribute whose quote opens exactly at the end of the text — the test
+ * `markupOpenAttrs` asks at each quote it walks past inside a tag, so a value that wraps is known
+ * to be a binding rather than the content an ordinary attribute holds.
+ */
+const ATTR_OPENS_CODE = new RegExp(String.raw`(?:^|\s)${CODE_ATTR}\s*=\s*["']$`, "i");
+
 /** Where a line is program text rather than markup, as `[start, end)` offsets into that line. */
 type CodeSpans = [number, number][];
+
+/** What a markup line starts inside — the state the lines above it leave open. */
+interface MarkupLine {
+  /** Where this line is program text rather than markup. */
+  code?: CodeSpans;
+  /** How many braced expressions the lines above leave open. */
+  depth?: number;
+  /** The quote holding a code-carrying attribute's value open, when one is. */
+  attr?: string;
+}
 
 /** A markup file as this filter reads it: the text to judge, and which of it is program. */
 interface MarkupProgram {
@@ -805,6 +836,12 @@ function markupProgram(code: string[], file: string): MarkupProgram {
  *
  * `opens` selects which bodies are reported: an element it rejects still runs to its closing tag,
  * so the ones after it are found where they are, but its own body is left out.
+ *
+ * A tag is read across lines, because an attribute list wraps as ordinary formatting: `<script`
+ * with `type="module">` under it opens the body its import sits in, and stopping at the line's end
+ * would read that import as markup and leave a live component reported dead. The opener's own text
+ * is joined with newlines so `opens` reads the attributes it wrapped as the whitespace-separated
+ * list they are.
  */
 function elementBodySpans(
   code: string[],
@@ -815,6 +852,8 @@ function elementBodySpans(
   const lines: CodeSpans[] = [];
   let open = false;
   let selected = true;
+  /** A tag whose `>` has not arrived yet: what it has spelled, and the attribute quote it leaves open. */
+  let pending: { closing: boolean; text: string; quote?: string } | undefined;
   for (const [index, line] of code.entries()) {
     if (index < from) {
       lines.push([]);
@@ -824,14 +863,33 @@ function elementBodySpans(
     // A body an earlier line left open runs from the start of this one; a body this line opens
     // runs from the end of its tag, and an unclosed one carries on into the line below.
     let start: number | undefined = open ? 0 : undefined;
-    for (const match of line.matchAll(tag)) {
-      const [opener, closing, selfClosing] = match;
-      if (closing === "/") {
-        if (start !== undefined && selected) spans.push([start, match.index]);
-        start = undefined;
-        selected = true;
-      } else if (start === undefined && selfClosing !== "/") {
-        start = match.index + opener.length;
+    let at = 0;
+    while (at <= line.length) {
+      if (pending === undefined) {
+        tag.lastIndex = at;
+        const match = tag.exec(line);
+        if (!match) break;
+        pending = { closing: match[1] === "/", text: match[0] };
+        // A closing tag ends the body where it starts, whatever line its `>` lands on.
+        if (pending.closing) {
+          if (start !== undefined && selected) spans.push([start, match.index]);
+          start = undefined;
+          selected = true;
+        }
+        at = match.index + match[0].length;
+      }
+      const end = markupTagEnd(line, at, pending.quote);
+      if (end.at < 0) {
+        pending.text += `${line.slice(at)}\n`;
+        pending.quote = end.quote;
+        break;
+      }
+      const { closing } = pending;
+      const opener = pending.text + line.slice(at, end.at + 1);
+      pending = undefined;
+      at = end.at + 1;
+      if (!closing && start === undefined && !opener.endsWith("/>")) {
+        start = at;
         selected = opens(opener);
       }
     }
@@ -880,6 +938,58 @@ function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): n
   return depths;
 }
 
+/**
+ * The quote holding a code-carrying attribute's value open at the start of each markup line, or
+ * undefined when none is. A handler wraps — `<button onclick="` with `Widget()` under it — and the
+ * browser runs it all the same, so judging that line alone finds no attribute before the symbol:
+ * the caller goes uncounted and a false dead-code signal keeps costing the health record a debt
+ * point. `markupOpenDepths` carries its own state across lines for the same reason.
+ *
+ * Quotes only delimit inside a tag, so the apostrophe in `<p>It's gone</p>` opens nothing — reading
+ * rendered text as an attribute value would hide the real handler under it. Every quoted value is
+ * walked, not just the code-carrying ones, so a static `title="see onclick="` cannot hand its own
+ * text back as a binding; only a value `ATTR_OPENS_CODE` recognizes is reported.
+ *
+ * A blank line closes whatever is open, read from `raw` for the reason `markupOpenDepths` reads it
+ * there: an unbalanced quote can then only mislead its own block rather than the rest of the file.
+ */
+function markupOpenAttrs(
+  code: string[],
+  script: CodeSpans[],
+  raw: string[],
+): (string | undefined)[] {
+  const opens: (string | undefined)[] = [];
+  let quote: string | undefined;
+  let isCode = false;
+  let inTag = false;
+  for (const [index, line] of code.entries()) {
+    opens.push(isCode ? quote : undefined);
+    if (!raw[index]?.trim()) {
+      quote = undefined;
+      isCode = false;
+      inTag = false;
+      continue;
+    }
+    const template = blankSpans(line, script[index] ?? []);
+    for (let at = 0; at < template.length; at += 1) {
+      const char = template[at];
+      if (quote !== undefined) {
+        if (char === quote) {
+          quote = undefined;
+          isCode = false;
+        }
+      } else if (!inTag) {
+        if (char === "<") inTag = true;
+      } else if (char === ">") inTag = false;
+      else if (char === '"' || char === "'") {
+        quote = char;
+        isCode = ATTR_OPENS_CODE.test(template.slice(0, at + 1));
+      }
+    }
+  }
+  return opens;
+}
+
 /** The last line of the Astro frontmatter fence, or -1 when the file opens with markup. */
 function astroFrontmatterEnd(code: string[]): number {
   const open = code.findIndex((line) => line.trim() !== "");
@@ -897,8 +1007,9 @@ function astroFrontmatterEnd(code: string[]): number {
  * — and inside a static attribute — is what the page shows a reader, so a name there describes the
  * symbol rather than calling it.
  *
- * `depth` is how many expressions the lines above left open, so an interpolation that wraps still
- * reads as one on the line the call actually sits on.
+ * `state` is what the lines above left open: how many expressions, so an interpolation that wraps
+ * still reads as one on the line the call actually sits on, and the quote of a handler whose value
+ * wrapped, so the code inside it still reads as code.
  *
  * A tag name and a braced expression only count in a `component` file, where `<Widget />` renders
  * the imported symbol and `{Widget()}` invokes it. In static HTML, XML or SVG the same element is
@@ -909,10 +1020,10 @@ function astroFrontmatterEnd(code: string[]): number {
 function referencesMarkup(
   line: string | undefined,
   symbol: string,
-  code: CodeSpans = [],
-  depth = 0,
+  state: MarkupLine = {},
   component = false,
 ): boolean {
+  const { code = [], depth = 0, attr } = state;
   return referencesWord(line, symbol, (head) => {
     const at = head.length;
     if (code.some(([start, end]) => at >= start && at < end)) return true;
@@ -922,6 +1033,9 @@ function referencesMarkup(
     // above stops there too.
     const from = code.reduce((last, [, end]) => (end <= at ? end : last), 0);
     const markup = head.slice(from);
+    // A handler that wrapped runs to the quote that opened it, so everything before that quote is
+    // still the code the browser executes.
+    if (attr !== undefined && from === 0 && !markup.includes(attr)) return true;
     const tag = openTagHead(markup);
     return (
       ATTR_VALUE.test(markup) ||
@@ -1021,8 +1135,8 @@ type JsxLine =
   | "text"
   /** The attribute list of a tag whose `>` has not arrived yet. */
   | "tag"
-  /** A static prop's quoted value, still unterminated. */
-  | "prop";
+  /** A static prop's quoted value, still unterminated, and the quote that opened it. */
+  | { prop: string };
 
 /**
  * The line with every tag it finishes blanked out, and how many elements those tags leave open.
@@ -1083,7 +1197,9 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
   let tag = false;
   let quote: string | undefined;
   for (const [index, line] of code.entries()) {
-    states.push(tag ? (quote === undefined ? "tag" : "prop") : depth > 0 ? "text" : "code");
+    states.push(
+      tag ? (quote === undefined ? "tag" : { prop: quote }) : depth > 0 ? "text" : "code",
+    );
     if (!raw[index]?.trim()) {
       depth = 0;
       tag = false;
@@ -1125,21 +1241,28 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
  * `state` is what the lines above left open — see `jsxLineStates` for why that bound is kept tight.
  * Rendered text carries only as far as the prose does: the symbol has to sit before any punctuation
  * on its line, or the line is program again. Inside a wrapped tag only a static value is prose, so
- * `body={Widget()}` on its own line still counts as the call it is; inside a value that wrapped, a
- * quote before the symbol has already ended it.
+ * `body={Widget()}` on its own line still counts as the call it is.
+ *
+ * A value that wrapped ends at the quote that opened it, not at any quote: a double-quoted
+ * `title` continued with `It's Widget documentation` holds an apostrophe, and ending the value
+ * there reads the prose behind it as program — which lets a page that only names the symbol prove
+ * its own caller and delete a true finding. Past that closing quote the line is the tag's
+ * attribute list again, so the static prop after it is still what a reader sees.
  *
  * The interpolations the line already closed are blanked first, so the child text resumes after a
  * `{…}` instead of reading as program.
  */
 function referencesJsx(line: string | undefined, symbol: string, state: JsxLine = "code"): boolean {
+  const wrapped = typeof state === "object" ? state.prop : undefined;
   return referencesWord(line, symbol, (raw) => {
     const head = maskJsxExpressions(raw);
-    if (state === "prop") return QUOTE.test(head);
+    if (wrapped !== undefined && !head.includes(wrapped)) return false;
+    const within: JsxLine = wrapped === undefined ? state : "tag";
     return (
-      !(state === "tag" && JSX_PROP_LINE.test(head)) &&
+      !(within === "tag" && JSX_PROP_LINE.test(head)) &&
       !JSX_TEXT.test(head) &&
       !JSX_PROP_TEXT.test(head) &&
-      !(state === "text" && !JSX_CODE.test(head))
+      !(within === "text" && !JSX_CODE.test(head))
     );
   });
 }
@@ -1213,6 +1336,8 @@ interface MaskedFile {
   script?: CodeSpans[];
   /** For markup, how many braced expressions the lines above leave open at each line's start. */
   depth?: number[];
+  /** For markup, the quote holding a code-carrying attribute open at each line's start. */
+  attr?: (string | undefined)[];
 }
 
 /**
@@ -1288,6 +1413,7 @@ async function codeReferencingFiles(
           jsx: isJsx ? jsxLineStates(code, raw) : undefined,
           script: markup?.script,
           depth: markup && markupOpenDepths(markup.code, markup.script, raw),
+          attr: markup && markupOpenAttrs(markup.code, markup.script, raw),
         });
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
@@ -1305,8 +1431,11 @@ async function codeReferencingFiles(
         return referencesMarkup(
           text,
           symbol,
-          entry.script?.[line - 1],
-          entry.depth?.[line - 1],
+          {
+            code: entry.script?.[line - 1],
+            depth: entry.depth?.[line - 1],
+            attr: entry.attr?.[line - 1],
+          },
           isComponent,
         );
       if (isJsx) return referencesJsx(text, symbol, entry.jsx?.[line - 1]);
