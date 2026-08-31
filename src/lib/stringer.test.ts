@@ -2221,6 +2221,33 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
     });
 
+    // Only the quote decides what a prop shows. JSX interpolates a braced value the attribute
+    // writes bare, so a brace inside the quotes is a character the prop renders: rejecting
+    // `title="Use {Widget} here"` over its own punctuation reads a rendered prop as program and
+    // lets it prove its own caller — while the bare braced prop beside it is still the call it is.
+    it("keeps a brace inside a quoted JSX prop inert, and still counts a bare braced one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notice.tsx":
+          'export const Notice = () => <Empty title="Use {Widget} here — it was removed" />;\n',
+        "src/ui/split.tsx":
+          "export const Split = () => (\n  <Empty\n" +
+          '    title="Use {Widget} here — it was removed"\n  />\n);\n',
+        "src/ui/live.tsx": "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
+    });
+
     // A wrapped value ends at the quote that opened it, not at any quote: the apostrophe in a
     // double-quoted `title` is prose, and reading it as the end of the value makes the sentence
     // behind it program — which lets a page that only names the symbol prove its own caller. Past

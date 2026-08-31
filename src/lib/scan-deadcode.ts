@@ -1102,8 +1102,15 @@ const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_PUNCTUATION}]*$`);
 /** Anything that makes a line program again — the closing `</p>`, an interpolation, a call. */
 const JSX_CODE = new RegExp(String.raw`[${JSX_PUNCTUATION}]`);
 
-/** The tail of a static prop — `title="Widget was removed`: the value a reader sees, not code. */
-const JSX_PROP_VALUE = String.raw`[\w-]\s*=\s*(?:"[^"<>{}]*|'[^'<>{}]*)$`;
+/**
+ * The tail of a static prop — `title="Widget was removed`: the value a reader sees, not code.
+ *
+ * Only the quote decides. JSX interpolates a braced value the attribute writes bare (`body={…}`),
+ * which the quote after `=` already excludes; a brace inside the quotes is a character the prop
+ * shows — `title="Use {Widget} here"` renders that text — so rejecting the value over its own
+ * punctuation reads a rendered prop as program and deletes a true finding.
+ */
+const JSX_PROP_VALUE = String.raw`[\w-]\s*=\s*(?:"[^"<>]*|'[^'<>]*)$`;
 
 /** The symbol inside a plain string prop — `<p title="Widget was removed">` renders that too. */
 const JSX_PROP_TEXT = new RegExp(String.raw`<[A-Za-z][\w.$:-]*\s[^<>]*${JSX_PROP_VALUE}`);
