@@ -353,8 +353,10 @@ function AutomationTableRow({
  * while `lastRunAt` stays stamped — so the switch alone would have an off row claim a handler is
  * running for as long as the automation stays off — but it never aborts a handler that already
  * holds the lease, so the switch alone would equally call a live run "held". `pendingRun` is the
- * fact that separates them: leased is in progress whatever the switch says, unleased under an off
- * switch is held, and unleased under an on switch is queued and waiting for a worker. With no
+ * fact that separates them: a LIVE lease (one that has not expired) is in progress whatever the
+ * switch says — a `running` row whose lease has lapsed is a dead worker, not work, and comes back
+ * `queued`. Unleased under an off switch is held, unleased under an on switch is queued and waiting
+ * for a worker. With no
  * pending job to read (a poll that hasn't landed yet) the switch is all there is, and decides as
  * before.
  */

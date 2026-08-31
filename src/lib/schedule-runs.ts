@@ -18,6 +18,7 @@
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
+import { systemClock, type Clock } from "./jobs/queue";
 
 export type ScheduleRunOutcome = "ok" | "noop" | "failed" | "cancelled";
 
@@ -44,13 +45,19 @@ const SETTLED = ["done", "parked", "failed", "cancelled"] as const;
 const PENDING = ["queued", "running"] as const;
 
 /**
- * Where an unsettled fire actually is (anton-znoz). `running` = leased, a handler is executing;
- * `queued` = enqueued and nothing has picked it up.
+ * Where an unsettled fire actually is (anton-znoz). `running` = leased by a LIVE worker;
+ * `queued` = nothing holds it — never picked up, or picked up by a process that died.
  *
  * The distinction is the only thing that separates a paused fire from a live one, and the enabled
  * flag cannot stand in for it: the runner gates the CLAIM on the schedule's switch (jobs/runner.ts),
  * so disabling leaves a queued job waiting unleased while an already-leased handler runs to
  * completion regardless of the switch.
+ *
+ * `running` alone cannot stand in for it either — the status outlives the worker. A handler killed
+ * mid-flight leaves the row `running` with a lease nobody renews, and if its schedule was disabled
+ * the runner excludes that bucket from reclamation entirely, so the row never moves. Freshness is
+ * what makes the claim honest: past `leaseExpiresAt`, no worker exists and the fire is waiting to be
+ * reclaimed, which is `queued`.
  */
 export type SchedulePendingStatus = (typeof PENDING)[number];
 
@@ -140,12 +147,21 @@ export async function lastRunsBySchedule(
  * Grouped rather than listed because only the strongest status matters: with both a leased and a
  * waiting job behind one schedule, work IS running, and reporting the queued one would understate
  * it. Schedules with nothing in flight are simply absent.
+ *
+ * The lease is compared in SQL so the grouping still collapses in one pass — an abandoned `running`
+ * row folds in with the genuinely queued ones instead of outranking them.
  */
 export async function pendingRunsBySchedule(
   projectId: string,
+  clock: Clock = systemClock,
 ): Promise<Record<string, SchedulePendingStatus>> {
+  // Seconds, matching the timestamp-mode column. A NULL lease is not proof a worker holds the row,
+  // so it reads as unleased.
+  const nowSec = Math.floor(clock.now() / 1000);
+  const leased = sql<number>`coalesce(${schema.jobs.status} = 'running' and ${schema.jobs.leaseExpiresAt} > ${nowSec}, 0)`;
+
   const rows = await getDb()
-    .select({ scheduleId: SCHEDULE_ID, status: schema.jobs.status })
+    .select({ scheduleId: SCHEDULE_ID, leased })
     .from(schema.jobs)
     .where(
       and(
@@ -154,12 +170,12 @@ export async function pendingRunsBySchedule(
         sql`${SCHEDULE_ID} is not null`,
       ),
     )
-    .groupBy(SCHEDULE_ID, schema.jobs.status);
+    .groupBy(SCHEDULE_ID, leased);
 
   const byId: Record<string, SchedulePendingStatus> = {};
   for (const row of rows) {
     if (!row.scheduleId) continue;
-    if (row.status === "running") byId[row.scheduleId] = "running";
+    if (row.leased) byId[row.scheduleId] = "running";
     else byId[row.scheduleId] ??= "queued";
   }
   return byId;

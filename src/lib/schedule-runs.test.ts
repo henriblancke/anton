@@ -18,6 +18,7 @@ let schema: typeof import("./db/schema");
 
 const PROJECT_ID = "p-sched";
 const NOW = 1_800_000_000;
+const CLOCK = { now: () => NOW * 1000 };
 
 beforeAll(async () => {
   fileDb = makeFileDb();
@@ -310,12 +311,15 @@ describe("listSchedules carries the last fire's outcome", () => {
         projectId: "p-live",
         payloadJson: JSON.stringify({ projectId: "p-live", scheduleId: "sched-leased" }),
         status: "running",
+        leaseExpiresAt: new Date((NOW + 60) * 1000),
         runAt: new Date((NOW - 120) * 1000),
         createdAt: new Date((NOW - 120) * 1000),
         updatedAt: new Date((NOW - 120) * 1000),
       });
 
-    const byType = Object.fromEntries((await listSchedules("p-live")).map((s) => [s.type, s]));
+    const byType = Object.fromEntries(
+      (await listSchedules("p-live", CLOCK)).map((s) => [s.type, s]),
+    );
     expect(byType["gate-check"].pendingRun).toBe("running");
     expect(byType["gardener"].pendingRun).toBeUndefined();
   });
@@ -330,9 +334,21 @@ describe("pendingRunsBySchedule", () => {
   const PENDING_PROJECT = "p-pending";
   let seq = 0;
 
-  async function pendingJob(over: { scheduleId?: string; status: string; projectId?: string }) {
+  /** A `running` job defaults to a live lease — that is what "a worker holds it" means here. */
+  async function pendingJob(over: {
+    scheduleId?: string;
+    status: string;
+    projectId?: string;
+    leaseExpiresAt?: Date | null;
+  }) {
     const id = `pj-${(seq += 1)}`;
     const projectId = over.projectId ?? PENDING_PROJECT;
+    const lease =
+      over.leaseExpiresAt !== undefined
+        ? over.leaseExpiresAt
+        : over.status === "running"
+          ? new Date((NOW + 60) * 1000)
+          : null;
     await getDb()
       .insert(schema.jobs)
       .values({
@@ -343,6 +359,7 @@ describe("pendingRunsBySchedule", () => {
           over.scheduleId ? { projectId, scheduleId: over.scheduleId } : { projectId },
         ),
         status: over.status,
+        leaseExpiresAt: lease,
         runAt: new Date(NOW * 1000),
         createdAt: new Date(NOW * 1000),
         updatedAt: new Date(NOW * 1000),
@@ -363,7 +380,7 @@ describe("pendingRunsBySchedule", () => {
     // A job no schedule fired (execute-epic and friends) belongs to no row here.
     await pendingJob({ status: "running" });
 
-    const byId = await runs.pendingRunsBySchedule(PENDING_PROJECT);
+    const byId = await runs.pendingRunsBySchedule(PENDING_PROJECT, CLOCK);
     expect(byId).toEqual({ "p-running": "running", "p-queued": "queued" });
   });
 
@@ -374,7 +391,37 @@ describe("pendingRunsBySchedule", () => {
     await pendingJob({ scheduleId: "p-both", status: "running" });
     await pendingJob({ scheduleId: "p-both", status: "queued" });
 
-    expect((await runs.pendingRunsBySchedule(PENDING_PROJECT))["p-both"]).toBe("running");
+    expect((await runs.pendingRunsBySchedule(PENDING_PROJECT, CLOCK))["p-both"]).toBe("running");
+  });
+
+  // The `running` status outlives the worker: a handler killed mid-flight leaves it stamped with a
+  // lease nobody renews, and a DISABLED schedule's bucket is excluded from reclamation, so nothing
+  // ever moves the row. Reading the status alone would have the table claim work in progress
+  // forever.
+  it("does not call an abandoned fire running once its lease has expired", async () => {
+    await pendingJob({
+      scheduleId: "p-dead",
+      status: "running",
+      leaseExpiresAt: new Date((NOW - 60) * 1000),
+    });
+    await pendingJob({ scheduleId: "p-unleased", status: "running", leaseExpiresAt: null });
+
+    const byId = await runs.pendingRunsBySchedule(PENDING_PROJECT, CLOCK);
+    expect(byId["p-dead"]).toBe("queued");
+    expect(byId["p-unleased"]).toBe("queued");
+  });
+
+  // Freshness decides, not row order: a live fire still outranks a dead one behind the same
+  // schedule, and a dead one must not shout down a live one.
+  it("lets a live fire outrank an abandoned one on the same schedule", async () => {
+    await pendingJob({
+      scheduleId: "p-mixed",
+      status: "running",
+      leaseExpiresAt: new Date((NOW - 60) * 1000),
+    });
+    await pendingJob({ scheduleId: "p-mixed", status: "running" });
+
+    expect((await runs.pendingRunsBySchedule(PENDING_PROJECT, CLOCK))["p-mixed"]).toBe("running");
   });
 
   it("is scoped to one project", async () => {
@@ -383,7 +430,7 @@ describe("pendingRunsBySchedule", () => {
       .values({ id: "p-elsewhere", slug: "elsewhere", name: "elsewhere", repoPath: "/tmp/elsewhere" });
     await pendingJob({ scheduleId: "p-far", status: "running", projectId: "p-elsewhere" });
 
-    expect(await runs.pendingRunsBySchedule(PENDING_PROJECT)).not.toHaveProperty("p-far");
-    expect(Object.keys(await runs.pendingRunsBySchedule("p-elsewhere"))).toEqual(["p-far"]);
+    expect(await runs.pendingRunsBySchedule(PENDING_PROJECT, CLOCK)).not.toHaveProperty("p-far");
+    expect(Object.keys(await runs.pendingRunsBySchedule("p-elsewhere", CLOCK))).toEqual(["p-far"]);
   });
 });

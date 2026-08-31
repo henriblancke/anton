@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
-import type { AntonDb, Clock } from "./jobs/queue";
+import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
 import {
@@ -165,11 +165,15 @@ export async function updateSchedule(
  * outcome column on every toggle, and a toggle is exactly when the pending fire's status decides
  * whether the row reads as running or held.
  */
-export async function listSchedules(projectId: string): Promise<ScheduleSummary[]> {
+export async function listSchedules(
+  projectId: string,
+  clock: Clock = systemClock,
+): Promise<ScheduleSummary[]> {
   const [rows, lastRuns, pendingRuns] = await Promise.all([
     getDb().select().from(schema.schedules).where(eq(schema.schedules.projectId, projectId)),
     lastRunsBySchedule(projectId),
-    pendingRunsBySchedule(projectId),
+    // Clock-dependent: an in-flight fire only counts as running while its lease is fresh.
+    pendingRunsBySchedule(projectId, clock),
   ]);
   return rows.map((row) => {
     const summary = toScheduleSummary(row);
