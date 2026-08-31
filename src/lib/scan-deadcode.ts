@@ -102,6 +102,14 @@ interface CommentSyntax {
    * only the literal text around each `{…}` is masked.
    */
   interpolated?: RegExp;
+  /**
+   * Whether the language writes regex literals, whose body is punctuation rather than syntax.
+   * `s.split(/\//).map(Widget)` opens no comment: blanking from the `//` inside that literal erases
+   * the call behind it, and the file then proves no caller for a signal it had in fact disproved.
+   * Only where a `/` can BEGIN a literal is one stepped over — after a value the same `/` divides,
+   * and skipping `a / b(c) / d` as a literal would swallow a comment that really did open past it.
+   */
+  regex?: boolean;
 }
 
 /**
@@ -125,7 +133,17 @@ interface FileSyntax extends CommentSyntax {
 
 const COMMENT_SYNTAX: FileSyntax[] = [
   {
-    files: /\.(?:[cm]?[jt]sx?|go|java|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
+    // Held apart from the C-like grammar below for the one thing only JavaScript writes: a regex
+    // literal, whose body carries comment delimiters that delimit nothing (`/\//`, `/[/*]/`).
+    // Matched first, so a `.ts` file never reaches the entry that would read those as comments.
+    files: /\.[cm]?[jt]sx?$/i,
+    line: ["//"],
+    block: [["/*", "*/"]],
+    quotes: "\"'`",
+    regex: true,
+  },
+  {
+    files: /\.(?:go|java|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
     line: ["//"],
     block: [["/*", "*/"]],
     quotes: "\"'`",
@@ -287,6 +305,53 @@ function stringEnd(line: string, at: number, quote: string): number {
 }
 
 /**
+ * The prefixes a `/` can only OPEN a regex literal after: the start of the text, an opener, a
+ * separator, an operator, or a keyword that expects an expression next. After a value — a `)`, a
+ * `]`, an identifier — the same `/` divides, and stepping over `a / b(c) / d` as a literal hides a
+ * comment that opened past it. `++`/`--` are excluded because `i++ / 2` divides: the trailing `+`
+ * there is a postfix operator that does yield a value.
+ *
+ * `<` and `>` are left out although they lead an expression too, because the same characters are
+ * JSX punctuation: `</div>` closes a tag, and reading its slash as an opener would run an invented
+ * literal over the braced JSX comment beside it and leave that comment unmasked — prose as code,
+ * which is the one direction this filter never errs in. A comparison against a regex's source is
+ * rare enough to pay for that; missing one only over-masks.
+ */
+const REGEX_PREFIX =
+  /(?:^|=>|\.\.\.|[([{,;:=!&|?*%^~/]|(?<!\+)\+|(?<!-)-|\b(?:return|case|typeof|throw|instanceof|delete|void|yield|await|new|in|of|else|do))\s*$/;
+
+/**
+ * Where a regex literal opens at or after `from`, or -1 when nothing on the line does. A `/` before
+ * a `*` or another `/` is the comment opener itself — neither spells a legal empty literal — so the
+ * markers this scan exists to find can never be mistaken for one.
+ */
+function regexAt(line: string, from: number): number {
+  for (let at = line.indexOf("/", from); at >= 0; at = line.indexOf("/", at + 1)) {
+    const next = line[at + 1];
+    if (next === "/" || next === "*") continue;
+    if (REGEX_PREFIX.test(line.slice(0, at))) return at;
+  }
+  return -1;
+}
+
+/**
+ * Where the regex literal opened at `at` ends, or -1 when it never closes on the line — which
+ * proves the slash was not one, since the grammar forbids the break. An escape and a character
+ * class are stepped over, so `/\//` and `/[/*]/` both close where they actually close.
+ */
+function regexEnd(line: string, at: number): number {
+  let inClass = false;
+  for (let cursor = at + 1; cursor < line.length; cursor += 1) {
+    const char = line[cursor];
+    if (char === "\\") cursor += 1;
+    else if (inClass) inClass = char !== "]";
+    else if (char === "[") inClass = true;
+    else if (char === "/") return cursor + 1;
+  }
+  return -1;
+}
+
+/**
  * The first comment starting at or after `from`, with quoted text stepped over rather than read.
  * `const url = "https://host"; Widget()` holds no comment: blanking from the `//` inside that URL
  * erases the call beside it, and the file then proves no caller for a signal it had in fact
@@ -296,6 +361,11 @@ function stringEnd(line: string, at: number, quote: string): number {
  * A quote that never closes on its line is not a literal worth trusting, so the scan resumes just
  * past it: a Rust `'a`, an apostrophe in a shell comment and a template literal spanning lines all
  * read as they did before, and a trailing comment behind any of them still gets blanked.
+ *
+ * A regex literal is stepped over the same way where the language writes one, since its body holds
+ * punctuation rather than syntax: `s.split(/\//).map(Widget)` carries a `//` that opens nothing,
+ * and blanking from it erases the call behind it. A literal that never closes on its line is not
+ * one either, so that scan resumes just past its slash as the quote scan does.
  */
 function nextComment(
   line: string,
@@ -306,20 +376,35 @@ function nextComment(
   let at = from;
   for (;;) {
     const found = commentAt(line, at, syntax);
-    if (quotes === undefined) return found;
     let quoteAt = -1;
     let quote = "";
-    for (let cursor = at; cursor < line.length; cursor += 1) {
-      const char = line[cursor];
-      if (char !== undefined && quotes.includes(char)) {
-        quoteAt = cursor;
-        quote = char;
-        break;
+    if (quotes !== undefined) {
+      for (let cursor = at; cursor < line.length; cursor += 1) {
+        const char = line[cursor];
+        if (char !== undefined && quotes.includes(char)) {
+          quoteAt = cursor;
+          quote = char;
+          break;
+        }
       }
     }
-    if (quoteAt < 0 || (found !== undefined && found.at <= quoteAt)) return found;
-    const end = stringEnd(line, quoteAt, quote);
-    at = end < 0 ? quoteAt + 1 : end + 1;
+    const literalAt = syntax.regex === true ? regexAt(line, at) : -1;
+    // Whichever literal opens FIRST is the one the marker might be sitting inside; a marker ahead of
+    // both is a comment, and nothing past it on the line is read at all.
+    if (quoteAt >= 0 && (literalAt < 0 || quoteAt < literalAt)) {
+      if (found !== undefined && found.at <= quoteAt) return found;
+      const end = stringEnd(line, quoteAt, quote);
+      at = end < 0 ? quoteAt + 1 : end + 1;
+      continue;
+    }
+    if (literalAt < 0) return found;
+    if (found !== undefined && found.at <= literalAt) return found;
+    const end = regexEnd(line, literalAt);
+    // A literal that closes on the marker's OWN slash never was one: `a! / b // note` divides on a
+    // postfix assertion the prefix rule reads as an operator, and the `//` it ran to is the comment.
+    // A real literal closes past its delimiters — `/[/*]/` ends on a slash the marker doesn't own.
+    if (found !== undefined && end - 1 === found.at) return found;
+    at = end < 0 ? literalAt + 1 : end;
   }
 }
 
@@ -2467,11 +2552,16 @@ function posix(path: string): string {
  * Whether `spec`, written in `importer`, could name `module` — both repo-relative paths.
  *
  * A relative specifier is resolved exactly, against the importing file's own directory, so it names
- * one module and no other. Anything else is matched by its tail instead, because resolving it needs
- * the repo's `paths` mapping and this filter reads no build config: `@/ui/widget` names the module
- * whose path ends in `ui/widget`. The tail must carry a directory for that — a bare `widget` or a
- * package name would match half a tree, and a mismatch here invents a caller and deletes a true
- * finding, which is the one direction this filter never errs in.
+ * one module and no other. An ALIASED one is matched by its tail instead, because resolving it
+ * needs the repo's `paths` mapping and this filter reads no build config: `@/ui/widget` names the
+ * module whose path ends in `ui/widget`. The tail must carry a directory for that — a bare `widget`
+ * would match half a tree.
+ *
+ * Nothing else is matched at all. A bare `ui/widget` is as readily a package subpath, and a local
+ * `src/ui/widget.ts` beside it would then read as the module that import named — inventing a caller
+ * and deleting a true finding, which is the one direction this filter never errs in. Refusing the
+ * bare form under-covers a repo that roots its own modules through `baseUrl` rather than an alias,
+ * and that only leaves a signal standing.
  */
 function specifierNames(importer: string, spec: string, module: string): boolean {
   const target = withoutModuleExtension(posix(module));
@@ -2479,7 +2569,9 @@ function specifierNames(importer: string, spec: string, module: string): boolean
     const resolved = withoutModuleExtension(posix(normalize(join(dirname(importer), spec))));
     return resolved === target || `${resolved}/index` === target;
   }
-  const tail = withoutModuleExtension(posix(spec).replace(MODULE_ALIAS, ""));
+  const path = posix(spec);
+  if (!MODULE_ALIAS.test(path)) return false;
+  const tail = withoutModuleExtension(path.replace(MODULE_ALIAS, ""));
   if (!tail.includes("/")) return false;
   return (
     target === tail ||
@@ -2506,10 +2598,17 @@ function moduleWord(module: string): string | undefined {
  * not this module's default, and `module.exports` reached through a property is not either.
  */
 const DEFAULT_EXPORT_HEAD =
-  /(?:^|[;{}])[ \t]*(?:export[ \t]+default[ \t]+(?:async[ \t]+)?(?:function[ \t*]+|class[ \t]+)?|(?:module\.exports|exports\.default)[ \t]*=[ \t]*)/g;
+  /(?:^|[;{}])[ \t]*(?:export[ \t]+default[ \t]+(?:async[ \t]+)?(?:function[ \t*]+|class[ \t]+)?|(?:module\.exports|exports\.default)[ \t]*=[ \t]*)/gm;
 
-/** `export { Widget as default }` — the same claim written as a re-export. */
-const DEFAULT_REEXPORT = /\bexport[ \t]*\{[^}]*?\b([A-Za-z_$][\w$]*)[ \t]+as[ \t]+default\b/;
+/**
+ * `export { Widget as default }` — the same claim written as a re-export, and the list is read
+ * across lines because a formatter wraps one: `export {` with `Widget as default` under it declares
+ * the module's default as plainly as the single line does, and a caller importing it under another
+ * name writes the symbol nowhere for a per-line match to find. The body admits only what an export
+ * list is spelled with, so a lone `export {` cannot reach across a whole file for an `as default`
+ * belonging to something else and invent a default export the module never had.
+ */
+const DEFAULT_REEXPORT = /\bexport\s*\{[\w$,\s]*?\b([A-Za-z_$][\w$]*)\s+as\s+default\b/g;
 
 /** How a module hands its default value out, which decides what a caller may bind it with. */
 interface DefaultExport {
@@ -2525,20 +2624,26 @@ interface DefaultExport {
 /** How `program` exports `symbol` as its default value, or undefined when it doesn't. */
 function defaultExportOf(program: readonly string[], symbol: string): DefaultExport | undefined {
   const result: DefaultExport = { esm: false, cjs: false };
-  for (const line of program) {
-    DEFAULT_EXPORT_HEAD.lastIndex = 0;
-    for (let head = DEFAULT_EXPORT_HEAD.exec(line); head; head = DEFAULT_EXPORT_HEAD.exec(line)) {
-      const at = head.index + head[0].length;
-      if (!line.startsWith(symbol, at)) continue;
-      if (WORD_CHAR.test(line[at + symbol.length] ?? "")) continue;
-      // Only an outright `module.exports = Widget` puts the symbol where a whole-module `require`
-      // lands. `exports.default = Widget` leaves it on a property, so a `require` binding names the
-      // module object and not the function — treating it as CJS would invent a caller.
-      if (head[0].includes("module.exports")) result.cjs = true;
-      else result.esm = true;
-    }
-    if (DEFAULT_REEXPORT.exec(line)?.[1] === symbol) result.esm = true;
+  // Read as one text rather than line by line, for the reason `defaultBindingsOf` reads its own that
+  // way: an export list is what wraps, and a pattern that never sees `export {` beside the name
+  // under it misses the module's default and reports a live symbol dead. The statement heads stay
+  // anchored to their own line — `[ \t]` never crosses a newline, and the multiline flag keeps `^`
+  // meaning the start of a line rather than the start of the file.
+  const text = program.join("\n");
+  DEFAULT_EXPORT_HEAD.lastIndex = 0;
+  for (let head = DEFAULT_EXPORT_HEAD.exec(text); head; head = DEFAULT_EXPORT_HEAD.exec(text)) {
+    const at = head.index + head[0].length;
+    if (!text.startsWith(symbol, at)) continue;
+    if (WORD_CHAR.test(text[at + symbol.length] ?? "")) continue;
+    // Only an outright `module.exports = Widget` puts the symbol where a whole-module `require`
+    // lands. `exports.default = Widget` leaves it on a property, so a `require` binding names the
+    // module object and not the function — treating it as CJS would invent a caller.
+    if (head[0].includes("module.exports")) result.cjs = true;
+    else result.esm = true;
   }
+  DEFAULT_REEXPORT.lastIndex = 0;
+  for (let list = DEFAULT_REEXPORT.exec(text); list; list = DEFAULT_REEXPORT.exec(text))
+    if (list[1] === symbol) result.esm = true;
   return result.esm || result.cjs ? result : undefined;
 }
 

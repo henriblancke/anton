@@ -1409,6 +1409,45 @@ describe("scan", () => {
       expect(result.deadcode.dropped[1].reason).toContain("src/cjs/caller.js");
     });
 
+    // A tail is only read off a specifier the repo roots its OWN modules under. A bare `ui/widget`
+    // is as readily a package subpath, and the local file whose path merely ends the same way is
+    // not what that import named — binding the package's export to the local symbol's name would
+    // invent a caller and delete a finding that was right.
+    it("does not follow a package specifier a local module's path merely ends with", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/ui/page.ts": "import Renamed from 'ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A formatter wraps an export list as readily as an import one, leaving `Widget as default` on
+    // a line whose `export {` opened above it. Read line by line the module declares no default at
+    // all, so the binding its caller took is never resolved and a live symbol is reported dead.
+    it("counts a default export declared by a wrapped export list", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts":
+          "function Widget() {\n  return null;\n}\n\nexport {\n  Widget as default,\n};\n",
+        "src/ui/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.ts");
+    });
+
     // `exports.default = Widget` is the compiled spelling of an ESM default, not a whole-module
     // export: `require('./widget')` hands back the object, so the binding is not the symbol and the
     // requiring file is no caller. Reading it as CommonJS deletes a true finding.
@@ -1615,6 +1654,50 @@ describe("scan", () => {
         "src/lib/orphan.ts": "export function neverCalled() {}\n",
         "src/lib/notes.ts": 'const url = "https://host"; // neverCalled was removed\n',
         "src/lib/wrapped.ts": "const banner = `\n  hello\n`; // neverCalled was removed\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A regex literal carries the same markers a string does, and they delimit nothing there
+    // either: `s.split(/\//)` holds a `//` that opens no comment, and blanking from it erases the
+    // call behind it — the file then proves no caller for a symbol it does use.
+    it("counts a call written after a regex literal that holds a comment marker", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/split.ts":
+          "export const head = (s: string) => s.split(/\\//)[0] + neverCalled();\n",
+        "src/lib/klass.ts": "export const mark = (s: string) => s.replace(/[/*]/g, neverCalled());\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/split.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/klass.ts");
+    });
+
+    // ...and a slash that only looks like an opener must not step over the comment past it. A tag
+    // closes with one (`</div>`), a TypeScript assertion divides behind one (`a! / b`), and reading
+    // either as a literal runs an invented span over the prose behind it — which then proves a
+    // caller that isn't there.
+    it("still masks a comment behind a slash that opens no regex literal", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/ui/tag.tsx":
+          "export const Page = () => <div>{count}</div>; {/* neverCalled was removed */}\n",
+        "src/lib/divide.ts": "export const half = (a?: number) => a! / 2; // neverCalled was here\n",
+        "src/lib/notes.ts": "// neverCalled was removed with /[/*]/ and its callers\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/lib/orphan.ts", "neverCalled"),
