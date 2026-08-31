@@ -25,7 +25,7 @@ import {
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { poisonBlockerIds, PoisonError } from "./errors";
+import { parkedAskGateId, poisonBlockerIds, PoisonError } from "./errors";
 import { beadBlockedByGate, runTargetAbove } from "./gate-targets";
 import {
   activeExecuteEpicKeys,
@@ -354,17 +354,26 @@ export function detectOpenHumanGates(
 /**
  * Drop the `exhausted-job` findings that are the SAME wait an open human gate already reports.
  *
- * A gate hung on work whose execute-epic job was ALREADY queued poison-parks that job on the gate
- * (execute-epic's readiness re-check), so the sweep sees the stall twice: once as the gate, once as
- * the job that refused to start because of it. Reported both ways it raises two escalations for one
- * wait — and only the gate row is reconciled when the wait ends, so the "retries spent" row survives
- * as a false failure with a stale Abandon on it long after the run resumed.
+ * Two ways a job ends up as that second half:
+ *
+ *   • a gate hung on work whose execute-epic job was ALREADY queued poison-parks that job on the
+ *     gate (execute-epic's readiness re-check) — the stall seen once as the gate, once as the job
+ *     that refused to start because of it; and
+ *   • a run that ARMED a human gate for its own ask parks on it (`ParkedAskError`), so the very act
+ *     of asking a person a question also books a job whose park reads "permanent failure"
+ *     (PR #205 review).
+ *
+ * Reported both ways each raises two escalations for one wait — and only the gate row is reconciled
+ * when the wait ends, so the "retries spent" row survives as a false failure with a stale Abandon on
+ * it long after the run resumed.
  *
  * The gate wait is the RIGHT half to keep: it names what a human actually does about it, and its
  * resolve-and-resume restarts the parked job on the way through.
  *
- * Suppressed only when EVERY blocker the park names is one of those gates. A job also held back by
- * an ordinary prerequisite outlives the gate being answered, and nothing else would surface it.
+ * A blocked park is suppressed only when EVERY blocker it names is one of those gates — a job also
+ * held back by an ordinary prerequisite outlives the gate being answered, and nothing else would
+ * surface it. An armed ask names exactly one gate, its own, and the holds beside it (which keep the
+ * target blocked too) are each reported as their own open gate.
  */
 export function withoutGateBlockedJobs(findings: RunHealthFinding[]): RunHealthFinding[] {
   const openGateIds = new Set(
@@ -373,6 +382,8 @@ export function withoutGateBlockedJobs(findings: RunHealthFinding[]): RunHealthF
   if (openGateIds.size === 0) return findings;
   return findings.filter((finding) => {
     if (finding.kind !== "exhausted-job") return true;
+    const parkedOn = parkedAskGateId(finding.reason);
+    if (parkedOn !== undefined) return !openGateIds.has(parkedOn);
     const blockers = poisonBlockerIds(finding.reason);
     return !blockers?.every((id) => openGateIds.has(id));
   });

@@ -83,6 +83,7 @@ import {
   isRecoverableClaudeError,
   isUsageLimitError,
   isRunAlreadyLiveError,
+  parkedOnGateClause,
   PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
@@ -2366,6 +2367,19 @@ export function humanGateReason(targetId: string, { ticketId, ask }: HumanAsk): 
 export const HUMAN_GATE_ARMED_LABEL = "gate-armed";
 
 /**
+ * Every OPEN human gate blocking the target. The one place the target's waits are read out of a
+ * board, so the plan made BEFORE the arm and the reconcile made after it can never disagree about
+ * what counts as a wait on this target.
+ */
+function openHumanGates(board: Bead[], targetId: string): Gate[] {
+  const byId = new Map(board.map((b) => [b.id, b]));
+  return (board.find((b) => b.id === targetId)?.dependencies ?? [])
+    .filter((d) => d.type === "blocks")
+    .map((d) => byId.get(d.depends_on_id))
+    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isHumanGate(b));
+}
+
+/**
  * What arming this target's human wait has to do, from the board alone: the open gate that already
  * carries THIS ask (`open` — reuse it, a second gate would race it), anton's own earlier waits
  * (`stale` — their ask no longer applies, so they are superseded), and every other open human gate
@@ -2386,11 +2400,7 @@ export function humanGatePlan(
   targetId: string,
   reason: string,
 ): { stale: Gate[]; held: Gate[]; open: Gate | undefined } {
-  const byId = new Map(board.map((b) => [b.id, b]));
-  const armed = (board.find((b) => b.id === targetId)?.dependencies ?? [])
-    .filter((d) => d.type === "blocks")
-    .map((d) => byId.get(d.depends_on_id))
-    .filter((b): b is Gate => b !== undefined && b.status !== "closed" && beads.isHumanGate(b));
+  const armed = openHumanGates(board, targetId);
   const open = armed.find((g) => gateReason(g)?.trim() === reason.trim());
   const superseded = armed.filter((g) => g !== open);
   return {
@@ -2404,7 +2414,10 @@ export function humanGatePlan(
 export interface ArmedHumanGate {
   /** The gate carrying this ask: created here, or the one an earlier attempt armed for it. */
   gateId: string;
-  /** Every OTHER open human gate on the target — a person's own holds, left where they are. */
+  /**
+   * Every OTHER open human gate on the target — holds this arm left where they are. Read back AFTER
+   * the arm, so a gate armed while this run planned is named in the park too (PR #205 review).
+   */
   held: string[];
   /**
    * Resolve the gate this call created, returning the target to the state the arm found it in.
@@ -2602,8 +2615,62 @@ export async function armHumanGate(
     );
   }
   const heldIds = held.map((g) => g.id);
+  const staleIds = new Set(stale.map((g) => g.id));
+
+  /**
+   * Re-read the target's waits AFTER the arm, so the park names every gate that actually holds it
+   * (PR #205 review).
+   *
+   * The plan above and the write below are separate bd transactions with nothing serializing them:
+   * an operator — or another machine, whose commits are global the moment bd makes them on a shared
+   * server — can arm a human gate for this target in the window between them. That gate is invisible
+   * to the plan, so a park composed from the plan alone promises the operator that resolving THIS
+   * run's gate resumes the run, while the target stays blocked by a wait nothing names.
+   *
+   * REPORTS rather than resolves, whoever armed it: a gate that appeared after the plan was made was
+   * never judged against this ask, and closing a live wait anton did not plan to supersede is
+   * exactly what the ownership label exists to prevent. The waits this ask DOES supersede are
+   * excluded — they are retired moments later, and naming them would send the operator after gates
+   * that are about to close.
+   *
+   * Best-effort, unlike the preflight read it corrects: by the time it runs the gate exists and
+   * carries the ask, so the park is already valid and failing here would strand the wait it just
+   * armed. A failed re-read falls back to the plan's holds, and says so.
+   */
+  const reconcileHeld = async (armed: string): Promise<string[]> => {
+    let fresh: Bead[];
+    try {
+      // Pulled as well as re-read: the other writer may be another MACHINE, whose gate reaches this
+      // workspace only through a pull. Both legs resolve trivially for a board with no remote.
+      await beads.pull(repo);
+      fresh = await loadAllIssues(repo, { strictGates: true });
+    } catch (e) {
+      console.warn(
+        `[execute-epic] could not re-read ${targetId}'s human gates after arming ${armed} ` +
+          `(${e instanceof Error ? e.message : String(e)}) — a gate armed for this target while ` +
+          `this run planned would not be named in the park`,
+      );
+      return heldIds;
+    }
+    const stillHeld = openHumanGates(fresh, targetId)
+      .map((g) => g.id)
+      .filter((id) => id !== armed && !staleIds.has(id));
+    for (const id of stillHeld.filter((id) => !heldIds.includes(id))) {
+      console.warn(
+        `[execute-epic] ${targetId} gained human gate ${id} while this run armed ${armed} — left ` +
+          `open, because it was never judged against this ask; the run resumes only once it is ` +
+          `resolved too`,
+      );
+    }
+    return stillHeld;
+  };
+
   // this ask is already with a human — a second gate would race it
   if (open) {
+    // Reconciled before the cancellation check, not after: the re-read is an uninterruptible await
+    // like every other, so a kill landing inside it must still reach the refusal below rather than
+    // ride out as a successful arm.
+    const stillHeld = await reconcileHeld(open.id);
     // Reusing writes nothing, so it reaches neither guarded write above — but a successful return is
     // what makes the caller PARK, and a cancelled run must never park (anton-287p). The gate itself
     // stays: an earlier attempt armed it for this same ask, and it is not this run's to take back.
@@ -2616,7 +2683,7 @@ export async function armHumanGate(
     await retireSuperseded(open.id);
     // No `undo`: an earlier attempt armed this wait for this same ask, and closing someone else's
     // live wait is not how this run stops.
-    return { gateId: open.id, held: heldIds };
+    return { gateId: open.id, held: stillHeld };
   }
 
   refuseIfCancelled("a gate armed now would block the target with nobody waiting on it");
@@ -2631,15 +2698,17 @@ export async function armHumanGate(
         `(${HUMAN_GATE_ARMED_LABEL}) — a later ask will leave it open instead of superseding it`,
     );
   }
-  // The label write is the last uninterruptible await, and a kill landing inside it would otherwise
-  // ride out as a successful arm past every check above. Last point an undo is still safe: the waits
-  // this ask supersedes are all still open behind it.
+  // Before the last cancellation check, so that check covers the re-read's own window too.
+  const stillHeld = await reconcileHeld(gateId);
+  // The label write and the re-read are the last uninterruptible awaits, and a kill landing inside
+  // one would otherwise ride out as a successful arm past every check above. Last point an undo is
+  // still safe: the waits this ask supersedes are all still open behind it.
   await undoIfCancelled(gateId, "the gate was labelled");
   // Replacement armed — only now is the older ask's wait retired.
   await retireSuperseded(gateId);
   return {
     gateId,
-    held: heldIds,
+    held: stillHeld,
     // Retiring a wait behind this one spends the right to undo it: resolving the replacement would
     // then leave the target carrying no wait of anton's at all, on an ask nobody answered.
     undo:
@@ -2706,7 +2775,8 @@ function ungatedAskMessage(e: NeedsHumanError, gateError: string | undefined): s
  * fallible and — like every other await in this unwind — a window a force-kill can land in. Three
  * outcomes, one per way that goes:
  *
- *   • **It landed.** The run is parked behind the gate; the ask rides out as the runner's park.
+ *   • **It landed.** The run is parked behind the gate; the ask rides out as the runner's park,
+ *     NAMING that gate ({@link ParkedAskError}) so the sweep reports the wait once, not twice.
  *   • **A kill landed inside it.** Every check in the arm passed before it, and no check follows,
  *     so the row would otherwise read as parked behind a wait nobody is servicing. The arm is taken
  *     back where {@link ArmedHumanGate.undo} says that is still safe, and the gate is NAMED where
@@ -2746,7 +2816,11 @@ export async function settleArmedAsk(args: {
   settle: (patch: RunPatch) => Promise<string | undefined>;
 }): Promise<ArmedAskSettlement> {
   const { targetId, ask, gate, signal, settle } = args;
-  let thrown: unknown = ask;
+  // Names the gate from the start, because this is the error the RUNNER parks the job on: an ask
+  // whose park message carries no gate id reads to the run-health sweep as a permanent failure, and
+  // the wait gets escalated twice (PR #205 review). Replaced below on either path that unseats the
+  // park — a cancelled unwind, or a row that could not be settled.
+  let thrown: unknown = new ParkedAskError(ask, gate.gateId);
   const parkFailure = await settle({
     status: "parked",
     error: needsHumanParkMessage(ask, gate.gateId, gate.held),
@@ -2796,7 +2870,8 @@ export async function settleArmedAsk(args: {
 
 /** What {@link settleArmedAsk} left behind — the run's error, and whether the park is live. */
 export interface ArmedAskSettlement {
-  /** The error the run throws: the ask itself behind a standing park, its cancelled form otherwise. */
+  /** The error the run throws: the ask naming its gate behind a standing park, its cancelled form
+   * otherwise. */
   thrown: unknown;
   /**
    * True only while the run really is recorded as parked behind the live gate — the one outcome a
@@ -3120,12 +3195,34 @@ export class NeedsHumanError extends Error {
     readonly ticketId: string,
     /** The agent's ask, verbatim — the gate's reason. Undefined when it named none. */
     readonly ask: string | undefined,
+    /** Overridden only by {@link ParkedAskError}, which names the gate the ask actually reached. */
+    message = `${ticketId} needs a human: ${ask ?? "(the agent named no ask)"}. The run is parked ` +
+      `until someone answers it.`,
   ) {
-    super(
-      `${ticketId} needs a human: ${ask ?? "(the agent named no ask)"}. The run is parked until ` +
-        `someone answers it.`,
-    );
+    super(message);
     this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * The ask once its gate is LIVE and the run row records the park (anton-287p) — thrown in the plain
+ * ask's place so the runner's poison park NAMES that gate.
+ *
+ * The id is what keeps ONE wait from being escalated twice (PR #205 review). Every poison park is an
+ * `exhausted-job` finding — "parked without retrying (permanent failure)" — while the run-health
+ * sweep already reports this same pause as the gate's own `needs-human`, the half that says what a
+ * person does about it. Carrying the id in the park message is how the sweep recognises the two as
+ * one wait ({@link parkedAskGateId}) and keeps only the actionable half; without it the operator
+ * gets a second escalation calling a wait on them a permanent failure.
+ */
+export class ParkedAskError extends NeedsHumanError {
+  constructor(ask: NeedsHumanError, readonly gateId: string) {
+    super(
+      ask.ticketId,
+      ask.ask,
+      `${ask.ticketId} needs a human: ${ask.ask ?? "(the agent named no ask)"}. ` +
+        parkedOnGateClause(gateId),
+    );
   }
 }
 

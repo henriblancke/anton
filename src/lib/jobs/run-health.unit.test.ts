@@ -18,7 +18,7 @@ import {
   withoutGateBlockedJobs,
   type InReviewPr,
 } from "./run-health";
-import { blockedByPoison } from "./errors";
+import { blockedByPoison, parkedOnGateClause } from "./errors";
 import { POISON_PARK_PREFIX } from "./runner";
 import { sortFindings, type RunHealthFinding } from "../run-health";
 import type { RunRow } from "../runs";
@@ -571,5 +571,31 @@ describe("withoutGateBlockedJobs", () => {
     // parked, and with no gate wait left to speak for it the finding has to come back.
     const findings = detectExhaustedJobs([blockedPark("g-1")], 3, NOW);
     expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["exhausted-job"]);
+  });
+
+  /** The park a run takes when it ARMED a human gate for its own ask (anton-287p). */
+  function armedAskPark(gateId: string): JobRow {
+    return job("j-1", {
+      attempts: 1,
+      lastError:
+        `${POISON_PARK_PREFIX} t-1 needs a human: the staging DB password has to be rotated. ` +
+        parkedOnGateClause(gateId),
+    });
+  }
+
+  it("drops the job an ARMED ask parked — asking a person is not a permanent failure", () => {
+    // Every successful needs-human park books a poison job beside the gate it just armed (PR #205
+    // review). Reported as well as the gate, one question to the operator arrives twice: once as
+    // the wait they answer, once as an exhausted job claiming the run failed for good.
+    const findings = [...detectExhaustedJobs([armedAskPark("g-1")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("keeps an armed-ask park whose gate is no longer open — the run is stuck with nothing to answer", () => {
+    const findings = [...detectExhaustedJobs([armedAskPark("g-2")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
   });
 });

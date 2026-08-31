@@ -26,6 +26,7 @@
  */
 import { beforeEach, expect, it, vi } from "vitest";
 import type { Bead, Gate } from "../beads/bd";
+import { parkedAskGateId } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
 const gateCreateMock = vi.fn();
@@ -115,7 +116,9 @@ it("pulls the shared board before it plans, so a gate another machine armed is v
     gateId: "g-elsewhere",
     held: [],
   });
-  expect(order).toEqual(["pull", "read"]);
+  // Pull-then-read twice: once to PLAN, once to reconcile what the target holds after the arm — the
+  // window between them is where a concurrent gate lands (PR #205 review).
+  expect(order).toEqual(["pull", "read", "pull", "read"]);
   expect(pullMock).toHaveBeenCalledWith(REPO);
   expect(gateCreateMock).not.toHaveBeenCalled();
 });
@@ -277,6 +280,68 @@ it("never resolves a human gate anton did not arm, and reports it back for the p
     undo: expect.any(Function),
   });
   expect(gateResolveMock).not.toHaveBeenCalled();
+});
+
+it("names a gate that landed AFTER the plan, so the park does not promise a resume it cannot give", async () => {
+  // The plan and the create are separate bd transactions with nothing serializing them (PR #205
+  // review): an operator — or another machine, on a shared server where every bd commit is global
+  // immediately — can arm a hold in the window between them. Invisible to the plan, it would hold
+  // the target after the park's named gate is resolved, with nothing naming it.
+  loadAllIssuesMock
+    .mockResolvedValueOnce([target()])
+    .mockResolvedValueOnce([
+      target("g-meanwhile"),
+      gate("g-meanwhile", "hold: talking to legal", []),
+    ]);
+  gateCreateMock.mockResolvedValue("g-new");
+
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
+    gateId: "g-new",
+    held: ["g-meanwhile"],
+    undo: expect.any(Function),
+  });
+  // Reported, never resolved: it was never judged against this ask, whoever armed it.
+  expect(gateResolveMock).not.toHaveBeenCalled();
+});
+
+it("leaves the waits it is about to supersede out of the reconciled holds", async () => {
+  // The reconcile runs BEFORE the retire (the replacement is armed first, always), so anton's own
+  // superseded gate is still open in the re-read. Naming it would send the operator after a gate
+  // that closes moments later.
+  loadAllIssuesMock.mockResolvedValue([target("g-old"), gate("g-old", "an older ask")]);
+  gateCreateMock.mockResolvedValue("g-new");
+
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({ gateId: "g-new", held: [] });
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-old", expect.stringMatching(/superseded/));
+});
+
+it("falls back to the planned holds when the reconcile read fails, rather than failing an arm that landed", async () => {
+  // By then the gate exists and carries the ask, so the park is already valid — throwing here would
+  // strand the wait this call just armed for the sake of a better message.
+  loadAllIssuesMock
+    .mockResolvedValueOnce([target("g-theirs"), gate("g-theirs", "hold: talking to legal", [])])
+    .mockRejectedValueOnce(new Error("bd: database is locked"));
+  gateCreateMock.mockResolvedValue("g-new");
+
+  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
+    gateId: "g-new",
+    held: ["g-theirs"],
+    undo: expect.any(Function),
+  });
+});
+
+it("refuses the arm when the kill lands inside the reconcile read", async () => {
+  // The re-read is an uninterruptible await like every other, so the cancellation check that follows
+  // it is what keeps a killed run from riding out as a successful arm and parking behind the gate.
+  const controller = new AbortController();
+  loadAllIssuesMock.mockResolvedValueOnce([target()]).mockImplementationOnce(async () => {
+    controller.abort();
+    return [target("g-new"), gate("g-new", REASON)];
+  });
+  gateCreateMock.mockResolvedValue("g-new");
+
+  await expect(armHumanGate(REPO, "f-1", ASKED, controller.signal)).rejects.toThrow(/cancelled/);
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/cancelled/));
 });
 
 it("creates no gate when the run is killed while the board is being read (anton-287p)", async () => {
@@ -476,6 +541,11 @@ it("parks the run behind the gate and throws the ask while the run is still live
   // session reads — otherwise the same question is asked again on resume, forever.
   expect(row.patches[0].error).toContain("note on t-1");
   expect(thrown).toBeInstanceOf(NeedsHumanError);
+  // The error the RUNNER parks the job on names the gate (PR #205 review). Without that id the
+  // sweep reads the poison park as a permanent failure and escalates the same wait twice — once as
+  // the gate a person can resolve, once as an exhausted job that never was one.
+  expect(parkedAskGateId((thrown as Error).message)).toBe("g-new");
+  expect((thrown as Error).message).toContain(ASK);
   // The park LANDED, so the caller still owns this arm through its cleanup: a kill arriving in the
   // awaits that follow has to take it back, and only this verdict tells the caller there is
   // something left to take back.

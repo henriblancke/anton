@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import type { Bead, BeadDep, Gate } from "../beads/bd";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
-import { blockedTailReason, poisonBlockerIds, PoisonEpic } from "./errors";
+import { blockedTailReason, parkedAskGateId, poisonBlockerIds, PoisonEpic } from "./errors";
 import {
   askSettleError,
   claudeResumeDecision,
@@ -17,6 +17,7 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
   NeedsHumanError,
+  ParkedAskError,
   reviewParkMessage,
   runReadiness,
   runTargetDrift,
@@ -256,6 +257,28 @@ describe("blockedTailReason — the park a held tail leaves behind (anton-1two)"
     const nothingRan = blockedTailReason("F1", { blockers: ["F2"], held: ["t-2"], ran: [] });
     expect(nothingRan).not.toMatch(/commits are on the branch/);
     expect(poisonBlockerIds(nothingRan)).toEqual(["F2"]);
+  });
+});
+
+describe("ParkedAskError — the park a run takes behind its own armed gate (anton-287p)", () => {
+  const parked = new ParkedAskError(new NeedsHumanError("t-1", "rotate the staging password"), "g-7");
+
+  it("names the gate, so run-health reads one wait rather than a second failure", () => {
+    // The runner parks the job on this message, and the sweep reports every poison park as an
+    // exhausted job. The id is what lets it recognise the gate's own wait and drop the duplicate
+    // (PR #205 review).
+    expect(parkedAskGateId(parked.message)).toBe("g-7");
+    expect(parkedAskGateId(`poison: ${parked.message}`)).toBe("g-7");
+  });
+
+  it("still carries the ask and the ticket that raised it", () => {
+    expect(parked.message).toContain("t-1 needs a human: rotate the staging password");
+    expect(parked.ticketId).toBe("t-1");
+    expect(parked.name).toBe("PoisonError"); // still parks rather than burning retries
+  });
+
+  it("reads nothing back out of a park that names no gate", () => {
+    expect(parkedAskGateId(new NeedsHumanError("t-1", "an ask").message)).toBeUndefined();
   });
 });
 

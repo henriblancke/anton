@@ -52,7 +52,7 @@ import {
   toEscalationView,
   type EscalationRow,
 } from "../escalations";
-import { poisonBlockerIds, PoisonError } from "./errors";
+import { parkedAskGateId, poisonBlockerIds, PoisonError } from "./errors";
 import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
@@ -508,13 +508,16 @@ export async function unstickPass(
   // answers "is anybody still waiting" outright, and the panel offers no Dismiss on a `needs-human`
   // row, so nothing else can retire one.
   const gateWaits = openRows.filter((row) => row.kind === "needs-human");
-  // The special case one kind over: an `exhausted-job` row raised for a job that poison-parked ON a
-  // human gate, back before the sweep deduped the two halves of that one wait
-  // (`withoutGateBlockedJobs`). Suppression retires the FINDING, never the row it already raised, and
-  // the job itself is still legitimately parked — so only the blocker list can tell this row is a
-  // duplicate of the gate's own wait.
+  // The special case one kind over: an `exhausted-job` row raised for a job parked on a human gate —
+  // one that refused to start behind someone else's gate, or one that ARMED its own for an ask —
+  // back before the sweep deduped the two halves of that one wait (`withoutGateBlockedJobs`).
+  // Suppression retires the FINDING, never the row it already raised, and the job itself is still
+  // legitimately parked — so only the gate id in the park message can tell this row is a duplicate
+  // of the gate's own wait.
   const blockedJobWaits = orphanRows.filter(
-    (row) => row.kind === "exhausted-job" && poisonBlockerIds(row.reason) !== undefined,
+    (row) =>
+      row.kind === "exhausted-job" &&
+      (poisonBlockerIds(row.reason) !== undefined || parkedAskGateId(row.reason) !== undefined),
   );
   // The general retirement, one live re-check per kind (see {@link settleEndedStalls}). Gate-blocked
   // rows stay in this set on purpose rather than being carved out: the gate path above retires one
@@ -947,13 +950,14 @@ async function readHumanGateIds(repoPath: string): Promise<Set<string> | undefin
 /**
  * Retire the `exhausted-job` rows that are a human gate's wait wearing a second face.
  *
- * A gate hung on work whose job was already queued poison-parks that job on the gate, and a sweep
- * from before the dedupe (`withoutGateBlockedJobs`) raised BOTH halves as escalations. Suppression
- * only stops the finding being reported again — the row it already raised is now invisible to every
- * re-check the pass makes, so it sits on the board forever as a "Retries spent" failure carrying an
- * Abandon that would cancel work the gate is merely waiting on.
+ * Two shapes reach here: a gate hung on work whose job was already queued poison-parks that job on
+ * the gate, and a run that ARMED a human gate for its own ask parks on the gate it just made. Either
+ * way a sweep from before the dedupe (`withoutGateBlockedJobs`) raised BOTH halves as escalations.
+ * Suppression only stops the finding being reported again — the row it already raised is now
+ * invisible to every re-check the pass makes, so it sits on the board forever as a "Retries spent"
+ * failure carrying an Abandon that would cancel work the gate is merely waiting on.
  *
- * Settled when EVERY blocker the park names is a human gate, which covers both ends of the gate's
+ * Settled when EVERY gate the park names is a human gate, which covers both ends of the gate's
  * life: while it is open the `needs-human` row carries the wait, and once it is answered the wait is
  * over and gate-check resumes the job. A job also held by an ordinary prerequisite is left alone —
  * that outlives the gate, and nothing else would surface it. So is a job still parked after its gate
@@ -975,7 +979,10 @@ async function settleGateBlockedJobWaits(
   const humanGateIds = await readHumanGateIds(repoPath);
   if (!humanGateIds) return settled;
   for (const wait of waits) {
-    const blockers = poisonBlockerIds(wait.reason);
+    // An armed ask names exactly one gate, its own; a blocked park names every bead that held the
+    // run, and only a set that is ALL human gates is the gate's wait wearing a second face.
+    const parkedOn = parkedAskGateId(wait.reason);
+    const blockers = parkedOn !== undefined ? [parkedOn] : poisonBlockerIds(wait.reason);
     if (!blockers?.every((id) => humanGateIds.has(id))) continue;
     if (!(await settleEscalation(db, clock, wait.id, "dismissed"))) continue;
     settled.add(wait.id);

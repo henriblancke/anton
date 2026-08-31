@@ -101,6 +101,31 @@ export function poisonBlockerIds(parkMessage: string): string[] | undefined {
   return ids.length > 0 ? ids : undefined;
 }
 
+/** How a needs-human park names the gate holding the run — and how it is read back. */
+const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/;
+
+/**
+ * The clause a run's poison park uses to name the human gate it is waiting behind. Lives beside its
+ * parser for the same reason {@link blockedByPoison} does: that sentence is the ONLY durable record
+ * of WHICH gate a parked ask reached, and reworded in two places the two would drift silently.
+ */
+export function parkedOnGateClause(gateId: string): string {
+  return `The run is parked on human gate ${gateId} until someone answers it.`;
+}
+
+/**
+ * The human gate a needs-human park is waiting behind, or undefined when the message is some other
+ * poison. Matched anywhere in the text so a caller can pass the park reason with the runner's
+ * `poison:` prefix — or a report finding's prose — still attached.
+ *
+ * The run-health sweep reads it back to tell this stall from a permanent failure: a parked ask is
+ * ALREADY reported as its gate's own wait, so reporting the job too would raise a second escalation
+ * — calling a wait on a person an exhausted job — for the same pause.
+ */
+export function parkedAskGateId(parkMessage: string): string | undefined {
+  return PARKED_ON_GATE.exec(parkMessage)?.[1];
+}
+
 /**
  * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
  * run-lease (anton-jz1). Two triggers, same recovery:
