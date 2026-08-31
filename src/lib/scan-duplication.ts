@@ -349,8 +349,13 @@ const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|
  * `++`/`--` are excluded, since `i++ / 2` divides: the trailing `+` there is a postfix operator that
  * DOES yield a value. `<` and `>` are held apart in `COMPARISON_OPERATORS`, since they lead an
  * expression only across whitespace.
+ *
+ * Spread is spelled out as its own alternative because a single `.` is the opposite rule: `...` can
+ * only be followed by an expression — `[.../[/*]/.source]` spreads a regex's source — while
+ * `array.length / 2` divides behind an ordinary property-access dot. Three dots are the whole
+ * distinction, so only the triple is read as a prefix.
  */
-const EXPRESSION_OPERATORS = String.raw`=>|[([{,;:=!&|?*%^/~]|(?<!\+)\+|(?<!-)-`;
+const EXPRESSION_OPERATORS = String.raw`=>|\.\.\.|[([{,;:=!&|?*%^/~]|(?<!\+)\+|(?<!-)-`;
 
 /**
  * The comparison operators, which expect an expression next exactly as the binary operators above do
@@ -418,6 +423,51 @@ function afterQuoted(line: string, start: number): number {
 }
 
 /**
+ * The same text with every literal and comment span blanked to spaces. Length is preserved, so an
+ * index measured in the original still points at the same character — which is what the backward
+ * scans below need: they walk `before` from its end counting brackets to find the `(` or `{` that
+ * its trailing `)` or `}` closes, then read the text in front of that opener.
+ *
+ * A bracket written inside a string, a template or a comment is TEXT, not nesting. Left standing,
+ * `const x = { val: "}" } / count` ends the scan one level deep, the object literal's `}` reads as a
+ * block's, and the divisor's slash is taken for a regex opener. Regex literals are blanked last for
+ * `stripNoise`'s reason — with quotes already gone, prose holding a `/…/` cannot be read as one.
+ */
+function blankLiterals(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const char = text[i];
+    if (char === "'" || char === '"') {
+      const end = afterQuoted(text, i);
+      out += " ".repeat(end - i);
+      i = end;
+      continue;
+    }
+    if (char === "`") {
+      const end = afterTemplate(text, i);
+      out += " ".repeat(end - i);
+      i = end;
+      continue;
+    }
+    if (char === "/" && (text[i + 1] === "/" || text[i + 1] === "*")) {
+      const close = text[i + 1] === "*" ? text.indexOf("*/", i + 2) : -1;
+      const end = close < 0 ? text.length : close + 2;
+      out += " ".repeat(end - i);
+      i = end;
+      continue;
+    }
+    out += char;
+    i += 1;
+  }
+  return out.replace(
+    REGEX_LITERAL,
+    (match: string, prefix: string, space: string) =>
+      `${prefix}${space}${" ".repeat(match.length - prefix.length - space.length)}`,
+  );
+}
+
+/**
  * The heads whose parenthesized clause is followed by a STATEMENT rather than by more expression.
  * `for await` is the same head with its async spelling — the `await` there is part of the loop, not
  * an operator yielding a value, so its clause hands to a statement exactly as a plain `for` does.
@@ -469,6 +519,17 @@ type BraceKind = "block" | "value";
 const STATEMENT_LABEL = /(?:^|[;{}])\s*(?:case\b[^:]*|default|[A-Za-z_$][\w$]*)\s*:$/;
 
 /**
+ * The expression keywords whose own `{` nevertheless opens a BLOCK. `else` and `do` hand to a
+ * STATEMENT — `} else { … }`, `do { … } while (…)` — so their brace is the block the keyword leads,
+ * not a value. Read as an object literal, the `}` that closes it is no longer a statement boundary
+ * and `} /[/*]/.test(value);` below opens a phantom comment over every window that follows. They
+ * stay in `EXPRESSION_KEYWORDS` all the same, since `else /[/*]/.test(value);` is a regex statement
+ * body; only the brace is the exception. A dot refuses the keyword for `CONTROL_HEAD`'s reason — a
+ * member of the same name yields a value.
+ */
+const BLOCK_KEYWORD = /(?<!\.\s*)\b(?:else|do)$/;
+
+/**
  * What the `{` that `before` ends at opened. An expression prefix — `=`, `(`, `return` — can only
  * be followed by a value, so the brace opened an object literal; anything else opened a block.
  *
@@ -480,6 +541,7 @@ const STATEMENT_LABEL = /(?:^|[;{}])\s*(?:case\b[^:]*|default|[A-Za-z_$][\w$]*)\
 function braceKind(before: string, enclosing: BraceKind | undefined): BraceKind {
   const text = before.trimEnd();
   if (enclosing !== "value" && STATEMENT_LABEL.test(text)) return "block";
+  if (BLOCK_KEYWORD.test(text)) return "block";
   return REGEX_PREFIX.test(text) ? "value" : "block";
 }
 
@@ -550,7 +612,11 @@ function opensRegex(
   // the whole distinction between `value < /re/` and a closing tag. Outside a JSX language no tag
   // can be meant at all, and the tight `value</re/.source` is the comparison it looks like.
   if (COMPARISON_PREFIX.test(before) && (!jsx || raw.length > before.length)) return true;
-  if (closesControlHead(before)) return true;
+  // Only the bracket scans read a blanked copy: they count nesting, where a bracket inside a string
+  // is text. The prefix tests above and below read the text as written, since a string is a VALUE —
+  // blanking one to spaces would make `const a = "x" / 2` look like a line leading with its slash.
+  const nesting = blankLiterals(before);
+  if (closesControlHead(nesting)) return true;
   // A `}` that ends a BLOCK hands to a fresh STATEMENT — `if (enabled) {} /[/*]/.test(value);`
   // tests a regex. Read as division, the `/*` inside that character class opens a comment that
   // swallows every line below. An object literal's `}` ends a value instead, so `closesBlock` tells
@@ -559,7 +625,7 @@ function opensRegex(
   // run an invented literal over the `{/*` that follows and leave that comment unseen. The `>` is
   // what tells them apart — a literal `/>/` loses to the tag, which is what the character pair means
   // in the TSX this actually scans.
-  if (before.endsWith("}") && line[start + 1] !== ">" && closesBlock(before, open)) return true;
+  if (before.endsWith("}") && line[start + 1] !== ">" && closesBlock(nesting, open)) return true;
   return REGEX_PREFIX.test(before);
 }
 

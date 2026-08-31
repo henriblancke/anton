@@ -2645,6 +2645,114 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // `...` can only be followed by an expression — `[.../[/*]/.source]` spreads a regex's source.
+    // Read as the property-access dot it shares two characters with, the slash divides, and the `/*`
+    // inside that character class opens a comment over every line below.
+    it("reads a slash after spread syntax as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/spread.ts": [
+          "export const chars = [.../[/*]/.source];",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/spread.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/spread.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // `else` leads a STATEMENT, so the `{` behind it opens a block and the `}` that closes it is a
+    // boundary: `} else { … } /[/*]/.test(value);` tests a regex. Recorded as an object literal, the
+    // slash reads as division and the `/*` beside it comments out every line below.
+    it("reads a slash after an else block as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/branch.ts": [
+          "export function check(enabled: boolean, value: string) {",
+          "  if (enabled) { log(value); } else { warn(value); } /[/*]/.test(value);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/branch.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/branch.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // `do {` opens a block by the same rule, and the kind it records is what the lines inside it
+    // inherit: read as an object literal, the labeled block nested in the loop body is read as a
+    // property, the `}` closing it stops being a boundary, and the `/*` in the class beside that
+    // brace comments out the rest of the file.
+    it("reads a do block as a block, so a slash after a label inside it opens a regex", async () => {
+      const repo = writeRepo({
+        "src/loop.ts": [
+          "export function check(value: string, times: number) {",
+          "  let index = times;",
+          "  do {",
+          "    outer: {",
+          "      log(value);",
+          "    } /[/*]/.test(value);",
+          "    index -= 1;",
+          "  } while (index > 0);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/loop.ts", 9]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/loop.ts", Line: 9 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // A brace written inside a STRING is text, not nesting. Counted, the scan behind `{ close: "}" }`
+    // never balances, the object literal's `}` reads as a block's, and the divisor's slash opens an
+    // invented literal that runs into the trailing note — leaving its `/*` to open a comment that
+    // swallows every line below.
+    it("does not count a brace inside a string when telling a literal from a block", async () => {
+      const repo = writeRepo({
+        "src/ratio.ts": [
+          'export const ratio = { close: "}" } / total; // splits on /[/*]/ groups',
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/ratio.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // The one `}` a slash follows without a statement starting is JSX's self-close. Read as a regex
     // opener, the invented literal runs to the next slash on the line — the `{/*` of the comment
     // beside it — and the prose below is then classified as runtime work and triaged as a clone.
