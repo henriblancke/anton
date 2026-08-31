@@ -100,7 +100,7 @@ import { assertRunFormulaFloor } from "./formula-floor";
 import { validateRunFormula, type ResolvedStep } from "./run-formula";
 import { truncateField, type StepContext } from "./step-registry";
 import type { AntonDb, Clock } from "./queue";
-import { systemClock } from "./queue";
+import { enqueueSyncPushDeduped, systemClock } from "./queue";
 import type { JobContext, JobHandler } from "./runner";
 
 export interface ExecuteEpicPayload {
@@ -473,6 +473,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // (anton-287p), and reconciling that window means taking THIS arm back — see
     // reconcileCancelledArmedPark.
     let armedPark: { gate: ArmedHumanGate; ask: NeedsHumanError; raw: unknown } | undefined;
+    // Tear the checkout down after all — set only when the teardown KEPT it for the park above, and
+    // called only when the cleanup's kill window unseats that park (see concludeCancelledArmedPark).
+    let releaseGateKeptWorktree: (() => Promise<void>) | undefined;
     // The error this attempt throws, thrown AFTER the `finally` rather than from inside the catch,
     // so the cleanup's own kill window can still rewrite it. Undefined = nothing to throw.
     let settled: { thrown: unknown } | undefined;
@@ -1936,32 +1939,49 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // refuse the removal it is asking for. A park that keeps the checkout drops the claim in
         // `finally` instead — it stops executing either way.
         await releaseWorktreeHold();
-        await safe(() =>
-          releaseRunResources({
-            db,
-            clock,
-            ctx,
-            projectId,
-            runId,
-            repoPath: repo,
-            worktree: stoppedWorktree,
-            beadId: epicBeadId,
+        const teardown = {
+          db,
+          clock,
+          ctx,
+          projectId,
+          runId,
+          repoPath: repo,
+          worktree: stoppedWorktree,
+          beadId: epicBeadId,
+          // Only a CONFIRMED foreign owner keeps this machine's hands off the checkout — the same
+          // rule the gate's orphan reconcile applies. A lease this run merely couldn't keep
+          // (`unproven`) proves nothing about who else is running, and reading it as foreign skips
+          // the teardown of a worktree nobody else owns.
+          foreign: isForeignRunOwner(e),
+          // A halt over unrollbackable partial work keeps its checkout: that tree is the only copy
+          // of the work, and the run's own note tells an operator to clear THIS path before
+          // resuming — a `--force` release here would delete what that instruction points at.
+          holdsPartialWork: e instanceof WorktreeDirtyError,
+        };
+        let kept = false;
+        await safe(async () => {
+          const entry = await releaseRunResources({
+            ...teardown,
             status: settledAs,
-            // Only a CONFIRMED foreign owner keeps this machine's hands off the checkout — the same
-            // rule the gate's orphan reconcile applies. A lease this run merely couldn't keep
-            // (`unproven`) proves nothing about who else is running, and reading it as foreign skips
-            // the teardown of a worktree nobody else owns.
-            foreign: isForeignRunOwner(e),
-            // A halt over unrollbackable partial work keeps its checkout: that tree is the only copy
-            // of the work, and the run's own note tells an operator to clear THIS path before
-            // resuming — a `--force` release here would delete what that instruction points at.
-            holdsPartialWork: e instanceof WorktreeDirtyError,
             // A wait whose gate is live keeps its checkout even when the row settled as failed: the
             // resume reuses this run, and the tree carries the edits the ask stopped in the middle
             // of (PR #205 review).
             awaitsHumanGate,
-          }),
-        );
+          });
+          kept = entry.outcome === "kept";
+        });
+        // A checkout kept for a park the cleanup's kill window can still unseat is one this run may
+        // owe back after all (PR #205 review): the reconcile below turns that park into a FAILED run
+        // nothing resumes, and no other pass reclaims the tree — the scheduled reaper keeps every
+        // checkout whose bead is still open, and this target's is. Armed only when the teardown
+        // really kept something, so no other keep (foreign, partial work) is torn down behind it.
+        if (kept && awaitsHumanGate) {
+          releaseGateKeptWorktree = async () => {
+            await safe(() =>
+              releaseRunResources({ ...teardown, status: "failed", awaitsHumanGate: false }),
+            );
+          };
+        }
       }
       settled = { thrown }; // thrown past the cleanup below; the runner applies job-level durability
     } finally {
@@ -1994,25 +2014,39 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // the last — and widest — window a force-kill can land in (anton-287p). By then the ask is
       // already recorded as a park behind a live gate and nothing else re-reads the signal: without
       // this the stopped run would leave its wait blocking a target no resume is coming for.
-      if (armedPark) {
-        const reconciled = await reconcileCancelledArmedPark({
-          targetId: epicBeadId,
-          ...armedPark,
-          signal: ctx.signal,
-          now: () => clock.now(),
-          settle: reportSettle,
-        });
-        if (reconciled) {
-          settled = reconciled;
+      const park = armedPark;
+      if (park) {
+        const concluded = await concludeCancelledArmedPark({
+          gateId: park.gate.gateId,
+          reconcile: () =>
+            reconcileCancelledArmedPark({
+              targetId: epicBeadId,
+              ...park,
+              signal: ctx.signal,
+              now: () => clock.now(),
+              settle: reportSettle,
+            }),
+          releaseKeptWorktree: releaseGateKeptWorktree,
           // Taking the arm back is a LOCAL bd write and the sync that would have carried it has
           // already run, so without this push the gate still reads as OPEN on every other machine —
           // the very state the reconcile just cleared here.
-          await beads
-            .sync(repo)
-            .catch((e) =>
-              console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e),
-            );
-        }
+          push: () =>
+            beads
+              .sync(repo)
+              .then(() => true)
+              .catch((e) => {
+                console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e);
+                return false;
+              }),
+          queuePush: () => {
+            try {
+              enqueueSyncPushDeduped(db, clock, projectId);
+            } catch (e) {
+              console.error(`[execute-epic] enqueue sync-push failed for ${projectId}`, e);
+            }
+          },
+        });
+        if (concluded) settled = concluded;
       }
     }
     // Thrown here rather than from the catch so the cleanup — and the kill window inside it — runs
@@ -3131,7 +3165,7 @@ async function unwindCancelledAsk(args: {
   during: string;
   now: () => number;
   settle: (patch: RunPatch) => Promise<string | undefined>;
-}): Promise<{ thrown: unknown; unsettled: string | undefined }> {
+}): Promise<{ thrown: unknown; unsettled: string | undefined; undone: boolean }> {
   const { targetId, ask, raw, gate, signal } = args;
   const undone = gate.undo ? await gate.undo() : false;
   // Undone, nothing on the board carries the ask — which is exactly what the cancelled form of the
@@ -3155,7 +3189,7 @@ async function unwindCancelledAsk(args: {
     error: thrown instanceof Error ? thrown.message : String(thrown),
     endedAt: args.now(),
   });
-  return { thrown, unsettled };
+  return { thrown, unsettled, undone };
 }
 
 /**
@@ -3168,7 +3202,8 @@ async function unwindCancelledAsk(args: {
  *
  * Answers `undefined` when there is nothing to reconcile (the run was not cancelled after all), and
  * otherwise the error the run must throw INSTEAD of its ask — the same unwind, and the same row, as
- * a kill that landed one await earlier.
+ * a kill that landed one await earlier — plus whether the gate itself was taken back, which is what
+ * the caller still owes the board a push for ({@link concludeCancelledArmedPark}).
  */
 export async function reconcileCancelledArmedPark(args: {
   targetId: string;
@@ -3179,20 +3214,74 @@ export async function reconcileCancelledArmedPark(args: {
   signal: AbortSignal;
   now: () => number;
   settle: (patch: RunPatch) => Promise<string | undefined>;
-}): Promise<{ thrown: unknown } | undefined> {
+}): Promise<CancelledParkReconcile | undefined> {
   if (!args.signal.aborted) return undefined;
-  const { thrown, unsettled } = await unwindCancelledAsk({
+  const { thrown, unsettled, undone } = await unwindCancelledAsk({
     ...args,
     during: "while it released its lease and synced the board, after its park was recorded",
   });
-  if (!unsettled) return { thrown };
+  if (!unsettled) return { thrown, undone };
   console.error(
     `[execute-epic] ${args.targetId}: the run row could not be settled (${unsettled}) — the ` +
       `cancelled unwind's verdict on human gate ${args.gate.gateId} stands`,
   );
   // The row may still read as parked, so the verdict above is carried through rather than restated:
   // it is the only accurate account of what the board holds.
-  return { thrown: new PoisonEpic(unsettledCancelledAskMessage(thrown, unsettled)) };
+  return { thrown: new PoisonEpic(unsettledCancelledAskMessage(thrown, unsettled)), undone };
+}
+
+/** What {@link reconcileCancelledArmedPark} did with the arm the cleanup's kill window caught. */
+export interface CancelledParkReconcile {
+  /** The error the run throws instead of its ask. */
+  thrown: unknown;
+  /** The gate was resolved here — a LOCAL board write no machine but this one has seen yet. */
+  undone: boolean;
+}
+
+/**
+ * The whole of the cleanup's kill window (anton-287p, PR #205 review): take the arm back, then
+ * finish the two things the ordinary park left standing for a resume that is no longer coming — the
+ * checkout kept FOR that park, and the board push that publishes the undo.
+ *
+ * Both matter only in the cancelled case, and neither has another owner:
+ *
+ *   • **The checkout.** The teardown already ran and kept it, correctly, because at that moment the
+ *     run WAS parked behind a live gate. The reconcile turns that into a failed run nothing resumes,
+ *     and no later pass reclaims the tree — the scheduled reaper keeps every worktree whose bead is
+ *     still open, and a cancelled run's target is. Left alone, the cancelled run's partial edits sit
+ *     there until a human finds them, and the next run on the branch inherits them.
+ *   • **The push.** The undo is a local Dolt write and the run's end-of-cleanup sync has already
+ *     gone. Until it ships, every other machine still reads the gate as OPEN and the target as
+ *     blocked, while this run reports that it armed no gate at all. So a failed push queues the
+ *     durable sync-push retry (anton-nowq) AND is named in the run's own error — the run is the only
+ *     place that contradiction is visible.
+ *
+ * Answers `undefined` when there was nothing to reconcile, and otherwise the error the run throws.
+ */
+export async function concludeCancelledArmedPark(args: {
+  /** The gate the park was armed on — named in the error when its undo could not be published. */
+  gateId: string;
+  /** Take the arm back if the run was cancelled — {@link reconcileCancelledArmedPark}. */
+  reconcile: () => Promise<CancelledParkReconcile | undefined>;
+  /** Hand back the checkout the teardown kept for the park. Undefined when it kept none. */
+  releaseKeptWorktree?: () => Promise<void>;
+  /** Publish the undo to the shared board; `false` when the push did not land. */
+  push: () => Promise<boolean>;
+  /** Queue the durable retry that keeps pushing, and parks for a human on exhaustion. */
+  queuePush: () => void;
+}): Promise<{ thrown: unknown } | undefined> {
+  const reconciled = await args.reconcile();
+  if (!reconciled) return undefined;
+  if (args.releaseKeptWorktree) await args.releaseKeptWorktree();
+  if (await args.push()) return { thrown: reconciled.thrown };
+  args.queuePush();
+  // Only a gate that WAS taken back can disagree with the board: a stranded one is open here and
+  // open everywhere else, and its error already sends the operator to resolve it by hand.
+  return {
+    thrown: reconciled.undone
+      ? new PoisonEpic(unpushedGateUndoMessage(reconciled.thrown, args.gateId))
+      : reconciled.thrown,
+  };
 }
 
 /**
@@ -3222,6 +3311,22 @@ function unsettledCancelledAskMessage(cancelled: unknown, failure: string): stri
     `${verdict} (The run was cancelled mid-park and its row could not then be settled as failed — ` +
     `${failure} — so the run history may still read as parked; the state described above is the ` +
     `accurate one.)`
+  );
+}
+
+/**
+ * The FAILURE reason when a cancelled unwind DID take its gate back but the push that publishes the
+ * undo failed. The resolve is committed in this checkout's Dolt working set alone, so every other
+ * machine still reads the gate as open and the target as blocked, while the verdict above says no
+ * gate was armed at all. The durable sync-push retry is already queued, so the id is named as the
+ * manual fallback rather than as a wait the operator must clear.
+ */
+function unpushedGateUndoMessage(cancelled: unknown, gateId: string): string {
+  const verdict = cancelled instanceof Error ? cancelled.message : String(cancelled);
+  return (
+    `${verdict} (Resolving human gate ${gateId} could not be pushed to the shared board, so other ` +
+    `machines still read it as open and the target as blocked until the queued sync-push lands. If ` +
+    `it never does, \`bd gate resolve ${gateId}\` on a machine that can reach the remote.)`
   );
 }
 

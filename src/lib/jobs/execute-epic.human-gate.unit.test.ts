@@ -55,6 +55,7 @@ vi.mock("../beads/bd", async () => {
 
 const {
   armHumanGate,
+  concludeCancelledArmedPark,
   HUMAN_GATE_ARMED_LABEL,
   NeedsHumanError,
   reconcileCancelledArmedPark,
@@ -945,6 +946,9 @@ it("takes the arm back when the kill lands in the cleanup AFTER the park was rec
   expect(row.patches).toEqual([
     { status: "failed", error: expect.stringContaining("armed NO gate"), endedAt: 42 },
   ]);
+  // The resolve is a LOCAL board write, so the caller is told about it: nothing else knows there is
+  // a gate undo still to publish (PR #205 review).
+  expect(reconciled?.undone).toBe(true);
   // Nothing on the board carries the ask any more, so nothing sends the operator to a resolve.
   expect((reconciled?.thrown as Error).message).toContain("armed NO gate");
   expect((reconciled?.thrown as Error).message).not.toContain("bd gate resolve g-new");
@@ -971,6 +975,8 @@ it("names the gate that STANDS when undoing after the cleanup kill is unsafe", a
   expect(String(row.patches[0].error)).toContain("bd gate resolve g-new");
   expect((reconciled?.thrown as Error).name).toBe("PoisonError"); // no retry can answer an ask
   expect((reconciled?.thrown as Error).message).toContain("re-run the target");
+  // Nothing was taken back, so there is no local-only undo for the caller to publish.
+  expect(reconciled?.undone).toBe(false);
 });
 
 it("keeps the cancelled verdict when the corrective write fails after the cleanup kill", async () => {
@@ -995,4 +1001,82 @@ it("keeps the cancelled verdict when the corrective write fails after the cleanu
   expect((reconciled?.thrown as Error).message).toContain("armed NO gate");
   expect((reconciled?.thrown as Error).message).toContain("database is locked");
   expect((reconciled?.thrown as Error).message).not.toContain("bd gate resolve g-new");
+});
+
+
+// ── what the cleanup's kill window still owes: the checkout, and the push (PR #205 review) ──
+
+/** The three effects `concludeCancelledArmedPark` drives, recorded. */
+const conclusion = (opts: {
+  reconciled?: { thrown: unknown; undone: boolean };
+  pushed?: boolean;
+  kept?: boolean;
+}) => {
+  const effects = { released: false, queued: 0 };
+  return {
+    effects,
+    args: {
+      gateId: "g-new",
+      reconcile: async () => opts.reconciled,
+      releaseKeptWorktree: opts.kept
+        ? async () => {
+            effects.released = true;
+          }
+        : undefined,
+      push: async () => opts.pushed ?? true,
+      queuePush: () => {
+        effects.queued += 1;
+      },
+    },
+  };
+};
+
+it("leaves the checkout and the board alone when the run was not cancelled after all", async () => {
+  // The ordinary end of a needs-human run: the park stands, a person is expected to answer it, and
+  // the checkout is the resume's. Touching either here would tear down a live wait.
+  const c = conclusion({ reconciled: undefined, kept: true });
+
+  await expect(concludeCancelledArmedPark(c.args)).resolves.toBeUndefined();
+  expect(c.effects).toEqual({ released: false, queued: 0 });
+});
+
+it("hands back the checkout the park kept once the cleanup kill unseats that park", async () => {
+  // The teardown kept this tree because the run WAS parked behind a live gate; the reconcile just
+  // turned that into a failed run nothing resumes. Nothing else reclaims it — the scheduled reaper
+  // keeps every checkout whose bead is still open — so the cancelled run's partial edits would sit
+  // there for the next run on the branch to inherit.
+  const cancelled = new Error("cancelled");
+  const c = conclusion({ reconciled: { thrown: cancelled, undone: true }, kept: true });
+
+  await expect(concludeCancelledArmedPark(c.args)).resolves.toEqual({ thrown: cancelled });
+  expect(c.effects).toEqual({ released: true, queued: 0 });
+});
+
+it("names the unpublished undo and queues the durable push when the sync fails", async () => {
+  // The undo lives only in this checkout's Dolt working set: every other machine still reads the
+  // gate as OPEN on a target this run has failed, while the run's own error says it armed none.
+  const c = conclusion({
+    reconciled: { thrown: new Error("the run armed NO gate"), undone: true },
+    pushed: false,
+    kept: true,
+  });
+
+  const concluded = await concludeCancelledArmedPark(c.args);
+
+  expect(c.effects).toEqual({ released: true, queued: 1 });
+  expect((concluded?.thrown as Error).name).toBe("PoisonError");
+  expect((concluded?.thrown as Error).message).toContain("the run armed NO gate");
+  expect((concluded?.thrown as Error).message).toContain("g-new");
+  expect((concluded?.thrown as Error).message).toContain("sync-push");
+});
+
+it("keeps a STRANDED gate's verdict when the sync fails — the board already agrees with it", async () => {
+  // Undoing was unsafe, so the gate is open here and open everywhere else; the verdict already
+  // sends the operator to resolve it by hand. Restating it as unpublished would invent a
+  // disagreement, but the push is still owed — the row and lease writes ride on it.
+  const stranded = new Error("bd gate resolve g-new");
+  const c = conclusion({ reconciled: { thrown: stranded, undone: false }, pushed: false });
+
+  await expect(concludeCancelledArmedPark(c.args)).resolves.toEqual({ thrown: stranded });
+  expect(c.effects).toEqual({ released: false, queued: 1 });
 });
