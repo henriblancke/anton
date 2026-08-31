@@ -1698,6 +1698,50 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
     });
 
+    // A handler's value runs to the quote that opened it, and the other quote inside it is code:
+    // `onclick="log('x'); Widget()"` is a call the browser makes. Ending the value at that
+    // apostrophe reads a live handler as text and leaves a finding standing about a live function.
+    it("counts a symbol after a nested quote in a handler attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/app.html": "<button onclick=\"log('x'); Widget()\">go</button>\n",
+        "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A brace binds only where the format gives it meaning: `{Widget()}` invokes the symbol in a
+    // single-file component, while the same braces in static HTML, XML or SVG are characters the
+    // page shows. Reading those as an expression deletes a true finding.
+    it("does not count a braced name in static markup, and still counts a component expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.svelte": "<p>{Widget()}</p>\n",
+        "public/notes.html": "<p>Write {Widget} literally</p>\n",
+        "public/icon.svg": "<title>{Widget} was removed</title>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/icon.svg");
+    });
+
     // The two shapes with no code punctuation around them at all: a Svelte directive binding
     // (`use:enhance`) and an Astro frontmatter import, which sits above the markup rather than in
     // a `<script>`. Both name the symbol as plainly as a call does.
@@ -1936,6 +1980,28 @@ describe("scan", () => {
         "src/ui/panel.tsx":
           "export const Panel = () => (\n  <p>\n    Widget was removed in favour of Panel\n  </p>\n);\n",
         "src/ui/live.tsx": "export const Live = () => (\n  <p>\n    {Widget()}\n  </p>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+    });
+
+    // A fragment renders its children the same way a named tag does: `<>` with a sentence under it
+    // is prose, and reading it as program text lets a page that merely names the symbol prove its
+    // own caller. The interpolation under the same fragment still counts as the call it is.
+    it("reads JSX text inside a fragment as prose, and still counts a call under one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx":
+          "export const Panel = () => (\n  <>\n    Widget was removed in favour of Panel\n  </>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => (\n  <>\n    {Widget()}\n  </>\n);\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/ui/widget.tsx", "Widget"),

@@ -734,8 +734,15 @@ const CODE_ATTR = String.raw`(?:on[a-z]+|v-[\w-]+|${DIRECTIVE}:[\w.-]*|[@:#][\w.
  * holds content rather than a binding, so `<div title="Widget was removed">` names the symbol the
  * way the text between the tags does: counting every attribute would let a committed page prove its
  * own caller and delete a true finding.
+ *
+ * The value runs to the quote that opened it, so the other quote inside it is code like the rest:
+ * `onclick="log('x'); Widget()"` invokes the symbol, and ending the value at that apostrophe reads
+ * a live handler as text and leaves a finding standing about a function the page still calls.
  */
-const ATTR_VALUE = new RegExp(String.raw`(?:^|[\s"'])${CODE_ATTR}\s*=\s*["'][^"']*$`, "i");
+const ATTR_VALUE = new RegExp(
+  String.raw`(?:^|[\s"'])${CODE_ATTR}\s*=\s*(?:"[^"]*|'[^']*)$`,
+  "i",
+);
 
 /**
  * The same attribute with its value left unquoted — `<button onclick=Widget()>` is HTML a browser
@@ -884,8 +891,11 @@ function astroFrontmatterEnd(code: string[]): number {
  * `depth` is how many expressions the lines above left open, so an interpolation that wraps still
  * reads as one on the line the call actually sits on.
  *
- * A tag name only counts in a `component` file, where `<Widget />` renders the imported symbol. In
- * static HTML, XML or SVG the same element is the document's own vocabulary rather than a binding.
+ * A tag name and a braced expression only count in a `component` file, where `<Widget />` renders
+ * the imported symbol and `{Widget()}` invokes it. In static HTML, XML or SVG the same element is
+ * the document's own vocabulary and a brace is a character the page shows — `<p>Write {Widget}
+ * literally</p>` names the symbol the way the prose around it does, and reading that as a call
+ * deletes a true finding about a genuinely unused symbol.
  */
 function referencesMarkup(
   line: string | undefined,
@@ -905,11 +915,11 @@ function referencesMarkup(
     const markup = head.slice(from);
     const tag = openTagHead(markup);
     return (
-      (component && TAG_HEAD.test(markup)) ||
       ATTR_VALUE.test(markup) ||
       ATTR_VALUE_BARE.test(markup) ||
       (tag !== undefined && DIRECTIVE_HEAD.test(tag)) ||
-      insideExpression(markup, from === 0 ? depth : 0)
+      (component &&
+        (TAG_HEAD.test(markup) || insideExpression(markup, from === 0 ? depth : 0)))
     );
   });
 }
@@ -918,11 +928,13 @@ function referencesMarkup(
 const JSX_FILE = /\.[jt]sx$/i;
 
 /**
- * A tag this line opens and leaves open — `<p>`, `<Panel tone="warn">` — so what follows it is
- * rendered. Not a self-closing `<Icon />`, which renders nothing after itself and leaves the code
- * beside it code, and not a closing `</p>`, which ends the text rather than starting it.
+ * A tag this line opens and leaves open — `<p>`, `<Panel tone="warn">`, the fragment `<>` — so what
+ * follows it is rendered. A fragment counts because prose is written straight inside one, and
+ * reading `<>` with `Widget was removed` under it as program text deletes a true finding. Not a
+ * self-closing `<Icon />`, which renders nothing after itself and leaves the code beside it code,
+ * and not a closing `</p>` or `</>`, which ends the text rather than starting it.
  */
-const JSX_OPEN_TAG = String.raw`<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?(?<![/])>`;
+const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?(?<![/])>)`;
 
 /**
  * The punctuation no rendered line carries. A generic closes with the same `>` a tag does —
