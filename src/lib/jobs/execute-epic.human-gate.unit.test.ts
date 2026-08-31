@@ -57,6 +57,7 @@ const {
   armHumanGate,
   concludeCancelledArmedPark,
   HUMAN_GATE_ARMED_LABEL,
+  liveArmedAsk,
   NeedsHumanError,
   reconcileCancelledArmedPark,
   settleArmedAsk,
@@ -913,6 +914,39 @@ it("carries BOTH write failures when the corrective write fails after a failed p
   expect((thrown as Error).message).toContain("the corrective write");
 });
 
+// ── which settlements the cleanup's kill window still owes a reconcile ──
+
+const ARM = () => ({
+  gate: { gateId: "g-new", held: [], undo: async () => true },
+  ask: ASK_ERROR(),
+  raw: ASK_ERROR(),
+});
+
+it("hands the cleanup the arm behind an ordinary park", () => {
+  const arm = ARM();
+  expect(liveArmedAsk(arm, { thrown: null, parked: true, awaitsHumanGate: true })).toEqual({
+    ...arm,
+    parkRecorded: true,
+  });
+});
+
+it("hands it the arm whose park write FAILED too — the gate is open all the same", () => {
+  // The regression (PR #205 review): keyed on the park row, this settlement left NO arm, so a kill
+  // arriving in the cleanup skipped the reconcile entirely — the run cancelled while its gate kept
+  // blocking the target, advertising a resume for a job that is never coming back.
+  const arm = ARM();
+  expect(liveArmedAsk(arm, { thrown: null, parked: false, awaitsHumanGate: true })).toEqual({
+    ...arm,
+    parkRecorded: false,
+  });
+});
+
+it("hands it nothing once the settle's own unwind has taken the wait back", () => {
+  // Already reconciled one await earlier: the gate is undone or named as stranded, and taking it
+  // back twice would send the operator after an id that no longer exists.
+  expect(liveArmedAsk(ARM(), { thrown: null, parked: false, awaitsHumanGate: false })).toBeUndefined();
+});
+
 // ── the kill that lands in the CLEANUP, after the park landed (PR #205 review) ──
 
 it("leaves a standing park alone while the run has not been cancelled", async () => {
@@ -972,6 +1006,28 @@ it("takes the arm back when the kill lands in the cleanup AFTER the park was rec
   // Nothing on the board carries the ask any more, so nothing sends the operator to a resolve.
   expect((reconciled?.thrown as Error).message).toContain("armed NO gate");
   expect((reconciled?.thrown as Error).message).not.toContain("bd gate resolve g-new");
+});
+
+it("does not claim a park was recorded when the park write had failed", async () => {
+  // Same unwind, different window: this run never got its wait into the row, so the stranded-gate
+  // message must not tell the operator it did (PR #205 review).
+  const controller = new AbortController();
+  controller.abort();
+  const row = recorder();
+
+  const reconciled = await reconcileCancelledArmedPark({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: [] }, // no undo — the message names the window it stranded in
+    signal: controller.signal,
+    parkRecorded: false,
+    now: () => 42,
+    settle: row.settle,
+  });
+
+  expect((reconciled?.thrown as Error).message).toContain("its park could not be recorded");
+  expect((reconciled?.thrown as Error).message).toContain("bd gate resolve g-new");
 });
 
 it("names the gate that STANDS when undoing after the cleanup kill is unsafe", async () => {

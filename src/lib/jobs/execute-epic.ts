@@ -468,11 +468,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // the try took — and only that — so the set has to outlive the block that took it. Null until the
     // claim gate runs, so every gate that parks before it releases nothing.
     let childCascade: { actor: string; ids: string[] } | null = null;
-    // A needs-human park that LANDED: the gate is live on the board and the row records the wait.
-    // Declared out here because the `finally`'s cleanup is the last window a force-kill can land in
-    // (anton-287p), and reconciling that window means taking THIS arm back — see
+    // A needs-human wait this attempt left LIVE on the board — whether or not the park row landed
+    // beside it. Declared out here because the `finally`'s cleanup is the last window a force-kill
+    // can land in (anton-287p), and reconciling that window means taking THIS arm back — see
     // reconcileCancelledArmedPark.
-    let armedPark: { gate: ArmedHumanGate; ask: NeedsHumanError; raw: unknown } | undefined;
+    let armedPark: LiveArmedAsk | undefined;
     // Tear the checkout down after all — set only when the teardown KEPT it for the park above, and
     // called only when the cleanup's kill window unseats that park (see concludeCancelledArmedPark).
     let releaseGateKeptWorktree: (() => Promise<void>) | undefined;
@@ -1881,9 +1881,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             settle: reportSettle,
           });
           thrown = settlement.thrown;
-          // A park that landed is not finished with: the cleanup below still has to run, and a kill
-          // inside it leaves this same gate blocking a target nothing returns to (anton-287p).
-          if (settlement.parked) armedPark = { gate, ask: e, raw };
+          // A wait still standing is not finished with: the cleanup below has to run, and a kill
+          // inside it leaves this gate blocking a target nothing returns to (anton-287p).
+          armedPark = liveArmedAsk({ gate, ask: e, raw }, settlement);
           // The worktree follows the WAIT, not the row: a settle that failed still leaves the gate
           // standing, and the person who resolves it resumes this attempt here. Only a cancelled
           // unwind — which takes the gate back — leaves nothing coming for the checkout.
@@ -2011,9 +2011,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         .catch((e) => console.error(`[execute-epic] beads dolt sync failed for ${epicBeadId}`, e));
 
       // Everything above is an uninterruptible await and the sync is seconds of network, so this is
-      // the last — and widest — window a force-kill can land in (anton-287p). By then the ask is
-      // already recorded as a park behind a live gate and nothing else re-reads the signal: without
-      // this the stopped run would leave its wait blocking a target no resume is coming for.
+      // the last — and widest — window a force-kill can land in (anton-287p). By then the ask is a
+      // live gate on the board and nothing else re-reads the signal: without this the stopped run
+      // would leave its wait blocking a target no resume is coming for.
       const park = armedPark;
       if (park) {
         const concluded = await concludeCancelledArmedPark({
@@ -3123,9 +3123,9 @@ export async function settleArmedAsk(args: {
         : unsettledAskMessage(ask, gate.gateId, unsettled),
     );
   }
-  // Only a park that actually LANDED is still the caller's to reconcile: a cancellation this call
-  // already unwound is settled, and a park write that failed leaves the gate standing on an ask no
-  // row records — taking it back later would leave nothing carrying it at all.
+  // `parked` is what the ROW says; `awaitsHumanGate` is what the BOARD holds. They part exactly on a
+  // failed park write, and the caller needs both: the row decides how the run settles, the live wait
+  // decides what the checkout and the cleanup's kill window still owe.
   return { thrown, parked: !cancelled && !parkFailure, awaitsHumanGate: !cancelled };
 }
 
@@ -3135,18 +3135,51 @@ export interface ArmedAskSettlement {
    * otherwise. */
   thrown: unknown;
   /**
-   * True only while the run really is recorded as parked behind the live gate — the one outcome a
-   * kill arriving LATER (in the handler's cleanup) still has to reconcile, via
-   * {@link reconcileCancelledArmedPark}.
+   * True only while the run really is RECORDED as parked behind the live gate — how the run settles.
+   * A failed park write leaves the gate standing all the same, so what the cleanup's kill window
+   * must reconcile is {@link awaitsHumanGate}, not this.
    */
   parked: boolean;
   /**
    * The gate still STANDS and a person resolving it resumes this run — true whether or not the park
    * row landed, and false only once the cancelled unwind has taken the wait back. It is what the
    * teardown needs (PR #205 review): a park write that failed settles the run as `failed`, and
-   * releasing the checkout on that would delete the partial work the resume continues from.
+   * releasing the checkout on that would delete the partial work the resume continues from. It is
+   * also the arm a kill arriving LATER (in the handler's cleanup) has to reconcile, via
+   * {@link reconcileCancelledArmedPark}.
    */
   awaitsHumanGate: boolean;
+}
+
+/** A needs-human wait this run left LIVE on the board — what the cleanup's kill window reconciles. */
+export interface LiveArmedAsk {
+  gate: ArmedHumanGate;
+  ask: NeedsHumanError;
+  /** The error the run's catch received, for the cancelled form of the ask. */
+  raw: unknown;
+  /** Whether the park row landed beside the gate — names the window in the stranded-gate message. */
+  parkRecorded: boolean;
+}
+
+/**
+ * The arm the run's cleanup still owes a reconcile, or `undefined` when nothing is left standing.
+ *
+ * Keyed on the GATE, not on the park row (PR #205 review): a park write that failed settles the run
+ * as `failed` while the wait stays open, which is the sharper version of the very state this window
+ * exists to prevent — a gate blocking a target with no row even recording it. Reconciling only the
+ * parks that landed would make that the one live arm a cancellation can never take back. Nothing is
+ * lost by taking it back: the cancelled form of the ask carries the ask itself, exactly as it does
+ * for a kill that lands one await earlier ({@link settleArmedAsk}).
+ *
+ * A cancellation that call already unwound is settled — the gate is gone or named as stranded — so
+ * it leaves no arm here.
+ */
+export function liveArmedAsk(
+  arm: Omit<LiveArmedAsk, "parkRecorded">,
+  settlement: ArmedAskSettlement,
+): LiveArmedAsk | undefined {
+  if (!settlement.awaitsHumanGate) return undefined;
+  return { ...arm, parkRecorded: settlement.parked };
 }
 
 /**
@@ -3196,12 +3229,13 @@ async function unwindCancelledAsk(args: {
 }
 
 /**
- * The LAST window a kill can land in once the ask is parked (anton-287p): the run's own cleanup —
- * awaiting the in-flight lease refresh, clearing the lease, syncing the board — runs AFTER
+ * The LAST window a kill can land in once the ask's gate is live (anton-287p): the run's own cleanup
+ * — awaiting the in-flight lease refresh, clearing the lease, syncing the board — runs AFTER
  * {@link settleArmedAsk}'s final signal read, is uninterruptible, and a board sync is seconds of
  * network. A force-kill arriving there would otherwise ride out as an ordinary park: the row parked,
  * the gate blocking the target, and no run ever coming back for either — the exact state every check
- * inside the arm exists to prevent, reached one await later.
+ * inside the arm exists to prevent, reached one await later. A park write that FAILED reaches the
+ * same window with the gate open and no row recording it at all, so it is reconciled here too.
  *
  * Answers `undefined` when there is nothing to reconcile (the run was not cancelled after all), and
  * otherwise the error the run must throw INSTEAD of its ask — the same unwind, and the same row, as
@@ -3215,13 +3249,21 @@ export async function reconcileCancelledArmedPark(args: {
   gate: ArmedHumanGate;
   /** The run's LIVE signal, re-read after the cleanup awaits — nothing checks it after this. */
   signal: AbortSignal;
+  /**
+   * Whether the park row landed beside the gate. Only names the window in the stranded-gate message
+   * — the unwind is the same either way — but a run whose park write failed must not be reported as
+   * one that recorded a wait it never did.
+   */
+  parkRecorded?: boolean;
   now: () => number;
   settle: (patch: RunPatch) => Promise<string | undefined>;
 }): Promise<CancelledParkReconcile | undefined> {
   if (!args.signal.aborted) return undefined;
   const { thrown, unsettled, undone } = await unwindCancelledAsk({
     ...args,
-    during: "while it released its lease and synced the board, after its park was recorded",
+    during:
+      `while it released its lease and synced the board, after its park ` +
+      `${args.parkRecorded === false ? "could not be recorded" : "was recorded"}`,
   });
   if (!unsettled) return { thrown, undone };
   console.error(

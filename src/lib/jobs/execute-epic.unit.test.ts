@@ -306,6 +306,24 @@ describe("ParkedAskError — the park a run takes behind its own armed gate (ant
   it("reads back just the armed gate when nothing else holds the target", () => {
     expect(parkedAskGateIds(parked.message)).toEqual(["g-7"]);
   });
+
+  it("reads ids that contain a PERIOD back whole — bd's own child ids do (PR #205 review)", () => {
+    // A period-terminated capture truncates `gate-287p.1` to `gate-287p`, and the sweeps that
+    // suppress on the ids would then match nothing: the park re-raises as a permanent failure while
+    // the wait is still open.
+    const dotted = new ParkedAskError(new NeedsHumanError("t-1.2", "an ask"), "gate-287p.1", [
+      "gate-287p.2",
+      "g-9",
+    ]);
+    expect(parkedAskGateId(dotted.message)).toBe("gate-287p.1");
+    expect(parkedAskGateIds(dotted.message)).toEqual(["gate-287p.1", "gate-287p.2", "g-9"]);
+    // …and still with the runner's poison prefix and prose trailing the clause.
+    expect(parkedAskGateIds(`poison: ${dotted.message} Re-run once answered.`)).toEqual([
+      "gate-287p.1",
+      "gate-287p.2",
+      "g-9",
+    ]);
+  });
 });
 
 describe("ticketSetDrift — the selection-to-lease window (anton-e42l)", () => {

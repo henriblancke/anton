@@ -104,8 +104,14 @@ export function poisonBlockerIds(parkMessage: string): string[] | undefined {
 /** How a needs-human park names the gate holding the run — and how it is read back. */
 const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/;
 
-/** How that park names the OTHER open human gates on the target, when there are any. */
-const PARKED_ALSO_HELD = /it is also held by human gate\(s\) ([^.]+)\./;
+/**
+ * How that park names the OTHER open human gates on the target, when there are any. The ids are
+ * comma-separated and the sentence's period is a LOOKAHEAD, not part of the capture: bd ids may
+ * contain a period themselves (`anton-287p.1`), and a period-terminated capture would truncate every
+ * one of them — silently returning the wrong gate id to the sweeps that suppress on it.
+ */
+const PARKED_ALSO_HELD =
+  /it is also held by human gate\(s\) ([^\s,]+(?:,\s*[^\s,]+)*)(?=\.(?:\s|$))/;
 
 /**
  * The clause a run's poison park uses to name the human gate it is waiting behind. Lives beside its
