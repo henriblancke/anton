@@ -274,8 +274,15 @@ process.exit(0);`),
         const target = await beads.show(repo, epic.id);
         expect(beads.getPrRef(target) ?? null).toBeNull();
         expect(target.labels ?? []).not.toContain("stage:in-review");
+        // Every ticket is CLAIMABLE again (anton-67xj): this park advertises a resume, and that
+        // resume re-dispatches both through runTicket's hard claim gate, which refuses `blocked`.
+        // What the timeout did is carried by the marker and the note, not by the status.
         for (const t of [epic.one, epic.two]) {
-          expect((await beads.show(repo, t)).status).toBe("blocked");
+          const stalled = await beads.show(repo, t);
+          expect(stalled.status).toBe("open");
+          expect(ownerOf(stalled)).toBeUndefined();
+          expect(stalled.labels ?? []).toContain("not-delivered");
+          expect(JSON.stringify(stalled)).toMatch(/outlived its budget/i);
         }
       } finally {
         process.env.ANTON_CLAUDE_BIN = successClaude;
