@@ -641,8 +641,22 @@ const COMPONENT_FILE = /\.(?:vue|svelte|astro)$/i;
 const ASTRO_FILE = /\.astro$/i;
 const ASTRO_FENCE = /^---\s*$/;
 
-/** A `<script>` or `</script>` tag, with whatever attributes it carries (`<script lang="ts">`). */
-const SCRIPT_TAG = /<(\/?)script\b[^>]*?(\/?)>/gi;
+/**
+ * A tag for `name`, opening or closing, with whatever attributes it carries
+ * (`<script lang="ts">`). A quoted value is matched whole, so the `>` inside one —
+ * `<script title="> gone">` — doesn't end the tag early and hand the rest of the attribute back as
+ * element body: text a reader sees would then read as program and prove its own caller.
+ *
+ * The three branches are told apart by their first character, so the scan stays linear on a long
+ * line rather than backtracking over it. A quote left unclosed on the line therefore matches no
+ * tag at all, the same bound a tag whose attributes wrap onto the next line already has.
+ */
+function elementTag(name: string): RegExp {
+  return new RegExp(String.raw`<(\/?)${name}\b(?:[^>"']|"[^"]*"|'[^']*')*?(\/?)>`, "gi");
+}
+
+/** A `<script>` or `</script>` tag. */
+const SCRIPT_TAG = elementTag("script");
 
 /**
  * The `type` a `<script>` declares. Only a whole attribute counts, so `data-type="ld+json"` is not
@@ -674,7 +688,7 @@ function runsJavaScript(opener: string): boolean {
 }
 
 /** The same for `<style>`, whose braces are CSS rather than the template's interpolations. */
-const STYLE_TAG = /<(\/?)style\b[^>]*?(\/?)>/gi;
+const STYLE_TAG = elementTag("style");
 
 /**
  * The framework directive prefixes that introduce a binding: Svelte's `use:enhance`, Vue's
@@ -911,11 +925,17 @@ const JSX_FILE = /\.[jt]sx$/i;
 const JSX_OPEN_TAG = String.raw`<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?(?<![/])>`;
 
 /**
- * What a reader sees, with none of the punctuation that would make it program text. A generic
- * closes with the same `>` a tag does — `new Map<string, Widget>()` — so the text after one has to
- * read as a sentence before the line is called rendered, or a real call goes uncounted.
+ * The punctuation no rendered line carries. A generic closes with the same `>` a tag does —
+ * `new Map<string, Widget>()` — so text that claims to be rendered has to read as a sentence
+ * before it is believed, or a real call goes uncounted.
  */
-const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^<>{}()[\]=;\\|&+*/\`]*$`);
+const JSX_PUNCTUATION = String.raw`<>{}()[\]=;\\|&+*/\``;
+
+/** What a reader sees: a tag this line leaves open, with only prose behind it. */
+const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_PUNCTUATION}]*$`);
+
+/** Anything that makes a line program again — the closing `</p>`, an interpolation, a call. */
+const JSX_CODE = new RegExp(String.raw`[${JSX_PUNCTUATION}]`);
 
 /** The symbol inside a plain string prop — `<p title="Widget was removed">` renders that too. */
 const JSX_PROP_TEXT = new RegExp(
@@ -923,19 +943,51 @@ const JSX_PROP_TEXT = new RegExp(
 );
 
 /**
+ * Which lines of a JSX file start inside rendered text a tag left open above — `<p>` with
+ * `Widget was removed` on the line under it. Children wrap onto lines of their own as ordinary
+ * formatting, and judging that line alone finds no tag before the symbol, so a paragraph naming a
+ * removed component reads as program text and deletes a true finding about a genuinely unused one.
+ * MDX and markup carry the same state across their lines for the same reason.
+ *
+ * The run ends at the first line carrying any code punctuation — a closing `</p>`, an
+ * interpolation, a call — and at a blank line, read from `raw` so a line masking emptied is not
+ * mistaken for the break. A module's generics and comparisons cannot be told from tags without a
+ * parser, so a line the tag test misreads (`Map<string, Widget>` closes with the same `>`) can
+ * only carry prose into the lines directly under it rather than into the rest of the file:
+ * misreading a program as rendered text drops real callers wholesale, which is the costlier
+ * direction in the language this repo is mostly written in.
+ */
+function jsxTextLines(code: string[], raw: string[]): boolean[] {
+  const text: boolean[] = [];
+  let open = false;
+  for (const [index, line] of code.entries()) {
+    text.push(open);
+    if (!raw[index]?.trim()) {
+      open = false;
+      continue;
+    }
+    open = JSX_TEXT.test(line) || (open && !JSX_CODE.test(line));
+  }
+  return text;
+}
+
+/**
  * Whether a JSX line uses the symbol or merely renders it. A `.jsx`/`.tsx` file is a program, so
  * everything on it is code except what it shows a reader: the text a tag opens, and the value of a
  * plain string prop. `<p>Widget was removed</p>` names the symbol the way a doc page does, and
  * counting that page as a caller deletes a true finding about a genuinely unused symbol.
  *
- * Only text the opening tag leaves on the symbol's own line reads that way. Children wrapped onto
- * lines of their own would need the file's JSX nesting carried across it, and a module's generics,
- * comparisons and arrows cannot be told from tags without a parser: misreading a program's own
- * lines as rendered text drops real callers wholesale, which is the costlier direction in the
- * language this repo is mostly written in. The bound is kept deliberately.
+ * `text` is that same rendered text seen from the line above. It only carries as far as the prose
+ * does: the symbol has to sit before any punctuation on its line, or the line is program again —
+ * see `jsxTextLines` for why that bound is kept tight.
  */
-function referencesJsx(line: string | undefined, symbol: string): boolean {
-  return referencesWord(line, symbol, (head) => !JSX_TEXT.test(head) && !JSX_PROP_TEXT.test(head));
+function referencesJsx(line: string | undefined, symbol: string, text = false): boolean {
+  return referencesWord(
+    line,
+    symbol,
+    (head) =>
+      !JSX_TEXT.test(head) && !JSX_PROP_TEXT.test(head) && !(text && !JSX_CODE.test(head)),
+  );
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -996,11 +1048,13 @@ function kindOf(signal: ScanSignal): string {
 /** The `git grep` hits that could be a reference: the lines to check, by file. */
 type CandidateHits = Map<string, number[]>;
 
-/** A file read once and reused across symbols: its comments blanked, plus MDX's cross-line state. */
+/** A file read once and reused across symbols: its comments blanked, plus its cross-line state. */
 interface MaskedFile {
   code: string[];
   /** For MDX, which lines start inside a block — an expression or ESM statement — left open above. */
   open?: boolean[];
+  /** For JSX, which lines start inside rendered text a tag left open on an earlier line. */
+  jsx?: boolean[];
   /** For markup, where each line is program text: an executable `<script>` body or Astro frontmatter. */
   script?: CodeSpans[];
   /** For markup, how many braced expressions the lines above leave open at each line's start. */
@@ -1077,6 +1131,7 @@ async function codeReferencingFiles(
         masked.set(file, {
           code: markup?.code ?? code,
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
+          jsx: isJsx ? jsxTextLines(code, raw) : undefined,
           script: markup?.script,
           depth: markup && markupOpenDepths(markup.code, markup.script, raw),
         });
@@ -1100,7 +1155,7 @@ async function codeReferencingFiles(
           entry.depth?.[line - 1],
           isComponent,
         );
-      if (isJsx) return referencesJsx(text, symbol);
+      if (isJsx) return referencesJsx(text, symbol, entry.jsx?.[line - 1] === true);
       return referencesWord(text, symbol);
     };
     if (lines.some(references)) files.push(file);

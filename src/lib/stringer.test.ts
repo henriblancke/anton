@@ -1770,6 +1770,27 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("public/braced.html");
     });
 
+    // A `>` inside a quoted attribute is part of the value, not the end of the tag. Ending the
+    // opening tag there hands the rest of the attribute back as script body, so text a reader sees
+    // reads as a program and proves its own caller — while the script beside it still has to run.
+    it("keeps a quoted greater-than inside a script tag out of its body", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "public/notes.html": '<script title="> neverCalled was removed">const x = 1;</script>\n',
+        "public/app.html": "<script>neverCalled();</script>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
     // A template expression closes on its own line too — `<p>{version} Widget was removed</p>`
     // renders the symbol as text once `}` has run. Reading any earlier `{` as executable context
     // lets a committed page prove its own caller and erase a genuinely unused symbol.
@@ -1903,6 +1924,29 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/registry.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+    });
+
+    // ...and that text wraps onto lines of its own as ordinary formatting: `<p>` with the sentence
+    // under it renders the symbol exactly as the single-line form does, and judging that line alone
+    // reads a paragraph as program text and deletes a finding that was right. The run ends at the
+    // first punctuation, so an interpolation under the same tag still counts as the call it is.
+    it("reads JSX text wrapped onto its own line as prose, and still counts a call under a tag", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx":
+          "export const Panel = () => (\n  <p>\n    Widget was removed in favour of Panel\n  </p>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => (\n  <p>\n    {Widget()}\n  </p>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
     });
 
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
