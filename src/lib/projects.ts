@@ -27,6 +27,16 @@ import {
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
+import {
+  POLICY_BOUND_MAX,
+  POLICY_CONTROL_NAMESPACES,
+  POLICY_CRITERION_VALUES_MAX,
+  POLICY_LABEL_CRITERIA_MAX,
+  POLICY_PRIORITY_MAX,
+  POLICY_TEXT_MAX,
+  POLICY_TYPES_MAX,
+  type Policy,
+} from "./policy/types";
 import type { FailureBreakerConfig } from "./autopilot-failure-streak";
 import type { ScoreBreakerConfig } from "./autopilot-score-slide";
 import type { WipLimitConfig } from "./autopilot-wip";
@@ -345,6 +355,16 @@ export interface ProjectSettings {
    * nominate more than two tiers. Validated with {@link valueLabelsSchema} at the API boundary.
    */
   valueLabels?: string[];
+  /**
+   * The standing policy narrowing what anton may start on its own (anton-c7iv, R2.1). MACHINE-LOCAL:
+   * it lives here rather than on the board because two machines on one repo may legitimately hold
+   * different policies, and bd's claim protocol — not a shared setting — resolves the race.
+   *
+   * Absent is load-bearing: it means the operator has never armed this project, which is what makes
+   * first arm propose a calibrated draft (`policy/calibrate.ts`) instead of a blank form. Nothing
+   * writes it but an explicit accept. Validated with {@link pickerPolicySchema} at the API boundary.
+   */
+  pickerPolicy?: Policy;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -658,6 +678,102 @@ export function resolveValueLabels(settings: ProjectSettings): string[] {
 }
 
 /**
+ * The standing work policy (anton-c7iv). Strict on every field, because a policy that fails to parse
+ * is a policy that silently admits everything: absent means "never armed", and the picker treats
+ * that as "start nothing", so a malformed store must 400 at the boundary rather than round-trip.
+ *
+ * `values` may not be empty. An empty membership set matches NOTHING (criteria fail closed, R2.5),
+ * so it is never what an operator meant — dropping the namespace is how you stop constraining it.
+ * Bounded like every other operator list.
+ *
+ * Both ends of each ordered native field are accepted, but nothing here rejects a pair that crosses
+ * (`minPriority` above `maxPriority`): an empty window is a legible policy that admits nothing, and
+ * the editor's live match count already says so louder than a 400 would.
+ */
+export const pickerPolicySchema = z
+  .object({
+    // A membership set, so duplicate-free like every other one here: a repeat is a test the first
+    // entry already answered, and it burns a slot against POLICY_TYPES_MAX — which the editor reads
+    // as a ceiling reached, disabling every type the operator has not already selected.
+    types: z
+      .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.type))
+      .min(1)
+      .max(POLICY_TYPES_MAX)
+      .refine((ts) => new Set(ts).size === ts.length, {
+        message: "each type may be listed once",
+      }),
+    // bd's priority NUMBER, not the printed label: P0 is 0 and larger is less urgent, so `max` is
+    // the floor and `min` the ceiling.
+    maxPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
+    minPriority: z.number().int().min(0).max(POLICY_PRIORITY_MAX),
+    // Parent hops above the bead — 0 is top-level. Bounded rather than open-ended because a board
+    // nests epic → feature → ticket, and a depth beyond that is a typo, not a policy.
+    maxParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),
+    minParentDepth: z.number().int().min(0).max(POLICY_BOUND_MAX.parentDepth),
+    // Whole days. A year is the outer edge of a rule an operator could mean by "old".
+    minAgeDays: z.number().int().min(0).max(POLICY_BOUND_MAX.minAgeDays),
+    maxAgeDays: z.number().int().min(0).max(POLICY_BOUND_MAX.maxAgeDays),
+    labels: z
+      .array(
+        z
+          .object({
+            // Never one of anton's own bookkeeping namespaces. The editor already keeps them out of
+            // the offered criteria, and the boundary has to agree: a criterion over a namespace
+            // anton rewrites mid-run tests a label set that moves under the picker, so the symptom
+            // is "policy armed, picker starts nothing" — unreadable from the plan output.
+            namespace: z
+              .string()
+              .trim()
+              .min(1)
+              .max(POLICY_TEXT_MAX.namespace)
+              .refine((ns) => !POLICY_CONTROL_NAMESPACES.has(ns), {
+                message: "cannot constrain an anton bookkeeping namespace",
+              }),
+            // ORDERED when `ranked` — the drag order the operator gave these values (R2.3), which is
+            // why nothing on this path sorts them. Duplicate-free: a repeat is a second membership
+            // test the first already answered, and under a ranking it is a value at two positions at
+            // once — which `admittedValues` resolves by its first, so a bound could admit a slice
+            // the stored order does not show.
+            values: z
+              .array(z.string().trim().min(1).max(POLICY_TEXT_MAX.value))
+              .min(1)
+              .max(POLICY_CRITERION_VALUES_MAX)
+              .refine((vs) => new Set(vs).size === vs.length, {
+                message: "each value may be listed once",
+              }),
+            ranked: z.boolean().optional(),
+            // A `≤`/`≥` over that ranking. Rejected without `ranked`, and rejected when it names a
+            // value the ranking does not carry: the predicate fails such a criterion CLOSED against
+            // every bead (R2.5), so persisting one would arm a policy that admits nothing and says
+            // so only per bead.
+            compare: z
+              .object({
+                op: z.enum(["lte", "gte"]),
+                value: z.string().trim().min(1).max(POLICY_TEXT_MAX.value),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .refine((c) => !c.compare || (c.ranked && c.values.includes(c.compare.value)), {
+            message: "a comparison needs a ranking that contains its bound",
+          }),
+      )
+      .max(POLICY_LABEL_CRITERIA_MAX)
+      .refine((cs) => new Set(cs.map((c) => c.namespace)).size === cs.length, {
+        message: "each namespace may be constrained once",
+      }),
+    requireUnblocked: z.boolean(),
+  })
+  .partial()
+  .strict();
+
+/** The armed policy, or undefined when this project has never been armed (the first-arm case). */
+export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefined {
+  return settings.pickerPolicy;
+}
+
+/**
  * Per-label pipeline variants (anton-aa3m). An ORDERED list, not a map, because the order IS the
  * documented precedence: a bead carrying two mapped labels walks the one the project listed first.
  *
@@ -754,17 +870,23 @@ export function resolveRunHealthThresholds(
   return { ...DEFAULT_RUN_HEALTH_THRESHOLDS, ...(settings.runHealth ?? {}) };
 }
 
+/** A stored settings blob, or `{}` for a missing row and for one no longer parseable. */
+function parseSettings(settingsJson: string | undefined): ProjectSettings {
+  if (settingsJson === undefined) return {};
+  try {
+    return JSON.parse(settingsJson) as ProjectSettings;
+  } catch {
+    return {};
+  }
+}
+
 export async function getProjectSettings(db: AntonDb, id: string): Promise<ProjectSettings> {
   const rows = await db
     .select({ settingsJson: schema.projects.settingsJson })
     .from(schema.projects)
     .where(eq(schema.projects.id, id))
     .limit(1);
-  try {
-    return rows[0] ? (JSON.parse(rows[0].settingsJson) as ProjectSettings) : {};
-  } catch {
-    return {};
-  }
+  return parseSettings(rows[0]?.settingsJson);
 }
 
 /** Read this project's settings via the shared anton.db (UI/API read path). */
@@ -813,15 +935,11 @@ export async function budgetAwareProjectPolicies(): Promise<BudgetPolicy[]> {
   return policies;
 }
 
-/** Merge a settings patch into the project's settingsJson. Returns the merged settings. */
-export async function updateProjectSettings(
-  slug: string,
+/** Apply a patch to a settings blob, key by key. Pure — the store's read/write is the caller's. */
+function mergeSettings(
+  current: ProjectSettings,
   patch: Partial<ProjectSettings>,
-): Promise<ProjectSettings> {
-  const db = getDb();
-  const p = await getProjectBySlug(slug);
-  if (!p) throw new Error(`Project not found: ${slug}`);
-  const current = await getProjectSettings(db, p.id);
+): ProjectSettings {
   // Drop keys explicitly set to undefined so "Default" clears rather than persists.
   const next: ProjectSettings = { ...current };
   for (const [k, v] of Object.entries(patch)) {
@@ -842,11 +960,46 @@ export async function updateProjectSettings(
     }
     else (next as Record<string, unknown>)[k] = v;
   }
-  await db
-    .update(schema.projects)
-    .set({ settingsJson: JSON.stringify(next) })
-    .where(eq(schema.projects.id, p.id));
   return next;
+}
+
+/**
+ * Merge a settings patch into the project's settingsJson. Returns the merged settings.
+ *
+ * The read, the merge and the write happen inside ONE immediate transaction, synchronously, because
+ * every writer here rewrites the WHOLE blob and the settings page has several of them: the global
+ * Save, the automation table (which saves on change) and the work-policy panel each PATCH on their
+ * own. Two in flight at once would otherwise both read the pre-save row, and the later write would
+ * silently erase the earlier one's keys while both requests reported success.
+ */
+export async function updateProjectSettings(
+  slug: string,
+  patch: Partial<ProjectSettings>,
+): Promise<ProjectSettings> {
+  const db = getDb();
+  const p = await getProjectBySlug(slug);
+  if (!p) throw new Error(`Project not found: ${slug}`);
+  return db.transaction(
+    (tx) => {
+      const row = tx
+        .select({ settingsJson: schema.projects.settingsJson })
+        .from(schema.projects)
+        .where(eq(schema.projects.id, p.id))
+        .limit(1)
+        .get();
+      const next = mergeSettings(parseSettings(row?.settingsJson), patch);
+      tx
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify(next) })
+        .where(eq(schema.projects.id, p.id))
+        .run();
+      return next;
+    },
+    // The write lock is taken up front: a deferred transaction would read first and only then try to
+    // upgrade, which is the shape that loses to SQLITE_BUSY under exactly the concurrency this
+    // guards against.
+    { behavior: "immediate" },
+  );
 }
 
 /** What the shared beads config path reports back — the one seam the log helpers below read. */

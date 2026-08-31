@@ -2,6 +2,7 @@ import type {
   ScheduleLastRun,
   SchedulePendingStatus,
 } from "@/components/settings/automation-table";
+import type { Policy } from "@/components/settings/policy-draft-section";
 
 /**
  * The shapes the settings form works in. Every one of them is MIRRORED from a server type rather
@@ -78,6 +79,9 @@ export interface EditableSettings {
   };
   /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
   valueLabels?: string[];
+  /** The armed work policy (anton-c7iv). Absent = never armed, which is what makes the panel
+   *  propose a calibrated draft instead of an empty form. */
+  pickerPolicy?: Policy;
   /** The operator declined the daily product-master offer (anton-3xa9); absent = not yet asked. */
   keepProductMasterWeekly?: boolean;
   /**

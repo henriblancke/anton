@@ -50,8 +50,9 @@ export interface PickerPolicy {
 export const STRUCTURAL_RULE = "any claimable run target";
 
 /**
- * The policy in force before the editor ships: everything structurally claimable is admitted, and
- * the plan says so by name.
+ * The policy in force on a project that has armed none: everything structurally claimable is
+ * admitted, and the plan says so by name. An armed project narrows this with the operator's own
+ * policy instead ({@link ./picker-policy}).
  *
  * Safe only because this pass STARTS NOTHING — it ranks and records, and the record is read by a
  * human. The arming feature (R1.5) must not inherit this default: a pass that writes `approved` off
