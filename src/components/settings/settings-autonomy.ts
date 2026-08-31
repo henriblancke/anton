@@ -144,7 +144,7 @@ export const AUTONOMY_GROUPS: {
     id: "history",
     title: "Writes history",
     does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — or grants the approve gate on one, which records the decision a run starts from in your name.",
-    undo: "Reopening, or withdrawing an approval and releasing the reservation it took, is one write — but the close or the grant stays in the board's history and in every report already taken from it.",
+    undo: "Reopening a close is one write. Undoing a grant is two, in that order — withdraw the label, then release the reservation it took, because nothing will release a target the board still shows as approved — and a failure between them leaves the bead reserved with the gate already off. Either way the close or the grant stays in the board's history and in every report already taken from it.",
     armed:
       "Armed, a pass closes beads and grants approvals with nobody watching, and what it writes " +
       "outlives the undo. Arm this last, on a project whose shadow record you have actually read.",

@@ -1106,6 +1106,9 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
     const history = groupBox("Writes history");
     expect(within(history).getByRole("radio", { name: "shipped-orphan · propose" })).toBeTruthy();
     expect(within(history).getByText(/stays in the board's history/)).toBeTruthy();
+    // Undoing an applied grant is not one write — the label comes off before the reservation can be
+    // released, so the copy must price both rather than promise a single undo.
+    expect(within(history).getByText(/Undoing a grant is two/)).toBeTruthy();
   });
 
   it("shows split as not armable, with the reason, rather than offering it", () => {

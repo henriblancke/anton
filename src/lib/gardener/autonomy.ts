@@ -106,9 +106,10 @@ export function resolveProposalAutonomyPolicy(overrides?: unknown): ProposalAuto
  *   • `dequeued`   — the bead and its contract survive untouched, but nothing picks it up next. A
  *     wrong one is a week the bead sat still, found only by reading the record.
  *   • `history`    — the write outlives its own undo. A close is a CLAIM about what happened ("this
- *     shipped", "that replaced it"); an approve STARTS a run. Reopening or withdrawing is one write,
- *     but the claim stays in the board's history and in every report already taken from it, and the
- *     run it released has already spent what it spent.
+ *     shipped", "that replaced it"); an approve STARTS a run. Reopening is one write and undoing a
+ *     grant is two — the label, then the reservation, since nothing releases a target still shown as
+ *     approved — but the claim stays in the board's history and in every report already taken from
+ *     it, and the run it released has already spent what it spent.
  */
 export type AutonomyTier = "reversible" | "dequeued" | "history";
 
