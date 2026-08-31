@@ -884,7 +884,7 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
       [id],
     );
   }
-  await assertReservationHeld(repo, id, operator);
+  await assertReservationHeld(repo, id, swap, operator);
   return true;
 }
 
@@ -926,10 +926,18 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
  * machine rather than reserved for this one, which is precisely what the CAS was for. So it passes
  * only when no identity was resolved at all, because that swap was a verified no-op with no
  * reservation to lose (see {@link releaseReservation}).
+ *
+ * The GATE is re-asserted off the same read, because the expected holder alone does not prove the
+ * grant survived: a shell `bd label --remove` landing in this window leaves the target reserved for
+ * this machine WITHOUT `approved`, which is the one state no retry clears — the picker's eligibility
+ * bars every holder, so the proposal would settle over a bead nothing can pick up. The reservation
+ * is handed back instead, which puts the board where the proposal found it and lets the next pass
+ * re-ask the question; a hand-back that fails strands the pair and says so.
  */
 async function assertReservationHeld(
   repo: string,
   id: string,
+  swap: Extract<SwapResult, { ok: true }>,
   operator: string | undefined,
 ): Promise<void> {
   const live = await beads.show(repo, id).catch(() => undefined);
@@ -940,7 +948,10 @@ async function assertReservationHeld(
     );
   }
   const holder = claimHolder(live);
-  if (holder === operator || (!holder && !operator)) return;
+  if (holder === operator || (!holder && !operator)) {
+    if (beads.isApproved(live)) return;
+    return assertGateSurvived(repo, id, swap, operator);
+  }
   const change = holder
     ? `was claimed by ${holder}`
     : `had the reservation this start took for ${operator} removed`;
@@ -951,6 +962,39 @@ async function assertReservationHeld(
   }
   throw new StrandedWriteError(
     `${id} ${change} while this start was being approved and the \`${LABELS.approved}\` label could not be withdrawn — it now reads as approved work under a reservation this apply never checked, so a run nobody authorised can start on it`,
+    [id],
+  );
+}
+
+/**
+ * The reservation is still ours and the gate it was taken for is gone — hand the claim back and fail
+ * the start. Never returns: reaching it means another writer removed `approved` between
+ * {@link grantApproval}'s label write and its re-read.
+ *
+ * The pair only means something together. A claim without the gate is the half-applied state the
+ * whole ordering exists to avoid: the picker's eligibility bars every holder, this machine's own
+ * operator included, so the target sits reserved and unpickable until a human unassigns it. Handing
+ * the reservation back leaves the board exactly where the proposal found it, and the next pass asks
+ * the same question from the same state.
+ *
+ * Only a swap that WROTE is unwound, for the reason every other rollback here gives: this machine's
+ * identity is shared by every anton process on it, so a no-op swap is somebody else's reservation and
+ * releasing it would cancel their start.
+ */
+async function assertGateSurvived(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+): Promise<never> {
+  const removed = `${id} had the \`${LABELS.approved}\` this start wrote taken back off by another writer before the grant could be confirmed`;
+  if (!swap.wrote || (await releaseReservation(repo, id, operator))) {
+    throw new SubjectMovedError(
+      `${removed} — ${swap.wrote ? "the reservation taken for it was handed back" : "the reservation on it was never this apply's to hold"}, so the board is back where this proposal found it`,
+    );
+  }
+  throw new StrandedWriteError(
+    `${removed} and the reservation taken for that start could not be handed back — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
     [id],
   );
 }

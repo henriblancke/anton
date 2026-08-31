@@ -87,9 +87,23 @@ export function record(verb: string, ...args: string[]): Promise<string> {
   // The auto-claim an approve makes VERIFIES itself by reading the assignee back (beads/claim.ts),
   // so a board that answered with pre-write state would fail every swap as a lost race.
   if (verb === "assign") setLive(args[0] as string, { assignee: args[1] || undefined });
+  // The grant is re-read too — the approve route asserts the label survived the write it just made,
+  // so a board that never reflected `approved` would answer that assertion with pre-write state.
+  if (verb === "approve") setLive(args[0] as string, { labels: withLabel(args[0] as string) });
+  if (verb === "untag") setLive(args[0] as string, { labels: withoutLabels(args[0] as string, (args[1] ?? "").split(",")) });
   afterWrite?.(call);
   return Promise.resolve("");
 }
+
+/** The bead's labels as the writes so far have left them. */
+function labelsOf(id: string): string[] {
+  return (liveBeads.get(id) ?? snapshot.find((b) => b.id === id))?.labels ?? [];
+}
+
+const withLabel = (id: string): string[] => [...new Set([...labelsOf(id), LABELS.approved])];
+
+const withoutLabels = (id: string, dropped: string[]): string[] =>
+  labelsOf(id).filter((label) => !dropped.includes(label));
 
 /** What the next `bd show` of this bead answers with — the board as the writes have left it. */
 export function setLive(id: string, patch: Partial<Bead>): void {

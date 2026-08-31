@@ -1192,6 +1192,69 @@ describe("the product master's moves", () => {
       expect(err.changed).toEqual(["anton-a"]);
     });
 
+    it("hands the reservation back when the gate is taken back off before it is confirmed", async () => {
+      // The assignee half of this window has a twin: a shell `bd label --remove` landing while the
+      // re-read is in flight leaves the target reserved for THIS machine without `approved` — the
+      // one state no retry clears, because the picker's eligibility bars every holder. Settling on
+      // the expected holder alone would close the proposal over exactly that bead.
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a had the `approved` this start wrote taken back off by another writer before the grant could be confirmed — the reservation taken for it was handed back/,
+      );
+      // Claim, grant, hand-back: the board is left where the proposal found it.
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        "assign anton-a ",
+      ]);
+      expect(calls.filter((c) => c.startsWith("close"))).toEqual([]);
+    });
+
+    it("leaves a reservation this apply never took when the gate is taken back off", async () => {
+      // The same window over the CAS's idempotent no-op: another anton process on this machine
+      // shares the identity and claimed first, so the swap wrote nothing. Handing back here would
+      // unassign THEIR reservation in the name of undoing ours.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      };
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/the reservation on it was never this apply's to hold/);
+      expect(calls.filter((c) => c.startsWith("assign anton-a"))).toEqual([]);
+    });
+
+    it("names the stranded pair when the gate went and the reservation cannot be handed back", async () => {
+      failOn.set("assign:anton-a", 2);
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(/could not be handed back/);
+      expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
     it("fails the start when the target cannot be re-read after the grant", async () => {
       // The read IS the ownership assertion, so a failed one cannot settle the ask: an intervening
       // assign or unassign is invisible to it, and returning success would close the proposal over a
