@@ -30,7 +30,8 @@
  */
 import { existsSync } from "node:fs";
 import { beads, LABELS, ownerOf, type BatchOp, type Bead } from "../beads/bd";
-import { releaseChildren } from "../beads/child-assign";
+import { claimGuard } from "../beads/claim";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { runClaude } from "../claude/driver";
 import {
   branchAheadOfRemote,
@@ -785,12 +786,21 @@ function ownershipNote(
  * Hand back the dead run's own reservation on a preserved ticket — guarded on a read taken here,
  * not on the plan (PR #199).
  *
- * `releaseChildren` swaps on the ACTOR alone, and project concurrency lets a second run for the
- * same operator hold this ticket under the very string this one claimed under. What tells the two
- * apart is the rest of the bead: a second run reparents the ticket onto a target of its own and
- * claims it there. So the release lands only while a fresh read still finds the ticket exactly
- * where and as the sweep left it, and a board that has moved it on keeps its claim — the same rule
- * {@link reopenPreserved} applies to the status, one bd round trip later.
+ * A CAS on the ACTOR alone is not enough: project concurrency lets a second run for the same
+ * operator hold this ticket under the very string this one claimed under, so the swap matches and
+ * clears a live reservation. What tells the two runs apart is the rest of the bead — a second run
+ * reparents the ticket onto a target of its own and claims it there — so the release lands only
+ * while a fresh read still finds the ticket exactly where and as the sweep left it, and a board
+ * that has moved it on keeps its claim (the same rule {@link reopenPreserved} applies to the
+ * status, one bd round trip later).
+ *
+ * That parent/status check and the unassign are ONE guarded operation (PR #199): both run inside
+ * the ticket's claim-write lock, with the swap deciding on the read taken under it. Taken apart,
+ * they leave a window in which a second run adopts the ticket after the read and before the swap —
+ * and the actor-only CAS then clears the reservation it just made. The lock orders every claim
+ * write made in THIS process (a run's `beads.claimVerified`, a human's Claim, this release); the
+ * cross-process half stays open on bd's current primitives, which is why a claim is advisory at all
+ * (beads/claim.ts, anton-od4).
  *
  * A read that fails releases nothing either: the snapshot is not evidence enough to clear a claim.
  *
@@ -802,19 +812,26 @@ async function releasePreserved(
   bead: Bead,
   owner: string,
 ): Promise<"released" | "moved" | "kept"> {
-  const live = await beads.show(repo, bead.id).catch(() => undefined);
-  if (!live) return "kept";
-  const liveOwner = ownerOf(live);
-  if (liveOwner === undefined) return "released"; // nothing left to hand back
-  if (
-    liveOwner !== owner ||
-    beads.parentOf(live) !== beads.parentOf(bead) ||
-    live.status !== bead.status
-  )
-    return "moved";
-  return (await releaseChildren(repo, [bead.id], owner)).released.length > 0
-    ? "released"
-    : "kept";
+  return claimGuard.withClaimLock<"released" | "moved" | "kept">(
+    repo,
+    bead.id,
+    async (swap) => {
+      const live = await beads.show(repo, bead.id).catch(() => undefined);
+      if (!live) return "kept";
+      const liveOwner = ownerOf(live);
+      if (liveOwner === undefined) return "released"; // nothing left to hand back
+      if (
+        liveOwner !== owner ||
+        beads.parentOf(live) !== beads.parentOf(bead) ||
+        live.status !== bead.status
+      )
+        return "moved";
+      // `live` was read under this lock, so it IS the swap's own re-read — hand it in rather than
+      // pay for a second `bd show` that cannot say anything different.
+      const swapped = await swap(owner, undefined, live).catch(() => undefined);
+      return swapped?.ok ? "released" : "kept";
+    },
+  );
 }
 
 /**
@@ -859,6 +876,48 @@ async function reopenPreserved(
 }
 
 /**
+ * The in-process lock one merged target's finalization holds (PR #199). `enqueueReviewFixIfAbsent`
+ * deliberately lets two jobs reach the same target — the project-wide sweep and a gate-check's
+ * targeted fix — and finalizing is a long read-decide-write sequence over the whole ticket subtree:
+ * run concurrently, both read a board without a {@link REHOME_OF} follow-up on it, each create one,
+ * and their reparents then split the preserved tickets across two run targets or overwrite each
+ * other's moves. Serialized, the second pass reads the board the first one left.
+ *
+ * Namespaced rather than keyed on the target's own bead id on purpose: the finalization takes the
+ * CHILD tickets' claim locks inside it ({@link releasePreserved}), and a caller that holds a
+ * ticket's lock while it waits for its parent's — `withBeadWriteLocks` acquires a set in sorted
+ * order, which puts a ticket first whenever its id sorts lower — would deadlock against the
+ * opposite order. No bead is named `review-fix:finalize:<id>`, so this key orders finalizations
+ * against each other and against nothing else.
+ *
+ * In-process only, like every other lock on this seam: two anton servers sharing a board still
+ * interleave (anton-od4), which is why every write below is guarded on a read of its own.
+ */
+const finalizeLockKey = (epicId: string): string =>
+  `review-fix:finalize:${epicId}`;
+
+/** What {@link finalizeMergedEpic} needs to finalize one merged run target. */
+export interface FinalizeMergedEpicArgs {
+  db: AntonDb;
+  clock: Clock;
+  repo: string;
+  projectId: string;
+  epic: Bead;
+  /**
+   * The run target's whole ticket subtree (runTickets), carrying its inline `blocks` edges. Open
+   * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
+   */
+  children: Bead[];
+  /** The merged PR's head branch — the local branch + worktree to clean up. */
+  branch: string;
+  /**
+   * The full board — the follow-up epic's `area:` ({@link areaLabelOf}) and the follow-up an
+   * interrupted earlier finalization already created for this target ({@link REHOME_OF}).
+   */
+  all: Bead[];
+}
+
+/**
  * Finalize an epic whose PR merged: rehome the child tickets it did NOT deliver
  * ({@link undeliveredAtMerge}) onto a fresh run target, remove the merged branch + its worktree,
  * finalize the run row, and only then close the epic + the children it delivered and drop the
@@ -882,26 +941,19 @@ async function reopenPreserved(
  * the LAST thing done to a ticket — it is released and reopened first, while it is still where a
  * re-run of this function would find it. Only its note is written after, and a missing note is the
  * one thing that costs nobody a claim.
+ *
+ * All of it runs under {@link finalizeLockKey}, so two jobs racing on one merged target finalize it
+ * one after the other rather than planning against the same pre-rehome board (PR #199).
  */
-export async function finalizeMergedEpic(args: {
-  db: AntonDb;
-  clock: Clock;
-  repo: string;
-  projectId: string;
-  epic: Bead;
-  /**
-   * The run target's whole ticket subtree (runTickets), carrying its inline `blocks` edges. Open
-   * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
-   */
-  children: Bead[];
-  /** The merged PR's head branch — the local branch + worktree to clean up. */
-  branch: string;
-  /**
-   * The full board — the follow-up epic's `area:` ({@link areaLabelOf}) and the follow-up an
-   * interrupted earlier finalization already created for this target ({@link REHOME_OF}).
-   */
-  all: Bead[];
-}): Promise<void> {
+export function finalizeMergedEpic(args: FinalizeMergedEpicArgs): Promise<void> {
+  return withBeadWriteLock(args.repo, finalizeLockKey(args.epic.id), () =>
+    finalizeMergedTarget(args),
+  );
+}
+
+async function finalizeMergedTarget(
+  args: FinalizeMergedEpicArgs,
+): Promise<void> {
   const { db, clock, repo, projectId, epic, children, branch, all } = args;
 
   // A merged PR does NOT mean every child shipped in it (anton-67xj). A run that absorbed a ticket
@@ -1312,6 +1364,12 @@ async function applyRehome(
     stale: new Map(),
   };
   if (rerunnable.length === 0) return none;
+  // Nothing the plan still allows anton to move means nothing for a follow-up to hold (PR #199).
+  // Creating one anyway and deleting it again writes an empty run target to a shared board twice
+  // over — and a delete that fails then holds the merged target's close back for a home nobody
+  // needed. Every ticket that got here belongs to somebody else now, and each says so in its own
+  // note.
+  if (plan.takeable.size === 0) return none;
   const ids = rerunnable.map((b) => b.id).join(", ");
   // A memo of this pass's OWN reads, not the plan's (PR #199). Every read here is made after the
   // caller released and reopened the preserved tickets — bd round-trips on a board other operators
@@ -1338,8 +1396,8 @@ async function applyRehome(
   // of its own, and adding tickets to a live run's set is the drift that parks it — that one gets a
   // fresh follow-up, exactly as before.
   //
-  // `all` is the sweep's snapshot, and this PR sat in review for as long as it sat: the snapshot
-  // only NOMINATES a candidate, and reuse is decided on a read taken here (PR #199). An approval or
+  // Wherever it is nominated, this PR sat in review for as long as it sat: the nomination only
+  // POINTS AT a candidate, and reuse is decided on a read taken here (PR #199). An approval or
   // a claim that landed since is exactly the change the untouched test exists to catch, and adding
   // tickets to a target another worker is already running is the drift that parks it. A candidate
   // anton cannot re-read decides nothing either way — and creating a second follow-up on that
@@ -1349,9 +1407,21 @@ async function applyRehome(
     b.status !== "closed" &&
     ownerOf(b) === undefined &&
     !(b.labels ?? []).includes(LABELS.approved);
-  const candidate = all.find(
-    (b) => b.metadata?.[REHOME_OF] === epic.id && untouched(b),
-  );
+  const stampedForEpic = (b: Bead): boolean =>
+    b.metadata?.[REHOME_OF] === epic.id && untouched(b);
+  // A snapshot that names NO candidate is not evidence that none exists (PR #199). Two jobs may
+  // finalize the same merged target — `enqueueReviewFixIfAbsent` counts the project-wide sweep and
+  // a gate-check's targeted fix as different work — and whichever runs second holds a board read
+  // taken before the first created its follow-up. Creating on that silence splits the preserved
+  // tickets across two run targets, so the board itself is asked once more before anything is
+  // created. A list that fails proves nothing either way, and a second follow-up created on it
+  // would strand the first: finalization stops short of the close instead, and the next sweep
+  // retries the whole rehome.
+  const board = all.some(stampedForEpic)
+    ? all
+    : await beads.list(repo, ["--status", "all"]).catch(() => undefined);
+  if (!board) return { ...none, unfinished: epic.id };
+  const candidate = board.find(stampedForEpic);
   const liveCandidate = candidate ? await reread(candidate.id) : undefined;
   if (candidate && !liveCandidate) return { ...none, unfinished: candidate.id };
   const reused =
@@ -1658,7 +1728,7 @@ async function applyRehome(
   // into the claimable queue where execution can only park on "nothing left to run". Left
   // discoverable, the next sweep reuses this same follow-up (`REHOME_OF`) and retries the delete.
   const unfinished =
-    (!reused || !all.some((b) => beads.parentOf(b) === followUp)) &&
+    (!reused || !board.some((b) => beads.parentOf(b) === followUp)) &&
     !(await safe(() => beads.delete(repo, followUp)))
       ? followUp
       : undefined;

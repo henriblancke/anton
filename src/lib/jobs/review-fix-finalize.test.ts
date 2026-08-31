@@ -15,6 +15,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps } from "../beads/contract";
 
 const batchMock = vi.fn();
@@ -26,6 +27,8 @@ const deleteMock = vi.fn();
 const unassignMock = vi.fn();
 const setStatusMock = vi.fn();
 const showMock = vi.fn();
+/** The board read the rehome takes when the sweep's snapshot names no follow-up candidate. */
+const listMock = vi.fn();
 /** id → current assignee, so the claim guard's CAS (show → unassign → show) reads a live board. */
 const assignees = new Map<string, string>();
 /** id → current status, so the re-read before a status write sees the board, not the snapshot. */
@@ -51,6 +54,7 @@ vi.mock("../beads/bd", async () => {
       unassign: (...args: unknown[]) => unassignMock(...args),
       setStatus: (...args: unknown[]) => setStatusMock(...args),
       show: (...args: unknown[]) => showMock(...args),
+      list: (...args: unknown[]) => listMock(...args),
     },
   };
 });
@@ -144,6 +148,7 @@ describe("finalizeMergedEpic", () => {
         assignees.delete(id);
       });
     setStatusMock.mockReset().mockResolvedValue(undefined);
+    listMock.mockReset().mockResolvedValue([]);
     findOpenRunMock.mockReset().mockResolvedValue(null);
     updateRunMock.mockReset().mockResolvedValue(undefined);
     showMock.mockReset().mockImplementation(
@@ -471,6 +476,74 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  it("reuses a follow-up the sweep's snapshot could not have seen (PR #199)", async () => {
+    // `enqueueReviewFixIfAbsent` lets the project-wide sweep and a gate-check's targeted fix both
+    // reach one merged target, and whichever finalizes second read the board before the first
+    // created its follow-up. Nominating off that snapshot alone would create a SECOND target and
+    // split the preserved tickets across the two.
+    const concurrent = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    listMock.mockResolvedValue([concurrent]);
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-7");
+  });
+
+  it("holds the close back when the board cannot be re-read for a follow-up (PR #199)", async () => {
+    // A list that fails says neither that a concurrent finalization made a follow-up nor that none
+    // exists — and creating one on that silence is exactly how the tickets end up split. The merged
+    // target stays open and `stage:in-review` so the next sweep retries the whole rehome.
+    listMock.mockRejectedValue(new Error("bd list: DB locked"));
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("finalizes one merged target once when two jobs sweep it at the same time (PR #199)", async () => {
+    // The two jobs queue.ts deliberately lets coexist, racing on one target. Unserialized, both
+    // plan against a board with no follow-up on it and both create one — two run targets holding
+    // half the preserved work each, and each pass overwriting the other's reparents.
+    const created: Bead[] = [];
+    createMock.mockImplementation(
+      async (_repo: string, opts: { metadata?: Record<string, string> }) => {
+        const id = `epic-${created.length + 2}`;
+        created.push({
+          id,
+          title: id,
+          status: "open",
+          labels: [],
+          metadata: opts.metadata,
+        } as Bead);
+        return id;
+      },
+    );
+    listMock.mockImplementation(async () => created);
+    reparentMock.mockImplementation(
+      async (_repo: string, id: string, parent: string) => {
+        parents.set(id, parent);
+      },
+    );
+    const epic = bead("epic-1");
+    const preserved = bead("t2", "blocked", ["not-delivered"]);
+
+    await Promise.all([
+      finalize(epic, [preserved]),
+      finalize(epic, [preserved]),
+    ]);
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+  });
+
   it("releases the reservation the skipping run still holds on a preserved ticket", async () => {
     // The rerun path the note advertises only works if the ticket can be claimed again: a claim
     // that outlived its run hides it from `bd ready --unassigned` and refuses the claim cascade of
@@ -481,6 +554,43 @@ describe("finalizeMergedEpic", () => {
 
     expect(unassignMock).toHaveBeenCalledWith("/repo", "t2");
     expect(noteMock.mock.calls[0][2]).not.toContain("still assigned");
+  });
+
+  it("checks the ticket and clears the claim as one locked step (PR #199)", async () => {
+    // A second run for the same operator adopts this ticket — reparents it onto a target of its
+    // own and reserves it there, under the very actor string this release's CAS expects. Between
+    // an unlocked check and the swap, that adoption lands and the swap then clears the live
+    // reservation it just made. Under the ticket's claim lock the adoption can only queue behind
+    // the whole check-and-swap, so it either loses the ticket cleanly or never races it at all.
+    const events: string[] = [];
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+    const adopt = () =>
+      withBeadWriteLock("/repo", "t2", async () => {
+        events.push("adopt");
+        parents.set("t2", "epic-9");
+        assignees.set("t2", "op-1");
+      });
+    unassignMock.mockImplementation(async (_repo: string, id: string) => {
+      events.push("unassign");
+      assignees.delete(id);
+    });
+    let reads = 0;
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      // The release's own read — the plan read t2 once already, before it took the lock.
+      if (id === "t2" && ++reads === 2) void adopt();
+      return {
+        id,
+        title: id,
+        status: statuses.get(id) ?? "open",
+        labels: boardLabels.get(id) ?? [],
+        assignee: assignees.get(id),
+        parent: parents.get(id),
+      } as Bead;
+    });
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    expect(events).toEqual(["unassign", "adopt"]);
   });
 
   it("names the manual remedy when the reservation cannot be released", async () => {
@@ -674,8 +784,11 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [preserved]);
 
     expect(reparentMock).not.toHaveBeenCalled();
-    // Nothing reached the follow-up, so the empty target it would have been is taken back off the board.
-    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    // Nothing was left for a follow-up to take, so none is written to the board at all
+    // (PR #199) — an epic created and deleted in one pass is two writes to a shared board that
+    // leave nothing behind but the window in which an empty run target was claimable.
+    expect(createMock).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
     // Its status is part of the state that other target runs it in — left alone too.
     expect(setStatusMock).not.toHaveBeenCalled();
     const note = noteMock.mock.calls[0][2];
@@ -1220,7 +1333,8 @@ describe("finalizeMergedEpic", () => {
     ]);
 
     expect(reparentMock).not.toHaveBeenCalled();
-    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(createMock).not.toHaveBeenCalled(); // nothing to take, so no follow-up is written
+    expect(deleteMock).not.toHaveBeenCalled();
     expect(setStatusMock).not.toHaveBeenCalled();
     expect(noteMock.mock.calls[0][2]).toContain(
       "Another operator moved it under t2",
@@ -1248,7 +1362,8 @@ describe("finalizeMergedEpic", () => {
     ]);
 
     expect(reparentMock).not.toHaveBeenCalled();
-    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(createMock).not.toHaveBeenCalled(); // nothing to take, so no follow-up is written
+    expect(deleteMock).not.toHaveBeenCalled();
     const note = noteMock.mock.calls[0][2];
     expect(note).toContain("could NOT be rehomed");
     expect(note).not.toContain("Another operator moved it");
@@ -1292,7 +1407,8 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [preserved]);
 
     expect(reparentMock).not.toHaveBeenCalled();
-    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(createMock).not.toHaveBeenCalled(); // nothing to take, so no follow-up is written
+    expect(deleteMock).not.toHaveBeenCalled();
     expect(setStatusMock).not.toHaveBeenCalled();
     const note = noteMock.mock.calls[0][2];
     expect(note).toContain("Its status is now `in_progress` under op-2");
@@ -1333,7 +1449,8 @@ describe("finalizeMergedEpic", () => {
     await finalize(claimed(bead("epic-1"), "op-1"), [held]);
 
     expect(reparentMock).not.toHaveBeenCalled();
-    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(createMock).not.toHaveBeenCalled(); // nothing to take, so no follow-up is written
+    expect(deleteMock).not.toHaveBeenCalled();
     expect(setStatusMock).not.toHaveBeenCalled();
     expect(unassignMock).not.toHaveBeenCalled();
     const note = noteMock.mock.calls[0][2];
