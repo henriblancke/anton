@@ -2375,6 +2375,65 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // A `}` closes the block before it and a fresh STATEMENT begins — `if (enabled) {}
+    // /[/*]/.test(value);` tests a regex. Read as division, the `/*` inside the character class opens
+    // a comment that runs to the end of the file and every real duplication window below it is
+    // dropped unread.
+    it("reads a slash after a closed block as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/guarded.ts": [
+          "export function check(enabled: boolean, value: string) {",
+          "  if (enabled) {} /[/*]/.test(value);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/guarded.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/guarded.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // The one `}` a slash follows without a statement starting is JSX's self-close. Read as a regex
+    // opener, the invented literal runs to the next slash on the line — the `{/*` of the comment
+    // beside it — and the prose below is then classified as runtime work and triaged as a clone.
+    it("reads a slash after a self-closing JSX tag as the tag, not as a regex", async () => {
+      const repo = writeRepo({
+        "src/panel.tsx": [
+          "export function Panel({ size }: { size: number }) {",
+          "  return (",
+          "    <div>",
+          "      <Icon size={size} /> {/* the note below is prose:",
+          "      it explains what the icon means, at length,",
+          "      over lines that hold no runtime work at all,",
+          "      and none of it is worth extracting anywhere,",
+          "      here or in the component beside it */}",
+          "    </div>",
+          "  );",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/panel.tsx", 5]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped).toMatchObject([
+        { path: "src/panel.tsx", kind: "code-clone" },
+      ]);
+      expect(result.duplication.dropped[0].reason).toContain("3 comment");
+    });
+
     // `hits++ / span` divides — the trailing `+` is a postfix operator that yields a value, not one
     // that leads an expression. Read as a regex opener, the invented literal runs to the next slash
     // and eats the `)` between them, leaving the parenthesized expression open over the live code

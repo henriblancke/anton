@@ -400,8 +400,9 @@ function closesControlHead(before: string): boolean {
 /**
  * Whether the `/` at `start` OPENS a regex literal rather than divides — `REGEX_PREFIX` read
  * against the text BEHIND the slash, for the scanners that walk a line character by character
- * instead of matching it whole, plus the one prefix a regex cannot express: the `)` of a
- * control-flow head, which takes a balanced scan backwards to tell from a call's.
+ * instead of matching it whole, plus the two prefixes a regex cannot express: the `)` of a
+ * control-flow head, which takes a balanced scan backwards to tell from a call's, and the `}` that
+ * closes a block, which is told from JSX's self-close by the character AFTER the slash.
  */
 function opensRegex(line: string, start: number): boolean {
   const raw = line.slice(0, start);
@@ -412,6 +413,14 @@ function opensRegex(line: string, start: number): boolean {
   // and a closing tag.
   if (raw.length > before.length && COMPARISON_PREFIX.test(before)) return true;
   if (closesControlHead(before)) return true;
+  // A `}` ends the block before it, and what follows is a fresh STATEMENT — `if (enabled) {}
+  // /[/*]/.test(value);` tests a regex. Read as division, the `/*` inside that character class opens
+  // a comment that swallows every line below. The one `}` a slash follows without a statement
+  // starting is JSX's self-close: `<Icon size={n} /> {/* note` puts a `/` there too, and reading it
+  // as an opener would run an invented literal over the `{/*` that follows and leave that comment
+  // unseen. The `>` is what tells them apart — a literal `/>/` loses to the tag, which is what the
+  // character pair means in the TSX this actually scans.
+  if (before.endsWith("}") && line[start + 1] !== ">") return true;
   return REGEX_PREFIX.test(before);
 }
 
