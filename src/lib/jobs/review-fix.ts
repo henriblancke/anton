@@ -748,15 +748,33 @@ export function undeliveredAtMerge(children: Bead[]): Set<string> {
 function ownershipNote(
   bead: Bead,
   owner: string | undefined,
-  args: { stillOwned: boolean; foreignOwner: boolean; blocksClaim: string },
+  args: {
+    stillOwned: boolean;
+    foreignOwner: boolean;
+    heldElsewhere?: boolean;
+    blocksClaim: string;
+  },
 ): string {
   if (!args.stillOwned) return "";
-  return args.foreignOwner
-    ? ` It is also assigned to ${owner}, not to the actor this run reserved it for — anton ` +
-        `releases only its own claim, so that reservation was left intact${args.blocksClaim}. If ` +
-        `it is stale, clear it with \`bd assign ${bead.id} ""\`.`
-    : ` It is also still assigned to ${owner} and could not be released${args.blocksClaim}: clear ` +
-        `that with \`bd assign ${bead.id} ""\`.`;
+  if (args.foreignOwner)
+    return (
+      ` It is also assigned to ${owner}, not to the actor this run reserved it for — anton ` +
+      `releases only its own claim, so that reservation was left intact${args.blocksClaim}. If ` +
+      `it is stale, clear it with \`bd assign ${bead.id} ""\`.`
+    );
+  // Named to the run's own actor, yet deliberately kept: the board moved this ticket on, and under
+  // project concurrency the same actor can be a second run reserving it for work it is doing now.
+  if (args.heldElsewhere)
+    return (
+      ` It is also still assigned to ${owner}, which anton left intact${args.blocksClaim}: the ` +
+      `board moved this ticket on after the run stopped it, so that claim may be the live ` +
+      `reservation of whoever owns it now. If it is stale, clear it with ` +
+      `\`bd assign ${bead.id} ""\`.`
+    );
+  return (
+    ` It is also still assigned to ${owner} and could not be released${args.blocksClaim}: clear ` +
+    `that with \`bd assign ${bead.id} ""\`.`
+  );
 }
 
 /**
@@ -904,9 +922,18 @@ export async function finalizeMergedEpic(args: {
     // snapshot, so a takeover that landed since it was read loses nothing here either.
     const owner = ownerOf(bead);
     const foreignOwner = owner !== undefined && owner !== runOwner;
+    // …and only while the board still reads this ticket as the dead run's. A ticket planRehome
+    // found under another target, or moved on in place, may be a SECOND run's live work — and
+    // project concurrency lets that run reserve it under the same actor string this one claimed
+    // under, so an actor-only CAS matches and clears a valid reservation, advertising a ticket
+    // somebody is executing as unassigned. Its claim is left exactly as its parent and status are,
+    // for the same reason.
+    const heldElsewhere =
+      plan.elsewhere.has(bead.id) || plan.changed.has(bead.id);
     const released =
       owner !== undefined &&
       !foreignOwner &&
+      !heldElsewhere &&
       (await releaseChildren(repo, [bead.id], owner)).released.length > 0;
     const stillOwned = owner !== undefined && !released;
     // Return the ticket to a claimable status. A timed-out one carries `blocked` from the run that
@@ -920,13 +947,17 @@ export async function finalizeMergedEpic(args: {
     // running it in.
     // …or moved on in place: a ticket someone has since claimed, closed or snoozed keeps the status
     // they put it in, so the reopen is skipped for the same reason the reparent was.
-    const takenOver = plan.elsewhere.has(bead.id);
-    const movedOn = plan.changed.get(bead.id);
     const statusNote =
-      rerun.has(bead.id) && !takenOver && !movedOn
+      rerun.has(bead.id) && !heldElsewhere
         ? await reopenPreserved(repo, bead, runOwner)
         : "";
-    settled.set(bead.id, { owner, stillOwned, foreignOwner, statusNote });
+    settled.set(bead.id, {
+      owner,
+      stillOwned,
+      foreignOwner,
+      heldElsewhere,
+      statusNote,
+    });
   }
 
   // Claimable now, so the tickets the plan cleared can take their new home.
@@ -943,9 +974,8 @@ export async function finalizeMergedEpic(args: {
 
   // Only once the moves have landed can a ticket say where it ended up, so the notes come last.
   for (const bead of preserved) {
-    const { owner, stillOwned, foreignOwner, statusNote } = settled.get(
-      bead.id,
-    )!;
+    const { owner, stillOwned, foreignOwner, heldElsewhere, statusNote } =
+      settled.get(bead.id)!;
     const takenOver = plan.elsewhere.has(bead.id);
     const movedOn = plan.changed.get(bead.id);
     // Three lanes, three different things to tell the operator who meets this ticket later: the
@@ -967,6 +997,7 @@ export async function finalizeMergedEpic(args: {
               ownershipNote(bead, owner, {
                 stillOwned,
                 foreignOwner,
+                heldElsewhere,
                 blocksClaim: "",
               })
           : !rerun.has(bead.id)
@@ -980,6 +1011,7 @@ export async function finalizeMergedEpic(args: {
               ownershipNote(bead, owner, {
                 stillOwned,
                 foreignOwner,
+                heldElsewhere,
                 blocksClaim: "",
               })
             : `anton: the pull request for ${epic.id} merged WITHOUT this ticket — the run did ` +
@@ -1022,6 +1054,7 @@ export async function finalizeMergedEpic(args: {
               ownershipNote(bead, owner, {
                 stillOwned,
                 foreignOwner,
+                heldElsewhere,
                 blocksClaim: ", so no other operator can claim it",
               }) +
               statusNote,
@@ -1703,6 +1736,12 @@ interface PreservedSetup {
   stillOwned: boolean;
   /** That reservation belongs to someone other than the run — deliberately left alone. */
   foreignOwner: boolean;
+  /**
+   * The board moved this ticket on (another target, or a state change in place), so anton left its
+   * claim alone whoever it names — under project concurrency the same actor string can be a second
+   * run's live reservation.
+   */
+  heldElsewhere: boolean;
   /** The sentence the note adds when the ticket did not reach a claimable status (empty once it did). */
   statusNote: string;
 }

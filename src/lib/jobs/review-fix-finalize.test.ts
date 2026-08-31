@@ -653,6 +653,36 @@ describe("finalizeMergedEpic", () => {
     expect(note).not.toContain("--parent <new-epic>");
   });
 
+  it("keeps the claim on a ticket a second run already owns (PR #199)", async () => {
+    // Concurrency lets one operator hold two runs at once, so the second run's reservation carries
+    // the SAME actor string this one claimed under. The actor-only CAS matches it, and clearing it
+    // would advertise a ticket that run is executing as globally unassigned.
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+    parents.set("t2", "epic-9"); // reparented into the second run while the PR sat in review
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    const note = noteFor("t2");
+    expect(note).toContain("Another operator moved it under epic-9");
+    expect(note).toContain("still assigned to op-1");
+    expect(note).not.toContain("could not be released");
+  });
+
+  it("keeps the claim on a ticket the board moved on in place (PR #199)", async () => {
+    // Same reasoning without a reparent: whoever snoozed this ticket may be running it under the
+    // run's own actor, and the release is decided on that actor alone.
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+    statuses.set("t2", "deferred"); // moved on after the sweep read the board
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(noteFor("t2")).toContain("still assigned to op-1");
+  });
+
   it("does not move a ticket claimed between the plan and the reparent (PR #199)", async () => {
     // The plan cleared t2, and then anton's OWN release and reopen writes — bd round-trips on a
     // board other operators share — left a window before the move. A claim that lands in it makes
