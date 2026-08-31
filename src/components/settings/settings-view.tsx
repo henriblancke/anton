@@ -11,6 +11,7 @@ import {
 } from "@/components/settings/policy-draft-section";
 import { AgentsSection } from "@/components/settings/sections/agents-section";
 import { AutomationSection } from "@/components/settings/sections/automation-section";
+import { AutopilotSection } from "@/components/settings/sections/autopilot-section";
 import { DangerSection } from "@/components/settings/sections/danger-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
@@ -134,6 +135,7 @@ export function SettingsView({
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,
     execution: <ExecutionSection form={form} />,
+    autopilot: <AutopilotSection form={form} />,
     value: <ValueSection form={form} labelVocabulary={labelVocabulary} />,
     gates: <GatesSection form={form} />,
     review: <ReviewSection form={form} agents={agents} />,

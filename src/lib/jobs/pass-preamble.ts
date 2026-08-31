@@ -104,6 +104,11 @@ export interface PassSessionInput {
   ctx: JobContext;
   projectId: string;
   kind: SessionKind;
+  /**
+   * The run this session accounts for, when it accounts for one — a per-run teardown rather than a
+   * board-wide pass. Set it and the row links to the RUN instead of the job (see {@link openRow}).
+   */
+  runId?: string;
   /** Reported alongside the live handle for a pass that runs claude somewhere (anton-susu). */
   cwd?: string;
 }
@@ -124,12 +129,17 @@ export interface OpenPassSession extends PassSession {
 /**
  * Open the row and report the live handle. `jobId` is the durable half of the link: these passes
  * write no run row, so once one settles the jobs page is the only route to its log.
+ *
+ * A session that DOES belong to a run links to the run instead, and deliberately not to both: the
+ * jobs page shows a job's newest job-linked session as that job's output (`linksByJob`), so an
+ * execute-epic teardown stamped with the job would replace the run's own work with a two-line
+ * cleanup account — while the run's timeline, where it belongs, would omit it entirely.
  */
 async function openRow(db: AntonDb, clock: Clock, input: PassSessionInput): Promise<JobSession> {
   const session = await startJobSession(db, clock, {
     projectId: input.projectId,
     kind: input.kind,
-    jobId: input.ctx.jobId,
+    ...(input.runId ? { runId: input.runId } : { jobId: input.ctx.jobId }),
   });
   // The log is created WITH the row, so a pass session with no log file can only mean the log store
   // broke. That is what lets a retry tell "the earlier attempt had nothing to say" from "its account

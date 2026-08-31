@@ -48,6 +48,7 @@ const JOB_TYPE_LABELS: Record<JobType, string> = {
   gardener: "Gardener",
   "product-master": "Product master",
   "board-picker": "Board picker",
+  "worktree-reaper": "Worktree reaper",
 };
 
 export const JOB_STATUSES = Object.keys(JOB_STATUS_LABELS) as JobStatus[];

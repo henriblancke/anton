@@ -1,4 +1,8 @@
 import {
+  DEFAULT_AUTOPILOT_FAILURE_STREAK,
+  DEFAULT_AUTOPILOT_SCORE_FLOOR,
+  DEFAULT_AUTOPILOT_SCORE_WINDOW,
+  DEFAULT_AUTOPILOT_WIP_LIMIT,
   DEFAULT_CONCURRENCY,
   DEFAULT_DAYTIME_RESERVE_PCT,
   DEFAULT_JOB_TIMEOUT_MINUTES,
@@ -49,6 +53,11 @@ export interface SettingsDraft {
   maxRetries: number;
   autonomy: boolean;
   conventionalCommits: boolean;
+  /** The autopilot brakes (anton-nmy7), held resolved — the controls render numbers, not "absent". */
+  autopilotWipLimit: number;
+  autopilotFailureStreak: number;
+  autopilotScoreFloor: number;
+  autopilotScoreWindow: number;
   budgetAware: boolean;
   daytimeReservePct: number;
   weeklyTargetPct: number;
@@ -97,6 +106,10 @@ export function draftFromSettings(
     maxRetries: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
     autonomy: settings.autonomy ?? true,
     conventionalCommits: settings.conventionalCommits ?? false,
+    autopilotWipLimit: settings.autopilotWipLimit ?? DEFAULT_AUTOPILOT_WIP_LIMIT,
+    autopilotFailureStreak: settings.autopilotFailureStreak ?? DEFAULT_AUTOPILOT_FAILURE_STREAK,
+    autopilotScoreFloor: settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR,
+    autopilotScoreWindow: settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW,
     budgetAware: settings.budgetAware ?? false,
     daytimeReservePct: settings.budgetPolicy?.daytimeReservePct ?? DEFAULT_DAYTIME_RESERVE_PCT,
     weeklyTargetPct: settings.budgetPolicy?.weeklyTargetPct ?? DEFAULT_WEEKLY_TARGET_PCT,
@@ -128,6 +141,12 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   maxRetries: ["maxRetries"],
   autonomy: ["autonomy"],
   conventionalCommits: ["conventionalCommits"],
+  autopilot: [
+    "autopilotWipLimit",
+    "autopilotFailureStreak",
+    "autopilotScoreFloor",
+    "autopilotScoreWindow",
+  ],
   budget: ["budgetAware", "daytimeReservePct", "weeklyTargetPct"],
   gates: ["testCommand", "lintCommand", "typecheckCommand", "buildCommand"],
   review: [
@@ -241,6 +260,13 @@ export function settingsPatchBody(
     agents: bundledAgentIds.filter((id) => draft.activeAgents.has(id)),
     autonomy: draft.autonomy,
     conventionalCommits: draft.conventionalCommits,
+    // The autopilot brakes (anton-nmy7). Sent as concrete numbers, including the 0 that turns one
+    // off: null would clear the override back to the shipped default, which is the exact opposite
+    // of what an operator disabling a breaker asked for.
+    autopilotWipLimit: draft.autopilotWipLimit,
+    autopilotFailureStreak: draft.autopilotFailureStreak,
+    autopilotScoreFloor: draft.autopilotScoreFloor,
+    autopilotScoreWindow: draft.autopilotScoreWindow,
     budgetAware: draft.budgetAware,
     // Only the two exposed knobs; the server deep-merges into the stored policy, so knobs set via
     // the API (dayWindow, minSessionHeadroomPct, …) survive a save from this form.

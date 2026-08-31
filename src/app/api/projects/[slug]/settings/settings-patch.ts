@@ -9,6 +9,10 @@
  */
 import { discoverAgents } from "@/lib/agents-discovery";
 import {
+  AUTOPILOT_FAILURE_STREAK_RANGE,
+  AUTOPILOT_SCORE_FLOOR_RANGE,
+  AUTOPILOT_SCORE_WINDOW_RANGE,
+  AUTOPILOT_WIP_LIMIT_RANGE,
   CONCURRENCY_RANGE,
   DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
   DEFAULT_REVIEW_MAX_ROUNDS,
@@ -66,9 +70,10 @@ const settingsField = <K extends keyof ProjectSettings & string>(
 ): FieldRule<ProjectSettings> => fieldRule<ProjectSettings, K>(key, parse);
 
 /**
- * Numeric job-policy fields. `reviewMinScore` accepts 0 as a real value — it is how the operator
- * turns the score-regression alarm off (anton-i98r) — which the shared `null` / `""` clear leaves
- * intact.
+ * Numeric job-policy fields, including the autopilot breakers' thresholds. Several accept 0 as a
+ * REAL value rather than a clear — it is how the operator turns that guard off: the score-regression
+ * alarm (anton-i98r), the consecutive-failure breaker (anton-rgso), the score-regression breaker
+ * (anton-cekf) and the WIP hold (anton-wy9y). The shared `null` / `""` clear leaves that intact.
  */
 const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("concurrency", integerInRange(CONCURRENCY_RANGE)),
@@ -78,6 +83,10 @@ const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("reviewMaxRounds", integerInRange(REVIEW_MAX_ROUNDS_RANGE)),
   settingsField("reviewMinScore", integerInRange(REVIEW_MIN_SCORE_RANGE)),
   settingsField("reviewLowScoreRounds", integerInRange(REVIEW_LOW_SCORE_ROUNDS_RANGE)),
+  settingsField("autopilotFailureStreak", integerInRange(AUTOPILOT_FAILURE_STREAK_RANGE)),
+  settingsField("autopilotScoreFloor", integerInRange(AUTOPILOT_SCORE_FLOOR_RANGE)),
+  settingsField("autopilotScoreWindow", integerInRange(AUTOPILOT_SCORE_WINDOW_RANGE)),
+  settingsField("autopilotWipLimit", integerInRange(AUTOPILOT_WIP_LIMIT_RANGE)),
 ];
 
 /**

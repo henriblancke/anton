@@ -28,6 +28,12 @@ export type SessionKind =
    * a row exists only for a pass with output to carry — today, its shadow records (anton-lmps).
    */
   | "gardener"
+  /**
+   * A worktree-reaper pass (anton-hrun.1) — or one run's own teardown — with worktrees or branches
+   * to account for. Like the gardener it runs no claude session, so a row exists only when there is
+   * something to report.
+   */
+  | "worktree-reaper"
   | "interactive";
 export type SessionStatus = "running" | "done" | "failed";
 
