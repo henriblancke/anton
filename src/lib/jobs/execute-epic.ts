@@ -1931,9 +1931,21 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // on the branch. Not on an ABORT either — a kill or an abandon settles these beads itself
       // (an abandon closes them), and reopening one there re-queues work a human just killed, the
       // rule runTicket's own abort path follows.
+      //
+      // Retried, not best-effort (PR #199 review). Every path below advertises a resume or a retry,
+      // and this status is what that attempt's claim gate tests: swallowing a transient bd failure
+      // here leaves the ticket `blocked` with nothing said anywhere, so the resume the park promises
+      // dies on its first step for a reason nobody can see. A refusal that outlives the retries is
+      // logged with its repair, the escalation every other must-land write on this seam makes.
       if (!ctx.signal.aborted) {
         for (const stalled of timedOut.filter((t) => !t.committed)) {
-          await safe(() => beads.setStatus(repo, stalled.id, "open"));
+          if (!(await mustPersist(() => beads.setStatus(repo, stalled.id, "open")))) {
+            console.error(
+              `[execute-epic] ${epicBeadId}: could not reopen ${stalled.id} — it stays \`blocked\`, ` +
+                `which runTicket's claim gate refuses, so the resume this run advertises would die ` +
+                `on it. Clear it by hand: bd update ${stalled.id} --status open`,
+            );
+          }
         }
       }
       // Resolved HERE — after the release awaits, immediately before the settle that would arm the
@@ -4534,11 +4546,20 @@ const PERSIST_RETRY_MS = 500;
  * `not-delivered` marker (anton-67xj): that label is merge finalization's ONLY signal that a ticket
  * is in no diff, so swallowing its failure lets the run open a PR whose merge closes never-written
  * work as shipped — silently, and against the note on the bead telling the operator to re-run it.
+ *
+ * Every refusal is LOGGED rather than swallowed (PR #199 review): the callers escalate to a park
+ * whose message can only say "check the beads DB", so bd's own reason for refusing is what makes
+ * that park actionable — and it exists nowhere else once this has returned.
  */
 async function mustPersist(fn: () => Promise<unknown>, attempts = 3): Promise<boolean> {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    if (await safe(fn)) return true;
-    if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+    try {
+      await fn();
+      return true;
+    } catch (e) {
+      console.error(`[execute-epic] bd write failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+    }
   }
   return false;
 }

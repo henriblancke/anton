@@ -37,6 +37,8 @@ const statuses = new Map<string, string>();
 const parents = new Map<string, string | undefined>();
 /** id → current labels, so a re-read still carries the `not-delivered` marker the lane turns on. */
 const boardLabels = new Map<string, string[]>();
+/** id → creation time, which is how two racing processes agree on which follow-up survives. */
+const createdAt = new Map<string, string>();
 
 vi.mock("../beads/bd", async () => {
   const actual =
@@ -142,6 +144,7 @@ describe("finalizeMergedEpic", () => {
     statuses.clear();
     parents.clear();
     boardLabels.clear();
+    createdAt.clear();
     unassignMock
       .mockReset()
       .mockImplementation(async (_repo: string, id: string) => {
@@ -160,6 +163,7 @@ describe("finalizeMergedEpic", () => {
           labels: boardLabels.get(id) ?? [],
           assignee: assignees.get(id),
           parent: parents.get(id),
+          created_at: createdAt.get(id),
         }) as Bead,
     );
   });
@@ -503,6 +507,85 @@ describe("finalizeMergedEpic", () => {
     await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
 
     expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("stops moving onto a FRESH follow-up taken mid-pass (PR #199 review)", async () => {
+    // Seconds old makes it no less reachable: the epic anton just created sits on a board humans
+    // watch, and its own description asks to be approved. Once it is, it is a run of its own, and
+    // every further ticket added to it is the ticket-set drift that parks that run — the same
+    // reason a reused leftover is re-read, so the guard cannot depend on who created the home.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "m1") boardLabels.set("epic-2", ["approved"]);
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("m1", "blocked", ["not-delivered"]),
+      bead("m2", "blocked", ["not-delivered"]),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "m1", "epic-2"]]);
+    expect(deleteMock).not.toHaveBeenCalled(); // it is somebody's run now, not anton's to remove
+    // Finalization is left undone, so the merged target stays open for the next sweep.
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("defers to the older follow-up when another PROCESS created one too (PR #199 review)", async () => {
+    // `finalizeLockKey` orders finalizations inside one process; two anton servers sharing a board
+    // both read a stamp-free board and both create, and bd has no board-level uniqueness to key the
+    // create on. So the create is verified after the fact: read the stamp back, and let the oldest
+    // follow-up win — a rule both processes reach, so the preserved tickets stay under ONE target.
+    const rival = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+      created_at: "2026-01-01T00:00:00.000Z",
+    } as Bead;
+    createdAt.set("epic-2", "2026-01-01T00:00:05.000Z");
+    listMock.mockResolvedValueOnce([]).mockResolvedValue([rival]);
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // the duplicate, before anything lands on it
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-7");
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
+  });
+
+  it("keeps its own follow-up when the rival's is the younger one (PR #199 review)", async () => {
+    // The other half of the same rule. A process that cannot see its rival's create is necessarily
+    // the older one, so keeping its own is the verdict the rival reaches when it sees both.
+    const rival = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+      created_at: "2026-01-01T00:00:05.000Z",
+    } as Bead;
+    createdAt.set("epic-2", "2026-01-01T00:00:00.000Z");
+    listMock.mockResolvedValueOnce([]).mockResolvedValue([rival]);
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
+  });
+
+  it("holds the close back when the board cannot be re-read after the create (PR #199 review)", async () => {
+    // A list that fails cannot rule a duplicate out, and filling a home that may be one splits the
+    // preserved tickets across two run targets. The follow-up keeps its stamp, so the next sweep
+    // reuses this very epic and reconciles then.
+    listMock
+      .mockResolvedValueOnce([])
+      .mockRejectedValue(new Error("bd list: DB locked"));
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(createMock).toHaveBeenCalledTimes(1);
     expect(reparentMock).not.toHaveBeenCalled();
     expect(batchMock).not.toHaveBeenCalled();
     expect(untagMock).not.toHaveBeenCalled();
@@ -1341,9 +1424,12 @@ describe("finalizeMergedEpic", () => {
     );
   });
 
-  it("moves nothing when an ancestor in the chain cannot be re-read", async () => {
+  it("holds the close back when an ancestor in the chain cannot be re-read", async () => {
     // An unreadable link proves neither that t3 still rides on the merged target nor that somebody
-    // took it, so it moves nothing and its note claims neither.
+    // took it, so it moves nothing and its note claims neither. Nor may the target CLOSE over it
+    // (PR #199 review): a ticket no verdict covers is indistinguishable from one anton left behind
+    // on purpose, and closing epic-1 would strand t3 undelivered beneath a target no later sweep
+    // re-selects.
     showMock.mockImplementation(async (_repo: string, id: string) => {
       if (id === "t2") throw new Error("bd show: DB locked");
       return {
@@ -1365,8 +1451,64 @@ describe("finalizeMergedEpic", () => {
     expect(createMock).not.toHaveBeenCalled(); // nothing to take, so no follow-up is written
     expect(deleteMock).not.toHaveBeenCalled();
     const note = noteMock.mock.calls[0][2];
-    expect(note).toContain("could NOT be rehomed");
+    expect(note).toContain("could not confirm it still hangs under epic-1");
     expect(note).not.toContain("Another operator moved it");
+    // Left open and `stage:in-review`, so the next sweep plans the whole rehome again.
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("holds the close back when a preserved ticket itself cannot be re-read (PR #199)", async () => {
+    // Same silence one step nearer: the candidate's OWN read fails, so anton knows nothing about
+    // whether it is still this run's to move. Omitted from every verdict it would read as
+    // intentionally excluded, and the closing batch would retire the merged target over it.
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") throw new Error("bd show: DB locked");
+      return {
+        id,
+        title: id,
+        status: statuses.get(id) ?? "open",
+        labels: boardLabels.get(id) ?? [],
+        assignee: assignees.get(id),
+        parent: parents.get(id),
+      } as Bead;
+    });
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+    expect(noteMock.mock.calls[0][2]).toContain(
+      "could not re-read it from the board",
+    );
+  });
+
+  it("still moves what it can when another candidate is unreadable (PR #199)", async () => {
+    // The moves that CAN be made are worth making — a rehome is not all-or-nothing — but the
+    // unreadable one is finalization left undone all the same, so the target stays open for the
+    // next sweep rather than closing over a ticket nobody decided about.
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") throw new Error("bd show: DB locked");
+      return {
+        id,
+        title: id,
+        status: statuses.get(id) ?? "open",
+        labels: boardLabels.get(id) ?? [],
+        assignee: assignees.get(id),
+        parent: parents.get(id),
+      } as Bead;
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      bead("t3", "blocked", ["not-delivered"]),
+    ]);
+
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t3", "epic-2");
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
   });
 
   it("reruns a marker-bearing ticket the timeout left in_progress (anton-67xj)", async () => {

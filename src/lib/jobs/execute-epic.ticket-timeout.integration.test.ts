@@ -822,13 +822,25 @@ process.exit(0);`),
 
       // Refuses the marker for the DEPENDENT alone, so the stalled ticket's own marker lands and its
       // timeout is genuinely absorbed — the state the reopen has to undo.
+      //
+      // …and refuses the first two REOPENS of the stalled ticket, which is the same transient bd
+      // failure one step later (PR #199 review). Best-effort, that one refusal leaves the ticket
+      // `blocked` and says so nowhere: the resume this park advertises then dies at runTicket's
+      // claim gate. The reopen is a must-land write, so it retries.
       const realBd = resolveBdBin();
+      const reopenFailures = join(sandbox, "reopen-failures");
       const shim = writeBin(
         binDir,
         "bd-refuses-dependent-marker",
-        `const {spawnSync}=require('child_process');const a=process.argv.slice(2);
+        `const {spawnSync}=require('child_process');const fs=require('fs');const a=process.argv.slice(2);
 const i=a.indexOf('--add-label');
 if(i>=0&&a[i+1]==='not-delivered'&&a.includes(${JSON.stringify(dependent)})){process.stderr.write('Error: simulated bd write failure\\n');process.exit(1);}
+const s=a.indexOf('--status');
+if(a[0]==='update'&&s>=0&&a[s+1]==='open'&&a.includes(${JSON.stringify(stalls)})){
+  const f=${JSON.stringify(reopenFailures)};
+  const n=fs.existsSync(f)?Number(fs.readFileSync(f,'utf8')):0;
+  if(n<2){fs.writeFileSync(f,String(n+1));process.stderr.write('Error: simulated bd write failure\\n');process.exit(1);}
+}
 const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.status===null?1:r.status);`,
       );
 
@@ -851,6 +863,9 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
 
         // The absorbed timeout is CLAIMABLE again — the whole point: the resume this park advertises
         // starts at a hard claim gate that refuses a `blocked` (or unowned `in_progress`) bead.
+        // Two refused reopens later, which is what makes this a retried write rather than a
+        // best-effort one.
+        expect(readFileSync(reopenFailures, "utf8")).toBe("2");
         const stalled = await beads.show(repo, stalls);
         expect(stalled.status).toBe("open");
         expect(ownerOf(stalled)).toBeUndefined();
