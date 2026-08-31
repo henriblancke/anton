@@ -3174,6 +3174,107 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // A heredoc delimiter is a shell WORD, not an identifier — `cat <<'END-SQL'` is a valid opener.
+    // Read as identifier characters only, the delimiter never parses, the heredoc is never tracked,
+    // and the `function fake(` in its payload opens a parameter list that swallows every command
+    // past the real terminator.
+    it("tracks a heredoc whose quoted delimiter carries punctuation", async () => {
+      const repo = writeRepo({
+        "scripts/seed.sh": [
+          "#!/usr/bin/env bash",
+          "cat <<'END-SQL' > /tmp/seed.sql",
+          "function fake(",
+          "  value,",
+          "END-SQL",
+          "upload /tmp/seed.sql",
+          "notify team",
+          "flush queue",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/seed.sh", 6]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/seed.sh", Line: 6 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // A plain `<<EOF` ends only on a line that is EXACTLY its delimiter, so an indented `  EOF` in
+    // the payload is payload. Ending the heredoc there hands the generated `function fake(` below it
+    // back to the classifiers, and the commands past the real terminator inherit its open parameter
+    // list and are dropped as a declaration.
+    it("keeps a heredoc open past an indented copy of its terminator", async () => {
+      const repo = writeRepo({
+        "scripts/render.sh": [
+          "#!/usr/bin/env bash",
+          "cat <<EOF > /tmp/sample.js",
+          "  EOF",
+          "function fake(",
+          "  value,",
+          "EOF",
+          "upload /tmp/sample.js",
+          "notify team",
+          "flush queue",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/render.sh", 7]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/render.sh", Line: 7 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // The other half of that rule: `<<-` DOES strip leading tabs, which is what the form is for.
+    // Left unstripped, the tab-indented terminator never matches, the heredoc runs to the end of the
+    // file, and the prose below it reads as payload — so a duplicated comment block is triaged as a
+    // clone instead of being dropped.
+    it("ends a `<<-` heredoc on its tab-indented terminator", async () => {
+      const repo = writeRepo({
+        "scripts/notes.sh": [
+          "#!/usr/bin/env bash",
+          "cat <<-EOF > /tmp/config.json",
+          '\t{ "mode": "fast" }',
+          "\tEOF",
+          "# publish uploads the artifact to the bucket",
+          "# then notifies the team the release is live",
+          "# and waits for the upload queue to drain",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/notes.sh", 5]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "scripts/notes.sh" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 comment");
+    });
+
     // `for await (…)` hands to a STATEMENT exactly as a plain `for` does, so a regex may follow its
     // closing paren. Read as division, the `/*` inside the character class opens a comment that
     // swallows every line below and drops the executable windows there as prose.

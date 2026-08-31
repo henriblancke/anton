@@ -954,19 +954,62 @@ function withoutHashComment(line: string, spaced: boolean): string {
   return line;
 }
 
+/** A heredoc still owed its payload: the word that ends it, and whether `<<-` strips leading tabs. */
+type Heredoc = { word: string; tabs: boolean };
+
 /**
- * A heredoc opener and the word that ends it — `<<EOF`, `<<-'SQL'`, `<< "END"`, `<<\END`. Sticky, so
- * it is read at one position rather than searched for. `<<<` is a herestring, which carries its
- * whole value on the line and opens nothing, so both neighbours of the `<<` are checked.
+ * A heredoc opener — `<<EOF`, `<<-'SQL'`, `<< "END"`, `<<\END` — up to but not including its word,
+ * with the `-` of the tab-stripping form captured. Sticky, so it is read at one position rather
+ * than searched for. `<<<` is a herestring, which carries its whole value on the line and opens
+ * nothing, so both neighbours of the `<<` are checked.
  */
-const HEREDOC_OPEN = /(?<!<)<<(?!<)-?\s*(?:(["'])([A-Za-z_]\w*)\1|\\?([A-Za-z_]\w*))/y;
+const HEREDOC_OPEN = /(?<!<)<<(?!<)(-?)/y;
+
+/** Where an unquoted delimiter word ends: shell's metacharacters, which cannot be part of one. */
+const WORD_BREAK = /[\s;&|<>()`]/;
+
+/**
+ * The delimiter word after a `<<`, read from `start` — `EOF`, `'END-SQL'`, `"end marker"`, `\END`,
+ * `EO'F'`. Quote removal is the only expansion a delimiter gets, so the quotes come off and
+ * everything between them — punctuation included — belongs to the terminator. Restricting the word
+ * to identifier characters instead would leave `cat <<'END-SQL'` untracked, and payload text like
+ * `function fake(` would open a parameter list that swallows the commands past the real terminator.
+ *
+ * Undefined where no word follows, or where a quote in it never closes — neither is a heredoc a
+ * shell would open.
+ */
+function heredocWord(line: string, start: number): { word: string; end: number } | undefined {
+  let i = start;
+  while (line[i] === " " || line[i] === "\t") i += 1;
+  let word = "";
+  while (i < line.length) {
+    const char = line[i];
+    if (char === "'" || char === '"') {
+      const close = line.indexOf(char, i + 1);
+      if (close === -1) return undefined;
+      word += line.slice(i + 1, close);
+      i = close + 1;
+      continue;
+    }
+    if (char === "\\") {
+      if (i + 1 >= line.length) break;
+      word += line[i + 1];
+      i += 2;
+      continue;
+    }
+    if (WORD_BREAK.test(char)) break;
+    word += char;
+    i += 1;
+  }
+  return word ? { word, end: i } : undefined;
+}
 
 /**
  * The heredocs a line opens, in the order their payloads arrive — one command can open two
  * (`cmd <<A <<B`). Quoted strings are stepped over, so a `<<EOF` inside one opens nothing.
  */
-function heredocDelimiters(line: string): string[] {
-  const found: string[] = [];
+function heredocDelimiters(line: string): Heredoc[] {
+  const found: Heredoc[] = [];
   for (let i = 0; i < line.length; i += 1) {
     const char = line[i];
     if (char === "'" || char === '"') {
@@ -977,10 +1020,27 @@ function heredocDelimiters(line: string): string[] {
     HEREDOC_OPEN.lastIndex = i;
     const opened = HEREDOC_OPEN.exec(line);
     if (!opened) continue;
-    found.push(opened[2] ?? opened[3]);
-    i = HEREDOC_OPEN.lastIndex - 1;
+    const delimiter = heredocWord(line, HEREDOC_OPEN.lastIndex);
+    if (!delimiter) {
+      i = HEREDOC_OPEN.lastIndex - 1;
+      continue;
+    }
+    found.push({ word: delimiter.word, tabs: opened[1] === "-" });
+    i = delimiter.end - 1;
   }
   return found;
+}
+
+/**
+ * Whether a payload line is the terminator of the heredoc it is inside. Shell ends a heredoc only
+ * on a line that is EXACTLY the delimiter, so indentation is part of the comparison — an indented
+ * `  EOF` under a plain `<<EOF` is payload, and ending the heredoc there would hand the declaration
+ * -looking text below it back to the classifiers. Only `<<-` strips leading TABS (never spaces),
+ * which is the whole point of that form.
+ */
+function endsHeredoc(raw: string, heredoc: Heredoc): boolean {
+  const line = heredoc.tabs ? raw.replace(/^\t+/, "") : raw;
+  return line.trimEnd() === heredoc.word;
 }
 
 /**
@@ -1150,8 +1210,8 @@ function classifyLines(
   let template: TemplateFrame[] = [];
   // The triple-quote delimiter an open multiline string is behind; undefined outside one.
   let tripleQuote: TripleQuote | undefined;
-  // The terminator words of the heredocs still owed a payload, in the order they were opened.
-  const heredocs: string[] = [];
+  // The heredocs still owed a payload, in the order they were opened.
+  const heredocs: Heredoc[] = [];
   // How many `#` the open Rust raw string's closer must carry; undefined outside one.
   let rawString: number | undefined;
   // The quote an ordinary string a backslash continued is still behind; undefined outside one.
@@ -1177,15 +1237,17 @@ function classifyLines(
   if (lines[lines.length - 1] === "") lines.pop();
 
   for (let index = 0; index < lines.length; index += 1) {
-    let line = lines[index].trim();
+    const raw = lines[index];
+    let line = raw.trim();
     const next = lines[index + 1]?.trim() ?? "";
 
     // Inside a heredoc the line is the command's INPUT, not shell syntax — exactly as template and
     // raw-string text is. A payload quoting `function fake(` would otherwise open a parameter list
     // that no `)` closes, and every command past the terminator inherits `signature` and is dropped
-    // as a declaration. Read first, since payload text leading with `#` is not a comment either.
+    // as a declaration. Read first, since payload text leading with `#` is not a comment either, and
+    // matched against the RAW line, since indentation decides whether a heredoc ends.
     if (heredocs.length > 0) {
-      if (line === heredocs[0]) heredocs.shift();
+      if (endsHeredoc(raw, heredocs[0])) heredocs.shift();
       classes.push("code");
       continue;
     }
