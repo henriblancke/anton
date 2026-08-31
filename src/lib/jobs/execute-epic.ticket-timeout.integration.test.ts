@@ -421,11 +421,26 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       );
       const okGh = process.env.ANTON_GH_BIN!;
 
+      // Every bd invocation, in order: the ORDER of the two writes a skip makes is what this case
+      // also proves (below). A real bd does the work; the shim only records the argv.
+      const bdLog = join(sandbox, "cascade-bd.jsonl");
+      const realBd = resolveBdBin();
+      const bdShim = writeBin(
+        binDir,
+        "bd-logging-cascade",
+        `const fs=require('fs');const {spawnSync}=require('child_process');const a=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(bdLog)},JSON.stringify(a)+'\\n');
+const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.status===null?1:r.status);`,
+      );
+
       await patchSettings({ ticketTimeoutMinutes: 0.25 });
 
       const runner = makeEpicRunner(ctx);
       process.env.ANTON_CLAUDE_BIN = claude;
       process.env.ANTON_GH_BIN = bodyGh;
+      const priorBdBin = process.env[BD_BIN_ENV];
+      process.env[BD_BIN_ENV] = bdShim;
+      resetBdBinCache();
       try {
         const jobId = await driveEpicRun(runner, {
           projectId,
@@ -482,9 +497,34 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
         const files = filesOnBranch(run.branch!);
         expect(files).toContain("AGENT_WORK.md");
         expect(files).not.toContain("HALF_WRITTEN.md");
+
+        // The marker is written while the run still HOLDS the reservation (PR #199). Released
+        // first, the ticket is claimable again on a shared board in that gap: a worker that takes
+        // it snapshots it without the marker, so nothing ever clears the one landing right after —
+        // and the ticket can deliver still carrying it, which sends merge finalization off
+        // preserving and rehoming work that actually shipped.
+        const bdCalls = readFileSync(bdLog, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as string[]);
+        const marked = bdCalls.findIndex(
+          (a) =>
+            a[0] === "update" &&
+            a[1] === dependent &&
+            a.includes("not-delivered"),
+        );
+        const handedBack = bdCalls.findIndex(
+          (a) => a[0] === "assign" && a[1] === dependent && a[2] === "",
+        );
+        expect(marked).toBeGreaterThanOrEqual(0);
+        expect(handedBack).toBeGreaterThan(marked);
       } finally {
         process.env.ANTON_CLAUDE_BIN = successClaude;
         process.env.ANTON_GH_BIN = okGh;
+        if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
+        else process.env[BD_BIN_ENV] = priorBdBin;
+        resetBdBinCache();
         await patchSettings({ ticketTimeoutMinutes: undefined });
       }
     });

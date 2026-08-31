@@ -778,6 +778,42 @@ function ownershipNote(
 }
 
 /**
+ * Hand back the dead run's own reservation on a preserved ticket — guarded on a read taken here,
+ * not on the plan (PR #199).
+ *
+ * `releaseChildren` swaps on the ACTOR alone, and project concurrency lets a second run for the
+ * same operator hold this ticket under the very string this one claimed under. What tells the two
+ * apart is the rest of the bead: a second run reparents the ticket onto a target of its own and
+ * claims it there. So the release lands only while a fresh read still finds the ticket exactly
+ * where and as the sweep left it, and a board that has moved it on keeps its claim — the same rule
+ * {@link reopenPreserved} applies to the status, one bd round trip later.
+ *
+ * A read that fails releases nothing either: the snapshot is not evidence enough to clear a claim.
+ *
+ * Answers what the note must say — `moved` for a reservation deliberately left to whoever owns the
+ * ticket now, `kept` for one bd would not release and an operator has to clear by hand.
+ */
+async function releasePreserved(
+  repo: string,
+  bead: Bead,
+  owner: string,
+): Promise<"released" | "moved" | "kept"> {
+  const live = await beads.show(repo, bead.id).catch(() => undefined);
+  if (!live) return "kept";
+  const liveOwner = ownerOf(live);
+  if (liveOwner === undefined) return "released"; // nothing left to hand back
+  if (
+    liveOwner !== owner ||
+    beads.parentOf(live) !== beads.parentOf(bead) ||
+    live.status !== bead.status
+  )
+    return "moved";
+  return (await releaseChildren(repo, [bead.id], owner)).released.length > 0
+    ? "released"
+    : "kept";
+}
+
+/**
  * Return a rerunnable preserved ticket to a claimable `open`, and answer the sentence its note must
  * add when that did not happen (empty once the ticket is claimable).
  *
@@ -928,13 +964,22 @@ export async function finalizeMergedEpic(args: {
     // under, so an actor-only CAS matches and clears a valid reservation, advertising a ticket
     // somebody is executing as unassigned. Its claim is left exactly as its parent and status are,
     // for the same reason.
-    const heldElsewhere =
+    const plannedElsewhere =
       plan.elsewhere.has(bead.id) || plan.changed.has(bead.id);
-    const released =
-      owner !== undefined &&
-      !foreignOwner &&
-      !heldElsewhere &&
-      (await releaseChildren(repo, [bead.id], owner)).released.length > 0;
+    // …and that verdict has a lifetime of its own, which this loop's writes are inside (PR #199).
+    // planRehome returned before the releases and reopens of every ticket settled ahead of this one
+    // — bd round trips on a board other operators share — and it says nothing at all about a ticket
+    // on the manual path. A second run for the same operator can reparent this ticket onto a target
+    // of its own and reserve it there in that window, under the very actor string the CAS expects:
+    // the swap then matches and clears a live reservation the ancestry and status guards below can
+    // refuse to compound but cannot give back. So the release is decided on a read taken HERE, and
+    // what tells the two runs apart is the rest of the bead.
+    const release =
+      owner !== undefined && !foreignOwner && !plannedElsewhere
+        ? await releasePreserved(repo, bead, owner)
+        : undefined;
+    const heldElsewhere = plannedElsewhere || release === "moved";
+    const released = release === "released";
     const stillOwned = owner !== undefined && !released;
     // Return the ticket to a claimable status. A timed-out one carries `blocked` from the run that
     // stopped it, and bd refuses to claim a bead in that status — so an operator who approves the
@@ -1507,16 +1552,22 @@ async function applyRehome(
    * since — undefined while the whole subtree is still this run's to move. A reparent carries
    * everything beneath it, so a rider anton may no longer move stops its ancestor exactly as an
    * excluded descendant does (pass 1b): the alternative is advertising somebody's live work under a
-   * target anton wrote, on an edge nobody checked. Candidates are picked out with the reads already
-   * taken; only an actual rider costs a fresh one.
+   * target anton wrote, on an edge nobody checked.
+   *
+   * Every candidate is re-read BEFORE it is written off as a non-rider (PR #199). Whether a ticket
+   * rides along is an ancestry question, and the prepass answered it into the memo: a ticket
+   * another operator has since reparented beneath `moverId` and claimed still reads as a SIBLING
+   * from that cache, so the ride-along test drops it and the mover carries their live work onto the
+   * follow-up — the takeover check never reached. The whole chain is taken at this vintage for the
+   * same reason, and the one re-read is what the takeover check then decides on.
    */
   const staleRider = async (moverId: string): Promise<string | undefined> => {
     for (const rider of takeable.values()) {
       if (rider.id === moverId || moved.has(rider.id)) continue;
-      const known = (await readFresh(rider.id)) ?? rider;
-      if ((await ridesOn(known, moverId, bySubtreeId, readFresh)) !== "target")
+      const known = (await reread(rider.id)) ?? rider;
+      if ((await ridesOn(known, moverId, bySubtreeId, reread)) !== "target")
         continue;
-      if (await takenSince(await reread(rider.id), reread)) return rider.id;
+      if (await takenSince(known, reread)) return rider.id;
     }
     return undefined;
   };

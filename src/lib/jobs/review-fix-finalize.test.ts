@@ -683,6 +683,34 @@ describe("finalizeMergedEpic", () => {
     expect(noteFor("t2")).toContain("still assigned to op-1");
   });
 
+  it("keeps a claim a second run took between the plan and the release (PR #199)", async () => {
+    // The plan cleared t2, and the release is a bd round trip later — behind every ticket settled
+    // ahead of it. A second run for the same operator reparents t2 onto a target of its own and
+    // reserves it there in that window: the actor-only CAS matches the string it expects and would
+    // clear a live reservation, which no later ancestry check can give back.
+    const reserved = claimed(bead("t2", "blocked", ["not-delivered"]), "op-1");
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      const live = {
+        id,
+        title: id,
+        status: statuses.get(id) ?? "open",
+        labels: boardLabels.get(id) ?? [],
+        assignee: assignees.get(id),
+        parent: parents.get(id),
+      } as Bead;
+      // The plan reads t2 here and clears it; the takeover lands immediately after that read.
+      if (id === "t2") parents.set("t2", "epic-9");
+      return live;
+    });
+
+    await finalize(claimed(bead("epic-1"), "op-1"), [reserved]);
+
+    expect(unassignMock).not.toHaveBeenCalled();
+    expect(setStatusMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(noteFor("t2")).toContain("still assigned to op-1");
+  });
+
   it("does not move a ticket claimed between the plan and the reparent (PR #199)", async () => {
     // The plan cleared t2, and then anton's OWN release and reopen writes — bd round-trips on a
     // board other operators share — left a window before the move. A claim that lands in it makes
@@ -1057,6 +1085,30 @@ describe("finalizeMergedEpic", () => {
     expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
     expect(noteFor("t2")).toContain("t3 still hangs off it");
     expect(noteFor("t3")).toContain("between planning the move and making it");
+  });
+
+  it("re-reads a candidate before deciding it does not ride along (PR #199)", async () => {
+    // t3 was a SIBLING when the prepass read it, so the ride-along test answers from that memo. In
+    // the window the delivered child d0's detach opens, another operator hangs t3 off t2 and claims
+    // it — and t2's reparent then carries their live work onto the follow-up on an edge the stale
+    // read said did not exist.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "d0") {
+        parents.set("t3", "t2");
+        assignees.set("t3", "op-2");
+      }
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("d0")),
+      bead("t3", "blocked", ["not-delivered"]),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "d0", "epic-1"]]);
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
+    expect(noteFor("t2")).toContain("t3 still hangs off it");
+    expect(noteFor("t3")).toContain("under op-2");
   });
 
   it("does not detach a delivered child from an ancestor that went stale (PR #199)", async () => {

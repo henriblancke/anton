@@ -1370,20 +1370,19 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             );
           }
         }
-        // Hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
-        // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
+        // Mark it as work this run did NOT deliver, which is what stops merge finalization from
+        // closing it as shipped when the PR for the rest of the feature lands (anton-67xj). That
+        // marker is finalization's only input, so it is not best-effort: a run that cannot record
+        // it must not go on to open a PR whose merge would then file this ticket as shipped.
+        // Retry, then park for a human rather than proceed on an unwritten fact.
         //
-        // ONLY this run's own reservation, under the cascade's compare-and-swap (anton-67xj).
-        // `tickets` is the run's snapshot, taken before any dispatch: an operator who took this
-        // ticket over between the cascade and this skip is doing live work, and an unconditional
-        // unassign would advertise their ticket as claimable and invite a second run of it.
-        const reservedFor = childCascade?.actor;
-        if (reservedFor) await safe(() => releaseChildren(repo, [ticket.id], reservedFor));
-        // …and mark it as work this run did NOT deliver, which is what stops merge finalization
-        // from closing it as shipped when the PR for the rest of the feature lands (anton-67xj).
-        // That marker is finalization's only input, so it is not best-effort: a run that cannot
-        // record it must not go on to open a PR whose merge would then file this ticket as
-        // shipped. Retry, then park for a human rather than proceed on an unwritten fact.
+        // Written BEFORE the reservation goes back (PR #199). The release is what makes this
+        // ticket claimable again on a shared board, and a second run that takes it in the gap
+        // would snapshot it without the marker — runTicket clears the label off its own snapshot,
+        // so it would never clear this one, and the ticket could deliver with `not-delivered`
+        // still attached, which sends merge finalization off preserving and rehoming work that
+        // actually shipped. While the reservation stands, `bd ready --unassigned` keeps the ticket
+        // out of every other worker's claimable set, so there is no such snapshot to take.
         if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
           throw new PoisonEpic(
             `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
@@ -1392,6 +1391,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `the beads DB, then resume the run`,
           );
         }
+        // …then hand it back: the run's claim cascade reserved it, and a ticket left assigned to a
+        // run that never dispatched it is invisible to `bd ready --unassigned` on every machine.
+        //
+        // ONLY this run's own reservation, under the cascade's compare-and-swap (anton-67xj).
+        // `tickets` is the run's snapshot, taken before any dispatch: an operator who took this
+        // ticket over between the cascade and this skip is doing live work, and an unconditional
+        // unassign would advertise their ticket as claimable and invite a second run of it.
+        const reservedFor = childCascade?.actor;
+        if (reservedFor) await safe(() => releaseChildren(repo, [ticket.id], reservedFor));
         await safe(() => beads.note(repo, ticket.id, skipNote(skipping)));
         console.warn(
           `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
