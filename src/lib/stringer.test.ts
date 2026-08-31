@@ -2453,6 +2453,61 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // The same object literal written over lines: its `{` is not on the line its `}` ends, so the
+    // brace kinds the lines above opened are what say the `}` closed a VALUE. Read as a block, the
+    // slash behind it opens an invented literal that runs to the divisor's own slash, and the `/*`
+    // inside that character class comments out every line below.
+    it("reads a slash after a multiline object literal as division, not as a regex", async () => {
+      const repo = writeRepo({
+        "src/ratio.ts": [
+          "export const ratio = {",
+          "  value: 1,",
+          "} / /[/*]/.source.length;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.ts", 5]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/ratio.ts", Line: 5 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // And the other side of the same rule: a BLOCK opened lines above still hands to a statement, so
+    // the slash behind its `}` opens a regex. Reading every earlier-line `}` as a literal's would
+    // leave the `/*` in this character class to open a comment over the rest of the file.
+    it("reads a slash after a multiline block as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/guarded.ts": [
+          "export function check(enabled: boolean, value: string) {",
+          "  if (enabled) {",
+          "    log(value);",
+          "  } /[/*]/.test(value);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/guarded.ts", 5]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/guarded.ts", Line: 5 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // The one `}` a slash follows without a statement starting is JSX's self-close. Read as a regex
     // opener, the invented literal runs to the next slash on the line — the `{/*` of the comment
     // beside it — and the prose below is then classified as runtime work and triaged as a clone.
@@ -3521,6 +3576,34 @@ describe("scan", () => {
 
       expect(result.signals).toMatchObject([{ FilePath: "src/unreadable.ts" }]);
       expect(result.duplication.dropped).toMatchObject([{ path: "src/deleted.ts" }]);
+    });
+
+    // Two spellings of one path are one FILE. Cached under the raw string a signal used, the second
+    // spelling reads the file again and spends a second of the 500-file budget on it — and a scan
+    // wide enough to sit at that budget then reports a location it never read, keeping a signal the
+    // tree disproves. 500 files with one of them respelled is exactly that edge.
+    it("spends one file budget slot on a path reported under two spellings", async () => {
+      const files: Record<string, string> = {};
+      for (let i = 0; i < 500; i += 1) {
+        files[`src/doc${i}.ts`] = [
+          "// what this module is for,",
+          "// at length,",
+          "// and why.",
+          "export const doc = 1;",
+          "",
+        ].join("\n");
+      }
+      const repo = writeRepo(files);
+      const locations: [string, number][] = Object.keys(files).map((path) => [path, 1]);
+      locations.splice(1, 0, ["./src/doc0.ts", 1]);
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone(locations, 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/doc0.ts" }]);
     });
 
     // The regression the bead was filed on, replayed: the duplication half of scan d9eab116

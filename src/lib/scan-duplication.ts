@@ -431,6 +431,12 @@ function closesControlHead(before: string): boolean {
 }
 
 /**
+ * What an open `{` turned out to be. A block ends a STATEMENT, so a `/` behind its `}` opens a
+ * regex; an object literal ends a VALUE, so the same `/` divides.
+ */
+type BraceKind = "block" | "value";
+
+/**
  * Whether the trailing `}` of `before` closes a BLOCK rather than an object literal. A block ends a
  * statement, so a `/` behind it opens a regex; an object literal is a VALUE, so the same `/`
  * divides — `const ratio = { value: 1 } / /[/*]/.source.length` divides by a regex's source length,
@@ -440,10 +446,14 @@ function closesControlHead(before: string): boolean {
  * The `{` that matches is found by a balanced scan backwards, as the control head's `(` is, and what
  * precedes it decides: an expression prefix — `=`, `(`, `return` — can only be followed by a value,
  * so the brace opened a literal. Anything else (`if (…)`, `function f()`, the start of a statement)
- * opened a block. A `{` opened on an EARLIER line reads as a block, which is what this rule assumed
- * of every `}` before the distinction existed.
+ * opened a block. A `{` opened on an EARLIER line is not on this line to read, so the kinds `open`
+ * carries from above decide instead: a multiline object literal ends on a line leading with its own
+ * `}`, and `} / /[/*]/.source.length` divides there exactly as the one-line spelling does. The
+ * backward scan ends one level deep per unmatched `}`, so the brace this one closes sits that many
+ * levels down that stack; anything the stack does not reach still reads as a block, which is what
+ * this rule assumed of every `}` before the distinction existed.
  */
-function closesBlock(before: string): boolean {
+function closesBlock(before: string, open: readonly BraceKind[]): boolean {
   let depth = 0;
   for (let i = before.length - 1; i >= 0; i -= 1) {
     if (before[i] === "}") depth += 1;
@@ -452,7 +462,23 @@ function closesBlock(before: string): boolean {
       if (depth === 0) return !REGEX_PREFIX.test(before.slice(0, i).trimEnd());
     }
   }
-  return true;
+  return open[open.length - depth] !== "value";
+}
+
+/**
+ * Fold this line's braces into the kinds still open above it, so a `}` on a LATER line knows what it
+ * closed. The rule is `closesBlock`'s, carried ACROSS lines rather than within one: an expression
+ * prefix opens a value, anything else opens a block. `stripNoise` runs first — a brace inside a
+ * comment, a string or a regex opens nothing — and an unmatched `}` simply pops nothing, since a
+ * file whose braces do not balance is one this scanner is already guessing about.
+ */
+function trackBraces(open: BraceKind[], line: string): void {
+  const text = stripNoise(line);
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "{") {
+      open.push(REGEX_PREFIX.test(text.slice(0, i).trimEnd()) ? "value" : "block");
+    } else if (text[i] === "}") open.pop();
+  }
 }
 
 /**
@@ -463,7 +489,12 @@ function closesBlock(before: string): boolean {
  * closes a block, which is told from an object literal's by the same scan and from JSX's self-close
  * by the character AFTER the slash.
  */
-function opensRegex(line: string, start: number, jsx: boolean): boolean {
+function opensRegex(
+  line: string,
+  start: number,
+  jsx: boolean,
+  open: readonly BraceKind[],
+): boolean {
   const raw = line.slice(0, start);
   const before = raw.trimEnd();
   if (before === "") return true;
@@ -481,7 +512,7 @@ function opensRegex(line: string, start: number, jsx: boolean): boolean {
   // run an invented literal over the `{/*` that follows and leave that comment unseen. The `>` is
   // what tells them apart — a literal `/>/` loses to the tag, which is what the character pair means
   // in the TSX this actually scans.
-  if (before.endsWith("}") && line[start + 1] !== ">" && closesBlock(before)) return true;
+  if (before.endsWith("}") && line[start + 1] !== ">" && closesBlock(before, open)) return true;
   return REGEX_PREFIX.test(before);
 }
 
@@ -1099,6 +1130,7 @@ function unclosedBlockComment(
   line: string,
   nested: boolean,
   jsx: boolean,
+  open: readonly BraceKind[],
 ): { opener: number; depth: number } {
   let i = 0;
   while (i < line.length) {
@@ -1122,7 +1154,7 @@ function unclosedBlockComment(
     }
     // Checked AFTER the comment forms, since a `/*` at a position where a regex could begin is a
     // comment in the grammar too. A slash that opens nothing that closes is left as division.
-    if (char === "/" && opensRegex(line, i, jsx)) {
+    if (char === "/" && opensRegex(line, i, jsx, open)) {
       const end = afterRegex(line, i);
       if (end > 0) {
         i = end;
@@ -1156,6 +1188,7 @@ function continuedQuote(
   line: string,
   slashComments: boolean,
   jsx: boolean,
+  open: readonly BraceKind[],
 ): { opener: number; quote: QuoteChar } | undefined {
   if (!line.endsWith("\\")) return undefined;
   let i = 0;
@@ -1179,7 +1212,7 @@ function continuedQuote(
         i = close + 2;
         continue;
       }
-      if (char === "/" && opensRegex(line, i, jsx)) {
+      if (char === "/" && opensRegex(line, i, jsx, open)) {
         const end = afterRegex(line, i);
         if (end > 0) {
           i = end;
@@ -1263,6 +1296,9 @@ function classifyLines(
   // The quote an ordinary string a backslash continued is still behind; undefined outside one.
   let quoted: QuoteChar | undefined;
   let depth = 0;
+  // The braces still open from the lines ABOVE, innermost last. A `}` that leads a line closes one
+  // of these, and whether it ended a block or an object literal is what the `/` behind it reads as.
+  const braces: BraceKind[] = [];
   let statement: "import" | "type" | "signature" | undefined;
   // Whether the open import is a side-effect one: held as an `import` so it terminates on its own
   // brace, but every line of it runs, so none of them votes as a declaration.
@@ -1424,7 +1460,12 @@ function classifyLines(
     // start. What precedes the opener is still what the line does; everything after it is prose the
     // lines below inherit, so the state has to be raised here or their delimiters count as syntax.
     if (blockComments) {
-      const { opener, depth: opened } = unclosedBlockComment(line, opts.nestedComments, opts.jsx);
+      const { opener, depth: opened } = unclosedBlockComment(
+        line,
+        opts.nestedComments,
+        opts.jsx,
+        braces,
+      );
       if (opener >= 0) {
         commentDepth = opened;
         line = line.slice(0, opener).trim();
@@ -1444,7 +1485,7 @@ function classifyLines(
     // neither its text nor the delimiters inside it reach the classifiers below — what precedes the
     // quote is still what the line does. Cut here, after the comment markers, since a quote inside a
     // note opens nothing.
-    const continued = continuedQuote(line, slashComments, opts.jsx);
+    const continued = continuedQuote(line, slashComments, opts.jsx, braces);
     if (continued) {
       quoted = continued.quote;
       line = `${line.slice(0, continued.opener)}""`.trim();
@@ -1454,6 +1495,10 @@ function classifyLines(
     // classifies as the command it is. Read after the `#` cut, so one quoted in a note opens
     // nothing.
     if (opts.heredocs) heredocs.push(...heredocDelimiters(line));
+
+    // Fold this line's braces in once every masker has run, so only real syntax is counted — and
+    // AFTER the two scanners above read the stack, which must describe the lines above this one.
+    trackBraces(braces, line);
 
     if (statement) {
       if (statement === "signature") {
@@ -1628,11 +1673,15 @@ function sourceIndex(repoPath: string) {
   let read = 0;
 
   return async function linesOf(path: string): Promise<FileLines> {
-    const cached = cache.get(path);
-    if (cached) return cached;
     const rel = insideRepo(repoPath, path);
+    // Keyed on the RESOLVED path, not the spelling a signal used: `src/a.ts` and `./src/a.ts` are
+    // one file, and keying on the raw string reads it twice and spends two FILE_BUDGET slots on it.
+    // A path that escapes the repo has no resolved form, so its own spelling is the key there.
+    const key = rel ?? path;
+    const cached = cache.get(key);
+    if (cached) return cached;
     if (!rel) {
-      cache.set(path, { status: "missing" });
+      cache.set(key, { status: "missing" });
       return { status: "missing" };
     }
     if (read >= FILE_BUDGET) return { status: "budget" };
@@ -1644,7 +1693,7 @@ function sourceIndex(repoPath: string) {
       const failed: FileLines = isMissingFile(error)
         ? { status: "missing" }
         : { status: "unreadable" };
-      cache.set(path, failed);
+      cache.set(key, failed);
       return failed;
     }
     const result: FileLines = {
@@ -1667,7 +1716,7 @@ function sourceIndex(repoPath: string) {
         jsx: JSX_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
-    cache.set(path, result);
+    cache.set(key, result);
     return result;
   };
 }
