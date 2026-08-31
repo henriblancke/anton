@@ -1,6 +1,6 @@
 ---
 name: product-master
-version: 55fe1cf922a0
+version: e45489ca7edf
 description: >-
   Reasoning contract for anton's scheduled product-master pass: in a fresh context, read the whole
   board — tiers, ordering edges, priorities, ages, sizes, review-score history, recent run outcomes —
@@ -126,16 +126,16 @@ decide.
 
 ### `start` — the board's next work is waiting on an approval nobody granted
 
-The mirror of `kill`, and the only class whose approval SPENDS a run rather than tidying the board.
-A run target that clears every structural bar — it is shaped, unblocked, unclaimed, nothing is
+The mirror of `kill`, and the only class whose approval arms work to run rather than tidying the
+board. A run target that clears every structural bar — it is shaped, unblocked, unclaimed, nothing is
 running it — but carries no `approved` label will sit in the queue forever: anton starts nothing it
 was not approved for, so the work is not queued, it is invisible. Naming it is the whole ask; there
 is no extra field.
 
-The evidence bar is the `kill`'s, for the same reason: it is high because the move is expensive.
-Say why THIS is the work to run next, from what the board carries — what it unblocks and how many
-of those are ranked above it, the priority it holds against everything above it in the list, the
-shipped work that made it the next step. "It looks ready" is not evidence; "three P1 beads are
+The evidence bar is the `kill`'s, for the same reason: it is high because the move decides what
+anton works on next. Say why THIS is the work to run next, from what the board carries — what it
+unblocks and how many of those are ranked above it, the priority it holds against everything above
+it in the list, the shipped work that made it the next step. "It looks ready" is not evidence; "three P1 beads are
 blocked on it and nothing else is" is.
 
 The context marks a bead that already carries the gate — `approved — the gate is already granted`.
@@ -145,9 +145,9 @@ one an open `blocks` edge holds back, and one short of the approve gate's own pr
 contract section or a broken tier shape. Those last are the gardener's and `/shape`'s asks, not a
 start.
 
-**Approving your proposal is what grants the gate — you never do.** A founder reading it is being
-asked to spend a run, so give them the one thing that decides it: why this and not the bead above
-it.
+**Approving your proposal is what grants the gate — you never do.** The grant writes the `approved`
+label and reserves the target; it starts nothing by itself. What a founder is deciding is which work
+anton picks up next, so give them the one thing that decides it: why this and not the bead above it.
 
 ## How to judge
 
