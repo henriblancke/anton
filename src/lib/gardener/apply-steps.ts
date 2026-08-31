@@ -56,6 +56,26 @@ import { impliesOrdering } from "./relink";
 /** A subject the board moved on between the decision and the write. Never a bd failure. */
 export class SubjectMovedError extends Error {}
 
+/**
+ * A step that failed with writes of its OWN left standing — the beads it could not take back.
+ *
+ * The rollback prefix cannot name them: a step joins it only once it has RETURNED, so a step that
+ * half-applied and threw is invisible to the undo (apply.ts `applySteps`). They ride on the error
+ * instead, because `changed` is what tells the pass its board moved (gardener/armed.ts
+ * `movedTheBoard`) — a failure reporting none of them would tell a founder nothing moved over beads
+ * this checkout has moved and cannot un-move.
+ */
+export class StrandedWriteError extends Error {
+  constructor(
+    message: string,
+    /** Beads this failure left written. */
+    readonly stranded: string[],
+  ) {
+    super(message);
+    this.name = "StrandedWriteError";
+  }
+}
+
 /** The verbs that SETTLE the subject — the ones that would strand whatever still hangs under it. */
 const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"]);
 
@@ -859,8 +879,9 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
   } catch (err) {
     if (!swap.wrote) throw err;
     if (await releaseReservation(repo, id, operator)) throw err;
-    throw new Error(
+    throw new StrandedWriteError(
       `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+      [id],
     );
   }
   await assertReservationHeld(repo, id, operator);
@@ -888,9 +909,16 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
  *
  * The grant is UNDONE rather than kept: withdrawing the label puts the board back where the proposal
  * found it, and the reservation needs no unwinding — a foreign owner means our claim is already
- * gone. A bead we could not re-read is left approved and merely reported: untagging on a read that
- * proves nothing would withdraw a sound approval, and if the claim is still ours it would strand the
- * bead as a reservation no retry can clear (see {@link grantApproval}).
+ * gone.
+ *
+ * A bead we could not re-read is left approved and FAILS the start. Not withdrawn, because untagging
+ * on a read that proves nothing would take back a sound approval, and with the claim still ours it
+ * would strand the bead as a reservation no retry can clear (see {@link grantApproval}) — but not
+ * accepted either: this read IS the assertion, so returning success over it would settle the ask with
+ * ownership nothing proved, exactly the unverified grant the assignee check exists to refuse (the
+ * claim protocol's own re-read, AGENTS.md). An intervening `bd assign` or `bd unassign` is invisible
+ * to a failed read, so the honest report is a failed start naming the bead it left written, not a
+ * settled proposal over a reservation nobody checked.
  *
  * An ABSENT holder is the same failure wearing a different face, and only silence proves it is not:
  * a shell `bd unassign` landing in this window erases the reservation the swap took, and returning
@@ -906,10 +934,10 @@ async function assertReservationHeld(
 ): Promise<void> {
   const live = await beads.show(repo, id).catch(() => undefined);
   if (!live) {
-    console.warn(
-      `gardener: ${id} was approved but could not be re-read to confirm it is still reserved for ${operator ?? "nobody"} — a run only starts on it after re-asserting ownership itself (beads.claimVerified)`,
+    throw new StrandedWriteError(
+      `${id} was approved but could not be re-read to confirm it is still reserved for ${operator ?? "nobody"} — the grant stands on the board over ownership this apply could not prove, so the start is reported failed rather than settled and a human has to check who holds it`,
+      [id],
     );
-    return;
   }
   const holder = claimHolder(live);
   if (holder === operator || (!holder && !operator)) return;
@@ -921,8 +949,9 @@ async function assertReservationHeld(
       `${id} ${change} while this start was being approved — the grant was withdrawn, so the board is back where this proposal found it`,
     );
   }
-  throw new Error(
+  throw new StrandedWriteError(
     `${id} ${change} while this start was being approved and the \`${LABELS.approved}\` label could not be withdrawn — it now reads as approved work under a reservation this apply never checked, so a run nobody authorised can start on it`,
+    [id],
   );
 }
 
@@ -965,8 +994,9 @@ async function grantedByAnother(
 ): Promise<boolean> {
   if (!beads.isApproved(swap.bead)) return false;
   if (swap.wrote && !(await releaseReservation(repo, id, operator))) {
-    throw new Error(
+    throw new StrandedWriteError(
       `${id} was approved by another writer while this start was reserving it, and the reservation could not be handed back — it is assigned to ${operator ?? "this machine"}, which bars every other machine from picking up work somebody else opened`,
+      [id],
     );
   }
   return true;

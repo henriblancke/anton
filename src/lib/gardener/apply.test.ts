@@ -1108,6 +1108,8 @@ describe("the product master's moves", () => {
         /anton-a could not be approved \(bd approve exploded\) and the reservation taken for that start could not be released either/,
       );
       expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+      // The claim is on the board, so the pass has a write to publish and report.
+      expect(err.changed).toEqual(["anton-a"]);
     });
 
     it("withdraws a grant that landed on a reservation taken while the label was written", async () => {
@@ -1174,25 +1176,34 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(
         /anton-a was claimed by teammate while this start was being approved and the `approved` label could not be withdrawn/,
       );
+      expect(err.changed).toEqual(["anton-a"]);
     });
 
-    it("leaves the grant standing when the target cannot be re-read after it", async () => {
-      // A read that failed proves nothing, and untagging on it would withdraw a sound approval — or,
-      // with the claim still ours, strand the bead as a reservation no retry can clear. The run that
-      // starts on it re-asserts ownership for itself before it works.
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    it("fails the start when the target cannot be re-read after the grant", async () => {
+      // The read IS the ownership assertion, so a failed one cannot settle the ask: an intervening
+      // assign or unassign is invisible to it, and returning success would close the proposal over a
+      // reservation nobody checked. The grant is not withdrawn either — a read that proves nothing
+      // would take back a sound approval, or strand the bead as a reservation no retry can clear —
+      // so the bead stays written and the failure names it.
       onWrite((call) => {
         if (call === "approve anton-a") liveBeads.set("anton-a", undefined);
       });
 
-      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
 
-      expect(result.changed).toEqual(["anton-a"]);
-      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
-      expect(warn.mock.calls[0]?.[0]).toMatch(
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
         /anton-a was approved but could not be re-read to confirm it is still reserved for operator-1/,
       );
-      warn.mockRestore();
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      // The approve landed, so the pass must record a moved board — and must not be told the
+      // opposite by the empty-prefix clause.
+      expect(err.changed).toEqual(["anton-a"]);
+      expect(err.message).not.toMatch(/nothing had been written/);
+      // The proposal stays open over it: nothing settles an ask whose ownership went unproven.
+      expect(calls.filter((c) => c.startsWith("close"))).toEqual([]);
     });
   });
 
