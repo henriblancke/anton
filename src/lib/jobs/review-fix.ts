@@ -57,6 +57,7 @@ import {
   createWorktree,
   findWorktree,
   removeWorktree,
+  withWorktreeClaim,
   worktreePathFor,
   type Worktree,
 } from "../git/worktree";
@@ -168,6 +169,21 @@ export function inReviewEpics(
     if (epicBeadId) return b.id === epicBeadId; // targeted run — ownership bypassed
     return ownedByOperator(b, operator);
   });
+}
+
+/**
+ * Who this job is, as the worktree claim records it. The same name goes to `createWorktree`, which
+ * refuses to hand a claimed checkout to anyone but its holder.
+ *
+ * The job id is part of it because "review-fix" alone is not one holder: the project-wide sweep and
+ * a gate-check's targeted fix for the same epic are two jobs that `enqueueReviewFixIfAbsent`
+ * deliberately allows to coexist, and a claim they share is no claim at all — `conflictingClaim`
+ * only rejects a holder whose owner differs from the caller, so the second job would reuse the
+ * checkout and interleave its fetch/merge/claude/commit/push with the first's in one directory.
+ * Distinct owners make that the conflict it is; the readable prefix keeps refusal logs legible.
+ */
+export function claimOwnerFor(jobId: string): string {
+  return `review-fix#${jobId}`;
 }
 
 /** Build the runner handler bound to a db/clock. Register it as the "review-fix" handler. */
@@ -289,32 +305,40 @@ async function handleEpic(args: {
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return; // nothing to fix on this PR yet.
 
-  // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
-  // sync it with origin, and pre-merge the base if GitHub reports a conflict.
-  const { worktree, conflicts } = await prepareFixWorktree({
-    ctx,
-    repo,
-    branch,
-    settings,
-    baseBranch,
-    pr,
-    number,
-  });
+  // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
+  // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
+  // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
+  // the commit and push behind it.
+  const claimOwner = claimOwnerFor(ctx.jobId);
+  await withWorktreeClaim(repo, branch, claimOwner, async () => {
+    // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
+    // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
+    const { worktree, conflicts } = await prepareFixWorktree({
+      ctx,
+      repo,
+      branch,
+      settings,
+      baseBranch,
+      pr,
+      number,
+      claimOwner,
+    });
 
-  await runFixSession({
-    db,
-    clock,
-    ctx,
-    repo,
-    projectId,
-    epic,
-    settings,
-    worktree,
-    pr,
-    verdict,
-    conflicts,
-    branch,
-    number,
+    await runFixSession({
+      db,
+      clock,
+      ctx,
+      repo,
+      projectId,
+      epic,
+      settings,
+      worktree,
+      pr,
+      verdict,
+      conflicts,
+      branch,
+      number,
+    });
   });
 }
 
@@ -333,14 +357,18 @@ async function prepareFixWorktree(args: {
   baseBranch: string | undefined;
   pr: PrReview;
   number: number;
+  /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
+  claimOwner: string;
 }): Promise<{ worktree: Worktree; conflicts: string[] }> {
-  const { ctx, repo, branch, settings, baseBranch, pr, number } = args;
+  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } =
+    args;
 
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
     baseBranch: settings.baseBranch,
     warm: false,
+    claimedBy: claimOwner,
   });
   // Fail loudly here rather than letting a missing worktree ride through the best-effort git steps
   // below — `safe()` swallows their errors, so the first thing to actually report the problem would
@@ -1156,7 +1184,10 @@ async function planRehome(
  * reparent takes the ticket out of the merged target's subtree, so no later sweep can finish a step
  * this one leaves undone. Which is also why the plan's verdicts are re-checked here rather than
  * trusted: those writes are bd round-trips on a board other operators share, so ownership, status
- * and ancestry are all read once more (pass 1a) immediately before anything moves.
+ * and ancestry are all read once more. Twice, in fact — pass 1a decides which tickets pin their
+ * ancestors BEFORE any of them move, and pass 2 then re-reads each mover and its riders adjacent to
+ * the reparent that moves them, because the detaches and the earlier movers' writes in between are
+ * themselves a window another worker can claim or reparent into.
  *
  * Deliberately NOT `approved`: approval is the founder's gate, and re-running work a run already
  * failed to deliver — after a timeout, possibly needing re-scoping first — is exactly the decision
@@ -1250,7 +1281,15 @@ async function applyRehome(
   // share — so reusing the plan's reads would decide these writes on evidence from before that
   // window. A bead read in both halves is read twice; that is the price of writing against the
   // board as it is now.
-  const readFresh = memoisedShow(repo, new Map());
+  const memo = new Map<string, Bead | undefined>();
+  const readFresh = memoisedShow(repo, memo);
+  // Evidence for a write that is about to happen: drop the memoised read and take another. A
+  // memoised one is only as young as the round trip that first took it, which is exactly what the
+  // guarded writes below must not decide on.
+  const reread = async (id: string): Promise<Bead | undefined> => {
+    memo.delete(id);
+    return readFresh(id);
+  };
   const liveParentOf = async (bead: Bead): Promise<string | undefined> =>
     beads.parentOf((await readFresh(bead.id)) ?? bead);
 
@@ -1281,15 +1320,24 @@ async function applyRehome(
   // before anything moves, and one that changed hands neither moves nor rides along — it pins its
   // ancestors exactly as an undelivered descendant does, since the reparent above it would carry it
   // onto the follow-up all the same.
+  //
+  // This pass exists to settle the PINS while nothing has moved yet: a pin has to be known before
+  // the ancestor it protects is written, which is why the verdicts cannot simply be deferred to the
+  // guarded writes in pass 2. They are not trusted there either — pass 2 re-reads what it is about
+  // to move.
   const stale = new Map<string, string>();
   /**
-   * What has changed about `mover` since the plan cleared it, as a note fragment — undefined while
+   * What has changed about a mover since the plan cleared it, as a note fragment — undefined while
    * it is still this run's to move. Ownership, status and ancestry, the same three the plan weighed,
    * because any of them can have moved on: a claim makes the ticket somebody's live work, a status a
    * human set is their decision about it, and a reparent puts it under a target that owns it now.
+   *
+   * Takes the read rather than making it, so the caller decides its vintage: this prepass reads
+   * through the memo, pass 2 re-reads immediately before the write it is about to make.
    */
-  const takenSince = async (mover: Bead): Promise<string | undefined> => {
-    const live = await readFresh(mover.id);
+  const takenSince = async (
+    live: Bead | undefined,
+  ): Promise<string | undefined> => {
     if (!live) return "anton could not re-read it from the board";
     const owner = ownerOf(live);
     if (
@@ -1307,7 +1355,7 @@ async function applyRehome(
     }
   };
   for (const mover of takeable.values()) {
-    const reason = await takenSince(mover);
+    const reason = await takenSince(await readFresh(mover.id));
     if (!reason) continue;
     stale.set(mover.id, reason);
     await pinAncestors(mover);
@@ -1357,27 +1405,67 @@ async function applyRehome(
     await pinAncestors(bead);
   }
 
-  // The ride-along below is an edge, so it is decided on the LIVE parent, never the plan's (PR
-  // #199). Another operator can have reparented a rerunnable ticket onto a DIFFERENT bead still
-  // beneath the merged target in the same window — pass 1a accepts that, since its ancestry still
-  // reaches the target — and the planned parent then names a bead it no longer hangs off. Riding
-  // along on that one issues no reparent of its own, so the ticket stays under the merged target
-  // once its planned parent moves, while the note tells the founder it reached the follow-up.
+  // Depth ORDER only — the nesting the plan saw is enough to decide who moves before whom, and the
+  // edge each move is actually made on is re-read at the write itself below.
   const liveParents = new Map<string, string | undefined>();
   for (const mover of takeable.values())
     liveParents.set(mover.id, await liveParentOf(mover));
+
+  /**
+   * The first takeable ticket that would RIDE ALONG on `moverId`'s reparent and has changed hands
+   * since — undefined while the whole subtree is still this run's to move. A reparent carries
+   * everything beneath it, so a rider anton may no longer move stops its ancestor exactly as an
+   * excluded descendant does (pass 1b): the alternative is advertising somebody's live work under a
+   * target anton wrote, on an edge nobody checked. Candidates are picked out with the reads already
+   * taken; only an actual rider costs a fresh one.
+   */
+  const staleRider = async (moverId: string): Promise<string | undefined> => {
+    for (const rider of takeable.values()) {
+      if (rider.id === moverId || moved.has(rider.id)) continue;
+      const known = (await readFresh(rider.id)) ?? rider;
+      if ((await ridesOn(known, moverId, bySubtreeId, readFresh)) !== "target")
+        continue;
+      if (await takenSince(await reread(rider.id))) return rider.id;
+    }
+    return undefined;
+  };
 
   // Pass 2 — move them ancestors first. A ticket whose own parent is moving rides along on it
   // rather than being flattened onto the follow-up: the nesting is how its work was scoped, and
   // reparenting it separately would hand the same subtree two homes. Ordering is what makes that
   // safe — the ride-along is decided on what actually MOVED, so a parent whose reparent bd refused
   // leaves its descendant to take a home of its own rather than staying stranded behind it.
+  //
+  // Every move is a GUARDED write (PR #199): the mover, and everything takeable that would ride
+  // along on it, are re-read here rather than trusted from pass 1a. That prepass is separated from
+  // this one by the delivered-child detaches and by every earlier mover's reparent — bd round trips
+  // on a board other workers share — so a claim or a reparent of their own has a real window to land
+  // in between, and moving on stale evidence hands a second run work somebody is already doing.
+  //
+  // The ride-along edge is re-read for the same reason it is guarded (PR #199): another operator can
+  // have reparented a rerunnable ticket onto a DIFFERENT bead still beneath the merged target, which
+  // pass 1a accepts since its ancestry still reaches the target. Riding along on the PLANNED parent
+  // would issue no reparent of its own, leaving the ticket under the merged target while its note
+  // told the founder it reached the follow-up.
   for (const mover of ancestorsFirst(takeable, liveParents)) {
     if (pinned.has(mover.id) || stale.has(mover.id)) continue;
-    const parentId = liveParents.get(mover.id);
+    const live = await reread(mover.id);
+    const parentId = live ? beads.parentOf(live) : liveParents.get(mover.id);
+    // Already carried by its ancestor's write — and validated as that write's rider, so it is
+    // reported as what it is (nested under a mover) rather than re-decided after the fact.
     if (parentId && moved.has(parentId)) {
       nested.set(mover.id, parentId);
       moved.add(mover.id);
+      continue;
+    }
+    const reason = await takenSince(live);
+    if (reason) {
+      stale.set(mover.id, reason);
+      continue;
+    }
+    const rider = await staleRider(mover.id);
+    if (rider) {
+      pinned.set(mover.id, rider);
       continue;
     }
     if (await safe(() => beads.reparent(repo, mover.id, followUp)))

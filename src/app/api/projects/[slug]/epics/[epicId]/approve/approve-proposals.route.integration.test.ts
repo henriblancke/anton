@@ -72,10 +72,33 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     resetIssueSnapshots();
   });
 
+  // The subjects state a SUBJECT with the card and the card already carries a ticket, because that
+  // is what makes a cluster proposal applyable at all: approving one re-derives the detector's own
+  // grouping over the survivors (`regroupSurvivors`) and re-asks the container bar on the home
+  // (`homeStoppedCarrying`). A board of "Loose one"/"Loose two" beads under an empty card could
+  // never have produced this proposal, so approving it would (rightly) refuse.
   it("re-parents a cluster under its card, and settles the proposal with what changed", async () => {
-    const card = await beads.create(repo, { title: "The home", type: "feature", acceptance: "- [ ] a" });
-    const one = await beads.create(repo, { title: "Loose one", type: "task", acceptance: "- [ ] a" });
-    const two = await beads.create(repo, { title: "Loose two", type: "task", acceptance: "- [ ] a" });
+    const card = await beads.create(repo, {
+      title: "Escalation banner rollout",
+      type: "feature",
+      acceptance: "- [ ] a",
+    });
+    await beads.create(repo, {
+      title: "Escalation banner shell",
+      type: "task",
+      acceptance: "- [ ] a",
+      deps: [`parent-child:${card}`],
+    });
+    const one = await beads.create(repo, {
+      title: "Escalation banner copy",
+      type: "task",
+      acceptance: "- [ ] a",
+    });
+    const two = await beads.create(repo, {
+      title: "Escalation banner timing",
+      type: "task",
+      acceptance: "- [ ] a",
+    });
     const proposal = await file({
       kind: "parentless-cluster",
       move: "reparent",
@@ -233,6 +256,39 @@ describeBd("POST approve — gardener proposals apply their move (temp anton.db 
     // Never labelled approved — approving a proposal is applying it, not queuing a run.
     expect(beads.isApproved(still)).toBe(false);
     expect(String(still.notes ?? "")).toContain("apply FAILED");
+  });
+
+  /**
+   * The OTHER end of the move, and the one nothing re-checked before anton-9hpp: a target validated
+   * when the patrol ran, then read by a human days later. Two cluster proposals named cards that had
+   * closed in between; approving either would have parented open work under a shipped feature.
+   */
+  it("refuses a re-parent whose target closed after the proposal was filed", async () => {
+    const card = await beads.create(repo, { title: "Doomed home", type: "feature", acceptance: "- [ ] a" });
+    const one = await beads.create(repo, { title: "Loose alpha", type: "task", acceptance: "- [ ] a" });
+    const two = await beads.create(repo, { title: "Loose beta", type: "task", acceptance: "- [ ] a" });
+    const proposal = await file({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: [one, two],
+      target: card,
+      summary: "two loose beads belong under the card",
+      evidence: ["they state the card's subject"],
+    });
+    await beads.close(repo, card);
+    resetIssueSnapshots();
+
+    const res = await approve(proposal.id);
+    const body = (await res.json()) as { error?: string };
+
+    // A refusal an approver can read, not a 500 — and not a move onto a shipped card.
+    expect(res.status).toBe(409);
+    expect(body.error).toContain(card);
+    expect(body.error).toMatch(/hang it off a card nothing will run/);
+    expect(beads.parentOf(await show(one))).toBeUndefined();
+    expect(beads.parentOf(await show(two))).toBeUndefined();
+    expect((await show(proposal.id)).status).toBe("open");
+    expect(await notesOf(proposal.id)).toContain("apply FAILED");
   });
 
   // The filing→approval window a live board is the only place to prove: `bd update --claim` writes

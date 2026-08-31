@@ -101,6 +101,10 @@ const under = (parent: string, b: Bead): Bead => {
   return { ...b, parent } as Bead;
 };
 
+/** The note anton left on `id` — the finalization writes one per preserved ticket. */
+const noteFor = (id: string): string =>
+  noteMock.mock.calls.find((c: unknown[]) => c[1] === id)?.[2] as string;
+
 /** `rest` is the rest of the board — the product epic a feature target hangs off, say. */
 const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) => {
   // Children hang off the target they were run under (the snapshot the sweep read), unless a case
@@ -852,6 +856,45 @@ describe("finalizeMergedEpic", () => {
     // Still handed back claimable, with the manual remedy named — the pinned lane exactly.
     expect(setStatusMock.mock.calls).toEqual([["/repo", "t2", "open"]]);
     expect(noteMock.mock.calls[0][2]).toContain("t3 still hangs off it");
+  });
+
+  it("re-reads each mover at its own reparent, not just in the prepass (PR #199)", async () => {
+    // Pass 1a cleared both, and then t2's own reparent — a bd round trip on a board other workers
+    // share — gave the claim on t3 a window to land in. Validating once up front and moving on that
+    // verdict put somebody's live work under a second target.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t2") assignees.set("t3", "op-2");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      bead("t3", "blocked", ["not-delivered"]),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t2", "epic-2"]]);
+    const note = noteFor("t3");
+    expect(note).toContain("between planning the move and making it");
+    expect(note).toContain("under op-2");
+  });
+
+  it("pins an ancestor whose rider is claimed after the prepass (PR #199)", async () => {
+    // t3 rides along on t2's edge, so it never gets a reparent of its own to be guarded at. The
+    // claim lands while the delivered child t4 is being detached — after pass 1a — so only a
+    // re-read taken at t2's write can stop the move that would carry it.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t4") assignees.set("t3", "op-2");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+      under("t2", bead("t4")),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "t4", "epic-1"]]);
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
+    expect(noteFor("t2")).toContain("t3 still hangs off it");
+    expect(noteFor("t3")).toContain("between planning the move and making it");
   });
 
   it("does not detach a delivered child from an ancestor that went stale (PR #199)", async () => {

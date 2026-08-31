@@ -6,7 +6,7 @@ import { TriangleAlertIcon } from "lucide-react";
 
 import { DISPLAY_LOCALE } from "@/lib/time";
 import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import { CopyButton } from "@/components/ui/copy-button";
 import { agentDotClass } from "@/components/board/board-utils";
 import { RunTerminal } from "@/components/runs/run-terminal";
@@ -101,15 +101,10 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
 
   if (error && !run) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-        </span>
-        <p className="text-sm text-risk-high">{error}</p>
-        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        message={error}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
     );
   }
 

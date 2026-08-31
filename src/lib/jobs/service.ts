@@ -28,6 +28,7 @@ import { makeRunHealthHandler } from "./run-health";
 import { makeUnstickHandler, resumeEpic, type ResumeOutcome } from "./unstick";
 import { makeGateCheckHandler } from "./gate-check";
 import { makeBoardPickerHandler } from "./board-picker";
+import { makeWorktreeReaperHandler } from "./worktree-reaper";
 import { makeGardenerHandler } from "./gardener";
 import { makeProductMasterHandler } from "./product-master";
 import { JobRunner, type RunnerLogger, type RunningJobInfo } from "./runner";
@@ -164,6 +165,7 @@ export function getRunner(): JobRunner {
   runner.registerHandler("gardener", makeGardenerHandler({ db }));
   runner.registerHandler("product-master", makeProductMasterHandler({ db }));
   runner.registerHandler("board-picker", makeBoardPickerHandler({ db }));
+  runner.registerHandler("worktree-reaper", makeWorktreeReaperHandler({ db }));
   s.runner = runner;
   return runner;
 }

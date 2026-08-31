@@ -16,6 +16,7 @@ import {
   bead,
   blockedBy,
   CARD,
+  CARRIED,
   child,
   CLOSE,
   CLUSTER,
@@ -53,7 +54,7 @@ const decide = (plan: GardenerPlan, board: Bead[], nowMs: number = NOW) =>
 
 describe("planApply — what an approval means against the board as it now is", () => {
   it("re-parents every subject that isn't already home, remembering the parent to undo to", () => {
-    const board = [CARD, child("anton-a", "anton-container"), bead("anton-b")];
+    const board = [CARD, CARRIED, child("anton-a", "anton-container"), bead("anton-b")];
     const decision = decide(CLUSTER, board);
 
     expect(decision).toEqual({
@@ -73,6 +74,20 @@ describe("planApply — what an approval means against the board as it now is", 
           parentClaim: "",
           kind: "parentless-cluster",
           observedAtMs: Date.parse(FILED),
+          // The two premises the WRITE re-asks under its locks: the ids to keep out of the home's
+          // carried-ticket count, the membership to re-group, and the home's own pre-existing
+          // tickets the container bar is counted over, plus the beads those tickets reach the home
+          // through — empty here, this one sits directly under the card (apply-steps.ts
+          // `assertClusterHolds`). None is readable from the step's two ends alone, and each names a
+          // bead the write must lock. `landed` grows with the writes: nothing has moved yet when
+          // the first step is re-checked, so nothing is owed a place under the home.
+          cluster: {
+            named: ["anton-a", "anton-b"],
+            members: ["anton-a", "anton-b"],
+            landed: [],
+            carriers: [CARRIED.id],
+            carrierPaths: [],
+          },
         },
         // A parentless subject undoes to bd's detach form, not to some invented parent.
         {
@@ -84,6 +99,13 @@ describe("planApply — what an approval means against the board as it now is", 
           parentClaim: "",
           kind: "parentless-cluster",
           observedAtMs: Date.parse(FILED),
+          cluster: {
+            named: ["anton-a", "anton-b"],
+            members: ["anton-a", "anton-b"],
+            landed: ["anton-a"],
+            carriers: [CARRIED.id],
+            carrierPaths: [],
+          },
         },
       ],
     });
@@ -235,6 +257,108 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(refusal(decide(REPARENT, abandoned))).toMatch(/anton-a is abandoned/);
     });
 
+    /**
+     * The home is validated when the PATROL runs and then read by a human days later. Two cluster
+     * proposals (anton-a7hp, anton-z5jn) named targets that had CLOSED by the time they were read;
+     * approving either would have parented open work under a shipped feature (anton-9hpp). So the
+     * target's freedom is re-asked here, against the board the writes would actually land on.
+     */
+    it("refuses a target that settled or was picked up since the proposal was filed", () => {
+      const settled = [{ ...CARD, status: "closed" }, bead("anton-a"), bead("anton-b")];
+      expect(refusal(decide(CLUSTER, settled))).toMatch(
+        /anton-card is closed — re-parenting work under it would hang it off a card nothing will run/,
+      );
+
+      const claimed = [
+        warm(CARD.id, { issue_type: "feature", status: "in_progress", assignee: "runner-7" }),
+        bead("anton-a"),
+        bead("anton-b"),
+      ];
+      expect(refusal(decide(CLUSTER, claimed))).toMatch(
+        /anton-card is held by runner-7 and it was claimed since this proposal was filed/,
+      );
+
+      // …and the same for a run that got as far as publishing its lease.
+      const leasedHome = [
+        { ...leased(CARD.id, NOW), issue_type: "feature" },
+        bead("anton-a"),
+        bead("anton-b"),
+      ];
+      expect(refusal(decide(CLUSTER, leasedHome))).toMatch(/anton-card/);
+    });
+
+    /**
+     * The home's OTHER premise, and the one nothing else restates: a cluster detector calls a card
+     * obvious only when the board already files tickets under it (reparent.ts
+     * `MIN_CARRIED_TICKETS`). Delete or re-home that last ticket between the filing and the read and
+     * the card is a leaf again — one PR's worth of work — so approving would turn somebody's card
+     * into somebody else's epic. The grouping re-check cannot see it: it reads titles and labels.
+     */
+    it("refuses a cluster whose home stopped carrying tickets of its own", () => {
+      const leaf = [CARD, bead("anton-a"), bead("anton-b")];
+      expect(refusal(decide(CLUSTER, leaf))).toMatch(
+        /anton-card carries no tickets of its own any more/,
+      );
+    });
+
+    // …and the cluster's own members may not stand in for the ticket that left: half-applying the
+    // move by hand would otherwise let the proposal prove its own premise with the very move it asks
+    // for. Only tickets the home carried BEFORE this ask count.
+    it("does not let the cluster's own members prove the home still carries work", () => {
+      const halfApplied = [CARD, child("anton-a", CARD.id), bead("anton-b")];
+      expect(refusal(decide(CLUSTER, halfApplied))).toMatch(/carries no tickets of its own/);
+    });
+
+    // …nor may a member's SUBTREE stand in for it. `cardOf` walks the whole parent chain, so a
+    // hand-moved member drags its own children onto the home too — and they reach it only through
+    // the move being asked for, which is the same circularity by one more hop.
+    it("does not let a named member's descendants prove it either", () => {
+      const halfApplied = [
+        CARD,
+        child("anton-a", CARD.id),
+        child("anton-a1", "anton-a"),
+        bead("anton-b"),
+      ];
+      expect(refusal(decide(CLUSTER, halfApplied))).toMatch(/carries no tickets of its own/);
+    });
+
+    // And the same subtree is kept out of the carriers the WRITE half re-asks the bar over: a
+    // premise recorded on the proposal's own descendants would be re-proved by its own move.
+    it("records only independent carriers on the step's premise", () => {
+      const decision = decide(CLUSTER, [
+        CARD,
+        CARRIED,
+        child("anton-a", CARD.id),
+        child("anton-a1", "anton-a"),
+        bead("anton-b"),
+      ]);
+      expect(decision.status).toBe("apply");
+      const carriers = (decision.status === "apply" ? decision.steps : []).map((step) =>
+        step.verb === "reparent" ? step.cluster?.carriers : undefined,
+      );
+      expect(carriers).toEqual([[CARRIED.id]]);
+    });
+
+    // A carrier reaches the home through whatever sits between them, and an intermediate the count
+    // never sees — an exempt type is no ticket of anybody's — is deleted under its own lock alone.
+    // So the premise records the PATH as well as its ends, which is what lets the write half hold it
+    // (apply-steps.ts `lockedBeads`) instead of trusting it to survive until the write.
+    it("records the beads a nested carrier reaches the home through", () => {
+      const decision = decide(CLUSTER, [
+        CARD,
+        child("anton-note", CARD.id, { issue_type: "learning" }),
+        child("anton-t0", "anton-note"),
+        bead("anton-a"),
+        bead("anton-b"),
+      ]);
+      expect(decision.status).toBe("apply");
+      const premise = (decision.status === "apply" ? decision.steps : []).map((step) =>
+        step.verb === "reparent" ? step.cluster : undefined,
+      )[0];
+      expect(premise?.carriers).toEqual(["anton-t0"]);
+      expect(premise?.carrierPaths).toEqual(["anton-note"]);
+    });
+
     it("refuses a home that is not a board card — the state the proposal exists to fix", () => {
       // An epic WITH a feature child is a container: work parented to it rides no card.
       const container = bead("anton-card", { issue_type: "epic" });
@@ -374,8 +498,12 @@ describe("planApply — what an approval means against the board as it now is", 
     it("refuses every move against a bead a run owns — live lease or open PR alike", () => {
       for (const live of [leased("anton-a", NOW), inReview("anton-a")]) {
         expect(refusal(decide(REPARENT, [CARD, live], NOW))).toMatch(/anton-a is mid-run/);
-        expect(refusal(decide(CLUSTER, [CARD, live, bead("anton-b")], NOW))).toMatch(
-          /anton-a is mid-run/,
+        // A cluster drops a mid-run member rather than refusing over it (see "a cluster member the
+        // board has answered"); what this test asserts of it is the same thing — nothing is written
+        // to a bead a run owns.
+        const cluster = decide(CLUSTER, [CARD, CARRIED, live, bead("anton-b")], NOW);
+        expect(cluster.status === "apply" ? cluster.steps.map((s) => s.id) : []).not.toContain(
+          "anton-a",
         );
         const liveBlocked = ordered(live.assignee ? leased("anton-aa", NOW) : inReview("anton-aa"));
         expect(refusal(decide(LINK, [liveBlocked, bead("anton-bb")], NOW))).toMatch(
@@ -517,9 +645,246 @@ describe("planApply — what an approval means against the board as it now is", 
       expect(reason(decide(REPARENT, [CARD, other, rehomed]))).toMatch(
         /now rides board card anton-other/,
       );
-      expect(reason(decide(CLUSTER, [CARD, other, rehomed, bead("anton-b")]))).toMatch(
-        /now rides board card anton-other/,
-      );
+    });
+
+    /**
+     * …but ONE answered member does not take the rest of a cluster down with it. A cluster's claim
+     * is its target now, not its membership (anton-9hpp), so the proposal standing open suppresses
+     * the fresh cluster the next patrol derives from the members nobody has answered — and refusing
+     * the whole plan over `anton-a` would leave that valid claim unapplyable until a human declined
+     * this bead by hand. The newer decision is still never written over: `anton-a` gets no step.
+     */
+    /** The members an apply decision actually writes to, in order. */
+    const moved = (decision: ReturnType<typeof decide>): string[] =>
+      decision.status === "apply" ? decision.steps.map((s) => s.id) : [];
+
+    describe("a cluster member the board has answered", () => {
+      /** Three members, so dropping one still leaves the detector's own MIN_CLUSTER_SIZE behind. */
+      const THREE = planFor({
+        kind: "parentless-cluster",
+        move: "reparent",
+        subjects: ["anton-a", "anton-b", "anton-c"],
+        target: CARD.id,
+      });
+      const rest = [CARD, CARRIED, bead("anton-b"), bead("anton-c")];
+
+      it("drops the member somebody re-homed and moves the ones nobody answered", () => {
+        const other = bead("anton-other", { issue_type: "feature" });
+        const decision = decide(THREE, [...rest, other, child("anton-a", other.id)]);
+
+        expect(decision.status).toBe("apply");
+        expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
+        expect(decision.status === "apply" ? decision.summary : "").toBe(
+          "re-parented anton-b, anton-c under anton-card (1 member(s) no longer in the cluster)",
+        );
+      });
+
+      /**
+       * The other two ways a member stops being one of the loose beads the cluster was derived from
+       * (reparent.ts `isClusterCandidate`). Both used to refuse the whole plan while the proposal's
+       * target-only fingerprint went on suppressing the fresh cluster the remaining members form.
+       */
+      it("drops a member closed since the filing", () => {
+        const decision = decide(THREE, [...rest, bead("anton-a", { status: "closed" })]);
+        expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
+      });
+
+      // `bd delete` is the third way a member leaves, and the only one that leaves no bead behind to
+      // read the departure from — so it used to refuse the plan before the answered path was reached.
+      it("drops a member deleted since the filing", () => {
+        const decision = decide(THREE, rest);
+        expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
+        expect(decision.status === "apply" ? decision.summary : "").toContain(
+          "(1 member(s) no longer in the cluster)",
+        );
+      });
+
+      it("drops a member a run has picked up since the filing", () => {
+        for (const live of [leased("anton-a", NOW), inReview("anton-a")]) {
+          expect(moved(decide(THREE, [...rest, live], NOW))).toEqual(["anton-b", "anton-c"]);
+        }
+      });
+
+      // Nothing left to write is not a settle: the ask never reached the target it names, and an
+      // approver told "already sit under anton-card" would be told the opposite of what happened.
+      it("refuses a cluster whose every member was answered elsewhere", () => {
+        const other = bead("anton-other", { issue_type: "feature" });
+        const board = [CARD, CARRIED, other, child("anton-a", other.id), child("anton-b", other.id)];
+        expect(reason(decide(CLUSTER, board))).toMatch(/now rides board card anton-other/);
+      });
+
+      /**
+       * Dropping members may not smuggle the move below the bar the DETECTOR holds itself to: one
+       * loose bead sharing a topic with a card is the weak evidence this detector was rebuilt to stop
+       * proposing on, and the re-home that took the other member away may be the newer reading of
+       * where the work belongs.
+       */
+      it("refuses what is left of a two-member cluster once one member is answered", () => {
+        const other = bead("anton-other", { issue_type: "feature" });
+        const board = [CARD, CARRIED, other, child("anton-a", other.id), bead("anton-b")];
+        expect(reason(decide(CLUSTER, board))).toMatch(
+          /anton-b is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too/,
+        );
+      });
+
+      // …but a member somebody already filed under the target IS the cluster the ask wanted, so it
+      // counts towards the floor rather than reading as one more member that left.
+      it("counts a member already sitting under the home towards the minimum", () => {
+        const decision = decide(CLUSTER, [CARD, CARRIED, child("anton-a", CARD.id), bead("anton-b")]);
+        expect(moved(decision)).toEqual(["anton-b"]);
+      });
+
+      // …and the write half is told it is already there. A member the board should show under the
+      // home by the time a step runs must still be under it — the one departure no later step
+      // notices on its own, because its own step has run or will never run.
+      it("names the members already under the home as the step's landed set", () => {
+        const decision = decide(CLUSTER, [CARD, CARRIED, child("anton-a", CARD.id), bead("anton-b")]);
+        const premise = (decision.status === "apply" ? decision.steps : []).map((step) =>
+          step.verb === "reparent" ? step.cluster : undefined,
+        )[0];
+        expect(premise?.landed).toEqual(["anton-a"]);
+      });
+
+      /**
+       * …only while it is still one of the loose beads the cluster was derived from. A member moved
+       * under the home by hand and THEN closed, promoted or picked up left the cluster exactly as a
+       * re-homed one did — and counting it would carry the lone survivor past a floor a fresh
+       * detector pass would refuse, moving a bead no cluster remains to justify.
+       */
+      it("drops an in-place member the board has since answered", () => {
+        const answered = [
+          child("anton-a", CARD.id, { status: "closed" }),
+          child("anton-a", CARD.id, { issue_type: "feature" }),
+          child("anton-a", CARD.id, leased("anton-a", NOW)),
+        ];
+        for (const member of answered) {
+          expect(reason(decide(CLUSTER, [CARD, CARRIED, member, bead("anton-b")], NOW))).toMatch(
+            /anton-b is all that is left of this cluster/,
+          );
+        }
+      });
+
+      /**
+       * …and once what already sits under the home is a cluster in its own right, the ask is DONE.
+       * Two members filed there by hand are the outcome this proposal wanted, so a third that closed
+       * or moved on leaves nothing to write — reporting its refusal instead left a proposal no
+       * approval could ever settle, because every later approve reached the same refusal while the
+       * valid cluster sat on the board.
+       */
+      it("settles a cluster the board already holds, whatever became of the other members", () => {
+        const board = [
+          CARD,
+          CARRIED,
+          child("anton-a", CARD.id),
+          child("anton-b", CARD.id),
+          bead("anton-c", { status: "closed" }),
+        ];
+        expect(decide(THREE, board)).toEqual({
+          status: "settled",
+          // Named from the members that ARE there: anton-c never reached the target.
+          summary: "anton-a, anton-b already sit under anton-card",
+          // Writing nothing is not resting on nothing: the summary still claims anton-card is a
+          // container, so the settlement carries the tickets that premise was counted from — the
+          // beads apply.ts has to lock and re-count before it closes the ask (`settleUnwritten`).
+          carried: { carriers: [CARRIED.id], carrierPaths: [] },
+        });
+      });
+
+      // …but two in-place members that no longer agree about anything are not a cluster, so the
+      // departure that unravelled it is still the answer the approver gets.
+      it("does not settle on in-place members that no longer state one subject", () => {
+        const board = [
+          CARD,
+          CARRIED,
+          child("anton-a", CARD.id, { title: "anton-a: docker image cache" }),
+          child("anton-b", CARD.id),
+          bead("anton-c", { status: "closed" }),
+        ];
+        expect(reason(decide(THREE, board))).toMatch(/anton-c is closed/);
+      });
+
+      /**
+       * …and with nobody left to blame the unravelling on — every member moved home by hand, then
+       * retitled out of the subject they shared — the refusal has to be stated of the in-place set
+       * itself. Settling here would close a proposal as applied over a grouping no detector would
+       * derive today, putting the gardener's name on it.
+       */
+      it("refuses in-place members that agree about nothing, answered members or not", () => {
+        const board = [
+          CARD,
+          CARRIED,
+          child("anton-a", CARD.id, { title: "anton-a: docker image cache" }),
+          child("anton-b", CARD.id),
+        ];
+        expect(reason(decide(CLUSTER, board))).toMatch(
+          /anton-a, anton-b already sit under anton-card but no longer state a subject anton-card states too/,
+        );
+      });
+
+      /**
+       * The fourth way a member leaves, and the one every bar around it read as a fatal HOME refusal:
+       * promoted to a `feature`, it is a board card, and the tier taxonomy rejects the move as
+       * `feature-under-non-epic` before any member is judged — taking the pair that is still a cluster
+       * down with it, while the target-only fingerprint suppressed their fresh proposal.
+       */
+      it("drops a member promoted out of the working layer since the filing", () => {
+        const decision = decide(THREE, [...rest, bead("anton-a", { issue_type: "feature" })]);
+        expect(moved(decision)).toEqual(["anton-b", "anton-c"]);
+        expect(decision.status === "apply" ? decision.summary : "").toContain(
+          "(1 member(s) no longer in the cluster)",
+        );
+      });
+    });
+
+    /**
+     * A proposal's subjects are the UNION of every topic group its home hosts, so one target can
+     * carry an escalation pair AND a docker pair. Lose one member of each and the raw count still
+     * reads as a cluster while the survivors agree about nothing — a fresh patrol, which groups
+     * before it counts, would propose nothing at all. So the grouping is recomputed over whoever is
+     * left rather than trusted from the filing.
+     */
+    describe("a cluster whose surviving members no longer state one subject", () => {
+      const HOME = bead("anton-card", {
+        issue_type: "feature",
+        title: "Escalation banner and docker image",
+      });
+      const member = (id: string, title: string): Bead => bead(id, { title });
+      const PAIRS = planFor({
+        kind: "parentless-cluster",
+        move: "reparent",
+        subjects: ["anton-a1", "anton-a2", "anton-d1", "anton-d2"],
+        target: HOME.id,
+      });
+      const escalation = [
+        member("anton-a1", "Escalation banner rollout"),
+        member("anton-a2", "Escalation banner copy"),
+      ];
+      const docker = [
+        member("anton-d1", "Docker image cache"),
+        member("anton-d2", "Docker image build"),
+      ];
+
+      it("moves both groups while both still hold", () => {
+        const decision = decide(PAIRS, [HOME, CARRIED, ...escalation, ...docker]);
+        expect(moved(decision)).toEqual(["anton-a1", "anton-a2", "anton-d1", "anton-d2"]);
+      });
+
+      // One survivor from each pair reaches MIN_CLUSTER_SIZE by count alone and by nothing else.
+      it("refuses two unrelated survivors that only add up to the floor", () => {
+        const board = [HOME, CARRIED, escalation[0]!, docker[0]!];
+        expect(reason(decide(PAIRS, board))).toMatch(
+          /anton-a1, anton-d1 is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too/,
+        );
+      });
+
+      // …and the pair that DOES still hold is not held hostage to the survivor that no longer does.
+      it("moves the group that still holds and drops the survivor that does not", () => {
+        const decision = decide(PAIRS, [HOME, CARRIED, ...escalation, docker[0]!]);
+        expect(moved(decision)).toEqual(["anton-a1", "anton-a2"]);
+        expect(decision.status === "apply" ? decision.summary : "").toContain(
+          "(2 member(s) no longer in the cluster)",
+        );
+      });
     });
 
     // A move under another CONTAINER leaves the bead exactly as unreachable as the proposal says,
