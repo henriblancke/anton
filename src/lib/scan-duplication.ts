@@ -382,8 +382,13 @@ const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+
  * reading its slash as division leaves the `/*` inside the character class to open a comment that
  * swallows every line below. The whole expression-prefix set is listed rather than the few that came
  * up, since a keyword missing from it costs the rest of the file.
+ *
+ * `default` is listed only in its export spelling — `export default /[/*]/;` exports a regex, while a
+ * bare `default` is either a switch arm, whose `:` is already an expression prefix, or a property
+ * (`mod.default / 2` divides). Requiring the `export` keeps the module form without reading a
+ * divisor behind an ordinary member of that name as a regex.
  */
-const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|delete|void|yield|await|new|else|do|in|of)`;
+const EXPRESSION_KEYWORDS = String.raw`\b(?:return|case|typeof|throw|instanceof|delete|void|yield|await|new|else|do|in|of|export\s+default)`;
 
 /**
  * The punctuation the same rule covers: openers, separators, and the binary and unary operators

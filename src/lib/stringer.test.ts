@@ -2275,6 +2275,31 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // A default export leads an expression too — `export default /[/*]/;` exports a regex. Read as
+    // division, the `/*` inside the character class opens a comment that runs to the end of the file
+    // and every real duplication window below it is dropped unread.
+    it("reads a slash after a default export as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/separator.ts": [
+          "export default /[/*]/;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/separator.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/separator.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // An arithmetic operator leads an expression too — `prefix + /[/*]/.source` concatenates a
     // regex source. Read as division, the `/*` inside the character class opens a comment that runs
     // to the end of the file and every real duplication window below it is dropped unread.
