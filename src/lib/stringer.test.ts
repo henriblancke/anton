@@ -1280,6 +1280,59 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/py/module.py");
     });
 
+    // Rust spells the same stale binding as `use crate::widget::Widget`, under a keyword no other
+    // mask reads — so the surviving hit was classified as executable code and one forgotten `use`
+    // deleted a true finding. The declaration ends at its own `;`, and a grouped list is followed
+    // only while its brace is open, so the code under it still counts.
+    it("does not count a Rust `use` binding as a use of the symbol", async () => {
+      const repo = initRepo({
+        "src/widget.rs": "pub fn Widget() {}\n",
+        "src/panel.rs": "pub fn Panel() {}\n",
+        "src/stale.rs": "use crate::widget::Widget;\n\npub fn stale() {}\n",
+        "src/wrapped.rs":
+          "use crate::widget::{\n    Widget,\n    Panel,\n};\n\npub fn wrapped() {}\n",
+        "src/calls.rs": "use crate::panel::Panel;\n\npub fn calls() {\n    Panel();\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget.rs", "Widget"),
+        unused("src/panel.rs", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the symbol the tree really calls is still dropped, and by the file that calls
+      // it rather than by either file that only bound it.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/calls.rs");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/stale.rs");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/wrapped.rs");
+    });
+
+    // Rust's two exceptions, the same two ESM has: a binding taken under another name holds the
+    // file's only mention of the symbol, and a `pub use` republishes it under this module's path,
+    // which is a use of it rather than a binding taken and forgotten.
+    it("counts a Rust rename the file uses, and a `pub use` re-export", async () => {
+      const repo = initRepo({
+        "src/widget.rs": "pub fn Widget() {}\n",
+        "src/renamed.rs":
+          "use crate::widget::Widget as Renamed;\n\npub fn renamed() {\n    Renamed();\n}\n",
+        "src/panel.rs": "pub fn Panel() {}\n",
+        "src/api.rs": "pub use crate::panel::Panel;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget.rs", "Widget"),
+        unused("src/panel.rs", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }, { symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/renamed.rs");
+      expect(result.deadcode.dropped[1].reason).toContain("src/api.rs");
+    });
+
     // A binding taken under another name is the one import that is not a stale half: the statement
     // holds the file's only mention of the symbol, and every use of it beside is spelled with the
     // local name, which the searched symbol can never match. Blanking that reports a live symbol
@@ -1426,6 +1479,37 @@ describe("scan", () => {
 
       expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
       expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A tail is read off an aliased specifier only where the repo publishes no mapping for it. A
+    // monorepo holds more than one module whose path ends `ui/widget`, and `@/*` names exactly one
+    // of them: matching the tail behind a mapping that already answered binds an unrelated
+    // package's default to the caller's name, inventing a caller and deleting a finding that was
+    // right.
+    it("resolves an alias through the repo's `paths` mapping, not by path tail", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./apps/web/*"] } },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/ui/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/home.ts": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/ui/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the module the mapping DOES name is still resolved, so the caller that binds
+      // its default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/home.ts");
     });
 
     // A formatter wraps an export list as readily as an import one, leaving `Widget as default` on

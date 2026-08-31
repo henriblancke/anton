@@ -25,6 +25,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
+import { readAliases, type AliasRule } from "./scan-coupling";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -2265,6 +2266,79 @@ function maskPythonImports(code: readonly string[]): MaskedCode {
   return { code: masked, aliases };
 }
 
+/** Files whose imports are Rust `use` declarations, which name no module string either. */
+const RUST_FILE = /\.rs$/i;
+
+/**
+ * A Rust `use` declaration's keyword, at the head of a statement — the start of a line, or after
+ * the `;` that closed the one before it.
+ *
+ * `pub use` and `pub(crate) use` are left standing on purpose: republishing a symbol under this
+ * module's path is a use of it, exactly as an ESM `export … from` is. Neither stands at the head of
+ * its statement, so neither is matched here.
+ */
+const RUST_USE_HEAD = /(?:^|;)[ \t]*use\b/g;
+
+/**
+ * Where the Rust `use` declaration opened at `at` on line `from` ends: at the `;` that closes it.
+ * A grouped list — `use crate::widget::{Widget, Panel}` — is what carries one onto another line, so
+ * the search follows it only while a brace is open, and a `}` that closes the block around an
+ * unterminated `use` stops it rather than letting the mask reach the program below.
+ */
+function rustUseEnd(
+  code: string[],
+  from: number,
+  at: number,
+): { line: number; at: number } | undefined {
+  let depth = 0;
+  for (let line = from; line < code.length && line - from <= IMPORT_SPAN_LINES; line += 1) {
+    const text = code[line] ?? "";
+    for (let index = line === from ? at : 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (char === "{") depth += 1;
+      else if (char === "}") {
+        if (depth <= 0) return undefined;
+        depth -= 1;
+      } else if (char === ";" && depth <= 0) return { line, at: index };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The code with its Rust `use` declarations blanked out. `use crate::widget::Widget;` takes a
+ * binding exactly as `import { Widget } from './widget'` does, so a module that still imports a
+ * symbol it stopped calling would otherwise read as its own caller and erase a true finding — the
+ * same stale half the ESM mask exists to discount.
+ */
+function maskRustUse(code: readonly string[]): MaskedCode {
+  const masked = [...code];
+  const aliases: AliasBinding[] = [];
+  for (let index = 0; index < masked.length; index += 1) {
+    let at = 0;
+    for (;;) {
+      RUST_USE_HEAD.lastIndex = at;
+      const head = RUST_USE_HEAD.exec(masked[index] ?? "");
+      if (!head) break;
+      const opened = head.index + head[0].length;
+      const end = rustUseEnd(masked, index, opened);
+      if (!end) break;
+      const start = opened - "use".length;
+      aliases.push(...aliasBindings(masked, { line: index, at: start }, end, AS_ALIAS));
+      if (end.line === index) {
+        masked[index] = blankSpans(masked[index], [[start, end.at]]);
+      } else {
+        masked[index] = blankSpans(masked[index], [[start, masked[index].length]]);
+        for (let line = index + 1; line < end.line; line += 1) masked[line] = blankAll(masked[line]);
+        masked[end.line] = blankSpans(masked[end.line], [[0, end.at]]);
+        index = end.line;
+      }
+      at = end.at;
+    }
+  }
+  return { code: masked, aliases };
+}
+
 /**
  * The code with its import declarations blanked out. A binding a file imports and never uses is not
  * a caller: `import { Widget } from './widget'` names the symbol as plainly as a call does, so
@@ -2280,7 +2354,8 @@ function maskPythonImports(code: readonly string[]): MaskedCode {
  * `import static pkg.Widget.render;` binds `render` without calling it exactly as an ESM import
  * does, so leaving it standing let one stale Java import erase a true finding. Python spells its
  * imports without a specifier too, but its own grammar — no `;`, parenthesised lists, `from widget
- * import Widget` — is read by `maskPythonImports` instead.
+ * import Widget` — is read by `maskPythonImports` instead, and Rust's `use`, which spells the same
+ * binding under another keyword entirely, by `maskRustUse`.
  *
  * CommonJS `require` bindings are masked first, by `maskRequireBindings`, since a repo can spell
  * the same stale binding either way.
@@ -2294,6 +2369,10 @@ function maskImports(code: string[], file: string, references?: LineReference): 
   if (PYTHON_FILE.test(file)) {
     const python = maskPythonImports(code);
     return unmaskUsedAliases(code, python.code, python.aliases, references);
+  }
+  if (RUST_FILE.test(file)) {
+    const rust = maskRustUse(code);
+    return unmaskUsedAliases(code, rust.code, rust.aliases, references);
   }
   const required = maskRequireBindings(code);
   const masked = required.code;
@@ -2503,6 +2582,7 @@ async function filesMentioning(
   declaring: ReadonlySet<string>,
   masked: Map<string, MaskedFile | undefined>,
   pathspecs: string[],
+  aliases: readonly AliasRule[],
   abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
   const hits = await grepWord(repoPath, symbol, pathspecs, abort);
@@ -2511,7 +2591,15 @@ async function filesMentioning(
   if (files.some((file) => !declaring.has(file))) return files;
   // Only when the symbol's own name turned up no caller: the second search costs a grep per
   // declaring module, and a symbol already proved live has nothing to gain from it.
-  const renamed = await defaultBindingCallers(repoPath, symbol, declaring, masked, pathspecs, abort);
+  const renamed = await defaultBindingCallers(
+    repoPath,
+    symbol,
+    declaring,
+    masked,
+    pathspecs,
+    aliases,
+    abort,
+  );
   return [...files, ...renamed.filter((file) => !files.includes(file))];
 }
 
@@ -2549,13 +2637,32 @@ function posix(path: string): string {
 }
 
 /**
+ * Where the repo's own `paths` mapping sends `spec` — every target the rules claiming its prefix
+ * expand to, and nothing when no rule claims it.
+ */
+function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
+  const mapped: string[] = [];
+  for (const rule of aliases) {
+    if (!spec.startsWith(rule.prefix)) continue;
+    for (const target of rule.targets)
+      mapped.push(posix(normalize(join(target, spec.slice(rule.prefix.length)))));
+  }
+  return mapped;
+}
+
+/**
  * Whether `spec`, written in `importer`, could name `module` — both repo-relative paths.
  *
  * A relative specifier is resolved exactly, against the importing file's own directory, so it names
- * one module and no other. An ALIASED one is matched by its tail instead, because resolving it
- * needs the repo's `paths` mapping and this filter reads no build config: `@/ui/widget` names the
- * module whose path ends in `ui/widget`. The tail must carry a directory for that — a bare `widget`
- * would match half a tree.
+ * one module and no other. An ALIASED one is resolved through the repo's `paths` mapping when the
+ * repo publishes one, and a rule that claims the prefix answers alone: `@/ui/widget` under
+ * `"@/*": ["apps/web/*"]` is `apps/web/ui/widget` and no other module. Falling back to the tail
+ * behind a mapping that already answered is how the same specifier gets read as the same-named
+ * module in an unrelated package of a monorepo — inventing a caller and deleting a true finding.
+ *
+ * Only where no rule claims the prefix is the tail matched instead — a repo whose aliases anton
+ * cannot read still imports `@/ui/widget` from the module whose path ends in `ui/widget`. The tail
+ * must carry a directory for that: a bare `widget` would match half a tree.
  *
  * Nothing else is matched at all. A bare `ui/widget` is as readily a package subpath, and a local
  * `src/ui/widget.ts` beside it would then read as the module that import named — inventing a caller
@@ -2563,13 +2670,20 @@ function posix(path: string): string {
  * bare form under-covers a repo that roots its own modules through `baseUrl` rather than an alias,
  * and that only leaves a signal standing.
  */
-function specifierNames(importer: string, spec: string, module: string): boolean {
+function specifierNames(
+  importer: string,
+  spec: string,
+  module: string,
+  aliases: readonly AliasRule[],
+): boolean {
   const target = withoutModuleExtension(posix(module));
-  if (spec.startsWith("./") || spec.startsWith("../")) {
-    const resolved = withoutModuleExtension(posix(normalize(join(dirname(importer), spec))));
-    return resolved === target || `${resolved}/index` === target;
-  }
+  const names = (resolved: string): boolean =>
+    resolved === target || `${resolved}/index` === target;
+  if (spec.startsWith("./") || spec.startsWith("../"))
+    return names(withoutModuleExtension(posix(normalize(join(dirname(importer), spec)))));
   const path = posix(spec);
+  const mapped = aliasedModules(aliases, path);
+  if (mapped.length > 0) return mapped.some((to) => names(withoutModuleExtension(to)));
   if (!MODULE_ALIAS.test(path)) return false;
   const tail = withoutModuleExtension(path.replace(MODULE_ALIAS, ""));
   if (!tail.includes("/")) return false;
@@ -2668,6 +2782,7 @@ function defaultBindingsOf(
   program: readonly string[],
   file: string,
   modules: ReadonlyMap<string, DefaultExport>,
+  aliases: readonly AliasRule[],
 ): string[] {
   // Read as one text rather than line by line: an import statement is what wraps, and a pattern
   // that never sees the local name beside its specifier misses the binding and reports a live
@@ -2680,7 +2795,7 @@ function defaultBindingsOf(
       const [, local, spec] = match;
       if (local === undefined || spec === undefined) continue;
       for (const [declared, how] of modules)
-        if (reachable(how) && specifierNames(file, spec, declared)) locals.push(local);
+        if (reachable(how) && specifierNames(file, spec, declared, aliases)) locals.push(local);
     }
   };
   collect(DEFAULT_IMPORT, () => true);
@@ -2720,6 +2835,7 @@ async function defaultBindingCallers(
   declaring: ReadonlySet<string>,
   masked: Map<string, MaskedFile | undefined>,
   pathspecs: string[],
+  aliases: readonly AliasRule[],
   abort?: AbortSignal,
 ): Promise<string[]> {
   const modules = new Map<string, DefaultExport>();
@@ -2751,7 +2867,7 @@ async function defaultBindingCallers(
       abort?.throwIfAborted();
       const entry = await maskedFile(repoPath, file, masked, abort);
       if (!entry) continue;
-      const locals = defaultBindingsOf(entry.program, file, modules);
+      const locals = defaultBindingsOf(entry.program, file, modules, aliases);
       const used = locals.some((local) =>
         entry.code.some((line, index) => entry.references(line, local, index)),
       );
@@ -2797,6 +2913,9 @@ export async function filterDeadcodeSignals(
   if (relevant.length === 0) return { kept: signals, deadcode: { dropped: [] } };
 
   const pathspecs = excludePathspecs(opts.exclude ?? []);
+  // The repo's own `paths` mapping, read once: it is what says which module an aliased specifier
+  // names, and a monorepo holds more than one module per path tail.
+  const aliases = await readAliases(repoPath);
   // Every file that declares a given symbol, gathered before any grep. Two signals can name the
   // same symbol in different files (an overload in a sibling module, a helper copied per package);
   // excluding only the signal's own path leaves each declaration looking like the other's caller,
@@ -2843,6 +2962,7 @@ export async function filterDeadcodeSignals(
         declarers.get(symbol) ?? new Set([path]),
         masked,
         pathspecs,
+        aliases,
         abort,
       );
       if (!Array.isArray(found)) {
