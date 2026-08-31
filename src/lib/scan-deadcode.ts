@@ -23,7 +23,7 @@
  */
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
@@ -1826,19 +1826,27 @@ function kindOf(signal: ScanSignal): string {
 /** The `git grep` hits that could be a reference: the lines to check, by file. */
 type CandidateHits = Map<string, number[]>;
 
-/** A file read once and reused across symbols: its comments blanked, plus its cross-line state. */
+/**
+ * Whether a masked line of one file writes a name as code, judged by that file's own grammar and
+ * closed over the cross-line state read from its text. `index` is the line's 0-based position, so
+ * the state the lines above leave open can be looked up.
+ *
+ * One predicate answers for the whole file, so the hit check and the alias unmasking below it ask
+ * the same question: `<p>Panel was removed</p>` is prose in a `.tsx` file whichever of them is
+ * looking at it.
+ */
+type LineReference = (line: string | undefined, symbol: string, index: number) => boolean;
+
+/** A file read once and reused across symbols: its comments and imports blanked, and how to read it. */
 interface MaskedFile {
   code: string[];
-  /** For MDX, which lines start inside a block — an expression or ESM statement — left open above. */
-  open?: boolean[];
-  /** For JSX, what each line starts inside: rendered text, a wrapped tag, or its quoted value. */
-  jsx?: JsxLine[];
-  /** For markup, where each line is program text: an executable `<script>` body or Astro frontmatter. */
-  script?: CodeSpans[];
-  /** For markup, how many braced expressions the lines above leave open at each line's start. */
-  depth?: number[];
-  /** For markup, the quote holding a code-carrying attribute open at each line's start. */
-  attr?: (string | undefined)[];
+  /**
+   * The same lines with the import declarations still standing. What a file binds a module to is
+   * written only inside the statement `code` blanks, so the default-import search below reads this
+   * instead — and reads it with the comments and non-program markup already gone.
+   */
+  program: string[];
+  references: LineReference;
 }
 
 /**
@@ -1953,14 +1961,23 @@ function aliasBindings(
  * still uses somewhere. The local name inside the binding went out with the mask, so any mention of
  * it left over is a real use — and a binding nothing uses stays blanked, which is the stale half
  * the mask exists to discount.
+ *
+ * "Uses" is the file's own reading of its lines, not a bare word match: in `import { Widget as
+ * Panel } from './widget'` followed by `<p>Panel was removed</p>`, the only mention left is
+ * rendered prose, and restoring `Widget` on the strength of it would make a stale import read as a
+ * caller and delete the true finding about `Widget`. So an alias is put back on exactly the
+ * evidence a hit for the symbol itself would need.
  */
 function unmaskUsedAliases(
   source: readonly string[],
   masked: string[],
   aliases: readonly AliasBinding[],
+  references: LineReference = (line, symbol) => referencesWord(line, symbol),
 ): string[] {
   if (aliases.length === 0) return masked;
-  const used = aliases.filter((alias) => masked.some((line) => referencesWord(line, alias.local)));
+  const used = aliases.filter((alias) =>
+    masked.some((line, index) => references(line, alias.local, index)),
+  );
   for (const alias of used) {
     const text = source[alias.line];
     const line = masked[alias.line];
@@ -2185,12 +2202,13 @@ function maskPythonImports(code: readonly string[]): MaskedCode {
  *
  * A binding taken under another name is put back by `unmaskUsedAliases` when the file still uses
  * that name: `import { Widget as Renamed } from './widget'` holds the file's only mention of the
- * symbol, and the call beside it is spelled `Renamed`.
+ * symbol, and the call beside it is spelled `Renamed`. `references` is how this file reads a line,
+ * so that use has to be code by the same rules a hit for the symbol is judged by.
  */
-function maskImports(code: string[], file: string): string[] {
+function maskImports(code: string[], file: string, references?: LineReference): string[] {
   if (PYTHON_FILE.test(file)) {
     const python = maskPythonImports(code);
-    return unmaskUsedAliases(code, python.code, python.aliases);
+    return unmaskUsedAliases(code, python.code, python.aliases, references);
   }
   const required = maskRequireBindings(code);
   const masked = required.code;
@@ -2220,7 +2238,84 @@ function maskImports(code: string[], file: string): string[] {
       at = end.at;
     }
   }
-  return unmaskUsedAliases(code, masked, aliases);
+  return unmaskUsedAliases(code, masked, aliases, references);
+}
+
+/**
+ * One file read and prepared for every symbol that lands in it: its comments and imports blanked,
+ * and the predicate that reads a line of the result — its own grammar when anton tracks one, and
+ * the union comment fallback when it doesn't, since an unrecognized extension is no reason to read
+ * the middle of a block comment as a call.
+ *
+ * The predicate is built before the imports are masked, because the mask consults it: an alias is
+ * only restored when the file uses its local name as code, which is the same question the hit check
+ * asks of the symbol.
+ */
+async function maskFile(
+  repoPath: string,
+  file: string,
+  abort?: AbortSignal,
+): Promise<MaskedFile> {
+  const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
+  const isMdx = MDX_FILE.test(file);
+  const isMarkup = !isMdx && MARKUP_FILE.test(file);
+  const flavor: MarkupFlavor = isMarkup ? markupFlavorOf(file) : "static";
+  const isJsx = !isMdx && !isMarkup && JSX_FILE.test(file);
+  const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
+  // MDX's markdown — its fences and code spans — is blanked before the JSX comment grammar runs,
+  // so a `/*` or `//` shown inside an example can't open a comment across the program.
+  const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
+  const raw = text.split("\n");
+  const markup = isMarkup ? markupProgram(code, file) : undefined;
+  const open = isMdx ? mdxOpenLines(code, raw) : undefined;
+  const jsx = isJsx ? jsxLineStates(code) : undefined;
+  const depth = markup && markupOpenDepths(markup.code, markup.script, raw, flavor);
+  const attr = markup && markupOpenAttrs(markup.code, markup.script, raw);
+  const references: LineReference = (line, symbol, index) => {
+    if (isMdx) return referencesMdx(line, symbol, open?.[index] === true);
+    if (isMarkup)
+      return referencesMarkup(
+        line,
+        symbol,
+        { code: markup?.script[index], depth: depth?.[index], attr: attr?.[index] },
+        flavor,
+      );
+    if (isJsx) return referencesJsx(line, symbol, jsx?.[index]);
+    return referencesWord(line, symbol);
+  };
+  const program = markup?.code ?? code;
+  return {
+    // Imports are blanked last, off the program text every state above was tracked through: an
+    // `import` is what opens MDX's ESM block and what a wrapped specifier list continues, so
+    // masking it before those are read would close the block over the lines under it.
+    code: maskImports(program, file, references),
+    program,
+    references,
+  };
+}
+
+/**
+ * The file's masked text, read once and reused: the same cache `codeReferencingFiles` fills, so a
+ * file already judged for one symbol is never read again for another. Undefined for a file anton
+ * cannot read, which proves nothing either way.
+ */
+async function maskedFile(
+  repoPath: string,
+  file: string,
+  masked: Map<string, MaskedFile | undefined>,
+  abort?: AbortSignal,
+): Promise<MaskedFile | undefined> {
+  if (!masked.has(file)) {
+    try {
+      masked.set(file, await maskFile(repoPath, file, abort));
+    } catch {
+      // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
+      // "proves no caller" and let the pass finish on a verdict nobody asked for.
+      abort?.throwIfAborted();
+      masked.set(file, undefined);
+    }
+  }
+  return masked.get(file);
 }
 
 /**
@@ -2245,57 +2340,10 @@ async function codeReferencingFiles(
     // The reads are the rest of the check once grep has answered, and a busy symbol has many of
     // them: a job cancelled here must stop rather than read out the list it no longer owes anyone.
     abort?.throwIfAborted();
-    const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
-    const isMdx = MDX_FILE.test(file);
-    const isMarkup = !isMdx && MARKUP_FILE.test(file);
-    const flavor: MarkupFlavor = isMarkup ? markupFlavorOf(file) : "static";
-    const isJsx = !isMdx && !isMarkup && JSX_FILE.test(file);
-    if (!masked.has(file)) {
-      try {
-        const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
-        // MDX's markdown — its fences and code spans — is blanked before the JSX comment grammar
-        // runs, so a `/*` or `//` shown inside an example can't open a comment across the program.
-        const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
-        const raw = text.split("\n");
-        const markup = isMarkup ? markupProgram(code, file) : undefined;
-        masked.set(file, {
-          // Imports are blanked last, off the program text every state below was tracked through:
-          // an `import` is what opens MDX's ESM block and what a wrapped specifier list continues,
-          // so masking it before those are read would close the block over the lines under it.
-          code: maskImports(markup?.code ?? code, file),
-          open: isMdx ? mdxOpenLines(code, raw) : undefined,
-          jsx: isJsx ? jsxLineStates(code) : undefined,
-          script: markup?.script,
-          depth: markup && markupOpenDepths(markup.code, markup.script, raw, flavor),
-          attr: markup && markupOpenAttrs(markup.code, markup.script, raw),
-        });
-      } catch {
-        // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
-        // "proves no caller" and let the pass finish on a verdict nobody asked for.
-        abort?.throwIfAborted();
-        masked.set(file, undefined);
-      }
-    }
-    const entry = masked.get(file);
+    const entry = await maskedFile(repoPath, file, masked, abort);
     if (!entry) continue;
-    const references = (line: number): boolean => {
-      const text = entry.code[line - 1];
-      if (isMdx) return referencesMdx(text, symbol, entry.open?.[line - 1] === true);
-      if (isMarkup)
-        return referencesMarkup(
-          text,
-          symbol,
-          {
-            code: entry.script?.[line - 1],
-            depth: entry.depth?.[line - 1],
-            attr: entry.attr?.[line - 1],
-          },
-          flavor,
-        );
-      if (isJsx) return referencesJsx(text, symbol, entry.jsx?.[line - 1]);
-      return referencesWord(text, symbol);
-    };
-    if (lines.some(references)) files.push(file);
+    if (lines.some((line) => entry.references(entry.code[line - 1], symbol, line - 1)))
+      files.push(file);
   }
   return files;
 }
@@ -2316,35 +2364,36 @@ function excludePathspecs(exclude: readonly string[]): string[] {
 }
 
 /**
- * Every file that references the symbol as a whole word, across the TRACKED tree — the one the
- * scan's commit names. Untracked files are deliberately left out: the nightly refresh tolerates the
+ * Every hit for a word across the TRACKED tree — the one the scan's commit names, whether the word
+ * is the symbol itself or the module a caller might import it from. Untracked files are
+ * deliberately left out: the nightly refresh tolerates the
  * scratch and generated debris a checkout accumulates (git/refresh.ts), so counting it would let a
  * file that never shipped erase a signal recorded against a SHA whose tree holds no such caller,
  * and score the same commit differently on two machines. `-F`/`-w` so a symbol carrying regex
  * punctuation (`$mount`) matches itself rather than a pattern, `-z` so a non-ASCII path comes back
  * unquoted under `core.quotePath`, `-I` so a binary blob is never read as a call site, `-n` so a
  * hit can be located in its file and judged against the comments around it, and the scan's own
- * exclusions so generated and vendored trees answer for nothing.
+ * exclusions so generated and vendored trees answer for nothing. Whether a hit is a reference is
+ * the caller's question — this one only reports where the word is written.
  *
  * The caller's signal goes to the child so a cancelled job kills the grep it is waiting on instead
  * of paying out its 30s timeout.
  */
-async function filesMentioning(
+async function grepWord(
   repoPath: string,
-  symbol: string,
-  masked: Map<string, MaskedFile | undefined>,
+  word: string,
   pathspecs: string[],
   abort?: AbortSignal,
-): Promise<string[] | { unavailable: string }> {
+): Promise<CandidateHits | { unavailable: string }> {
   try {
-    const args = ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "-e", symbol];
+    const args = ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "-e", word];
     if (pathspecs.length > 0) args.push("--", ...pathspecs);
     const { stdout } = await execFileAsync("git", args, {
       timeout: GREP_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
       signal: abort,
     });
-    return await codeReferencingFiles(repoPath, symbol, candidateHits(stdout), masked, abort);
+    return candidateHits(stdout);
   } catch (err) {
     // A cancelled job is not an unsearchable tree. Reporting the kill as `unavailable` would let the
     // scan finish and record the pass, holding up shutdown and the `--delta` baseline unwind — so
@@ -2353,9 +2402,243 @@ async function filesMentioning(
     // Exit 1 is `git grep`'s "no match" — the answer, not a failure. Anything else is git unable to
     // answer at all, which must not read as "nothing references it".
     const e = err as { code?: number | string } | null;
-    if (e?.code === 1) return [];
+    if (e?.code === 1) return new Map();
     return { unavailable: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * Every file that references the symbol, by either spelling it or binding the module's default
+ * export to a name of its own. `declaring` is the file set this scan says declares the symbol, so
+ * the second search knows which modules to follow and which hits are the declaration itself.
+ */
+async function filesMentioning(
+  repoPath: string,
+  symbol: string,
+  declaring: ReadonlySet<string>,
+  masked: Map<string, MaskedFile | undefined>,
+  pathspecs: string[],
+  abort?: AbortSignal,
+): Promise<string[] | { unavailable: string }> {
+  const hits = await grepWord(repoPath, symbol, pathspecs, abort);
+  if (!(hits instanceof Map)) return hits;
+  const files = await codeReferencingFiles(repoPath, symbol, hits, masked, abort);
+  if (files.some((file) => !declaring.has(file))) return files;
+  // Only when the symbol's own name turned up no caller: the second search costs a grep per
+  // declaring module, and a symbol already proved live has nothing to gain from it.
+  const renamed = await defaultBindingCallers(repoPath, symbol, declaring, masked, pathspecs, abort);
+  return [...files, ...renamed.filter((file) => !files.includes(file))];
+}
+
+/**
+ * Extensions a module specifier may leave off, longest first so `./widget` resolving to
+ * `widget.d.ts` is not read as a module named `widget.d`.
+ */
+const MODULE_EXTENSIONS = [
+  ".d.ts",
+  ".tsx",
+  ".ts",
+  ".mts",
+  ".cts",
+  ".jsx",
+  ".js",
+  ".mjs",
+  ".cjs",
+  ".vue",
+  ".svelte",
+  ".astro",
+];
+
+/** A path with the module extension a specifier omits stripped off. */
+function withoutModuleExtension(path: string): string {
+  const found = MODULE_EXTENSIONS.find((ext) => path.toLowerCase().endsWith(ext));
+  return found ? path.slice(0, -found.length) : path;
+}
+
+/** The prefixes a repo roots its own modules under — `@/lib/x`, `~/lib/x`, `#lib/x`. */
+const MODULE_ALIAS = /^(?:[@~#]\/|#)/;
+
+/** Path separators as either platform writes them, so a resolved path compares as git spells it. */
+function posix(path: string): string {
+  return path.split(/[\\/]/).join("/");
+}
+
+/**
+ * Whether `spec`, written in `importer`, could name `module` — both repo-relative paths.
+ *
+ * A relative specifier is resolved exactly, against the importing file's own directory, so it names
+ * one module and no other. Anything else is matched by its tail instead, because resolving it needs
+ * the repo's `paths` mapping and this filter reads no build config: `@/ui/widget` names the module
+ * whose path ends in `ui/widget`. The tail must carry a directory for that — a bare `widget` or a
+ * package name would match half a tree, and a mismatch here invents a caller and deletes a true
+ * finding, which is the one direction this filter never errs in.
+ */
+function specifierNames(importer: string, spec: string, module: string): boolean {
+  const target = withoutModuleExtension(posix(module));
+  if (spec.startsWith("./") || spec.startsWith("../")) {
+    const resolved = withoutModuleExtension(posix(normalize(join(dirname(importer), spec))));
+    return resolved === target || `${resolved}/index` === target;
+  }
+  const tail = withoutModuleExtension(posix(spec).replace(MODULE_ALIAS, ""));
+  if (!tail.includes("/")) return false;
+  return (
+    target === tail ||
+    target === `${tail}/index` ||
+    target.endsWith(`/${tail}`) ||
+    target.endsWith(`/${tail}/index`)
+  );
+}
+
+/**
+ * The word every specifier naming `module` must contain: the module's own file name, or its
+ * directory's when the file is the directory's `index`. Grepping for it is how the importers of a
+ * module are found without walking the tree.
+ */
+function moduleWord(module: string): string | undefined {
+  const segments = withoutModuleExtension(posix(module)).split("/");
+  const name = segments.pop();
+  return name === "index" ? segments.pop() : name;
+}
+
+/**
+ * `export default`, and the two CommonJS spellings of it, up to the name being exported. The head
+ * has to stand at the start of a statement: `export default` inside a string or after other code is
+ * not this module's default, and `module.exports` reached through a property is not either.
+ */
+const DEFAULT_EXPORT_HEAD =
+  /(?:^|[;{}])[ \t]*(?:export[ \t]+default[ \t]+(?:async[ \t]+)?(?:function[ \t*]+|class[ \t]+)?|(?:module\.exports|exports\.default)[ \t]*=[ \t]*)/g;
+
+/** `export { Widget as default }` — the same claim written as a re-export. */
+const DEFAULT_REEXPORT = /\bexport[ \t]*\{[^}]*?\b([A-Za-z_$][\w$]*)[ \t]+as[ \t]+default\b/;
+
+/** How a module hands its default value out, which decides what a caller may bind it with. */
+interface DefaultExport {
+  /** `export default Widget` — reached by an ESM default import. */
+  esm: boolean;
+  /** `module.exports = Widget` — reached by a whole-module `require` as well. */
+  cjs: boolean;
+}
+
+/** How `program` exports `symbol` as its default value, or undefined when it doesn't. */
+function defaultExportOf(program: readonly string[], symbol: string): DefaultExport | undefined {
+  const result: DefaultExport = { esm: false, cjs: false };
+  for (const line of program) {
+    DEFAULT_EXPORT_HEAD.lastIndex = 0;
+    for (let head = DEFAULT_EXPORT_HEAD.exec(line); head; head = DEFAULT_EXPORT_HEAD.exec(line)) {
+      const at = head.index + head[0].length;
+      if (!line.startsWith(symbol, at)) continue;
+      if (WORD_CHAR.test(line[at + symbol.length] ?? "")) continue;
+      if (head[0].includes("exports")) result.cjs = true;
+      else result.esm = true;
+    }
+    if (DEFAULT_REEXPORT.exec(line)?.[1] === symbol) result.esm = true;
+  }
+  return result.esm || result.cjs ? result : undefined;
+}
+
+/**
+ * `import Renamed from './widget'`, and `import Renamed, { other } from './widget'` — the shapes
+ * that bind a module's default export to a name the importing file chooses. A brace or a `*` where
+ * the name would stand is a named or namespace import, which binds no default and is left out.
+ */
+const DEFAULT_IMPORT =
+  /(?:^|[;{}])[ \t]*import[ \t]+(?:type[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*(?:,[^'"]*)?\bfrom[ \t]*['"]([^'"]+)['"]/g;
+
+/** `const Renamed = require('./widget')` — CommonJS binding the whole module, default and all. */
+const DEFAULT_REQUIRE =
+  /(?:^|[;{}])[ \t]*(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*=[ \t]*require[ \t]*\([ \t]*['"]([^'"]+)['"]/g;
+
+/** The local names `program` binds the default export of one of `modules` to. */
+function defaultBindingsOf(
+  program: readonly string[],
+  file: string,
+  modules: ReadonlyMap<string, DefaultExport>,
+): string[] {
+  const locals: string[] = [];
+  const collect = (pattern: RegExp, reachable: (how: DefaultExport) => boolean): void => {
+    for (const line of program) {
+      pattern.lastIndex = 0;
+      for (let match = pattern.exec(line); match; match = pattern.exec(line)) {
+        const [, local, spec] = match;
+        if (local === undefined || spec === undefined) continue;
+        for (const [declared, how] of modules)
+          if (reachable(how) && specifierNames(file, spec, declared)) locals.push(local);
+      }
+    }
+  };
+  collect(DEFAULT_IMPORT, () => true);
+  // A `require` hands back the module object, which is the default value only where the module
+  // assigned `module.exports` outright. Requiring an ESM module yields a namespace whose `.default`
+  // holds the symbol, and the property beside it is a mention grep already reads.
+  collect(DEFAULT_REQUIRE, (how) => how.cjs);
+  return locals;
+}
+
+/**
+ * How many files one symbol's default-binding search will read. The word it greps for is a module's
+ * file name, and a framework that names every route module the same thing (`page.tsx`) makes that
+ * word half the tree. Stopping there under-covers — the signal stands, which is the direction this
+ * filter errs in — rather than letting one symbol spend a nightly reading a repo twice.
+ */
+const DEFAULT_BINDING_FILE_BUDGET = 200;
+
+/**
+ * The files that call the symbol through a default import bound to another name.
+ * `export default function Widget()` consumed as `import Renamed from './widget'; Renamed()` writes
+ * `Widget` nowhere outside its own module, so the symbol's own grep finds no caller and a live
+ * function is reported dead. The explicit `Widget as Renamed` recovery cannot help — there is no
+ * original-name hit to read the rename off — so the binding is resolved from the declaring module
+ * instead: which modules export the symbol as their default, who imports those modules, and whether
+ * that importer uses the name it bound them to.
+ *
+ * Nothing here can invent a caller out of prose: the local name is judged by the importing file's
+ * own grammar, exactly as a hit for the symbol would be.
+ *
+ * A grep that fails leaves the signal standing rather than failing the pass — the symbol's own
+ * search already answered, so this one adds evidence or adds nothing.
+ */
+async function defaultBindingCallers(
+  repoPath: string,
+  symbol: string,
+  declaring: ReadonlySet<string>,
+  masked: Map<string, MaskedFile | undefined>,
+  pathspecs: string[],
+  abort?: AbortSignal,
+): Promise<string[]> {
+  const modules = new Map<string, DefaultExport>();
+  for (const file of declaring) {
+    abort?.throwIfAborted();
+    const entry = await maskedFile(repoPath, file, masked, abort);
+    const how = entry && defaultExportOf(entry.program, symbol);
+    if (how) modules.set(file, how);
+  }
+  if (modules.size === 0) return [];
+
+  const words = new Set<string>();
+  for (const declared of modules.keys()) {
+    const word = moduleWord(declared);
+    if (word) words.add(word);
+  }
+  const callers = new Set<string>();
+  let read = 0;
+  for (const word of words) {
+    abort?.throwIfAborted();
+    const hits = await grepWord(repoPath, word, pathspecs, abort);
+    if (!(hits instanceof Map)) continue;
+    for (const file of hits.keys()) {
+      if (declaring.has(file) || callers.has(file)) continue;
+      if ((read += 1) > DEFAULT_BINDING_FILE_BUDGET) return [...callers];
+      abort?.throwIfAborted();
+      const entry = await maskedFile(repoPath, file, masked, abort);
+      if (!entry) continue;
+      const locals = defaultBindingsOf(entry.program, file, modules);
+      const used = locals.some((local) =>
+        entry.code.some((line, index) => entry.references(line, local, index)),
+      );
+      if (used) callers.add(file);
+    }
+  }
+  return [...callers];
 }
 
 /**
@@ -2367,6 +2650,11 @@ async function filesMentioning(
  * that nothing references it, and a single word-boundary hit on a code line outside its declaration
  * falsifies exactly that — a line that imports the symbol excepted, since a binding a file took and
  * never used is the stale half of the same finding.
+ *
+ * A symbol nothing spells is checked once more before it stands: a default export consumed as
+ * `import Renamed from './widget'` is written under the caller's own name and never under its own,
+ * so `defaultBindingCallers` resolves the binding from the declaring module rather than reporting a
+ * live function dead.
  *
  * Every file this scan reports as declaring the symbol is excluded, because
  * a symbol always mentions itself there — counting a declaration would drop every signal, which is
@@ -2429,7 +2717,14 @@ export async function filterDeadcodeSignals(
         unchecked += 1;
         continue;
       }
-      const found = await filesMentioning(repoPath, symbol, masked, pathspecs, abort);
+      const found = await filesMentioning(
+        repoPath,
+        symbol,
+        declarers.get(symbol) ?? new Set([path]),
+        masked,
+        pathspecs,
+        abort,
+      );
       if (!Array.isArray(found)) {
         unavailable = found.unavailable;
         break;

@@ -1332,6 +1332,83 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/py/stale.py");
     });
 
+    // An alias is put back only on the evidence a hit for the symbol itself would need. A page that
+    // says `<p>Panel was removed</p>` is telling a reader the component is gone: reading that
+    // sentence as a use restores `Widget` inside an otherwise masked import, and the stale import
+    // then reads as a caller and deletes the true finding.
+    it("does not restore a renamed import whose local name only appears in rendered text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.tsx":
+          "import { Widget as Panel } from './widget';\nexport const Stale = () => <p>Panel was removed</p>;\n",
+        "src/ui/notes.mdx":
+          "import { Widget as Card } from './widget';\n\nCard was the old renderer.\n",
+        "src/ui/page.tsx":
+          "import { Widget as Panel } from './widget';\nexport const Page = () => <Panel />;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.mdx");
+    });
+
+    // A default export consumed under another name writes the symbol nowhere outside its own
+    // module, so its grep finds no caller and a live function is reported dead. The binding is
+    // resolved from the declaring module instead — and a module bound and never used is still the
+    // stale half the import mask exists to discount.
+    it("counts a default export a caller imported under another name", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/ui/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+        "src/ui/list.ts": "import Also, { other } from './widget';\nexport const list = [Also];\n",
+        "src/ui/stale.ts": "import Ignored from './widget';\nexport const kept = 1;\n",
+        "src/ui/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+        unused("src/ui/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/list.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+    });
+
+    // The same binding written the other two ways a repo spells it: an alias specifier, which no
+    // build config is read to resolve and so is matched by its tail, and a CommonJS `require` of a
+    // module that assigned `module.exports` outright.
+    it("follows a default binding through an alias specifier and a require", async () => {
+      const repo = initRepo({
+        "src/ui/panel/index.tsx": "export default function Panel() {\n  return null;\n}\n",
+        "src/ui/page.tsx": "import Card from '@/ui/panel';\nexport const Page = () => <Card />;\n",
+        "src/cjs/widget.js": "function Widget() {\n  return null;\n}\nmodule.exports = Widget;\n",
+        "src/cjs/caller.js":
+          "const Required = require('./widget');\nmodule.exports = () => Required();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/panel/index.tsx", "Panel"),
+        unused("src/cjs/widget.js", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }, { symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[1].reason).toContain("src/cjs/caller.js");
+    });
+
     // Python's triple quote opens a docstring, but `f"""` opens an expression: the text between its
     // braces runs, and `f"""{Widget()}"""` calls the symbol. Reading every triple-quoted span as a
     // comment blanks that call and reports a live symbol dead — while the literal text around the
