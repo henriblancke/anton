@@ -2416,7 +2416,8 @@ export interface ArmedHumanGate {
   gateId: string;
   /**
    * Every OTHER open human gate on the target — holds this arm left where they are. Read back AFTER
-   * the arm, so a gate armed while this run planned is named in the park too (PR #205 review).
+   * the arm, so a gate armed while this run planned is named in the park too (PR #205 review); an
+   * arm that could not complete that read fails rather than returning a list it knows is partial.
    */
   held: string[];
   /**
@@ -2465,11 +2466,13 @@ export interface ArmedHumanGate {
  * stands — it is the target's only blocker by then — and every still-open id rides out in the
  * error), when a kill lands anywhere from the board read through the label write (a gate this run
  * created is undone first, which is safe only while the superseded wait is still open; one it was
- * only reusing is left where it stands), or when the shared board cannot be refreshed or read
- * (arming blind is how the duplicate wait gets made) — so the caller settles
- * the run LOUDLY instead of parking it. All three are the same failure: a park is only meaningful if
- * resolving the gate it names makes the target runnable, and it does not when there is no gate, when
- * a twin blocks the target, or when anton's own superseded wait is still open beside it. An epic
+ * only reusing is left where it stands), or when the shared board cannot be refreshed or read —
+ * before the arm, where arming blind is how the duplicate wait gets made, or after it, where a
+ * re-read that fails cannot rule out a gate armed concurrently (the created gate is undone first) —
+ * so the caller settles the run LOUDLY instead of parking it. They are all the same failure: a park
+ * is only meaningful if resolving the gate it names makes the target runnable, and it does not when
+ * there is no gate, when a twin blocks the target, when anton's own superseded wait is still open
+ * beside it, or when a wait the park never names holds it. An epic
  * target is the first case up front — bd refuses a gate edge onto one ("epics can only block other
  * epics") and a failed `gate create` still leaves an orphan gate bead behind, so it is refused here
  * rather than attempted.
@@ -2618,6 +2621,32 @@ export async function armHumanGate(
   const staleIds = new Set(stale.map((g) => g.id));
 
   /**
+   * End an arm whose holds could not be reconciled — taking the gate back where that is still safe.
+   *
+   * Mirrors the cancellation unwind, and for the same reason: a gate this call CREATED can be
+   * resolved right up to the supersede, so the ask settles exactly as if it never landed. A gate an
+   * earlier attempt armed carries this same ask and is not this run's to close — it stands, and
+   * rides out named in the error, because nothing else on the board would point at it.
+   */
+  const unreconciledFailure = async (gateId: string, undoable: boolean, cause: unknown) => {
+    const why =
+      `${targetId}'s human gates could not be re-read after arming ${gateId} (${
+        cause instanceof Error ? cause.message : String(cause)
+      }), so a gate armed for this target while this run planned would be missing from the park`;
+    if (undoable) {
+      const undone = await safe(() => beads.gateResolve(repo, gateId, `arm abandoned — ${why}`));
+      if (undone) {
+        return new Error(
+          `refusing to park ${targetId} behind ${gateId} — ${why}; the gate was resolved, so the ` +
+            `target carries no wait from this run`,
+          { cause },
+        );
+      }
+    }
+    return new StrandedHumanGateError(targetId, gateId, why);
+  };
+
+  /**
    * Re-read the target's waits AFTER the arm, so the park names every gate that actually holds it
    * (PR #205 review).
    *
@@ -2633,11 +2662,15 @@ export async function armHumanGate(
    * excluded — they are retired moments later, and naming them would send the operator after gates
    * that are about to close.
    *
-   * Best-effort, unlike the preflight read it corrects: by the time it runs the gate exists and
-   * carries the ask, so the park is already valid and failing here would strand the wait it just
-   * armed. A failed re-read falls back to the plan's holds, and says so.
+   * ABORTS the arm when the re-read fails, rather than falling back to the plan's holds (PR #205
+   * review). The plan is exactly the reading that cannot see a gate armed since it was taken, so
+   * parking on it publishes a message promising that resolving anton's gate resumes the run while an
+   * unnamed wait keeps blocking the target — the same dead park the preflight read is strict to
+   * prevent, reached from the other side. Failing costs only a re-run: the gate this call created is
+   * taken back first (safe here, and only here — the waits this ask supersedes are all still open
+   * behind it), and the run settles FAILED carrying the ask.
    */
-  const reconcileHeld = async (armed: string): Promise<string[]> => {
+  const reconcileHeld = async (armed: string, undoable: boolean): Promise<string[]> => {
     let fresh: Bead[];
     try {
       // Pulled as well as re-read: the other writer may be another MACHINE, whose gate reaches this
@@ -2645,12 +2678,7 @@ export async function armHumanGate(
       await beads.pull(repo);
       fresh = await loadAllIssues(repo, { strictGates: true });
     } catch (e) {
-      console.warn(
-        `[execute-epic] could not re-read ${targetId}'s human gates after arming ${armed} ` +
-          `(${e instanceof Error ? e.message : String(e)}) — a gate armed for this target while ` +
-          `this run planned would not be named in the park`,
-      );
-      return heldIds;
+      throw await unreconciledFailure(armed, undoable, e);
     }
     const stillHeld = openHumanGates(fresh, targetId)
       .map((g) => g.id)
@@ -2669,8 +2697,9 @@ export async function armHumanGate(
   if (open) {
     // Reconciled before the cancellation check, not after: the re-read is an uninterruptible await
     // like every other, so a kill landing inside it must still reach the refusal below rather than
-    // ride out as a successful arm.
-    const stillHeld = await reconcileHeld(open.id);
+    // ride out as a successful arm. Not undoable: an earlier attempt armed this wait for this same
+    // ask, so a reconcile that fails leaves it standing and names it instead.
+    const stillHeld = await reconcileHeld(open.id, false);
     // Reusing writes nothing, so it reaches neither guarded write above — but a successful return is
     // what makes the caller PARK, and a cancelled run must never park (anton-287p). The gate itself
     // stays: an earlier attempt armed it for this same ask, and it is not this run's to take back.
@@ -2698,8 +2727,10 @@ export async function armHumanGate(
         `(${HUMAN_GATE_ARMED_LABEL}) — a later ask will leave it open instead of superseding it`,
     );
   }
-  // Before the last cancellation check, so that check covers the re-read's own window too.
-  const stillHeld = await reconcileHeld(gateId);
+  // Before the last cancellation check, so that check covers the re-read's own window too. Undoable
+  // for the same reason the kill's undo is: the waits this ask supersedes are all still open behind
+  // this gate, so taking it back cannot be what leaves the target bare.
+  const stillHeld = await reconcileHeld(gateId, true);
   // The label write and the re-read are the last uninterruptible awaits, and a kill landing inside
   // one would otherwise ride out as a successful arm past every check above. Last point an undo is
   // still safe: the waits this ask supersedes are all still open behind it.

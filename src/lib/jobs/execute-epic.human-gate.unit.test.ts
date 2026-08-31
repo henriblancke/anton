@@ -315,19 +315,64 @@ it("leaves the waits it is about to supersede out of the reconciled holds", asyn
   expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-old", expect.stringMatching(/superseded/));
 });
 
-it("falls back to the planned holds when the reconcile read fails, rather than failing an arm that landed", async () => {
-  // By then the gate exists and carries the ask, so the park is already valid — throwing here would
-  // strand the wait this call just armed for the sake of a better message.
+it("undoes the gate it armed when the reconcile read fails, rather than parking on a partial list", async () => {
+  // The planned holds are exactly the reading that cannot see a concurrent gate (PR #205 review):
+  // falling back to them would park the run promising that resolving `g-new` resumes it, while a
+  // wait nothing names keeps blocking the target. The undo is safe here — nothing was superseded —
+  // so the arm costs a re-run instead.
   loadAllIssuesMock
     .mockResolvedValueOnce([target("g-theirs"), gate("g-theirs", "hold: talking to legal", [])])
     .mockRejectedValueOnce(new Error("bd: database is locked"));
   gateCreateMock.mockResolvedValue("g-new");
 
-  await expect(armHumanGate(REPO, "f-1", ASKED)).resolves.toEqual({
-    gateId: "g-new",
-    held: ["g-theirs"],
-    undo: expect.any(Function),
-  });
+  const failure = await armHumanGate(REPO, "f-1", ASKED).catch((e) => e);
+  expect(failure.message).toContain("could not be re-read");
+  expect(failure.message).toContain("database is locked");
+  expect(failure.message).toContain("carries no wait from this run");
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/abandoned/));
+});
+
+it("fails the same way when the reconcile PULL fails, not just the read", async () => {
+  // The concurrent writer may be another machine, so an unreachable remote is the same blindness as
+  // an unreadable board — the local copy simply cannot show the gate.
+  loadAllIssuesMock.mockResolvedValue([target()]);
+  gateCreateMock.mockResolvedValue("g-new");
+  pullMock.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("remote unreachable"));
+
+  await expect(armHumanGate(REPO, "f-1", ASKED)).rejects.toThrow(/remote unreachable/);
+  expect(gateResolveMock).toHaveBeenCalledWith(REPO, "g-new", expect.stringMatching(/abandoned/));
+});
+
+it("names the gate it could not take back when the reconcile fails AND the undo fails", async () => {
+  // Nothing automatic closes a human gate, so an undo that fails leaves `g-new` blocking the target
+  // for good; the id has to ride out in the error, because nothing else on the board names it.
+  loadAllIssuesMock
+    .mockResolvedValueOnce([target()])
+    .mockRejectedValueOnce(new Error("bd: database is locked"));
+  gateCreateMock.mockResolvedValue("g-new");
+  gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
+
+  const failure = await armHumanGate(REPO, "f-1", ASKED).catch((e) => e);
+  expect(failure).toBeInstanceOf(StrandedHumanGateError);
+  expect(failure.gateIds).toEqual(["g-new"]);
+  expect(failure.message).toContain("bd gate resolve g-new");
+});
+
+it("leaves a reused gate standing when the reconcile fails, and names it", async () => {
+  // An earlier attempt armed `g-mine` for this same ask: it is not this run's to resolve, so the
+  // failure carries it instead of taking it back. The supersede never runs — the arm ends first.
+  loadAllIssuesMock
+    .mockResolvedValueOnce([
+      target("g-mine", "g-old"),
+      gate("g-mine", REASON),
+      gate("g-old", "an older ask"),
+    ])
+    .mockRejectedValueOnce(new Error("bd: database is locked"));
+
+  const failure = await armHumanGate(REPO, "f-1", ASKED).catch((e) => e);
+  expect(failure).toBeInstanceOf(StrandedHumanGateError);
+  expect(failure.gateIds).toEqual(["g-mine"]);
+  expect(gateResolveMock).not.toHaveBeenCalled();
 });
 
 it("refuses the arm when the kill lands inside the reconcile read", async () => {
