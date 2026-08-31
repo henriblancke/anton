@@ -1,3 +1,8 @@
+import type {
+  ScheduleLastRun,
+  SchedulePendingStatus,
+} from "@/components/settings/automation-table";
+
 /**
  * The shapes the settings form works in. Every one of them is MIRRORED from a server type rather
  * than imported: this whole module tree is client-side, and importing the server's settings code to
@@ -95,6 +100,10 @@ export interface AutomationSchedule {
   nextRunAt?: number;
   /** Epoch SECONDS of the last fire; absent until it has run once. */
   lastRunAt?: number;
+  /** How that fire ended (anton-znoz); absent until a fired job has settled. */
+  lastRun?: ScheduleLastRun;
+  /** Where an unsettled fire sits (anton-znoz); absent when nothing is in flight. */
+  pendingRun?: SchedulePendingStatus;
 }
 
 /** One discoverable agent (anton-dvo.1), mirrored from the server's DiscoveredAgent. */

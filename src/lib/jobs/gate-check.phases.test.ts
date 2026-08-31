@@ -43,8 +43,10 @@ const {
   surfaceStalls,
   unmatchedGatedReport,
   wroteToBoard,
+  gatePassEffect,
 } = await import("./gate-check");
 type PassContext = import("./gate-check").PassContext;
+type GatePassCounts = import("./gate-check").GatePassCounts;
 type GateEvaluation = import("./gate-check").GateEvaluation;
 type ResumePlan = import("./gate-targets").ResumePlan;
 
@@ -199,11 +201,12 @@ describe("surfaceStalls (phase 2)", () => {
 
 describe("dispatchUngated (phase 4a)", () => {
   it("enqueues one execute-epic per released target, and nothing on a second pass", async () => {
-    await dispatchUngated(pass, [bead("e-1"), bead("e-2")]);
+    expect(await dispatchUngated(pass, [bead("e-1"), bead("e-2")])).toBe(2);
     expect((await jobsOfType("execute-epic")).sort()).toEqual(["e-1", "e-2"]);
 
-    // The overlap guarantee: `resumeEpic` refuses a target an active job already covers.
-    await dispatchUngated(pass, [bead("e-1"), bead("e-2")]);
+    // The overlap guarantee: `resumeEpic` refuses a target an active job already covers — and a
+    // refusal is not work, so the pass must not report it as a run it put back in flight.
+    expect(await dispatchUngated(pass, [bead("e-1"), bead("e-2")])).toBe(0);
     expect((await jobsOfType("execute-epic")).sort()).toEqual(["e-1", "e-2"]);
   });
 });
@@ -212,26 +215,36 @@ describe("dispatchReleased (phase 4b)", () => {
   const resume = (id: string, gateId: string) => ({ gate: gate(gateId), target: bead(id) });
 
   it("dispatches the target and marks its gate, counting the marks that landed", async () => {
-    const handedBack = await dispatchReleased(pass, [resume("t-1", "g-1")]);
+    const dispatched = await dispatchReleased(pass, [resume("t-1", "g-1")]);
 
-    expect(handedBack).toBe(1);
+    expect(dispatched).toEqual({ handedBack: 1, resumed: 1 });
     expect(await jobsOfType("execute-epic")).toEqual(["t-1"]);
     expect(tagMock).toHaveBeenCalledWith(REPO, "g-1", [GATE_RESUMED_LABEL]);
   });
 
   it("keeps going when one mark fails, and leaves that gate uncounted", async () => {
     tagMock.mockRejectedValueOnce(new Error("bd down"));
-    const handedBack = await dispatchReleased(pass, [resume("t-1", "g-1"), resume("t-2", "g-2")]);
+    const dispatched = await dispatchReleased(pass, [resume("t-1", "g-1"), resume("t-2", "g-2")]);
 
-    expect(handedBack).toBe(1);
+    // The mark is what the board push depends on; the resume is what the queue did. A failed mark
+    // must not erase a run this pass actually put back in flight.
+    expect(dispatched).toEqual({ handedBack: 1, resumed: 2 });
     expect((await jobsOfType("execute-epic")).sort()).toEqual(["t-1", "t-2"]);
+  });
+
+  it("counts no resume for a target an active job already covers", async () => {
+    await dispatchReleased(pass, [resume("t-1", "g-1")]);
+    expect(await dispatchReleased(pass, [resume("t-1", "g-1")])).toEqual({
+      handedBack: 1,
+      resumed: 0,
+    });
   });
 });
 
 describe("dispatchMerged (phase 4c)", () => {
   it("hands each merged target to review-fix, deduped against the live job", async () => {
-    await dispatchMerged(pass, [bead("e-1")]);
-    await dispatchMerged(pass, [bead("e-1")]);
+    expect(await dispatchMerged(pass, [bead("e-1")])).toBe(1);
+    expect(await dispatchMerged(pass, [bead("e-1")])).toBe(0);
     expect(await jobsOfType("review-fix")).toEqual(["e-1"]);
   });
 });
@@ -270,5 +283,41 @@ describe("wroteToBoard", () => {
     expect(wroteToBoard(1, 0, 0)).toBe(true);
     expect(wroteToBoard(0, 1, 0)).toBe(true);
     expect(wroteToBoard(0, 0, 1)).toBe(true);
+  });
+});
+
+describe("gatePassEffect", () => {
+  const counts = (over: Partial<GatePassCounts> = {}): GatePassCounts => ({
+    resolved: 0,
+    surfaced: 0,
+    handedBack: 0,
+    resumed: 0,
+    dispatched: 0,
+    ...over,
+  });
+
+  it("reads an idle slot as nothing to do — the normal case on a ten-minute cadence", () => {
+    expect(gatePassEffect(counts())).toEqual({ changed: false, note: "no gate closed" });
+  });
+
+  // The note has to name every count that made `changed` true, or the dot says work happened while
+  // the words say nothing did.
+  it("names each action the pass took, not just the gates it closed", () => {
+    expect(gatePassEffect(counts({ surfaced: 1, handedBack: 2 }))).toEqual({
+      changed: true,
+      note: "surfaced 1 stall(s), handed back 2 gate(s)",
+    });
+    expect(gatePassEffect(counts({ resolved: 2, surfaced: 1, handedBack: 1 })).note).toBe(
+      "closed 2 gate(s), surfaced 1 stall(s), handed back 1 gate(s)",
+    );
+  });
+
+  // A gate resolved on another machine leaves this pass with no board write of its own — but the
+  // queue moved, and reporting that as a no-op hides the slot that mattered.
+  it("counts work put back in flight even when the pass wrote nothing to the board", () => {
+    expect(gatePassEffect(counts({ resumed: 1, dispatched: 2 }))).toEqual({
+      changed: true,
+      note: "resumed 1 run(s), dispatched 2 merged run(s) to review-fix",
+    });
   });
 });

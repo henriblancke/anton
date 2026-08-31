@@ -394,7 +394,11 @@ describe("gardener patrol", () => {
     nowMs += 60_000; // past the retry backoff
     expect(await runner.tickOnce()).toBe(1);
     await runner.whenIdle();
-    await expectJobStatus(t.db, jobId, "done");
+    const settled = await expectJobStatus(t.db, jobId, "done");
+    // The Automation row reports the PATROL, not the retry: "noop / board clean" here would tell an
+    // operator nothing happened in a pass that closed an epic and repaired two rows.
+    expect(settled.outcome).toBe("ok");
+    expect(settled.outcomeNote).toContain("closed 1 epic(s)");
 
     const report = await getHygieneReport(t.db, projectId);
     expect(report?.jobId).toBe(jobId);

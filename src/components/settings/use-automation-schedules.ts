@@ -233,10 +233,12 @@ function queueRowWrite<T>(
 /**
  * Keep the open Automation panel's next-run and last-run times live (anton-ue90).
  *
- * Only the two TIME fields are taken from the poll. Cadence and enabled state are owned by this
- * page's optimistic writes, and letting a poll land on them would let a response that left the
- * server before an edit arrive after it and quietly put the old cadence back on screen — while the
- * editor's own draft, seeded once from the `cron` prop, kept showing the new one.
+ * Only the SERVER-OWNED fields are taken from the poll — the two times, the last fire's outcome and
+ * where an unsettled fire sits.
+ * Cadence and enabled state are owned by this page's optimistic writes, and letting a poll land on
+ * them would let a response that left the server before an edit arrive after it and quietly put the
+ * old cadence back on screen — while the editor's own draft, seeded once from the `cron` prop, kept
+ * showing the new one.
  */
 function useSchedulePoll({
   slug,
@@ -296,6 +298,8 @@ function seedRows(schedules: AutomationSchedule[], defaultCrons: Record<string, 
           cron: row?.cron ?? defaultCrons[a.id] ?? "",
           nextRunAt: row?.nextRunAt,
           lastRunAt: row?.lastRunAt,
+          lastRun: row?.lastRun,
+          pendingRun: row?.pendingRun,
         },
       ];
     }),
@@ -337,12 +341,21 @@ async function readSchedules(slug: string): Promise<AutomationSchedule[] | undef
   }
 }
 
-/** Apply only the two poll-owned TIME fields; a row for a type this build doesn't list isn't ours. */
+/** Apply only the poll-owned server fields; a row for a type this build doesn't list isn't ours. */
 function withTimes(state: ScheduleState, rows: AutomationSchedule[]): ScheduleState {
   const next = { ...state };
   for (const row of rows) {
     const current = next[row.type];
-    if (current) next[row.type] = { ...current, nextRunAt: row.nextRunAt, lastRunAt: row.lastRunAt };
+    if (current)
+      next[row.type] = {
+        ...current,
+        nextRunAt: row.nextRunAt,
+        lastRunAt: row.lastRunAt,
+        lastRun: row.lastRun,
+        // Assigned, never spread-preserved: a fire that has since settled leaves no pending row, and
+        // keeping the previous value would leave the cell claiming work is still in flight.
+        pendingRun: row.pendingRun,
+      };
   }
   return next;
 }

@@ -69,7 +69,7 @@ import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./r
 import { isUsageLimitError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
-import type { JobContext, JobHandler, RunnerLogger } from "./runner";
+import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
 
 // The per-thread report parser is a review-fix protocol concern; re-export so existing importers
 // (and unit tests) can keep reaching it via this module.
@@ -170,7 +170,7 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
   const clock = deps.clock ?? systemClock;
   const branchPrefix = deps.branchPrefix ?? "anton";
 
-  return async function reviewFix(ctx: JobContext): Promise<void> {
+  return async function reviewFix(ctx: JobContext): Promise<JobEffect> {
     const { projectId, epicBeadId } = ctx.payload as ReviewFixPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -184,7 +184,7 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
     // comes from the same resolveOperator that execute-epic claims with, so "mine" matches the claim.
     const operator = await resolveOperator();
     const epics = inReviewEpics(all, { operator, epicBeadId });
-    if (epics.length === 0) return; // nothing in review for this operator — done.
+    if (epics.length === 0) return { changed: false, note: "nothing in review" };
 
     // Sweep each in-review PR. One epic's failure shouldn't abort the others, but a usage limit
     // must propagate so the runner backs the WHOLE job off (you can't retry an exhausted quota).
@@ -220,6 +220,10 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
     if (lastError) {
       throw lastError instanceof Error ? lastError : new Error(String(lastError));
     }
+
+    // Sweeping a PR is the effect, whether or not the review had anything actionable on it: the
+    // count is what an operator checks the poll against. A sweep of zero epics returned above.
+    return { changed: true, note: `swept ${epics.length} PR(s) in review` };
   };
 }
 

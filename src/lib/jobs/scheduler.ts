@@ -11,7 +11,7 @@
  */
 import { and, eq, inArray, lte } from "drizzle-orm";
 import * as schema from "../db/schema";
-import { enqueue, systemClock, type AntonDb, type Clock } from "./queue";
+import { newJobRow, systemClock, type AntonDb, type Clock, type JobType } from "./queue";
 import { nextRun } from "./cron";
 import type { RunnerLogger } from "./runner";
 import { PollingLoop } from "./polling-loop";
@@ -89,23 +89,41 @@ export class Scheduler {
       try {
         // Re-check inside the loop: deletion can raise the barrier after the due-query snapshot.
         if (this.quiescedProjects.has(s.projectId)) continue;
-        const overlapped = inflightKeys.has(`${s.type}\0${s.projectId}`);
-        if (!overlapped) {
-          await enqueue(this.db, this.clock, {
-            type: s.type as Parameters<typeof enqueue>[2]["type"],
+        // Advance from `now`, not the stale nextRunAt, so a long sleep (or an overlap) fires once.
+        // Resolved BEFORE any write: a cron this scheduler can't advance past must not enqueue, or
+        // the bad schedule re-fires on every tick.
+        const nextRunAt = secDate(nextRun(s.cron, nowMs));
+
+        if (inflightKeys.has(`${s.type}\0${s.projectId}`)) {
+          this.log.info(`scheduler: ${s.type} for ${s.projectId} still in flight — skipping this slot`);
+          // The slot is skipped, so `lastRunAt` keeps pointing at the fire actually in flight.
+          await this.db
+            .update(schema.schedules)
+            .set({ nextRunAt })
+            .where(eq(schema.schedules.id, s.id));
+          continue;
+        }
+
+        // The job insert and the `lastRunAt` stamp are ONE transaction, and the stamp IS the job's
+        // `createdAt`. The Automation table pairs a fire with its outcome by matching those two
+        // (lib/schedule-runs.ts), so splitting the writes would let a crash in between settle a job
+        // whose verdict then reads beside an earlier fire's date — or beside "never".
+        const row = newJobRow(
+          {
+            type: s.type as JobType,
             projectId: s.projectId,
             payload: { projectId: s.projectId, scheduleId: s.id },
-          });
-          enqueued += 1;
-        } else {
-          this.log.info(`scheduler: ${s.type} for ${s.projectId} still in flight — skipping this slot`);
-        }
-        // Advance from `now`, not the stale nextRunAt, so a long sleep (or an overlap) fires once.
-        const next = nextRun(s.cron, nowMs);
-        await this.db
-          .update(schema.schedules)
-          .set({ lastRunAt: overlapped ? s.lastRunAt : nowDate, nextRunAt: secDate(next) })
-          .where(eq(schema.schedules.id, s.id));
+          },
+          nowMs,
+        );
+        this.db.transaction((tx) => {
+          tx.insert(schema.jobs).values(row).run();
+          tx.update(schema.schedules)
+            .set({ lastRunAt: row.createdAt, nextRunAt })
+            .where(eq(schema.schedules.id, s.id))
+            .run();
+        });
+        enqueued += 1;
       } catch (e) {
         // A bad cron shouldn't wedge the whole loop; log and skip this schedule.
         this.log.error(`scheduler: failed to enqueue schedule ${s.id} (${s.type})`, e);

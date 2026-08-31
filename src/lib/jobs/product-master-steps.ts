@@ -76,7 +76,8 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
 
 /** A tier's filer, plus the snapshot the tier AFTER it must judge. */
 export interface ProposalFiler {
-  (detections: GardenerDetection[]): Promise<void>;
+  /** Returns how many proposals actually LANDED on the board — not how many were detected. */
+  (detections: GardenerDetection[]): Promise<number>;
   /**
    * The board as this filer now holds it. Re-read whenever an armed apply moved a bead, because a
    * pass that judged its own writes' premise would be reading a board it had already changed.
@@ -103,7 +104,7 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
   let snapshot = input;
   let writeBudget = scope.applyBudget;
 
-  const file = async (detections: GardenerDetection[]): Promise<void> => {
+  const file = async (detections: GardenerDetection[]): Promise<number> => {
     scope.ctx.signal.throwIfAborted();
     const { board, observedAtMs } = snapshot;
     // Derived from the SNAPSHOT, so it moves with it: an armed apply settles the proposals it
@@ -173,6 +174,7 @@ export function makeProposalFiler(scope: PassScope, input: ProposalFilerInput): 
         // resolved gate as an open blocker.
         snapshot = { board: await loadAllIssues(repo, { strictGates: true }), observedAtMs };
       }
+      return emission.created.length;
     } catch (e) {
       // Whatever landed before a create failed is real board state living only in the local working
       // set — report and propagate it, or a pass that parks leaves the proposals that DID file

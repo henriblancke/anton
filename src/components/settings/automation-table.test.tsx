@@ -243,6 +243,207 @@ describe("the automation rows", () => {
     expect(screen.getAllByText("never").length).toBe(AUTOMATIONS.length - 1);
   });
 
+  // "3h ago" alone reads as healthy whether the pass did work, found nothing, or parked on an
+  // error — which is what made the column unanswerable (anton-znoz).
+
+  it("says what came of the last fire, not just when it was", () => {
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: NOW_SEC() - 3 * 3600 - 60,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+    expect(screen.getByText("3h ago")).toBeTruthy();
+    expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
+  });
+
+  it("tells a fire that did nothing apart from one that did work", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 60,
+        lastRun: {
+          outcome: "noop",
+          at: NOW_SEC() - 60,
+          enqueuedAt: NOW_SEC() - 60,
+          note: "no stalls found",
+        },
+      },
+    });
+    expect(screen.getByText("no stalls found")).toBeTruthy();
+    // The no-op is named for a screen reader too, where the note alone would not carry the verdict.
+    expect(screen.getByText("nothing to do —")).toBeTruthy();
+  });
+
+  it("shows a failed fire with the error that explains it", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 120,
+          enqueuedAt: NOW_SEC() - 120,
+          note: "gh: not authenticated",
+        },
+      },
+    });
+    expect(screen.getByText("gh: not authenticated")).toBeTruthy();
+    expect(screen.getByText("failed —")).toBeTruthy();
+  });
+
+  // A schedule's FIRST fire has been enqueued and has settled nothing, so there is no previous
+  // result to date it against. Without saying "in progress" the row is a bare timestamp, and the
+  // automation's first execution looks like one that reported nothing at all.
+  it("shows a first fire with no settled result as in progress", () => {
+    renderTable({ "run-health": { enabled: true, lastRunAt: NOW_SEC() - 120 } });
+    expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.getByText("in progress")).toBeTruthy();
+    expect(screen.queryByText("nothing to do")).toBeNull();
+  });
+
+  // `lastRunAt` is stamped at enqueue, `lastRun` is the newest SETTLED job — so for the whole length
+  // of a fire the outcome beside it belongs to the PREVIOUS one. Reading last night's green result
+  // as the verdict on a run that started two minutes ago is the failure this guards.
+  it("does not credit a still-running fire with the previous fire's result", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: true,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+
+    expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.queryByText("triaged 4 signal(s)")).toBeNull();
+    // The older result is not hidden, it is dated to the run it came from.
+    expect(screen.getByText("in progress · ok 3h ago")).toBeTruthy();
+  });
+
+  it("does not blame a running fire for yesterday's failure", () => {
+    renderTable({
+      "run-health": {
+        enabled: true,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 26 * 3600,
+          enqueuedAt: NOW_SEC() - 26 * 3600,
+          note: "gh: not authenticated",
+        },
+      },
+    });
+
+    expect(screen.queryByText("gh: not authenticated")).toBeNull();
+    expect(screen.queryByText("failed —")).toBeNull();
+    expect(screen.getByText(/^in progress · failed 1d ago$/)).toBeTruthy();
+  });
+
+  // Disabling a schedule leaves an already enqueued job queued and unleased (jobs/runner.ts) while
+  // preserving `lastRunAt`, so the unsettled reading would otherwise claim a handler is running for
+  // as long as the automation stays off.
+  it("calls an unleased fire held, not in progress, while the automation is off", () => {
+    renderTable({
+      "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120, pendingRun: "queued" },
+    });
+
+    expect(screen.getByText("held · automation off")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // The other half of the same fact: the runner gates the CLAIM on the switch, never the handler, so
+  // a job leased before the switch went off runs to completion. Calling that held would tell an
+  // operator nothing is happening while a session is mid-flight.
+  it("keeps an already-leased fire in progress after the automation is switched off", () => {
+    renderTable({
+      "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120, pendingRun: "running" },
+    });
+
+    expect(screen.getByText("in progress")).toBeTruthy();
+    expect(screen.queryByText(/held/)).toBeNull();
+  });
+
+  // An armed schedule whose fire nothing has picked up yet is waiting on a worker, not working.
+  it("calls an unleased fire queued while the automation is on", () => {
+    renderTable({
+      "run-health": { enabled: true, lastRunAt: NOW_SEC() - 120, pendingRun: "queued" },
+    });
+
+    expect(screen.getByText("queued")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // With no pending job to read — a poll that has not landed yet — the switch is all there is.
+  it("falls back to the switch when the fire's own status is unknown", () => {
+    renderTable({ "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120 } });
+
+    expect(screen.getByText("held · automation off")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  it("dates the previous outcome behind a held fire without crediting it", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: false,
+        pendingRun: "queued",
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+
+    expect(screen.getByText("held · automation off · ok 3h ago")).toBeTruthy();
+    expect(screen.queryByText("triaged 4 signal(s)")).toBeNull();
+  });
+
+  // The mirror check: a settled fire always settles at or after it was enqueued, so the in-flight
+  // reading must never swallow a real outcome.
+  it("shows the outcome of a fire that settled after it was enqueued", () => {
+    const firedAt = NOW_SEC() - 3 * 3600 - 60;
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: firedAt,
+        lastRun: { outcome: "ok", at: firedAt + 90, enqueuedAt: firedAt, note: "triaged 4 signal(s)" },
+      },
+    });
+
+    expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // The outcomes are matched on ENQUEUE time, not settlement: an operator resuming a week-old parked
+  // fire settles it today, AFTER the fire now running was enqueued. Comparing settlement times would
+  // hand that stale failure to the running fire as its verdict.
+  it("does not hand a running fire the verdict of an older fire resumed after it started", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: true,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 30,
+          enqueuedAt: NOW_SEC() - 7 * 86_400,
+          note: "bd exited 1",
+        },
+      },
+    });
+
+    expect(screen.queryByText("bd exited 1")).toBeNull();
+    expect(screen.getByText("in progress · failed 7d ago")).toBeTruthy();
+  });
+
   // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
   // and without saying so the row reads as a failure.
   it("says which automations are idle because the one that feeds them is off", () => {
