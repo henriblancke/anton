@@ -32,8 +32,23 @@ const DUPLICATION_COLLECTOR = "duplication";
  */
 const FILE_BUDGET = 500;
 
-/** Languages where `#` starts a comment. In TS/JS a leading `#` is a private class field — code. */
-const HASH_COMMENT_EXTENSIONS = [".py", ".sh", ".bash", ".zsh", ".rb", ".yaml", ".yml", ".toml"];
+/**
+ * Languages where `#` starts a comment. In TS/JS a leading `#` is a private class field — code. A
+ * stub (`.pyi`) is Python with its bodies removed: `#` cuts a line there exactly as it does in the
+ * module it describes, and omitting the extension files a window of repeated stub comments as
+ * executable code and sends it to triage.
+ */
+const HASH_COMMENT_EXTENSIONS = [
+  ".py",
+  ".pyi",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".rb",
+  ".yaml",
+  ".yml",
+  ".toml",
+];
 
 /**
  * The subset where a `#` opens a comment only AFTER whitespace. Shell reads `${#items[@]}` and `$#`
@@ -352,14 +367,16 @@ const COMPARISON_OPERATORS = String.raw`[<>]=?`;
  * a separator, an operator or an expression keyword. After a value — `)`, `]`, an identifier — the
  * same `/` divides, and blanking `a / b(c) / d` would eat the parens it spans. The prefix is
  * captured rather than looked behind so the scan resumes after it, and the body admits an escape or
- * a character class so `/[/]/` and `/\(/` both close where they actually close.
+ * a character class so `/[/]/` and `/\(/` both close where they actually close. A class carries
+ * escapes of its own — `/[\(]/`, `/[\w]/` — so its content admits them too: refusing them fails the
+ * whole class branch, and the `(` left behind in `/[\(]/` is counted as a delimiter by `parenDelta`.
  *
  * Without this a parameter default like `pattern = /\(/` leaves an unmatched `(` for `parenDelta`
  * to count, the signature never closes on its real `)`, and every statement below it reads as more
  * parameter list — turning a genuine clone of runtime work into a declaration and dropping it.
  */
 const REGEX_LITERAL = new RegExp(
-  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS}|${COMPARISON_OPERATORS}(?=\s))(\s*)\/(?:\\.|\[([{,;:=!&|?*%^/]:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
+  String.raw`(^|${EXPRESSION_OPERATORS}|${EXPRESSION_KEYWORDS}|${COMPARISON_OPERATORS}(?=\s))(\s*)\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\[])+\/[dgimsuvy]*`,
   "g",
 );
 
@@ -404,8 +421,11 @@ function afterQuoted(line: string, start: number): number {
  * The heads whose parenthesized clause is followed by a STATEMENT rather than by more expression.
  * `for await` is the same head with its async spelling — the `await` there is part of the loop, not
  * an operator yielding a value, so its clause hands to a statement exactly as a plain `for` does.
+ * `with` is on the list because sloppy-mode scripts still carry it and `with (obj) /[/*]/.test(v)`
+ * is a legal body; a MEMBER of the same name is not, since `array.with(0, x)` yields a value and
+ * `array.with(0, x) / 2` divides — hence the dot the head is refused behind.
  */
-const CONTROL_HEAD = /\b(?:if|for(?:\s+await)?|while)\s*$/;
+const CONTROL_HEAD = /(?<!\.\s*)\b(?:if|for(?:\s+await)?|while|with)\s*$/;
 
 /**
  * Whether the text ends with the `)` that CLOSES a control-flow head — `if (enabled)`, `for (…)`,
@@ -437,16 +457,42 @@ function closesControlHead(before: string): boolean {
 type BraceKind = "block" | "value";
 
 /**
+ * The two spellings where a trailing `:` hands to a STATEMENT rather than to a value — a statement
+ * label (`outer:`) and a switch arm (`case "draft":`, `default:`). The `:` is an expression prefix
+ * everywhere else, so without this `outer: {` records an object literal and the `}` that closes it
+ * is not read as a statement boundary: `} /[/*]/.test(value);` on the next line then opens a
+ * phantom comment that drops every executable window below it.
+ *
+ * The label must be the whole clause — a name, or a `case` expression carrying no `:` of its own —
+ * so a property key with a value already on the line (`retries: 3,`) never reads as one.
+ */
+const STATEMENT_LABEL = /(?:^|[;{}])\s*(?:case\b[^:]*|default|[A-Za-z_$][\w$]*)\s*:$/;
+
+/**
+ * What the `{` that `before` ends at opened. An expression prefix — `=`, `(`, `return` — can only
+ * be followed by a value, so the brace opened an object literal; anything else opened a block.
+ *
+ * A label's `:` is the exception: it is an expression prefix by spelling and a statement boundary in
+ * fact. Which one it is depends on where it sits — inside an object literal `handler: {` is a
+ * property whose value is another literal, while anywhere else `outer: {` is a labeled block — so
+ * the kind of the brace ENCLOSING it decides.
+ */
+function braceKind(before: string, enclosing: BraceKind | undefined): BraceKind {
+  const text = before.trimEnd();
+  if (enclosing !== "value" && STATEMENT_LABEL.test(text)) return "block";
+  return REGEX_PREFIX.test(text) ? "value" : "block";
+}
+
+/**
  * Whether the trailing `}` of `before` closes a BLOCK rather than an object literal. A block ends a
  * statement, so a `/` behind it opens a regex; an object literal is a VALUE, so the same `/`
  * divides — `const ratio = { value: 1 } / /[/*]/.source.length` divides by a regex's source length,
  * and reading its first slash as an opener runs an invented literal to the second one and leaves the
  * `/*` in that character class to open a comment over every line below.
  *
- * The `{` that matches is found by a balanced scan backwards, as the control head's `(` is, and what
- * precedes it decides: an expression prefix — `=`, `(`, `return` — can only be followed by a value,
- * so the brace opened a literal. Anything else (`if (…)`, `function f()`, the start of a statement)
- * opened a block. A `{` opened on an EARLIER line is not on this line to read, so the kinds `open`
+ * The `{` that matches is found by a balanced scan backwards, as the control head's `(` is, and
+ * `braceKind` reads what precedes it. A `{` opened on an EARLIER line is not on this line to read,
+ * so the kinds `open`
  * carries from above decide instead: a multiline object literal ends on a line leading with its own
  * `}`, and `} / /[/*]/.source.length` divides there exactly as the one-line spelling does. The
  * backward scan ends one level deep per unmatched `}`, so the brace this one closes sits that many
@@ -459,7 +505,7 @@ function closesBlock(before: string, open: readonly BraceKind[]): boolean {
     if (before[i] === "}") depth += 1;
     else if (before[i] === "{") {
       depth -= 1;
-      if (depth === 0) return !REGEX_PREFIX.test(before.slice(0, i).trimEnd());
+      if (depth === 0) return braceKind(before.slice(0, i), open[open.length - 1]) === "block";
     }
   }
   return open[open.length - depth] !== "value";
@@ -467,8 +513,9 @@ function closesBlock(before: string, open: readonly BraceKind[]): boolean {
 
 /**
  * Fold this line's braces into the kinds still open above it, so a `}` on a LATER line knows what it
- * closed. The rule is `closesBlock`'s, carried ACROSS lines rather than within one: an expression
- * prefix opens a value, anything else opens a block. `stripNoise` runs first — a brace inside a
+ * closed. The rule is `braceKind`'s, the one `closesBlock` reads within a line, carried ACROSS
+ * lines — the kinds already on the stack are what tells a labeled block's `{` from an object
+ * literal's property. `stripNoise` runs first — a brace inside a
  * comment, a string or a regex opens nothing — and an unmatched `}` simply pops nothing, since a
  * file whose braces do not balance is one this scanner is already guessing about.
  */
@@ -476,7 +523,7 @@ function trackBraces(open: BraceKind[], line: string): void {
   const text = stripNoise(line);
   for (let i = 0; i < text.length; i += 1) {
     if (text[i] === "{") {
-      open.push(REGEX_PREFIX.test(text.slice(0, i).trimEnd()) ? "value" : "block");
+      open.push(braceKind(text.slice(0, i), open[open.length - 1]));
     } else if (text[i] === "}") open.pop();
   }
 }

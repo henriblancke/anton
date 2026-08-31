@@ -1997,6 +1997,34 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("5 import");
     });
 
+    // A stub is Python with its bodies removed: `#` cuts a line there exactly as it does in the
+    // module it describes. Read as code, a window of repeated stub notes keeps its signal and
+    // reaches triage — the very thing this filter exists to stop.
+    it("reads a `#` in a Python stub as the comment it is", async () => {
+      const repo = writeRepo({
+        "src/types.pyi": [
+          "# the row shape the loader hands back, restated for callers",
+          "# who only ever see the stub and never the module beside it",
+          "# and who need the field order spelled out to read it at all",
+          "def load(rows: list[str]) -> int: ...",
+          "",
+        ].join("\n"),
+        "src/work.py": ["total = compute(rows)", "report(total)", "flush(report)", ""].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/types.pyi", 1]], 3),
+        clone([["src/work.py", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the executable window beside it survives, so the drop is the comment rule
+      // rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/work.py" }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/types.pyi" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 comment");
+    });
+
     // A `#` note trails code as readily as it leads a line, and its prose is not syntax. Counted,
     // the `{` inside `)  # keep { documented` cancels the paren that ends the import, so the state
     // never closes and every executable window below it is dropped as a specifier list.
@@ -2401,6 +2429,57 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // `with` heads a clause the same way — sloppy-mode scripts still carry it, and
+    // `with (obj) /[/*]/.test(value);` runs a regex test as its body. Read as division, the `/*`
+    // inside that character class opens a comment that runs to the end of the file and every real
+    // duplication window below it is dropped unread.
+    it("reads a slash after a with head as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/sloppy.js": [
+          "function check(obj, value) {",
+          "  with (obj) /[/*]/.test(value);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/sloppy.js", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/sloppy.js", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // The member of the same name is not that head: `array.with(0, seed)` yields a VALUE, so the
+    // slash behind its `)` divides. Read as a head, the invented literal runs to the divisor's own
+    // slash and the `/*` inside its character class comments out every line below.
+    it("reads a slash after an Array#with call as division, not as a regex", async () => {
+      const repo = writeRepo({
+        "src/ratio.ts": [
+          "export function ratio(items: number[], seed: number, limit: number) {",
+          "  const rate = items.with(0, seed) / /[/*]/.source.length;",
+          "  emit(rate);",
+          "  flush(rate);",
+          "  report(rate);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/ratio.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // A `}` closes the block before it and a fresh STATEMENT begins — `if (enabled) {}
     // /[/*]/.test(value);` tests a regex. Read as division, the `/*` inside the character class opens
     // a comment that runs to the end of the file and every real duplication window below it is
@@ -2505,6 +2584,64 @@ describe("scan", () => {
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
       expect(result.signals).toMatchObject([{ FilePath: "src/guarded.ts", Line: 5 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // A LABEL's `:` is an expression prefix by spelling and a statement boundary in fact, so
+    // `outer: {` opens a block. Recorded as an object literal, its `}` ends a value, the slash
+    // behind it reads as division, and the `/*` in the character class beside it comments out every
+    // line below.
+    it("reads a slash after a labeled block as a regex, not as division", async () => {
+      const repo = writeRepo({
+        "src/labeled.ts": [
+          "export function check(enabled: boolean, value: string) {",
+          "  outer: {",
+          "    if (enabled) break outer;",
+          "    log(value);",
+          "  } /[/*]/.test(value);",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/labeled.ts", 6]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/labeled.ts", Line: 6 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
+    // The other side of that rule: inside an object literal the same `key: {` is a PROPERTY whose
+    // value is another literal, so the slash behind its `}` still divides. Read as a labeled block,
+    // the invented literal runs to the divisor's own slash and its `/*` comments out the rest.
+    it("reads a slash after a nested property literal as division, not as a regex", async () => {
+      const repo = writeRepo({
+        "src/config.ts": [
+          "export const config = {",
+          "  handler: {",
+          "    value: 1,",
+          "  } / /[/*]/.source.length,",
+          "};",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/config.ts", 7]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/config.ts", Line: 7 }]);
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
@@ -2689,6 +2826,33 @@ describe("scan", () => {
       // ...while the parameter list above them still reads as one, division and all.
       expect(result.duplication.dropped).toMatchObject([{ path: "src/ratio.ts" }]);
       expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
+    // A character class carries escapes of its own — `/[\(]/` matches a literal paren. Refused, the
+    // whole literal goes unrecognized and the `(` inside it is counted as syntax: the parameter list
+    // never closes on its real `)` and every statement below it reads as more parameter list.
+    it("does not count the delimiters escaped inside a regex character class as syntax", async () => {
+      const repo = writeRepo({
+        "src/classed.ts": [
+          "export function match(",
+          "  input: string,",
+          "  pattern = /[\\(]/,",
+          ") {",
+          "  doAlpha(input);",
+          "  doBeta(input);",
+          "  doGamma(input);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/classed.ts", 5]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/classed.ts", Line: 5 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
     });
 
     // A template literal that runs past its line is raw text, and a `(` in that text is not syntax.
