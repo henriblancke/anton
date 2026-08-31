@@ -880,6 +880,38 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-2");
   });
 
+  it("pins the ancestor when a delivered descendant was reopened since the sweep (PR #199)", async () => {
+    // The closing batch is built from the same snapshot that called t3 delivered, so a t3 reopened
+    // while the PR was being finalized is left out of it. Detaching it onto the merged target would
+    // leave it open beneath a closed home nothing anton runs reaches — neither rehomed with t2 nor
+    // closed with the merge.
+    const shipped = under("t2", bead("t3", "closed"));
+    statuses.set("t3", "open");
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      shipped,
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(noteFor("t2")).toContain("t3 still hangs off it");
+  });
+
+  it("pins the ancestor when a delivered descendant is claimed since the sweep (PR #199)", async () => {
+    // A claim is live work whatever the status: detaching t3 would pull it out of the subtree its
+    // operator selected, onto a target anton is about to close.
+    const shipped = claimed(under("t2", bead("t3", "closed")), "op-2");
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      shipped,
+    ]);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(noteFor("t2")).toContain("t3 still hangs off it");
+  });
+
   it("leaves a delivered descendant another operator moved off the ancestor alone", async () => {
     // The snapshot says t3 hangs off t2; the live board says it does not. Detaching it would
     // rewrite an edge that belongs to whoever moved it, and nothing rides onto the follow-up.

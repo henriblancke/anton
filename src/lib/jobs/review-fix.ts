@@ -1412,6 +1412,19 @@ async function applyRehome(
   // there is nothing to take the child off — and it now belongs to whoever claimed or reparented
   // it, so detaching their descendant would rewrite an edge inside somebody else's subtree.
   const preservedIds = new Set(preserved.map((b) => b.id));
+  /**
+   * Whether detaching this child onto the merged target would STRAND it (PR #199). Delivery is the
+   * sweep's verdict, and the closing batch is built from that same snapshot: a child it read as
+   * `closed` is left out of the batch, so one another operator has reopened, deferred or claimed
+   * since would sit open beneath a closed target nothing anton runs reaches — neither rehomed with
+   * its ancestor nor closed with the merge. A claim says as much on its own, whatever the status:
+   * the detach would pull live work out of the subtree its operator picked.
+   */
+  const strandedByDetach = (live: Bead, snapshot: Bead): boolean => {
+    const owner = ownerOf(live);
+    if (owner !== undefined && owner !== runOwner) return true;
+    return snapshot.status === "closed" && live.status !== "closed";
+  };
   for (const bead of subtree) {
     if (preservedIds.has(bead.id)) continue;
     const parentId = beads.parentOf(bead);
@@ -1426,7 +1439,11 @@ async function applyRehome(
     // Still the sweep's evidence until the board confirms it: a ticket another operator has since
     // moved off this ancestor rides on nothing, and detaching would rewrite an edge that is theirs.
     if (shipped && beads.parentOf(shipped) !== parentId) continue;
-    if (shipped && (await safe(() => beads.reparent(repo, bead.id, epic.id))))
+    if (
+      shipped &&
+      !strandedByDetach(shipped, bead) &&
+      (await safe(() => beads.reparent(repo, bead.id, epic.id)))
+    )
       continue;
     await pinAncestors(bead);
   }
