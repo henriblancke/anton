@@ -957,6 +957,82 @@ function unclosedBlockComment(line: string, nested: boolean): { opener: number; 
   return { opener: -1, depth: 0 };
 }
 
+/** The quotes an ordinary, single-line string is written behind. */
+type QuoteChar = "'" | '"';
+
+/**
+ * Where an ordinary quoted string OPENS on this line and a trailing backslash carries it onto the
+ * next — `const fixture = "example \`. Its text is not syntax, so the caller blanks it from the
+ * opener on and resumes inside the same quote below.
+ *
+ * A quote left hanging WITHOUT that backslash opens nothing: the literal is then unterminated,
+ * which no language accepts, and reading the rest of the file as its text would drop every window
+ * below it. Comments and regex literals are stepped over for the reason the block-comment scanner
+ * steps over them — the apostrophe in a trailing `// don't` note quotes nothing, and `/["']/` holds
+ * quotes inside a character class.
+ *
+ * Without it the string's own text is read as syntax: a fixture line leading `import {` opens
+ * import state whose unmatched brace never closes, and every executable window past the closing
+ * quote inherits the class and is dropped as a specifier list.
+ */
+function continuedQuote(
+  line: string,
+  slashComments: boolean,
+): { opener: number; quote: QuoteChar } | undefined {
+  if (!line.endsWith("\\")) return undefined;
+  let i = 0;
+  while (i < line.length) {
+    const char = line[i];
+    if (char === "'" || char === '"') {
+      const end = afterQuoted(line, i);
+      // `afterQuoted` stops at the line's end whether the closer arrived or not; the character it
+      // stopped on is what tells the two apart. A lone quote is its own opener, never its closer.
+      if (end - 1 === i || line[end - 1] !== char) return { opener: i, quote: char };
+      i = end;
+      continue;
+    }
+    if (slashComments) {
+      if (char === "/" && line[i + 1] === "/") return undefined;
+      if (char === "/" && line[i + 1] === "*") {
+        const close = line.indexOf("*/", i + 2);
+        // An opener the line never closes is already cut by `unclosedBlockComment`; a remnant of one
+        // leaves nothing behind it that could open a string.
+        if (close < 0) return undefined;
+        i = close + 2;
+        continue;
+      }
+      if (char === "/" && opensRegex(line, i)) {
+        const end = afterRegex(line, i);
+        if (end > 0) {
+          i = end;
+          continue;
+        }
+      }
+    }
+    i += 1;
+  }
+  return undefined;
+}
+
+/**
+ * Blank the text a continued string leaves on this line — up to the quote that closes it, or the
+ * whole line when a backslash carries it on again. What follows the closer is handed back, since
+ * that suffix is real syntax: `still text";` ends a statement.
+ *
+ * A line that neither closes nor continues ENDS the string here rather than running on: the file is
+ * malformed at that point, and recovering costs the one line where carrying it costs the rest.
+ */
+function maskContinuedQuote(
+  line: string,
+  quote: QuoteChar,
+): { text: string; open: QuoteChar | undefined } {
+  for (let i = 0; i < line.length; i += 1) {
+    if (line[i] === "\\") i += 1;
+    else if (line[i] === quote) return { text: `""${line.slice(i + 1)}`, open: undefined };
+  }
+  return { text: '""', open: line.endsWith("\\") ? quote : undefined };
+}
+
 /**
  * Classify every line of a file in one forward pass. Whole-file, not just the reported window,
  * because the state that decides what a line IS — inside a block comment, inside a wrapped import,
@@ -1004,6 +1080,8 @@ function classifyLines(
   const heredocs: string[] = [];
   // How many `#` the open Rust raw string's closer must carry; undefined outside one.
   let rawString: number | undefined;
+  // The quote an ordinary string a backslash continued is still behind; undefined outside one.
+  let quoted: QuoteChar | undefined;
   let depth = 0;
   let statement: "import" | "type" | "signature" | undefined;
   // Whether the open import is a side-effect one: held as an `import` so it terminates on its own
@@ -1048,6 +1126,19 @@ function classifyLines(
       line = walked.rest.trim();
       if (line === "") {
         classes.push("comment");
+        continue;
+      }
+    }
+    // Inside a string a backslash carried onto this line, the line is that string's TEXT — the same
+    // rule the template and raw-string states follow, for the one multiline form an ORDINARY quote
+    // has. Read before the comment and blank tests, since a continuation line starting with `//` is
+    // not prose.
+    if (quoted) {
+      const masked = maskContinuedQuote(line, quoted);
+      quoted = masked.open;
+      line = masked.text.trim();
+      if (quoted || line === "") {
+        classes.push("code");
         continue;
       }
     }
@@ -1166,6 +1257,16 @@ function classifyLines(
     // documented`. Cut here, before any delta is counted, so the prose after the marker cannot hold
     // a wrapped import open over the executable lines below it.
     if (opts.hashComments) line = withoutHashComment(line, opts.spacedHash);
+
+    // A quoted string this line leaves open behind a backslash: blank it from the opener on, so
+    // neither its text nor the delimiters inside it reach the classifiers below — what precedes the
+    // quote is still what the line does. Cut here, after the comment markers, since a quote inside a
+    // note opens nothing.
+    const continued = continuedQuote(line, slashComments);
+    if (continued) {
+      quoted = continued.quote;
+      line = `${line.slice(0, continued.opener)}""`.trim();
+    }
 
     // A heredoc this line opens: its payload starts on the NEXT line, so the opener itself still
     // classifies as the command it is. Read after the `#` cut, so one quoted in a note opens

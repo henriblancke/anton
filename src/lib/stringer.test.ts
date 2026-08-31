@@ -2987,6 +2987,70 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // A backslash at a line's end carries an ordinary quoted string onto the next line, and a
+    // fixture written that way quotes source as readily as a template does. Read line by line, the
+    // string's own `import {` opens import state whose unmatched brace holds every executable line
+    // past the closing quote as a specifier — and the clone of real work below is dropped unread.
+    it("carries a backslash-continued string, so a declaration inside it cannot swallow the code below", async () => {
+      const repo = writeRepo({
+        "src/fixture.ts": [
+          "export function load(rows: Row[]) {",
+          "  // the opening fragment of a generated file — its `}` closes in a later chunk",
+          '  const header = "example \\',
+          "import { readFile, \\",
+          'still text";',
+          "  const total = compute(rows);",
+          "  report(total);",
+          "  flush(total);",
+          "}",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/fixture.ts", 6]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the specifier list beside it is still dropped, so the survivor is the carried
+      // quote rather than a filter that read nothing.
+      expect(result.signals).toMatchObject([{ FilePath: "src/fixture.ts", Line: 6 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
+    // An unterminated quote is not a continued one: without the backslash the literal is malformed,
+    // and reading the rest of the file as its text would drop every window below it. A hanging
+    // apostrophe in a trailing note is the same rule — a comment opens no string at all.
+    it("keeps reading code below a hanging quote that no backslash continues", async () => {
+      const repo = writeRepo({
+        "src/notes.ts": [
+          "export function notes(rows: Row[]) {",
+          "  const label = tag(rows); // don't drop the rows below",
+          "  const total = compute(rows);",
+          "  report(total);",
+          "  flush(total);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/notes.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/notes.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // Dart nests its block comments as Rust does. Closed at the INNER `*/`, the still-commented
     // `import (` below it opens import state that no real `)` closes, and every executable line past
     // the outer closer inherits it and is dropped as a specifier list.
