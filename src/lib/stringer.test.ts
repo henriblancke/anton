@@ -1249,6 +1249,51 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
     });
 
+    // A marker quoted inside a string opens no comment. Blanking from the `//` in a URL erases the
+    // call written beside it, and the file then proves no caller for a symbol it does use — the
+    // filter reports a signal the tree had already disproved.
+    it("counts a call written after a string that holds a comment marker", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.ts": 'const url = "https://host"; neverCalled();\n',
+        "src/lib/block.ts": "const opener = '/*';\nneverCalled();\n",
+        "src/lib/tick.ts": "const url = `https://host`;\nneverCalled();\n",
+        "config/deploy.yml": 'url: "https://host" # neverCalled runs here\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/block.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/tick.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("config/deploy.yml");
+    });
+
+    // ...and stepping over the literal must not step over the comment behind it: a marker past the
+    // closing quote still blanks its line, or prose proves a caller that isn't there. A quote that
+    // never closes on its line is no literal to step over at all — the tail of a template literal
+    // still carries the comment written after it.
+    it("still masks a comment opened after a string on the same line", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts": 'const url = "https://host"; // neverCalled was removed\n',
+        "src/lib/wrapped.ts": "const banner = `\n  hello\n`; // neverCalled was removed\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
     // PHP takes `#` as a line comment on top of `//`, so it reads neither like C nor like a file
     // anton has no grammar for: prose after `#` must not prove a caller, and a real call must still
     // count.
@@ -2410,6 +2455,41 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/icon.tsx");
+    });
+
+    // Rendered prose carries ordinary punctuation. JSX gives an operator no meaning between a tag
+    // and its children — code stands there only inside a `{…}` — so a slash in `A/B` or an
+    // ampersand in `R&D` is a character the page shows, and reading it as program lets a doc page
+    // prove its own caller. Nor does it end the element: the paragraph under `A/B testing` is
+    // still the `<div>`'s text. The interpolation and the tag beside that prose stay code.
+    it("reads JSX text holding an operator as prose, and still counts the code beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/slash.tsx": "export const Doc = () => <p>A/B Widget documentation</p>;\n",
+        "src/ui/prose.tsx":
+          "export const Note = () => (\n" +
+          "  <p>R&D + QA dropped Widget in favour of Panel</p>\n);\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    A/B testing\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>{Widget()}</p>;\n",
+        "src/ui/after.tsx":
+          "export const After = () => (\n  <div>\n    A/B testing\n" +
+          "    <Widget />\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/after.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/slash.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/prose.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
     });
 
     // A child expression wraps onto lines of its own too, and it is the element's child rather

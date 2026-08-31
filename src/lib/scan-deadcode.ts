@@ -85,6 +85,15 @@ interface CommentSyntax {
    * `=end` are, so `total =begin_of_month` is an assignment rather than a comment that never closes.
    */
   anchored?: boolean;
+  /**
+   * The characters a string literal opens with, for the languages that spell one unambiguously. A
+   * marker quoted inside a literal opens no comment — `const url = "https://host"; Widget()` calls
+   * the symbol beside the URL — and blanking from that `//` erases the call, leaving a signal
+   * standing that the file had already disproved. Left unset where the quote means something else
+   * as often: a lifetime in Rust, an apostrophe in MDX prose, anything at all in a language anton
+   * tracks no grammar for.
+   */
+  quotes?: string;
 }
 
 /**
@@ -103,6 +112,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     files: /\.(?:[cm]?[jt]sx?|go|java|c|h|cc|cpp|hpp|cs|css|scss|less|dart|proto)$/i,
     line: ["//"],
     block: [["/*", "*/"]],
+    quotes: "\"'`",
   },
   {
     // Rust, Swift, Scala and Kotlin nest block comments: in `/* outer /* inner */ tail */` the
@@ -112,6 +122,9 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     line: ["//"],
     block: [["/*", "*/"]],
     nested: true,
+    // Only the double quote: `'` opens a lifetime (`&'a str`) and a backtick an identifier as
+    // often as either opens a literal, and skipping a span that isn't one hides a real comment.
+    quotes: '"',
   },
   {
     // PHP takes `#` as well as `//`, so it can't ride with the C-like languages, where `#` opens a
@@ -120,6 +133,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     files: /\.(?:php|phtml)$/i,
     line: ["//", "#"],
     block: [["/*", "*/"]],
+    quotes: "\"'",
   },
   {
     files: /\.(?:html?|xml|svg|vue|svelte|astro)$/i,
@@ -128,6 +142,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
       ["<!--", "-->"],
       ["/*", "*/"],
     ],
+    quotes: "\"'",
   },
   {
     // MDX is a program, not a document: `import { Widget } from './widget'` and `<Widget />` name a
@@ -157,6 +172,9 @@ const COMMENT_SYNTAX: FileSyntax[] = [
       ['"""', '"""'],
       ["'''", "'''"],
     ],
+    // The triple-quoted forms are matched as blocks before this, so a docstring still opens where
+    // it always did — only the one- and two-character literals are stepped over.
+    quotes: "\"'",
   },
   {
     // Ruby's block comment is a pair of line-anchored markers rather than an inline delimiter, and
@@ -166,6 +184,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     line: ["#"],
     block: [["=begin", "=end"]],
     anchored: true,
+    quotes: "\"'",
   },
   {
     // SQL's line comment is `--`, which the unknown-language fallback cannot read: `--` is as often
@@ -177,6 +196,7 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     line: ["--"],
     block: [["/*", "*/"]],
     nested: true,
+    quotes: "\"'",
   },
   {
     // HCL comments with `#` as well as `//`, and the unknown-language fallback reads neither once
@@ -186,11 +206,13 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     files: /\.(?:tf|tfvars|hcl)$/i,
     line: ["#", "//"],
     block: [["/*", "*/"]],
+    quotes: '"',
   },
   {
     files: /\.(?:sh|bash|zsh|ya?ml|toml)$/i,
     line: ["#"],
     block: [],
+    quotes: "\"'",
   },
 ];
 
@@ -217,8 +239,8 @@ function commentSyntaxOf(file: string): FileSyntax | undefined {
   return COMMENT_SYNTAX.find((syntax) => syntax.files.test(file));
 }
 
-/** The first comment starting at or after `from`, whichever kind opens earliest. */
-function nextComment(
+/** The first comment marker at or after `from`, whichever kind opens earliest. */
+function commentAt(
   line: string,
   from: number,
   syntax: CommentSyntax,
@@ -233,6 +255,55 @@ function nextComment(
     if (at >= from && (!found || at < found.at)) found = { at, marker: opener, closer };
   }
   return found;
+}
+
+/**
+ * Where the string opened at `at` ends, or -1 when it runs off the end of the line. Escapes are
+ * stepped over so `"a\"b"` ends on its third quote and not its second.
+ */
+function stringEnd(line: string, at: number, quote: string): number {
+  for (let cursor = at + 1; cursor < line.length; cursor += 1) {
+    if (line[cursor] === "\\") cursor += 1;
+    else if (line[cursor] === quote) return cursor;
+  }
+  return -1;
+}
+
+/**
+ * The first comment starting at or after `from`, with quoted text stepped over rather than read.
+ * `const url = "https://host"; Widget()` holds no comment: blanking from the `//` inside that URL
+ * erases the call beside it, and the file then proves no caller for a signal it had in fact
+ * disproved. A marker that opens where the quote does wins — Python's `"""` is a block, not a
+ * literal to skip.
+ *
+ * A quote that never closes on its line is not a literal worth trusting, so the scan resumes just
+ * past it: a Rust `'a`, an apostrophe in a shell comment and a template literal spanning lines all
+ * read as they did before, and a trailing comment behind any of them still gets blanked.
+ */
+function nextComment(
+  line: string,
+  from: number,
+  syntax: CommentSyntax,
+): { at: number; marker: string; closer?: string } | undefined {
+  const quotes = syntax.quotes;
+  let at = from;
+  for (;;) {
+    const found = commentAt(line, at, syntax);
+    if (quotes === undefined) return found;
+    let quoteAt = -1;
+    let quote = "";
+    for (let cursor = at; cursor < line.length; cursor += 1) {
+      const char = line[cursor];
+      if (char !== undefined && quotes.includes(char)) {
+        quoteAt = cursor;
+        quote = char;
+        break;
+      }
+    }
+    if (quoteAt < 0 || (found !== undefined && found.at <= quoteAt)) return found;
+    const end = stringEnd(line, quoteAt, quote);
+    at = end < 0 ? quoteAt + 1 : end + 1;
+  }
 }
 
 /** The line with its comment spans replaced by spaces — same length, so offsets still line up. */
@@ -293,9 +364,10 @@ function closeBlock(
 
 /**
  * The file's lines with every comment blanked out, so a hit is read against the code actually left
- * on its line. The scan is textual: a delimiter inside a string literal opens a block that isn't
- * there, and a `//` inside a URL comments out the rest of its line. Every such mistake ends in
- * "this hit is prose", which leaves a signal standing rather than deleting one.
+ * on its line. The scan is textual, so it reads a line at a time and only steps over the literals
+ * `syntax.quotes` names — a delimiter quoted in a language anton has no quote grammar for, or in a
+ * string that wraps, still opens a block that isn't there. Every such mistake ends in "this hit is
+ * prose", which leaves a signal standing rather than deleting one.
  */
 function maskComments(text: string, syntax: CommentSyntax): string[] {
   let open: OpenBlock | undefined;
@@ -1160,17 +1232,29 @@ const JSX_ATTRS = String.raw`(?:"[^"]*"|'[^']*'|[^<>"'])*`;
 const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![/])>)`;
 
 /**
- * The punctuation no rendered line carries. A generic closes with the same `>` a tag does —
- * `new Map<string, Widget>()` — so text that claims to be rendered has to read as a sentence
- * before it is believed, or a real call goes uncounted.
+ * The delimiters JSX spells its own syntax with — the only punctuation that means anything between
+ * a tag and its children, since code stands there solely inside a `{…}`. A generic closes with the
+ * same `>` a tag does — `new Map<string, Widget>()` — so text that claims to be rendered has to
+ * read as a sentence before it is believed, or a real call goes uncounted.
  */
-const JSX_PUNCTUATION = String.raw`<>{}()[\]=;\\|&+*/\``;
+const JSX_DELIMITERS = String.raw`<>{}()[\]=;\\|\``;
+
+/**
+ * Arithmetic, which is program text on a line standing outside every element — `const half =
+ * total / 2` — and ordinary punctuation inside one. `<p>A/B Widget documentation</p>` shows the
+ * symbol to a reader, and reading that slash as program lets a prose-only page prove its own
+ * caller and delete a true finding.
+ */
+const JSX_OPERATORS = String.raw`&+*/`;
+
+/** Anything that makes a line outside an element program — an interpolation, a call, arithmetic. */
+const JSX_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}${JSX_OPERATORS}]`);
+
+/** That same test for text a tag has opened, where an operator is punctuation the page shows. */
+const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}]`);
 
 /** What a reader sees: a tag this line leaves open, with only prose behind it. */
-const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_PUNCTUATION}]*$`);
-
-/** Anything that makes a line program again — the closing `</p>`, an interpolation, a call. */
-const JSX_CODE = new RegExp(String.raw`[${JSX_PUNCTUATION}]`);
+const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_DELIMITERS}]*$`);
 
 /**
  * The tail of a static prop — `title="Widget was removed`: the value a reader sees, not code.
@@ -1421,7 +1505,10 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
     }
     const opener = JSX_TAG_OPEN.exec(rest);
     const { net, remainder } = jsxTags(opener ? rest.slice(0, opener.index) : rest);
-    if (JSX_CODE.test(remainder)) {
+    // Inside an element the line is that element's children, where arithmetic is punctuation the
+    // page shows rather than the program text that ends the run — `<div>` with `A/B testing` under
+    // it still renders the paragraph written below that.
+    if ((depth > 0 ? JSX_CHILD_CODE : JSX_CODE).test(remainder)) {
       // An interpolation inside an element is that element's child, not the end of it: `<div>` with
       // `{ready &&` under it still renders the prose written after the brace closes. Dropping the
       // parent here reads that text as program and lets it prove its own caller.
@@ -1456,9 +1543,10 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
  * element rendered before the prose leaves its parent open rather than ending it:
  * `<p><strong>Note:</strong> Widget was removed</p>` shows the symbol to a reader, and reading the
  * `</strong>` as program would let that paragraph prove its own caller. Rendered text then carries
- * only as far as the prose does — past the last tag the head has to be punctuation-free, or the
- * symbol sits inside an expression and the line is program again. Inside a wrapped tag only a
- * static value is prose, so `body={Widget()}` on its own line still counts as the call it is.
+ * only as far as the prose does — past the last tag the head has to be free of JSX's own
+ * delimiters, or the symbol sits inside an expression and the line is program again. Inside a
+ * wrapped tag only a static value is prose, so `body={Widget()}` on its own line still counts as
+ * the call it is.
  *
  * A value that wrapped ends at the quote that opened it, not at any quote: a double-quoted
  * `title` continued with `It's Widget documentation` holds an apostrophe, and ending the value
@@ -1489,7 +1577,7 @@ function referencesJsx(line: string | undefined, symbol: string, state: JsxLine 
     if (JSX_PROP_TEXT.test(head)) return false;
     const { net, remainder, after } = jsxTags(head);
     const open = (inTag ? 0 : parents) + net;
-    return open <= 0 || JSX_CODE.test(remainder.slice(after));
+    return open <= 0 || JSX_CHILD_CODE.test(remainder.slice(after));
   });
 }
 
