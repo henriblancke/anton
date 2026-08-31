@@ -1862,6 +1862,20 @@ function graphPlanError(err: unknown): string | undefined {
   }
 }
 
+/**
+ * Every issue type a run target can have. NECESSARY, not sufficient — the structural clauses in
+ * {@link beads.isRunTarget} still decide (a container epic and a parented task are both out) — but
+ * a type absent here can never be started, whatever its shape. Exported so anything that has to
+ * name the runnable vocabulary without a board in hand (the policy calibration fallback) reads it
+ * from the predicate rather than restating it: a `chore` fallback would propose work no pass can
+ * ever admit.
+ */
+export const RUN_TARGET_TYPES = ["feature", "epic", "task", "bug"] as const;
+export type RunTargetType = (typeof RUN_TARGET_TYPES)[number];
+
+const isRunTargetType = (t: string | undefined): t is RunTargetType =>
+  RUN_TARGET_TYPES.includes(t as RunTargetType);
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
@@ -2653,6 +2667,7 @@ export const beads = {
    */
   isRunTarget: (b: Bead, board: Bead[]): boolean =>
     !isPipelineArtifact(b) &&
+    isRunTargetType(b.issue_type) &&
     (b.issue_type === "feature" ||
       (beads.isEpic(b) && !beads.isContainer(b, board)) ||
       ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b))),

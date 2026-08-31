@@ -13,7 +13,7 @@
  * derivation reads whatever the repo already says, which is where R2.8's agnosticism comes from.
  */
 import { describe, expect, it } from "vitest";
-import { LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, type Bead } from "../beads/bd";
 import { pickerPolicySchema } from "../projects";
 import { POLICY_BOUND_MAX, POLICY_TEXT_MAX } from "./types";
 import { boardIssueTypes, calibratePolicy, FALLBACK_POLICY, MIN_CALIBRATION_APPROVALS } from "./calibrate";
@@ -154,6 +154,16 @@ describe("calibratePolicy — thin evidence", () => {
     const draft = calibratePolicy([]);
     expect(draft.policy).toEqual(FALLBACK_POLICY);
     expect(draft.approvals).toBe(0);
+  });
+
+  // The fallback is the one policy anton authors itself, so it is the one that can name a type the
+  // picker never offers. A `chore` fallback would arm a board and then refuse every eligible bead on
+  // it, which reads to the operator as autopilot being broken rather than as a policy being wrong.
+  it("proposes only types the picker can actually start", () => {
+    for (const type of FALLBACK_POLICY.types ?? []) {
+      const target: Bead = { id: `fallback-${type}`, title: type, status: "open", issue_type: type };
+      expect(beads.isRunTarget(target, [target])).toBe(true);
+    }
   });
 });
 

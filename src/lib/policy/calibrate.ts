@@ -22,7 +22,7 @@
  *
  * Pure and spawn-free: it takes a board snapshot a caller already holds.
  */
-import { LABELS } from "../beads/bd";
+import { LABELS, type RunTargetType } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import {
   POLICY_CONTROL_NAMESPACES,
@@ -47,12 +47,21 @@ import {
 export const MIN_CALIBRATION_APPROVALS = 5;
 
 /**
+ * The types the fallback admits: the two RUNNABLE single-ticket shapes — a standalone bug or task is
+ * an "epic-of-one", the smallest, most reversible thing anton can start. Typed against
+ * {@link RunTargetType} so the compiler refuses a type no pass could ever admit: `chore` reads like
+ * the natural companion to `bug`, but `beads.isRunTarget` excludes it before any policy is
+ * consulted, so a fallback naming it would arm a board whose eligible work it then all refused.
+ */
+const FALLBACK_TYPES = ["bug", "task"] as const satisfies readonly RunTargetType[];
+
+/**
  * The conservative universal default (R2.7), stated in bd-NATIVE fields only — the sole vocabulary
  * guaranteed to exist on a board anton has never seen. Small, reversible work at or above P2, and
  * nothing with an unmet blocker.
  */
 export const FALLBACK_POLICY: Policy = {
-  types: ["bug", "chore"],
+  types: [...FALLBACK_TYPES],
   maxPriority: 2,
   requireUnblocked: true,
 };
@@ -289,7 +298,7 @@ function fallbackDraft(approvals: readonly Bead[]): PolicyDraft {
     rationale: [
       {
         criterion: "types",
-        summary: `${because} Bugs and chores are the smallest, most reversible work on any board.`,
+        summary: `${because} A standalone bug or task is the smallest, most reversible run on any board.`,
         citedBeadIds: cite(approvals),
       },
       {
