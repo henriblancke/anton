@@ -259,17 +259,18 @@ describe("finalizeMergedEpic", () => {
     expect(createMock.mock.calls[0][1].labels).toEqual(["area:runs"]);
   });
 
-  it("names the manual remedy when the ticket cannot be rehomed", async () => {
+  it("holds the close back when the follow-up cannot be created (PR #199)", async () => {
     createMock.mockRejectedValue(new Error("bd create: DB locked"));
 
     await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
 
-    // Finalization still completes — its closes already landed — but the note must not claim a
-    // home the ticket never reached.
-    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
-      "stage:in-review",
-    ]);
+    // The note must not claim a home the ticket never reached…
     expect(noteMock.mock.calls[0][2]).toContain("could NOT be rehomed");
+    // …and the close must not land on top of it: a closed run target is invisible to the next
+    // sweep, so a swallowed create failure would leave t2 parented to a merged target with nothing
+    // on the board left to retry the create. Open and `stage:in-review`, the next sweep does.
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
   });
 
   it("deletes the follow-up target again when no ticket reaches it", async () => {
@@ -346,6 +347,60 @@ describe("finalizeMergedEpic", () => {
 
     expect(createMock).toHaveBeenCalledTimes(1);
     expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
+  });
+
+  it("does not reuse a leftover follow-up claimed since the sweep (PR #199)", async () => {
+    // The snapshot only nominates it. A PR sits in review for days, and an operator who claimed
+    // this epic in that window is running it — adding tickets to a live run's ticket set is the
+    // drift that parks it.
+    const leftover = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    assignees.set("epic-7", "op-9");
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [leftover],
+    );
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
+  });
+
+  it("holds the close back when the leftover follow-up cannot be re-read (PR #199)", async () => {
+    // An unreadable candidate proves neither that it is still reusable nor that it is somebody's
+    // run now. Creating a second follow-up on that silence would strand this one on the board, so
+    // finalization stops short of the close and the next sweep retries the whole rehome.
+    const leftover = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    showMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "epic-7") throw new Error("bd show: DB locked");
+      return {
+        id,
+        title: id,
+        status: statuses.get(id) ?? "open",
+        labels: boardLabels.get(id) ?? [],
+        assignee: assignees.get(id),
+        parent: parents.get(id),
+      } as Bead;
+    });
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [leftover],
+    );
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
   });
 
   it("keeps a reused follow-up that already carries an earlier sweep's tickets", async () => {
@@ -875,6 +930,27 @@ describe("finalizeMergedEpic", () => {
     const note = noteFor("t3");
     expect(note).toContain("between planning the move and making it");
     expect(note).toContain("under op-2");
+  });
+
+  it("re-reads the whole ancestor chain at the guarded move (PR #199)", async () => {
+    // t2 hangs off a1, which shipped in this merge — so pass 1a reads a1 and memoises it under the
+    // merged target. Another operator then moves a1 onto a target of their own, in the window m1's
+    // own reparent opens. Re-reading only the mover leaves that memo answering "still on the merged
+    // target", and t2 is reparented out of their subtree.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "m1") parents.set("a1", "epic-9");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("m1", "blocked", ["not-delivered"]),
+      bead("a1"),
+      under("a1", bead("t2", "blocked", ["not-delivered"])),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "m1", "epic-2"]]);
+    const note = noteFor("t2");
+    expect(note).toContain("between planning the move and making it");
+    expect(note).toContain("another operator moved it under a1");
   });
 
   it("pins an ancestor whose rider is claimed after the prepass (PR #199)", async () => {
