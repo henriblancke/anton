@@ -629,12 +629,49 @@ function referencesMdx(line: string | undefined, symbol: string, open = false): 
  */
 const MARKUP_FILE = /\.(?:html?|xml|svg|vue|svelte|astro)$/i;
 
+/**
+ * Markup whose tag names resolve program bindings: a single-file component renders `<Widget />` by
+ * the symbol it imported. Static HTML, XML and SVG have no such binding — `<Widget>` there is an
+ * element name the document defines itself, and counting it as a caller deletes a true finding
+ * about a genuinely unused symbol.
+ */
+const COMPONENT_FILE = /\.(?:vue|svelte|astro)$/i;
+
 /** Astro puts its module in a `---` fence at the top of the file, above any markup. */
 const ASTRO_FILE = /\.astro$/i;
 const ASTRO_FENCE = /^---\s*$/;
 
 /** A `<script>` or `</script>` tag, with whatever attributes it carries (`<script lang="ts">`). */
 const SCRIPT_TAG = /<(\/?)script\b[^>]*?(\/?)>/gi;
+
+/**
+ * The `type` a `<script>` declares. Only a whole attribute counts, so `data-type="ld+json"` is not
+ * read as the element's own type.
+ */
+const SCRIPT_TYPE = /(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i;
+
+/**
+ * The script types a browser executes: `module` and the JavaScript MIMEs, plus the ones a
+ * transpiler claims. Anything else — `application/ld+json`, `importmap`, `speculationrules`, a
+ * templating engine's block — is data the page never runs.
+ */
+const EXECUTABLE_SCRIPT_TYPE =
+  /^(?:module|(?:text|application)\/(?:java|ecma)script|text\/(?:babel|jsx|typescript)|application\/typescript)$/i;
+
+/**
+ * Whether the body this `<script>` opens is a program. A data block names a symbol the way rendered
+ * text does — `<script type="application/ld+json">{"name":"Widget"}</script>` shows it, it doesn't
+ * call it — so reading every script body as code lets a committed page prove its own caller.
+ *
+ * A script with no `type` runs, as does one whose MIME carries parameters
+ * (`text/javascript;charset=utf-8`).
+ */
+function runsJavaScript(opener: string): boolean {
+  const declared = SCRIPT_TYPE.exec(opener);
+  if (!declared) return true;
+  const type = (declared[1] ?? declared[2] ?? declared[3] ?? "").split(";")[0]?.trim() ?? "";
+  return type === "" || EXECUTABLE_SCRIPT_TYPE.test(type);
+}
 
 /** The same for `<style>`, whose braces are CSS rather than the template's interpolations. */
 const STYLE_TAG = /<(\/?)style\b[^>]*?(\/?)>/gi;
@@ -696,33 +733,58 @@ const ATTR_VALUE_BARE = new RegExp(String.raw`(?:^|\s)${CODE_ATTR}\s*=\s*$`, "i"
 /** Where a line is program text rather than markup, as `[start, end)` offsets into that line. */
 type CodeSpans = [number, number][];
 
+/** A markup file as this filter reads it: the text to judge, and which of it is program. */
+interface MarkupProgram {
+  /** The masked lines, with every data-only `<script>` body blanked out. */
+  code: string[];
+  /** Where each line is program text rather than markup. */
+  script: CodeSpans[];
+}
+
 /**
- * Which spans of a markup file are program text rather than markup: the body of a `<script>`
- * element, or an Astro frontmatter block. Those are where a component gets imported, so judging
- * them by markup's rules would miss the import that proves the symbol live.
+ * Which spans of a markup file are program text rather than markup: the body of an executable
+ * `<script>` element, or an Astro frontmatter block. Those are where a component gets imported, so
+ * judging them by markup's rules would miss the import that proves the symbol live.
  *
  * Spans rather than whole lines, because an element can share its line with rendered text:
  * `<p>Widget was removed</p><script>go()</script>` runs only between the tags, and calling the
  * whole line executable lets the prose beside the script prove a caller and delete a true finding.
  *
+ * A data script's body is blanked rather than handed back as markup, because it is neither: the
+ * `{` opening `{"name":"Widget"}` is JSON punctuation, and reading it as a template interpolation
+ * would count the block as a caller by the other route.
+ *
  * Read from the masked lines, so a `<script>` shown inside a comment opens nothing.
  */
-function markupCodeSpans(code: string[], file: string): CodeSpans[] {
+function markupProgram(code: string[], file: string): MarkupProgram {
   const frontmatterEnd = ASTRO_FILE.test(file) ? astroFrontmatterEnd(code) : -1;
-  const scripts = elementBodySpans(code, SCRIPT_TAG, frontmatterEnd + 1);
-  return code.map((line, index) =>
+  const from = frontmatterEnd + 1;
+  const data = elementBodySpans(code, SCRIPT_TAG, from, (opener) => !runsJavaScript(opener));
+  const blanked = code.map((line, index) => blankSpans(line, data[index] ?? []));
+  const scripts = elementBodySpans(blanked, SCRIPT_TAG, from, runsJavaScript);
+  const script: CodeSpans[] = blanked.map((line, index) =>
     index <= frontmatterEnd ? [[0, line.length]] : (scripts[index] ?? []),
   );
+  return { code: blanked, script };
 }
 
 /**
  * Where each line sits inside the body of `tag` — the program a `<script>` holds, the CSS a
  * `<style>` holds. Both are the element's own language rather than the template's, so the markup
  * rules stop at their tags.
+ *
+ * `opens` selects which bodies are reported: an element it rejects still runs to its closing tag,
+ * so the ones after it are found where they are, but its own body is left out.
  */
-function elementBodySpans(code: string[], tag: RegExp, from = 0): CodeSpans[] {
+function elementBodySpans(
+  code: string[],
+  tag: RegExp,
+  from = 0,
+  opens: (opener: string) => boolean = () => true,
+): CodeSpans[] {
   const lines: CodeSpans[] = [];
   let open = false;
+  let selected = true;
   for (const [index, line] of code.entries()) {
     if (index < from) {
       lines.push([]);
@@ -735,13 +797,15 @@ function elementBodySpans(code: string[], tag: RegExp, from = 0): CodeSpans[] {
     for (const match of line.matchAll(tag)) {
       const [opener, closing, selfClosing] = match;
       if (closing === "/") {
-        if (start !== undefined) spans.push([start, match.index]);
+        if (start !== undefined && selected) spans.push([start, match.index]);
         start = undefined;
+        selected = true;
       } else if (start === undefined && selfClosing !== "/") {
         start = match.index + opener.length;
+        selected = opens(opener);
       }
     }
-    if (start !== undefined) spans.push([start, line.length]);
+    if (start !== undefined && selected) spans.push([start, line.length]);
     open = start !== undefined;
     lines.push(spans);
   }
@@ -805,12 +869,16 @@ function astroFrontmatterEnd(code: string[]): number {
  *
  * `depth` is how many expressions the lines above left open, so an interpolation that wraps still
  * reads as one on the line the call actually sits on.
+ *
+ * A tag name only counts in a `component` file, where `<Widget />` renders the imported symbol. In
+ * static HTML, XML or SVG the same element is the document's own vocabulary rather than a binding.
  */
 function referencesMarkup(
   line: string | undefined,
   symbol: string,
   code: CodeSpans = [],
   depth = 0,
+  component = false,
 ): boolean {
   return referencesWord(line, symbol, (head) => {
     const at = head.length;
@@ -823,7 +891,7 @@ function referencesMarkup(
     const markup = head.slice(from);
     const tag = openTagHead(markup);
     return (
-      TAG_HEAD.test(markup) ||
+      (component && TAG_HEAD.test(markup)) ||
       ATTR_VALUE.test(markup) ||
       ATTR_VALUE_BARE.test(markup) ||
       (tag !== undefined && DIRECTIVE_HEAD.test(tag)) ||
@@ -933,7 +1001,7 @@ interface MaskedFile {
   code: string[];
   /** For MDX, which lines start inside a block — an expression or ESM statement — left open above. */
   open?: boolean[];
-  /** For markup, where each line is program text: a `<script>` body or an Astro frontmatter line. */
+  /** For markup, where each line is program text: an executable `<script>` body or Astro frontmatter. */
   script?: CodeSpans[];
   /** For markup, how many braced expressions the lines above leave open at each line's start. */
   depth?: number[];
@@ -996,6 +1064,7 @@ async function codeReferencingFiles(
     const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
     const isMdx = MDX_FILE.test(file);
     const isMarkup = !isMdx && MARKUP_FILE.test(file);
+    const isComponent = isMarkup && COMPONENT_FILE.test(file);
     const isJsx = !isMdx && !isMarkup && JSX_FILE.test(file);
     if (!masked.has(file)) {
       try {
@@ -1004,12 +1073,12 @@ async function codeReferencingFiles(
         // runs, so a `/*` or `//` shown inside an example can't open a comment across the program.
         const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
         const raw = text.split("\n");
-        const script = isMarkup ? markupCodeSpans(code, file) : undefined;
+        const markup = isMarkup ? markupProgram(code, file) : undefined;
         masked.set(file, {
-          code,
+          code: markup?.code ?? code,
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
-          script,
-          depth: script && markupOpenDepths(code, script, raw),
+          script: markup?.script,
+          depth: markup && markupOpenDepths(markup.code, markup.script, raw),
         });
       } catch {
         // A cancelled read is not an unreadable file. Swallowing it would turn the abort into
@@ -1024,7 +1093,13 @@ async function codeReferencingFiles(
       const text = entry.code[line - 1];
       if (isMdx) return referencesMdx(text, symbol, entry.open?.[line - 1] === true);
       if (isMarkup)
-        return referencesMarkup(text, symbol, entry.script?.[line - 1], entry.depth?.[line - 1]);
+        return referencesMarkup(
+          text,
+          symbol,
+          entry.script?.[line - 1],
+          entry.depth?.[line - 1],
+          isComponent,
+        );
       if (isJsx) return referencesJsx(text, symbol);
       return referencesWord(text, symbol);
     };

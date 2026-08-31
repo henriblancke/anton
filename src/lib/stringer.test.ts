@@ -1585,6 +1585,53 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
     });
 
+    // A tag name resolves a binding only where the format has one: `<Widget />` in a single-file
+    // component renders the imported symbol, while the same element in static HTML, XML or SVG is
+    // the document's own vocabulary. Reading those as callers deletes a true finding.
+    it("does not count an element name in static markup, and still counts a component tag", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/page.svelte": "<main>\n  <Widget />\n</main>\n",
+        "public/notes.html": "<Widget>gone</Widget>\n",
+        "public/feed.xml": "<entry>\n  <Widget>gone</Widget>\n</entry>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/feed.xml");
+    });
+
+    // A `<script>` only runs when its type says so: `application/ld+json` and `importmap` hold data
+    // a browser never executes, so a name inside one is shown rather than called — and its JSON
+    // braces are not the template interpolation that would count it by the other route.
+    it("reads a data script's body as inert, and still counts an executable one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html":
+          '<script type="application/ld+json">\n{"name": "Widget"}\n</script>\n<p>gone</p>\n',
+        "public/app.html": '<script type="text/javascript;charset=utf-8">\nWidget();\n</script>\n',
+        "public/module.html": '<script type="module">\n  Widget();\n</script>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).toContain("public/module.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
     // ...and a template is not prose either: a rendered tag and an attribute value each name a
     // real caller, so the same rule that discounts markup text must still count them.
     it("counts a component rendered as a tag or called from an attribute", async () => {
