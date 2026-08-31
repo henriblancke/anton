@@ -10,6 +10,13 @@ on:
     #   - "src/**/*.js"
     #   - "src/**/*.jsx"
 
+# Collapse superseded runs on the same PR (e.g. rapid pushes) into the latest one. Without this,
+# two concurrent runs race step 9's non-atomic lookup-then-write: both can create a summary, and
+# the slower one can overwrite the faster one's summary and label with stale results.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
     # Optional: Filter by PR author
@@ -80,7 +87,15 @@ jobs:
                - If the PR is small, `gh pr diff ${{ github.event.pull_request.number }}` is fine. If it is
                  large (say, over ~1500 changed lines or ~20 files), do NOT dump the whole diff — pull the
                  patch one file at a time, selecting it by the INDEX from that listing:
-                 `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files -X GET -F per_page=100 --paginate --slurp | jq -r '[.[][]] | .[<index>] | .patch // "(no patch — binary or too large)"'`
+                 `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files -X GET -F per_page=100 --paginate --slurp | jq -r '[.[][]] | .[<index>] | .patch // "(no patch)"'`
+                 GitHub omits `.patch` for binaries and for a file whose diff is very large — which
+                 can be a real source file, exactly the case this path exists to serve. When it is
+                 missing you must NOT quietly move on: fall back to `gh pr diff ${{ github.event.pull_request.number }}`
+                 (last resort — it is the whole diff, so do this only for the file that needs it),
+                 and if the delta is still unavailable, Read the file from the checkout to review its
+                 head state and say plainly in your summary that this file's diff could not be
+                 retrieved and was reviewed as a whole file. An unreviewable file is a stated gap,
+                 never a silent one.
                  Select by index, never by filename. Git permits `"` and `'` in filenames, and a filename
                  substituted into the jq program or the surrounding shell quoting would break the command
                  (leaving that file silently unreviewed) or run as shell syntax. An index is a number and
