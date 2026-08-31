@@ -150,6 +150,26 @@ describe("planRunTeardown — what a stopped run owes back", () => {
     expect(plan).toMatchObject({ removeWorktree: false, deleteBranch: false });
   });
 
+  it("keeps the checkout of a run waiting on the human gate it armed, even when the row failed", () => {
+    // The park write is the last thing that can fail behind a live gate (PR #205 review): the run
+    // settles as `failed` while the wait stands, and the person who resolves it resumes THIS run
+    // here. A release would force-remove the partial work that resume continues from.
+    const plan = planRunTeardown(
+      { ...run, status: "failed", beadSettled: false, awaitsHumanGate: true },
+      undefined,
+    );
+    expect(plan).toMatchObject({ removeWorktree: false, deleteBranch: false });
+    expect(plan.reason).toContain("human gate");
+  });
+
+  it("reaps that checkout once the bead settles — no resume is coming for the wait", () => {
+    const plan = planRunTeardown(
+      { ...run, status: "failed", beadSettled: true, awaitsHumanGate: true },
+      undefined,
+    );
+    expect(plan).toMatchObject({ removeWorktree: true, deleteBranch: true });
+  });
+
   it("touches nothing when the run is live on another machine", () => {
     const plan = planRunTeardown(
       { ...run, status: "parked", beadSettled: true, foreign: true },

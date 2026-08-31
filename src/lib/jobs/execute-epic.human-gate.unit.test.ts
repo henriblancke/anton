@@ -569,7 +569,7 @@ const recorder = (failure?: string) => {
 
 it("parks the run behind the gate and throws the ask while the run is still live", async () => {
   const row = recorder();
-  const { thrown, parked } = await settleArmedAsk({
+  const { thrown, parked, awaitsHumanGate } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -595,6 +595,9 @@ it("parks the run behind the gate and throws the ask while the run is still live
   // awaits that follow has to take it back, and only this verdict tells the caller there is
   // something left to take back.
   expect(parked).toBe(true);
+  // …and the checkout belongs to the resume, not to the reaper: whoever answers the ask comes back
+  // to this very run (PR #205 review).
+  expect(awaitsHumanGate).toBe(true);
 });
 
 it("takes the arm back when the kill lands INSIDE the park write, and fails the row", async () => {
@@ -612,7 +615,7 @@ it("takes the arm back when the kill lands INSIDE the park write, and fails the 
   };
   let undone = false;
 
-  const { thrown, parked } = await settleArmedAsk({
+  const { thrown, parked, awaitsHumanGate } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -638,6 +641,8 @@ it("takes the arm back when the kill lands INSIDE the park write, and fails the 
   // Already unwound here — the caller must NOT unwind it a second time in its cleanup, where
   // `undo` would resolve a gate that is already gone and report the ask as stranded.
   expect(parked).toBe(false);
+  // No wait survives, so nothing is coming back for the checkout — the teardown releases it.
+  expect(awaitsHumanGate).toBe(false);
 });
 
 it("names the gate that STANDS when the kill lands mid-write and undoing is unsafe", async () => {
@@ -702,7 +707,7 @@ it("keeps the gate and parks the JOB loudly when the row cannot be settled at al
   const row = recorder("SQLITE_BUSY: database is locked");
   let undone = false;
 
-  const { thrown, parked } = await settleArmedAsk({
+  const { thrown, parked, awaitsHumanGate } = await settleArmedAsk({
     targetId: "f-1",
     ask: ASK_ERROR(),
     raw: ASK_ERROR(),
@@ -723,6 +728,10 @@ it("keeps the gate and parks the JOB loudly when the row cannot be settled at al
   // Not the caller's to take back in its cleanup either: the row never recorded the park, so undoing
   // the gate later would leave NOTHING carrying the ask.
   expect(parked).toBe(false);
+  // But the WAIT is live, and it is the checkout's verdict that matters here (PR #205 review): the
+  // row reads failed while the gate stands, and releasing the worktree on that would discard the
+  // partial work the resumed session continues from.
+  expect(awaitsHumanGate).toBe(true);
   expect((thrown as Error).name).toBe("PoisonError");
   expect((thrown as Error).message).toContain(ASK);
   expect((thrown as Error).message).toContain("bd gate resolve g-new");

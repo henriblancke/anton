@@ -1806,6 +1806,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
       let settledAs: "parked" | "failed";
+      // A live human gate this attempt armed. Kept apart from `settledAs` because the two disagree
+      // on exactly the path this exists for: a park write that failed settles the row as `failed`
+      // while the wait stands, and the checkout is the resume's (PR #205 review).
+      let awaitsHumanGate = false;
       if (isUsageLimitError(e)) {
         settledAs = "parked";
         await updateRun(db, clock, runId, { status: "parked", error: `usage-limit${orphanNotice}` });
@@ -1877,9 +1881,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // A park that landed is not finished with: the cleanup below still has to run, and a kill
           // inside it leaves this same gate blocking a target nothing returns to (anton-287p).
           if (settlement.parked) armedPark = { gate, ask: e, raw };
-          // The worktree follows the row: a live park resumes in this very checkout, while a settle
-          // that failed or was killed leaves nothing coming back for it.
+          // The worktree follows the WAIT, not the row: a settle that failed still leaves the gate
+          // standing, and the person who resolves it resumes this attempt here. Only a cancelled
+          // unwind — which takes the gate back — leaves nothing coming for the checkout.
           settledAs = settlement.parked ? "parked" : "failed";
+          awaitsHumanGate = settlement.awaitsHumanGate;
         } else {
           // The run FAILED, so the error the runner sees has to say so (PR #205 review). The ask's
           // own message promises a park "until someone answers it" — with no gate there is nothing
@@ -1950,6 +1956,10 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // of the work, and the run's own note tells an operator to clear THIS path before
             // resuming — a `--force` release here would delete what that instruction points at.
             holdsPartialWork: e instanceof WorktreeDirtyError,
+            // A wait whose gate is live keeps its checkout even when the row settled as failed: the
+            // resume reuses this run, and the tree carries the edits the ask stopped in the middle
+            // of (PR #205 review).
+            awaitsHumanGate,
           }),
         );
       }
@@ -3079,7 +3089,7 @@ export async function settleArmedAsk(args: {
   // Only a park that actually LANDED is still the caller's to reconcile: a cancellation this call
   // already unwound is settled, and a park write that failed leaves the gate standing on an ask no
   // row records — taking it back later would leave nothing carrying it at all.
-  return { thrown, parked: !cancelled && !parkFailure };
+  return { thrown, parked: !cancelled && !parkFailure, awaitsHumanGate: !cancelled };
 }
 
 /** What {@link settleArmedAsk} left behind — the run's error, and whether the park is live. */
@@ -3093,6 +3103,13 @@ export interface ArmedAskSettlement {
    * {@link reconcileCancelledArmedPark}.
    */
   parked: boolean;
+  /**
+   * The gate still STANDS and a person resolving it resumes this run — true whether or not the park
+   * row landed, and false only once the cancelled unwind has taken the wait back. It is what the
+   * teardown needs (PR #205 review): a park write that failed settles the run as `failed`, and
+   * releasing the checkout on that would delete the partial work the resume continues from.
+   */
+  awaitsHumanGate: boolean;
 }
 
 /**

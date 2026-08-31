@@ -15,7 +15,7 @@
  *
  * Off by default: the schedule is seeded disabled (schedules.ts), so a project opts in.
  */
-import { beads, LABELS, type Bead, type Gate } from "../beads/bd";
+import { beads, gateReason as bdGateReason, LABELS, type Bead, type Gate } from "../beads/bd";
 import { getPrActivity, prNumberFromRef, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -261,23 +261,16 @@ export function detectExhaustedJobs(
   return findings;
 }
 
-const GATE_REASON_MARKER = "Reason:";
-
 /**
- * The prose a human wrote when they hung the gate. bd stores it INSIDE the gate's description —
- * `Ad-hoc gate blocking <id>`, then a blank line and `Reason: <text>` when `--reason` was given
- * (measured on bd 1.1.2) — so there is no field to read and this parse is the only way to it.
- * Collapsed to one line: a report row is one line, and bd accepts a multi-line reason.
+ * The prose a human wrote when they hung the gate, collapsed to one line — a report row is one
+ * line, and bd accepts a multi-line reason.
+ *
+ * The parse itself is {@link bdGateReason}'s (PR #205 review): bd folds the reason into the gate's
+ * description rather than giving it a field, and exactly one place in anton should know that
+ * format, so a bd change is fixed once instead of in two parsers that drifted apart.
  */
 function gateReason(gate: Gate): string | undefined {
-  const description = gate.description ?? "";
-  const marker = description.indexOf(GATE_REASON_MARKER);
-  if (marker < 0) return undefined;
-  const reason = description
-    .slice(marker + GATE_REASON_MARKER.length)
-    .replace(/\s+/g, " ")
-    .trim();
-  return reason || undefined;
+  return bdGateReason(gate)?.replace(/\s+/g, " ").trim() || undefined;
 }
 
 /**

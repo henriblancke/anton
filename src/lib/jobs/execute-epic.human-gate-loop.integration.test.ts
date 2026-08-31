@@ -124,8 +124,15 @@ process.exit(0);`),
       (j) => (JSON.parse(j.payloadJson) as { epicBeadId?: string }).epicBeadId === targetId,
     );
 
-  const sessionsOfRun = async (runId: string) =>
-    (await tdb.db.select().from(schema.sessions)).filter((s) => s.runId === runId);
+  /**
+   * The claude ATTEMPTS on a run — its `execute` sessions. Filtered on kind because a delivered run
+   * also carries the worktree-reaper's teardown session (anton-hrun.1), which records what the run
+   * handed back rather than an attempt at the work.
+   */
+  const attemptsOfRun = async (runId: string) =>
+    (await tdb.db.select().from(schema.sessions)).filter(
+      (s) => s.runId === runId && s.kind === "execute",
+    );
 
   /** One REAL gate-check pass over the sandbox project, on the same db + clock as the runs. */
   const gateCheckPass = () =>
@@ -174,7 +181,7 @@ process.exit(0);`),
     expect(runs[0].endedAt ?? null).toBeNull();
     expect(runs[0].branch).toBeTruthy(); // the branch the resume must continue on, not replace
     expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
-    expect(await sessionsOfRun(runs[0].id)).toHaveLength(1); // the one attempt that hit the wall
+    expect(await attemptsOfRun(runs[0].id)).toHaveLength(1); // the one attempt that hit the wall
 
     return {
       targetId,
@@ -215,7 +222,7 @@ process.exit(0);`),
 
     // Two claude sessions hang off that ONE run row — the attempt that hit the wall and the one
     // that finished, on the same ticket. A restart would have opened its session against a new run.
-    const sessions = await sessionsOfRun(parked.runId);
+    const sessions = await attemptsOfRun(parked.runId);
     expect(sessions).toHaveLength(2);
     expect(new Set(sessions.map((s) => s.beadId)).size).toBe(1);
 
