@@ -2015,6 +2015,34 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
     });
 
+    // A child expression closes on the line that opened it: `<p>{version} Widget was removed</p>`
+    // renders the symbol as text once `}` has run, and a tag whose attribute interpolates still
+    // opens the prose under it. Reading either brace as executable context lets a page that merely
+    // names the symbol prove its own caller and erase a genuinely unused one — while the symbol
+    // inside an expression the line leaves open counts as the call it is.
+    it("reads JSX text after a closed interpolation as prose, and still counts one left open", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.tsx":
+          "export const Notes = () => <p>{version} Widget was removed in favour of Panel</p>;\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <p className={styles.note}>\n" +
+          "    Widget was removed in favour of Panel\n  </p>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>{version} {Widget()}</p>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {

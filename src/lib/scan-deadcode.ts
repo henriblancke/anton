@@ -955,6 +955,38 @@ const JSX_PROP_TEXT = new RegExp(
 );
 
 /**
+ * The line with every `{…}` it closes blanked out, so what follows one reads as the prose it is.
+ * `<p>{version} Widget was removed</p>` renders the symbol as text once `}` has run, but the braces
+ * are punctuation both text tests reject, so leaving them in makes any interpolated line program
+ * again — a paragraph naming a removed component then proves its own caller and deletes a true
+ * finding. A span still open keeps its brace: the symbol behind it really is inside an expression.
+ *
+ * Spaces stand in for the span so offsets keep their meaning, and a quoted brace is skipped the way
+ * `punctuation` skips one — `{label ?? "}"}` closes on its own brace, not the quoted one.
+ */
+function maskJsxExpressions(line: string): string {
+  const out = line.split("");
+  let depth = 0;
+  let start = 0;
+  let quote: string | undefined;
+  for (let at = 0; at < line.length; at += 1) {
+    const char = line[at];
+    if (char === "\\") at += 1;
+    else if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+    } else if (depth > 0 && QUOTE.test(char)) quote = char;
+    else if (char === "{") {
+      if (depth === 0) start = at;
+      depth += 1;
+    } else if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0) out.fill(" ", start, at + 1);
+    }
+  }
+  return out.join("");
+}
+
+/**
  * Which lines of a JSX file start inside rendered text a tag left open above — `<p>` with
  * `Widget was removed` on the line under it. Children wrap onto lines of their own as ordinary
  * formatting, and judging that line alone finds no tag before the symbol, so a paragraph naming a
@@ -978,7 +1010,8 @@ function jsxTextLines(code: string[], raw: string[]): boolean[] {
       open = false;
       continue;
     }
-    open = JSX_TEXT.test(line) || (open && !JSX_CODE.test(line));
+    const rendered = maskJsxExpressions(line);
+    open = JSX_TEXT.test(rendered) || (open && !JSX_CODE.test(rendered));
   }
   return text;
 }
@@ -991,15 +1024,14 @@ function jsxTextLines(code: string[], raw: string[]): boolean[] {
  *
  * `text` is that same rendered text seen from the line above. It only carries as far as the prose
  * does: the symbol has to sit before any punctuation on its line, or the line is program again —
- * see `jsxTextLines` for why that bound is kept tight.
+ * see `jsxTextLines` for why that bound is kept tight. The interpolations the line already closed
+ * are blanked first, so the child text resumes after a `{…}` instead of reading as program.
  */
 function referencesJsx(line: string | undefined, symbol: string, text = false): boolean {
-  return referencesWord(
-    line,
-    symbol,
-    (head) =>
-      !JSX_TEXT.test(head) && !JSX_PROP_TEXT.test(head) && !(text && !JSX_CODE.test(head)),
-  );
+  return referencesWord(line, symbol, (raw) => {
+    const head = maskJsxExpressions(raw);
+    return !JSX_TEXT.test(head) && !JSX_PROP_TEXT.test(head) && !(text && !JSX_CODE.test(head));
+  });
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
