@@ -553,16 +553,33 @@ function* punctuation(text: string, inCode: () => boolean): Generator<string> {
  * so treating any earlier `{` on the line as still open reads that prose as code, calls the page a
  * caller, and deletes a true finding about a genuinely unused symbol.
  *
- * `least` is how many braces the format needs before the text inside them runs: one for Svelte,
- * Astro and MDX, two for Vue, whose interpolation is `{{ count }}` — a single brace there is a
- * character the page shows, so counting it reads `<p>Write {Widget} literally</p>` as a call.
+ * `flavor` is how the format spells an interpolation: one brace for Svelte, Astro and MDX, the
+ * doubled `{{ count }}` for Vue.
  */
-function insideExpression(head: string, depth = 0, least = 1): boolean {
+function insideExpression(head: string, depth = 0, flavor: MarkupFlavor = "brace"): boolean {
+  return expressionDepth(head, depth, flavor) >= (flavor === "mustache" ? 2 : 1);
+}
+
+/**
+ * The depth `head` leaves a braced expression at, counted from the depth the lines above left open.
+ *
+ * Vue's `{{` is a delimiter rather than a nesting: only the second brace of an adjacent pair opens
+ * an interpolation, and a lone brace anywhere else in its template is a character the page shows.
+ * Reading the depth instead lets ordinary prose reach two — `<p>Write {one {Widget} two}
+ * literally</p>` interpolates nothing — and counting that as an expression makes the sentence a
+ * caller, which deletes a true finding about a genuinely unused symbol. Inside an interpolation
+ * every brace nests as usual, so an object literal in `{{ fn({ a: 1 }) }}` still holds it open.
+ */
+function expressionDepth(head: string, depth: number, flavor: MarkupFlavor): number {
+  let previous: string | undefined;
   for (const char of punctuation(head, () => depth > 0)) {
-    if (char === "{") depth += 1;
-    else if (char === "}") depth = Math.max(0, depth - 1);
+    if (char === "{") {
+      if (flavor !== "mustache" || depth > 0) depth += 1;
+      else if (previous === "{") depth = 2;
+    } else if (char === "}") depth = Math.max(0, depth - 1);
+    previous = char;
   }
-  return depth >= least;
+  return depth;
 }
 
 /**
@@ -979,8 +996,16 @@ function elementBodySpans(
  * — so a line a comment emptied is not mistaken for the break. That bound is deliberate, as it is
  * in MDX: an unbalanced `{` in rendered text can then only mislead its own block instead of every
  * line after it, and reading prose as code is the direction that deletes a true finding.
+ *
+ * The depth is counted the way `flavor` opens an expression, so a Vue template that never doubles
+ * its braces carries none of them into the lines below.
  */
-function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): number[] {
+function markupOpenDepths(
+  code: string[],
+  script: CodeSpans[],
+  raw: string[],
+  flavor: MarkupFlavor,
+): number[] {
   const depths: number[] = [];
   let depth = 0;
   for (const [index, line] of code.entries()) {
@@ -993,10 +1018,7 @@ function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): n
     let template = "";
     for (let at = 0; at < line.length; at += 1)
       template += skip.some(([start, end]) => at >= start && at < end) ? " " : line[at];
-    for (const char of punctuation(template, () => depth > 0)) {
-      if (char === "{") depth += 1;
-      else if (char === "}") depth = Math.max(0, depth - 1);
-    }
+    depth = expressionDepth(template, depth, flavor);
   }
   return depths;
 }
@@ -1111,7 +1133,7 @@ function referencesMarkup(
         (ATTR_VALUE.test(tag) || ATTR_VALUE_BARE.test(tag) || DIRECTIVE_HEAD.test(tag))) ||
       (flavor !== "static" &&
         (TAG_HEAD.test(markup) ||
-          insideExpression(markup, from === 0 ? depth : 0, flavor === "mustache" ? 2 : 1)))
+          insideExpression(markup, from === 0 ? depth : 0, flavor)))
     );
   });
 }
@@ -1180,8 +1202,11 @@ const JSX_TAG_OPEN = /<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?$/;
  *
  * Spaces stand in for the span so offsets keep their meaning, and a quoted brace is skipped the way
  * `punctuation` skips one — `{label ?? "}"}` closes on its own brace, not the quoted one.
+ *
+ * The depth the line ends at comes back with it: an expression that wrapped is what the lines under
+ * it are reading, and its caller has to know how far it still has to run.
  */
-function maskJsxExpressions(line: string): string {
+function maskJsxExpressions(line: string): { masked: string; depth: number } {
   const out = line.split("");
   let depth = 0;
   let start = 0;
@@ -1200,7 +1225,7 @@ function maskJsxExpressions(line: string): string {
       if (depth === 0) out.fill(" ", start, at + 1);
     }
   }
-  return out.join("");
+  return { masked: out.join(""), depth };
 }
 
 /**
@@ -1216,9 +1241,13 @@ function maskJsxEntities(line: string): string {
   return line.replace(JSX_ENTITY, (entity) => " ".repeat(entity.length));
 }
 
-/** What a reader sees of a line: its closed interpolations and its entities both blanked out. */
-function maskJsxRendered(line: string): string {
-  return maskJsxEntities(maskJsxExpressions(line));
+/**
+ * What a reader sees of a line: its closed interpolations and its entities both blanked out, with
+ * the expression depth the line leaves open behind them.
+ */
+function maskJsxRendered(line: string): { masked: string; depth: number } {
+  const { masked, depth } = maskJsxExpressions(line);
+  return { masked: maskJsxEntities(masked), depth };
 }
 
 /** What the line above leaves open, which is what the line under it is reading. */
@@ -1270,6 +1299,31 @@ function jsxTagEnd(text: string, quote?: string): { at: number; quote?: string }
 }
 
 /**
+ * Where the expression a line above left open finishes on this line, and the depth it still stands
+ * at when it doesn't. An interpolation wraps as ordinary formatting — `{ready &&` with the child it
+ * renders under it — and its braces are the element's own child rather than the end of the element:
+ * the text after the closing brace is what the tag still open above renders. Quotes are walked the
+ * way `maskJsxExpressions` walks them, since inside an expression a brace a string holds is a
+ * character rather than a delimiter.
+ */
+function jsxExpressionEnd(text: string, depth: number): { at: number; depth: number } {
+  let quote: string | undefined;
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at];
+    if (char === "\\") at += 1;
+    else if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+    } else if (QUOTE.test(char)) quote = char;
+    else if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return { at, depth };
+    }
+  }
+  return { at: -1, depth: Math.max(0, depth) };
+}
+
+/**
  * What each line of a JSX file starts inside — the rendered text a tag left open above (`<p>` with
  * `Widget was removed` under it), or the attribute list of a tag whose props wrapped onto lines of
  * their own. Both wrap as ordinary formatting, and judging such a line alone finds no tag before
@@ -1278,8 +1332,12 @@ function jsxTagEnd(text: string, quote?: string): { at: number; quote?: string }
  * their lines for the same reason.
  *
  * The run ends at the first line that reads as program once its tags are blanked — a call, an
- * interpolation, an assignment — and at a blank line, read from `raw` so a line masking emptied is
- * not mistaken for the break. Within a run the open elements are counted rather than remembered as
+ * assignment — and at a blank line, read from `raw` so a line masking emptied is not mistaken for
+ * the break. An interpolation the line leaves open inside an element ends nothing: it is a child
+ * of the tag still open above, so its own lines read as the program they are and the parent's text
+ * resumes on the brace that closes it. Ending the run there instead reads the prose under a
+ * wrapped `{ready &&` as program, and a paragraph naming a removed component proves its own
+ * caller. Within a run the open elements are counted rather than remembered as
  * one flag, so a nested sibling ends its own text and not its parent's. A module's generics and
  * comparisons cannot be told from tags without a parser, so a line the tag test misreads
  * (`Map<string, Widget>` closes with the same `>`) can only carry prose into the lines under it
@@ -1293,17 +1351,35 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
   let depth = 0;
   let tag = false;
   let quote: string | undefined;
+  let expression = 0;
   for (const [index, line] of code.entries()) {
     states.push(
-      tag ? (quote === undefined ? "tag" : { prop: quote }) : depth > 0 ? "text" : "code",
+      expression > 0
+        ? "code"
+        : tag
+          ? quote === undefined
+            ? "tag"
+            : { prop: quote }
+          : depth > 0
+            ? "text"
+            : "code",
     );
     if (!raw[index]?.trim()) {
       depth = 0;
       tag = false;
       quote = undefined;
+      expression = 0;
       continue;
     }
-    const rendered = maskJsxRendered(line);
+    let text = line;
+    if (expression > 0) {
+      const end = jsxExpressionEnd(text, expression);
+      expression = end.at < 0 ? end.depth : 0;
+      if (end.at < 0) continue;
+      // Past the brace that closed it the line is the parent's children again.
+      text = text.slice(end.at + 1);
+    }
+    const { masked: rendered, depth: open } = maskJsxRendered(text);
     let rest = rendered;
     if (tag) {
       const end = jsxTagEnd(rest, quote);
@@ -1319,6 +1395,13 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
     const opener = JSX_TAG_OPEN.exec(rest);
     const { net, remainder } = jsxTags(opener ? rest.slice(0, opener.index) : rest);
     if (JSX_CODE.test(remainder)) {
+      // An interpolation inside an element is that element's child, not the end of it: `<div>` with
+      // `{ready &&` under it still renders the prose written after the brace closes. Dropping the
+      // parent here reads that text as program and lets it prove its own caller.
+      if (open > 0 && depth > 0) {
+        expression = open;
+        continue;
+      }
       depth = JSX_TEXT.test(rendered) ? 1 : 0;
       continue;
     }
@@ -1356,7 +1439,7 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
 function referencesJsx(line: string | undefined, symbol: string, state: JsxLine = "code"): boolean {
   const wrapped = typeof state === "object" ? state.prop : undefined;
   return referencesWord(line, symbol, (raw) => {
-    const head = maskJsxRendered(raw);
+    const { masked: head } = maskJsxRendered(raw);
     if (wrapped !== undefined && !head.includes(wrapped)) return false;
     const within: JsxLine = wrapped === undefined ? state : "tag";
     if (within === "tag" && JSX_PROP_LINE.test(head)) return false;
@@ -1610,7 +1693,7 @@ async function codeReferencingFiles(
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
           jsx: isJsx ? jsxLineStates(code, raw) : undefined,
           script: markup?.script,
-          depth: markup && markupOpenDepths(markup.code, markup.script, raw),
+          depth: markup && markupOpenDepths(markup.code, markup.script, raw, flavor),
           attr: markup && markupOpenAttrs(markup.code, markup.script, raw),
         });
       } catch {

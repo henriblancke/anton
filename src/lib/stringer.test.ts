@@ -1979,6 +1979,28 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
     });
 
+    // ...and `{{` is a delimiter rather than a nesting: prose that happens to nest two single
+    // braces — `<p>Write {one {Widget} two} literally</p>` — interpolates nothing, so reading its
+    // depth as an expression makes the sentence a caller and deletes a true finding. A Vue
+    // expression that really does nest a brace still runs.
+    it("opens a Vue interpolation on adjacent braces only, not on nested ones", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.vue": "<template>\n  <p>Write {one {Widget} two} literally</p>\n</template>\n",
+        "src/ui/nested.vue": "<template>\n  <p>{{ fn({ a: Widget }) }}</p>\n</template>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/nested.vue");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
     // A `<script>` runs between its tags, not across its line. Rendered text sharing the line with
     // one is still markup, so reading the whole line as code lets that prose prove a caller and
     // delete a true finding — while the script's own body has to keep counting.
@@ -2336,6 +2358,32 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/icon.tsx");
+    });
+
+    // A child expression wraps onto lines of its own too, and it is the element's child rather
+    // than the end of it: `<div>` with `{ready &&` under it still renders the prose written after
+    // the brace closes. Ending the parent's text on that opener reads the sentence below as
+    // program and lets a paragraph naming a removed component prove its own caller — while the
+    // lines the expression itself spans stay the code they are.
+    it("keeps a JSX element open across a wrapped child expression, and still counts a call inside one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <div>\n    {ready &&\n      <span />}\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    {ready &&\n      Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
     });
 
     // A tag's props wrap onto lines of their own as ordinary formatting, and so can the value of
