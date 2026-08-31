@@ -756,7 +756,7 @@ type CodeSpans = [number, number][];
 
 /** A markup file as this filter reads it: the text to judge, and which of it is program. */
 interface MarkupProgram {
-  /** The masked lines, with every data-only `<script>` body blanked out. */
+  /** The masked lines, with every data-only `<script>` body and every `<style>` body blanked out. */
   code: string[];
   /** Where each line is program text rather than markup. */
   script: CodeSpans[];
@@ -773,7 +773,14 @@ interface MarkupProgram {
  *
  * A data script's body is blanked rather than handed back as markup, because it is neither: the
  * `{` opening `{"name":"Widget"}` is JSON punctuation, and reading it as a template interpolation
- * would count the block as a caller by the other route.
+ * would count the block as a caller by the other route. A `<style>` body is blanked for the same
+ * reason: the `{` opening `.notice::after { content: "Widget was removed"; }` is a CSS rule's own
+ * punctuation, and left visible it reads as an interpolation holding the name a stylesheet only
+ * shows a reader — which deletes a true finding. Blanking answers both routes at once, since the
+ * rule can open on the very line the name sits on, where no cross-line depth is consulted.
+ *
+ * A CSS-only reference — Vue's `v-bind(widget)` — goes uncounted with the rest of the body. That
+ * leaves its signal standing rather than deleting one, the direction this filter errs in.
  *
  * Read from the masked lines, so a `<script>` shown inside a comment opens nothing.
  */
@@ -783,10 +790,12 @@ function markupProgram(code: string[], file: string): MarkupProgram {
   const data = elementBodySpans(code, SCRIPT_TAG, from, (opener) => !runsJavaScript(opener));
   const blanked = code.map((line, index) => blankSpans(line, data[index] ?? []));
   const scripts = elementBodySpans(blanked, SCRIPT_TAG, from, runsJavaScript);
-  const script: CodeSpans[] = blanked.map((line, index) =>
+  const style = elementBodySpans(blanked, STYLE_TAG, from);
+  const masked = blanked.map((line, index) => blankSpans(line, style[index] ?? []));
+  const script: CodeSpans[] = masked.map((line, index) =>
     index <= frontmatterEnd ? [[0, line.length]] : (scripts[index] ?? []),
   );
-  return { code: blanked, script };
+  return { code: masked, script };
 }
 
 /**
@@ -840,9 +849,10 @@ function elementBodySpans(
  * rendered text and its signal goes on costing the health record a debt point. MDX carries the
  * same state across its lines for the same reason.
  *
- * Braces inside a `<script>` or `<style>` body don't count: an object literal or a CSS rule is the
- * element's own punctuation, not an interpolation, and letting one open an expression would read
- * every line below it as code.
+ * Braces inside a `<script>` body don't count: an object literal is the element's own punctuation,
+ * not an interpolation, and letting one open an expression would read every line below it as code.
+ * A `<style>` body needs no skipping here — `markupProgram` has already blanked it, so its CSS
+ * braces are gone from `code` before this runs.
  *
  * A blank line closes whatever is open, and blankness is read from `raw` — the file before masking
  * — so a line a comment emptied is not mistaken for the break. That bound is deliberate, as it is
@@ -850,7 +860,6 @@ function elementBodySpans(
  * line after it, and reading prose as code is the direction that deletes a true finding.
  */
 function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): number[] {
-  const style = elementBodySpans(code, STYLE_TAG);
   const depths: number[] = [];
   let depth = 0;
   for (const [index, line] of code.entries()) {
@@ -859,7 +868,7 @@ function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): n
       depth = 0;
       continue;
     }
-    const skip = [...(script[index] ?? []), ...(style[index] ?? [])];
+    const skip = script[index] ?? [];
     let template = "";
     for (let at = 0; at < line.length; at += 1)
       template += skip.some(([start, end]) => at >= start && at < end) ? " " : line[at];

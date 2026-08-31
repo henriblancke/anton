@@ -1880,6 +1880,32 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/theme.svelte");
     });
 
+    // A CSS rule's brace is the stylesheet's own punctuation on the line it opens on as well:
+    // `.notice::after { content: "Widget was removed"; }` shows the name to a reader. Reading that
+    // brace as a template interpolation makes a stylesheet prove its own caller and deletes a true
+    // finding about a genuinely unused symbol.
+    it("does not count a symbol inside a style rule that opens on its own line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.svelte": "<p>{Widget()}</p>\n",
+        "src/ui/theme.svelte":
+          '<style>\n  .notice::after { content: "Widget was removed"; }\n</style>\n',
+        "src/ui/inline.vue":
+          '<template>\n  <p>shipped</p>\n</template>\n<style>.notice { content: "Widget"; }</style>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/theme.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/inline.vue");
+    });
+
     // A brace inside a string is text rather than the end of the expression holding it: `{ready ?
     // "}"` with the call under it still runs. Counting the quoted one closes the expression a line
     // early, so the caller below reads as markdown and a live component is reported dead.
