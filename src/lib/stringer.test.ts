@@ -1743,6 +1743,53 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/theme.svelte");
     });
 
+    // A brace inside a string is text rather than the end of the expression holding it: `{ready ?
+    // "}"` with the call under it still runs. Counting the quoted one closes the expression a line
+    // early, so the caller below reads as markdown and a live component is reported dead.
+    it("counts an MDX symbol under a quoted brace in a multiline expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/live.mdx": '{ready\n  ? "}"\n  : Widget()}\n',
+        "docs/notes.mdx": "Widget was removed in favour of Panel\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/live.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // A `.tsx` file is a program, but not everything on its lines runs: the text a tag opens and a
+    // plain string prop are what the page shows a reader. Reading either as code lets a page that
+    // merely names the symbol prove its own caller and erase a genuinely unused one — while the
+    // import that renders it, and a generic closing with the same `>` a tag does, still count.
+    it("reads JSX text and string props as prose, and still counts the code beside them", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx": "export const Panel = () => <p>Widget was removed in favour of Panel</p>;\n",
+        "src/ui/notice.tsx": 'export const Notice = () => <p title="Widget was removed">gone</p>;\n',
+        "src/ui/page.tsx": "import { Widget } from './widget';\nexport const Page = () => <Widget />;\n",
+        "src/ui/registry.tsx": "export const registry = new Map<string, Widget>([['a', Widget]]);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/registry.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+    });
+
     // SQL comments out the rest of a line with `--`, which can open after code: the line test the
     // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
     it("masks a SQL comment opened after code, and still counts the call beside one", async () => {

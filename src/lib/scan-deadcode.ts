@@ -496,6 +496,32 @@ function maskMdxProse(text: string): string {
  */
 const TAG_HEAD = /<\/?\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
 
+/** The quotes JavaScript writes a string or a template literal with. */
+const QUOTE = /["'`]/;
+
+/**
+ * The characters of `text` that punctuate a program, with the contents of its strings and template
+ * literals skipped. A quoted brace is text rather than a delimiter: `{ready ? "}" : Widget()}` runs
+ * to the brace its punctuation closes on, and counting the quoted one ends the expression a line
+ * early, so the call under it reads as prose and the caller it names goes uncounted.
+ *
+ * `inCode` is asked per character, because the depth it answers from moves as the scan runs. A
+ * quote only delimits inside code — in prose an apostrophe is an apostrophe, and reading one as a
+ * string would swallow the braces of the expression behind it and hand the rest of the line back
+ * to the markup rules.
+ */
+function* punctuation(text: string, inCode: () => boolean): Generator<string> {
+  let quote: string | undefined;
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at];
+    if (quote !== undefined) {
+      if (char === "\\") at += 1;
+      else if (char === quote) quote = undefined;
+    } else if (inCode() && QUOTE.test(char)) quote = char;
+    else yield char;
+  }
+}
+
 /**
  * Whether the text before the symbol leaves a braced expression open, counting from the depth the
  * lines above left open. An expression closes on the line that opened it unless a caller tracked
@@ -504,7 +530,7 @@ const TAG_HEAD = /<\/?\s*(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
  * caller, and deletes a true finding about a genuinely unused symbol.
  */
 function insideExpression(head: string, depth = 0): boolean {
-  for (const char of head) {
+  for (const char of punctuation(head, () => depth > 0)) {
     if (char === "{") depth += 1;
     else if (char === "}") depth = Math.max(0, depth - 1);
   }
@@ -546,7 +572,7 @@ function mdxOpenLines(code: string[], raw: string[]): boolean[] {
       continue;
     }
     if (depth === 0 && !esm && MDX_ESM_LINE.test(line)) esm = true;
-    for (const char of line) {
+    for (const char of punctuation(line, () => depth > 0 || esm)) {
       // Only braces hold an expression open; an import's list can also wrap in `(` or `[`, which
       // are ordinary punctuation in the markdown around it.
       if (char === "{" || (esm && (char === "(" || char === "["))) depth += 1;
@@ -707,17 +733,12 @@ function markupOpenDepths(code: string[], script: CodeSpans[], raw: string[]): n
       continue;
     }
     const skip = [...(script[index] ?? []), ...(style[index] ?? [])];
-    let at = 0;
-    while (at < line.length) {
-      const body = skip.find(([start, end]) => at >= start && at < end);
-      if (body) {
-        at = body[1];
-        continue;
-      }
-      const char = line[at];
+    let template = "";
+    for (let at = 0; at < line.length; at += 1)
+      template += skip.some(([start, end]) => at >= start && at < end) ? " " : line[at];
+    for (const char of punctuation(template, () => depth > 0)) {
       if (char === "{") depth += 1;
       else if (char === "}") depth = Math.max(0, depth - 1);
-      at += 1;
     }
   }
   return depths;
@@ -766,6 +787,44 @@ function referencesMarkup(
       insideExpression(markup, from === 0 ? depth : 0)
     );
   });
+}
+
+/** Files whose program also renders text: the JSX a `.jsx`/`.tsx` module carries. */
+const JSX_FILE = /\.[jt]sx$/i;
+
+/**
+ * A tag this line opens and leaves open — `<p>`, `<Panel tone="warn">` — so what follows it is
+ * rendered. Not a self-closing `<Icon />`, which renders nothing after itself and leaves the code
+ * beside it code, and not a closing `</p>`, which ends the text rather than starting it.
+ */
+const JSX_OPEN_TAG = String.raw`<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?(?<![/])>`;
+
+/**
+ * What a reader sees, with none of the punctuation that would make it program text. A generic
+ * closes with the same `>` a tag does — `new Map<string, Widget>()` — so the text after one has to
+ * read as a sentence before the line is called rendered, or a real call goes uncounted.
+ */
+const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^<>{}()[\]=;\\|&+*/\`]*$`);
+
+/** The symbol inside a plain string prop — `<p title="Widget was removed">` renders that too. */
+const JSX_PROP_TEXT = new RegExp(
+  String.raw`<[A-Za-z][\w.$:-]*\s[^<>]*[\w-]\s*=\s*(?:"[^"<>{}]*|'[^'<>{}]*)$`,
+);
+
+/**
+ * Whether a JSX line uses the symbol or merely renders it. A `.jsx`/`.tsx` file is a program, so
+ * everything on it is code except what it shows a reader: the text a tag opens, and the value of a
+ * plain string prop. `<p>Widget was removed</p>` names the symbol the way a doc page does, and
+ * counting that page as a caller deletes a true finding about a genuinely unused symbol.
+ *
+ * Only text the opening tag leaves on the symbol's own line reads that way. Children wrapped onto
+ * lines of their own would need the file's JSX nesting carried across it, and a module's generics,
+ * comparisons and arrows cannot be told from tags without a parser: misreading a program's own
+ * lines as rendered text drops real callers wholesale, which is the costlier direction in the
+ * language this repo is mostly written in. The bound is kept deliberately.
+ */
+function referencesJsx(line: string | undefined, symbol: string): boolean {
+  return referencesWord(line, symbol, (head) => !JSX_TEXT.test(head) && !JSX_PROP_TEXT.test(head));
 }
 
 /** One deadcode signal the filter removed, and the proof that removed it. */
@@ -894,6 +953,7 @@ async function codeReferencingFiles(
     const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
     const isMdx = MDX_FILE.test(file);
     const isMarkup = !isMdx && MARKUP_FILE.test(file);
+    const isJsx = !isMdx && !isMarkup && JSX_FILE.test(file);
     if (!masked.has(file)) {
       try {
         const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
@@ -922,6 +982,7 @@ async function codeReferencingFiles(
       if (isMdx) return referencesMdx(text, symbol, entry.open?.[line - 1] === true);
       if (isMarkup)
         return referencesMarkup(text, symbol, entry.script?.[line - 1], entry.depth?.[line - 1]);
+      if (isJsx) return referencesJsx(text, symbol);
       return referencesWord(text, symbol);
     };
     if (lines.some(references)) files.push(file);
