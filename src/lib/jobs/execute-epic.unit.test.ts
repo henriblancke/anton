@@ -307,6 +307,24 @@ describe("ParkedAskError — the park a run takes behind its own armed gate (ant
     expect(parkedAskGateIds(parked.message)).toEqual(["g-7"]);
   });
 
+  it("reads the MACHINE clause, not an ask that quotes it (PR #205 review)", () => {
+    // The ask is agent prose and sits in front of the machine-appended clause: an agent asking a
+    // person to resolve an existing gate can quote this exact sentence. A first-match parse would
+    // hand the sweeps `g-quoted` — suppressing the park against a gate this run never armed while
+    // the real one stays open.
+    const quoting = new ParkedAskError(
+      new NeedsHumanError(
+        "t-1",
+        "the run is parked on human gate g-quoted until someone answers it; please close it. " +
+          "Even then it is also held by human gate(s) g-bogus.",
+      ),
+      "g-7",
+      ["g-8"],
+    );
+    expect(parkedAskGateId(quoting.message)).toBe("g-7");
+    expect(parkedAskGateIds(quoting.message)).toEqual(["g-7", "g-8"]);
+  });
+
   it("reads ids that contain a PERIOD back whole — bd's own child ids do (PR #205 review)", () => {
     // A period-terminated capture truncates `gate-287p.1` to `gate-287p`, and the sweeps that
     // suppress on the ids would then match nothing: the park re-raises as a permanent failure while

@@ -101,8 +101,23 @@ export function poisonBlockerIds(parkMessage: string): string[] | undefined {
   return ids.length > 0 ? ids : undefined;
 }
 
-/** How a needs-human park names the gate holding the run — and how it is read back. */
-const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/;
+/**
+ * How a needs-human park names the gate holding the run — and how it is read back. Global, because
+ * the clause is read from the TAIL: the agent's ask sits in front of it verbatim, and an ask that
+ * quotes this very sentence (asking a person to resolve a gate, say) would win a first-match parse
+ * and hand the sweeps a gate that was never armed for this run (PR #205 review).
+ */
+const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/g;
+
+/**
+ * The LAST match of a global pattern, or undefined. `matchAll` iterates a clone, so the shared
+ * pattern's `lastIndex` never carries between calls.
+ */
+function lastMatch(pattern: RegExp, text: string): RegExpExecArray | undefined {
+  let last: RegExpExecArray | undefined;
+  for (const match of text.matchAll(pattern)) last = match as RegExpExecArray;
+  return last;
+}
 
 /**
  * How that park names the OTHER open human gates on the target, when there are any. The ids are
@@ -140,7 +155,7 @@ export function parkedOnGateClause(gateId: string, held: string[] = []): string 
  * — calling a wait on a person an exhausted job — for the same pause.
  */
 export function parkedAskGateId(parkMessage: string): string | undefined {
-  return PARKED_ON_GATE.exec(parkMessage)?.[1];
+  return lastMatch(PARKED_ON_GATE, parkMessage)?.[1];
 }
 
 /**
@@ -153,13 +168,16 @@ export function parkedAskGateId(parkMessage: string): string | undefined {
  * person's hold.
  */
 export function parkedAskGateIds(parkMessage: string): string[] | undefined {
-  const armed = parkedAskGateId(parkMessage);
-  if (armed === undefined) return undefined;
-  const held = (PARKED_ALSO_HELD.exec(parkMessage)?.[1] ?? "")
+  const armed = lastMatch(PARKED_ON_GATE, parkMessage);
+  if (!armed) return undefined;
+  // Only the text AFTER the armed clause: the holds are appended right behind it, so an ask that
+  // quotes a hold sentence of its own can't be read as this park's.
+  const tail = parkMessage.slice(armed.index + armed[0].length);
+  const held = (PARKED_ALSO_HELD.exec(tail)?.[1] ?? "")
     .split(",")
     .map((id) => id.trim())
     .filter(Boolean);
-  return [armed, ...held];
+  return [armed[1]!, ...held];
 }
 
 /**
