@@ -1235,7 +1235,16 @@ const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![
  * The delimiters JSX spells its own syntax with — the only punctuation that means anything between
  * a tag and its children, since code stands there solely inside a `{…}`.
  */
-const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]\\|\``;
+const JSX_CHILD_DELIMITERS = String.raw`<>{}\\|\``;
+
+/**
+ * The square brackets, which index and list outside every element — `const [first] = items` — and
+ * are the marks a sentence names a thing with inside one: `<p>[Widget] was removed</p>` shows the
+ * symbol to a reader the way a doc page does, and reading that label as program lets a prose-only
+ * page prove its own caller and delete a true finding. An array written between a tag and its
+ * children stands inside a `{…}`, which is a delimiter of its own.
+ */
+const JSX_BRACKETS = String.raw`[\]`;
 
 /**
  * The brackets a call is spelled with, which are the program's outside every element —
@@ -1267,7 +1276,7 @@ const JSX_ASSIGNMENT = String.raw`=`;
  * the same `>` a tag does — `new Map<Widget>()` — so text that claims to be rendered has to read as
  * a sentence before it is believed, or a real call goes uncounted.
  */
-const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_PARENS}${JSX_STATEMENT}${JSX_ASSIGNMENT}`;
+const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_BRACKETS}${JSX_PARENS}${JSX_STATEMENT}${JSX_ASSIGNMENT}`;
 
 /**
  * Arithmetic, which is program text on a line standing outside every element — `const half =
@@ -1281,8 +1290,8 @@ const JSX_OPERATORS = String.raw`&+*/`;
 const JSX_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}${JSX_OPERATORS}]`);
 
 /**
- * That same test for text a tag has opened, where an operator, an aside, the semicolon between two
- * clauses and the equals sign in a sentence are punctuation the page shows.
+ * That same test for text a tag has opened, where an operator, an aside, a bracketed label, the
+ * semicolon between two clauses and the equals sign in a sentence are punctuation the page shows.
  */
 const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_CHILD_DELIMITERS}]`);
 
@@ -1849,6 +1858,74 @@ function maskRequireBindings(code: readonly string[]): string[] {
   return masked;
 }
 
+/** Files whose imports are Python statements, which name no module string to end on. */
+const PYTHON_FILE = /\.pyi?$/i;
+
+/**
+ * A Python import statement's head, at the start of a statement — the start of a line, or after the
+ * `;` that closed the one before it. The `import` keyword is required on both forms, so a `from`
+ * that names something else never opens the mask; the `from` of a chained `raise … from cause` and
+ * a `yield from` both stand mid-statement, where this never looks.
+ */
+const PYTHON_IMPORT_HEAD = /(?:^|;)[ \t]*((?:from[ \t]+[\w.]+[ \t]+)?import\b)/g;
+
+/**
+ * Where the Python import statement opened at `at` on line `from` ends: at the `;` that closes it
+ * or at the end of its last line. A statement runs onto another line only while a parenthesised
+ * binding list is open or a backslash has joined the next one, so an `import` that never closes its
+ * list is left standing rather than dragged over the program below it.
+ */
+function pythonImportEnd(
+  code: string[],
+  from: number,
+  at: number,
+): { line: number; at: number } | undefined {
+  let depth = 0;
+  for (let line = from; line < code.length && line - from <= IMPORT_SPAN_LINES; line += 1) {
+    const text = code[line] ?? "";
+    for (let index = line === from ? at : 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (char === "(") depth += 1;
+      else if (char === ")") depth -= 1;
+      else if (char === ";" && depth <= 0) return { line, at: index };
+    }
+    if (depth <= 0 && !text.endsWith("\\")) return { line, at: text.length };
+  }
+  return undefined;
+}
+
+/**
+ * The code with its Python import statements blanked out. `from widget import Widget` takes a
+ * binding exactly as `import { Widget } from './widget'` does, so a module that still imports a
+ * symbol it stopped calling would otherwise read as its own caller and erase a true finding — the
+ * same stale half the ESM mask exists to discount.
+ */
+function maskPythonImports(code: readonly string[]): string[] {
+  const masked = [...code];
+  for (let index = 0; index < masked.length; index += 1) {
+    let at = 0;
+    for (;;) {
+      PYTHON_IMPORT_HEAD.lastIndex = at;
+      const head = PYTHON_IMPORT_HEAD.exec(masked[index] ?? "");
+      if (!head) break;
+      const opened = head.index + head[0].length;
+      const end = pythonImportEnd(masked, index, opened);
+      if (!end) break;
+      const start = opened - head[1].length;
+      if (end.line === index) {
+        masked[index] = blankSpans(masked[index], [[start, end.at]]);
+      } else {
+        masked[index] = blankSpans(masked[index], [[start, masked[index].length]]);
+        for (let line = index + 1; line < end.line; line += 1) masked[line] = blankAll(masked[line]);
+        masked[end.line] = blankSpans(masked[end.line], [[0, end.at]]);
+        index = end.line;
+      }
+      at = end.at;
+    }
+  }
+  return masked;
+}
+
 /**
  * The code with its import declarations blanked out. A binding a file imports and never uses is not
  * a caller: `import { Widget } from './widget'` names the symbol as plainly as a call does, so
@@ -1861,12 +1938,15 @@ function maskRequireBindings(code: readonly string[]): string[] {
  * symbol under another module's name is a use of it, not a mention.
  *
  * An `import` that reaches no quoted specifier is left standing rather than guessed at, so a
- * language that spells its imports without one (Python, Java) keeps exactly the check it had.
+ * language that spells its imports without one (Java) keeps exactly the check it had. Python spells
+ * its own without one too, so a `.py` file is masked by `maskPythonImports` instead — the only
+ * grammar that reads `from widget import Widget` as the stale binding it is.
  *
  * CommonJS `require` bindings are masked first, by `maskRequireBindings`, since a repo can spell
  * the same stale binding either way.
  */
-function maskImports(code: string[]): string[] {
+function maskImports(code: string[], file: string): string[] {
+  if (PYTHON_FILE.test(file)) return maskPythonImports(code);
   const masked = maskRequireBindings(code);
   for (let index = 0; index < masked.length; index += 1) {
     IMPORT_HEAD.lastIndex = 0;
@@ -1934,7 +2014,7 @@ async function codeReferencingFiles(
           // Imports are blanked last, off the program text every state below was tracked through:
           // an `import` is what opens MDX's ESM block and what a wrapped specifier list continues,
           // so masking it before those are read would close the block over the lines under it.
-          code: maskImports(markup?.code ?? code),
+          code: maskImports(markup?.code ?? code, file),
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
           jsx: isJsx ? jsxLineStates(code) : undefined,
           script: markup?.script,

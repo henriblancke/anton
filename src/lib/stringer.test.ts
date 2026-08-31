@@ -1223,6 +1223,35 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/Main.java");
     });
 
+    // Python spells the same stale binding as `from widget import Widget`, where the `import`
+    // keyword never stands at the head of the statement and no module string ever ends it. Counting
+    // that line lets one forgotten import delete a true finding exactly as an ESM one would, while
+    // the module that calls what it imports names the symbol again on a line of its own — and a
+    // `raise … from` names it mid-statement, where an import never starts.
+    it("does not count a Python import of the symbol as a use of it", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/stale.py": "from widget import Widget\n\nkept = 1\n",
+        "src/py/wrapped.py": "from widget import (\n    Widget,\n)\n\nkept = 2\n",
+        "src/py/module.py": "import Widget\n\nkept = 3\n",
+        "src/py/calls.py": "from widget import Widget\n\nhtml = Widget()\n",
+        "src/py/raises.py": "def run():\n    raise ValueError('gone') from Widget\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/calls.py");
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/raises.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/stale.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/wrapped.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/module.py");
+    });
+
     // A name written in prose is being described, not called. Without this the module that documents
     // a symbol keeps it alive forever, and the filter goes blind to the symbols it exists to check.
     it("does not count a name in a comment or a doc as a reference", async () => {
@@ -2565,6 +2594,33 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/aside.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // Prose brackets the name it labels. Code stands between a tag and its children only inside a
+    // `{…}`, so the `[]` around `[Widget]` are characters the page shows — reading them as program
+    // lets a doc page prove its own caller, and ends the element so the sentence under the label
+    // reads as program too. Outside every element the same brackets still list and index, and the
+    // module that puts the symbol in an array keeps counting.
+    it("reads JSX text holding brackets as prose, and still counts an array beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/bracket.tsx": "export const Doc = () => <p>[Widget] was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    [deprecated]\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const items = [Widget];\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/bracket.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
     });
 
