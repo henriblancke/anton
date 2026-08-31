@@ -1142,13 +1142,23 @@ function referencesMarkup(
 const JSX_FILE = /\.[jt]sx$/i;
 
 /**
+ * The attributes between a tag's name and the `>` that ends it, with each quoted value taken as a
+ * unit the way `openTagHead` walks one. A value shows the angle bracket it holds — `<p title="a >
+ * b">Widget was removed</p>` — so reading that `>` as the end of the tag leaves the element
+ * unopened and the prose behind it program, which lets a paragraph naming a removed component
+ * prove its own caller. A value left unterminated closes no tag on this line at all, which is the
+ * wrapped opener `JSX_TAG_OPEN` carries onto the lines under it.
+ */
+const JSX_ATTRS = String.raw`(?:"[^"]*"|'[^']*'|[^<>"'])*`;
+
+/**
  * A tag this line opens and leaves open — `<p>`, `<Panel tone="warn">`, the fragment `<>` — so what
  * follows it is rendered. A fragment counts because prose is written straight inside one, and
  * reading `<>` with `Widget was removed` under it as program text deletes a true finding. Not a
  * self-closing `<Icon />`, which renders nothing after itself and leaves the code beside it code,
  * and not a closing `</p>` or `</>`, which ends the text rather than starting it.
  */
-const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?(?<![/])>)`;
+const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![/])>)`;
 
 /**
  * The punctuation no rendered line carries. A generic closes with the same `>` a tag does —
@@ -1174,7 +1184,7 @@ const JSX_CODE = new RegExp(String.raw`[${JSX_PUNCTUATION}]`);
 const JSX_PROP_VALUE = String.raw`[\w-]\s*=\s*(?:"[^"<>]*|'[^'<>]*)$`;
 
 /** The symbol inside a plain string prop — `<p title="Widget was removed">` renders that too. */
-const JSX_PROP_TEXT = new RegExp(String.raw`<[A-Za-z][\w.$:-]*\s[^<>]*${JSX_PROP_VALUE}`);
+const JSX_PROP_TEXT = new RegExp(String.raw`<[A-Za-z][\w.$:-]*\s${JSX_ATTRS}${JSX_PROP_VALUE}`);
 
 /**
  * That same prop on a line the tag opened above. An attribute list wraps onto lines of its own as
@@ -1186,12 +1196,19 @@ const JSX_PROP_LINE = new RegExp(JSX_PROP_VALUE);
 
 /** Every tag a line finishes: one it opens, the `</p>` that ends one, the self-closing `<Icon />`. */
 const JSX_TAGS = new RegExp(
-  String.raw`${JSX_OPEN_TAG}|</(?:[A-Za-z][\w.$:-]*\s*)?>|<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?/>`,
+  String.raw`${JSX_OPEN_TAG}|</(?:[A-Za-z][\w.$:-]*\s*)?>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?/>`,
   "g",
 );
 
-/** A tag this line opens and leaves unfinished — `<Empty` with its props on the lines below. */
-const JSX_TAG_OPEN = /<[A-Za-z][\w.$:-]*(?:\s[^<>]*)?$/;
+/**
+ * A tag this line opens and leaves unfinished — `<Empty` with its props on the lines below, or an
+ * attribute whose quoted value wraps. The value that wraps is matched unterminated so `jsxTagEnd`
+ * can name the quote still open, and so a `>` a closed value shows does not pass for the end of a
+ * tag that in fact runs on.
+ */
+const JSX_TAG_OPEN = new RegExp(
+  String.raw`<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS}(?:"[^"]*|'[^']*)?)?$`,
+);
 
 /**
  * The line with every `{…}` it closes blanked out, so what follows one reads as the prose it is.

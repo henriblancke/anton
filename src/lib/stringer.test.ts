@@ -2304,6 +2304,34 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
     });
 
+    // A prop's value shows the angle bracket it holds — `<p title="a > b">Widget was removed</p>`.
+    // Ending the tag at that `>` leaves the element unopened, so the prose behind it reads as
+    // program and a paragraph naming a removed component proves its own caller. The value that
+    // wraps carries the same bracket onto the line under it, while the call beside one stays the
+    // call it is.
+    it("reads JSX text after a quoted angle bracket in a prop as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.tsx":
+          'export const Notes = () => <p title="a > b">Widget was removed in favour of Panel</p>;\n',
+        "src/ui/note.tsx":
+          'export const Note = () => (\n  <p\n    title="a > b"\n  >\n' +
+          "    Widget was removed in favour of Panel\n  </p>\n);\n",
+        "src/ui/live.tsx": 'export const Live = () => <p title="a > b">{Widget()}</p>;\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
     // Children nest, and a sibling element closes only itself: the paragraph beside `<span>gone
     // </span>` is still the text their `<div>` opened. Reading that `</span>` as the end of the
     // parent's text makes the prose under it program again, so a page that merely names the symbol
