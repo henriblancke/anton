@@ -1497,6 +1497,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
           }
           onBranch.add(ticket.id);
+          // Rebuild the cascade around it (PR #199 review). `skipCause` was computed at the
+          // timeout, before the loop knew this ticket's commit was already here: for a→b→c it
+          // still names both b and c, and c would be skipped over a mechanism that IS on the
+          // branch. Only matters when this ticket was itself in the cascade — otherwise the walk
+          // never reached it and the verdict is unchanged.
+          if (skipCause.has(ticket.id)) {
+            skipCause = skippedDependents(timedOut, tickets, all, onBranch);
+          }
           continue;
         }
         // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The

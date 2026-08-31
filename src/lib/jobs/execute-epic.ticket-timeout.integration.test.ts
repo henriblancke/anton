@@ -529,6 +529,106 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
       }
     });
 
+    it("dispatches the tail behind a dependent whose commit is already on the branch (PR #199 review)", async () => {
+      // a→b→c, where a runs out of time and b's commit is ALREADY on this branch — another machine
+      // closed and committed it, and this run branches off a base that carries it. The cascade is
+      // computed at a's timeout, before the loop reaches b and learns that; unless it is rebuilt
+      // there, c is skipped over a mechanism that IS on the branch and left out of the epic's only PR.
+      const epicId = await beads.create(repo, {
+        title: "Cascade stops at a delivered dependent",
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nCascade stops at a delivered dependent",
+      });
+      await beads.approve(repo, epicId);
+      const mk = (title: string) =>
+        createTicket(repo, { title, parent: epicId });
+      const stalls = mk("Ticket that cannot converge");
+      const middle = mk("Ticket another machine already committed here");
+      const tail = mk("Ticket that builds on the middle one");
+      await beads.link(repo, middle, stalls, "blocks");
+      await beads.link(repo, tail, middle, "blocks");
+
+      // The middle ticket in the shape a cross-machine resume finds it: closed on the board, with
+      // its commit — subject `<id>:`, what worktreeHasCommitFor reads — already on origin/main, the
+      // base this run's worktree branches off.
+      execFileSync(
+        resolveBdBin(),
+        ["close", middle, "--force"], // still `blocks`-linked to the ticket that stalls here
+        { cwd: repo, stdio: "ignore" },
+      );
+      execFileSync(
+        "git",
+        [
+          "-C",
+          repo,
+          "commit",
+          "-q",
+          "--allow-empty",
+          "-m",
+          `${middle}: work from another machine`,
+        ],
+        { stdio: "ignore" },
+      );
+      execFileSync("git", ["-C", repo, "push", "-q", "origin", "main"], {
+        stdio: "ignore",
+      });
+
+      const invLog = join(sandbox, "delivered-dep-inv.jsonl");
+      const claude = writeBin(
+        binDir,
+        "claude-hang-delivered-dep",
+        fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+      );
+
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      try {
+        const jobId = await driveEpicRun(runner, {
+          projectId,
+          epicBeadId: epicId,
+        });
+
+        const invoked = readFileSync(invLog, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        // The middle ticket is delivered work, so it is skipped rather than regenerated…
+        expect(invoked).not.toContain(middle);
+        // …and the tail behind it STILL RAN: what it was written against is on the branch.
+        expect(invoked).toContain(tail);
+
+        const shipped = await beads.show(repo, tail);
+        expect(shipped.status).toBe("closed");
+        expect(shipped.labels ?? []).not.toContain("not-delivered");
+        expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+        const run = (await tdb.db.select().from(schema.runs)).find(
+          (r) => r.epicBeadId === epicId,
+        )!;
+        const files = filesOnBranch(run.branch!);
+        expect(files).toContain("AGENT_WORK.md");
+        expect(files).not.toContain("HALF_WRITTEN.md");
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+      }
+    });
+
     it("leaves a skipped ticket another operator took over reserved to them (anton-67xj)", async () => {
       // The reservation this protects: the run's claim cascade assigned every child to itself at the
       // start, but an operator can take one over while the run is still working. Handing the ticket
