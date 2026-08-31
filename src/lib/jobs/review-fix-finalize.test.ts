@@ -673,6 +673,29 @@ describe("finalizeMergedEpic", () => {
     expect(nested).not.toContain("Another operator moved it");
   });
 
+  it("decides the ride-along on the LIVE parent, not the planned one (PR #199)", async () => {
+    // Another operator reparents t3 off t2 and onto t4 — still beneath the merged target, so the
+    // re-read still clears it to move. Riding along on the PLANNED parent would record it as nested
+    // under t2 and issue no reparent, leaving it under a delivered ticket on the merged target
+    // while its note claimed it reached epic-2.
+    setStatusMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "t3") parents.set("t3", "t4");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("t2", "blocked", ["not-delivered"]),
+      under("t2", bead("t3", "blocked", ["not-delivered"])),
+      bead("t4"),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([
+      ["/repo", "t2", "epic-2"],
+      ["/repo", "t3", "epic-2"],
+    ]);
+    expect(noteMock.mock.calls[1][2]).toContain("now lives under epic-2");
+    expect(noteMock.mock.calls[1][2]).not.toContain("stays nested under t2");
+  });
+
   it("gives a nested ticket its own home when its parent's reparent fails", async () => {
     // The ride-along is decided on what actually MOVED: a parent bd refused to move is still stuck
     // under the merged target, so following it would strand the descendant too.

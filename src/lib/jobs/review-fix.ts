@@ -1351,14 +1351,24 @@ async function applyRehome(
     await pinAncestors(bead);
   }
 
+  // The ride-along below is an edge, so it is decided on the LIVE parent, never the plan's (PR
+  // #199). Another operator can have reparented a rerunnable ticket onto a DIFFERENT bead still
+  // beneath the merged target in the same window — pass 1a accepts that, since its ancestry still
+  // reaches the target — and the planned parent then names a bead it no longer hangs off. Riding
+  // along on that one issues no reparent of its own, so the ticket stays under the merged target
+  // once its planned parent moves, while the note tells the founder it reached the follow-up.
+  const liveParents = new Map<string, string | undefined>();
+  for (const mover of takeable.values())
+    liveParents.set(mover.id, await liveParentOf(mover));
+
   // Pass 2 — move them ancestors first. A ticket whose own parent is moving rides along on it
   // rather than being flattened onto the follow-up: the nesting is how its work was scoped, and
   // reparenting it separately would hand the same subtree two homes. Ordering is what makes that
   // safe — the ride-along is decided on what actually MOVED, so a parent whose reparent bd refused
   // leaves its descendant to take a home of its own rather than staying stranded behind it.
-  for (const mover of ancestorsFirst(takeable)) {
+  for (const mover of ancestorsFirst(takeable, liveParents)) {
     if (pinned.has(mover.id) || stale.has(mover.id)) continue;
-    const parentId = beads.parentOf(mover);
+    const parentId = liveParents.get(mover.id);
     if (parentId && moved.has(parentId)) {
       nested.set(mover.id, parentId);
       moved.add(mover.id);
@@ -1407,18 +1417,27 @@ async function ridesOn(
 /**
  * The beads of a rehome set ordered so a ticket always follows every ancestor that is moving with
  * it — depth within the set, which is stable under a sort that preserves board order among peers.
+ *
+ * Depth is walked over `liveParents`, the same edges the ride-along is decided on: ordering by the
+ * plan's parents would place a reparented ticket ahead of the ancestor it now hangs off, and its
+ * ride-along would then be judged before that ancestor had moved.
  */
-function ancestorsFirst(takeable: Map<string, Bead>): Bead[] {
+function ancestorsFirst(
+  takeable: Map<string, Bead>,
+  liveParents: Map<string, string | undefined>,
+): Bead[] {
+  const parentOf = (bead: Bead): string | undefined =>
+    liveParents.has(bead.id) ? liveParents.get(bead.id) : beads.parentOf(bead);
   const depth = (bead: Bead): number => {
     const seen = new Set<string>([bead.id]);
     let steps = 0;
-    let parentId = beads.parentOf(bead);
+    let parentId = parentOf(bead);
     while (parentId && !seen.has(parentId)) {
       const parent = takeable.get(parentId);
       if (!parent) break;
       seen.add(parentId); // a parent cycle terminates rather than hanging finalization
       steps++;
-      parentId = beads.parentOf(parent);
+      parentId = parentOf(parent);
     }
     return steps;
   };
