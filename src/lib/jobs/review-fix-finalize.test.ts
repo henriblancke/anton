@@ -441,6 +441,36 @@ describe("finalizeMergedEpic", () => {
     expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-7");
   });
 
+  it("stops moving onto a reused follow-up approved mid-pass (PR #199)", async () => {
+    // Reuse is decided once, at the top of the pass; the moves are bd round trips after it. A human
+    // who approves the leftover epic in that window has made it a run of its own, and every further
+    // ticket added to it is the ticket-set drift that parks that run.
+    const leftover = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "m1") boardLabels.set("epic-7", ["approved"]);
+    });
+
+    await finalize(
+      bead("epic-1"),
+      [
+        bead("m1", "blocked", ["not-delivered"]),
+        bead("m2", "blocked", ["not-delivered"]),
+      ],
+      [leftover],
+    );
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "m1", "epic-7"]]);
+    expect(deleteMock).not.toHaveBeenCalled(); // it is somebody's run now, not anton's to remove
+    // Finalization is left undone, so the merged target stays open and `stage:in-review` for the
+    // next sweep — which finds the candidate no longer untouched and makes a fresh follow-up.
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   it("releases the reservation the skipping run still holds on a preserved ticket", async () => {
     // The rerun path the note advertises only works if the ticket can be claimed again: a claim
     // that outlived its run hides it from `bd ready --unassigned` and refuses the claim cascade of
@@ -1085,6 +1115,26 @@ describe("finalizeMergedEpic", () => {
     expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
     expect(noteFor("t2")).toContain("t3 still hangs off it");
     expect(noteFor("t3")).toContain("between planning the move and making it");
+  });
+
+  it("pins an ancestor an EXCLUDED ticket is reparented under after the prepass (PR #199)", async () => {
+    // x1 is deferred, so the plan refused it and pass 1b pinned on the ancestry it had THEN — as a
+    // sibling of m1. Another operator hangs it off m1 while the delivered child d0 is being
+    // detached, and a rider scan that only walks `takeable` never sees it: m1's move would carry
+    // their snoozed ticket onto a target anton wrote.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "d0") parents.set("x1", "m1");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("m1", "blocked", ["not-delivered"]),
+      under("m1", bead("d0")),
+      bead("x1", "deferred", ["not-delivered"]),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "d0", "epic-1"]]);
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
+    expect(noteFor("m1")).toContain("x1 still hangs off it");
   });
 
   it("re-reads a candidate before deciding it does not ride along (PR #199)", async () => {

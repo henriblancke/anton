@@ -1609,6 +1609,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // only once the park above is ruled out, so a run that still parks leaves the board untouched.
       // `doneOnBoard: false` — the epic graph puts closed children in neither the ready nor the held
       // set, so a held ticket is open by construction and has no cross-machine close to undo.
+      // Every held ticket has a cause here: `stillHeld` is exactly the ones without one, and the
+      // park above throws whenever that set is non-empty.
       for (const ticket of held) {
         await recordSkipped(ticket, skipCause.get(ticket.id)!, false);
       }

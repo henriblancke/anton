@@ -1473,10 +1473,8 @@ async function applyRehome(
   // and no pending decision of its own — it is detached in 1c instead, and blocking on it would
   // strand a parent merely because part of its work shipped. A PRESERVED one the plan refused does
   // pin, for everything the pin exists for.
-  for (const bead of preserved) {
-    if (takeable.has(bead.id)) continue;
-    await pinAncestors(bead);
-  }
+  const excluded = preserved.filter((b) => !takeable.has(b.id));
+  for (const bead of excluded) await pinAncestors(bead);
 
   // Pass 1c — a DELIVERED descendant is taken off its ancestor BEFORE that ancestor moves
   // (anton-67xj). The reparent carries the whole subtree with it, so a ticket that shipped in this
@@ -1573,6 +1571,16 @@ async function applyRehome(
         continue;
       if (await takenSince(known, reread)) return rider.id;
     }
+    // A preserved ticket the plan EXCLUDED rides along on exactly the same edge (PR #199), and pass
+    // 1b pinned on the ancestry it read THEN: one another operator reparents beneath a mover after
+    // that prepass is under no pin at all, so the reparent would carry their deferred or reserved
+    // ticket onto a target anton wrote. Scanning `takeable` alone never sees it. No takeover test —
+    // the plan already refused this ticket, so any ride-along disqualifies the mover.
+    for (const rider of excluded) {
+      const known = (await reread(rider.id)) ?? rider;
+      if ((await ridesOn(known, moverId, bySubtreeId, reread)) === "target")
+        return rider.id;
+    }
     return undefined;
   };
 
@@ -1593,6 +1601,16 @@ async function applyRehome(
   // pass 1a accepts since its ancestry still reaches the target. Riding along on the PLANNED parent
   // would issue no reparent of its own, leaving the ticket under the merged target while its note
   // told the founder it reached the follow-up.
+  //
+  // A REUSED follow-up is re-read at each of those writes too (PR #199). Reuse was decided at the
+  // top of this pass, and pass 1a, the detaches and every earlier mover sit between that decision
+  // and this write — bd round trips on a board other operators share. In that window a human can
+  // approve that epic, or a worker claim it, which turns it from an interrupted sweep's leftover
+  // into a live run: adding tickets to a run's set is the ticket-set drift that parks it. So the
+  // moves stop at the first write that would land on a taken follow-up, and the merged target stays
+  // open — the next sweep finds the candidate no longer untouched and gives the remainder a fresh
+  // follow-up of its own.
+  let taken = false;
   for (const mover of ancestorsFirst(takeable, liveParents)) {
     if (pinned.has(mover.id) || stale.has(mover.id)) continue;
     const live = await reread(mover.id);
@@ -1614,9 +1632,20 @@ async function applyRehome(
       pinned.set(mover.id, rider);
       continue;
     }
+    if (reused) {
+      const home = await reread(followUp);
+      if (!home || !untouched(home)) {
+        taken = true;
+        break;
+      }
+    }
     if (await safe(() => beads.reparent(repo, mover.id, followUp)))
       moved.add(mover.id);
   }
+  // A follow-up somebody took mid-pass is theirs now: not this rehome's to keep filling, and not
+  // anton's to delete either, whatever did or did not reach it before the takeover.
+  if (taken)
+    return { id: followUp, moved, nested, pinned, stale, unfinished: followUp };
   if (moved.size > 0) return { id: followUp, moved, nested, pinned, stale };
   // Nothing moved — the epic is a childless run target no one asked for. Take it back off the
   // board, unless it is a REUSED follow-up an earlier sweep already moved tickets onto: deleting
@@ -1771,7 +1800,8 @@ interface Rehomed {
   stale: Map<string, string>;
   /**
    * The bead a rehome anton could not finish is about: a follow-up it failed to CREATE, one it
-   * could not RE-READ to decide reuse on, or a childless one it could not DELETE. Finalization has
+   * could not RE-READ to decide reuse on, a REUSED one a human approved or a worker claimed while
+   * the moves were landing, or a childless one it could not DELETE. Finalization has
    * left something undone, so the caller must keep the merged target open and discoverable —
    * closing it would either strand the preserved tickets beneath a merged target nothing anton runs
    * reaches, or leave an empty run target on the board permanently, inviting the approval its own
