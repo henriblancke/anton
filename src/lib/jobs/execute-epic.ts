@@ -1843,6 +1843,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           );
         }
       }
+      // Reopen the timeouts this attempt absorbed (anton-67xj). runTicket leaves a rolled-back
+      // timeout `blocked` on purpose — the run walks on to its PR and the block is the founder's cue
+      // — but that only holds while the run REACHES that PR. Every stop below advertises a retry or
+      // a resume instead, and that attempt re-dispatches this ticket: `blocked` is a status bd
+      // refuses to claim, so runTicket's hard claim gate would kill the next attempt on a bead THIS
+      // one blocked, over a failure (a `not-delivered` write that wouldn't land, a held tail, a
+      // review the gate refused) that has nothing to do with it. Same restore the halting paths
+      // inside runTicket perform, for the same reason; the note it left is what carries the
+      // timeout's account to the operator, not the status.
+      //
+      // Only the ROLLED-BACK ones: a ticket stopped after its commit stays blocked for a human to
+      // read, and reopening it would have the next attempt re-dispatch an agent over work already
+      // on the branch. Not on an ABORT either — a kill or an abandon settles these beads itself
+      // (an abandon closes them), and reopening one there re-queues work a human just killed, the
+      // rule runTicket's own abort path follows.
+      if (!ctx.signal.aborted) {
+        for (const stalled of timedOut.filter((t) => !t.committed)) {
+          await safe(() => beads.setStatus(repo, stalled.id, "open"));
+        }
+      }
       // Quota, a run already live on another machine (anton-jz1), or a self-review that refused the
       // PR → park the run (the job reschedules, re-checks liveness, or waits for the founder);
       // anything else → the run failed (job retries/parks).
@@ -2250,8 +2270,9 @@ async function runTicket(args: {
       // unowned, if that best-effort status write failed — and runTicket's hard claim gate refuses
       // both, so the advertised resume would die on its own first step. Put it back at `open`, the
       // same restore the stale-marker path performs; the note above is what carries the timeout's
-      // account to the operator, not the status. A timeout the run ABSORBS keeps `blocked`: it
-      // carries on to a PR, so nothing resumes and the block is the human's cue.
+      // account to the operator, not the status. A timeout the run ABSORBS keeps `blocked` here: it
+      // carries on to a PR, and the block is the human's cue — and if that run later stops instead,
+      // its own stopping path reopens what it absorbed, for exactly the reason above.
       if (leftovers || !marked) await safe(() => beads.setStatus(repo, ticket.id, "open"));
       // The rollback is what keeps the REST of the run honest, so its failure cannot be absorbed
       // the way the timeout itself is: the next ticket captures its baseline from this same tree

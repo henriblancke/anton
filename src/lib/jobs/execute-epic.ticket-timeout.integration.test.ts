@@ -28,6 +28,9 @@
  * 8. **A held tail a rolled-back timeout ALSO skipped does not park the run** (anton-67xj). A
  *    cross-run blocker is no longer why that ticket cannot run, so parking on it would strand the
  *    independent commits behind a resume that could not dispatch it either.
+ * 9. **A run that STOPS reopens the timeouts it absorbed** (anton-67xj). A blocked ticket is the
+ *    founder's cue only on a run that reaches its PR; on one that parks instead, it is a status bd
+ *    refuses to claim — and the resume the park advertises dies on it at runTicket's claim gate.
  *
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
@@ -714,6 +717,99 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
         expect(ownerOf(stalled)).toBeUndefined();
         expect(stalled.labels ?? []).not.toContain("stage:implementing");
         expect(stalled.labels ?? []).not.toContain("not-delivered");
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
+        else process.env[BD_BIN_ENV] = priorBdBin;
+        resetBdBinCache();
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+        if (jobId)
+          await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      }
+    });
+
+    it("reopens the timeout it absorbed when a DEPENDENT's marker will not persist (anton-67xj)", async () => {
+      // The strand this closes: the stalled ticket's OWN marker landed, so the run absorbed its
+      // timeout and left it `blocked` — correct only while the run reaches its PR. The dependent's
+      // marker then refuses to write and parks the run instead, and the resume the park advertises
+      // re-dispatches the stalled ticket, where bd rejects the `blocked` status at runTicket's hard
+      // claim gate. One transient bd write failure would strand the run until an operator noticed a
+      // status repair nothing had asked them for.
+      const epicId = await beads.create(repo, {
+        title: "MarkerRefusedDependent",
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nMarkerRefusedDependent",
+      });
+      await beads.approve(repo, epicId);
+      const stalls = createTicket(repo, {
+        title: "MarkerRefusedDependent stalls",
+        parent: epicId,
+      });
+      const dependent = createTicket(repo, {
+        title: "MarkerRefusedDependent dependent",
+        parent: epicId,
+      });
+      await beads.link(repo, dependent, stalls, "blocks");
+
+      const invLog = join(sandbox, "marker-dependent-inv.jsonl");
+      const claude = writeBin(
+        binDir,
+        "claude-hang-marker-dependent",
+        fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  fs.appendFileSync(path.join(process.cwd(),'HALF_WRITTEN.md'),'partial '+id+'\\n');
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+      );
+
+      // Refuses the marker for the DEPENDENT alone, so the stalled ticket's own marker lands and its
+      // timeout is genuinely absorbed — the state the reopen has to undo.
+      const realBd = resolveBdBin();
+      const shim = writeBin(
+        binDir,
+        "bd-refuses-dependent-marker",
+        `const {spawnSync}=require('child_process');const a=process.argv.slice(2);
+const i=a.indexOf('--add-label');
+if(i>=0&&a[i+1]==='not-delivered'&&a.includes(${JSON.stringify(dependent)})){process.stderr.write('Error: simulated bd write failure\\n');process.exit(1);}
+const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.status===null?1:r.status);`,
+      );
+
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      const priorBdBin = process.env[BD_BIN_ENV];
+      process.env[BD_BIN_ENV] = shim;
+      resetBdBinCache();
+      let jobId: string | undefined;
+      try {
+        jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
+
+        const job = await getJob(tdb.db, jobId);
+        expect(job?.status).toBe("parked");
+        expect(job?.lastError).toMatch(/would not record `not-delivered`/i);
+        const target = await beads.show(repo, epicId);
+        expect(beads.getPrRef(target) ?? null).toBeNull();
+
+        // The absorbed timeout is CLAIMABLE again — the whole point: the resume this park advertises
+        // starts at a hard claim gate that refuses a `blocked` (or unowned `in_progress`) bead.
+        const stalled = await beads.show(repo, stalls);
+        expect(stalled.status).toBe("open");
+        expect(ownerOf(stalled)).toBeUndefined();
+        // …and it still says it delivered nothing, so the resumed run re-runs it rather than reading
+        // it as work already on the branch.
+        expect(stalled.labels ?? []).toContain("not-delivered");
       } finally {
         process.env.ANTON_CLAUDE_BIN = successClaude;
         if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
