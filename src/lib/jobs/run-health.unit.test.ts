@@ -15,6 +15,7 @@ import {
   detectStalePrs,
   inReviewTargets,
   settledExecuteEpicJobsByEpic,
+  sweepOutcome,
   withoutGateBlockedJobs,
   type InReviewPr,
 } from "./run-health";
@@ -70,6 +71,8 @@ function job(id: string, o: Partial<JobRow> = {}): JobRow {
     leaseExpiresAt: null,
     attempts: 3,
     lastError: null,
+    outcome: null,
+    outcomeNote: null,
     createdAt: secDate(NOW - 4 * HOUR),
     updatedAt: secDate(NOW - HOUR),
     ...o,
@@ -550,5 +553,31 @@ describe("withoutGateBlockedJobs", () => {
     // parked, and with no gate wait left to speak for it the finding has to come back.
     const findings = detectExhaustedJobs([blockedPark("g-1")], 3, NOW);
     expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["exhausted-job"]);
+  });
+});
+
+describe("sweepOutcome", () => {
+  it("calls a complete sweep with nothing wrong a clean bill of health", () => {
+    expect(sweepOutcome(0, 0)).toEqual({ changed: false, note: "no stalls found" });
+  });
+
+  it("refuses to claim 'no stalls' for a sweep that never checked every PR", () => {
+    // A `gh` read that failed (unauthenticated, rate-limited) means that PR was never checked for
+    // staleness — reporting the pass as clean would be a false all-clear.
+    const effect = sweepOutcome(0, 2);
+    expect(effect.changed).toBe(false);
+    expect(effect.note).toContain("partial sweep");
+    expect(effect.note).toContain("2 PR check(s) skipped");
+  });
+
+  it("carries the skipped count beside the findings a partial sweep did produce", () => {
+    expect(sweepOutcome(3, 1)).toEqual({
+      changed: true,
+      note: "3 finding(s); 1 PR check(s) skipped",
+    });
+  });
+
+  it("says nothing about skips when there were none", () => {
+    expect(sweepOutcome(3, 0)).toEqual({ changed: true, note: "3 finding(s)" });
   });
 });

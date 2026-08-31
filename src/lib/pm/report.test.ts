@@ -5,7 +5,7 @@
  * reached.
  */
 import { describe, expect, it } from "vitest";
-import { parsePmReport } from "./report";
+import { CLAIM_KINDS, parsePmReport, pmReportFormatSection } from "./report";
 
 /** A report block exactly as the protocol demands it — the shape every parse case varies from. */
 const report = (body: string): string => `Here is what I found.\n\n\`\`\`json\n${body}\n\`\`\``;
@@ -32,6 +32,16 @@ describe("parsePmReport", () => {
       claims: [
         { kind: "rehome", bead: "anton-a", home: "anton-epic", summary: "s", evidence: ["e"] },
       ],
+    });
+  });
+
+  it("reads a start claim as the bead alone — the ask carries no extra field", () => {
+    const result = parsePmReport(
+      report(`{"proposals":[{"kind":"start","bead":"anton-a","summary":"s","evidence":["e"]}]}`),
+    );
+    expect(result).toEqual({
+      ok: true,
+      claims: [{ kind: "start", bead: "anton-a", summary: "s", evidence: ["e"] }],
     });
   });
 
@@ -78,5 +88,20 @@ describe("parsePmReport", () => {
     // A block that tried to be the report and failed IS the report — say WHICH way it broke, so a
     // log reader can tell a garbled report from a session that emitted none.
     expect(parsePmReport(text)).toEqual({ ok: false, violation: "malformed-proposals" });
+  });
+});
+
+/**
+ * The other half of the protocol: what the pass is TOLD it may say. A kind the parser accepts but
+ * the format section never documents has no producer — no session emits a class it was never
+ * offered — which is how `withheld-approval` shipped with a full apply path reachable only from a
+ * fixture (anton-1ivg.1). Derived from the table, so adding a wire kind without documenting it
+ * fails here rather than shipping unreachable.
+ */
+describe("pmReportFormatSection", () => {
+  const section = pmReportFormatSection();
+
+  it.each(Object.keys(CLAIM_KINDS))("documents the %s claim it will be parsed for", (kind) => {
+    expect(section).toContain(`\`"${kind}"\``);
   });
 });

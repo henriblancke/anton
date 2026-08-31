@@ -10,11 +10,22 @@ import * as schema from "../db/schema";
 import { getBurnAverage, recordBurnSample } from "../burn";
 import type { ClaudeUsage } from "../claude/usage";
 import { PoisonError, RunAlreadyLiveError, SyncNotWiredError, UsageLimitError } from "./errors";
-import { complete, enqueue, getJob, park, reschedule, toMs, type Clock } from "./queue";
+import {
+  BUDGET_DEFER_PREFIX,
+  BUDGET_DEFER_PRIOR_SEP,
+  complete,
+  enqueue,
+  getJob,
+  park,
+  reschedule,
+  toMs,
+  type Clock,
+} from "./queue";
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./budget";
 import {
   classifyError,
   DEFAULT_CONFIG,
+  hasPriorAttempt,
   JobRunner,
   nextAction,
   type BeadLabelsReader,
@@ -48,6 +59,37 @@ const CONFIG: RunnerConfig = {
   maxConcurrent: 2,
   tickMs: 1_000,
 };
+
+describe("hasPriorAttempt (durable evidence of an unfinished attempt)", () => {
+  it("reads a first attempt as the job's first", () => {
+    expect(hasPriorAttempt({ attempts: 1, lastError: null })).toBe(false);
+  });
+
+  it("counts a second lease — the first attempt ran and did not complete", () => {
+    expect(hasPriorAttempt({ attempts: 2, lastError: null })).toBe(true);
+  });
+
+  it("counts a refunded retry by the error it stamped, not by attempts", () => {
+    // Quota / lease-held / not-wired rewind `attempts`, so the row's error is their only trace.
+    expect(hasPriorAttempt({ attempts: 1, lastError: "usage-limit: resumes at …" })).toBe(true);
+  });
+
+  it("ignores a budget-defer marker — pacing stamps a QUEUED row that never ran", () => {
+    const lastError = `${BUDGET_DEFER_PREFIX}weekly pace — resumes at 2026-01-01T00:00:00.000Z`;
+    expect(hasPriorAttempt({ attempts: 1, lastError })).toBe(false);
+    // Once an attempt has actually run, the stale marker no longer decides it.
+    expect(hasPriorAttempt({ attempts: 2, lastError })).toBe(true);
+  });
+
+  it("still counts a refunded attempt whose error a later defer carried inside the marker", () => {
+    // A deferral can land on a row a refunded attempt already ran; `deferQueuedJobs` appends that
+    // attempt's error rather than replacing it, so the evidence survives into the next lease.
+    const lastError =
+      `${BUDGET_DEFER_PREFIX}weekly pace — resumes at 2026-01-01T00:00:00.000Z` +
+      `${BUDGET_DEFER_PRIOR_SEP}usage-limit: resumes at …`;
+    expect(hasPriorAttempt({ attempts: 1, lastError })).toBe(true);
+  });
+});
 
 describe("nextAction (pure durability policy)", () => {
   const now = 1_000_000_000_000;
@@ -189,6 +231,110 @@ describe("JobRunner (live, in-memory db)", () => {
         .values({ id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
     }
   }
+
+  // ── the handler's own claim about what it DID (anton-znoz) ──
+  //
+  // `status` says the job finished; `outcome` says whether finishing meant anything. The Automation
+  // table reads the two together, so a run that reported nothing must not be dressed up as either.
+
+  it("records a handler's reported effect on the completed job", async () => {
+    const r = runner(async () => ({ changed: true, note: "bucketed 3 loose ticket(s)" }));
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("ok");
+    expect(job?.outcomeNote).toBe("bucketed 3 loose ticket(s)");
+  });
+
+  it("records a no-op distinctly from a run that changed something", async () => {
+    const r = runner(async () => ({ changed: false, note: "no loose tickets" }));
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("noop");
+    expect(job?.outcomeNote).toBe("no loose tickets");
+  });
+
+  it("leaves the outcome null for a handler that reports nothing", async () => {
+    const r = runner(async () => {});
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBeNull();
+    expect(job?.outcomeNote).toBeNull();
+  });
+
+  it("records no outcome for a job that parked — a failure is status + lastError", async () => {
+    const r = runner(async () => {
+      throw new PoisonError("boom");
+    });
+    const id = await r.enqueue({ type: "execute-epic", payload: {} });
+    await r.tickOnce();
+    await r.whenIdle();
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("parked");
+    expect(job?.outcome).toBeNull();
+    expect(job?.lastError).toContain("boom");
+  });
+
+  it("withholds a retry's no-op claim — an earlier attempt may have changed state", async () => {
+    // The effect is attempt-local: gate-check can close gates and then throw, leaving the retry
+    // nothing to find. Publishing that retry's "no gate closed" would report work that happened as
+    // work that didn't, so the claim is withheld and the job settles as "ran, effect unknown".
+    let attempt = 0;
+    const r = runner(
+      async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("closed 2 gate(s), then failed");
+        return { changed: false, note: "no gate closed" };
+      },
+      { maxAttempts: 3, backoffBaseMs: 1_000 },
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+    clock.advance(2_000);
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.attempts).toBe(2);
+    expect(job?.outcome).toBeNull();
+    expect(job?.outcomeNote).toContain("no gate closed");
+    expect(job?.outcomeNote).toContain("earlier attempt");
+  });
+
+  it("still records a retry that changed something as ok", async () => {
+    let attempt = 0;
+    const r = runner(
+      async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("transient");
+        return { changed: true, note: "closed 2 gate(s)" };
+      },
+      { maxAttempts: 3, backoffBaseMs: 1_000 },
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+    clock.advance(2_000);
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const job = await getJob(tdb.db, id);
+    expect(job?.status).toBe("done");
+    expect(job?.outcome).toBe("ok");
+    expect(job?.outcomeNote).toBe("closed 2 gate(s)");
+  });
 
   it("runs a queued job to completion", async () => {
     let ran = 0;

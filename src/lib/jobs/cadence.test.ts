@@ -8,6 +8,7 @@ import { DEFAULT_SCHEDULES } from "../schedules";
 import {
   CADENCE_PRESETS,
   cronForPreset,
+  dailyEquivalentOf,
   describeCron,
   FAST_CADENCE_MINUTES,
   isFastCadence,
@@ -194,5 +195,26 @@ describe("preset table", () => {
       expect(p.defaults.hour, p.id).toBeLessThanOrEqual(23);
       expect(WEEKDAY_LABELS[p.defaults.weekday], p.id).toBeTruthy();
     }
+  });
+});
+
+describe("dailyEquivalentOf (anton-3xa9)", () => {
+  it("promotes a weekly cadence to daily at the operator's own time of day", () => {
+    // product-master's shipped default: the offer must keep 06:00, not reset it to a preset hour.
+    expect(dailyEquivalentOf("0 6 * * 1")).toBe("0 6 * * *");
+    expect(describeCron(dailyEquivalentOf("30 22 * * 5")!)).toBe("Daily at 22:30");
+  });
+
+  it("has nothing to offer a cadence that is already daily or faster", () => {
+    expect(dailyEquivalentOf("0 6 * * *")).toBeNull();
+    expect(dailyEquivalentOf("0 * * * *")).toBeNull();
+    expect(dailyEquivalentOf("*/10 * * * *")).toBeNull();
+  });
+
+  it("refuses to rewrite an expression the operator hand-built", () => {
+    // Fires weekly-ish, but it is not the weekly PRESET — rewriting it would lose the choice.
+    expect(dailyEquivalentOf("0 6 * * 1,4")).toBeNull();
+    expect(dailyEquivalentOf("0 6 1 * 1")).toBeNull();
+    expect(dailyEquivalentOf("garbage")).toBeNull();
   });
 });

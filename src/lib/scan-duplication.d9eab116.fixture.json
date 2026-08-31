@@ -1,0 +1,875 @@
+[
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/git/ops.test.ts",
+    "Line": 318,
+    "Title": "Duplicated block (6 lines, 4 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/git/ops.test.ts:318\n  - src/lib/git/ops.test.ts:436\n  - src/lib/git/ops.test.ts:732\n  - src/lib/git/ops.test.ts:319\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/beads/formula.test.ts",
+    "Line": 222,
+    "Title": "Duplicated block (6 lines, 4 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/formula.test.ts:222\n  - src/lib/beads/formula.test.ts:246\n  - src/lib/beads/formula.test.ts:270\n  - src/lib/beads/formula.test.ts:221\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/execute-epic.formula-walk.integration.test.ts",
+    "Line": 165,
+    "Title": "Duplicated block (6 lines, 4 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:165\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:211\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:359\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:164\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/execute-epic.review-gate.integration.test.ts",
+    "Line": 506,
+    "Title": "Duplicated block (6 lines, 6 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:506\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:564\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:883\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:919\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:958\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:507\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/app/api/projects/[slug]/settings/route.test.ts",
+    "Line": 35,
+    "Title": "Duplicated block (6 lines, 5 locations)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/settings/route.test.ts:35\n  - src/app/api/projects/[slug]/settings/route.test.ts:264\n  - src/app/api/projects/[slug]/settings/route.test.ts:304\n  - src/app/api/projects/[slug]/settings/route.test.ts:542\n  - src/app/api/projects/[slug]/settings/route.test.ts:34\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/review-context.test.ts",
+    "Line": 480,
+    "Title": "Duplicated block (6 lines, 4 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/review-context.test.ts:480\n  - src/lib/jobs/review-context.test.ts:716\n  - src/lib/jobs/review-context.test.ts:783\n  - src/lib/jobs/review-context.test.ts:478\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/review-context.test.ts",
+    "Line": 500,
+    "Title": "Duplicated block (6 lines, 8 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/review-context.test.ts:500\n  - src/lib/jobs/review-context.test.ts:528\n  - src/lib/jobs/review-context.test.ts:555\n  - src/lib/jobs/review-context.test.ts:585\n  - src/lib/jobs/review-context.test.ts:611\n  - src/lib/jobs/review-context.test.ts:633\n  - src/lib/jobs/review-context.test.ts:650\n  - src/lib/jobs/review-context.test.ts:498\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/claude/driver.test.ts",
+    "Line": 385,
+    "Title": "Duplicated block (6 lines, 5 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/claude/driver.test.ts:385\n  - src/lib/claude/driver.test.ts:420\n  - src/lib/claude/driver.test.ts:456\n  - src/lib/claude/driver.test.ts:494\n  - src/lib/claude/driver.test.ts:386\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/scan-health.test.ts",
+    "Line": 323,
+    "Title": "Duplicated block (6 lines, 4 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/scan-health.test.ts:323\n  - src/lib/scan-health.test.ts:636\n  - src/lib/scan-health.test.ts:682\n  - src/lib/scan-health.test.ts:318\n",
+    "Confidence": 0.44999999999999996
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/board-column.tsx",
+    "Line": 18,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/board-column.tsx:18\n  - src/components/runs/bulk-kill-jobs-bar.tsx:43\n  - src/components/shape/shape-draft-fields.tsx:17\n  - src/components/shape/shape-draft-fields.tsx:82\n  - src/components/shape/shape-draft-panel.tsx:32\n  - src/components/tickets/tickets-view.tsx:33\n  - src/components/tickets/tickets-view.tsx:171\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/pr-link-control.tsx",
+    "Line": 19,
+    "Title": "Near-duplicate block (6 lines, 11 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/pr-link-control.tsx:19\n  - src/components/epic/rework-dialog.tsx:55\n  - src/components/roadmap/epic-dialog.tsx:60\n  - src/components/runs/job-list.tsx:68\n  - src/components/settings/automation-table.tsx:101\n  - src/components/settings/cadence-editor.tsx:192\n  - src/components/settings/settings-view.tsx:486\n  - src/components/shape/shape-draft-panel.tsx:29\n  - src/components/shell/sidebar.tsx:51\n  - src/components/ui/copy-button.tsx:27\n  - src/components/ui/filter-select.tsx:30\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/merge-gate.integration.test.ts",
+    "Line": 166,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/merge-gate.integration.test.ts:166\n  - src/lib/jobs/nightly-stringer.integration.test.ts:113\n  - src/lib/jobs/nightly-stringer.routing.integration.test.ts:167\n  - src/lib/jobs/review-fix.integration.test.ts:139\n  - src/lib/scan-health.integration.test.tsx:140\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/components/epic/epic-priority-control.tsx",
+    "Line": 61,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/epic-priority-control.tsx:61\n  - src/components/roadmap/epic-dialog.tsx:120\n  - src/components/settings/settings-view.tsx:905\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/nightly-stringer.integration.test.ts",
+    "Line": 44,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/nightly-stringer.integration.test.ts:44\n  - src/lib/jobs/nightly-stringer.routing.integration.test.ts:125\n  - src/lib/jobs/orphan-grooming.integration.test.ts:45\n  - src/lib/jobs/review-fix-merge.integration.test.ts:63\n  - src/lib/scan-health.integration.test.tsx:81\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/epics/[epicId]/abandon/route.integration.test.ts",
+    "Line": 36,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/epics/[epicId]/abandon/route.integration.test.ts:36\n  - src/app/api/projects/[slug]/epics/[epicId]/abandon/route.integration.test.ts:120\n  - src/app/api/projects/[slug]/epics/[epicId]/route.integration.test.ts:28\n  - src/app/api/projects/[slug]/tickets/[ticketId]/notes/route.integration.test.ts:29\n  - src/app/api/projects/[slug]/tickets/[ticketId]/route.integration.test.ts:25\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/epic/graph-layout.ts",
+    "Line": 10,
+    "Title": "Near-duplicate block (6 lines, 6 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/graph-layout.ts:10\n  - src/components/epic/graph-layout.ts:15\n  - src/lib/beads/child-assign.ts:26\n  - src/lib/jobs/cadence.ts:48\n  - src/lib/scan-health.ts:43\n  - src/lib/scan-health.ts:49\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/epic/rework-dialog.tsx",
+    "Line": 199,
+    "Title": "Near-duplicate block (6 lines, 12 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/rework-dialog.tsx:199\n  - src/components/epic/rework-dialog.tsx:262\n  - src/components/epic/rework-dialog.tsx:328\n  - src/components/runs/run-detail-view.tsx:278\n  - src/components/settings/cadence-editor.tsx:348\n  - src/components/settings/settings-view.tsx:1947\n  - src/components/settings/settings-view.tsx:1980\n  - src/components/settings/settings-view.tsx:2078\n  - src/components/shape/shape-draft-fields.tsx:81\n  - src/components/shape/shape-draft-fields.tsx:175\n  - src/components/shape/shape-draft-panel.tsx:59\n  - src/components/tickets/tickets-view.tsx:170\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/shape/shape-draft.ts",
+    "Line": 17,
+    "Title": "Near-duplicate block (6 lines, 10 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/shape/shape-draft.ts:17\n  - src/components/ticket/ticket-dialog-utils.ts:26\n  - src/lib/backlog.ts:36\n  - src/lib/beads/bd.ts:1175\n  - src/lib/burn.ts:123\n  - src/lib/git/pr.ts:158\n  - src/lib/jobs/budget.ts:83\n  - src/lib/jobs/runner.ts:69\n  - src/lib/jobs/unstick.ts:451\n  - src/lib/scan-health.ts:519\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/draggable-epic-card.tsx",
+    "Line": 13,
+    "Title": "Near-duplicate block (6 lines, 6 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/draggable-epic-card.tsx:13\n  - src/components/board/epic-card.tsx:315\n  - src/components/board/standalone-chip.tsx:37\n  - src/components/epic/epic-priority-control.tsx:18\n  - src/components/runs/view-job-output.tsx:18\n  - src/components/ticket/ticket-dialog.tsx:525\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/escalation-actions.tsx",
+    "Line": 57,
+    "Title": "Near-duplicate block (6 lines, 10 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/escalation-actions.tsx:57\n  - src/components/board/health-pill.tsx:58\n  - src/components/board/pr-link-control.tsx:15\n  - src/components/epic/rework-dialog.tsx:50\n  - src/components/roadmap/epic-dialog.tsx:56\n  - src/components/settings/automation-table.tsx:97\n  - src/components/settings/cadence-editor.tsx:188\n  - src/components/shape/shape-view.tsx:14\n  - src/components/ticket/ticket-notes.tsx:15\n  - src/components/ticket/ticket-state-bar.tsx:20\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/settings/route.ts",
+    "Line": 160,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/settings/route.ts:160\n  - src/app/api/projects/[slug]/settings/route.ts:174\n  - src/app/api/projects/[slug]/settings/route.ts:188\n  - src/app/api/projects/[slug]/settings/route.ts:161\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/components/epic/project-graph.tsx",
+    "Line": 142,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/project-graph.tsx:142\n  - src/components/ticket/ticket-dialog.tsx:130\n  - src/components/tickets/tickets-view.tsx:84\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/epic/rework-dialog.tsx",
+    "Line": 385,
+    "Title": "Near-duplicate block (6 lines, 13 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/rework-dialog.tsx:385\n  - src/components/runs/job-list.tsx:220\n  - src/components/runs/run-detail-view.tsx:233\n  - src/components/settings/automation-table.tsx:189\n  - src/components/settings/automation-table.tsx:281\n  - src/components/settings/cadence-editor.tsx:455\n  - src/components/settings/cadence-editor.tsx:499\n  - src/components/settings/settings-view.tsx:1820\n  - src/components/settings/settings-view.tsx:1895\n  - src/components/shape/shape-draft-fields.tsx:209\n  - src/components/shape/shape-draft-fields.tsx:246\n  - src/components/ticket/ticket-dialog.tsx:93\n  - src/components/ticket/ticket-dialog.tsx:559\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/epics/[epicId]/abandon/route.integration.test.ts",
+    "Line": 33,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/epics/[epicId]/abandon/route.integration.test.ts:33\n  - src/app/api/projects/[slug]/epics/[epicId]/abandon/route.integration.test.ts:117\n  - src/lib/beads/bd-hygiene.integration.test.ts:29\n  - src/lib/jobs/execute-epic.lifecycle.integration.test.ts:48\n  - src/lib/jobs/execute-epic.rework.integration.test.ts:89\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/execute-epic.abandon-base.integration.test.ts",
+    "Line": 45,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.abandon-base.integration.test.ts:45\n  - src/lib/jobs/execute-epic.gating.integration.test.ts:44\n  - src/lib/jobs/execute-epic.lifecycle.integration.test.ts:49\n  - src/lib/jobs/execute-epic.recovery.integration.test.ts:40\n  - src/lib/jobs/execute-epic.rework.integration.test.ts:90\n  - src/lib/jobs/execute-epic.ticket-timeout.integration.test.ts:49\n  - src/lib/jobs/execute-epic.usage-resume.integration.test.ts:39\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/execute-epic.formula-walk.integration.test.ts",
+    "Line": 4,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:4\n  - src/lib/jobs/execute-epic.rework.integration.test.ts:6\n  - src/lib/jobs/execute-epic.ticket-timeout.integration.test.ts:9\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/approval-gate.ts",
+    "Line": 109,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/approval-gate.ts:109\n  - src/lib/beads/subtree.ts:23\n  - src/lib/gardener/board-index.ts:75\n  - src/lib/roadmap.ts:53\n  - src/lib/tickets.ts:139\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/runs/run-view-utils.ts",
+    "Line": 26,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/runs/run-view-utils.ts:26\n  - src/components/settings/automation-table.tsx:17\n  - src/lib/beads/bd.ts:1163\n  - src/lib/beads/bd.ts:1555\n  - src/lib/claude/driver.ts:38\n  - src/lib/sessions.ts:148\n  - src/lib/types.ts:312\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/execute-epic.ts",
+    "Line": 46,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.ts:46\n  - src/lib/jobs/execute-epic.ts:45\n  - src/lib/jobs/run-health.ts:23\n  - src/lib/jobs/unstick.ts:41\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/beads/bd-hygiene.integration.test.ts",
+    "Line": 21,
+    "Title": "Near-duplicate block (6 lines, 50 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/bd-hygiene.integration.test.ts:21\n  - src/lib/beads/bd-hygiene.integration.test.ts:22\n  - src/lib/beads/bd-hygiene.integration.test.ts:24\n  - src/lib/beads/bd-hygiene.integration.test.ts:26\n  - src/lib/beads/bd-hygiene.integration.test.ts:27\n  - src/lib/gate-molecule.integration.test.ts:63\n  - src/lib/gate-molecule.integration.test.ts:64\n  - src/lib/gate-molecule.integration.test.ts:65\n  - src/lib/jobs/execute-epic.lifecycle.integration.test.ts:46\n  - src/lib/jobs/execute-epic.lifecycle.integration.test.ts:47\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:54\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:55\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:56\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:58\n  - src/lib/jobs/execute-epic.rework.integration.test.ts:87\n  - src/lib/jobs/execute-epic.rework.integration.test.ts:88\n  - src/lib/jobs/gardener.integration.test.ts:43\n  - src/lib/jobs/gardener.integration.test.ts:45\n  - src/lib/jobs/gardener.integration.test.ts:46\n  - src/lib/jobs/nightly-stringer.integration.test.ts:34\n  - src/lib/jobs/nightly-stringer.integration.test.ts:35\n  - src/lib/jobs/nightly-stringer.refresh.test.ts:45\n  - src/lib/jobs/nightly-stringer.refresh.test.ts:46\n  - src/lib/jobs/nightly-stringer.routing.integration.test.ts:113\n  - src/lib/jobs/orphan-grooming.integration.test.ts:34\n  - src/lib/jobs/orphan-grooming.integration.test.ts:35\n  - src/lib/jobs/orphan-grooming.integration.test.ts:36\n  - src/lib/jobs/orphan-grooming.integration.test.ts:37\n  - src/lib/jobs/product-master.integration.test.ts:47\n  - src/lib/jobs/product-master.integration.test.ts:49\n  - src/lib/jobs/product-master.integration.test.ts:51\n  - src/lib/jobs/review-fix-merge.integration.test.ts:49\n  - src/lib/jobs/review-fix-merge.integration.test.ts:50\n  - src/lib/jobs/review-fix-merge.integration.test.ts:51\n  - src/lib/jobs/review-fix-merge.integration.test.ts:52\n  - src/lib/jobs/review-fix-merge.integration.test.ts:53\n  - src/lib/jobs/review-fix-merge.integration.test.ts:54\n  - src/lib/jobs/review-fix-merge.integration.test.ts:55\n  - src/lib/jobs/review-fix.integration.test.ts:38\n  - src/lib/jobs/review-fix.integration.test.ts:39\n  - src/lib/jobs/review-fix.integration.test.ts:40\n  - src/lib/jobs/review-fix.integration.test.ts:41\n  - src/lib/jobs/run-health.integration.test.ts:37\n  - src/lib/jobs/run-health.integration.test.ts:38\n  - src/lib/jobs/run-health.integration.test.ts:39\n  - src/lib/jobs/run-health.integration.test.ts:40\n  - src/lib/jobs/run-health.integration.test.ts:41\n  - src/lib/jobs/run-health.integration.test.ts:43\n  - src/lib/jobs/run-health.integration.test.ts:45\n  - src/lib/jobs/run-health.integration.test.ts:47\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/components/board/board-filters.test.tsx",
+    "Line": 23,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/components/board/board-filters.test.tsx:23\n  - src/components/board/board-grouping.test.tsx:56\n  - src/components/board/epic-filter.test.tsx:86\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/escalation-actions.test.ts",
+    "Line": 497,
+    "Title": "Near-duplicate block (6 lines, 9 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/escalation-actions.test.ts:497\n  - src/lib/escalation-actions.test.ts:510\n  - src/lib/escalation-actions.test.ts:545\n  - src/lib/escalation-actions.test.ts:561\n  - src/lib/escalation-actions.test.ts:587\n  - src/lib/escalation-actions.test.ts:602\n  - src/lib/escalation-actions.test.ts:617\n  - src/lib/escalation-actions.test.ts:778\n  - src/lib/escalation-actions.test.ts:1450\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/beads/bd-batch.integration.test.ts",
+    "Line": 46,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/bd-batch.integration.test.ts:46\n  - src/lib/beads/bd-batch.integration.test.ts:84\n  - src/lib/beads/bd-batch.integration.test.ts:48\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/beads/bd.test.ts",
+    "Line": 16,
+    "Title": "Near-duplicate block (6 lines, 12 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/bd.test.ts:16\n  - src/lib/beads/formula.test.ts:20\n  - src/lib/beads/structure.test.ts:6\n  - src/lib/board.ts:10\n  - src/lib/claude/usage.test.ts:14\n  - src/lib/gardener/apply.ts:56\n  - src/lib/gardener/autonomy.test.ts:9\n  - src/lib/gardener/record.test.ts:14\n  - src/lib/git/refresh.ts:16\n  - src/lib/hygiene.test.ts:22\n  - src/lib/jobs/budget.test.ts:11\n  - src/lib/pm/context.test.ts:15\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/escalation-actions.ts",
+    "Line": 453,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/escalation-actions.ts:453\n  - src/lib/gardener/apply.ts:293\n  - src/lib/git/pr.ts:335\n  - src/lib/jobs/unstick.ts:405\n  - src/lib/rework.ts:843\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/backlog.test.ts",
+    "Line": 32,
+    "Title": "Near-duplicate block (6 lines, 14 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/backlog.test.ts:32\n  - src/lib/beads/bd-gate.test.ts:20\n  - src/lib/beads/snapshot.test.ts:7\n  - src/lib/burn.test.ts:13\n  - src/lib/escalations.test.ts:17\n  - src/lib/git/ops.test.ts:33\n  - src/lib/git/remote.test.ts:9\n  - src/lib/git/worktree.test.ts:23\n  - src/lib/jobs/cadence.test.ts:12\n  - src/lib/jobs/execute-epic.ts:74\n  - src/lib/jobs/queue.dedupe.test.ts:15\n  - src/lib/stringer.test.ts:23\n  - src/lib/ticket-view.ts:22\n  - src/lib/types.ts:21\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/scan-health.test.ts",
+    "Line": 631,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/scan-health.test.ts:631\n  - src/lib/scan-health.test.ts:653\n  - src/lib/scan-health.test.ts:630\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/backlog.ts",
+    "Line": 231,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/backlog.ts:231\n  - src/lib/escalation-actions.ts:675\n  - src/lib/gardener/apply.ts:380\n  - src/lib/git/ops.ts:159\n  - src/lib/jobs/review-context.ts:210\n  - src/lib/rework.ts:830\n  - src/lib/scan-health.ts:587\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/review-context.test.ts",
+    "Line": 481,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/review-context.test.ts:481\n  - src/lib/jobs/review-context.test.ts:784\n  - src/lib/jobs/review-context.test.ts:825\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/epic/rework-dialog.tsx",
+    "Line": 236,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/rework-dialog.tsx:236\n  - src/components/epic/rework-dialog.tsx:391\n  - src/components/settings/cadence-editor.tsx:197\n  - src/components/settings/cadence-editor.tsx:396\n  - src/components/ticket/ticket-state-bar.tsx:29\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/components/health/health-rail.test.tsx",
+    "Line": 46,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/components/health/health-rail.test.tsx:46\n  - src/components/health/health-report.test.tsx:42\n  - src/lib/board.test.ts:894\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/atoms.tsx",
+    "Line": 54,
+    "Title": "Near-duplicate block (6 lines, 6 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/atoms.tsx:54\n  - src/components/atoms.tsx:100\n  - src/components/atoms.tsx:188\n  - src/components/runs/investigate-job.tsx:33\n  - src/components/runs/kill-job-button.tsx:101\n  - src/components/usage/usage-pill.tsx:90\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/abandon.ts",
+    "Line": 444,
+    "Title": "Near-duplicate block (6 lines, 11 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/abandon.ts:444\n  - src/lib/escalations.ts:126\n  - src/lib/git/ops.ts:353\n  - src/lib/hygiene.ts:164\n  - src/lib/hygiene.ts:194\n  - src/lib/jobs/review-score.ts:103\n  - src/lib/rework.ts:104\n  - src/lib/scan-health.ts:725\n  - src/lib/testing/jobs.ts:69\n  - src/lib/ticket-detail.ts:112\n  - src/lib/ticket-detail.ts:198\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/execute-epic.abandon-base.integration.test.ts",
+    "Line": 86,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.abandon-base.integration.test.ts:86\n  - src/lib/jobs/execute-epic.gating.integration.test.ts:86\n  - src/lib/jobs/execute-epic.gating.integration.test.ts:281\n  - src/lib/jobs/execute-epic.gating.integration.test.ts:800\n  - src/lib/jobs/execute-epic.gating.integration.test.ts:1023\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/epic/epic-detail-view.tsx",
+    "Line": 75,
+    "Title": "Near-duplicate block (6 lines, 8 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/epic-detail-view.tsx:75\n  - src/components/runs/bulk-kill-jobs-bar.tsx:32\n  - src/components/runs/investigate-job.tsx:80\n  - src/components/runs/job-list.tsx:59\n  - src/components/settings/settings-view.tsx:484\n  - src/components/shape/shape-draft-panel.tsx:26\n  - src/components/shell/sidebar.tsx:49\n  - src/components/ui/copy-button.tsx:20\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/execute-epic.formula-walk.integration.test.ts",
+    "Line": 340,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:340\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:458\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:336\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/epics/[epicId]/approve/approve-claims.route.integration.test.ts",
+    "Line": 24,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/epics/[epicId]/approve/approve-claims.route.integration.test.ts:24\n  - src/app/api/projects/[slug]/epics/[epicId]/approve/approve-gating.route.integration.test.ts:47\n  - src/app/api/projects/[slug]/epics/[epicId]/claim/route.integration.test.ts:66\n  - src/app/api/projects/[slug]/epics/[epicId]/rework/route.integration.test.ts:88\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/beads/formula.test.ts",
+    "Line": 261,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/formula.test.ts:261\n  - src/lib/beads/formula.test.ts:285\n  - src/lib/beads/formula.test.ts:309\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/execute-epic.review-gate.integration.test.ts",
+    "Line": 507,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:507\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:565\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:627\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:884\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:920\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:959\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:506\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/review-gate.test.ts",
+    "Line": 838,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/review-gate.test.ts:838\n  - src/lib/jobs/review-gate.test.ts:878\n  - src/lib/jobs/review-gate.test.ts:921\n  - src/lib/jobs/review-gate.test.ts:834\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/step-registry.test.ts",
+    "Line": 162,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/step-registry.test.ts:162\n  - src/lib/jobs/step-registry.test.ts:188\n  - src/lib/jobs/step-registry.test.ts:221\n  - src/lib/jobs/step-registry.test.ts:247\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/epic-card.tsx",
+    "Line": 317,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/epic-card.tsx:317\n  - src/components/epic/epic-detail-view.tsx:86\n  - src/components/epic/epic-priority-control.tsx:20\n  - src/components/runs/job-list.tsx:397\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/runs/bulk-kill-jobs-bar.tsx",
+    "Line": 12,
+    "Title": "Near-duplicate block (6 lines, 6 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/runs/bulk-kill-jobs-bar.tsx:12\n  - src/lib/beads/child-assign.ts:31\n  - src/lib/epic-graph.ts:65\n  - src/lib/gardener/record.ts:118\n  - src/lib/jobs/gate-check.ts:172\n  - src/lib/pm/context.ts:104\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/approval-gate.ts",
+    "Line": 17,
+    "Title": "Near-duplicate block (6 lines, 29 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/approval-gate.ts:17\n  - src/lib/attention.ts:8\n  - src/lib/beads/contract.ts:14\n  - src/lib/escalation-actions.ts:24\n  - src/lib/gardener/apply-plan.ts:4\n  - src/lib/gardener/apply-steps.test.ts:4\n  - src/lib/gardener/apply.ts:36\n  - src/lib/gardener/emit.ts:8\n  - src/lib/gardener/retire.ts:4\n  - src/lib/git/refresh.ts:3\n  - src/lib/jobs/execute-epic.formula-walk.integration.test.ts:4\n  - src/lib/jobs/execute-epic.rework.integration.test.ts:6\n  - src/lib/jobs/execute-epic.ticket-timeout.integration.test.ts:9\n  - src/lib/jobs/execute-epic.ts:5\n  - src/lib/jobs/gardener-proposals.ts:5\n  - src/lib/jobs/gardener.armed.integration.test.ts:4\n  - src/lib/jobs/gate-check.ts:30\n  - src/lib/jobs/gate-targets.ts:9\n  - src/lib/jobs/pass-preamble.ts:4\n  - src/lib/jobs/product-master.ts:19\n  - src/lib/jobs/review-fix.ts:18\n  - src/lib/jobs/review-gate.ts:4\n  - src/lib/jobs/run-formula.test.ts:11\n  - src/lib/jobs/run-health.ts:10\n  - src/lib/jobs/runner.ts:4\n  - src/lib/jobs/step-registry.ts:13\n  - src/lib/jobs/unstick.ts:17\n  - src/lib/pm/context.ts:5\n  - src/lib/scan-health.ts:5\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/gardener/armed.test.ts",
+    "Line": 196,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/gardener/armed.test.ts:196\n  - src/lib/gardener/armed.test.ts:228\n  - src/lib/gardener/armed.test.ts:197\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/shape/shape-draft.ts",
+    "Line": 16,
+    "Title": "Near-duplicate block (6 lines, 44 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/shape/shape-draft.ts:16\n  - src/components/ticket/ticket-dialog-utils.ts:25\n  - src/lib/backlog.ts:35\n  - src/lib/burn.ts:121\n  - src/lib/jobs/budget.ts:43\n  - src/lib/jobs/budget.ts:45\n  - src/lib/jobs/budget.ts:47\n  - src/lib/jobs/budget.ts:49\n  - src/lib/jobs/budget.ts:51\n  - src/lib/jobs/budget.ts:57\n  - src/lib/jobs/budget.ts:63\n  - src/lib/jobs/budget.ts:65\n  - src/lib/jobs/budget.ts:67\n  - src/lib/jobs/budget.ts:69\n  - src/lib/jobs/budget.ts:77\n  - src/lib/jobs/budget.ts:79\n  - src/lib/jobs/budget.ts:81\n  - src/lib/jobs/execute-epic.fixture.ts:186\n  - src/lib/jobs/execute-epic.fixture.ts:188\n  - src/lib/jobs/execute-epic.fixture.ts:190\n  - src/lib/jobs/execute-epic.fixture.ts:192\n  - src/lib/jobs/execute-epic.fixture.ts:194\n  - src/lib/jobs/execute-epic.fixture.ts:196\n  - src/lib/jobs/pass-preamble.ts:59\n  - src/lib/jobs/review-fix.ts:205\n  - src/lib/jobs/review-fix.ts:206\n  - src/lib/jobs/review-fix.ts:207\n  - src/lib/jobs/review-fix.ts:303\n  - src/lib/jobs/review-fix.ts:304\n  - src/lib/jobs/review-fix.ts:305\n  - src/lib/jobs/review-fix.ts:306\n  - src/lib/jobs/review-fix.ts:307\n  - src/lib/jobs/review-gate.ts:574\n  - src/lib/jobs/review-gate.ts:641\n  - src/lib/jobs/review-gate.ts:642\n  - src/lib/jobs/review-gate.ts:643\n  - src/lib/jobs/runner.ts:61\n  - src/lib/jobs/runner.ts:63\n  - src/lib/jobs/runner.ts:65\n  - src/lib/jobs/runner.ts:67\n  - src/lib/jobs/step-registry.ts:143\n  - src/lib/jobs/step-registry.ts:144\n  - src/lib/jobs/step-registry.ts:146\n  - src/lib/types.ts:139\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/execute-epic.ts",
+    "Line": 1048,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.ts:1048\n  - src/lib/jobs/review-gate.ts:458\n  - src/lib/jobs/review-gate.ts:513\n  - src/lib/jobs/review-gate.ts:457\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/components/board/board-grouping.test.tsx",
+    "Line": 27,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/components/board/board-grouping.test.tsx:27\n  - src/components/board/epic-board.test.tsx:49\n  - src/components/board/epic-filter.test.tsx:61\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/board-utils.ts",
+    "Line": 200,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/board-utils.ts:200\n  - src/components/board/board-utils.ts:202\n  - src/components/board/board-utils.ts:204\n  - src/components/board/board-utils.ts:206\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/execute-epic.review-gate.integration.test.ts",
+    "Line": 898,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:898\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:935\n  - src/lib/jobs/execute-epic.review-gate.integration.test.ts:899\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/claude/driver.test.ts",
+    "Line": 272,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/claude/driver.test.ts:272\n  - src/lib/claude/driver.test.ts:308\n  - src/lib/claude/driver.test.ts:411\n  - src/lib/claude/driver.test.ts:447\n  - src/lib/claude/driver.test.ts:270\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/beads/bd.test.ts",
+    "Line": 1304,
+    "Title": "Near-duplicate block (6 lines, 13 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/bd.test.ts:1304\n  - src/lib/gardener/reparent.ts:131\n  - src/lib/jobs/execute-epic.fixture.ts:278\n  - src/lib/jobs/gardener.test.ts:446\n  - src/lib/jobs/merge-gate.integration.test.ts:169\n  - src/lib/jobs/nightly-stringer.integration.test.ts:114\n  - src/lib/jobs/nightly-stringer.routing.integration.test.ts:169\n  - src/lib/jobs/review-fix.integration.test.ts:142\n  - src/lib/jobs/run-formula.integration.test.ts:98\n  - src/lib/jobs/run-formula.integration.test.ts:105\n  - src/lib/jobs/run-formula.integration.test.ts:121\n  - src/lib/jobs/run-formula.test.ts:107\n  - src/lib/scan-health.integration.test.tsx:142\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/projects/[slug]/runs/page.tsx",
+    "Line": 124,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/projects/[slug]/runs/page.tsx:124\n  - src/components/health/housekeeping-section.tsx:46\n  - src/components/projects/add-project-dialog.tsx:276\n  - src/components/runs/run-detail-view.tsx:316\n  - src/components/settings/automation-table.tsx:182\n  - src/components/settings/delete-project-dialog.tsx:121\n  - src/components/ticket/ticket-dialog.tsx:515\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/nightly-stringer.integration.test.ts",
+    "Line": 20,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/nightly-stringer.integration.test.ts:20\n  - src/lib/jobs/review-fix-merge.integration.test.ts:23\n  - src/lib/jobs/review-fix.integration.test.ts:24\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/board-utils.ts",
+    "Line": 38,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/board-utils.ts:38\n  - src/components/health/scan-copy.ts:19\n  - src/components/settings/cadence-editor.tsx:39\n  - src/lib/jobs-filters.ts:32\n  - src/lib/scan-severity.ts:96\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/review-context.test.ts",
+    "Line": 499,
+    "Title": "Near-duplicate block (6 lines, 8 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/review-context.test.ts:499\n  - src/lib/jobs/review-context.test.ts:527\n  - src/lib/jobs/review-context.test.ts:554\n  - src/lib/jobs/review-context.test.ts:584\n  - src/lib/jobs/review-context.test.ts:610\n  - src/lib/jobs/review-context.test.ts:632\n  - src/lib/jobs/review-context.test.ts:649\n  - src/lib/jobs/review-context.test.ts:498\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/escalation-actions.test.ts",
+    "Line": 702,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/escalation-actions.test.ts:702\n  - src/lib/escalation-actions.test.ts:717\n  - src/lib/escalation-actions.test.ts:754\n  - src/lib/escalation-actions.test.ts:700\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/runner.test.ts",
+    "Line": 1528,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/runner.test.ts:1528\n  - src/lib/jobs/runner.test.ts:1596\n  - src/lib/jobs/runner.test.ts:1527\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/app/api/projects/[slug]/epics/[epicId]/claim/route.integration.test.ts",
+    "Line": 5,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/epics/[epicId]/claim/route.integration.test.ts:5\n  - src/app/api/projects/[slug]/epics/[epicId]/review/route.integration.test.ts:4\n  - src/app/api/projects/[slug]/epics/[epicId]/rework/route.integration.test.ts:6\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/settings/route.test.ts",
+    "Line": 181,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/settings/route.test.ts:181\n  - src/app/api/projects/[slug]/settings/route.test.ts:214\n  - src/app/api/projects/[slug]/settings/route.test.ts:563\n  - src/app/api/projects/[slug]/settings/route.test.ts:644\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/execute-epic.ts",
+    "Line": 43,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/execute-epic.ts:43\n  - src/lib/jobs/execute-epic.ts:50\n  - src/lib/jobs/execute-epic.ts:44\n  - src/lib/jobs/run-health.ts:21\n  - src/lib/jobs/unstick.ts:39\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/abandon.ts",
+    "Line": 24,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/abandon.ts:24\n  - src/lib/backlog.ts:211\n  - src/lib/epic-detail.ts:131\n  - src/lib/jobs/errors.ts:176\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/epic-card.tsx",
+    "Line": 307,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/epic-card.tsx:307\n  - src/components/epic/rework-dialog.tsx:323\n  - src/components/runs/job-list.tsx:388\n  - src/components/runs/run-terminal.tsx:150\n  - src/components/shape/shape-draft-fields.tsx:169\n  - src/components/shape/shape-session-pane.tsx:21\n  - src/components/ticket/ticket-state-bar.tsx:193\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/beads/contract-report.ts",
+    "Line": 14,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/contract-report.ts:14\n  - src/lib/escalation-gate.integration.test.ts:3\n  - src/lib/gardener/detect.ts:5\n  - src/lib/jobs/formula-floor.ts:11\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/epics/[epicId]/rework/route.test.ts",
+    "Line": 37,
+    "Title": "Near-duplicate block (6 lines, 6 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/epics/[epicId]/rework/route.test.ts:37\n  - src/lib/beads/bd-hygiene.test.ts:41\n  - src/lib/gardener/emit.test.ts:76\n  - src/lib/jobs/gardener-hygiene.test.ts:42\n  - src/lib/jobs/gate-check.phases.test.ts:36\n  - src/lib/rework.test.ts:67\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/service.test.ts",
+    "Line": 37,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/service.test.ts:37\n  - src/lib/jobs/service.test.ts:69\n  - src/lib/jobs/service.test.ts:121\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/epic-graph.test.ts",
+    "Line": 77,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/epic-graph.test.ts:77\n  - src/lib/epic-graph.test.ts:99\n  - src/lib/epic-graph.test.ts:248\n  - src/lib/epic-graph.test.ts:429\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/components/shell/icons.tsx",
+    "Line": 65,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/components/shell/icons.tsx:65\n  - src/components/shell/icons.tsx:99\n  - src/components/shell/icons.tsx:58\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/draggable-epic-card.tsx",
+    "Line": 11,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/draggable-epic-card.tsx:11\n  - src/components/board/standalone-chip.tsx:35\n  - src/components/board/standalone-group.tsx:16\n  - src/components/epic/review-score-panel.tsx:36\n  - src/components/runs/view-job-output.tsx:16\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/rework.test.ts",
+    "Line": 431,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/rework.test.ts:431\n  - src/lib/rework.test.ts:455\n  - src/lib/rework.test.ts:429\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/hygiene.ts",
+    "Line": 336,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/hygiene.ts:336\n  - src/lib/hygiene.ts:342\n  - src/lib/run-health.ts:111\n  - src/lib/scan-health.ts:821\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/beads/bd-hygiene.test.ts",
+    "Line": 38,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/bd-hygiene.test.ts:38\n  - src/lib/gardener/emit.test.ts:73\n  - src/lib/jobs/gardener-hygiene.test.ts:39\n  - src/lib/jobs/gate-check.phases.test.ts:33\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/scan-health.test.ts",
+    "Line": 321,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/scan-health.test.ts:321\n  - src/lib/scan-health.test.ts:492\n  - src/lib/scan-health.test.ts:319\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/epic-badge.tsx",
+    "Line": 21,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/epic-badge.tsx:21\n  - src/components/board/epic-lane.tsx:50\n  - src/components/board/pr-link-control.tsx:23\n  - src/components/runs/job-list.tsx:230\n  - src/components/shape/shape-draft-panel.tsx:84\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "code-clone",
+    "FilePath": "src/lib/jobs/nightly-stringer.integration.test.ts",
+    "Line": 132,
+    "Title": "Duplicated block (6 lines, 3 locations)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/nightly-stringer.integration.test.ts:132\n  - src/lib/jobs/orphan-grooming.integration.test.ts:70\n  - src/lib/jobs/review-fix.integration.test.ts:162\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/runs/run-detail-view.tsx",
+    "Line": 241,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/runs/run-detail-view.tsx:241\n  - src/components/runs/run-view-utils.ts:33\n  - src/lib/claude/driver.ts:32\n  - src/lib/escalations.ts:39\n  - src/lib/run-health.ts:46\n  - src/lib/runs.test.ts:34\n  - src/lib/runs.ts:108\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/runs/run-detail-view.tsx",
+    "Line": 234,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/runs/run-detail-view.tsx:234\n  - src/components/settings/settings-view.tsx:1900\n  - src/components/settings/settings-view.tsx:1898\n  - src/components/ui/copy-button.tsx:28\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/backlog.ts",
+    "Line": 299,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/backlog.ts:299\n  - src/lib/gardener/apply-steps.ts:146\n  - src/lib/gardener/apply.ts:127\n  - src/lib/git/ops.ts:550\n  - src/lib/jobs/queue.ts:576\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/epic-card.tsx",
+    "Line": 309,
+    "Title": "Near-duplicate block (6 lines, 35 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/epic-card.tsx:309\n  - src/components/epic/rework-dialog.tsx:164\n  - src/components/epic/rework-dialog.tsx:196\n  - src/components/epic/rework-dialog.tsx:228\n  - src/components/epic/rework-dialog.tsx:259\n  - src/components/epic/rework-dialog.tsx:289\n  - src/components/epic/rework-dialog.tsx:325\n  - src/components/epic/rework-dialog.tsx:353\n  - src/components/epic/rework-dialog.tsx:382\n  - src/components/roadmap/epic-dialog.tsx:80\n  - src/components/runs/job-list.tsx:217\n  - src/components/runs/job-list.tsx:390\n  - src/components/runs/pagination.tsx:45\n  - src/components/runs/run-detail-view.tsx:230\n  - src/components/settings/automation-table.tsx:186\n  - src/components/settings/automation-table.tsx:274\n  - src/components/settings/cadence-editor.tsx:344\n  - src/components/settings/cadence-editor.tsx:389\n  - src/components/settings/cadence-editor.tsx:452\n  - src/components/settings/cadence-editor.tsx:495\n  - src/components/settings/settings-view.tsx:1816\n  - src/components/settings/settings-view.tsx:1846\n  - src/components/settings/settings-view.tsx:1887\n  - src/components/settings/settings-view.tsx:1938\n  - src/components/settings/settings-view.tsx:2074\n  - src/components/shape/shape-draft-fields.tsx:77\n  - src/components/shape/shape-draft-fields.tsx:171\n  - src/components/shape/shape-draft-fields.tsx:206\n  - src/components/shape/shape-draft-fields.tsx:243\n  - src/components/shape/shape-draft-panel.tsx:56\n  - src/components/shape/shape-draft-panel.tsx:77\n  - src/components/shape/shape-session-pane.tsx:23\n  - src/components/ticket/ticket-dialog.tsx:90\n  - src/components/ticket/ticket-dialog.tsx:519\n  - src/components/ticket/ticket-dialog.tsx:556\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/review-gate.test.ts",
+    "Line": 246,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/review-gate.test.ts:246\n  - src/lib/jobs/review-gate.ts:363\n  - src/lib/jobs/review-gate.ts:510\n  - src/lib/jobs/review-gate.ts:839\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/beads/bd-bin.test.ts",
+    "Line": 10,
+    "Title": "Near-duplicate block (6 lines, 14 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/beads/bd-bin.test.ts:10\n  - src/lib/board-context.test.ts:15\n  - src/lib/board.ts:30\n  - src/lib/claude/agent-prompt.test.ts:12\n  - src/lib/gardener/apply.ts:49\n  - src/lib/jobs/execute-epic.unit.test.ts:16\n  - src/lib/jobs/gate-check.unit.test.ts:16\n  - src/lib/jobs/review-score.test.ts:12\n  - src/lib/jobs/run-formula.test.ts:34\n  - src/lib/jobs-filters.test.ts:15\n  - src/lib/ticket-detail.test.ts:14\n  - src/lib/ticket-detail.ts:14\n  - src/lib/ticket-view.test.ts:5\n  - src/lib/types.ts:33\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/settings/settings-view.tsx",
+    "Line": 1080,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/settings/settings-view.tsx:1080\n  - src/components/settings/settings-view.tsx:1132\n  - src/components/settings/settings-view.tsx:1410\n  - src/components/settings/settings-view.tsx:1081\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/epic/use-rework-form.ts",
+    "Line": 165,
+    "Title": "Near-duplicate block (6 lines, 5 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/epic/use-rework-form.ts:165\n  - src/lib/gardener/apply-steps.ts:693\n  - src/lib/gardener/apply.ts:515\n  - src/lib/git/ops.ts:894\n  - src/lib/projects.ts:870\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/jobs/gardener-proposals.test.ts",
+    "Line": 168,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/jobs/gardener-proposals.test.ts:168\n  - src/lib/jobs/gardener.test.ts:470\n  - src/lib/jobs/gardener.test.ts:877\n  - src/lib/jobs/product-master.test.ts:509\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/lib/backlog.ts",
+    "Line": 56,
+    "Title": "Near-duplicate block (6 lines, 4 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/lib/backlog.ts:56\n  - src/lib/beads/contract-report.ts:39\n  - src/lib/bin.ts:66\n  - src/lib/gardener/emit.ts:211\n",
+    "Confidence": 0.39999999999999997
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/app/api/projects/[slug]/settings/route.ts",
+    "Line": 158,
+    "Title": "Near-duplicate block (6 lines, 7 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/app/api/projects/[slug]/settings/route.ts:158\n  - src/app/api/projects/[slug]/settings/route.ts:172\n  - src/app/api/projects/[slug]/settings/route.ts:186\n  - src/app/api/projects/[slug]/settings/route.ts:200\n  - src/app/api/projects/[slug]/settings/route.ts:238\n  - src/app/api/projects/[slug]/settings/route.ts:270\n  - src/app/api/projects/[slug]/settings/route.ts:292\n",
+    "Confidence": 0.5
+  },
+  {
+    "Source": "duplication",
+    "Kind": "near-clone",
+    "FilePath": "src/components/board/pr-link-control.tsx",
+    "Line": 20,
+    "Title": "Near-duplicate block (6 lines, 20 locations, renamed identifiers)",
+    "Description": "Duplicated code found in:\n  - src/components/board/pr-link-control.tsx:20\n  - src/components/epic/rework-dialog.tsx:387\n  - src/components/roadmap/epic-dialog.tsx:61\n  - src/components/runs/job-list.tsx:69\n  - src/components/runs/job-list.tsx:227\n  - src/components/settings/automation-table.tsx:102\n  - src/components/settings/automation-table.tsx:192\n  - src/components/settings/automation-table.tsx:282\n  - src/components/settings/cadence-editor.tsx:193\n  - src/components/settings/cadence-editor.tsx:456\n  - src/components/settings/cadence-editor.tsx:501\n  - src/components/settings/settings-view.tsx:489\n  - src/components/settings/settings-view.tsx:1821\n  - src/components/shape/shape-draft-fields.tsx:212\n  - src/components/shape/shape-draft-fields.tsx:247\n  - src/components/shape/shape-draft-panel.tsx:30\n  - src/components/shell/sidebar.tsx:52\n  - src/components/ticket/ticket-dialog.tsx:94\n  - src/components/ticket/ticket-dialog.tsx:561\n  - src/components/ui/filter-select.tsx:35\n",
+    "Confidence": 0.39999999999999997
+  }
+]

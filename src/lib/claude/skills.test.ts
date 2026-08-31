@@ -419,16 +419,22 @@ describe("required skill assets", () => {
       expect(body).toMatch(/what matters next/i);
       expect(body).toMatch(/what is too big/i);
       expect(body).toMatch(/what should die/i);
+      expect(body).toMatch(/what should start/i);
     });
 
-    it("names exactly the four claim classes the runtime can file", () => {
-      // Drift here is silent-but-fatal: a class anton has no detection kind for is dropped at
-      // validation, so the pass would spend its judgment on asks nobody ever sees.
+    it("names exactly the five claim classes the runtime can file", () => {
+      // Drift here is silent-but-fatal in BOTH directions: a class anton has no detection kind for
+      // is dropped at validation, and a kind this contract never mentions has no producer at all —
+      // which is how `withheld-approval` shipped with a full apply path and no session that could
+      // ever ask for it. The classes are the CONTRACT's taxonomy, one wider than the wire's:
+      // `reprioritize` covers both a priority delta and a missing ordering edge (see CLAIM_KINDS),
+      // and report.test.ts holds the wire side of the same invariant.
       expect(body).toMatch(/`reprioritize`/);
       expect(body).toMatch(/`rehome`/);
       expect(body).toMatch(/`split`/);
       expect(body).toMatch(/`kill`/);
-      expect(body).toMatch(/Exactly four classes/);
+      expect(body).toMatch(/`start`/);
+      expect(body).toMatch(/Exactly five classes/);
     });
 
     // The contract used to tell the session in as many words that parentage was the gardener's and

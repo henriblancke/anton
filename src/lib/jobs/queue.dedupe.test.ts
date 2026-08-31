@@ -9,11 +9,14 @@ import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import {
+  BUDGET_DEFER_PREFIX,
+  BUDGET_DEFER_PRIOR_SEP,
   deferQueuedJobs,
   enqueueExecuteEpicDeduped,
   enqueueExecuteEpicIfAbsent,
   enqueueReviewFixIfAbsent,
   getJob,
+  resumeBudgetDeferredJobs,
   resumeJob,
   systemClock,
   toMs,
@@ -165,6 +168,85 @@ describe("deferQueuedJobs bypass filter (anton-d8i4)", () => {
     });
     expect(onlyImmediate).toBe(1); // now the immediate row moves
     expect(await deferMs(now)).toBe(Math.floor(retry / 1000) * 1000);
+  });
+});
+
+describe("deferQueuedJobs preserves prior-attempt evidence", () => {
+  const REFUNDED = "usage-limit: resumes at 2026-01-01T00:00:00.000Z";
+  const marker = (reason: string) => `${BUDGET_DEFER_PREFIX}${reason} — resumes at …`;
+
+  async function lastErrorOf(id: string) {
+    return (await getJob(t.db, id))?.lastError ?? null;
+  }
+
+  function setLastError(id: string, lastError: string) {
+    t.db.update(schema.jobs).set({ lastError }).where(eq(schema.jobs.id, id)).run();
+  }
+
+  it("carries a refunded attempt's error alongside the marker instead of overwriting it", async () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    setLastError(id, REFUNDED); // a quota refund rewound attempts; this error is its only trace
+
+    await deferQueuedJobs(t.db, systemClock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: systemClock.now() + 60 * 60_000,
+      lastError: marker("weekly-on-track"),
+    });
+
+    const after = await lastErrorOf(id);
+    expect(after).toBe(`${marker("weekly-on-track")}${BUDGET_DEFER_PRIOR_SEP}${REFUNDED}`);
+  });
+
+  it("does not accumulate markers across repeated deferrals", async () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    setLastError(id, REFUNDED);
+
+    for (const [i, reason] of ["weekly-on-track", "session-headroom"].entries()) {
+      await deferQueuedJobs(t.db, systemClock, {
+        types: ["execute-epic"],
+        projectId: "p1",
+        retryAtMs: systemClock.now() + (i + 1) * 60 * 60_000,
+        lastError: marker(reason),
+      });
+    }
+
+    expect(await lastErrorOf(id)).toBe(
+      `${marker("session-headroom")}${BUDGET_DEFER_PRIOR_SEP}${REFUNDED}`,
+    );
+  });
+
+  it("leaves a never-run row carrying the bare marker", async () => {
+    const id = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    await deferQueuedJobs(t.db, systemClock, {
+      types: ["execute-epic"],
+      projectId: "p1",
+      retryAtMs: systemClock.now() + 60 * 60_000,
+      lastError: marker("weekly-on-track"),
+    });
+    expect(await lastErrorOf(id)).toBe(marker("weekly-on-track"));
+  });
+
+  it("restores the carried error when the deferral is undone, and clears a bare marker", async () => {
+    const carried = enqueueExecuteEpicDeduped(t.db, systemClock, "p1", "epic-1");
+    const bare = enqueueExecuteEpicDeduped(t.db, systemClock, "p2", "epic-2");
+    setLastError(carried, REFUNDED);
+    for (const projectId of ["p1", "p2"]) {
+      await deferQueuedJobs(t.db, systemClock, {
+        types: ["execute-epic"],
+        projectId,
+        retryAtMs: systemClock.now() + 60 * 60_000,
+        lastError: marker("weekly-on-track"),
+      });
+      await resumeBudgetDeferredJobs(t.db, systemClock, {
+        types: ["execute-epic"],
+        projectId,
+      });
+    }
+
+    expect(await lastErrorOf(carried)).toBe(REFUNDED);
+    expect(await lastErrorOf(bare)).toBeNull();
+    expect(toMs((await getJob(t.db, carried))?.runAt)).toBeLessThanOrEqual(systemClock.now());
   });
 });
 

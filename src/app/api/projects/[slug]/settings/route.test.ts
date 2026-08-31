@@ -175,6 +175,31 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect("budgetAware" in persisted()).toBe(false);
   });
 
+  it("PATCH persists the keep-weekly answer, and GET restores it (anton-3xa9)", async () => {
+    // The opt-out only works if it survives the session that gave it — otherwise arming the picker
+    // asks the same question forever.
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.keepProductMasterWeekly).toBe(true);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.keepProductMasterWeekly).toBe(true);
+  });
+
+  it("PATCH rejects a non-boolean keepProductMasterWeekly (anton-3xa9)", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ keepProductMasterWeekly: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears keepProductMasterWeekly back to unasked (anton-3xa9)', async () => {
+    await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect("keepProductMasterWeekly" in persisted()).toBe(false);
+  });
+
   it("PATCH persists a budgetPolicy, and GET restores it (anton-egrg)", async () => {
     const budgetPolicy = { daytimeReservePct: 25, weeklyTargetPct: 80 };
     const res = await PATCH(patchReq({ budgetPolicy }), ctx("tmp"));

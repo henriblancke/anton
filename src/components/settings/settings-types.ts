@@ -1,3 +1,7 @@
+import type {
+  ScheduleLastRun,
+  SchedulePendingStatus,
+} from "@/components/settings/automation-table";
 import type { Policy } from "@/components/settings/policy-draft-section";
 
 /**
@@ -78,6 +82,8 @@ export interface EditableSettings {
   /** The armed work policy (anton-c7iv). Absent = never armed, which is what makes the panel
    *  propose a calibrated draft instead of an empty form. */
   pickerPolicy?: Policy;
+  /** The operator declined the daily product-master offer (anton-3xa9); absent = not yet asked. */
+  keepProductMasterWeekly?: boolean;
   /**
    * The autopilot brakes (anton-nmy7): when anton stops STARTING work. `autopilotWipLimit` is a
    * self-clearing hold; the other three latch a disarm only a human re-arms. Each absent value
@@ -98,6 +104,10 @@ export interface AutomationSchedule {
   nextRunAt?: number;
   /** Epoch SECONDS of the last fire; absent until it has run once. */
   lastRunAt?: number;
+  /** How that fire ended (anton-znoz); absent until a fired job has settled. */
+  lastRun?: ScheduleLastRun;
+  /** Where an unsettled fire sits (anton-znoz); absent when nothing is in flight. */
+  pendingRun?: SchedulePendingStatus;
 }
 
 /** One discoverable agent (anton-dvo.1), mirrored from the server's DiscoveredAgent. */

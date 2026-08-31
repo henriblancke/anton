@@ -67,7 +67,7 @@ import {
   type Clock,
   type JobRow,
 } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 /** The park reason execute-epic records on a run it stopped because Claude's quota ran out. */
 const USAGE_LIMIT_PARK = "usage-limit";
@@ -1064,7 +1064,7 @@ export function makeUnstickHandler(deps: UnstickDeps): JobHandler {
   const clock = deps.clock ?? systemClock;
   const readPrActivity = deps.readPrActivity;
 
-  return async function unstick(ctx: JobContext): Promise<void> {
+  return async function unstick(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as UnstickPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -1083,5 +1083,14 @@ export function makeUnstickHandler(deps: UnstickDeps): JobHandler {
         `${summary.resumed} resumed, ${summary.escalated} escalated, ${summary.held} held, ` +
         `${summary.settled} settled`,
     );
+
+    // `held` is deliberately NOT an effect: holding a finding is the pass deciding not to act on it.
+    const acted = summary.resumed + summary.escalated + summary.settled;
+    return acted > 0
+      ? {
+          changed: true,
+          note: `${summary.resumed} resumed, ${summary.escalated} escalated, ${summary.settled} settled`,
+        }
+      : { changed: false, note: summary.findings > 0 ? "findings held, none actionable" : "nothing to unstick" };
   };
 }

@@ -27,8 +27,11 @@ export function AutomationSection({
         automations={AUTOMATIONS}
         state={schedules.state}
         defaultCrons={defaultCrons}
+        cadenceOffer={schedules.cadenceOffer}
         onCronChange={schedules.setCron}
         onToggle={schedules.toggle}
+        onAcceptCadenceOffer={schedules.acceptCadenceOffer}
+        onDeclineCadenceOffer={schedules.declineCadenceOffer}
       />
       <ProductMasterPrompt form={form} />
     </section>

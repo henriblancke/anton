@@ -154,6 +154,8 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("agents", knownAgentList(agentIds)),
     settingsField("autonomy", booleanValue),
     settingsField("conventionalCommits", booleanValue),
+    // Cleared = not yet asked, so the next arm offers the weekly cadence again.
+    settingsField("keepProductMasterWeekly", booleanValue),
     settingsField("budgetAware", booleanValue),
 
     // Policy blobs. Each parsed partial is deep-merged into the stored policy by

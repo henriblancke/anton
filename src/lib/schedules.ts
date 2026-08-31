@@ -9,9 +9,15 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
-import type { AntonDb, Clock } from "./jobs/queue";
+import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import type { JobType } from "./jobs/queue";
 import { isValidCron, nextRun } from "./jobs/cron";
+import {
+  lastRunsBySchedule,
+  pendingRunsBySchedule,
+  type ScheduleLastRun,
+  type SchedulePendingStatus,
+} from "./schedule-runs";
 
 /** Job types that run on a schedule (execute-epic is enqueued on approval, never on cron). */
 export type ScheduledJobType = Extract<
@@ -38,6 +44,17 @@ export interface ScheduleSummary {
   enabled: boolean;
   lastRunAt?: number;
   nextRunAt?: number;
+  /**
+   * How the last fire ENDED (anton-znoz) — absent until this schedule has settled a job, and absent
+   * from every write path that only touches the row itself. `lastRunAt` says when; this says what.
+   */
+  lastRun?: ScheduleLastRun;
+  /**
+   * Where this schedule's still-unsettled fire is (anton-znoz) — absent when nothing is in flight.
+   * The switch cannot answer that: the runner gates only the claim, so a disabled schedule can hold
+   * a queued job AND a leased one that is still executing.
+   */
+  pendingRun?: SchedulePendingStatus;
 }
 
 function secDate(ms: number): Date {
@@ -112,8 +129,22 @@ export interface UpdateSchedulePatch {
 }
 
 /**
+ * `immediate` takes the write lock at BEGIN rather than upgrading to it after the read: anton.db is
+ * shared with the scheduler process, and a deferred transaction that upgrades mid-way fails the
+ * write outright instead of waiting out `busy_timeout`.
+ */
+const TAKE_WRITE_LOCK = { behavior: "immediate" } as const;
+
+/**
  * Patch a schedule's cron/enabled. Recomputes `nextRunAt` whenever the cron changes or a disabled
  * schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it.
+ *
+ * The read and the write are ONE synchronous transaction, because this is a read-modify-write over a
+ * row two callers reach at once: the settings panel patches `enabled` on the same row a cadence
+ * accept is patching `cron` (settings-view.tsx), and each write carries the field it did NOT send at
+ * the value it read. Awaiting between the read and the update let both patches read the same row and
+ * the loser's intent vanish — the weekly cron restored, or a disabled job switched back on — with a
+ * success response for both. Serialized, the second patch reads what the first committed.
  */
 export async function updateSchedule(
   db: AntonDb,
@@ -121,32 +152,59 @@ export async function updateSchedule(
   id: string,
   patch: UpdateSchedulePatch,
 ): Promise<void> {
-  const rows = await db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).limit(1);
-  const current = rows[0];
-  if (!current) throw new Error(`schedule not found: ${id}`);
-
-  const cron = patch.cron ?? current.cron;
   if (patch.cron !== undefined && !isValidCron(patch.cron)) {
     throw new Error(`invalid cron expression: "${patch.cron}"`);
   }
-  const enabled = patch.enabled ?? current.enabled;
+  return db.transaction((tx) => {
+    const current = tx
+      .select()
+      .from(schema.schedules)
+      .where(eq(schema.schedules.id, id))
+      .limit(1)
+      .get();
+    if (!current) throw new Error(`schedule not found: ${id}`);
 
-  const set: Partial<ScheduleRow> = { cron, enabled };
-  if (!enabled) {
-    set.nextRunAt = null;
-  } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
-    set.nextRunAt = secDate(nextRun(cron, clock.now()));
-  }
-  await db.update(schema.schedules).set(set).where(eq(schema.schedules.id, id));
+    const cron = patch.cron ?? current.cron;
+    const enabled = patch.enabled ?? current.enabled;
+
+    const set: Partial<ScheduleRow> = { cron, enabled };
+    if (!enabled) {
+      set.nextRunAt = null;
+    } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
+      set.nextRunAt = secDate(nextRun(cron, clock.now()));
+    }
+    tx.update(schema.schedules).set(set).where(eq(schema.schedules.id, id)).run();
+  }, TAKE_WRITE_LOCK);
 }
 
-/** All schedules for a project (UI read path via shared anton.db). */
-export async function listSchedules(projectId: string): Promise<ScheduleSummary[]> {
-  const rows = await getDb()
-    .select()
-    .from(schema.schedules)
-    .where(eq(schema.schedules.projectId, projectId));
-  return rows.map(toScheduleSummary);
+/**
+ * All schedules for a project (UI read path via shared anton.db), each carrying how its last fire
+ * ended and where an unsettled one currently sits. Both are joined here rather than left to the
+ * caller so every path that renders a schedule — the settings page's server render, the panel's
+ * poll, a PATCH response — shows the same row; a patch that answered without them would blank the
+ * outcome column on every toggle, and a toggle is exactly when the pending fire's status decides
+ * whether the row reads as running or held.
+ */
+export async function listSchedules(
+  projectId: string,
+  clock: Clock = systemClock,
+): Promise<ScheduleSummary[]> {
+  const [rows, lastRuns, pendingRuns] = await Promise.all([
+    getDb().select().from(schema.schedules).where(eq(schema.schedules.projectId, projectId)),
+    lastRunsBySchedule(projectId),
+    // Clock-dependent: an in-flight fire only counts as running while its lease is fresh.
+    pendingRunsBySchedule(projectId, clock),
+  ]);
+  return rows.map((row) => {
+    const summary = toScheduleSummary(row);
+    const lastRun = lastRuns[row.id];
+    const pendingRun = pendingRuns[row.id];
+    return {
+      ...summary,
+      ...(lastRun ? { lastRun } : {}),
+      ...(pendingRun ? { pendingRun } : {}),
+    };
+  });
 }
 
 /**
@@ -177,6 +235,10 @@ export async function listSchedules(projectId: string): Promise<ScheduleSummary[
  * proposal it files spends a founder's attention. It runs WEEKLY rather than nightly because that is
  * the natural cadence of the question — "what matters next" does not change between two Tuesdays on
  * a board a nightly pass would find identical, and re-asking it daily is how the pass becomes noise.
+ * Weekly is only the DEFAULT, not a rule: arming board-picker makes these priorities the input to a
+ * ranking recomputed every few minutes, so the settings panel then offers to raise it to daily
+ * (anton-3xa9) — on that ranking's freshness, not on execution the picker does not do yet. The offer
+ * is an offer — nothing here moves a cadence an operator did not accept.
  *
  * board-picker (anton-albm) ships disabled for the gardener's reasons: an operator who never asked
  * for a pass should not find one running. Today it DECIDES ONLY — it ranks the claimable set and
