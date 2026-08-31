@@ -1409,6 +1409,54 @@ describe("scan", () => {
       expect(result.deadcode.dropped[1].reason).toContain("src/cjs/caller.js");
     });
 
+    // `exports.default = Widget` is the compiled spelling of an ESM default, not a whole-module
+    // export: `require('./widget')` hands back the object, so the binding is not the symbol and the
+    // requiring file is no caller. Reading it as CommonJS deletes a true finding.
+    it("does not follow a require through a module that exported only its default", async () => {
+      const repo = initRepo({
+        "src/cjs/widget.js": "function Widget() {\n  return null;\n}\nexports.default = Widget;\n",
+        "src/cjs/caller.js":
+          "const Required = require('./widget');\nmodule.exports = () => Required();\n",
+        "src/cjs/panel.js": "function Panel() {\n  return null;\n}\nexports.default = Panel;\n",
+        "src/cjs/page.js": "import Card from './panel';\nexport const page = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/cjs/widget.js", "Widget"),
+        unused("src/cjs/panel.js", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/cjs/page.js");
+    });
+
+    // A formatter wraps a long specifier list, leaving the local name and the module it came from on
+    // different lines. Reading the statement line by line never sees them together, so the binding is
+    // missed and a live default export is reported dead.
+    it("counts a default binding written across wrapped import lines", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/ui/page.ts":
+          "import Renamed, {\n  other,\n} from './widget';\nexport const page = () => Renamed(other);\n",
+        "src/ui/list.ts": "import Also\n  from './widget';\nexport const list = [Also];\n",
+        "src/ui/stale.ts":
+          "import Ignored, {\n  gone,\n} from './widget';\nexport const kept = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/list.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+    });
+
     // Python's triple quote opens a docstring, but `f"""` opens an expression: the text between its
     // braces runs, and `f"""{Widget()}"""` calls the symbol. Reading every triple-quoted span as a
     // comment blanks that call and reports a live symbol dead — while the literal text around the

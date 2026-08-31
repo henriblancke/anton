@@ -2501,7 +2501,7 @@ function moduleWord(module: string): string | undefined {
 }
 
 /**
- * `export default`, and the two CommonJS spellings of it, up to the name being exported. The head
+ * `export default`, and the two `exports` spellings of it, up to the name being exported. The head
  * has to stand at the start of a statement: `export default` inside a string or after other code is
  * not this module's default, and `module.exports` reached through a property is not either.
  */
@@ -2513,7 +2513,10 @@ const DEFAULT_REEXPORT = /\bexport[ \t]*\{[^}]*?\b([A-Za-z_$][\w$]*)[ \t]+as[ \t
 
 /** How a module hands its default value out, which decides what a caller may bind it with. */
 interface DefaultExport {
-  /** `export default Widget` — reached by an ESM default import. */
+  /**
+   * `export default Widget`, and the `exports.default = Widget` an ESM default compiles to — both
+   * reached by an ESM default import and by nothing else.
+   */
   esm: boolean;
   /** `module.exports = Widget` — reached by a whole-module `require` as well. */
   cjs: boolean;
@@ -2528,7 +2531,10 @@ function defaultExportOf(program: readonly string[], symbol: string): DefaultExp
       const at = head.index + head[0].length;
       if (!line.startsWith(symbol, at)) continue;
       if (WORD_CHAR.test(line[at + symbol.length] ?? "")) continue;
-      if (head[0].includes("exports")) result.cjs = true;
+      // Only an outright `module.exports = Widget` puts the symbol where a whole-module `require`
+      // lands. `exports.default = Widget` leaves it on a property, so a `require` binding names the
+      // module object and not the function — treating it as CJS would invent a caller.
+      if (head[0].includes("module.exports")) result.cjs = true;
       else result.esm = true;
     }
     if (DEFAULT_REEXPORT.exec(line)?.[1] === symbol) result.esm = true;
@@ -2540,13 +2546,17 @@ function defaultExportOf(program: readonly string[], symbol: string): DefaultExp
  * `import Renamed from './widget'`, and `import Renamed, { other } from './widget'` — the shapes
  * that bind a module's default export to a name the importing file chooses. A brace or a `*` where
  * the name would stand is a named or namespace import, which binds no default and is left out.
+ *
+ * Whitespace spans newlines because a formatter wraps a long specifier list, and the local name and
+ * the module it came from land on different lines. The run of any-but-quote after the comma cannot
+ * cross a string literal, so it stops inside the statement it started in.
  */
 const DEFAULT_IMPORT =
-  /(?:^|[;{}])[ \t]*import[ \t]+(?:type[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*(?:,[^'"]*)?\bfrom[ \t]*['"]([^'"]+)['"]/g;
+  /(?:^|[;{}])\s*import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*(?:,[^'"]*)?\bfrom\s*['"]([^'"]+)['"]/gm;
 
 /** `const Renamed = require('./widget')` — CommonJS binding the whole module, default and all. */
 const DEFAULT_REQUIRE =
-  /(?:^|[;{}])[ \t]*(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*=[ \t]*require[ \t]*\([ \t]*['"]([^'"]+)['"]/g;
+  /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]/gm;
 
 /** The local names `program` binds the default export of one of `modules` to. */
 function defaultBindingsOf(
@@ -2554,16 +2564,18 @@ function defaultBindingsOf(
   file: string,
   modules: ReadonlyMap<string, DefaultExport>,
 ): string[] {
+  // Read as one text rather than line by line: an import statement is what wraps, and a pattern
+  // that never sees the local name beside its specifier misses the binding and reports a live
+  // symbol dead.
+  const text = program.join("\n");
   const locals: string[] = [];
   const collect = (pattern: RegExp, reachable: (how: DefaultExport) => boolean): void => {
-    for (const line of program) {
-      pattern.lastIndex = 0;
-      for (let match = pattern.exec(line); match; match = pattern.exec(line)) {
-        const [, local, spec] = match;
-        if (local === undefined || spec === undefined) continue;
-        for (const [declared, how] of modules)
-          if (reachable(how) && specifierNames(file, spec, declared)) locals.push(local);
-      }
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+      const [, local, spec] = match;
+      if (local === undefined || spec === undefined) continue;
+      for (const [declared, how] of modules)
+        if (reachable(how) && specifierNames(file, spec, declared)) locals.push(local);
     }
   };
   collect(DEFAULT_IMPORT, () => true);
@@ -2624,6 +2636,9 @@ async function defaultBindingCallers(
   for (const word of words) {
     abort?.throwIfAborted();
     const hits = await grepWord(repoPath, word, pathspecs, abort);
+    // Deliberately not propagated as `unavailable`: the symbol's own grep already answered, and this
+    // search only ever adds callers. A failure here is "no further evidence", which keeps the signal
+    // standing — the conservative direction — rather than voiding a pass that did search the tree.
     if (!(hits instanceof Map)) continue;
     for (const file of hits.keys()) {
       if (declaring.has(file) || callers.has(file)) continue;
