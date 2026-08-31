@@ -939,6 +939,19 @@ describe("the product master's moves", () => {
       expect(calls.at(-1)).toMatch(/close anton-p1 applied: anton-a already carries `approved`/);
     });
 
+    // The retry after a grant this apply could not prove it still held (apply-steps.ts
+    // `assertReservationHeld` leaves the label standing and the ask open). The label is the whole
+    // ask, so the proposal CONVERGES rather than refusing forever over a reservation no later read
+    // can attribute — see `planApprove` for what carries the ownership assertion instead.
+    it("settles an approved target whatever became of its reservation", async () => {
+      await applyWith(proposalFor(APPROVE), [
+        warm("anton-a", { labels: [LABELS.approved], assignee: "teammate" }),
+      ]);
+
+      expect(calls.filter((c) => !c.startsWith("note") && !c.startsWith("close"))).toEqual([]);
+      expect(calls.at(-1)).toMatch(/close anton-p1 applied: anton-a already carries `approved`/);
+    });
+
     // Every one of these leaves the OTHER bars untouched — the bead stays open, unclaimed and
     // unapproved while its Acceptance is edited away or a blocker is drawn — so only re-deriving the
     // gate refuses them. Asked of the snapshot here; the same helper is re-asked under the lock below.

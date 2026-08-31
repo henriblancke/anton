@@ -1234,6 +1234,15 @@ export function unapproveNote(gaps: ApprovalGap[]): string {
  * A target that somebody has ALREADY approved settles, ahead of the fence — the outcome the ask
  * wanted is the board's state whoever wrote it, and refusing over a stamp would leave the ask open
  * forever against a board that agrees with it (the same order `planReprioritize` uses).
+ *
+ * On the LABEL alone, ownership unasked — including on the retry after a grant this apply left
+ * standing without proving it still held the reservation (apply-steps.ts `assertReservationHeld`).
+ * A retry cannot tell that grant from another writer's, and demanding the reservation back would
+ * strand the far commoner case: a read that merely failed over a reservation still ours becomes a
+ * proposal nothing can ever close. What carries that assertion instead is the failure itself — it
+ * names the bead it left written, notes the still-open proposal, and no unattended pass re-decides
+ * it, because an open proposal's fingerprint suppresses re-emission (emit.ts
+ * `suppressedFingerprints`). So the only retry is a human who has read that note.
  */
 function planApprove(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
   const [id] = plan.subjects;
@@ -1839,6 +1848,13 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
   // Fenced, unlike its mirror: clearing the gate is re-derivable, but "this is the work worth
   // starting next" is a judgment about the bead's contract, and starting a run on a rescoped one
   // spends the pass's dearest write on a target nobody judged.
+  //
+  // The TARGET's contract, not the board's rank around it. A rival unblocked or re-ranked above it
+  // since the filing leaves the ask true and costs nothing: the grant starts no run (the approve
+  // route never enqueues one for a proposal apply), and what runs next is decided at pickup by the
+  // PRIME ranking, which reads the board rather than who carries the label (jobs/picker-targets.ts
+  // tests approval's promises, never the grant). Fencing on whole-board rank inputs would instead
+  // refuse every start over an unrelated write, which is most nights.
   "withheld-approval": {
     still: "the bead whose contract this start was judged from",
     harm: "approving it now would set a run loose on work somebody has since rewritten",
