@@ -1992,6 +1992,14 @@ async function runTicket(args: {
   // and a run that cannot clear it parks before it can open that PR.
   if (beads.isNotDelivered(ticket)) {
     if (!(await mustPersist(() => beads.untag(repo, ticket.id, [LABELS.notDelivered])))) {
+      // Put the ticket back the way the claim above found it before halting. The claim already
+      // moved it to `in_progress`, and the epic-level cleanup hands the assignee back but not the
+      // status — leaving `in_progress` with no owner, which `bd update --claim` refuses outright.
+      // The resume this park tells the operator to run would then never get past its claim gate.
+      // Same restore the retryable-failure path below performs, for the same reason.
+      await safe(() => beads.setStatus(repo, ticket.id, "open"));
+      await safe(() => beads.unassign(repo, ticket.id));
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
       throw new PoisonEpic(
         `${ticket.id} carries \`${LABELS.notDelivered}\` from a previous run but bd would not ` +
           `clear it — running this ticket and opening a pull request would make merge ` +

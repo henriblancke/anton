@@ -36,6 +36,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
+import { ownerOf } from "../beads/claim";
 import { BD_BIN_ENV, resetBdBinCache, resolveBdBin } from "../beads/bd-bin";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
@@ -761,9 +762,14 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
         expect(job?.lastError).toMatch(/would not clear it/i);
         const target = await beads.show(repo, id);
         expect(beads.getPrRef(target) ?? null).toBeNull();
-        expect((await beads.show(repo, stale)).labels ?? []).toContain(
-          "not-delivered",
-        );
+        const stalled = await beads.show(repo, stale);
+        expect(stalled.labels ?? []).toContain("not-delivered");
+        // The park tells the operator to fix bd and resume, so the ticket must still be CLAIMABLE:
+        // the hard-gate claim moved it to `in_progress`, and bd refuses a claim on an `in_progress`
+        // bead nobody owns — the resume would never get past its own claim gate.
+        expect(stalled.status).toBe("open");
+        expect(ownerOf(stalled)).toBeUndefined();
+        expect(stalled.labels ?? []).not.toContain("stage:implementing");
       } finally {
         if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
         else process.env[BD_BIN_ENV] = priorBdBin;
