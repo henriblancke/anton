@@ -2594,6 +2594,60 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
     });
 
+    // Prose writes an equals sign too. Code stands between a tag and its children only inside a
+    // `{…}`, so the `=` in `Status = Widget was removed` is a character the page shows — reading it
+    // as program lets a doc page prove its own caller, and ends the element so the sentence under
+    // it reads as program too. Outside every element the same sign still binds a name, and the
+    // module that assigns the call keeps counting.
+    it("reads JSX text holding an equals sign as prose, and still counts the assignment beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/label.tsx": "export const Doc = () => <p>Status = Widget was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    Status = deprecated\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => {\n  const el = Widget();\n  return el;\n};\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/label.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // A component spaces its children apart, and JSX gives that gap no meaning: the paragraph under
+    // an empty line is still the `<div>`'s text, so closing the element there reads the prose as
+    // program and lets a sentence naming a removed component prove its own caller. MDX and markup
+    // do end a block at a blank line — a module does not. The call written under the same gap is
+    // still the call it is.
+    it("keeps a JSX element open across a blank line, and still counts a call under one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/gap.tsx":
+          "export const Doc = () => (\n  <div>\n    <Header />\n\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    <Header />\n\n" +
+          "    {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/gap.tsx");
+    });
+
     // A child expression wraps onto lines of its own too, and it is the element's child rather
     // than the end of it: `<div>` with `{ready &&` under it still renders the prose written after
     // the brace closes. Ending the parent's text on that opener reads the sentence below as

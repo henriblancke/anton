@@ -1235,7 +1235,7 @@ const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![
  * The delimiters JSX spells its own syntax with — the only punctuation that means anything between
  * a tag and its children, since code stands there solely inside a `{…}`.
  */
-const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]=\\|\``;
+const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]\\|\``;
 
 /**
  * The brackets a call is spelled with, which are the program's outside every element —
@@ -1254,11 +1254,20 @@ const JSX_PARENS = String.raw`()`;
 const JSX_STATEMENT = String.raw`;`;
 
 /**
+ * The equals sign, which binds a name outside an element — `const label = title` — and is a
+ * character a sentence shows inside one: `<p>Status = Widget was removed</p>` names the symbol the
+ * way a doc page does, and reading that equals as program lets a prose-only page prove its own
+ * caller and delete a true finding. A prop's `=` is not this one — an attribute list is read as a
+ * tag rather than as children.
+ */
+const JSX_ASSIGNMENT = String.raw`=`;
+
+/**
  * Every delimiter that means something on a line standing outside an element. A generic closes with
  * the same `>` a tag does — `new Map<Widget>()` — so text that claims to be rendered has to read as
  * a sentence before it is believed, or a real call goes uncounted.
  */
-const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_PARENS}${JSX_STATEMENT}`;
+const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_PARENS}${JSX_STATEMENT}${JSX_ASSIGNMENT}`;
 
 /**
  * Arithmetic, which is program text on a line standing outside every element — `const half =
@@ -1272,8 +1281,8 @@ const JSX_OPERATORS = String.raw`&+*/`;
 const JSX_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}${JSX_OPERATORS}]`);
 
 /**
- * That same test for text a tag has opened, where an operator, an aside and the semicolon between
- * two clauses are punctuation the page shows.
+ * That same test for text a tag has opened, where an operator, an aside, the semicolon between two
+ * clauses and the equals sign in a sentence are punctuation the page shows.
  */
 const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_CHILD_DELIMITERS}]`);
 
@@ -1467,9 +1476,12 @@ function jsxExpressionEnd(text: string, depth: number): { at: number; depth: num
  * their lines for the same reason.
  *
  * The run ends at the first line that reads as program once its tags are blanked — a call, an
- * assignment — and at a blank line, read from `raw` so a line masking emptied is not mistaken for
- * the break. An interpolation the line leaves open inside an element ends nothing: it is a child
- * of the tag still open above, so its own lines read as the program they are and the parent's text
+ * assignment. A blank line ends nothing, unlike in MDX and markup: JSX gives one no meaning, and a
+ * component that spaces its children apart — `<div>` with an empty line above `Widget was removed`
+ * — still renders the paragraph under the gap, so closing the element there reads that prose as
+ * program and lets it prove its own caller. An interpolation the line leaves open inside an element
+ * ends nothing either: it is a child of the tag still open above, so its own lines read as the
+ * program they are and the parent's text
  * resumes on the brace that closes it. Ending the run there instead reads the prose under a
  * wrapped `{ready &&` as program, and a paragraph naming a removed component proves its own
  * caller. Within a run the open elements are counted rather than remembered as
@@ -1481,13 +1493,13 @@ function jsxExpressionEnd(text: string, depth: number): { at: number; depth: num
  * repo is mostly written in. For the same reason a wrapped tag is only entered from a line that
  * already reads as markup — `a<b` at the end of a statement opens nothing.
  */
-function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
+function jsxLineStates(code: string[]): JsxLine[] {
   const states: JsxLine[] = [];
   let depth = 0;
   let tag = false;
   let quote: string | undefined;
   let expression = 0;
-  for (const [index, line] of code.entries()) {
+  for (const line of code) {
     states.push(
       expression > 0
         ? { expression, text: depth }
@@ -1499,13 +1511,9 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
             ? { text: depth }
             : "code",
     );
-    if (!raw[index]?.trim()) {
-      depth = 0;
-      tag = false;
-      quote = undefined;
-      expression = 0;
-      continue;
-    }
+    // An empty line carries no tag and no brace, so it leaves every run exactly as it found it —
+    // a comment masking emptied no more ends the element above it than a blank one does.
+    if (!line.trim()) continue;
     let text = line;
     if (expression > 0) {
       const end = jsxExpressionEnd(text, expression);
@@ -1928,7 +1936,7 @@ async function codeReferencingFiles(
           // so masking it before those are read would close the block over the lines under it.
           code: maskImports(markup?.code ?? code),
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
-          jsx: isJsx ? jsxLineStates(code, raw) : undefined,
+          jsx: isJsx ? jsxLineStates(code) : undefined,
           script: markup?.script,
           depth: markup && markupOpenDepths(markup.code, markup.script, raw, flavor),
           attr: markup && markupOpenAttrs(markup.code, markup.script, raw),
