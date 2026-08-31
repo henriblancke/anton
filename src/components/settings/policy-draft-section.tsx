@@ -998,8 +998,10 @@ function RankBound({
 }) {
   const values = criterion.values;
   const compare = criterion.compare;
-  // Never undefined here: the criterion is ranked and its bound is one of its own values.
-  const admitted = admittedValues(criterion) ?? values;
+  // Undefined only where the bound has left its own ranking — a policy the evaluator refuses every
+  // bead against. Named as the defect it is rather than widened to the whole ranking, which would
+  // show the operator an admitting rule where anton admits nothing.
+  const admitted = admittedValues(criterion);
 
   const setOp = (op: string) => {
     if (!op) return onChange(undefined);
@@ -1037,11 +1039,17 @@ function RankBound({
         )}
         in this ranking
       </div>
-      <p className="text-[11px] text-subtle">
-        {compare
-          ? `Admits ${namespace}:${admitted.join(`, ${namespace}:`)} — the rest of the ranking is left for a human.`
-          : "The order is stored, but every selected value still matches. Bound it to admit only part of the ranking."}
-      </p>
+      {compare && !admitted ? (
+        <p role="alert" className="text-[11px] text-destructive">
+          {`\`${namespace}:${compare.value}\` is not in this ranking, so nothing can be judged against it — every bead is refused. Pick a bound from the ranking above.`}
+        </p>
+      ) : (
+        <p className="text-[11px] text-subtle">
+          {compare && admitted
+            ? `Admits ${namespace}:${admitted.join(`, ${namespace}:`)} — the rest of the ranking is left for a human.`
+            : "The order is stored, but every selected value still matches. Bound it to admit only part of the ranking."}
+        </p>
+      )}
     </div>
   );
 }

@@ -931,6 +931,30 @@ describe("bounding a hand-ranked namespace (R2.3)", () => {
     // A comparison with no scale behind it refuses every bead (R2.5) and the store rejects it.
     expect(screen.queryByLabelText("Bound severity: by rank")).toBeNull();
   });
+
+  it("names a bound that has left its ranking rather than reading it as no bound at all", () => {
+    renderPanel({
+      candidates: CANDIDATES,
+      stored: {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            // A bound on a value the ranking no longer carries — nothing the predicate can judge.
+            compare: { op: "lte" as const, value: "minor" },
+          },
+        ],
+      },
+    });
+    // The panel must not describe this as admitting the whole ranking: the predicate refuses every
+    // bead against it, so a widened listing would show an admitting rule where anton admits nothing.
+    expect(screen.queryByText(/Admits severity:/)).toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain("is not in this ranking");
+    expect(matchCount()).toBe("0 of 5 startable run targets match this policy");
+    // And the controls stay, so the operator can put the bound back inside the ranking.
+    expect(screen.getByLabelText("Bound severity: by rank")).toBeTruthy();
+  });
 });
 
 /**

@@ -64,8 +64,9 @@ export function policyCandidates(board: readonly Bead[], now: Date = new Date())
   });
 
   // Eligibility is a subset of the open run targets, so the difference is exactly what the gate
-  // refused — no second walk of the exclusions to count them.
-  return { candidates, notStartable: openTargets.length - eligible.length };
+  // refused — no second walk of the exclusions to count them. Clamped because a widened eligible
+  // set would otherwise render as a negative count of withheld work rather than fail visibly.
+  return { candidates, notStartable: Math.max(0, openTargets.length - eligible.length) };
 }
 
 /**
