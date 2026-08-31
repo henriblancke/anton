@@ -14,7 +14,7 @@ import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 export interface OrphanGroomingPayload {
   projectId: string;
@@ -94,7 +94,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
   const db = deps.db;
   void (deps.clock ?? systemClock); // reserved for future time-based grooming (e.g. age threshold)
 
-  return async function orphanGrooming(ctx: JobContext): Promise<void> {
+  return async function orphanGrooming(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as OrphanGroomingPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -102,7 +102,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
 
     const all = await beads.list(repo, ["--status", "all"]);
     const orphans = findOrphans(all);
-    if (orphans.length === 0) return; // nothing loose — done.
+    if (orphans.length === 0) return { changed: false, note: "no loose tickets" };
 
     await ctx.heartbeat();
 
@@ -111,6 +111,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
       (b) => beads.isEpic(b) && b.status !== "closed" && b.labels?.includes(ORPHAN_EPIC_LABEL),
     )?.id;
 
+    let createdEpic = false;
     if (!epicId) {
       epicId = await beads.create(repo, {
         title: ORPHAN_EPIC_TITLE,
@@ -118,6 +119,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
         description: ORPHAN_EPIC_DESCRIPTION,
       });
       await beads.tag(repo, epicId, [ORPHAN_EPIC_LABEL]);
+      createdEpic = true;
     }
 
     // Link each orphan under the epic (child → parent). Best-effort per ticket so one bad id
@@ -144,6 +146,23 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
     await beads
       .sync(repo)
       .catch((e) => console.error("[orphan-grooming] beads dolt sync failed", e));
+
+    // A pass that bucketed NOTHING because bd refused every link is a failed pass, not a quiet one:
+    // every loose ticket is still loose, and `changed: false` would file it as "nothing to do" —
+    // indistinguishable, on the Automation row, from a board that simply had no orphans. Thrown
+    // (not returned) so it retries and then parks for a human, and thrown only AFTER the note and
+    // sync above, so the evidence lands on the epic either way (anton-znoz review).
+    if (linked === 0 && failed.length > 0) {
+      throw new Error(`orphan-grooming: bd refused every link (${failed.join(", ")})`);
+    }
+
+    // `linked`, not `orphans.length`: a ticket bd refused to link was not bucketed, and the row must
+    // not claim it was. The failures ride out in the note too, so a partly-failed pass reports the
+    // work it did without passing itself off as clean.
+    const note = failed.length
+      ? `bucketed ${linked} loose ticket(s); ${failed.length} failed to link`
+      : `bucketed ${linked} loose ticket(s)`;
+    return { changed: linked > 0 || createdEpic, note };
   };
 }
 

@@ -50,7 +50,7 @@ import {
   revalidationTier,
 } from "./product-master-steps";
 import { systemClock, type AntonDb, type Clock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 export { MAX_HYDRATED_SCORE_SERIES } from "./product-master-context";
 export { PM_DENIED_TOOLS } from "./product-master-steps";
@@ -76,7 +76,7 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
   const claude = deps.runClaude ?? runClaude;
   const nudge = deps.nudge ?? ((project: NudgeTarget) => nudgeSync(project, "product-master"));
 
-  return async function productMaster(ctx: JobContext): Promise<void> {
+  return async function productMaster(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as ProductMasterPayload;
     const project = await passProject(db, projectId);
     const repo = project.repoPath;
@@ -149,7 +149,7 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       // snapshot rather than taking it, because an armed apply replaces it (see `snapshot`).
       const file = makeProposalFiler(scope, { board, observedAtMs });
 
-      await file(await revalidationTier(scope, board, observedAtMs));
+      const revalidated = await file(await revalidationTier(scope, board, observedAtMs));
       await ctx.heartbeat();
 
       // The board tier 1 LEFT, not the one it found: armed at `apply`, revalidation withdraws
@@ -171,7 +171,7 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
         onEvent: session.onEvent,
       });
 
-      await file(
+      const accepted = await file(
         await acceptClaims(scope, {
           claims,
           board: judged.board,
@@ -180,6 +180,12 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       );
 
       await session.end("done");
+      // Proposals are the whole output of the pass: a week where the board's answer did not change
+      // costs a founder nothing to read, and must not look like one where ten asks landed.
+      const filed = revalidated + accepted;
+      return filed > 0
+        ? { changed: true, note: `filed ${filed} proposal(s)` }
+        : { changed: false, note: "no proposal to make" };
     } catch (e) {
       await log(`[product-master] ERROR: ${messageOf(e)}\n`);
       await session.end("failed");

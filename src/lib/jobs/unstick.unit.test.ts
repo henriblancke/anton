@@ -507,6 +507,16 @@ describe("escalationNote", () => {
     expect(escalationNote(finding(), ESC_ID)).toContain("3f2a1b9c");
   });
 
+  it("names the ticket an ask is answered on, since the note lands on the run target", () => {
+    const note = escalationNote(
+      finding({ kind: "needs-human", reason: "waiting on a human 3h: A or B?", askBeadId: "t-9" }),
+      ESC_ID,
+    );
+    expect(note).toContain("Answer on t-9");
+    // Nothing to answer on the four accidental stalls — they name no asking ticket.
+    expect(escalationNote(finding(), ESC_ID)).not.toContain("Answer on");
+  });
+
   it("stays on ONE line — beads splits a note blob on newlines into separate entries", () => {
     const note = escalationNote(finding({ reason: "parked:\n  agent exited 1\n" }), ESC_ID);
     expect(note).not.toContain("\n");

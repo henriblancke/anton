@@ -143,14 +143,20 @@ export const AUTONOMY_GROUPS: {
   {
     id: "history",
     title: "Writes history",
-    does: "Closes the bead — and a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it”.",
-    undo: "Reopening is one write, but the close stays in the board's history and in every report already taken from it.",
+    does: "Closes the bead — a close is a claim about what happened: shipped-orphan writes “this shipped”, superseded writes “that one replaced it” — or grants the approve gate on one, which records the decision a run starts from in your name.",
+    undo: "Reopening a close is one write. Undoing a grant is two, in that order — withdraw the label, then release the reservation it took, because nothing will release a target the board still shows as approved — and a failure between them leaves the bead reserved with the gate already off. Either way the close or the grant stays in the board's history and in every report already taken from it.",
     armed:
-      "Armed, a pass closes beads with nobody watching, and the claim it writes outlives the undo. " +
-      "Arm this last, on a project whose shadow record you have actually read.",
+      "Armed, a pass closes beads and grants approvals with nobody watching, and what it writes " +
+      "outlives the undo. Arm this last, on a project whose shadow record you have actually read.",
     kinds: [
       { id: "superseded", does: "closes a bead as superseded, pointing at the twin that landed" },
       { id: "shipped-orphan", does: "closes a bead a commit already shipped" },
+      {
+        id: "withheld-approval",
+        // The gate and the reservation are the whole write — nothing here enqueues a run
+        // (anton-qlci), and a tier that promised one would promise spend that never happens.
+        does: "grants the approve gate to work the board ranks next that nothing has approved, and reserves it for anton — the state a run starts from, not the run itself",
+      },
     ],
   },
   {

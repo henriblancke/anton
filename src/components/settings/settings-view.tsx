@@ -4,6 +4,11 @@ import type { ReactNode } from "react";
 
 import type { Project } from "@/lib/types";
 import { PageHeader } from "@/components/atoms";
+import {
+  PolicyDraftSection,
+  type PolicyCandidate,
+  type PolicyDraft,
+} from "@/components/settings/policy-draft-section";
 import { AgentsSection } from "@/components/settings/sections/agents-section";
 import { AutomationSection } from "@/components/settings/sections/automation-section";
 import { AutopilotSection } from "@/components/settings/sections/autopilot-section";
@@ -39,6 +44,12 @@ export function SettingsView({
   agents,
   bundledIds,
   labelVocabulary,
+  rankingCandidates,
+  issueTypes,
+  policyDraft,
+  policyCandidates,
+  policyNotStartable,
+  boardUnavailable,
   earned,
 }: {
   project: Project;
@@ -55,6 +66,32 @@ export function SettingsView({
   bundledIds: string[];
   /** The label namespaces this project's board actually uses — what value nominations pick from. */
   labelVocabulary: LabelNamespace[];
+  /**
+   * The namespaces whose values read as a scale (`src/lib/policy/vocabulary`), so the work policy
+   * offers a hand-ranking only where an order could mean something.
+   */
+  rankingCandidates: string[];
+  /** The issue types this board actually uses — the type vocabulary the work policy is edited against. */
+  issueTypes: string[];
+  /**
+   * The policy calibration proposes at first arm (anton-c7iv), computed on the server off this
+   * project's own approval history. Passed in even when a policy is already stored: the panel picks
+   * which to render, and re-deriving it in the client would need a board read this module can't do.
+   */
+  policyDraft: PolicyDraft;
+  /**
+   * Every STARTABLE target on this board, projected to what the policy predicate reads (anton-qsr1).
+   * Passed whole so the panel's match count and per-bead "why not?" recompute in the browser as
+   * criteria change — a fetch per edit would make the count lag the control that explains it.
+   */
+  policyCandidates: PolicyCandidate[];
+  /** Open run targets refused before the policy, so the panel can explain its own denominator. */
+  policyNotStartable: number;
+  /**
+   * The board read failed, so everything derived from it above is empty by accident rather than by
+   * fact. The work policy panel refuses to arm off that.
+   */
+  boardUnavailable: boolean;
   /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
@@ -82,12 +119,16 @@ export function SettingsView({
     bundledAgentIds: bundledAgents.map((a) => a.id),
     earned,
   });
-  // Above the panel it feeds so an optimistic cadence edit survives a trip to another section.
+  // Above the panel it feeds so an optimistic cadence edit survives a trip to another section. The
+  // cadence offer (anton-3xa9) persists its answer through the FORM's queued PATCH: the opt-out and
+  // "Save changes" write the same settings row, and the route read-modify-writes the whole of it.
   const automationSchedules = useAutomationSchedules({
     slug: project.slug,
     schedules,
     defaultCrons,
     polling: active === "automation",
+    keepProductMasterWeekly: settings.keepProductMasterWeekly === true,
+    patchSettings: form.patchSettings,
   });
 
   // Elements, not components: building all thirteen costs a `createElement` each and keeps the panel
@@ -107,6 +148,19 @@ export function SettingsView({
       <AutomationSection form={form} schedules={automationSchedules} defaultCrons={defaultCrons} />
     ),
     proposals: <ProposalsSection form={form} earned={earned} projectSlug={project.slug} />,
+    policy: (
+      <PolicyDraftSection
+        project={project}
+        draft={policyDraft}
+        stored={settings.pickerPolicy}
+        issueTypes={issueTypes}
+        labelVocabulary={labelVocabulary}
+        rankingCandidates={rankingCandidates}
+        candidates={policyCandidates}
+        notStartable={policyNotStartable}
+        boardUnavailable={boardUnavailable}
+      />
+    ),
     danger: <DangerSection project={project} />,
   };
 

@@ -57,6 +57,7 @@ import {
   oneLine,
   readWholeBoard,
   rollbackSteps,
+  StrandedWriteError,
   SubjectMovedError,
 } from "./apply-steps";
 import {
@@ -376,7 +377,11 @@ async function applySteps(
  *
  * "Rolled back" is not always the whole truth, which is why the survivors ride along: an undo the
  * board would not take leaves those beads moved (apply-steps.ts `rollbackSteps`), and a `failed` that
- * reported none of them would tell an unattended caller its board is exactly where it left it.
+ * reported none of them would tell an unattended caller its board is exactly where it left it. The
+ * FAILING step's own writes count the same way and no rollback can name them — it never joined the
+ * prefix — so they arrive on the error ({@link StrandedWriteError}), and their presence is also what
+ * suppresses the empty-prefix clause: "nothing had been written" is false over a bead the failure
+ * itself left written, and the message already says what stands.
  */
 async function stepFailure(
   repo: string,
@@ -385,13 +390,15 @@ async function stepFailure(
   e: unknown,
 ): Promise<ProposalApplyError> {
   const rollback = await rollbackSteps(repo, changed);
+  const stranded = e instanceof StrandedWriteError ? e.stranded : [];
   const stale = e instanceof SubjectMovedError && changed.length === 0;
+  const report = stranded.length > 0 && changed.length === 0 ? "" : rollback.report;
   return stale
     ? new ProposalApplyError("refused", `cannot apply ${proposalId}: ${messageOf(e)}`)
     : new ProposalApplyError(
         "failed",
-        `applying ${proposalId} failed: ${messageOf(e)}${rollback.report}`,
-        rollback.survivors,
+        `applying ${proposalId} failed: ${messageOf(e)}${report}`,
+        [...rollback.survivors, ...stranded],
       );
 }
 

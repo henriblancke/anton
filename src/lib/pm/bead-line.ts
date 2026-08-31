@@ -63,6 +63,7 @@ export function beadLines(
     ...extras,
     scoresOf(bead, input.scores),
     ownedBy(bead, input.now),
+    approvalOf(bead),
     beads.isDeferred(bead) ? "deferred" : undefined,
   ].filter((f): f is string => f !== undefined);
   const lines = [`${indent}- ${bead.id} ${facts.join(" · ")} — ${oneLine(bead.title ?? "")}`];
@@ -111,6 +112,19 @@ const ownedBy = (bead: Bead, nowMs: number): string | undefined => {
   }
   return undefined;
 };
+
+/**
+ * Whether the gate is already granted. The one fact a `start` claim rests on: the ask is that work
+ * the board should run next carries no `approved` label, so a session that cannot see the label can
+ * only guess — and every guess that lands on an approved bead is a claim `alreadyApproved` throws
+ * away (`start-guards.ts`).
+ *
+ * Rendered only when the label IS there. Its absence is the claim's premise, and marking every
+ * unapproved bead would read as an invitation to propose a start for each of them, which is the
+ * opposite of a pass that proposes few, load-bearing things.
+ */
+const approvalOf = (bead: Bead): string | undefined =>
+  beads.isApproved(bead) ? "approved — the gate is already granted" : undefined;
 
 const sizeOf = (bead: Bead): string | undefined => {
   const size = labelValueOf(bead.labels, "size");

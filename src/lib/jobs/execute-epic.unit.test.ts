@@ -9,16 +9,24 @@ import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import {
   blockedTailReason,
   isForeignRunOwner,
+  parkedAskGateId,
+  parkedAskGateIds,
   poisonBlockerIds,
   PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
 import {
+  askSettleError,
   claudeResumeDecision,
   continuationPrompt,
   inactiveAgentTickets,
   mergeGatePlan,
+  humanGatePlan,
+  humanGateReason,
+  HUMAN_GATE_ARMED_LABEL,
+  NeedsHumanError,
   orderTickets,
+  ParkedAskError,
   reviewParkMessage,
   runReadiness,
   runTargetDrift,
@@ -276,6 +284,82 @@ describe("blockedTailReason — the park a held tail leaves behind (anton-1two)"
     const nothingRan = blockedTailReason("F1", { blockers: ["F2"], held: ["t-2"], ran: [] });
     expect(nothingRan).not.toMatch(/commits are on the branch/);
     expect(poisonBlockerIds(nothingRan)).toEqual(["F2"]);
+  });
+});
+
+describe("ParkedAskError — the park a run takes behind its own armed gate (anton-287p)", () => {
+  const parked = new ParkedAskError(new NeedsHumanError("t-1", "rotate the staging password"), "g-7");
+
+  it("names the gate, so run-health reads one wait rather than a second failure", () => {
+    // The runner parks the job on this message, and the sweep reports every poison park as an
+    // exhausted job. The id is what lets it recognise the gate's own wait and drop the duplicate
+    // (PR #205 review).
+    expect(parkedAskGateId(parked.message)).toBe("g-7");
+    expect(parkedAskGateId(`poison: ${parked.message}`)).toBe("g-7");
+  });
+
+  it("still carries the ask and the ticket that raised it", () => {
+    expect(parked.message).toContain("t-1 needs a human: rotate the staging password");
+    expect(parked.ticketId).toBe("t-1");
+    expect(parked.name).toBe("PoisonError"); // still parks rather than burning retries
+  });
+
+  it("reads nothing back out of a park that names no gate", () => {
+    expect(parkedAskGateId(new NeedsHumanError("t-1", "an ask").message)).toBeUndefined();
+    expect(parkedAskGateIds(new NeedsHumanError("t-1", "an ask").message)).toBeUndefined();
+  });
+
+  it("names the holds that outlive the ask, so answering anton's gate alone isn't read as failure", () => {
+    // A person's own hold keeps the target blocked after this ask is answered (PR #205 review). The
+    // sweep suppresses the park while ANY named gate is open, so the ids have to be IN the message.
+    const held = new ParkedAskError(
+      new NeedsHumanError("t-1", "rotate the staging password"),
+      "g-7",
+      ["g-8", "g-9"],
+    );
+    expect(parkedAskGateIds(held.message)).toEqual(["g-7", "g-8", "g-9"]);
+    expect(parkedAskGateId(held.message)).toBe("g-7");
+    expect(held.message).toContain("g-8, g-9");
+  });
+
+  it("reads back just the armed gate when nothing else holds the target", () => {
+    expect(parkedAskGateIds(parked.message)).toEqual(["g-7"]);
+  });
+
+  it("reads the MACHINE clause, not an ask that quotes it (PR #205 review)", () => {
+    // The ask is agent prose and sits in front of the machine-appended clause: an agent asking a
+    // person to resolve an existing gate can quote this exact sentence. A first-match parse would
+    // hand the sweeps `g-quoted` — suppressing the park against a gate this run never armed while
+    // the real one stays open.
+    const quoting = new ParkedAskError(
+      new NeedsHumanError(
+        "t-1",
+        "the run is parked on human gate g-quoted until someone answers it; please close it. " +
+          "Even then it is also held by human gate(s) g-bogus.",
+      ),
+      "g-7",
+      ["g-8"],
+    );
+    expect(parkedAskGateId(quoting.message)).toBe("g-7");
+    expect(parkedAskGateIds(quoting.message)).toEqual(["g-7", "g-8"]);
+  });
+
+  it("reads ids that contain a PERIOD back whole — bd's own child ids do (PR #205 review)", () => {
+    // A period-terminated capture truncates `gate-287p.1` to `gate-287p`, and the sweeps that
+    // suppress on the ids would then match nothing: the park re-raises as a permanent failure while
+    // the wait is still open.
+    const dotted = new ParkedAskError(new NeedsHumanError("t-1.2", "an ask"), "gate-287p.1", [
+      "gate-287p.2",
+      "g-9",
+    ]);
+    expect(parkedAskGateId(dotted.message)).toBe("gate-287p.1");
+    expect(parkedAskGateIds(dotted.message)).toEqual(["gate-287p.1", "gate-287p.2", "g-9"]);
+    // …and still with the runner's poison prefix and prose trailing the clause.
+    expect(parkedAskGateIds(`poison: ${dotted.message} Re-run once answered.`)).toEqual([
+      "gate-287p.1",
+      "gate-287p.2",
+      "g-9",
+    ]);
   });
 });
 
@@ -829,6 +913,148 @@ describe("mergeGatePlan", () => {
     ];
     expect(mergeGatePlan(board, "f-1", "9").stale.map((g) => g.id)).toEqual(["g-related"]);
     expect(mergeGatePlan(withRelated, "f-1", "9")).toEqual({ stale: [], create: true });
+  });
+});
+
+/**
+ * anton-287p.4: the human wait must be re-enterable. A settle lost after the gate landed, a resume,
+ * or a fresh worktree on another machine all re-run the arm — and unlike every other flavour, a
+ * human gate is a REAL blocker that nothing but a person ever closes, so both a duplicate and a
+ * superseded leftover keep the target unrunnable.
+ */
+describe("humanGatePlan", () => {
+  const ASK = "the sandbox Stripe key is not something I can create";
+  /** A gate as bd returns it: the reason lives inside the description bd composes. */
+  const gate = (id: string, reason: string, o: Partial<Gate> = {}): Gate =>
+    ({
+      id,
+      title: "Gate: human",
+      status: "open",
+      issue_type: "gate",
+      await_type: "human",
+      description: `Ad-hoc gate blocking f-1\n\nReason: ${reason}`,
+      labels: [HUMAN_GATE_ARMED_LABEL],
+      ...o,
+    }) as Gate;
+
+  /** The other author: a hold a person hung on the target by hand, carrying no anton label. */
+  const handHeld = (id: string, reason: string, o: Partial<Gate> = {}): Gate =>
+    gate(id, reason, { labels: [], ...o });
+
+  const target = (...gateIds: string[]): Bead =>
+    ({
+      id: "f-1",
+      title: "f-1",
+      status: "open",
+      dependencies: gateIds.map((g) => ({ issue_id: "f-1", depends_on_id: g, type: "blocks" })),
+    }) as Bead;
+
+  it("creates the wait when the target carries none", () => {
+    expect(humanGatePlan([target()], "f-1", ASK)).toEqual({ stale: [], held: [], open: undefined });
+  });
+
+  it("reuses the gate already carrying this ask rather than racing it with a second", () => {
+    const plan = humanGatePlan([target("g-1"), gate("g-1", ASK)], "f-1", ASK);
+    expect(plan.open?.id).toBe("g-1");
+    expect(plan.stale).toEqual([]);
+  });
+
+  it("supersedes a gate whose ask no longer applies", () => {
+    const plan = humanGatePlan([target("g-old"), gate("g-old", "an older ask")], "f-1", ASK);
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-old"]);
+    expect(plan.held).toEqual([]);
+    expect(plan.open).toBeUndefined();
+  });
+
+  it("leaves a hold a person armed alone, however stale its reason looks", () => {
+    // The contract this protects: `bd gate create --blocks f-1` is a founder's "stop until I say
+    // so". Reading it as anton's leftover would auto-resolve someone's explicit hold the moment an
+    // agent stopped for an unrelated ask.
+    const board = [target("g-mine", "g-theirs"), gate("g-mine", "an older ask"), handHeld("g-theirs", "hold: talking to legal")];
+    const plan = humanGatePlan(board, "f-1", ASK);
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-mine"]);
+    expect(plan.held.map((g) => g.id)).toEqual(["g-theirs"]);
+  });
+
+  it("still reuses an anton gate whose label write was lost, rather than arming a twin", () => {
+    // Ownership narrows what may be CLOSED, never what may be reused: an arm that created the gate
+    // and then failed to tag it must still re-enter onto that same wait.
+    const plan = humanGatePlan([target("g-1"), handHeld("g-1", ASK)], "f-1", ASK);
+    expect(plan.open?.id).toBe("g-1");
+    expect(plan.stale).toEqual([]);
+    expect(plan.held).toEqual([]);
+  });
+
+  it("resolves EVERY stale gate even when the live one is seen first", () => {
+    // The failure this guards: a gateResolve that failed on an earlier run leaves the old ask open
+    // next to the current one. Stopping at the live gate would leave it blocking the target forever
+    // — no `bd gate check` and no expiry pass ever looks at a human gate.
+    const board = [target("g-1", "g-a", "g-b"), gate("g-1", ASK), gate("g-a", "ask A"), gate("g-b", "ask B")];
+    const plan = humanGatePlan(board, "f-1", ASK);
+    expect(plan.open?.id).toBe("g-1");
+    expect(plan.stale.map((g) => g.id)).toEqual(["g-a", "g-b"]);
+  });
+
+  it("ignores resolved gates, non-blocks edges, and gates of another flavour", () => {
+    const board = [
+      target("g-closed", "g-related", "g-merge"),
+      gate("g-closed", ASK, { status: "closed" }),
+      gate("g-related", "a related ask"),
+      gate("g-merge", "merge wait", { await_type: "gh:pr" }),
+    ];
+    // A closed gate is a wait a person already ended — its ask must not be reused, so this arms anew.
+    expect(humanGatePlan(board, "f-1", ASK)).toMatchObject({ open: undefined });
+    expect(humanGatePlan(board, "f-1", ASK).stale.map((g) => g.id)).toEqual(["g-related"]);
+    const related = [
+      { ...board[0], dependencies: [{ issue_id: "f-1", depends_on_id: "g-related", type: "related" }] } as Bead,
+      board[2],
+    ];
+    expect(humanGatePlan(related, "f-1", ASK)).toEqual({ stale: [], held: [], open: undefined });
+  });
+
+  it("matches the ask an agent that named none gets, so that gate is reused too", () => {
+    const reason = humanGateReason("f-1", { ticketId: "t-1", ask: undefined });
+    const plan = humanGatePlan([target("g-1"), gate("g-1", reason)], "f-1", reason);
+    expect(plan.open?.id).toBe("g-1");
+  });
+
+  it("names the asking TICKET in the reason, not just the target the gate blocks", () => {
+    // The gate blocks the run target, so on a feature with several children its own id is the only
+    // thing the escalation surface could otherwise recover (PR #205 review) — and an answer left on
+    // the feature reaches no dispatch: the resumed session reads notes off the ticket it re-runs.
+    expect(humanGateReason("f-1", { ticketId: "t-9", ask: ASK })).toBe(`t-9 needs a human: ${ASK}`);
+    expect(humanGateReason("f-1", { ticketId: "t-9", ask: undefined })).toContain("t-9 needs a human:");
+  });
+});
+
+describe("askSettleError — a cancellation that overtakes the ask (anton-287p)", () => {
+  const ask = new NeedsHumanError("t-1", "someone must approve the vendor contract");
+
+  it("keeps the ask when nothing cancelled the run, so the gate is armed", () => {
+    expect(askSettleError(ask, new AbortController().signal)).toBe(ask);
+  });
+
+  it("reads the signal at the settle, not when the error was caught", () => {
+    // The regression this guards: the handler unwinds through several awaited bd writes (releasing
+    // the children it reserved) before it settles, so a kill can land AFTER the catch. A snapshot
+    // taken on the way in would still arm a `human` gate — permanent board state blocking a target
+    // nobody is waiting on — for a run an operator just killed.
+    const controller = new AbortController();
+    expect(askSettleError(ask, controller.signal)).toBe(ask);
+    controller.abort();
+    const settled = askSettleError(ask, controller.signal);
+    expect(settled).not.toBe(ask);
+    expect((settled as Error).name).toBe("PoisonError"); // still parks; a retry can't answer an ask
+    expect((settled as Error).message).toContain("armed NO gate");
+    expect((settled as Error).message).toContain("someone must approve the vendor contract");
+  });
+
+  it("passes every other error through untouched, cancelled or not", () => {
+    const other = new Error("the build broke");
+    const controller = new AbortController();
+    controller.abort();
+    expect(askSettleError(other, controller.signal)).toBe(other);
+    expect(askSettleError(other, new AbortController().signal)).toBe(other);
   });
 });
 

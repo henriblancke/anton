@@ -119,10 +119,29 @@ ANTON-RESULT: blocked — <one-line reason>
 
 when you could not deliver (a blocker from "Fail loud", a contradiction in the acceptance
 criteria, a missing dependency, or a pre-existing failure that isn't yours to fix). State the
-reason in one line so a human knows what to decide.
+reason in one line so a human knows what to decide, **or**
+
+```
+ANTON-RESULT: needs-human — <one-line ask>
+```
+
+when the next step is one **only a person can take**: a credential or secret you cannot mint, an
+account or subscription someone must create, a click in a third-party dashboard, an approval, or a
+judgement call that is the founder's to make. State the ask concretely — what a person must do —
+so it can be handed to them and the work resumed.
+
+`needs-human` is **not** "this is hard", "I am unsure", or "this would take a while" — those are
+your job. Use it only when no amount of further work inside this worktree can reach the next step.
+
+When the ask is a **decision** rather than an action — which option, which value, which trade-off —
+state the choices, not just the question. The answer comes back to the resumed session as a **human
+note on the ticket** (anton inlines those notes into the task as binding steering); closing the gate
+carries nothing on its own. So before you ask again, read the ticket's notes: an ask already answered
+there is not an ask, and re-emitting it parks the run on a question that has been decided.
 
 Rules:
 - Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
 - **Never report `delivered` on an unchanged tree.** If you made no code changes, you delivered
-  nothing — report `blocked` with the reason. anton cross-checks this line against what actually
-  got committed; a `delivered` claim with an empty diff is a false success and is blocked for a human.
+  nothing — report `blocked` (or `needs-human`) with the reason. anton cross-checks this line
+  against what actually got committed; a `delivered` claim with an empty diff is a false success
+  and is blocked for a human.

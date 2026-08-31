@@ -15,6 +15,7 @@ import {
   AutomationTable,
   type AutomationScheduleState,
   type AutomationSpec,
+  type CadenceOffer,
 } from "@/components/settings/automation-table";
 
 afterEach(cleanup);
@@ -42,6 +43,12 @@ const AUTOMATIONS: AutomationSpec[] = [
     description: "ranks what could run next · records the plan · starts nothing yet",
     group: "Board maintenance",
   },
+  {
+    id: "product-master",
+    label: "product-master",
+    description: "product judgment",
+    group: "Board maintenance",
+  },
 ];
 
 const DEFAULT_CRONS: Record<string, string> = {
@@ -49,10 +56,14 @@ const DEFAULT_CRONS: Record<string, string> = {
   "run-health": "0 * * * *",
   unstick: "10 * * * *",
   "board-picker": "*/10 * * * *",
+  "product-master": "0 6 * * 1",
 };
 
 /** Every automation gets a row, so the table renders the same shape the settings page passes in. */
-function renderTable(overrides: Record<string, Partial<AutomationScheduleState>> = {}) {
+function renderTable(
+  overrides: Record<string, Partial<AutomationScheduleState>> = {},
+  cadenceOffer: CadenceOffer | null = null,
+) {
   const state: Record<string, AutomationScheduleState> = {};
   for (const automation of AUTOMATIONS) {
     state[automation.id] = {
@@ -63,16 +74,21 @@ function renderTable(overrides: Record<string, Partial<AutomationScheduleState>>
   }
   const onCronChange = vi.fn<(id: string, cron: string) => void>();
   const onToggle = vi.fn<(id: string, next: boolean) => void>();
+  const onAcceptCadenceOffer = vi.fn();
+  const onDeclineCadenceOffer = vi.fn();
   render(
     <AutomationTable
       automations={AUTOMATIONS}
       state={state}
       defaultCrons={DEFAULT_CRONS}
+      cadenceOffer={cadenceOffer}
       onCronChange={onCronChange}
       onToggle={onToggle}
+      onAcceptCadenceOffer={onAcceptCadenceOffer}
+      onDeclineCadenceOffer={onDeclineCadenceOffer}
     />,
   );
-  return { onCronChange, onToggle };
+  return { onCronChange, onToggle, onAcceptCadenceOffer, onDeclineCadenceOffer };
 }
 
 const cadenceButton = (id = "nightly-stringer") =>
@@ -227,6 +243,207 @@ describe("the automation rows", () => {
     expect(screen.getAllByText("never").length).toBe(AUTOMATIONS.length - 1);
   });
 
+  // "3h ago" alone reads as healthy whether the pass did work, found nothing, or parked on an
+  // error — which is what made the column unanswerable (anton-znoz).
+
+  it("says what came of the last fire, not just when it was", () => {
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: NOW_SEC() - 3 * 3600 - 60,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+    expect(screen.getByText("3h ago")).toBeTruthy();
+    expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
+  });
+
+  it("tells a fire that did nothing apart from one that did work", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 60,
+        lastRun: {
+          outcome: "noop",
+          at: NOW_SEC() - 60,
+          enqueuedAt: NOW_SEC() - 60,
+          note: "no stalls found",
+        },
+      },
+    });
+    expect(screen.getByText("no stalls found")).toBeTruthy();
+    // The no-op is named for a screen reader too, where the note alone would not carry the verdict.
+    expect(screen.getByText("nothing to do —")).toBeTruthy();
+  });
+
+  it("shows a failed fire with the error that explains it", () => {
+    renderTable({
+      "run-health": {
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 120,
+          enqueuedAt: NOW_SEC() - 120,
+          note: "gh: not authenticated",
+        },
+      },
+    });
+    expect(screen.getByText("gh: not authenticated")).toBeTruthy();
+    expect(screen.getByText("failed —")).toBeTruthy();
+  });
+
+  // A schedule's FIRST fire has been enqueued and has settled nothing, so there is no previous
+  // result to date it against. Without saying "in progress" the row is a bare timestamp, and the
+  // automation's first execution looks like one that reported nothing at all.
+  it("shows a first fire with no settled result as in progress", () => {
+    renderTable({ "run-health": { enabled: true, lastRunAt: NOW_SEC() - 120 } });
+    expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.getByText("in progress")).toBeTruthy();
+    expect(screen.queryByText("nothing to do")).toBeNull();
+  });
+
+  // `lastRunAt` is stamped at enqueue, `lastRun` is the newest SETTLED job — so for the whole length
+  // of a fire the outcome beside it belongs to the PREVIOUS one. Reading last night's green result
+  // as the verdict on a run that started two minutes ago is the failure this guards.
+  it("does not credit a still-running fire with the previous fire's result", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: true,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+
+    expect(screen.getByText("2m ago")).toBeTruthy();
+    expect(screen.queryByText("triaged 4 signal(s)")).toBeNull();
+    // The older result is not hidden, it is dated to the run it came from.
+    expect(screen.getByText("in progress · ok 3h ago")).toBeTruthy();
+  });
+
+  it("does not blame a running fire for yesterday's failure", () => {
+    renderTable({
+      "run-health": {
+        enabled: true,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 26 * 3600,
+          enqueuedAt: NOW_SEC() - 26 * 3600,
+          note: "gh: not authenticated",
+        },
+      },
+    });
+
+    expect(screen.queryByText("gh: not authenticated")).toBeNull();
+    expect(screen.queryByText("failed —")).toBeNull();
+    expect(screen.getByText(/^in progress · failed 1d ago$/)).toBeTruthy();
+  });
+
+  // Disabling a schedule leaves an already enqueued job queued and unleased (jobs/runner.ts) while
+  // preserving `lastRunAt`, so the unsettled reading would otherwise claim a handler is running for
+  // as long as the automation stays off.
+  it("calls an unleased fire held, not in progress, while the automation is off", () => {
+    renderTable({
+      "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120, pendingRun: "queued" },
+    });
+
+    expect(screen.getByText("held · automation off")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // The other half of the same fact: the runner gates the CLAIM on the switch, never the handler, so
+  // a job leased before the switch went off runs to completion. Calling that held would tell an
+  // operator nothing is happening while a session is mid-flight.
+  it("keeps an already-leased fire in progress after the automation is switched off", () => {
+    renderTable({
+      "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120, pendingRun: "running" },
+    });
+
+    expect(screen.getByText("in progress")).toBeTruthy();
+    expect(screen.queryByText(/held/)).toBeNull();
+  });
+
+  // An armed schedule whose fire nothing has picked up yet is waiting on a worker, not working.
+  it("calls an unleased fire queued while the automation is on", () => {
+    renderTable({
+      "run-health": { enabled: true, lastRunAt: NOW_SEC() - 120, pendingRun: "queued" },
+    });
+
+    expect(screen.getByText("queued")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // With no pending job to read — a poll that has not landed yet — the switch is all there is.
+  it("falls back to the switch when the fire's own status is unknown", () => {
+    renderTable({ "run-health": { enabled: false, lastRunAt: NOW_SEC() - 120 } });
+
+    expect(screen.getByText("held · automation off")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  it("dates the previous outcome behind a held fire without crediting it", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: false,
+        pendingRun: "queued",
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "ok",
+          at: NOW_SEC() - 3 * 3600 - 60,
+          enqueuedAt: NOW_SEC() - 3 * 3600 - 60,
+          note: "triaged 4 signal(s)",
+        },
+      },
+    });
+
+    expect(screen.getByText("held · automation off · ok 3h ago")).toBeTruthy();
+    expect(screen.queryByText("triaged 4 signal(s)")).toBeNull();
+  });
+
+  // The mirror check: a settled fire always settles at or after it was enqueued, so the in-flight
+  // reading must never swallow a real outcome.
+  it("shows the outcome of a fire that settled after it was enqueued", () => {
+    const firedAt = NOW_SEC() - 3 * 3600 - 60;
+    renderTable({
+      "nightly-stringer": {
+        lastRunAt: firedAt,
+        lastRun: { outcome: "ok", at: firedAt + 90, enqueuedAt: firedAt, note: "triaged 4 signal(s)" },
+      },
+    });
+
+    expect(screen.getByText("triaged 4 signal(s)")).toBeTruthy();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // The outcomes are matched on ENQUEUE time, not settlement: an operator resuming a week-old parked
+  // fire settles it today, AFTER the fire now running was enqueued. Comparing settlement times would
+  // hand that stale failure to the running fire as its verdict.
+  it("does not hand a running fire the verdict of an older fire resumed after it started", () => {
+    renderTable({
+      "nightly-stringer": {
+        enabled: true,
+        lastRunAt: NOW_SEC() - 120,
+        lastRun: {
+          outcome: "failed",
+          at: NOW_SEC() - 30,
+          enqueuedAt: NOW_SEC() - 7 * 86_400,
+          note: "bd exited 1",
+        },
+      },
+    });
+
+    expect(screen.queryByText("bd exited 1")).toBeNull();
+    expect(screen.getByText("in progress · failed 7d ago")).toBeTruthy();
+  });
+
   // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
   // and without saying so the row reads as a failure.
   it("says which automations are idle because the one that feeds them is off", () => {
@@ -253,5 +470,55 @@ describe("the automation rows", () => {
     const { onToggle } = renderTable({ "run-health": { enabled: false } });
     fireEvent.click(screen.getByRole("switch", { name: "run-health" }));
     expect(onToggle).toHaveBeenCalledWith("run-health", true);
+  });
+});
+
+/**
+ * The cadence offer (anton-3xa9). The claim under test is that it is an OFFER: it says why, it says
+ * which cadence would become which, and neither button is the one that already happened — the table
+ * changes nothing on its own.
+ */
+describe("the cadence offer", () => {
+  const OFFER: CadenceOffer = {
+    automationId: "product-master",
+    cron: "0 6 * * *",
+    reason: "product-master's judgment now feeds the board-picker — what it ranks is executed.",
+    acceptLabel: "Raise to daily",
+    declineLabel: "Keep weekly",
+  };
+
+  it("shows nothing at all when there is no offer", () => {
+    renderTable();
+    expect(screen.queryByRole("button", { name: "Raise to daily" })).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("states the reason and the cadence change, next to the row it would change", () => {
+    renderTable({}, OFFER);
+
+    const offer = screen.getByRole("status");
+    expect(offer.textContent).toContain("feeds the board-picker");
+    // Both sides, as phrases: the operator is deciding between two cadences, not two cron strings.
+    expect(offer.textContent).toContain("Weekly on Monday at 06:00");
+    expect(offer.textContent).toContain("Daily at 06:00");
+    // Under the automation it is about — the cadence cell is still the row's own, untouched.
+    expect(cadenceButton("product-master").textContent).toContain("Weekly on Monday at 06:00");
+  });
+
+  it("names both answers as decisions rather than as OK and Cancel", () => {
+    const { onAcceptCadenceOffer, onDeclineCadenceOffer } = renderTable({}, OFFER);
+
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+    expect(onAcceptCadenceOffer).toHaveBeenCalledTimes(1);
+    expect(onDeclineCadenceOffer).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+    expect(onDeclineCadenceOffer).toHaveBeenCalledTimes(1);
+  });
+
+  it("changes no cadence by itself — accepting is a callback, not a write", () => {
+    const { onCronChange } = renderTable({}, OFFER);
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+    expect(onCronChange).not.toHaveBeenCalled();
   });
 });

@@ -175,6 +175,31 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect("budgetAware" in persisted()).toBe(false);
   });
 
+  it("PATCH persists the keep-weekly answer, and GET restores it (anton-3xa9)", async () => {
+    // The opt-out only works if it survives the session that gave it — otherwise arming the picker
+    // asks the same question forever.
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.keepProductMasterWeekly).toBe(true);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.keepProductMasterWeekly).toBe(true);
+  });
+
+  it("PATCH rejects a non-boolean keepProductMasterWeekly (anton-3xa9)", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ keepProductMasterWeekly: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears keepProductMasterWeekly back to unasked (anton-3xa9)', async () => {
+    await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect("keepProductMasterWeekly" in persisted()).toBe(false);
+  });
+
   it("PATCH persists a budgetPolicy, and GET restores it (anton-egrg)", async () => {
     const budgetPolicy = { daytimeReservePct: 25, weeklyTargetPct: 80 };
     const res = await PATCH(patchReq({ budgetPolicy }), ctx("tmp"));
@@ -804,5 +829,165 @@ describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
     expect(res.status).toBe(200);
     expect((await res.json()).settings.proposalAutonomy).toBeUndefined();
     expect("proposalAutonomy" in persisted()).toBe(false);
+  });
+});
+
+/**
+ * The standing work policy (anton-c7iv). Absent is the load-bearing state — it means the project was
+ * never armed, which is what makes first arm propose a calibrated draft — so the round trip has to
+ * keep "no key" and "no key" distinguishable from an empty policy, and a criterion the operator drops
+ * has to actually leave the store.
+ */
+describe("settings route — work policy (anton-c7iv)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  const policy = {
+    types: ["bug", "feature"],
+    maxPriority: 2,
+    labels: [{ namespace: "severity", values: ["critical", "major"] }],
+    requireUnblocked: true,
+  };
+
+  it("persists no key for a project nobody has armed", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toBeUndefined();
+    expect("pickerPolicy" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists an accepted policy, and GET restores it", async () => {
+    const res = await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.pickerPolicy).toEqual(policy);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toEqual(policy);
+  });
+
+  it("replaces rather than merges — widening a policy means dropping a criterion", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    await PATCH(patchReq({ pickerPolicy: { types: ["bug"] } }), ctx("tmp"));
+    expect(persisted().pickerPolicy).toEqual({ types: ["bug"] });
+  });
+
+  it("clears on null — the project is unarmed again, not armed with nothing", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    await PATCH(patchReq({ pickerPolicy: null }), ctx("tmp"));
+    expect("pickerPolicy" in persisted()).toBe(false);
+  });
+
+  it("round-trips a hand-ranked namespace in the operator's order (anton-qsr1)", async () => {
+    // The ORDER is the ranking (R2.3), so it must survive the write and the read back unsorted —
+    // a policy that re-alphabetised on save would silently discard what the operator dragged.
+    const ranked = {
+      labels: [{ namespace: "severity", values: ["major", "critical", "minor"], ranked: true }],
+    };
+    const res = await PATCH(patchReq({ pickerPolicy: ranked }), ctx("tmp"));
+    expect(res.status).toBe(200);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.pickerPolicy).toEqual(ranked);
+    expect(persisted().pickerPolicy).toEqual(ranked);
+  });
+
+  it("round-trips the ordered native bounds and a ranked comparison (anton-hmyo)", async () => {
+    // Both ends of every ordered field, plus the one ordering a discovered namespace ever gets —
+    // the operator's own ranking, with the bound they set against it.
+    const ordered = {
+      minPriority: 1,
+      maxPriority: 3,
+      minParentDepth: 0,
+      maxParentDepth: 1,
+      minAgeDays: 1,
+      maxAgeDays: 180,
+      labels: [
+        {
+          namespace: "severity",
+          values: ["critical", "major", "minor"],
+          ranked: true,
+          compare: { op: "lte", value: "major" },
+        },
+      ],
+    };
+    const res = await PATCH(patchReq({ pickerPolicy: ordered }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().pickerPolicy).toEqual(ordered);
+  });
+
+  it("rejects a malformed policy without disturbing what is stored", async () => {
+    await PATCH(patchReq({ pickerPolicy: policy }), ctx("tmp"));
+    for (const value of [
+      // An empty membership set fails closed against every bead — never what an operator meant.
+      { types: [] },
+      { labels: [{ namespace: "severity", values: [] }] },
+      // One namespace, one criterion: a second entry could never be reached.
+      {
+        labels: [
+          { namespace: "severity", values: ["major"] },
+          { namespace: "severity", values: ["minor"] },
+        ],
+      },
+      // A value listed twice is one membership test twice over, and under a ranking it is a value
+      // at two positions — a bound could then admit a slice the stored order does not show.
+      { labels: [{ namespace: "severity", values: ["major", "major"] }] },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major", "critical"],
+            ranked: true,
+            compare: { op: "lte", value: "critical" },
+          },
+        ],
+      },
+      { maxPriority: -1 },
+      { maxPriority: "P2" },
+      { requireUnblocked: "yes" },
+      { labels: [{ namespace: "severity", values: ["major"], ranked: "yes" }] },
+      // A comparison the predicate could only ever fail closed on is a policy that admits nothing
+      // and says so one bead at a time — rejected here instead, where the operator can see it.
+      {
+        labels: [
+          { namespace: "severity", values: ["critical", "major"], compare: { op: "lte", value: "major" } },
+        ],
+      },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            compare: { op: "lte", value: "blocker" },
+          },
+        ],
+      },
+      {
+        labels: [
+          {
+            namespace: "severity",
+            values: ["critical", "major"],
+            ranked: true,
+            compare: { op: "under", value: "major" },
+          },
+        ],
+      },
+      { minPriority: 5 },
+      { maxParentDepth: -1 },
+      { minAgeDays: "a week" },
+      { unknownCriterion: true },
+      ["bug"],
+    ]) {
+      const res = await PATCH(patchReq({ pickerPolicy: value }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/pickerPolicy/);
+    }
+    expect(persisted().pickerPolicy).toEqual(policy);
   });
 });

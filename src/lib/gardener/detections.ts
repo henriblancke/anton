@@ -41,6 +41,11 @@ export const PROPOSAL_NAMESPACES: readonly ProposalNamespace[] = ["gardener", "p
  * contracts, which is `/shape`'s job and a human's call. It is a move all the same, because the ask
  * still belongs on the board with evidence and a fingerprint — approving it is refused, and
  * declining is what settles it (the same shape as a targetless re-parent; see `isManualProposal`).
+ *
+ * `approve` is the only move that STARTS work rather than tidying the board (anton-1ivg). Every other
+ * verb re-shapes, parks or retires something; this one grants the founder's own gate, and what
+ * follows it is a run that spends tokens and opens a PR. Taking the label back does not un-run that,
+ * which is why it is priced at the dearest earned-autonomy tier (autonomy.ts `autonomyTierOf`).
  */
 export type GardenerMove =
   | "reparent"
@@ -48,7 +53,8 @@ export type GardenerMove =
   | "retire"
   | "reprioritize"
   | "split"
-  | "unapprove";
+  | "unapprove"
+  | "approve";
 
 /**
  * The claims the two producers know how to name.
@@ -78,6 +84,11 @@ export type GardenerMove =
  *                             pm kind that is DETERMINISTIC rather than judged: it re-runs the gate's
  *                             own validator over the pass's board snapshot (anton-xg5y), so it costs
  *                             no session and never depends on one.
+ *   • `withheld-approval`   — the board's best next work carries no approval, so nothing will ever
+ *                             pick it up: grant the gate and let a run start. The mirror of
+ *                             `degraded-approval` and the only kind whose move STARTS work — until
+ *                             this one, the judgment tier could withdraw a founder's approval but
+ *                             never grant one.
  */
 export type GardenerDetectionKind =
   | "container-orphan"
@@ -91,7 +102,8 @@ export type GardenerDetectionKind =
   | "misfiled"
   | "oversized"
   | "low-value"
-  | "degraded-approval";
+  | "degraded-approval"
+  | "withheld-approval";
 
 export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "container-orphan",
@@ -106,6 +118,7 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "oversized",
   "low-value",
   "degraded-approval",
+  "withheld-approval",
 ];
 
 /**
@@ -183,6 +196,7 @@ export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   oversized: { namespace: "pm", move: "split" },
   "low-value": { namespace: "pm", move: "retire", retireAs: "defer" },
   "degraded-approval": { namespace: "pm", move: "unapprove" },
+  "withheld-approval": { namespace: "pm", move: "approve" },
 };
 
 /** Which producer files this kind — the fingerprint's prefix and the proposal's `source:` label. */
@@ -554,6 +568,7 @@ const GARDENER_MOVES: readonly GardenerMove[] = [
   "reprioritize",
   "split",
   "unapprove",
+  "approve",
 ];
 const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
 

@@ -51,6 +51,8 @@ export interface EscalationFinding {
   prNumber?: number;
   prUrl?: string;
   gateId?: string;
+  /** The ticket that raised a `needs-human` ask — where an answer goes (see EscalationView). */
+  askBeadId?: string;
   /** One line per run — the case a disarm asks the operator to re-arm (or not) on. */
   evidence?: string[];
 }
@@ -86,6 +88,12 @@ export interface EscalationView {
    * escalation-gate.ts). Absent on every other kind: nothing else stalls on a gate.
    */
   gateId?: string;
+  /**
+   * The ticket that raised a `needs-human` ask — the one bead an ANSWER belongs on, which is not
+   * `epicBeadId`: a resume re-enqueues the feature, while the notes steering it are read off the
+   * child that stopped. Absent on a gate a person hung by hand.
+   */
+  askBeadId?: string;
   runId?: string;
   jobId?: string;
   prNumber?: number;
@@ -137,6 +145,7 @@ export function toEscalationView(row: EscalationRow): EscalationView {
     epicBeadId: row.epicBeadId ?? undefined,
     // No column of its own: the gate is evidence the detector recorded, like the PR pointers below.
     gateId: typeof evidence.gateId === "string" ? evidence.gateId : undefined,
+    askBeadId: typeof evidence.askBeadId === "string" ? evidence.askBeadId : undefined,
     runId: row.runId ?? undefined,
     jobId: row.jobId ?? undefined,
     prNumber: typeof evidence.prNumber === "number" ? evidence.prNumber : undefined,

@@ -907,6 +907,18 @@ export interface Gate extends Bead {
   timeout?: number;
 }
 
+/**
+ * The `--reason` a gate was created with, read back off the gate bead. bd keeps no reason field: it
+ * folds the reason into the description it composes — `Ad-hoc gate blocking <bead>\n\nReason:
+ * <reason>` (measured on bd 1.1.2), verbatim and untruncated — so this is the only way to ask what a
+ * gate is waiting FOR. Undefined when the gate carries no reason.
+ */
+export function gateReason(gate: Bead): string | undefined {
+  const marker = "\nReason: ";
+  const at = (gate.description ?? "").indexOf(marker);
+  return at === -1 ? undefined : gate.description!.slice(at + marker.length);
+}
+
 export interface GateCreateOpts {
   /** Bead the gate blocks (required by bd). */
   blocks: string;
@@ -1871,6 +1883,20 @@ function graphPlanError(err: unknown): string | undefined {
   }
 }
 
+/**
+ * Every issue type a run target can have. NECESSARY, not sufficient — the structural clauses in
+ * {@link beads.isRunTarget} still decide (a container epic and a parented task are both out) — but
+ * a type absent here can never be started, whatever its shape. Exported so anything that has to
+ * name the runnable vocabulary without a board in hand (the policy calibration fallback) reads it
+ * from the predicate rather than restating it: a `chore` fallback would propose work no pass can
+ * ever admit.
+ */
+export const RUN_TARGET_TYPES = ["feature", "epic", "task", "bug"] as const;
+export type RunTargetType = (typeof RUN_TARGET_TYPES)[number];
+
+const isRunTargetType = (t: string | undefined): t is RunTargetType =>
+  RUN_TARGET_TYPES.includes(t as RunTargetType);
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
@@ -1945,6 +1971,16 @@ export const beads = {
    */
   isMergeWaitGate: (b: Bead): b is Gate =>
     b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
+
+  /**
+   * A `human` gate — the wait anton arms on a run target whose agent reported `needs-human`
+   * (anton-287p). The opposite of the merge wait in every way that matters here: it IS a real
+   * blocker (epic-graph counts it, so nothing re-runs the target behind it), and NOTHING closes it
+   * on its own — `bd gate check` never evaluates it and gate-check's expiry pass skips it — so it
+   * ends only when a person runs `bd gate resolve`.
+   */
+  isHumanGate: (b: Bead): b is Gate =>
+    b.issue_type === "gate" && (b as Gate).await_type === "human",
 
   /**
    * Molecules whose gate has closed and whose next step is runnable — the gate-resume discovery
@@ -2665,6 +2701,7 @@ export const beads = {
    */
   isRunTarget: (b: Bead, board: Bead[]): boolean =>
     !isPipelineArtifact(b) &&
+    isRunTargetType(b.issue_type) &&
     (b.issue_type === "feature" ||
       (beads.isEpic(b) && !beads.isContainer(b, board)) ||
       ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b))),

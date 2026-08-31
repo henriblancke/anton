@@ -118,6 +118,22 @@ describe("makeBoardPickerHandler", () => {
     expect(plan?.generatedAt).toBe(Math.floor(NOW / 1000));
   });
 
+  // A pass ALWAYS writes a plan row, so the write is not the effect — the ranking is. An empty
+  // board makes every ten-minute slot look like work if the two are conflated (anton-znoz).
+  it("reports a ranked plan as work done and an empty one as nothing to do", async () => {
+    board.current = [bead("t1", { priority: 2 })];
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: true,
+      note: "ranked 1 target(s)",
+    });
+
+    board.current = [];
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: false,
+      note: "nothing claimable to rank",
+    });
+  });
+
   it("reads the board strictly, so a gate-less read retries instead of recording it as blocked", async () => {
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
     expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true }]);
@@ -170,6 +186,34 @@ describe("makeBoardPickerHandler", () => {
     ).rejects.toThrow();
 
     expect(await getBoardPickerPlan(t.db, "p1")).toBeUndefined();
+  });
+
+  it("narrows the plan with the policy the operator armed", async () => {
+    // The settings panel says an accepted policy is what anton may start on; a plan that still
+    // admitted everything would advertise a boundary anton does not keep.
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerPolicy: { types: ["bug"] } }) })
+      .run();
+    board.current = [bead("t1", { issue_type: "bug" }), bead("t2", { issue_type: "task" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    // The refusal stays answerable: it is the policy's, not the board's, and it names the criterion.
+    const refused = plan?.exclusions.find((e) => e.beadId === "t2");
+    expect(refused?.reason).toBe("policy");
+    expect(refused?.detail).toContain("the policy admits only bug");
+  });
+
+  it("keeps the structural default on a project that has armed nothing", async () => {
+    board.current = [bead("t1", { issue_type: "task" })];
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries).toEqual([{ beadId: "t1", rank: 1, rule: "any claimable run target" }]);
   });
 
   it("disarms the project when its recent runs are a streak of failures, and still ranks", async () => {

@@ -16,7 +16,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { LABELS, type Bead, type Gate } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { blockedByPoison } from "./errors";
+import { blockedByPoison, parkedOnGateClause } from "./errors";
 import type { Clock } from "./queue";
 
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
@@ -1072,6 +1072,39 @@ describe("a legacy exhausted-job escalation that is really a gate's wait", () =>
     gates([], [{ ...openGate("g-1"), status: "closed" }]);
     seedGateBlockedEscalation("j-9", "g-1");
     await seedReport();
+
+    expect(await sweep()).toMatchObject({ settled: 1 });
+    expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });
+  });
+
+  it("retires the row a needs-human park raised beside its own gate", async () => {
+    // Arming a gate for an ask ALSO poison-parks the job (anton-287p), so a pre-dedupe sweep raised
+    // the same question twice: the wait the operator answers, and an "exhausted job" that never was
+    // one. Only the gate id in the park message connects the two.
+    // Seeded still parked, so the general retirement has live evidence the job is stuck: only the
+    // gate path can retire this row.
+    seedJob("j-9", { status: "parked", attempts: 1, lastError: "poison: needs a human" });
+    const reason =
+      "execute-epic job parked without retrying (permanent failure): t-1 needs a human: " +
+      `rotate the staging password. ${parkedOnGateClause("g-1")}`;
+    t.db
+      .insert(schema.escalations)
+      .values({
+        id: "esc-ask",
+        projectId: "p1",
+        findingKey: "exhausted-job:j-9",
+        kind: "exhausted-job",
+        reason,
+        beadId: "e-9",
+        jobId: "j-9",
+        since: secDate(NOW - 4 * HOUR),
+        evidenceJson: JSON.stringify({ kind: "exhausted-job", jobId: "j-9", reason }),
+        status: "open",
+        raisedAt: secDate(NOW - 4 * HOUR),
+        updatedAt: secDate(NOW - 4 * HOUR),
+      })
+      .run();
+    await seedReport(); // suppressed: the sweep reports the gate, never the job
 
     expect(await sweep()).toMatchObject({ settled: 1 });
     expect(escalationRows()[0]).toMatchObject({ status: "resolved", resolution: "dismissed" });

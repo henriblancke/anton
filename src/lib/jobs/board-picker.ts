@@ -26,14 +26,15 @@ import { describeFailureStreak } from "../autopilot-failure-streak";
 import { describeScoreSlide } from "../autopilot-score-slide";
 import { describeWipHold } from "../autopilot-wip";
 import { saveBoardPickerPlan } from "../board-picker-plan";
-import { getProjectById } from "../projects";
+import { getProjectById, getProjectSettings, resolvePickerPolicy } from "../projects";
 import { PoisonError } from "./errors";
 import { checkFailureStreak } from "./picker-failure-breaker";
 import { checkScoreSlide } from "./picker-score-breaker";
 import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
 import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./picker-decision";
+import { armedPickerPolicy } from "./picker-policy";
 import { systemClock, type AntonDb, type Clock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 /** What the scheduler enqueues for this type — the shape every scheduled job carries. */
 export interface BoardPickerPayload {
@@ -56,7 +57,7 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
 
-  return async function boardPicker(ctx: JobContext): Promise<void> {
+  return async function boardPicker(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as BoardPickerPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -107,9 +108,14 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     });
     if (hold) console.info(`[board-picker] ${projectId}: holding — ${describeWipHold(hold)}`);
 
+    // The policy the operator accepted in settings, applied to the plan this pass records: a panel
+    // that says a policy is armed while the plan admits everything is advertising a boundary anton
+    // does not keep. An unarmed project keeps the structural default — the pass starts nothing, so
+    // an unnarrowed plan is a ranking, not an autopilot.
+    const armed = resolvePickerPolicy(await getProjectSettings(db, projectId));
     const decision = decideBoardPickerPlan({
       board,
-      policy: ADMIT_ALL_POLICY,
+      policy: armed ? armedPickerPolicy(armed, board, new Date(observedAtMs)) : ADMIT_ALL_POLICY,
       runtime: { observedAtMs },
     });
 
@@ -128,5 +134,13 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // The job id goes on the row: "which pass decided this?" is the first question asked of a plan
     // an operator disagrees with, and the job carries the logs that answer it.
     await saveBoardPickerPlan(db, clock, { projectId, jobId: ctx.jobId, ...decision });
+
+    // The pass always writes a row, so "changed" is about the RANKING, not the write: a board with
+    // nothing claimable produces an empty plan, and calling that a result would make every idle slot
+    // look like work.
+    const ranked = decision.entries.length;
+    return ranked > 0
+      ? { changed: true, note: `ranked ${ranked} target(s)` }
+      : { changed: false, note: "nothing claimable to rank" };
   };
 }

@@ -16,6 +16,7 @@ import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import { REHOME_GUARDS } from "./home-guards";
 import { ORDER_GUARDS } from "./order-guards";
+import { START_GUARDS } from "./start-guards";
 import { detectionsFor } from "./refusals";
 import type { PmClaim } from "./report";
 
@@ -496,6 +497,83 @@ describe("detectionsFor", () => {
         "subjectHasNoHome",
         "noRunTargetCarriesSubject",
       ]);
+    });
+  });
+
+  // The start claim (anton-1ivg.1): the mirror of `kill` in shape and its opposite in consequence —
+  // approving it SPENDS a run. Its bars are the picker's own eligibility, asked here at filing time
+  // so a claim the board would refuse never reaches a founder, so the board below carries one bead
+  // of each shape that eligibility turns away.
+  describe("a start claim", () => {
+    /** A parentless task with a rubric: a run target the picker would offer, missing only the gate. */
+    const ready = bead("anton-ready", { acceptance_criteria: "- [ ] it ships" });
+
+    const start = (bead: string): PmClaim =>
+      claim({ kind: "start", bead, summary: "this is the work to run next" });
+
+    it("turns a target the board would offer into an approve proposal", () => {
+      const { detections, rejected } = detectionsFor([start(ready.id)], [ready], NOW);
+      expect(rejected).toEqual([]);
+      expect(detections.map((d) => [d.kind, d.move, d.subjects])).toEqual([
+        ["withheld-approval", "approve", [ready.id]],
+      ]);
+      // The ask IS the bead, so nothing else joins its identity — one start question per target.
+      expect(detections[0].subjectKey).toBe(`withheld-approval:${ready.id}`);
+      expect(detections[0].fingerprint.split(":")[0]).toBe("pm");
+    });
+
+    const START_CASES: RefusalCase[] = [
+      {
+        guard: "alreadyApproved",
+        label: "a bead that already carries the gate",
+        bad: start("anton-granted"),
+        reason: "anton-granted is already approved — nothing is withholding the gate, so the move would write nothing",
+      },
+      {
+        // A claim is not `isInFlight`, so the shared subject bars wave it through — but the picker
+        // refuses every holder, so approving it would grant the gate over somebody's reservation.
+        guard: "notStartable",
+        label: "a bead somebody already holds",
+        bad: start("anton-taken"),
+        reason:
+          "anton-taken is not work anton may start — held by runner-7 (claimed) — so approving it would set a run loose on a target the board itself refuses",
+      },
+      {
+        // Nothing dispatches a ticket: the run is the card above it, so the label would sit on a
+        // bead no worker ever comes for — the state `degraded-approval` exists to report.
+        guard: "notStartable",
+        label: "a bead no run can dispatch",
+        bad: start("anton-ticket"),
+        reason:
+          "anton-ticket is not work anton may start — it now sits under anton-card and runs as one of that target's tickets, not on its own (not-a-run-target) — so approving it would set a run loose on a target the board itself refuses",
+      },
+    ];
+
+    it.each(START_CASES)("refuses $label, and says why rather than dropping it", ({ bad, reason }) => {
+      const board = [
+        ready,
+        bead("anton-granted", {
+          acceptance_criteria: "- [ ] it ships",
+          labels: [LABELS.approved],
+        }),
+        bead("anton-taken", { acceptance_criteria: "- [ ] it ships", assignee: "runner-7" }),
+        bead("anton-card", { issue_type: "feature", acceptance_criteria: "- [ ] it ships" }),
+        bead("anton-ticket", { parent: "anton-card", acceptance_criteria: "- [ ] it ships" }),
+      ];
+      const { detections, rejected } = detectionsFor([bad], board, NOW);
+      expect(detections).toEqual([]);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toBe(reason);
+    });
+
+    it("asserts the exact refusal of every start guard", () => {
+      expect(guardsCovered(START_CASES)).toEqual(new Set(START_GUARDS.map((g) => g.name)));
+    });
+
+    // The cheap fact about the label first: a bead that already carries the gate says so, rather
+    // than being reported as whatever the eligibility walk happens to find wrong with it.
+    it("runs the start guards in the order the refusals depend on", () => {
+      expect(START_GUARDS.map((g) => g.name)).toEqual(["alreadyApproved", "notStartable"]);
     });
   });
 

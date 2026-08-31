@@ -6,7 +6,33 @@ import { describeCron, isFastCadence } from "@/lib/jobs/cadence";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/atoms";
+import { Button } from "@/components/ui/button";
 import { CadenceEditor } from "@/components/settings/cadence-editor";
+
+/**
+ * How the last fire ENDED, mirrored from the server's `ScheduleLastRun` (lib/schedule-runs.ts) so
+ * this client module imports no server code. `noop` is the one that earns its own state: an
+ * automation that ran and had nothing to do is working, and reading it as either success or silence
+ * is what made "last run: 3h ago" unanswerable.
+ */
+export type ScheduleRunOutcome = "ok" | "noop" | "failed" | "cancelled";
+
+export interface ScheduleLastRun {
+  outcome: ScheduleRunOutcome;
+  /** Epoch SECONDS — when the fire settled. */
+  at: number;
+  /** Epoch SECONDS — when the scheduler enqueued this fire; comparable with the row's `lastRunAt`. */
+  enqueuedAt: number;
+  /** One short line: what it did, or why it failed. */
+  note?: string;
+}
+
+/**
+ * Where a still-unsettled fire sits, mirrored from the server's `SchedulePendingStatus`
+ * (lib/schedule-runs.ts). `running` = a worker holds the lease and a handler is executing;
+ * `queued` = enqueued and nothing has picked it up.
+ */
+export type SchedulePendingStatus = "queued" | "running";
 
 /** One automation's live schedule state. `enabled: null` = this project has no row for it yet. */
 export interface AutomationScheduleState {
@@ -17,7 +43,39 @@ export interface AutomationScheduleState {
   nextRunAt?: number;
   /** Epoch SECONDS of the last fire, as stored. Absent until it has run once. */
   lastRunAt?: number;
+  /** How that fire ended. Absent until a job this schedule enqueued has settled. */
+  lastRun?: ScheduleLastRun;
+  /** Where the unsettled fire sits, if there is one. Absent when nothing is in flight. */
+  pendingRun?: SchedulePendingStatus;
 }
+
+/**
+ * The four outcomes, as a dot and a word.
+ *
+ * A no-op gets the SAME neutral weight as an unknown rather than the success colour: the column is
+ * scanned for the one row that is wrong, and painting every idle ten-minute poll green is how a real
+ * failure gets lost in it. Only failure is coloured, because only failure is a decision.
+ */
+const OUTCOME_STYLES: Record<ScheduleRunOutcome, { dot: string; label: string; text: string }> = {
+  ok: { dot: "bg-stage-done", label: "ok", text: "text-muted-foreground" },
+  noop: { dot: "bg-border", label: "nothing to do", text: "text-subtle" },
+  failed: { dot: "bg-risk-high", label: "failed", text: "text-risk-high" },
+  cancelled: { dot: "bg-risk-med", label: "cancelled", text: "text-muted-foreground" },
+};
+
+/**
+ * A fire that has been enqueued but has not settled. Amber — the colour work in flight wears
+ * everywhere else here — and deliberately not the last settled fire's colour, because that verdict
+ * belongs to an older run.
+ */
+const IN_FLIGHT_STYLE = { dot: "bg-stage-implementing", text: "text-muted-foreground" };
+
+/**
+ * A fire enqueued before the switch went off and never leased. The runner leaves jobs for a disabled
+ * schedule queued and unleased (jobs/runner.ts), so nothing is running — grey, like the row's own
+ * off dot, because this is the state the operator chose and not one to chase.
+ */
+const HELD_STYLE = { dot: "bg-stage-backlog", text: "text-subtle" };
 
 /** What one automation is, and what makes it inert. */
 export interface AutomationSpec {
@@ -33,6 +91,24 @@ export interface AutomationSpec {
   dependsOn?: string;
   /** Which group it belongs to, so a list of rows reads as three concerns. */
   group: string;
+}
+
+/**
+ * A cadence change worth offering because something ELSE the operator just did changed what this
+ * automation's staleness costs (anton-3xa9). Never applied without an explicit accept, and never
+ * shown without saying why — the table is the one place a cadence is meant to be legible, so a
+ * schedule that moved on its own would break the only surface that can be trusted about it.
+ */
+export interface CadenceOffer {
+  /** The automation whose cadence the offer would change. */
+  automationId: string;
+  /** The cron it would move to, if accepted. */
+  cron: string;
+  /** WHY it is being offered, in the operator's terms. Not the mechanism — the consequence. */
+  reason: string;
+  /** Accept/decline labels, so the offer reads as its own decision rather than as OK/Cancel. */
+  acceptLabel: string;
+  declineLabel: string;
 }
 
 /** Group order — board first (what the operator curates), then health, then delivery. */
@@ -102,15 +178,22 @@ export function AutomationTable({
   automations,
   state,
   defaultCrons,
+  cadenceOffer,
   onCronChange,
   onToggle,
+  onAcceptCadenceOffer,
+  onDeclineCadenceOffer,
 }: {
   automations: AutomationSpec[];
   state: Record<string, AutomationScheduleState>;
   /** DEFAULT_SCHEDULES' cron per type — the cadence "Reset" restores. */
   defaultCrons: Record<string, string>;
+  /** A pending cadence offer, rendered under the row it would change. Absent = nothing to ask. */
+  cadenceOffer?: CadenceOffer | null;
   onCronChange: (id: string, cron: string) => void;
   onToggle: (id: string, next: boolean) => void;
+  onAcceptCadenceOffer?: () => void;
+  onDeclineCadenceOffer?: () => void;
 }) {
   const enabledCount = automations.filter((a) => state[a.id]?.enabled === true).length;
   // Read once for the whole table so every row's countdown and last-run age agree on the instant
@@ -163,7 +246,10 @@ export function AutomationTable({
                     {group}
                   </th>
                 </tr>,
-                ...rows.map((automation) => (
+                // The offer renders directly UNDER the row it would change, not as a page banner:
+                // the answer is "weekly → daily", and that only reads as a decision next to the
+                // cadence it is talking about.
+                ...rows.flatMap((automation) => [
                   <AutomationTableRow
                     key={automation.id}
                     automation={automation}
@@ -175,14 +261,68 @@ export function AutomationTable({
                     defaultCron={defaultCrons[automation.id] ?? state[automation.id].cron}
                     onCronChange={(cron) => onCronChange(automation.id, cron)}
                     onToggle={(next) => onToggle(automation.id, next)}
-                  />
-                )),
+                  />,
+                  cadenceOffer?.automationId === automation.id ? (
+                    <CadenceOfferRow
+                      key={`${automation.id}-offer`}
+                      offer={cadenceOffer}
+                      currentCron={state[automation.id].cron}
+                      onAccept={() => onAcceptCadenceOffer?.()}
+                      onDecline={() => onDeclineCadenceOffer?.()}
+                    />
+                  ) : null,
+                ]),
               ];
             })}
           </tbody>
         </table>
       </div>
     </div>
+  );
+}
+
+/**
+ * The pending cadence offer, as a row of its own. States the consequence first and the cadences
+ * second, because an operator deciding this is weighing "is my judgment load-bearing now?", not
+ * two cron expressions — and both buttons are explicit choices, so walking away changes nothing.
+ */
+function CadenceOfferRow({
+  offer,
+  currentCron,
+  onAccept,
+  onDecline,
+}: {
+  offer: CadenceOffer;
+  /** The cadence that fires today — the left-hand side of the change being offered. */
+  currentCron: string;
+  onAccept: () => void;
+  onDecline: () => void;
+}) {
+  return (
+    <tr className="border-b border-border/60 last:border-b-0">
+      <td colSpan={5} className="px-2.5 pb-2.5">
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2.5"
+        >
+          <div className="flex min-w-[16rem] flex-1 flex-col gap-1">
+            <span className="text-[12.5px] leading-snug text-foreground">{offer.reason}</span>
+            <span className="font-mono text-[11px] text-subtle">
+              {describeCron(currentCron)} → {describeCron(offer.cron)}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={onDecline}>
+              {offer.declineLabel}
+            </Button>
+            <Button size="sm" onClick={onAccept}>
+              {offer.acceptLabel}
+            </Button>
+          </div>
+        </div>
+      </td>
+    </tr>
   );
 }
 
@@ -258,19 +398,110 @@ function AutomationTableRow({
       </td>
 
       <td className="px-2.5 py-2 align-middle font-mono text-[11.5px] tabular-nums whitespace-nowrap text-muted-foreground">
-        {state.lastRunAt ? (
-          <span title={formatInstant(state.lastRunAt)}>
-            {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString(), now)}
-          </span>
-        ) : (
-          <span className="text-subtle">never</span>
-        )}
+        <LastRunCell state={state} now={now} on={on} />
       </td>
 
       <td className="px-2.5 py-2 text-right align-middle">
         <Toggle checked={on} onChange={onToggle} label={automation.label} />
       </td>
     </tr>
+  );
+}
+
+/**
+ * When the automation last fired, and what came of it (anton-znoz).
+ *
+ * "3h ago" alone reads as healthy whether the pass filed three beads, found nothing, or parked on a
+ * bd failure — so the time is the headline and the outcome is the line under it, in the row's own
+ * words ("closed 2 gate(s)", "no gate closed") rather than a status vocabulary an operator has to
+ * learn. A fire whose handler reports no effect says "ok" and claims nothing more.
+ *
+ * The two halves come from different places and can describe different fires: `lastRunAt` is
+ * stamped when the scheduler ENQUEUES (jobs/scheduler.ts), `lastRun` is the newest job that has
+ * SETTLED (lib/schedule-runs.ts). While a fire is running — minutes, for the long passes — the
+ * outcome beside it is the PREVIOUS fire's, so pinning it to a two-minute-old timestamp reads as
+ * "it just succeeded" (or just failed). The two are matched on ENQUEUE time, not settlement: an
+ * outcome is this fire's only when the job behind it was enqueued by the tick that stamped
+ * `lastRunAt` — the scheduler writes the job and the stamp in one transaction from one instant, so
+ * a job newer than the stamp cannot exist and this comparison can only ever match the stamped fire.
+ * Settlement cannot decide it — an operator resuming a week-old parked fire settles it today, after
+ * the fire now running was enqueued. Otherwise the fire is still in flight and says so, and the
+ * older result is dated to when THAT fire ran — the same clock as the headline, so a resumed
+ * week-old failure reads as a week old and not as something that just happened. A FIRST fire has no
+ * older result to date, and still says it is in flight — otherwise the automation's very first
+ * execution is indistinguishable from a bare timestamp with nothing behind it.
+ *
+ * What an unsettled fire is DOING is read from the job, not from the switch. The runner gates the
+ * CLAIM on the schedule's enabled flag (jobs/runner.ts): disabling leaves an unleased job queued
+ * while `lastRunAt` stays stamped — so the switch alone would have an off row claim a handler is
+ * running for as long as the automation stays off — but it never aborts a handler that already
+ * holds the lease, so the switch alone would equally call a live run "held". `pendingRun` is the
+ * fact that separates them: a LIVE lease (one that has not expired) is in progress whatever the
+ * switch says — a `running` row whose lease has lapsed is a dead worker, not work, and comes back
+ * `queued`. Unleased under an off switch is held, unleased under an on switch is queued and waiting
+ * for a worker. With no
+ * pending job to read (a poll that hasn't landed yet) the switch is all there is, and decides as
+ * before.
+ */
+function LastRunCell({
+  state,
+  now,
+  on,
+}: {
+  state: AutomationScheduleState;
+  now: number;
+  on: boolean;
+}) {
+  if (!state.lastRunAt) return <span className="text-subtle">never</span>;
+
+  const previous = state.lastRun;
+  const settled = previous !== undefined && previous.enqueuedAt >= state.lastRunAt;
+  const style = settled ? OUTCOME_STYLES[previous.outcome] : undefined;
+  const held = state.pendingRun !== "running" && !on;
+  const pending = held
+    ? "held · automation off"
+    : state.pendingRun === "queued"
+      ? "queued"
+      : "in progress";
+  const pendingStyle = held ? HELD_STYLE : IN_FLIGHT_STYLE;
+
+  const detail = settled
+    ? (previous.note ?? style?.label)
+    : previous
+      ? `${pending} · ${OUTCOME_STYLES[previous.outcome].label} ${formatRelativeTime(
+          new Date(previous.enqueuedAt * 1000).toISOString(),
+          now,
+        )}`
+      : pending;
+  // The failure note is an error message and can outrun the column; the tooltip keeps it, including
+  // for the older fire whose note the in-flight line has no room to spell out.
+  const title = settled ? detail : previous?.note ? `${detail} — ${previous.note}` : detail;
+
+  return (
+    <span className="flex flex-col gap-0.5">
+      <span className="flex items-center gap-1.5">
+        <span
+          className={cn("size-1.5 shrink-0 rounded-full", style?.dot ?? pendingStyle.dot)}
+          aria-hidden="true"
+        />
+        <span title={formatInstant(state.lastRunAt)}>
+          {formatRelativeTime(new Date(state.lastRunAt * 1000).toISOString(), now)}
+        </span>
+      </span>
+      {detail ? (
+        <span
+          className={cn(
+            "max-w-[15rem] truncate text-[10.5px]",
+            style?.text ?? pendingStyle.text,
+          )}
+          title={title}
+        >
+          {/* Screen readers get the outcome named, not just the note that happens to imply it. */}
+          <span className="sr-only">{style ? `${style.label} — ` : ""}</span>
+          {detail}
+        </span>
+      ) : null}
+    </span>
   );
 }
 

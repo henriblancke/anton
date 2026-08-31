@@ -70,21 +70,23 @@ function secDate(ms: number): Date {
   return new Date(Math.floor(ms / 1000) * 1000);
 }
 
-export async function enqueue(
-  db: AntonDb,
-  clock: Clock,
-  input: {
-    type: JobType;
-    projectId?: string;
-    payload?: unknown;
-    /** ms epoch; default = now (immediately due). */
-    runAt?: number;
-  },
-): Promise<string> {
-  const id = randomUUID();
-  const nowMs = clock.now();
-  await db.insert(schema.jobs).values({
-    id,
+export interface EnqueueInput {
+  type: JobType;
+  projectId?: string;
+  payload?: unknown;
+  /** ms epoch; default = now (immediately due). */
+  runAt?: number;
+}
+
+/**
+ * The insert values for a fresh `queued` job, as a value — so a caller that must write the row
+ * inside its OWN synchronous transaction can, instead of restating the row shape. The scheduler does
+ * exactly that: it stamps `schedules.lastRunAt` from this row's `createdAt` in the same transaction,
+ * which is what lets the Automation table tell a fire's own outcome from an earlier one's.
+ */
+export function newJobRow(input: EnqueueInput, nowMs: number): typeof schema.jobs.$inferInsert {
+  return {
+    id: randomUUID(),
     type: input.type,
     projectId: input.projectId,
     payloadJson: JSON.stringify(input.payload ?? {}),
@@ -93,8 +95,13 @@ export async function enqueue(
     attempts: 0,
     createdAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
-  });
-  return id;
+  };
+}
+
+export async function enqueue(db: AntonDb, clock: Clock, input: EnqueueInput): Promise<string> {
+  const row = newJobRow(input, clock.now());
+  await db.insert(schema.jobs).values(row);
+  return row.id;
 }
 
 /** The active statuses that must hold at most one execute-epic job per (project, epic). */
@@ -835,11 +842,70 @@ export async function renewLease(
     .where(eq(schema.jobs.id, jobId));
 }
 
-export async function complete(db: AntonDb, clock: Clock, jobId: string): Promise<void> {
+/**
+ * What a handler reports it actually DID (anton-znoz). A job's `status` says whether it finished;
+ * this says whether finishing meant anything — the difference between a nightly scan that filed
+ * three beads and one that found nothing, which the Automation table reads as "worked" vs "nothing
+ * to do". Handlers that report nothing settle with a NULL outcome, which is a third claim again
+ * ("ran, effect unknown") and is never dressed up as either.
+ */
+export interface JobEffect {
+  /** Did this run change anything — the board, the queue, a report row? */
+  changed: boolean;
+  /** One short line naming what it did, or why there was nothing to do. */
+  note?: string;
+}
+
+/** How a `JobEffect` is stored on the row: the two values `jobs.outcome` ever holds. */
+export type JobOutcome = "ok" | "noop";
+
+/** How a withheld no-op explains itself on the row (see `toJobOutcome`). */
+const PRIOR_ATTEMPT_NOTE = "an earlier attempt may have changed state";
+
+/**
+ * Persisted shape of an effect — kept next to `complete` so writer and reader agree.
+ *
+ * `retried` says an earlier attempt of this job ran and did not complete. The effect is
+ * attempt-local, so a no-op reported by a retry is not a claim the JOB did nothing: an attempt that
+ * performed durable work and then threw (gate-check closes gates, then fails its own assertion)
+ * leaves the retry nothing left to find. Withhold the no-op there and settle as NULL — "ran, effect
+ * unknown" — rather than report work that happened as work that didn't. A `changed` claim stands
+ * either way: this attempt changed something regardless of what came before.
+ */
+export function toJobOutcome(
+  effect: JobEffect | undefined,
+  opts?: { retried?: boolean },
+): {
+  outcome: JobOutcome | null;
+  outcomeNote: string | null;
+} {
+  if (!effect) return { outcome: null, outcomeNote: null };
+  if (!effect.changed && opts?.retried) {
+    return {
+      outcome: null,
+      outcomeNote: effect.note ? `${effect.note} — ${PRIOR_ATTEMPT_NOTE}` : PRIOR_ATTEMPT_NOTE,
+    };
+  }
+  return { outcome: effect.changed ? "ok" : "noop", outcomeNote: effect.note ?? null };
+}
+
+export async function complete(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  effect?: JobEffect,
+  opts?: { retried?: boolean },
+): Promise<void> {
   const nowMs = clock.now();
   await db
     .update(schema.jobs)
-    .set({ status: "done", leaseExpiresAt: null, lastError: null, updatedAt: secDate(nowMs) })
+    .set({
+      status: "done",
+      leaseExpiresAt: null,
+      lastError: null,
+      ...toJobOutcome(effect, opts),
+      updatedAt: secDate(nowMs),
+    })
     .where(and(eq(schema.jobs.id, jobId), eq(schema.jobs.status, "running")));
 }
 
@@ -922,6 +988,38 @@ export async function reschedule(
 }
 
 /**
+ * Marker `deferQueuedJobs` stamps on the rows the budget governor holds. On its own it is a pacing
+ * note — not evidence of an attempt (see `hasPriorAttempt`).
+ */
+export const BUDGET_DEFER_PREFIX = "budget: ";
+
+/**
+ * Separator carrying a row's pre-existing `lastError` through a governor deferral. A governed row is
+ * not always virgin: a refunded attempt (quota, lease-held, not-wired) rewinds `attempts` and leaves
+ * its error as the ONLY trace that the job already ran. Overwriting that with a bare pacing note
+ * would publish the next attempt's "nothing to do" as the whole job's no-op even though the refunded
+ * attempt did durable work, so the marker carries the prior error instead of replacing it.
+ */
+export const BUDGET_DEFER_PRIOR_SEP = " | prior: ";
+
+/**
+ * The attempt evidence a row's `lastError` holds, as SQL: the text carried after the separator when
+ * it is already a governor marker, the whole error when it is not a marker at all, and null when the
+ * row holds nothing but a pacing note. Shared by defer (which re-carries it) and resume (which
+ * restores it), so a marker never accumulates and never swallows the evidence underneath it.
+ */
+function priorErrorSql(): SQL {
+  const col = schema.jobs.lastError;
+  const sep = BUDGET_DEFER_PRIOR_SEP;
+  return sql`case
+    when ${col} is null then null
+    when instr(${col}, ${sep}) > 0 then substr(${col}, instr(${col}, ${sep}) + ${sep.length})
+    when ${col} like ${`${BUDGET_DEFER_PREFIX}%`} then null
+    else ${col}
+  end`;
+}
+
+/**
  * Budget-defer (anton-szld): push the `queued` jobs of `types` for a project out to `retryAtMs`, so
  * the proactive budget governor backs autonomous work off past the reset/night boundary instead of
  * only catching a `UsageLimitError` after hitting the wall. Mirrors a quota backoff's reschedule but
@@ -934,6 +1032,11 @@ export async function reschedule(
  * different boundaries: `"exclude"` matches only the paced rows (flag unset), `"only"` matches only
  * the immediate ones (flag set). Absent → no payload filter (defer every matching row). SQLite maps
  * a JSON `true` to the integer 1 via `json_extract`, so an absent/`false` flag is `IS NOT 1`.
+ *
+ * The pacing note never destroys attempt evidence: any non-marker `lastError` already on the row is
+ * appended to it via {@link BUDGET_DEFER_PRIOR_SEP} rather than overwritten. Omitting `lastError`
+ * does NOT clear the column — it writes the same prior-attempt evidence back (an unmarked deferral),
+ * because erasing a refunded attempt's only trace is never what a caller that stays silent wants.
  */
 export async function deferQueuedJobs(
   db: AntonDb,
@@ -956,9 +1059,13 @@ export async function deferQueuedJobs(
       : opts.bypass === "exclude"
         ? sql`${bypassExtract} is not 1`
         : undefined;
+  const prior = priorErrorSql();
+  const lastError = opts.lastError
+    ? sql`${opts.lastError} || coalesce(${BUDGET_DEFER_PRIOR_SEP} || (${prior}), '')`
+    : prior; // no marker supplied → strip any prior marker, keep the attempt evidence under it
   const rows = await db
     .update(schema.jobs)
-    .set({ runAt: retryDate, lastError: opts.lastError ?? null, updatedAt: secDate(nowMs) })
+    .set({ runAt: retryDate, lastError, updatedAt: secDate(nowMs) })
     .where(
       and(
         eq(schema.jobs.status, "queued"),
@@ -980,7 +1087,8 @@ export async function deferQueuedJobs(
  * only scans due rows, so disabling pacing wouldn't actually resume them. Pull the governor's own
  * deferrals back to due-now. Scoped by the `budget: ` lastError marker `deferQueuedJobs` writes:
  * quota backoffs and retry reschedules carry different lastError text and are left where they are.
- * Returns how many rows it resumed.
+ * Clearing the marker restores whatever prior error it was carrying, so undoing a hold cannot erase
+ * a refunded attempt's evidence either. Returns how many rows it resumed.
  */
 export async function resumeBudgetDeferredJobs(
   db: AntonDb,
@@ -991,7 +1099,7 @@ export async function resumeBudgetDeferredJobs(
   const nowDate = secDate(clock.now());
   const rows = await db
     .update(schema.jobs)
-    .set({ runAt: nowDate, lastError: null, updatedAt: nowDate })
+    .set({ runAt: nowDate, lastError: priorErrorSql(), updatedAt: nowDate })
     .where(
       and(
         eq(schema.jobs.status, "queued"),
@@ -1000,7 +1108,7 @@ export async function resumeBudgetDeferredJobs(
           ? isNull(schema.jobs.projectId)
           : eq(schema.jobs.projectId, opts.projectId),
         gt(schema.jobs.runAt, nowDate),
-        like(schema.jobs.lastError, "budget: %"),
+        like(schema.jobs.lastError, `${BUDGET_DEFER_PREFIX}%`),
       ),
     )
     .returning({ id: schema.jobs.id });
