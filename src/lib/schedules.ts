@@ -138,7 +138,7 @@ export async function updateSchedule(
   if (patch.cron !== undefined && !isValidCron(patch.cron)) {
     throw new Error(`invalid cron expression: "${patch.cron}"`);
   }
-  db.transaction((tx) => {
+  return db.transaction((tx) => {
     const current = tx
       .select()
       .from(schema.schedules)
