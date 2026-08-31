@@ -17,6 +17,20 @@ export const REVIEW_MIN_SCORE_MAX = 10;
 export const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
 export const REVIEW_LOW_SCORE_ROUNDS_MIN = 1;
 export const REVIEW_LOW_SCORE_ROUNDS_MAX = 5;
+// Autopilot brakes (anton-nmy7). 0 is the OFF switch on three of the four — a limit, a streak or a
+// floor of zero can never be reached — which is why those ranges start at 0 rather than 1.
+export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
+export const AUTOPILOT_WIP_LIMIT_MIN = 0;
+export const AUTOPILOT_WIP_LIMIT_MAX = 20;
+export const DEFAULT_AUTOPILOT_FAILURE_STREAK = 3;
+export const AUTOPILOT_FAILURE_STREAK_MIN = 0;
+export const AUTOPILOT_FAILURE_STREAK_MAX = 10;
+export const DEFAULT_AUTOPILOT_SCORE_FLOOR = 7;
+export const AUTOPILOT_SCORE_FLOOR_MIN = 0;
+export const AUTOPILOT_SCORE_FLOOR_MAX = 10;
+export const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
+export const AUTOPILOT_SCORE_WINDOW_MIN = 1;
+export const AUTOPILOT_SCORE_WINDOW_MAX = 10;
 // Mirror DEFAULT_PROJECT_BUDGET_POLICY (src/lib/projects.ts) for the two operator-facing knobs.
 export const DEFAULT_DAYTIME_RESERVE_PCT = 15;
 export const DEFAULT_WEEKLY_TARGET_PCT = 90;

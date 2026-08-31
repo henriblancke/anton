@@ -12,7 +12,7 @@
  * actual handleDragEnd + poll interaction, not a reimplementation.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { DragEndEvent } from "@dnd-kit/core";
 
 import { STAGES, type Board, type Epic, type Stage } from "@/lib/types";
@@ -181,5 +181,68 @@ describe("EpicBoard drag-move (anton-4g35)", () => {
     // The poll advanced its token off the move response — it asked for the post-move version.
     const pollUrls = fetchMock.mock.calls.map((c) => String(c[0])).filter((u) => u.includes("/board?version="));
     expect(pollUrls.some((u) => u.includes("version=2"))).toBe(true);
+  });
+});
+
+describe("EpicBoard autopilot breaker (anton-5c8h)", () => {
+  /** The band the board must be able to draw and retire on its own: the WIP hold, at its limit. */
+  const hold = {
+    kind: "hold" as const,
+    reason: "wip-limit" as const,
+    detail: "4 of 4 PRs are waiting on review.",
+  };
+
+  /** Answer the breaker endpoint with `breaker`; 304 everything else (the board poll). */
+  function stubBreaker(next: () => Response) {
+    const fetchMock = vi.fn(async (url: string) =>
+      url.includes("/autopilot/breaker") ? next() : new Response(null, { status: 304 }),
+    );
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+    return fetchMock;
+  }
+
+  const breakerJson = (breaker: unknown) =>
+    new Response(JSON.stringify({ breaker }), { status: 200 });
+
+  it("retires the hold band when the PR that released it merges, with no reload", async () => {
+    // The release happens on GitHub: a merge changes nothing on an open board, so the band can only
+    // clear if the board re-reads the breaker for itself.
+    let current: unknown = hold;
+    stubBreaker(() => breakerJson(current));
+
+    render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
+
+    // Returning to the tab re-reads immediately — the poll's own cadence is a minute.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(screen.getByText("Autopilot is holding")).toBeTruthy());
+
+    current = null;
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(screen.queryByText("Autopilot is holding")).toBeNull());
+  });
+
+  it("keeps the band up when the breaker read fails", async () => {
+    // Answering a transient failure with "nothing is stopped" would tell the operator anton is
+    // running while it is frozen — the one error this band must not make.
+    let fail = false;
+    const fetchMock = stubBreaker(() =>
+      fail ? new Response("boom", { status: 500 }) : breakerJson(hold),
+    );
+
+    render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(screen.getByText("Autopilot is holding")).toBeTruthy());
+
+    fail = true;
+    const readsBefore = fetchMock.mock.calls.filter((c) =>
+      String(c[0]).includes("/autopilot/breaker"),
+    ).length;
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter((c) => String(c[0]).includes("/autopilot/breaker")).length,
+      ).toBeGreaterThan(readsBefore),
+    );
+    expect(screen.getByText("Autopilot is holding")).toBeTruthy();
   });
 });

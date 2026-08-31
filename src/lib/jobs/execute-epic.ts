@@ -352,12 +352,25 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         id: runId,
         projectId,
         epicBeadId,
+        jobId: ctx.jobId,
         branch,
         model: settings.model,
         status: "running",
       });
     } else {
-      await updateRun(db, clock, runId, { status: "running", error: null });
+      // The score goes with the attempt that earned it (anton-cekf). A resume REUSES the parked row,
+      // so leaving it would let a resumed attempt that never reaches review settle carrying the
+      // previous attempt's number — and the score breaker, which reads one score per row, would
+      // judge this attempt on a review it never had and could re-latch the disarm a human just
+      // cleared. Cleared here, and rewritten by the gate the moment this attempt is reviewed.
+      // `jobId` moves with the attempt (anton-rgso): a resume is a NEW job over the same row, and a
+      // cancel the operator raises from here names that job, not the one that first parked.
+      await updateRun(db, clock, runId, {
+        status: "running",
+        jobId: ctx.jobId,
+        error: null,
+        reviewScore: null,
+      });
     }
 
     // Cross-machine run-liveness lease (anton-jz1). `leaseLabels` tracks the run-lease labels this
@@ -1418,7 +1431,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // are written here or lost with the attempt — for a poison park (a round-3 death still
             // owes the founder rounds 1 and 2) and equally for a retryable one, where the run is
             // rescheduled and the resumed gate restarts from round 1 with nothing on the board.
-            await persistPartialReviewScores(repo, epicBeadId, gateRounds);
+            // The score goes on the RUN too, not only the board (anton-cekf): the label is the
+            // target's latest across every attempt, so a later rerun would otherwise inherit this
+            // one's number and let the breaker judge that run on a review it never had.
+            const partialScore = await persistPartialReviewScores(repo, epicBeadId, gateRounds);
+            if (partialScore !== undefined) {
+              await updateRun(db, clock, runId, { reviewScore: partialScore });
+            }
             // EVERY gate failure leaves the run without a PR of its own, so every one of them carries
             // the orphan hazard: a PR a previous attempt opened but never recorded (lost `gh` response
             // or lost setPrRef) stays READY and mergeable with un-reviewed work whether the gate
@@ -1460,7 +1479,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // The score history belongs to the board, not this run's logs — written on both exits the gate
           // RETURNS from, since a run parked on blocking findings is exactly the one whose score the
           // founder needs. The throwing exit is covered by the catch above.
-          await persistReviewScores(repo, epicBeadId, review);
+          const reviewScore = await persistReviewScores(repo, epicBeadId, review);
+          // ...and on the run row, which is what the score-regression breaker reads: one score per
+          // ATTEMPT, so a rerun that settles unreviewed reads as a gap rather than as its target's
+          // older score (see picker-score-breaker.ts).
+          if (reviewScore !== undefined) {
+            await updateRun(db, clock, runId, { reviewScore });
+          }
 
           const blocking = blockingFindings(review.unresolved);
           // Three states must not become a PR: blocking findings the converge loop couldn't clear, a

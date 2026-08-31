@@ -118,6 +118,25 @@ async function seedProject(slug: string) {
     cron: "0 3 * * *",
   });
 
+  // The disarm history, latched and lifted. Both rows reference the project, so leaving them
+  // behind fails the project DELETE on the foreign key and rolls the whole teardown back.
+  await db.insert(schema.autopilotDisarms).values({
+    id: randomUUID(),
+    projectId,
+    reason: "score-regression",
+    detail: "The rolling review score fell below the floor of 7.",
+    evidenceJson: JSON.stringify(["anton-a · 5.5"]),
+    rearmedAt: nowSec,
+    rearmedBy: "anton-test",
+  });
+  await db.insert(schema.autopilotDisarms).values({
+    id: randomUUID(),
+    projectId,
+    reason: "consecutive-failures",
+    detail: "3 runs in a row ended without delivering.",
+    evidenceJson: JSON.stringify(["r-1 · anton-a · failed"]),
+  });
+
   const logPath = join(workDir, `${slug}-session.log`);
   writeFileSync(logPath, "session output\n");
   await db.insert(schema.sessions).values({
@@ -145,6 +164,12 @@ async function projectRowCounts(projectId: string) {
     sessions: (
       await db.select().from(schema.sessions).where(eq(schema.sessions.projectId, projectId))
     ).length,
+    autopilotDisarms: (
+      await db
+        .select()
+        .from(schema.autopilotDisarms)
+        .where(eq(schema.autopilotDisarms.projectId, projectId))
+    ).length,
   };
 }
 
@@ -166,6 +191,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       jobs: 0,
       schedules: 0,
       sessions: 0,
+      autopilotDisarms: 0,
     });
 
     // Worktree dir + branch removed; session log deleted.
@@ -204,6 +230,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       jobs: 2,
       schedules: 1,
       sessions: 1,
+      autopilotDisarms: 2,
     });
   });
 });
