@@ -44,6 +44,9 @@ export interface ScanSignal {
   /** Repo-relative path the finding is about; absent for a signal that isn't about one file. */
   FilePath?: string | null;
   filePath?: string | null;
+  /** 1-based line the finding starts at; 0 when the collector is about the file as a whole. */
+  Line?: number | null;
+  line?: number | null;
   Kind?: string | null;
   kind?: string | null;
   /** The one-line finding, as stringer phrases it — some collectors put the whole claim in it. */
