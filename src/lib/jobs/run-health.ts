@@ -25,7 +25,7 @@ import {
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { parkedAskGateId, poisonBlockerIds, PoisonError } from "./errors";
+import { parkedAskGateIds, poisonBlockerIds, PoisonError } from "./errors";
 import { beadBlockedByGate, runTargetAbove } from "./gate-targets";
 import {
   activeExecuteEpicKeys,
@@ -365,8 +365,14 @@ export function detectOpenHumanGates(
  *
  * A blocked park is suppressed only when EVERY blocker it names is one of those gates — a job also
  * held back by an ordinary prerequisite outlives the gate being answered, and nothing else would
- * surface it. An armed ask names exactly one gate, its own, and the holds beside it (which keep the
- * target blocked too) are each reported as their own open gate.
+ * surface it.
+ *
+ * An armed ask names its own gate AND the holds a person hung on the same target, and it is
+ * suppressed while ANY of them is open (PR #205 review). Answering anton's gate does not release a
+ * target a manual gate still blocks, so keying on the armed gate alone would flip the still-waiting
+ * job to "permanent failure" — with an Abandon on it — the moment anton's half is resolved first.
+ * Once every named gate is closed the park is a genuine stall again (nothing resumed the job), and
+ * this reports it.
  */
 export function withoutGateBlockedJobs(findings: RunHealthFinding[]): RunHealthFinding[] {
   const openGateIds = new Set(
@@ -375,8 +381,8 @@ export function withoutGateBlockedJobs(findings: RunHealthFinding[]): RunHealthF
   if (openGateIds.size === 0) return findings;
   return findings.filter((finding) => {
     if (finding.kind !== "exhausted-job") return true;
-    const parkedOn = parkedAskGateId(finding.reason);
-    if (parkedOn !== undefined) return !openGateIds.has(parkedOn);
+    const parkedOn = parkedAskGateIds(finding.reason);
+    if (parkedOn !== undefined) return !parkedOn.some((id) => openGateIds.has(id));
     const blockers = poisonBlockerIds(finding.reason);
     return !blockers?.every((id) => openGateIds.has(id));
   });

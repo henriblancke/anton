@@ -25,7 +25,7 @@
  * Drives the REAL handler + runner + bd/git with fake `claude`/`gh`. Skipped without bd + git.
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads, gateReason, type Gate } from "../beads/bd";
@@ -344,6 +344,66 @@ process.exit(0);`),
       expect(run.error).not.toMatch(/AGENT_WORK|step:verify/);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("arms the gate when a LATER step asks after an earlier one reported blocked", async () => {
+    // A ticket phase may dispatch more than one agent, and the phase keeps the most severe report
+    // any of them made (PR #205 review). An ask outranks a block: it names the exact move a person
+    // owes, while sticking on the block would drop it silently and settle the run behind no gate at
+    // all — the operator getting "self-reported blocked" instead of the question they can answer.
+    const ask = "someone has to approve the MARKER_VENDOR contract before this can be wired up";
+    const feature = await approvedFeature("Blocked, then asking");
+    const formulaPath = join(repo, ".beads", "formulas", "anton-run.formula.toml");
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    writeFileSync(
+      formulaPath,
+      `formula = "anton-run"\ntype = "workflow"\nversion = 1\n\n` +
+        `[[steps]]\nid = "implement"\ntype = "task"\ntitle = "implement"\nlabels = ["step:implement"]\n\n` +
+        `[[steps]]\nid = "polish"\ntype = "task"\ntitle = "polish"\nneeds = ["implement"]\n` +
+        `labels = ["step:claude", "prompt:nextjs"]\n\n` +
+        `[[steps]]\nid = "commit"\ntype = "task"\ntitle = "commit"\nneeds = ["polish"]\nlabels = ["step:commit"]\n\n` +
+        `[[steps]]\nid = "pr"\ntype = "task"\ntitle = "pr"\nneeds = ["commit"]\nlabels = ["step:pr"]\n`,
+      "utf8",
+    );
+
+    // The implementer commits partial work and reports `blocked`; the polish step after it asks.
+    const claude = writeBin(
+      binDir,
+      "claude-blocked-then-ask",
+      fakeClaudeReadingStdin(`const implementing=prompt.includes('Implement this beads ticket');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'partial '+Date.now()+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+const text=implementing
+  ? 'ANTON-RESULT: blocked — the acceptance criteria contradict the existing API'
+  : 'ANTON-RESULT: needs-human — '+${JSON.stringify(ask)};
+e({type:'system',subtype:'init',session_id:'ba'});
+e({type:'assistant',message:{content:[{type:'text',text}]}});
+e({type:'result',subtype:'success',result:text,session_id:'ba',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = claude;
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: feature.id });
+
+      // The ASK reached the board — one open human gate carrying it verbatim.
+      const gates = await gatesBlocking(feature.id);
+      expect(gates).toHaveLength(1);
+      expect(gates[0].await_type).toBe("human");
+      expect(gateReason(gates[0])).toBe(`${feature.ticket} needs a human: ${ask}`);
+
+      // …and the run is parked behind it, not failed on the earlier block.
+      const run = await runFor(feature.id);
+      expect(run.status).toBe("parked");
+      expect(run.error).toContain(ask);
+      expect(run.error).not.toMatch(/self-reported blocked/i);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      rmSync(formulaPath, { force: true });
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });

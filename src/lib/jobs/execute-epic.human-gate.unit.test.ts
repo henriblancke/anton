@@ -26,7 +26,7 @@
  */
 import { beforeEach, expect, it, vi } from "vitest";
 import type { Bead, Gate } from "../beads/bd";
-import { parkedAskGateId } from "./errors";
+import { parkedAskGateId, parkedAskGateIds } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
 const gateCreateMock = vi.fn();
@@ -599,6 +599,26 @@ it("parks the run behind the gate and throws the ask while the run is still live
   // …and the checkout belongs to the resume, not to the reaper: whoever answers the ask comes back
   // to this very run (PR #205 review).
   expect(awaitsHumanGate).toBe(true);
+});
+
+it("names the person's hold in the JOB park too, not only in the run's", async () => {
+  // Anton's gate can be answered first while the hold still blocks the target, so the run does not
+  // resume (PR #205 review). A park naming only the armed gate would read to the run-health sweep as
+  // a permanent failure from that moment — with an Abandon offered on a run that is merely waiting.
+  const row = recorder();
+  const { thrown } = await settleArmedAsk({
+    targetId: "f-1",
+    ask: ASK_ERROR(),
+    raw: ASK_ERROR(),
+    gate: { gateId: "g-new", held: ["g-hold"], undo: async () => true },
+    signal: new AbortController().signal,
+    now: () => 1,
+    settle: row.settle,
+  });
+
+  expect(parkedAskGateIds((thrown as Error).message)).toEqual(["g-new", "g-hold"]);
+  // The run row still says what the operator does about the hold.
+  expect(String(row.patches[0].error)).toContain("g-hold");
 });
 
 it("takes the arm back when the kill lands INSIDE the park write, and fails the row", async () => {

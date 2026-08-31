@@ -577,12 +577,12 @@ describe("withoutGateBlockedJobs", () => {
   });
 
   /** The park a run takes when it ARMED a human gate for its own ask (anton-287p). */
-  function armedAskPark(gateId: string): JobRow {
+  function armedAskPark(gateId: string, held: string[] = []): JobRow {
     return job("j-1", {
       attempts: 1,
       lastError:
         `${POISON_PARK_PREFIX} t-1 needs a human: the staging DB password has to be rotated. ` +
-        parkedOnGateClause(gateId),
+        parkedOnGateClause(gateId, held),
     });
   }
 
@@ -596,6 +596,27 @@ describe("withoutGateBlockedJobs", () => {
 
   it("keeps an armed-ask park whose gate is no longer open — the run is stuck with nothing to answer", () => {
     const findings = [...detectExhaustedJobs([armedAskPark("g-2")], 3, NOW), gateWait("g-1")];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
+      "exhausted-job",
+      "needs-human",
+    ]);
+  });
+
+  it("drops an armed ask whose own gate was answered while a manual hold still blocks the target", () => {
+    // Resolving anton's gate first doesn't resume the run — the person's own gate still blocks the
+    // target — so the park is still that wait, not a permanent failure (PR #205 review).
+    const findings = [
+      ...detectExhaustedJobs([armedAskPark("g-1", ["g-2"])], 3, NOW),
+      gateWait("g-2"),
+    ];
+    expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual(["needs-human"]);
+  });
+
+  it("reports an armed ask once EVERY gate it names is answered — nothing else surfaces it", () => {
+    const findings = [
+      ...detectExhaustedJobs([armedAskPark("g-1", ["g-2"])], 3, NOW),
+      gateWait("g-9"),
+    ];
     expect(withoutGateBlockedJobs(findings).map((f) => f.kind)).toEqual([
       "exhausted-job",
       "needs-human",

@@ -104,13 +104,24 @@ export function poisonBlockerIds(parkMessage: string): string[] | undefined {
 /** How a needs-human park names the gate holding the run — and how it is read back. */
 const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/;
 
+/** How that park names the OTHER open human gates on the target, when there are any. */
+const PARKED_ALSO_HELD = /it is also held by human gate\(s\) ([^.]+)\./;
+
 /**
  * The clause a run's poison park uses to name the human gate it is waiting behind. Lives beside its
  * parser for the same reason {@link blockedByPoison} does: that sentence is the ONLY durable record
  * of WHICH gate a parked ask reached, and reworded in two places the two would drift silently.
+ *
+ * `held` — the open human gates on the target that anton did NOT arm — is named too, because
+ * answering anton's gate alone does not release the run (PR #205 review): the target stays blocked
+ * behind the person's own hold, and a park naming only the gate that just closed reads to the
+ * run-health sweep as a permanent failure the moment it is answered.
  */
-export function parkedOnGateClause(gateId: string): string {
-  return `The run is parked on human gate ${gateId} until someone answers it.`;
+export function parkedOnGateClause(gateId: string, held: string[] = []): string {
+  const base = `The run is parked on human gate ${gateId} until someone answers it.`;
+  return held.length > 0
+    ? `${base} Even then it is also held by human gate(s) ${held.join(", ")}.`
+    : base;
 }
 
 /**
@@ -124,6 +135,25 @@ export function parkedOnGateClause(gateId: string): string {
  */
 export function parkedAskGateId(parkMessage: string): string | undefined {
   return PARKED_ON_GATE.exec(parkMessage)?.[1];
+}
+
+/**
+ * EVERY human gate a needs-human park names — the one it armed, then the holds that keep the target
+ * blocked after that one is answered — or undefined when the message is some other poison.
+ *
+ * The list is what the sweep needs, not just the armed gate: while ANY of them is open the job is
+ * still one wait with the gate that reports it, and suppressing on the armed gate alone would
+ * re-raise the park as a permanent failure the moment anton's own gate is resolved ahead of the
+ * person's hold.
+ */
+export function parkedAskGateIds(parkMessage: string): string[] | undefined {
+  const armed = parkedAskGateId(parkMessage);
+  if (armed === undefined) return undefined;
+  const held = (PARKED_ALSO_HELD.exec(parkMessage)?.[1] ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return [armed, ...held];
 }
 
 /**

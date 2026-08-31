@@ -10,6 +10,7 @@ import {
   blockedTailReason,
   isForeignRunOwner,
   parkedAskGateId,
+  parkedAskGateIds,
   poisonBlockerIds,
   PoisonEpic,
   RunAlreadyLiveError,
@@ -286,6 +287,24 @@ describe("ParkedAskError — the park a run takes behind its own armed gate (ant
 
   it("reads nothing back out of a park that names no gate", () => {
     expect(parkedAskGateId(new NeedsHumanError("t-1", "an ask").message)).toBeUndefined();
+    expect(parkedAskGateIds(new NeedsHumanError("t-1", "an ask").message)).toBeUndefined();
+  });
+
+  it("names the holds that outlive the ask, so answering anton's gate alone isn't read as failure", () => {
+    // A person's own hold keeps the target blocked after this ask is answered (PR #205 review). The
+    // sweep suppresses the park while ANY named gate is open, so the ids have to be IN the message.
+    const held = new ParkedAskError(
+      new NeedsHumanError("t-1", "rotate the staging password"),
+      "g-7",
+      ["g-8", "g-9"],
+    );
+    expect(parkedAskGateIds(held.message)).toEqual(["g-7", "g-8", "g-9"]);
+    expect(parkedAskGateId(held.message)).toBe("g-7");
+    expect(held.message).toContain("g-8, g-9");
+  });
+
+  it("reads back just the armed gate when nothing else holds the target", () => {
+    expect(parkedAskGateIds(parked.message)).toEqual(["g-7"]);
   });
 });
 

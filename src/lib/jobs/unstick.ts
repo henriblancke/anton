@@ -52,7 +52,7 @@ import {
   toEscalationView,
   type EscalationRow,
 } from "../escalations";
-import { parkedAskGateId, poisonBlockerIds, PoisonError } from "./errors";
+import { parkedAskGateId, parkedAskGateIds, poisonBlockerIds, PoisonError } from "./errors";
 import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
@@ -979,10 +979,11 @@ async function settleGateBlockedJobWaits(
   const humanGateIds = await readHumanGateIds(repoPath);
   if (!humanGateIds) return settled;
   for (const wait of waits) {
-    // An armed ask names exactly one gate, its own; a blocked park names every bead that held the
-    // run, and only a set that is ALL human gates is the gate's wait wearing a second face.
-    const parkedOn = parkedAskGateId(wait.reason);
-    const blockers = parkedOn !== undefined ? [parkedOn] : poisonBlockerIds(wait.reason);
+    // An armed ask names the gate it armed plus the holds that outlive it; a blocked park names
+    // every bead that held the run, and only a set that is ALL human gates is the gate's wait
+    // wearing a second face.
+    const parkedOn = parkedAskGateIds(wait.reason);
+    const blockers = parkedOn ?? poisonBlockerIds(wait.reason);
     if (!blockers?.every((id) => humanGateIds.has(id))) continue;
     if (!(await settleEscalation(db, clock, wait.id, "dismissed"))) continue;
     settled.add(wait.id);

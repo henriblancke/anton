@@ -31,7 +31,7 @@ import { contractGaps, formatContractGaps } from "../beads/contract";
 import { computeEpicGraph, epicStandaloneBlockers, isUnit, standaloneBlockers } from "../epic-graph";
 import { contractGatedBeads, resumeSkipped, runTickets } from "../ticket-view";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
-import { formatAntonResult, type AntonResult } from "../claude/anton-result";
+import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import {
   lookupOpenPullRequest,
   markPullRequestDraft,
@@ -2194,13 +2194,16 @@ async function runTicket(args: {
         },
       });
       // A `blocked` or `needs-human` self-report is STICKY across a phase with several dispatching
-      // steps. A later agent — a `step:claude` the project added after `implement` — reports on its
-      // own work only, so letting its `delivered` overwrite an earlier block would close a ticket
-      // the implementer declared incomplete on the partial changes it left behind, and would drop
-      // an ask no later step ever saw. A missing/unparseable line (null) keeps whatever the phase
-      // reported before it, as it always has.
-      if (selfReport?.outcome === "delivered" || !selfReport) {
-        selfReport = result.facts?.selfReport ?? selfReport;
+      // steps, by SEVERITY (see {@link selfReportRank}). A later agent — a `step:claude` the project
+      // added after `implement` — reports on its own work only, so letting its `delivered` overwrite
+      // an earlier block would close a ticket the implementer declared incomplete on the partial
+      // changes it left behind. An ask still outranks an earlier block, because it names the exact
+      // move a person owes; sticking on the block instead would drop it silently and settle the run
+      // behind no gate at all (PR #205 review). A missing/unparseable line (null) keeps whatever the
+      // phase reported before it, as it always has.
+      const reported = result.facts?.selfReport;
+      if (reported && selfReportRank(reported.outcome) >= selfReportRank(selfReport?.outcome)) {
+        selfReport = reported;
       }
 
       // The agent asked for a HUMAN (anton-287p): the next step belongs to a person — a credential,
@@ -3078,7 +3081,7 @@ export async function settleArmedAsk(args: {
   // whose park message carries no gate id reads to the run-health sweep as a permanent failure, and
   // the wait gets escalated twice (PR #205 review). Replaced below on either path that unseats the
   // park — a cancelled unwind, or a row that could not be settled.
-  let thrown: unknown = new ParkedAskError(ask, gate.gateId);
+  let thrown: unknown = new ParkedAskError(ask, gate.gateId, gate.held);
   const parkFailure = await settle({
     status: "parked",
     error: needsHumanParkMessage(ask, gate.gateId, gate.held),
@@ -3552,12 +3555,21 @@ export class NeedsHumanError extends Error {
  * gets a second escalation calling a wait on them a permanent failure.
  */
 export class ParkedAskError extends NeedsHumanError {
-  constructor(ask: NeedsHumanError, readonly gateId: string) {
+  constructor(
+    ask: NeedsHumanError,
+    readonly gateId: string,
+    /**
+     * The target's OTHER open human gates, named in the park for the same reason (PR #205 review):
+     * they outlive this ask, so a sweep that knew only {@link gateId} would call the still-waiting
+     * job a permanent failure as soon as anton's own gate is answered.
+     */
+    readonly held: string[] = [],
+  ) {
     super(
       ask.ticketId,
       ask.ask,
       `${ask.ticketId} needs a human: ${ask.ask ?? "(the agent named no ask)"}. ` +
-        parkedOnGateClause(gateId),
+        parkedOnGateClause(gateId, held),
     );
   }
 }
@@ -3921,6 +3933,26 @@ export function stalePrBodyRunError(targetId: string, note: string): string {
     `FAILED (a locked or unavailable beads DB) — nothing else holds them, so they are reproduced ` +
     `here in full; put them back on the bead by hand:\n\n${note}`
   );
+}
+
+/**
+ * How much a self-report OUTRANKS the one a phase already carries. A phase of several dispatching
+ * steps keeps the most severe report any of them made, and severity is how actionable it is: an ask
+ * names the one move a person owes, a block names a defect to diagnose, and `delivered` is a claim
+ * a later step cannot make on an earlier step's behalf. An absent report (null) ranks below all
+ * three, so the first step to say anything sets the phase's report.
+ */
+function selfReportRank(outcome: AntonOutcome | undefined): number {
+  switch (outcome) {
+    case "needs-human":
+      return 2;
+    case "blocked":
+      return 1;
+    case "delivered":
+      return 0;
+    default:
+      return -1;
+  }
 }
 
 /** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
