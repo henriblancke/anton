@@ -1356,6 +1356,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/py/doc.py");
     });
 
+    // A brace a string inside the interpolation holds is a character rather than a delimiter:
+    // `f"""{ {'}}': Widget()} }"""` closes on the brace its punctuation matches. Counting the quoted
+    // one ends the expression early, which blanks the call behind it and reports a live symbol dead
+    // — while the literal text past the brace that really closes it is still prose.
+    it("reads a brace quoted inside an f-string expression as text, not as the end of it", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/quoted.py": 'def render():\n    return f"""{ {\'}}\': Widget()} }"""\n',
+        "src/py/wrapped.py": "def page():\n    return f\"\"\"{ '''\n    }\n    ''' + Widget()}\"\"\"\n",
+        "src/py/doc.py": 'def note():\n    return f"""{ {\'}\': 1} }\n    Widget was removed\n    """\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/quoted.py");
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/wrapped.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/doc.py");
+    });
+
     // A name written in prose is being described, not called. Without this the module that documents
     // a symbol keeps it alive forever, and the filter goes blind to the symbols it exists to check.
     it("does not count a name in a comment or a doc as a reference", async () => {
@@ -2454,6 +2478,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
       expect(result.deadcode.dropped[0].reason).toContain("src/ui/registry.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+    });
+
+    // A tag names a binding, and a binding may open with the `_` or `$` a JavaScript identifier
+    // does: `<_Panel>` renders the symbol under it exactly as `<Panel>` would. Reading only a
+    // letter as the start of a name leaves that tag unopened, which hands the sentence behind it
+    // back as program and lets a paragraph naming a removed component prove its own caller.
+    it("reads JSX text inside a tag named with an underscore or a dollar as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx": "export const Panel = () => <_Panel>Widget was removed</_Panel>;\n",
+        "src/ui/notice.tsx": "export const Notice = () => <$Note>Widget was removed</$Note>;\n",
+        "src/ui/live.tsx": "export const Live = () => <_Panel>{Widget()}</_Panel>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
     });

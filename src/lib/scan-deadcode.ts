@@ -379,10 +379,34 @@ function closeBlock(
   return { at: line.length, closed: false };
 }
 
-/** An interpolated literal open across lines: what closes it, and how deep braces are stacked. */
+/**
+ * An interpolated literal open across lines: what closes it, how deep braces are stacked, and the
+ * quote of a string still open inside the interpolation.
+ */
 interface OpenFString {
   closer: string;
   depth: number;
+  quote?: string;
+}
+
+/** The quotes Python writes a string with inside an interpolation. */
+const PY_QUOTE = /["']/;
+
+/**
+ * Where the string opened by `quote` ends, and whether it ended on this line. A backslash escapes
+ * the character behind it, so `'\''` runs past its own quote rather than closing on it.
+ */
+function closePyString(line: string, from: number, quote: string): { at: number; closed: boolean } {
+  let at = from;
+  while (at < line.length) {
+    if (line[at] === "\\") {
+      at += 2;
+      continue;
+    }
+    if (line.startsWith(quote, at)) return { at: at + quote.length, closed: true };
+    at += 1;
+  }
+  return { at: line.length, closed: false };
 }
 
 /**
@@ -390,6 +414,11 @@ interface OpenFString {
  * interpolation is a program, not prose: `f"""{Widget()}"""` calls the symbol, so only the text
  * around each `{…}` is blanked. `{{` and `}}` escape a brace rather than opening or closing one,
  * and a brace still open at the end of the line carries its depth onto the next.
+ *
+ * A brace inside a string the interpolation holds is a character rather than a delimiter:
+ * `f"""{ {'}}': Widget()} }"""` closes on the brace its punctuation matches, and counting the
+ * quoted one ends the expression early — which blanks the call behind it and reports a live symbol
+ * dead. Only a triple-quoted string carries onto the next line; a single-quoted one ends with it.
  */
 function scanFString(
   line: string,
@@ -405,6 +434,20 @@ function scanFString(
   let at = from;
   while (at < line.length) {
     if (open.depth > 0) {
+      if (open.quote !== undefined) {
+        const quoted = closePyString(line, at, open.quote);
+        at = quoted.at;
+        if (quoted.closed) open.quote = undefined;
+        continue;
+      }
+      if (PY_QUOTE.test(line[at])) {
+        const triple = line[at].repeat(3);
+        const quote = line.startsWith(triple, at) ? triple : line[at];
+        const quoted = closePyString(line, at + quote.length, quote);
+        at = quoted.at;
+        if (!quoted.closed && quote.length === 3) open.quote = quote;
+        continue;
+      }
       if (line[at] === "{") open.depth += 1;
       else if (line[at] === "}") {
         open.depth -= 1;
@@ -1305,13 +1348,21 @@ const JSX_FILE = /\.[jt]sx$/i;
 const JSX_ATTRS = String.raw`(?:"[^"]*"|'[^']*'|[^<>"'])*`;
 
 /**
+ * A tag's name, spelled the way a JSX binding is: `<_Panel>` and `<$Panel>` resolve to a symbol
+ * exactly as `<Panel>` does. Reading only a letter as the start leaves their tag unopened, which
+ * hands the text behind it back as program and lets `<_Panel>Widget was removed</_Panel>` prove
+ * its own caller.
+ */
+const JSX_NAME = String.raw`[A-Za-z_$][\w.$:-]*`;
+
+/**
  * A tag this line opens and leaves open — `<p>`, `<Panel tone="warn">`, the fragment `<>` — so what
  * follows it is rendered. A fragment counts because prose is written straight inside one, and
  * reading `<>` with `Widget was removed` under it as program text deletes a true finding. Not a
  * self-closing `<Icon />`, which renders nothing after itself and leaves the code beside it code,
  * and not a closing `</p>` or `</>`, which ends the text rather than starting it.
  */
-const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![/])>)`;
+const JSX_OPEN_TAG = String.raw`(?:<>|<${JSX_NAME}(?:\s${JSX_ATTRS})?(?<![/])>)`;
 
 /**
  * The delimiters JSX spells its own syntax with — a tag's angle brackets and the braces of an
@@ -1403,7 +1454,7 @@ const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_DELIMITERS}]*$`);
 const JSX_PROP_VALUE = String.raw`[\w-]\s*=\s*(?:"[^"<>]*|'[^'<>]*)$`;
 
 /** The symbol inside a plain string prop — `<p title="Widget was removed">` renders that too. */
-const JSX_PROP_TEXT = new RegExp(String.raw`<[A-Za-z][\w.$:-]*\s${JSX_ATTRS}${JSX_PROP_VALUE}`);
+const JSX_PROP_TEXT = new RegExp(String.raw`<${JSX_NAME}\s${JSX_ATTRS}${JSX_PROP_VALUE}`);
 
 /**
  * That same prop on a line the tag opened above. An attribute list wraps onto lines of its own as
@@ -1415,7 +1466,7 @@ const JSX_PROP_LINE = new RegExp(JSX_PROP_VALUE);
 
 /** Every tag a line finishes: one it opens, the `</p>` that ends one, the self-closing `<Icon />`. */
 const JSX_TAGS = new RegExp(
-  String.raw`${JSX_OPEN_TAG}|</(?:[A-Za-z][\w.$:-]*\s*)?>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?/>`,
+  String.raw`${JSX_OPEN_TAG}|</(?:${JSX_NAME}\s*)?>|<${JSX_NAME}(?:\s${JSX_ATTRS})?/>`,
   "g",
 );
 
@@ -1426,7 +1477,7 @@ const JSX_TAGS = new RegExp(
  * tag that in fact runs on.
  */
 const JSX_TAG_OPEN = new RegExp(
-  String.raw`<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS}(?:"[^"]*|'[^']*)?)?$`,
+  String.raw`<${JSX_NAME}(?:\s${JSX_ATTRS}(?:"[^"]*|'[^']*)?)?$`,
 );
 
 /**
