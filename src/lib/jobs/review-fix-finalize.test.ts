@@ -557,6 +557,30 @@ describe("finalizeMergedEpic", () => {
     ]);
   });
 
+  it("ignores an older stamped follow-up somebody already TOOK (PR #199 review)", async () => {
+    // A stamped epic a human approved is a run of its own — it failed the reuse test above for
+    // exactly that reason. Counting it as a rival would elect it the older winner, delete the home
+    // just created, then reject that winner as non-untouched: the remaining tickets would be
+    // rehomed by no sweep, and every later pass would repeat the same create-and-delete.
+    const taken = {
+      ...bead("epic-7", "open", ["approved"]),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+      created_at: "2026-01-01T00:00:00.000Z",
+    } as Bead;
+    createdAt.set("epic-2", "2026-01-01T00:00:05.000Z");
+    listMock.mockResolvedValueOnce([]).mockResolvedValue([taken]);
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(deleteMock).not.toHaveBeenCalled(); // the fresh follow-up is the only home going spare
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
+    expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
+      "stage:in-review",
+    ]);
+  });
+
   it("keeps its own follow-up when the rival's is the younger one (PR #199 review)", async () => {
     // The other half of the same rule. A process that cannot see its rival's create is necessarily
     // the older one, so keeping its own is the verdict the rival reaches when it sees both.

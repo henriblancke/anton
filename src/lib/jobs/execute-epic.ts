@@ -1407,6 +1407,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // whose commit was already on the branch still counts as delivered.
       let skipCause = new Map<string, SkipCause>();
       const skipped = new Map<string, SkipCause>();
+      // Tickets whose commit is on THIS branch — the ones a timeout cascade must stop at (PR #199
+      // review). A ticket closed on another machine whose commit this worktree already carries is
+      // delivered, so the tickets written against IT still have their mechanism and must still run,
+      // whatever rolled back further up the chain. Same rule merge finalization applies
+      // ({@link undeliveredAtMerge}); recorded as the loop goes, since only the loop knows what
+      // actually landed here.
+      const onBranch = new Set<string>();
       // Hand a ticket this run will NOT dispatch back to the board, and say so on it. Shared by the
       // dispatch loop below and by the held tail (4a), which reaches the same verdict for a ticket a
       // cross-run blocker also holds — one writer, so the two paths can never leave a skipped ticket
@@ -1489,6 +1496,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // leave a stale implementing label (making a reopened bead derive as in-progress).
             await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
           }
+          onBranch.add(ticket.id);
           continue;
         }
         // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The
@@ -1551,6 +1559,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             closeOnDone: !standaloneRun,
             timeoutMs: ticketTimeoutMs,
           });
+          onBranch.add(ticket.id); // it committed, so nothing behind it is missing its mechanism
         } catch (e) {
           // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
           // already blocked its own bead and rolled its partial work back, so the feature can carry
@@ -1559,13 +1568,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // still halts the run, unchanged.
           if (!(e instanceof TicketTimeoutError)) throw e;
           timedOut.push({ id: e.ticketId, committed: e.committed });
+          if (e.committed) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
           console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
           // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
           // that landed AFTER its commit takes nothing down with it (anton-67xj). Walked over
           // `tickets` rather than `live`: an abandoned ticket still sits on the `blocks` edges of
           // the chain around it, so dropping it from the graph would cut the walk short and
           // dispatch the tickets BEHIND it against work the rollback took off the branch.
-          skipCause = skippedDependents(timedOut, tickets, all);
+          skipCause = skippedDependents(timedOut, tickets, all, onBranch);
         }
         // A finished ticket is progress — reported here so the runner's no-progress timeout
         // measures a wedge rather than a long-but-healthy feature (anton-t1mo).
@@ -4434,11 +4444,18 @@ export interface TicketTimeoutOutcome {
  * node the walk crosses, never a verdict it reports. Leaving it out of the graph would cut a→b→c at
  * an abandoned `b` and dispatch `c` against a mechanism the rollback took off the branch; leaving it
  * in the result would have the run skip-note a bead a human already closed.
+ *
+ * A ticket in `onBranch` STOPS the walk, the same rule merge finalization applies to a delivered
+ * dependent ({@link undeliveredAtMerge}). Its commit is on this branch — a resume finds work an
+ * earlier attempt closed and committed here, whatever rolled back further up the chain — so the
+ * tickets behind it have what they were written against and must still run. Passing through one
+ * would skip valid work and leave it out of the run's pull request for no reason.
  */
 export function skippedDependents(
   timedOut: readonly TicketTimeoutOutcome[],
   tickets: Bead[],
   all: Bead[],
+  onBranch: ReadonlySet<string> = new Set(),
 ): Map<string, SkipCause> {
   const ids = new Set(tickets.map((t) => t.id));
   const adj = dependentEdges(tickets, all);
@@ -4452,6 +4469,7 @@ export function skippedDependents(
     const root = stoppedSet.has(id) ? id : cause.get(id)!.stopped;
     for (const dependent of adj.get(id) ?? []) {
       if (stoppedSet.has(dependent) || cause.has(dependent)) continue;
+      if (onBranch.has(dependent)) continue; // delivered here — it and its own dependents still run
       cause.set(dependent, { waitingOn: id, stopped: root });
       queue.push(dependent);
     }

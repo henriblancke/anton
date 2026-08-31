@@ -523,6 +523,19 @@ describe("orderTickets / skippedDependents — the run's own dependency graph (a
     expect(mixed.get("c")).toEqual({ waitingOn: "b", stopped: "b" });
   });
 
+  it("stops the cascade at a ticket already committed on THIS branch (PR #199 review)", () => {
+    const board = chain();
+    // A resume finds `b` closed on the board with its commit already on this worktree, so it is
+    // delivered whatever `a` did — the same delivered-node stopping rule merge finalization uses.
+    // `c` has the mechanism it was written against, so skipping it would leave valid work out of
+    // the run's pull request for no reason.
+    expect(skippedDependents(rolledBack("a"), board, board, new Set(["b"])).size).toBe(0);
+    // …and a delivered ticket further down stops nothing above it: `b`'s own prerequisite is gone.
+    expect([
+      ...skippedDependents(rolledBack("a"), board, board, new Set(["c"])).keys(),
+    ]).toEqual(["b"]);
+  });
+
   it("says on the bead which ticket it waited on and which one a human must re-scope", () => {
     const direct = skipNote({ waitingOn: "a", stopped: "a" });
     expect(direct).toContain("depends on a, which ran out of time");

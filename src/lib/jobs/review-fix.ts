@@ -1499,9 +1499,17 @@ async function applyRehome(
     // and let the OLDEST follow-up win. That rule converges without either process seeing the whole
     // race: a process whose read predates its rival's create is necessarily the older one, so
     // keeping its own is the same verdict the rival reaches when it sees both.
+    //
+    // The rivals are the UNTOUCHED stamped epics, the same set reuse selects from (PR #199 review).
+    // A stamped follow-up a human already approved, or an operator claimed, is a run of its own —
+    // it lost the reuse test above for exactly that reason, and counting it here would elect it the
+    // older winner, delete the home just created, then reject the winner as non-untouched. The
+    // remaining tickets would be rehomed by no sweep and the merged target could never close, since
+    // every later pass repeats that create-and-delete. A rival worth converging on is by
+    // construction untouched: it was created moments ago by a process racing this one.
     const rivals = (
       await beads.list(repo, ["--status", "all"]).catch(() => undefined)
-    )?.filter((b) => b.id !== followUp && stampedBy(b));
+    )?.filter((b) => b.id !== followUp && stampedForEpic(b));
     // A list that fails cannot rule a duplicate out, and filling a home that may be one splits the
     // preserved tickets across two run targets. The follow-up keeps its stamp, so the next sweep
     // reuses this very epic and reconciles then.
@@ -1518,9 +1526,12 @@ async function applyRehome(
         if (!(await safe(() => beads.delete(repo, followUp))))
           return { ...none, unfinished: followUp };
         // …unless the winner has since become somebody's run, which is the one thing tickets must
-        // not be added to. Left to the next sweep, which finds no untouched candidate and creates a
-        // fresh follow-up of its own.
-        if (!untouched(winner)) return { ...none, unfinished: epic.id };
+        // not be added to. Decided on a read taken HERE, not on the list snapshot the winner came
+        // out of: the rival's own process may have had it approved or claimed in that window, and
+        // adding tickets to a live run's set is the drift that parks it. Left to the next sweep,
+        // which finds no untouched candidate and creates a fresh follow-up of its own.
+        const live = await reread(winner.id);
+        if (!live || !untouched(live)) return { ...none, unfinished: epic.id };
         followUp = winner.id;
         disposable = false;
       }
