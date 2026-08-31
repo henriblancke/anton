@@ -292,7 +292,7 @@ describe("gatePassEffect", () => {
     surfaced: 0,
     handedBack: 0,
     resumed: 0,
-    finalized: 0,
+    dispatched: 0,
     ...over,
   });
 
@@ -315,9 +315,9 @@ describe("gatePassEffect", () => {
   // A gate resolved on another machine leaves this pass with no board write of its own — but the
   // queue moved, and reporting that as a no-op hides the slot that mattered.
   it("counts work put back in flight even when the pass wrote nothing to the board", () => {
-    expect(gatePassEffect(counts({ resumed: 1, finalized: 2 }))).toEqual({
+    expect(gatePassEffect(counts({ resumed: 1, dispatched: 2 }))).toEqual({
       changed: true,
-      note: "resumed 1 run(s), finalized 2 run(s)",
+      note: "resumed 1 run(s), dispatched 2 merged run(s) to review-fix",
     });
   });
 });

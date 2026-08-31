@@ -319,17 +319,19 @@ export async function dispatchReleased(
  * 4c. APPLY — hand every MERGED run target to review-fix (anton-k0kj), which finalizes it exactly as
  * it always has; only its trigger moved. Deduped against a live job for the same target, and
  * re-dispatched every pass until the finalize actually lands, so a half-done finalize heals itself.
+ * Returns how many review-fix jobs were ENQUEUED, not how many targets were finalized — that job
+ * has not run yet, and may still be held, fail, or park.
  */
 export async function dispatchMerged(pass: PassContext, merged: Bead[]): Promise<number> {
-  let finalized = 0;
+  let dispatched = 0;
   for (const target of merged) {
     const jobId = enqueueReviewFixIfAbsent(pass.db, pass.clock, pass.projectId, target.id);
     if (jobId) {
-      finalized += 1;
+      dispatched += 1;
       console.log(`[gate-check] ${pass.projectId}: ${target.id} merged — dispatched review-fix`);
     }
   }
-  return finalized;
+  return dispatched;
 }
 
 /**
@@ -358,7 +360,7 @@ export interface GatePassCounts {
   surfaced: number;
   handedBack: number;
   resumed: number;
-  finalized: number;
+  dispatched: number;
 }
 
 /**
@@ -373,7 +375,7 @@ export function gatePassEffect(counts: GatePassCounts): JobEffect {
     counts.surfaced > 0 && `surfaced ${counts.surfaced} stall(s)`,
     counts.handedBack > 0 && `handed back ${counts.handedBack} gate(s)`,
     counts.resumed > 0 && `resumed ${counts.resumed} run(s)`,
-    counts.finalized > 0 && `finalized ${counts.finalized} run(s)`,
+    counts.dispatched > 0 && `dispatched ${counts.dispatched} merged run(s) to review-fix`,
   ].filter((clause): clause is string => clause !== false);
 
   return did.length > 0
@@ -427,7 +429,7 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
     const plan = planResumes(board, await beads.readyGated(pass.repo), nowMs, operator);
     const ungated = await dispatchUngated(pass, plan.targets);
     const { handedBack, resumed: releasedResumes } = await dispatchReleased(pass, plan.released);
-    const finalized = await dispatchMerged(pass, plan.merged);
+    const dispatched = await dispatchMerged(pass, plan.merged);
 
     const unmatched = unmatchedGatedReport(plan);
     if (unmatched) console.log(`[gate-check] ${projectId}: ${unmatched}`);
@@ -446,7 +448,7 @@ export function makeGateCheckHandler(deps: GateCheckDeps): JobHandler {
       surfaced,
       handedBack,
       resumed: ungated + releasedResumes,
-      finalized,
+      dispatched,
     });
   };
 }
