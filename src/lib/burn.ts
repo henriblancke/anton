@@ -69,6 +69,8 @@ export const JOB_TYPE_TIER: Record<JobType, BurnTier> = {
   "product-master": "S",
   // A board read and a ranking — deterministic, no Claude on the tick.
   "board-picker": "none",
+  // git plumbing over anton's own residue — no Claude at all.
+  "worktree-reaper": "none",
 };
 
 /**

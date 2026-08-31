@@ -62,8 +62,9 @@ type EscalationVerb = Exclude<EscalationAction, "dismiss">;
  *   • `no-target`  — the finding names neither a bead/epic nor a job, so there is nothing to resume
  *                    or abandon (409).
  *   • `not-dismissable`
- *                  — a wait on a PERSON, which dismissing cannot settle: the gate stays open and the
- *                    next sweep raises the same row again (409).
+ *                  — a wait on a PERSON, which dismissing cannot settle (the gate stays open and the
+ *                    next sweep raises the same row again), or an autopilot DISARM, which no sweep
+ *                    re-raises at all — only a re-arm clears it (409).
  *   • `contested`  — the work was picked back up since the stall was raised, here or on another
  *                    machine (409).
  *   • `unverified` — bd could not confirm CURRENT shared state (the pull or a bead read failed), so
@@ -117,6 +118,10 @@ export async function actOnEscalation(
  */
 async function dismissStall(db: AntonDb, view: EscalationView): Promise<EscalationActionResult> {
   if (view.kind === "needs-human") return { ok: false, reason: "not-dismissable" };
+  // A disarm is refused for the mirror reason: no sweep re-raises one (it is raised on the latch,
+  // once), so a dismissal would clear the row for good while the project stayed frozen. Re-arming
+  // is the only answer, and it settles this row itself.
+  if (view.kind === "autopilot-disarm") return { ok: false, reason: "not-dismissable" };
   if (!(await settleEscalation(db, systemClock, view.id, "dismissed"))) {
     return { ok: false, reason: "not-open" };
   }

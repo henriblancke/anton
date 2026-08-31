@@ -17,7 +17,10 @@ import { parseAcceptance, parseGoal, toStandaloneItem } from "../ticket-view";
 import { detectBoard } from "./detect";
 import {
   concernedBeads,
+  fingerprintLabelOf,
+  GARDENER_PLAN_KEY,
   makeDetection,
+  proposalFingerprint,
   proposalPlanOf,
   type DetectionInput,
   type GardenerDetection,
@@ -105,6 +108,17 @@ const MISPARENTED: Bead[] = [
   bead("anton-cont", { issue_type: "epic", title: "Container epic" }),
   bead("anton-feat", { issue_type: "feature", title: "The runnable feature", parent: "anton-cont" }),
   bead("anton-lost", { title: "Loose ticket", parent: "anton-cont" }),
+];
+
+/**
+ * The parentless-cluster fixture: a card the board already files tickets under, and two loose beads
+ * that state its subject between them — what `detectParentlessClusters` needs to speak at all.
+ */
+const CLUSTERED: Bead[] = [
+  bead("anton-card", { issue_type: "feature", title: "Escalation settle route" }),
+  bead("anton-card-t", { title: "Escalation settle route smoke test", parent: "anton-card" }),
+  bead("anton-l1", { title: "Escalation banner copy" }),
+  bead("anton-l2", { title: "Escalation banner retry" }),
 ];
 
 const detect = (board: Bead[], findings: HygieneFinding[] = []): GardenerDetection[] =>
@@ -212,6 +226,28 @@ describe("the proposal bead", () => {
     expect(draft.description).toMatch(/Approve is refused/);
     expect(draft.description).toMatch(/`\/shape`/);
     expect(draft.acceptance).toMatch(/DECLINED/);
+  });
+
+  // A membership is a SET, and for the kind whose identity is its TARGET the hash no longer guards
+  // the list (anton-9hpp) — so the canonical form has to be deduped at emission, which is the bar
+  // `parseGardenerPlan` then holds every plan to on read.
+  it("files a subject list as a set — a bead named twice is one member", () => {
+    const detection = makeDetection({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-l2", "anton-l1", "anton-l2"],
+      target: "anton-card",
+      summary: "anton-l1 and anton-l2 state one subject — re-parent them under anton-card",
+      evidence: ["anton-card already carries anton-card-t"],
+    });
+
+    const draft = proposalDraft(detection);
+    expect(detection.subjects).toEqual(["anton-l1", "anton-l2"]);
+    // And it reads back: the plan a duplicate would have written is one apply refuses outright.
+    expect(proposalPlanOf({ labels: draft.labels, metadata: draft.metadata })?.subjects).toEqual([
+      "anton-l1",
+      "anton-l2",
+    ]);
   });
 
   it("carries its MOVE as metadata, so applying it never has to parse the prose (anton-1t3n)", () => {
@@ -401,21 +437,27 @@ describe("duplicate proposals from overlapping patrols", () => {
     // Ordered by id, not by board order: two patrols reconciling the same board concurrently must
     // pick the same survivor, or they fold each other away and no ask survives.
     expect(planReconciliation([twin("anton-p2"), twin("anton-p1")])).toEqual([
-      { fingerprint, keep: "anton-p1", fold: ["anton-p2"], held: [] },
+      {
+        fingerprint,
+        keep: "anton-p1",
+        keepLabel: fingerprint,
+        fold: [{ id: "anton-p2", label: fingerprint }],
+        held: [],
+      },
     ]);
   });
 
   it("keeps the twin a human approved, however late it was filed", () => {
     const [duplicate] = planReconciliation([twin("anton-p1"), approved("anton-p2")]);
     expect(duplicate.keep).toBe("anton-p2");
-    expect(duplicate.fold).toEqual(["anton-p1"]);
+    expect(duplicate.fold).toEqual([{ id: "anton-p1", label: fingerprint }]);
   });
 
   it("keeps the twin a run is applying rather than closing it mid-flight", () => {
     const claimed = twin("anton-p2", { status: "in_progress", assignee: "runner-1" });
     const [duplicate] = planReconciliation([twin("anton-p1"), claimed]);
     expect(duplicate.keep).toBe("anton-p2");
-    expect(duplicate.fold).toEqual(["anton-p1"]);
+    expect(duplicate.fold).toEqual([{ id: "anton-p1", label: fingerprint }]);
   });
 
   it("leaves a second APPROVED twin standing — folding one discards a decision", () => {
@@ -431,6 +473,48 @@ describe("duplicate proposals from overlapping patrols", () => {
     });
     expect(planReconciliation([twin("anton-p1"), declined])).toEqual([]);
     expect(planReconciliation([twin("anton-p1"), twin("anton-p2", { status: "closed" })])).toEqual([]);
+  });
+
+  /**
+   * The other half of the identity rollout (anton-9hpp). Suppression stops the NEXT patrol filing a
+   * fresh-format twin, but the pre-rollout asks it was filed beside are still there: several open
+   * `parentless-cluster` proposals for ONE target, each carrying the membership hash of whatever was
+   * loose the night it ran. Grouped by label they look like different claims and nothing ever folds
+   * them, so the duplicate pile target identity exists to remove would sit on the board forever.
+   * They are one claim, and each is closed against its OWN label — not the claim they grouped under.
+   */
+  it("folds pre-rollout cluster twins for one target, whatever labels they carry", async () => {
+    const [detection] = detect(CLUSTERED).filter((d) => d.kind === "parentless-cluster");
+    const legacy = (id: string, subjects: string[]): Bead => {
+      const label = proposalFingerprint(
+        "parentless-cluster",
+        `parentless-cluster:${[...subjects].sort().join("+")}>${detection.target}`,
+      );
+      return bead(id, {
+        labels: [label, ...PROPOSAL_LABELS],
+        metadata: {
+          [GARDENER_PLAN_KEY]: {
+            kind: detection.kind,
+            move: detection.move,
+            fingerprint: label,
+            subjects,
+            target: detection.target,
+          },
+        },
+      });
+    };
+    const older = legacy("anton-p1", ["anton-l1", "anton-l2"]);
+    const newer = legacy("anton-p2", ["anton-l1", "anton-l2", "anton-l3"]);
+    expect(fingerprintLabelOf(older)).not.toBe(fingerprintLabelOf(newer));
+
+    const [duplicate] = planReconciliation(onBoard(older, newer));
+
+    expect(duplicate.fingerprint).toBe(detection.fingerprint);
+    expect(duplicate.keep).toBe("anton-p1");
+    expect(duplicate.fold).toEqual([{ id: "anton-p2", label: fingerprintLabelOf(newer) }]);
+
+    const result = await reconcileDuplicateProposals(REPO, [older, newer]);
+    expect(result.folded).toEqual([{ id: "anton-p2", into: "anton-p1" }]);
   });
 
   it("closes the fold plainly, naming the survivor — never as abandoned", async () => {
@@ -680,6 +764,68 @@ describe("a patrol pass", () => {
     expect(second.created).toEqual([]);
     expect(second.suppressed).toBe(1);
     expect(createMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A cluster's membership is whatever was parentless and free when the patrol read the board, so
+   * hashing it gave the SAME claim a fresh fingerprint every night: four proposals naming anton-5ahy
+   * stood open at once, and the bead's own promise that "the patrol makes this claim no second time"
+   * was false for this kind (anton-9hpp). One target, one open ask.
+   */
+  it("files one cluster proposal per target, whatever membership the next patrol finds", async () => {
+    const first = await emitProposals(REPO, { board: CLUSTERED, detections: detect(CLUSTERED) });
+    expect(first.created).toHaveLength(1);
+
+    // The next patrol finds a third loose bead on the same subject: a different cluster, one claim.
+    const grown = [
+      ...CLUSTERED,
+      ...createdBeads,
+      bead("anton-l3", { title: "Escalation banner timeout" }),
+    ];
+    const detections = detect(grown).filter((d) => d.kind === "parentless-cluster");
+    expect(detections[0].subjects).toEqual(["anton-l1", "anton-l2", "anton-l3"]);
+
+    const second = await emitProposals(REPO, { board: grown, detections });
+
+    expect(second.created).toEqual([]);
+    expect(second.suppressed).toBe(1);
+    expect(createMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The rollout of that change (anton-9hpp). A cluster proposal already open when the identity moved
+   * carries the membership hash, which the detector no longer produces — so on label alone the next
+   * patrol would file a fresh-format twin of an ask the board already carries, the exact duplicate
+   * state target-identity exists to remove. Suppression reads the claim the bead's own PLAN makes.
+   */
+  it("suppresses a cluster proposal filed before the identity moved, rather than twinning it", async () => {
+    const [detection] = detect(CLUSTERED).filter((d) => d.kind === "parentless-cluster");
+    const legacy = proposalFingerprint(
+      "parentless-cluster",
+      `parentless-cluster:${[...detection.subjects].sort().join("+")}>${detection.target}`,
+    );
+    expect(legacy).not.toBe(detection.fingerprint);
+
+    const board = [
+      ...CLUSTERED,
+      proposal(legacy, {
+        metadata: {
+          [GARDENER_PLAN_KEY]: {
+            kind: detection.kind,
+            move: detection.move,
+            fingerprint: legacy,
+            subjects: detection.subjects,
+            target: detection.target,
+          },
+        },
+      }),
+    ];
+
+    const result = await emitProposals(REPO, { board, detections: detect(board) });
+
+    expect(result.created).toEqual([]);
+    expect(result.suppressed).toBe(1);
+    expect(createMock).not.toHaveBeenCalled();
   });
 
   it("files nothing at all once the proposal is declined", async () => {

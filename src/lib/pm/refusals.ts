@@ -8,9 +8,9 @@
  * judgment, and {@link detectionsFor} turns it into the same {@link GardenerDetection} values the
  * gardener's own detectors produce, after checking every claim against the board it was made about.
  *
- * The per-kind bars live with their kind (`order-guards.ts`, `home-guards.ts`) over the shape they
- * share (`guard.ts`), and what an accepted claim becomes lives in `claim-detection.ts` — so this
- * module holds only what every claim is asked, whatever it proposes.
+ * The per-kind bars live with their kind (`order-guards.ts`, `home-guards.ts`, `start-guards.ts`)
+ * over the shape they share (`guard.ts`), and what an accepted claim becomes lives in
+ * `claim-detection.ts` — so this module holds only what every claim is asked, whatever it proposes.
  */
 import { beads, type Bead } from "../beads/bd";
 import { indexBoard, isInFlight, isOpenWork, type BoardIndex } from "../gardener/board-index";
@@ -18,6 +18,7 @@ import { isProposalBead, type GardenerDetection } from "../gardener/detections";
 import { detectionFor } from "./claim-detection";
 import { rehomeRefusal } from "./home-guards";
 import { orderRefusal } from "./order-guards";
+import { startRefusal } from "./start-guards";
 import type { PmClaim, PmClaimKill, PmClaimReprioritize } from "./report";
 
 /** A claim the board refused, with the reason — reported, never silently dropped. */
@@ -99,6 +100,8 @@ function kindRefusal(
       return rehomeRefusal(claim, subject, index, nowMs);
     case "kill":
       return alreadyDeferred(claim, subject);
+    case "start":
+      return startRefusal(claim, subject, index, nowMs);
     default:
       return undefined;
   }

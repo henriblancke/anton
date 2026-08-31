@@ -1,9 +1,7 @@
 "use client";
 
-import { TriangleAlertIcon } from "lucide-react";
-
 import type { TicketDetail } from "@/lib/types";
-import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import {
   Dialog,
   DialogContent,
@@ -84,7 +82,9 @@ function TicketDialogBody({
 }) {
   const model = useTicketDialog({ slug, ticketId, onSaved, onDeleted, onClose });
 
-  if (model.error) return <TicketDialogError message={model.error} onRetry={model.retry} />;
+  if (model.error) {
+    return <ErrorState message={model.error} onRetry={model.retry} layout="dialog" />;
+  }
   if (!model.loaded) return <TicketDialogSkeleton />;
   return <TicketDialogForm slug={slug} ticketId={ticketId} loaded={model.loaded} model={model} />;
 }
@@ -174,20 +174,6 @@ function TicketDialogForm({
         onSave={model.save}
         onDelete={model.remove}
       />
-    </div>
-  );
-}
-
-function TicketDialogError({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
-      <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-        <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-      </span>
-      <p className="text-sm text-risk-high">{message}</p>
-      <Button size="sm" variant="outline" onClick={onRetry}>
-        Try again
-      </Button>
     </div>
   );
 }

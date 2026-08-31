@@ -27,6 +27,9 @@ import {
   type ScanSeverityOverrides,
   type ScanSeverityPolicy,
 } from "./scan-severity";
+import type { FailureBreakerConfig } from "./autopilot-failure-streak";
+import type { ScoreBreakerConfig } from "./autopilot-score-slide";
+import type { WipLimitConfig } from "./autopilot-wip";
 import type { ScoreAlarm } from "./jobs/review-alarm";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
@@ -166,6 +169,37 @@ export interface ProjectSettings {
    * DEFAULT_REVIEW_LOW_SCORE_ROUNDS.
    */
   reviewLowScoreRounds?: number;
+  /**
+   * How many runs in a row ending parked, failed, or abandoned disarm the picker for this project
+   * (anton-rgso / R4.4). A delivered run resets the count; a run an operator CANCELLED is not
+   * counted at all. `0` turns the breaker off outright — the single knob for an operator who would
+   * rather anton kept trying. Absent → DEFAULT_AUTOPILOT_FAILURE_STREAK.
+   */
+  autopilotFailureStreak?: number;
+  /**
+   * The review-score floor the picker disarms below (anton-cekf / R4.3). A finished run whose target
+   * scored BELOW this counts toward the slide; {@link autopilotScoreWindow} consecutive such runs
+   * disarm the project. `0` turns the breaker off outright — no score is below zero. Absent →
+   * DEFAULT_AUTOPILOT_SCORE_FLOOR.
+   *
+   * Distinct from {@link reviewMinScore}, which parks ONE run mid-gate on its own rounds. This floor
+   * judges the trend across runs that already shipped, so it is set higher: work good enough to
+   * leave the gate can still be getting worse.
+   */
+  autopilotScoreFloor?: number;
+  /**
+   * How many consecutive scored runs below {@link autopilotScoreFloor} disarm the picker
+   * (anton-cekf). A run at or above the floor resets it; a settled run that left NO score voids the
+   * window entirely rather than being read through. Absent → DEFAULT_AUTOPILOT_SCORE_WINDOW.
+   */
+  autopilotScoreWindow?: number;
+  /**
+   * How many unmerged PRs in review HOLD the picker for this project (anton-wy9y / R4.2). Not a
+   * disarm: nothing is wrong, in-flight work is untouched, and the next merge or close releases it
+   * with no human act. `0` turns the hold off outright — the single knob for an operator who
+   * reviews faster than anton ships. Absent → DEFAULT_AUTOPILOT_WIP_LIMIT.
+   */
+  autopilotWipLimit?: number;
   /**
    * Max concurrent execute-epic runs for this project (anton-xbk). The runner gates approved-epic
    * execution per project against this; other job types (review-fix/nightly) don't count against
@@ -350,6 +384,35 @@ export const DEFAULT_REVIEW_MAX_ROUNDS = 2;
 export const DEFAULT_REVIEW_MIN_SCORE = 5;
 /** Twice is a trend, once is a round the fix loop exists to answer. */
 export const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
+/**
+ * Three is the smallest count that can only be a pattern. One failure is a hard ticket; two in a row
+ * is bad luck often enough that disarming on it would train an operator to re-arm without reading.
+ */
+export const DEFAULT_AUTOPILOT_FAILURE_STREAK = 3;
+/**
+ * The picker's score floor, read off what this project has actually shipped rather than picked to
+ * sound strict: across 59 scored run targets on anton's own board the scores are 8s and 9s (mean
+ * 8.8, minimum 8) — the review contract's "ships as-is" band. Below 7 is therefore under everything
+ * a healthy run here has ever produced, and on the anchored scale (skills/review) it is the 5-6
+ * "needs another round" band or worse. A 7 itself is acceptable work, so it deliberately does not
+ * count: the breaker fires on work that would have been sent back, not on work a reviewer merely
+ * had notes about.
+ */
+export const DEFAULT_AUTOPILOT_SCORE_FLOOR = 7;
+/**
+ * Three, for the reason {@link DEFAULT_AUTOPILOT_FAILURE_STREAK} is three: it is the smallest count
+ * that can only be a pattern. One low score is a hard feature; two is a bad week — and unlike the
+ * within-run alarm, nothing downstream re-reviews these, so a breaker that cried wolf would train an
+ * operator to re-arm without reading the series.
+ */
+export const DEFAULT_AUTOPILOT_SCORE_WINDOW = 3;
+/**
+ * Three unmerged PRs is already a full sitting for one reviewer, and it is the same number as
+ * {@link DEFAULT_CONCURRENCY} on purpose: a project running flat out can carry every one of its
+ * concurrent runs through to review before the brake bites. So the hold fires on the queue growing
+ * past what anton can produce at once — a review backlog — rather than on anton's own concurrency.
+ */
+export const DEFAULT_AUTOPILOT_WIP_LIMIT = 3;
 
 /** Allowed ranges for the numeric job-policy settings (validated at the API boundary). */
 export const CONCURRENCY_RANGE = { min: 1, max: 6 } as const;
@@ -360,6 +423,13 @@ export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
 export const REVIEW_MIN_SCORE_RANGE = { min: 0, max: 10 } as const;
 export const REVIEW_LOW_SCORE_ROUNDS_RANGE = { min: 1, max: 5 } as const;
+/** `0` is in range on purpose: it is how the operator turns the consecutive-failure breaker off. */
+export const AUTOPILOT_FAILURE_STREAK_RANGE = { min: 0, max: 10 } as const;
+/** `0` is in range on purpose: it is how the operator turns the score-regression breaker off. */
+export const AUTOPILOT_SCORE_FLOOR_RANGE = { min: 0, max: 10 } as const;
+export const AUTOPILOT_SCORE_WINDOW_RANGE = { min: 1, max: 10 } as const;
+/** `0` is in range on purpose: it is how the operator turns the WIP hold off. */
+export const AUTOPILOT_WIP_LIMIT_RANGE = { min: 0, max: 20 } as const;
 
 /** A project's resolved self-review configuration (anton-3apm) — never partial. */
 export interface ReviewConfig {
@@ -399,6 +469,43 @@ export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
         }
       : {}),
   };
+}
+
+/**
+ * The consecutive-failure breaker's configuration, with the default applied (anton-rgso).
+ *
+ * Resolved to ABSENT rather than to a threshold of 0, so the picker pass reads "no breaker" as a
+ * shape instead of having to know that 0 is the off switch — the same seam `resolveReviewConfig`
+ * gives the score alarm, and for the same reason.
+ */
+export function resolveFailureBreaker(
+  settings: ProjectSettings,
+): FailureBreakerConfig | undefined {
+  const threshold = settings.autopilotFailureStreak ?? DEFAULT_AUTOPILOT_FAILURE_STREAK;
+  return threshold > 0 ? { threshold } : undefined;
+}
+
+/**
+ * The score-regression breaker's configuration, with the defaults applied (anton-cekf).
+ *
+ * Absent rather than a floor of 0, the same seam its two siblings give their detectors — the picker
+ * pass reads "no breaker" as a shape rather than having to know that 0 is the off switch.
+ */
+export function resolveScoreBreaker(settings: ProjectSettings): ScoreBreakerConfig | undefined {
+  const floor = settings.autopilotScoreFloor ?? DEFAULT_AUTOPILOT_SCORE_FLOOR;
+  if (floor <= 0) return undefined;
+  return { floor, window: settings.autopilotScoreWindow ?? DEFAULT_AUTOPILOT_SCORE_WINDOW };
+}
+
+/**
+ * The WIP hold's configuration, with the default applied (anton-wy9y).
+ *
+ * Absent rather than a limit of 0, the same seam its three siblings give their detectors — the
+ * picker pass reads "no hold" as a shape rather than having to know that 0 is the off switch.
+ */
+export function resolveWipLimit(settings: ProjectSettings): WipLimitConfig | undefined {
+  const limit = settings.autopilotWipLimit ?? DEFAULT_AUTOPILOT_WIP_LIMIT;
+  return limit > 0 ? { limit } : undefined;
 }
 
 /** A project's resolved product-master configuration (anton-d2sx) — never partial. */
@@ -949,7 +1056,7 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
 /**
  * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
- * hygiene → scan summaries → escalations → projects.
+ * hygiene → scan summaries → autopilot disarms → escalations → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
@@ -965,6 +1072,13 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
         .run();
       tx.delete(schema.hygieneReports).where(eq(schema.hygieneReports.projectId, projectId)).run();
       tx.delete(schema.scanSummaries).where(eq(schema.scanSummaries.projectId, projectId)).run();
+      // Before the escalations they point at, and before the project they reference: a project
+      // disarmed even once keeps its whole disarm history, so leaving these behind fails the
+      // project DELETE on the foreign key and rolls the entire teardown back.
+      tx
+        .delete(schema.autopilotDisarms)
+        .where(eq(schema.autopilotDisarms.projectId, projectId))
+        .run();
       tx.delete(schema.escalations).where(eq(schema.escalations.projectId, projectId)).run();
       tx.delete(schema.projects).where(eq(schema.projects.id, projectId)).run();
     });

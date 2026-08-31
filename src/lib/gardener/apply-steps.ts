@@ -25,9 +25,12 @@ import {
 } from "./board-index";
 import {
   blockerUnusable,
+  clusterUngrouped,
   DOING,
   EVIDENCE_PREMISE,
   home,
+  heldCarriers,
+  homeCarriesNothing,
   homeClaimed,
   HOME_STANDING,
   homeUnusable,
@@ -45,6 +48,7 @@ import {
   unapproveNote,
   type ApplyStep,
   type EvidenceFence,
+  type ReparentStep,
   type TicketOwner,
 } from "./apply-plan";
 import { impliesOrdering } from "./relink";
@@ -119,16 +123,44 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
   }
 }
 
-/** Every bead this step rests on, and so every lock it has to hold to write at all. */
+/**
+ * The beads a CLUSTER re-parent's two board-derived premises are read off, beyond its own two ends:
+ * every member the grouping is recomputed over, the home's own tickets the container bar is counted
+ * from, and the beads those tickets reach the home THROUGH — a carrier attributed to the home
+ * across an intermediate is only as durable as that intermediate. None is written to, and none is
+ * derivable from the step's ends — which is why the decision carries them (apply-plan.ts
+ * `ClusterPremise`) and why they are locked (see {@link lockedBeads}).
+ */
+function premiseBeadsOf(step: ApplyStep): string[] {
+  const cluster = step.verb === "reparent" ? step.cluster : undefined;
+  return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
+}
+
+/**
+ * Every bead this step rests on, and so every lock it has to hold to write at all.
+ *
+ * The two ends and the ticket owner are the beads it WRITES to or points at; the cluster premise
+ * beads are the ones it READS to decide whether it may write at all, and they earn the same lock for
+ * the same reason. Without them {@link assertClusterHolds} re-reads state nothing serializes: a
+ * member other than this step's subject can be retitled or relabelled by `updateTicket` after the
+ * board read, so the grouping passes on a title that is already gone — and a home's last qualifying
+ * ticket can be removed by `deleteTicket`, which takes that ticket's lock and no other, so the
+ * home's own lock never orders the deletion against the container bar. The carriers' PATHS earn the
+ * lock by the same deletion: `cardOf` walks the whole parent chain, so deleting a bead between a
+ * carrier and the home leaves that carrier riding no card at all — the container premise gone
+ * without the carrier itself being touched. Held, all three writes either land before the read (and
+ * it refuses) or queue behind this one.
+ */
 function lockedBeads(step: ApplyStep): string[] {
-  return [step.id, counterpartOf(step), ownerOf(step)?.id].filter(
+  return [step.id, counterpartOf(step), ownerOf(step)?.id, ...premiseBeadsOf(step)].filter(
     (id): id is string => id !== undefined,
   );
 }
 
 /**
- * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart and
- * a retirement's ticket owner — and re-judged against reads taken from inside those locks.
+ * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart, a
+ * retirement's ticket owner, and a cluster's members and carried tickets ({@link premiseBeadsOf}) —
+ * and re-judged against reads taken from inside those locks.
  *
  * `planApply` decides against the caller's board snapshot, which is already seconds old by the time
  * the first bd write spawns — and the thing it is guarding against, a runner publishing a lease or
@@ -148,18 +180,20 @@ function lockedBeads(step: ApplyStep): string[] {
  * holds it too: handing a ticket to another card takes it out of that set exactly as retiring it
  * does, and leaves the run's commit landing in a PR for a bead that now belongs elsewhere.
  *
- * The body is the checks in the order they have to run, each named for what it refuses. Four of them
+ * The body is the checks in the order they have to run, each named for what it refuses. Five of them
  * buy a whole board read rather than trusting the snapshot: whether the subject still rides the
  * TICKET SET the step captured ({@link assertOwnerUnchanged}), whether a bead about to be SETTLED
  * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still
- * the TIER its subject demands ({@link assertHomeFitsSubject}), and whether the board still STATES
- * the ordering a link rests on ({@link assertOrderingStated}). All four earn it the same way — the
- * write that flips the answer is itself a locked write on a bead this step holds. Attaching work
- * under a bead, and moving a bead onto another card, are both re-parents, which take those beads'
- * locks as subject and home; an epic's tier turns entirely on its feature children — it stops being
- * a card, or stops being a container, the moment one lands under it or leaves it, that same locked
- * write; and a link's evidence sits on the PAIR, whose bodies are edited under these very locks
- * (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
+ * the TIER its subject demands ({@link assertHomeFitsSubject}), whether a cluster's home still
+ * CARRIES work and its members still state one subject ({@link assertClusterHolds}), and whether the
+ * board still STATES the ordering a link rests on ({@link assertOrderingStated}). All five earn it
+ * the same way — the write that flips the answer is itself a locked write on a bead this step holds.
+ * Attaching work under a bead, and moving a bead onto another card, are both re-parents, which take
+ * those beads' locks as subject, home and ticket owner; an epic's tier turns entirely on its feature
+ * children — it stops being a card, or stops being a container, the moment one lands under it or
+ * leaves it, that same locked write; and a link's evidence, like a cluster's grouping, sits on beads
+ * whose bodies and labels are edited under these very locks (`ticket-detail.ts` `updateTicket`). So
+ * those writes genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
@@ -170,7 +204,9 @@ function lockedBeads(step: ApplyStep): string[] {
  * serializations, and each refuses the opposite direction of the same drift.
  *
  * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
- * {@link alreadySatisfied}.
+ * {@link alreadySatisfied} — and a step the board already satisfies still re-asks its cluster's
+ * premises before it is accepted as one ({@link assertSatisfiedClusterHolds}), because closing the
+ * proposal over it is a decision even when it writes nothing.
  *
  * `signal` is an unattended caller's cancel, and apply.ts hands it here for the FIRST step alone —
  * the only one that can still stop for free. Everything above the write is an await: acquiring the
@@ -193,6 +229,7 @@ export async function applyStep(
 ): Promise<boolean> {
   return withBeadWriteLocks(repo, lockedBeads(step), async () => {
     if (await lockedSubjectSatisfied(repo, step)) {
+      await assertSatisfiedClusterHolds(repo, step);
       signal?.throwIfAborted();
       return false;
     }
@@ -217,6 +254,27 @@ async function lockedSubjectSatisfied(repo: string, step: ApplyStep): Promise<bo
   const moved = subjectMoved(step, subject, Date.now());
   if (moved) throw new SubjectMovedError(moved);
   return subject !== undefined && alreadySatisfied(step, subject);
+}
+
+/**
+ * What a CLUSTER re-parent owes its premises even when the board has already made its move.
+ *
+ * A satisfied step writes nothing, so nothing here can be rolled back — but it is still one of the
+ * moves this proposal is about to be CLOSED as applied over. Reach that state on every member at
+ * once (another approval, or an operator, landing the whole cluster between the decision and these
+ * locks) and no step reaches {@link assertClusterHolds} at all, so the proposal settles as applied
+ * against premises nobody re-asked: a home whose recorded carrier has since gone, or a membership
+ * the regrouping no longer holds. The same fresh board would refuse that ask outright.
+ *
+ * Only the CLUSTER premises, not {@link assertHomeHolds} whole: a subject somebody else already
+ * moved under the home rides the home's ticket set now, which is exactly the change
+ * {@link assertOwnerUnchanged} refuses — and refusing an agreeing move is what the idempotent branch
+ * exists to prevent (see {@link alreadySatisfied}).
+ */
+async function assertSatisfiedClusterHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "reparent" || !step.cluster) return;
+  const doing = `before settling ${step.id}'s move under ${step.parent} as already made`;
+  assertClusterHolds(step, await lockedBoard(repo, doing));
 }
 
 /** The bead this step POINTS AT, re-judged under its own lock by the bar the decision used. */
@@ -247,13 +305,73 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
 
 /**
  * What a RE-PARENT owes the two run targets it sits between: the home it is about to hang work
- * under, and the ticket set it is taking that work out of.
+ * under, and the ticket set it is taking that work out of — plus, for a cluster, the premises its
+ * home was chosen on.
  */
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
   const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`);
   assertOwnerUnchanged(step, board);
   assertHomeFitsSubject(step, board);
+  assertClusterHolds(step, board);
+}
+
+/**
+ * What a CLUSTER re-parent owes the two premises its home was chosen on — the card already filing
+ * work of this kind under it (reparent.ts `MIN_CARRIED_TICKETS`) and the members stating one subject
+ * between them ({@link clusterUngrouped}) — judged from a board read taken INSIDE the locks and
+ * through the same helpers the decision used. Absent on the re-parents that make no such claim.
+ *
+ * `planReparent` asks both of the snapshot, and nothing else here restates either: every check above
+ * asks whether the beads are open, unclaimed, unmoved and the right tier, all of which the writes
+ * that falsify these leave untouched.
+ *
+ * Both order against locks this step holds, and both need locks BEYOND its own two ends, which is
+ * why {@link lockedBeads} takes the whole membership and the home's carried tickets as well. The
+ * home's last ticket leaves by a re-parent — which takes the home's own lock as the ticket's ticket
+ * owner (see {@link ownerOf}) — but also by a `deleteTicket`, which takes only the deleted ticket's
+ * lock, so the container bar is asked over the CARRIERS the decision recorded and this step holds
+ * (apply-plan.ts `homeCarriesNothing`'s `only`) rather than over whatever the board happens to show.
+ * The grouping is read from titles and `area:` labels, edited under the bead's own lock
+ * (`ticket-detail.ts` `updateTicket`) — held here for every member, not just the subject, because a
+ * rename does its damage from either end: the partner that proves the subject still shares a topic
+ * can be the one edited away, and the member edited away can be one this apply has ALREADY moved.
+ * The locks only order one step's own reads, though — they are released between the writes — so the
+ * grouping is re-derived over the whole recorded membership rather than over this step's subject
+ * alone, and a member already sitting under the home that has left the cluster refuses HERE, which
+ * rolls the earlier writes back (apply.ts `applySteps`). Asking only about `step.id` let a
+ * three-member cluster whose first member was retitled after its move pass every later step and
+ * settle over a bead beneath a card it no longer belongs to.
+ *
+ * A carrier attributed to the home THROUGH an intermediate bead is only as ordered as that bead, so
+ * the premise names the whole PATH and this step locks it too (apply-plan.ts
+ * `ClusterPremise.carrierPaths`): deleting an intermediate takes its own lock alone, and it would
+ * otherwise cut the carrier's route to the home between this read and the write — leaving the bar
+ * satisfied by a ticket the board no longer files under the home at all. Which is why the count is
+ * narrowed to the carriers still reaching the home through THOSE beads (reparent.ts
+ * `carriersOnHeldPaths`) rather than to the recorded ids: a carrier re-parented onto a different
+ * intermediate under the same home since the filing reads as carrying it, on a route this step
+ * never locked, and the same deletion cuts it a moment later.
+ *
+ * The count ignores every id the ask NAMED rather than the members left to move: an earlier step of
+ * this same cluster has already landed under the home, and letting it count would let the ask prove
+ * its own premise with the very move it is asking for.
+ */
+function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
+  const cluster = step.cluster;
+  if (!cluster) return;
+  const target = board.byId.get(step.parent);
+  if (!target) throw new SubjectMovedError(missing(step.parent));
+  const carriers = heldCarriers(board, step.parent, cluster);
+  const leaf = homeCarriesNothing(target, board, new Set(cluster.named), carriers);
+  if (leaf) throw new SubjectMovedError(leaf);
+  // The step's own filing stamp rides along: dropping a member a run claimed since asks the same
+  // dated question the decision asked of it, so a claim the plan already saw is not read as news.
+  const ungrouped = clusterUngrouped(step.id, target, cluster, board, {
+    nowMs: Date.now(),
+    observedAtMs: step.observedAtMs,
+  });
+  if (ungrouped) throw new SubjectMovedError(ungrouped);
 }
 
 /**
@@ -773,6 +891,13 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
  * gone. A bead we could not re-read is left approved and merely reported: untagging on a read that
  * proves nothing would withdraw a sound approval, and if the claim is still ours it would strand the
  * bead as a reservation no retry can clear (see {@link grantApproval}).
+ *
+ * An ABSENT holder is the same failure wearing a different face, and only silence proves it is not:
+ * a shell `bd unassign` landing in this window erases the reservation the swap took, and returning
+ * success would settle the ask with an approved-but-unassigned target — work now available to any
+ * machine rather than reserved for this one, which is precisely what the CAS was for. So it passes
+ * only when no identity was resolved at all, because that swap was a verified no-op with no
+ * reservation to lose (see {@link releaseReservation}).
  */
 async function assertReservationHeld(
   repo: string,
@@ -787,14 +912,17 @@ async function assertReservationHeld(
     return;
   }
   const holder = claimHolder(live);
-  if (!holder || holder === operator) return;
+  if (holder === operator || (!holder && !operator)) return;
+  const change = holder
+    ? `was claimed by ${holder}`
+    : `had the reservation this start took for ${operator} removed`;
   if (await withdrawGrant(repo, id)) {
     throw new SubjectMovedError(
-      `${id} was claimed by ${holder} while this start was being approved — the grant was withdrawn, so the board is back where this proposal found it`,
+      `${id} ${change} while this start was being approved — the grant was withdrawn, so the board is back where this proposal found it`,
     );
   }
   throw new Error(
-    `${id} was claimed by ${holder} while this start was being approved and the \`${LABELS.approved}\` label could not be withdrawn — it now reads as approved work under a reservation this apply never checked, so a run nobody authorised can start on it`,
+    `${id} ${change} while this start was being approved and the \`${LABELS.approved}\` label could not be withdrawn — it now reads as approved work under a reservation this apply never checked, so a run nobody authorised can start on it`,
   );
 }
 

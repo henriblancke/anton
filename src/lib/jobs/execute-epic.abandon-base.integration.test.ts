@@ -15,6 +15,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beads } from "../beads/bd";
+import { findWorktree } from "../git/worktree";
 import { parseTicketNotes } from "../beads/notes";
 import * as schema from "../db/schema";
 import { getJob, park } from "./queue";
@@ -401,6 +402,23 @@ setTimeout(()=>process.exit(0),60000);`,
       const epic = await beads.show(repo, epicKill);
       expect(beads.getPrRef(epic) ?? null).toBeNull();
       expect(epic.labels ?? []).not.toContain("stage:in-review");
+
+      // anton-hrun.1: the kill releases the worktree, exactly as a delivery does — a killed run
+      // used to tear down nothing at all. The BRANCH survives because the run target itself is
+      // still open (only the ticket was abandoned), and the teardown says so in the session log.
+      expect(await findWorktree(repo, `anton/${epicKill}`)).toBeNull();
+      expect(
+        execFileSync("git", ["-C", repo, "branch", "--list", `anton/${epicKill}`], {
+          encoding: "utf8",
+        }).trim(),
+      ).not.toBe("");
+      const teardown = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.kind === "worktree-reaper",
+      );
+      expect(teardown).toHaveLength(1);
+      expect(readFileSync(teardown[0].logPath!, "utf8")).toContain(
+        `kept branch anton/${epicKill}`,
+      );
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }

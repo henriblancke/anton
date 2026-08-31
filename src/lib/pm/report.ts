@@ -20,6 +20,7 @@ export const CLAIM_KINDS = {
   rehome: "misfiled",
   split: "oversized",
   kill: "low-value",
+  start: "withheld-approval",
 } as const;
 
 export type ClaimKind = keyof typeof CLAIM_KINDS;
@@ -46,6 +47,11 @@ export type PmClaimRehome = PmClaimBase & { kind: "rehome"; home: string };
 export type PmClaimSplit = PmClaimBase & { kind: "split"; pieces: string[] };
 /** `kill`: the ask is the bead itself, so the evidence is all there is. */
 export type PmClaimKill = PmClaimBase & { kind: "kill" };
+/**
+ * `start`: the mirror of `kill` in shape and its opposite in consequence — the ask is the bead
+ * itself, so the evidence is all it carries, and approving it grants the gate a run starts on.
+ */
+export type PmClaimStart = PmClaimBase & { kind: "start" };
 
 /**
  * One judgment the session reported, before anything has checked it against the board.
@@ -60,7 +66,8 @@ export type PmClaim =
   | PmClaimOrder
   | PmClaimRehome
   | PmClaimSplit
-  | PmClaimKill;
+  | PmClaimKill
+  | PmClaimStart;
 
 /**
  * How a pass broke the protocol. Deliberately NOT folded into "no proposals": a session that never
@@ -114,6 +121,12 @@ export function pmReportFormatSection(): string {
     `  two. A split with no sketch is not actionable and anton drops it.`,
     `- \`"kill"\` — no extra field. Approving it DEFERS the bead: out of the ready set, contract`,
     `  intact, reversible with \`bd undefer\`.`,
+    `- \`"start"\` — no extra field. The bead is what anton should run NEXT and nothing has approved`,
+    `  it, so no worker will ever come. Approving the proposal grants the \`approved\` gate and a run`,
+    `  can start on it, which makes this the only claim whose approval SPENDS a run — so the evidence`,
+    `  bar is the kill's. anton refuses a bead that already carries the gate, one a run holds, and one`,
+    `  the board itself would not offer as work to start: not a run target, blocked by open work, or`,
+    `  short of the approve gate's own promises (a missing contract section, a broken tier shape).`,
     ``,
     `One entry per claim, and at most one claim per bead per kind — anton fingerprints each claim by`,
     `what it is ABOUT, so two entries saying the same thing become one ask either way.`,
@@ -226,6 +239,8 @@ const CLAIM_FIELDS: { [K in ClaimKind]: FieldReader<K> } = {
   },
   // `kill`: the ask is the bead itself, so the base fields are the whole claim.
   kill: () => ({}),
+  // `start`: likewise — naming the bead IS the ask, and the gate it must clear is the board's answer.
+  start: () => ({}),
 };
 
 /** One wire entry as a claim, or undefined when it is not a usable one. */

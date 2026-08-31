@@ -47,6 +47,12 @@ export const SECTIONS = [
     ],
   },
   {
+    id: "autopilot",
+    label: "Autopilot brakes",
+    group: "While a run works",
+    dirtyKeys: ["autopilot"],
+  },
+  {
     id: "value",
     label: "Work value",
     group: "While a run works",
