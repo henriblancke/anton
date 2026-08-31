@@ -1910,13 +1910,18 @@ function unmaskUsedAliases(
 
 /**
  * Where the import declaration opened at `at` on line `from` ends: just past the closing quote of
- * its module specifier, which is the last thing a declaration writes. Undefined when no specifier
- * turns up.
+ * its module specifier when the language writes one, and otherwise at the `;` that closes the
+ * statement or at the end of the line it stops on. Undefined only when neither turns up inside the
+ * span — an unclosed quote, or a binding list left open.
+ *
+ * The declaration-only endpoint is what a language spelling its imports without a string (Java's
+ * `import static pkg.Widget.render;`, Kotlin's `import pkg.Widget`) is masked by: the binding it
+ * takes is as stale as an ESM one, and leaving the statement standing let it read as its own
+ * caller.
  *
  * The search only follows the statement onto another line while it is visibly unfinished — a
- * binding list still open, or a break after `from` or a comma. `import com.example.Helper;` ends
- * where it stands, so a language that spells its imports without a string never drags the mask
- * over the program below it.
+ * binding list still open, or a break after `from` or a comma — so the mask stops on the line the
+ * declaration stops on and never reaches the program below it.
  */
 function importEnd(
   code: string[],
@@ -1933,10 +1938,13 @@ function importEnd(
         const close = text.indexOf(char, index + 1);
         return close < 0 ? undefined : { line, at: close + 1 };
       }
+      // The `;` closes the statement and the code after it is a statement of its own, so the mask
+      // ends before it rather than swallowing what shares the line.
+      if (char === ";" && depth <= 0) return { line, at: index };
       if (char === "{" || char === "(" || char === "[") depth += 1;
       else if (char === "}" || char === ")" || char === "]") depth -= 1;
     }
-    if (depth <= 0 && !IMPORT_CONTINUES.test(text.slice(start))) return undefined;
+    if (depth <= 0 && !IMPORT_CONTINUES.test(text.slice(start))) return { line, at: text.length };
   }
   return undefined;
 }
@@ -2103,10 +2111,11 @@ function maskPythonImports(code: readonly string[]): MaskedCode {
  * stays, because it is a statement of its own. An `export … from` is left alone: republishing a
  * symbol under another module's name is a use of it, not a mention.
  *
- * An `import` that reaches no quoted specifier is left standing rather than guessed at, so a
- * language that spells its imports without one (Java) keeps exactly the check it had. Python spells
- * its own without one too, so a `.py` file is masked by `maskPythonImports` instead — the only
- * grammar that reads `from widget import Widget` as the stale binding it is.
+ * An `import` that reaches no quoted specifier ends at its `;` or at the end of its line instead:
+ * `import static pkg.Widget.render;` binds `render` without calling it exactly as an ESM import
+ * does, so leaving it standing let one stale Java import erase a true finding. Python spells its
+ * imports without a specifier too, but its own grammar — no `;`, parenthesised lists, `from widget
+ * import Widget` — is read by `maskPythonImports` instead.
  *
  * CommonJS `require` bindings are masked first, by `maskRequireBindings`, since a repo can spell
  * the same stale binding either way.
@@ -2244,8 +2253,11 @@ function excludePathspecs(exclude: readonly string[]): string[] {
 }
 
 /**
- * Every file that references the symbol as a whole word — tracked files plus anything new that
- * isn't ignored, since a caller written today is a caller. `-F`/`-w` so a symbol carrying regex
+ * Every file that references the symbol as a whole word, across the TRACKED tree — the one the
+ * scan's commit names. Untracked files are deliberately left out: the nightly refresh tolerates the
+ * scratch and generated debris a checkout accumulates (git/refresh.ts), so counting it would let a
+ * file that never shipped erase a signal recorded against a SHA whose tree holds no such caller,
+ * and score the same commit differently on two machines. `-F`/`-w` so a symbol carrying regex
  * punctuation (`$mount`) matches itself rather than a pattern, `-z` so a non-ASCII path comes back
  * unquoted under `core.quotePath`, `-I` so a binary blob is never read as a call site, `-n` so a
  * hit can be located in its file and judged against the comments around it, and the scan's own
@@ -2262,7 +2274,7 @@ async function filesMentioning(
   abort?: AbortSignal,
 ): Promise<string[] | { unavailable: string }> {
   try {
-    const args = ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "--untracked", "-e", symbol];
+    const args = ["-C", repoPath, "grep", "-n", "-I", "-w", "-F", "-z", "-e", symbol];
     if (pathspecs.length > 0) args.push("--", ...pathspecs);
     const { stdout } = await execFileAsync("git", args, {
       timeout: GREP_TIMEOUT_MS,

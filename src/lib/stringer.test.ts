@@ -1203,14 +1203,19 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
     });
 
-    // An import that reaches no quoted module specifier belongs to a language that spells one
-    // without a string, and the mask has nothing to end it at. Guessing at its extent would blank
-    // the program under it — including the call that keeps a live symbol out of the report.
-    it("leaves a quoteless import unmasked rather than blanking the code under it", async () => {
+    // Java spells an import without a module string, so the mask had nothing to end it at and left
+    // `import static pkg.Orphan.neverCalled;` standing — a binding taken and never called, reading
+    // as its own caller and erasing a true finding. The statement ends at its own `;`: far enough
+    // to discount the binding, never far enough to reach the call on the line below it or the
+    // statement sharing its line.
+    it("does not count a quoteless import as a use, and keeps the code under it", async () => {
       const repo = initRepo({
         "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/Stale.java":
+          "import static com.example.util.Orphan.neverCalled;\n\npublic class Stale {}\n",
         "src/Main.java":
           "import com.example.util.Helper;\n\npublic class Main {\n  void run() { neverCalled(); }\n}\n",
+        "src/Same.java": "import com.example.util.Helper; class Same { void r() { neverCalled(); } }\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/lib/orphan.ts", "neverCalled"),
@@ -1221,6 +1226,29 @@ describe("scan", () => {
       expect(result.signals).toEqual([]);
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
       expect(result.deadcode.dropped[0].reason).toContain("src/Main.java");
+      expect(result.deadcode.dropped[0].reason).toContain("src/Same.java");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/Stale.java");
+    });
+
+    // A quoteless import that never closes its own statement is still bounded by the line it stops
+    // on: a language spelling one without a `;` (Kotlin) has its binding discounted, and the call
+    // written under it still counts.
+    it("ends a quoteless import at its line when no `;` closes it", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/Stale.kt": "import com.example.util.neverCalled\n\nclass Stale\n",
+        "src/Main.kt": "import com.example.util.neverCalled\n\nfun run() { neverCalled() }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/Main.kt");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/Stale.kt");
     });
 
     // Python spells the same stale binding as `from widget import Widget`, where the `import`
@@ -3041,6 +3069,30 @@ describe("scan", () => {
 
       expect(result.signals).toHaveLength(3);
       expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // anton tolerates the scratch and generated files a checkout accumulates — the nightly refresh
+    // fast-forwards past them rather than standing down (git/refresh.ts) — but the health point it
+    // records names a SHA whose tree holds none of them. Counting an untracked caller would erase a
+    // signal the shipped tree does not contradict, and score the same commit differently on two
+    // machines. A tracked file edited and not yet committed is the tree being measured, and counts.
+    it("does not count an untracked file as a caller, and still reads uncommitted edits", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/live.ts": "export function stillCalled() {}\n",
+        "src/lib/caller.ts": "export const ready = 1;\n",
+      });
+      writeFileSync(join(repo, "scratch.ts"), "neverCalled();\n", "utf8");
+      writeFileSync(join(repo, "src/lib/caller.ts"), "stillCalled();\n", "utf8");
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("src/lib/orphan.ts", "neverCalled"),
+        unused("src/lib/live.ts", "stillCalled"),
+      ]);
+
+      expect(result.kept).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "stillCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
     });
 
     // A filter that can't search the tree must under-filter rather than delete findings — and say
