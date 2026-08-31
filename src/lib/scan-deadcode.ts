@@ -35,9 +35,10 @@ const DEADCODE_COLLECTOR = "deadcode";
 /**
  * How many distinct symbols one pass will search for. A scan carrying more than this is a repo
  * anton has never scanned before (a whole-repo baseline pass), and the budget bounds what a nightly
- * spends on it. Hitting it means "not checked", so the signals past it keep their place — reported,
- * not silently dropped, and counted in the filter's diagnostics so a truncated pass can't be read
- * as a verified one.
+ * spends on it. Hitting it means "not checked" only for signals naming a symbol nothing searched
+ * yet — a symbol already in hand is still answered, since its result costs nothing. The unchecked
+ * ones keep their place: reported, not silently dropped, and counted in the filter's diagnostics
+ * so a truncated pass can't be read as a verified one.
  */
 export const SYMBOL_BUDGET = 200;
 
@@ -1168,20 +1169,23 @@ type JsxLine =
   | { prop: string };
 
 /**
- * The line with every tag it finishes blanked out, and how many elements those tags leave open.
+ * The line with every tag it finishes blanked out, how many elements those tags leave open, and
+ * where the last of them ended — the point rendered text resumes from.
  * A sibling closes only itself: `<span>hello</span>` under a `<div>` ends its own text and not the
  * paragraph beside it, so counting its `</span>` as the end of the parent makes the prose under it
  * program again — and a line naming a removed component then proves its own caller.
  */
-function jsxTags(line: string): { net: number; remainder: string } {
+function jsxTags(line: string): { net: number; remainder: string; after: number } {
   let net = 0;
-  const remainder = line.replace(JSX_TAGS, (tag) => {
+  let after = 0;
+  const remainder = line.replace(JSX_TAGS, (tag, at: number) => {
     if (tag.startsWith("</")) net -= 1;
     // A self-closing element renders nothing after itself, so it opens nothing either.
     else if (!tag.endsWith("/>")) net += 1;
+    after = at + tag.length;
     return " ".repeat(tag.length);
   });
-  return { net, remainder };
+  return { net, remainder, after };
 }
 
 /**
@@ -1268,9 +1272,13 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
  * counting that page as a caller deletes a true finding about a genuinely unused symbol.
  *
  * `state` is what the lines above left open — see `jsxLineStates` for why that bound is kept tight.
- * Rendered text carries only as far as the prose does: the symbol has to sit before any punctuation
- * on its line, or the line is program again. Inside a wrapped tag only a static value is prose, so
- * `body={Widget()}` on its own line still counts as the call it is.
+ * The tags the head finishes are counted the way `jsxLineStates` counts a whole line, so a child
+ * element rendered before the prose leaves its parent open rather than ending it:
+ * `<p><strong>Note:</strong> Widget was removed</p>` shows the symbol to a reader, and reading the
+ * `</strong>` as program would let that paragraph prove its own caller. Rendered text then carries
+ * only as far as the prose does — past the last tag the head has to be punctuation-free, or the
+ * symbol sits inside an expression and the line is program again. Inside a wrapped tag only a
+ * static value is prose, so `body={Widget()}` on its own line still counts as the call it is.
  *
  * A value that wrapped ends at the quote that opened it, not at any quote: a double-quoted
  * `title` continued with `It's Widget documentation` holds an apostrophe, and ending the value
@@ -1287,12 +1295,11 @@ function referencesJsx(line: string | undefined, symbol: string, state: JsxLine 
     const head = maskJsxExpressions(raw);
     if (wrapped !== undefined && !head.includes(wrapped)) return false;
     const within: JsxLine = wrapped === undefined ? state : "tag";
-    return (
-      !(within === "tag" && JSX_PROP_LINE.test(head)) &&
-      !JSX_TEXT.test(head) &&
-      !JSX_PROP_TEXT.test(head) &&
-      !(within === "text" && !JSX_CODE.test(head))
-    );
+    if (within === "tag" && JSX_PROP_LINE.test(head)) return false;
+    if (JSX_PROP_TEXT.test(head)) return false;
+    const { net, remainder, after } = jsxTags(head);
+    const open = (within === "text" ? 1 : 0) + net;
+    return open <= 0 || JSX_CODE.test(remainder.slice(after));
   });
 }
 
@@ -1318,9 +1325,10 @@ export interface DeadcodeFilter {
    */
   unavailable?: string;
   /**
-   * How many signals the pass never reached, because the symbol budget ran out mid-scan. They ride
-   * through counted — but a truncated pass otherwise reads exactly like a fully verified one, so
-   * the diagnostics say how much of the scan the check never saw.
+   * How many signals went without a reference check, because the symbol budget ran out mid-scan
+   * and theirs would have needed a search of its own. They ride through counted — but a truncated
+   * pass otherwise reads exactly like a fully verified one, so the diagnostics say how much of the
+   * scan the check never saw.
    */
   unchecked?: number;
 }
@@ -1578,7 +1586,7 @@ export async function filterDeadcodeSignals(
   let unavailable: string | undefined;
   let unchecked = 0;
 
-  for (const [index, signal] of relevant.entries()) {
+  for (const signal of relevant) {
     // Before starting another symbol's grep, not just inside it: a cancelled job should not spend
     // the tree on findings nobody will read.
     abort?.throwIfAborted();
@@ -1590,11 +1598,13 @@ export async function filterDeadcodeSignals(
 
     let files = seen.get(symbol);
     if (!files) {
-      // Out of budget: this signal and everything after it is reported without a reference check,
-      // so the count of what went unverified travels with the result.
+      // Out of budget: this signal is reported without a reference check, and the count of what
+      // went unverified travels with the result. The pass keeps going rather than stopping here —
+      // a signal whose symbol was already searched is answered from `seen` for free, so only the
+      // ones that would need a new grep go unchecked.
       if (seen.size >= SYMBOL_BUDGET) {
-        unchecked = relevant.length - index;
-        break;
+        unchecked += 1;
+        continue;
       }
       const found = await filesMentioning(repoPath, symbol, masked, pathspecs, abort);
       if (!Array.isArray(found)) {

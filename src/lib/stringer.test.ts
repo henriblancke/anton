@@ -2162,6 +2162,36 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
     });
 
+    // The same nesting holds along a line, not just down the page: the prose after `<strong>Note:
+    // </strong>` or a self-closing `<Icon />` is still the text their `<p>` opened, and the closing
+    // punctuation in front of it is the child's, not the parent's. Reading it as program lets a page
+    // that only names the symbol prove its own caller — while the interpolation after the same child
+    // stays the call it is.
+    it("reads JSX text after an inline child tag as prose, and still counts a call after one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n" +
+          "  <p><strong>Note:</strong> Widget was removed in favour of Panel</p>\n);\n",
+        "src/ui/icon.tsx":
+          "export const Icon = () => (\n" +
+          "  <p><Info /> Widget was removed in favour of Panel</p>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <p><strong>Note:</strong> {Widget()}</p>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/icon.tsx");
+    });
+
     // A tag's props wrap onto lines of their own as ordinary formatting, and so can the value of
     // one: the line carrying `title="Widget was removed"` has no opener on it, and the line under
     // `title="` has neither. Judging either alone reads a static prop as program and lets it prove
@@ -2436,6 +2466,32 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
       expect(result.deadcode.unchecked).toBe(1);
       expect(describeDeadcodeFilter(result.deadcode)).toContain("1 dead-code signal(s) were counted unchecked");
+    });
+
+    // The budget withholds greps, not answers: a symbol already searched is in hand, so a signal
+    // past the budget that names one is still checked. Counting it unchecked would leave a signal
+    // standing that this very pass had already contradicted.
+    it("still checks a signal past the budget whose symbol was already searched", async () => {
+      const repo = initRepo({
+        "src/testing/integration.ts": "export function withOperator() {}\n",
+        "src/routes/claim.test.ts": "withOperator();\n",
+      });
+      // The budget fills on withOperator plus one signal per distinct dead symbol. Past it sits an
+      // unsearched symbol — which goes unchecked — and a second withOperator, whose answer is free.
+      const signals = [
+        unused("src/testing/integration.ts", "withOperator"),
+        ...Array.from({ length: SYMBOL_BUDGET - 1 }, (_, i) =>
+          unused("src/lib/orphan.ts", `dead${i}`),
+        ),
+        unused("src/lib/orphan.ts", "unsearched"),
+        unused("src/testing/integration.ts", "withOperator"),
+      ];
+
+      const result = await filterDeadcodeSignals(repo, signals);
+
+      expect(result.deadcode.unchecked).toBe(1);
+      expect(result.deadcode.dropped).toHaveLength(2);
+      expect(result.kept).toHaveLength(signals.length - 2);
     });
 
     // A cancelled job must stop the check, not ride it out: the greps are what the shutdown waits
