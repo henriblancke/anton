@@ -398,11 +398,37 @@ function closesControlHead(before: string): boolean {
 }
 
 /**
+ * Whether the trailing `}` of `before` closes a BLOCK rather than an object literal. A block ends a
+ * statement, so a `/` behind it opens a regex; an object literal is a VALUE, so the same `/`
+ * divides — `const ratio = { value: 1 } / /[/*]/.source.length` divides by a regex's source length,
+ * and reading its first slash as an opener runs an invented literal to the second one and leaves the
+ * `/*` in that character class to open a comment over every line below.
+ *
+ * The `{` that matches is found by a balanced scan backwards, as the control head's `(` is, and what
+ * precedes it decides: an expression prefix — `=`, `(`, `return` — can only be followed by a value,
+ * so the brace opened a literal. Anything else (`if (…)`, `function f()`, the start of a statement)
+ * opened a block. A `{` opened on an EARLIER line reads as a block, which is what this rule assumed
+ * of every `}` before the distinction existed.
+ */
+function closesBlock(before: string): boolean {
+  let depth = 0;
+  for (let i = before.length - 1; i >= 0; i -= 1) {
+    if (before[i] === "}") depth += 1;
+    else if (before[i] === "{") {
+      depth -= 1;
+      if (depth === 0) return !REGEX_PREFIX.test(before.slice(0, i).trimEnd());
+    }
+  }
+  return true;
+}
+
+/**
  * Whether the `/` at `start` OPENS a regex literal rather than divides — `REGEX_PREFIX` read
  * against the text BEHIND the slash, for the scanners that walk a line character by character
  * instead of matching it whole, plus the two prefixes a regex cannot express: the `)` of a
  * control-flow head, which takes a balanced scan backwards to tell from a call's, and the `}` that
- * closes a block, which is told from JSX's self-close by the character AFTER the slash.
+ * closes a block, which is told from an object literal's by the same scan and from JSX's self-close
+ * by the character AFTER the slash.
  */
 function opensRegex(line: string, start: number): boolean {
   const raw = line.slice(0, start);
@@ -413,14 +439,15 @@ function opensRegex(line: string, start: number): boolean {
   // and a closing tag.
   if (raw.length > before.length && COMPARISON_PREFIX.test(before)) return true;
   if (closesControlHead(before)) return true;
-  // A `}` ends the block before it, and what follows is a fresh STATEMENT — `if (enabled) {}
-  // /[/*]/.test(value);` tests a regex. Read as division, the `/*` inside that character class opens
-  // a comment that swallows every line below. The one `}` a slash follows without a statement
-  // starting is JSX's self-close: `<Icon size={n} /> {/* note` puts a `/` there too, and reading it
-  // as an opener would run an invented literal over the `{/*` that follows and leave that comment
-  // unseen. The `>` is what tells them apart — a literal `/>/` loses to the tag, which is what the
-  // character pair means in the TSX this actually scans.
-  if (before.endsWith("}") && line[start + 1] !== ">") return true;
+  // A `}` that ends a BLOCK hands to a fresh STATEMENT — `if (enabled) {} /[/*]/.test(value);`
+  // tests a regex. Read as division, the `/*` inside that character class opens a comment that
+  // swallows every line below. An object literal's `}` ends a value instead, so `closesBlock` tells
+  // the two apart. The one block-closing `}` a slash follows without a statement starting is JSX's
+  // self-close: `<Icon size={n} /> {/* note` puts a `/` there too, and reading it as an opener would
+  // run an invented literal over the `{/*` that follows and leave that comment unseen. The `>` is
+  // what tells them apart — a literal `/>/` loses to the tag, which is what the character pair means
+  // in the TSX this actually scans.
+  if (before.endsWith("}") && line[start + 1] !== ">" && closesBlock(before)) return true;
   return REGEX_PREFIX.test(before);
 }
 
@@ -509,6 +536,47 @@ function maskTemplate(
     i = end;
   }
   return { text, stack: frames };
+}
+
+/**
+ * Where the template literal opened at `start` ends — the backtick that MATCHES it, and the line's
+ * end when it never closes. Pairing backticks instead would end the outer literal on a nested one's
+ * opener: in `` `${`in/*ner`}` `` the scan would resume inside the inner literal's TEXT and read its
+ * `/*` as a comment opener, filing every line below a balanced one-liner as prose.
+ *
+ * Quoted strings inside an interpolation are stepped over, so a backtick quoted in one closes
+ * nothing.
+ */
+function afterTemplate(line: string, start: number): number {
+  const frames: TemplateFrame[] = [{ kind: "text" }];
+  let i = start + 1;
+  while (i < line.length) {
+    const char = line[i];
+    const top = frames[frames.length - 1];
+    if (top.kind === "text") {
+      if (char === "\\") i += 2;
+      else if (char === "`") {
+        frames.pop();
+        i += 1;
+        if (frames.length === 0) return i;
+      } else if (char === "$" && line[i + 1] === "{") {
+        frames.push({ kind: "expression", depth: 0 });
+        i += 2;
+      } else i += 1;
+      continue;
+    }
+    if (char === "`") frames.push({ kind: "text" });
+    else if (char === "{") top.depth += 1;
+    else if (char === "}") {
+      if (top.depth > 0) top.depth -= 1;
+      else frames.pop();
+    } else if (char === "'" || char === '"') {
+      i = afterQuoted(line, i);
+      continue;
+    }
+    i += 1;
+  }
+  return line.length;
 }
 
 /** The delimiters a string can span lines behind. */
@@ -932,8 +1000,14 @@ function unclosedBlockComment(line: string, nested: boolean): { opener: number; 
   let i = 0;
   while (i < line.length) {
     const char = line[i];
-    if (char === "'" || char === '"' || char === "`") {
+    if (char === "'" || char === '"') {
       i = afterQuoted(line, i);
+      continue;
+    }
+    // A template is stepped over through its own nesting rather than paired backtick to backtick: a
+    // literal nested in an interpolation would otherwise close the outer one, exposing its raw text.
+    if (char === "`") {
+      i = afterTemplate(line, i);
       continue;
     }
     if (char === "/" && line[i + 1] === "/") return { opener: -1, depth: 0 };

@@ -2401,6 +2401,32 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // An object literal's `}` ends a VALUE, so the slash behind it divides — `{ value: 1 } /
+    // /[/*]/.source.length` divides by a regex's source length. Read as a statement boundary, the
+    // invented literal runs to the divisor's own slash and the `/*` inside its character class opens
+    // a comment that runs to the end of the file, dropping every window below it unread.
+    it("reads a slash after an object literal as division, not as a regex", async () => {
+      const repo = writeRepo({
+        "src/ratio.ts": [
+          "export const ratio = { value: 1 } / /[/*]/.source.length;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/ratio.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // The one `}` a slash follows without a statement starting is JSX's self-close. Read as a regex
     // opener, the invented literal runs to the next slash on the line — the `{/*` of the comment
     // beside it — and the prose below is then classified as runtime work and triaged as a clone.
@@ -2667,6 +2693,32 @@ describe("scan", () => {
       // ...while the parameter list holding it still reads as one.
       expect(result.duplication.dropped).toMatchObject([{ path: "src/wrapped.ts" }]);
       expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
+    // The comment scanner steps over a template through the same nesting: paired backtick to
+    // backtick, a nested literal's opener closes the outer one and the scan resumes inside the
+    // nested TEXT — where the `/*` of `` `src/${`**/*.ts`}` `` reads as a comment opener that runs
+    // to the end of the file, dropping every executable window below a balanced one-liner.
+    it("closes a template on its own backtick when scanning for a comment opener", async () => {
+      const repo = writeRepo({
+        "src/glob.ts": [
+          "export const glob = `src/${`**/*.ts`}`;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/glob.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/glob.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
     });
 
     // Go spells an import path with a raw string just as readily as with a quoted one, and a blank
