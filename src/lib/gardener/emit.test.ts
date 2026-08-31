@@ -329,6 +329,25 @@ describe("the proposal bead", () => {
     expect(proposalDraft(supersede).acceptance).toContain("superseded by anton-kept");
   });
 
+  // The one box whose over-promise would be unfalsifiable by `bd show`: anton's own grant reserves
+  // the target, but a human (or a concurrent pass) granting the label first settles the ask with no
+  // claim written over their write (apply-plan.ts `planApprove`), leaving the bead approved and
+  // unassigned — which is exactly the state the picker's pool expects. So the gate is what it states.
+  it("promises the approve gate alone, never a reservation the applied state may not carry", () => {
+    const approve = makeDetection({
+      kind: "withheld-approval",
+      move: "approve",
+      subjects: ["anton-next"],
+      summary: "the board's next work is unapproved",
+      evidence: ["anton-next tops the ranked pool and carries no `approved`"],
+    });
+
+    expect(proposalDraft(approve).acceptance).toContain("anton-next is approved");
+    expect(proposalDraft(approve).acceptance).not.toMatch(/reserv|claim/);
+    // The Verify section restates the same assertion, so it must not re-promise it either.
+    expect(proposalDraft(approve).description).not.toMatch(/reserved for anton/);
+  });
+
   // A container orphan with no single obvious home files without a target on purpose, and apply
   // refuses every targetless re-parent — so the bead must not read as one an approval can settle.
   it("tells a proposal that names no home to be applied by hand and DECLINED, not approved", () => {

@@ -62,5 +62,13 @@ export function detectionFor(claim: PmClaim): GardenerDetection {
         summary: claim.summary,
         evidence: claim.evidence,
       });
+    case "start":
+      return makeDetection({
+        kind: CLAIM_KINDS.start,
+        move: "approve",
+        subjects: [claim.bead],
+        summary: claim.summary,
+        evidence: claim.evidence,
+      });
   }
 }

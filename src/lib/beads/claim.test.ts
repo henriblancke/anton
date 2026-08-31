@@ -176,7 +176,7 @@ describe("swap read economy", () => {
 
     const result = await swap("/repo", "bd-1", undefined, "alice");
 
-    expect(result).toEqual({ ok: true, bead: { id: "bd-1", assignee: "alice" } });
+    expect(result).toEqual({ ok: true, bead: { id: "bd-1", assignee: "alice" }, wrote: true });
     // Exactly the two reads the CAS needs: the pre-write re-read and the post-write verification.
     expect(calls).toEqual(["show bd-1", "assign bd-1 alice", "show bd-1"]);
   });
@@ -201,9 +201,12 @@ describe("swap read economy", () => {
     const { store, calls } = fakeStore("alice");
     const swap = createAssigneeSwap(store);
 
+    // `wrote: false` is the whole point of saying so: a caller that unwinds its own claim on a
+    // later failure would otherwise release a reservation somebody else's write had already taken.
     await expect(swap("/repo", "bd-1", "alice", "alice")).resolves.toEqual({
       ok: true,
       bead: { id: "bd-1", assignee: "alice" },
+      wrote: false,
     });
     expect(calls).toEqual(["show bd-1"]);
   });

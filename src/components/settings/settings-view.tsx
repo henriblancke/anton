@@ -82,12 +82,16 @@ export function SettingsView({
     bundledAgentIds: bundledAgents.map((a) => a.id),
     earned,
   });
-  // Above the panel it feeds so an optimistic cadence edit survives a trip to another section.
+  // Above the panel it feeds so an optimistic cadence edit survives a trip to another section. The
+  // cadence offer (anton-3xa9) persists its answer through the FORM's queued PATCH: the opt-out and
+  // "Save changes" write the same settings row, and the route read-modify-writes the whole of it.
   const automationSchedules = useAutomationSchedules({
     slug: project.slug,
     schedules,
     defaultCrons,
     polling: active === "automation",
+    keepProductMasterWeekly: settings.keepProductMasterWeekly === true,
+    patchSettings: form.patchSettings,
   });
 
   // Elements, not components: building all thirteen costs a `createElement` each and keeps the panel

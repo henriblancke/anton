@@ -13,6 +13,7 @@ import { LABELS, type Bead } from "../beads/bd";
 import { planApply } from "./apply-plan";
 import { type GardenerPlan } from "./detections";
 import {
+  APPROVE,
   bead,
   blockedBy,
   CARD,
@@ -39,6 +40,7 @@ import {
   REPARENT,
   retirements,
   runCard,
+  startable,
   SUPERSEDE,
   supersededBy,
   ticket,
@@ -237,6 +239,30 @@ describe("planApply — what an approval means against the board as it now is", 
     expect(
       decide(SUPERSEDE, [supersededBy("anton-a", "anton-c"), survivor]),
     ).toMatchObject({ status: "refuse" });
+  });
+
+  // The one move that STARTS work (anton-gmbz). Its step carries no counterpart and no ticket owner
+  // — a start's subject is a run target in its own right — but it does carry the fence, because
+  // "this is the work worth starting next" is a judgment no board read restates.
+  it("grants the gate on a target the board still offers, and settles one already granted", () => {
+    expect(decide(APPROVE, [startable()])).toEqual({
+      status: "apply",
+      summary: "approved anton-a, so a run can start on it",
+      steps: [
+        {
+          verb: "approve",
+          id: "anton-a",
+          claim: "",
+          kind: "withheld-approval",
+          observedAtMs: Date.parse(FILED),
+        },
+      ],
+    });
+    // Already granted — by hand, or by a concurrent approve. The ask is answered, so nothing is
+    // written, and nothing is auto-claimed over the reservation that came with it.
+    expect(decide(APPROVE, [startable({ labels: [LABELS.approved] })])).toMatchObject({
+      status: "settled",
+    });
   });
 
   describe("refusals — every one of them writes nothing at all", () => {

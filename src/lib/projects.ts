@@ -328,6 +328,16 @@ export interface ProjectSettings {
    */
   proposalAutonomy?: ProposalAutonomyOverrides;
   /**
+   * The operator's standing answer to the cadence offer arming the board-picker makes (anton-3xa9,
+   * design R7.1): true = keep product-master weekly, and never ask again. Absent = not yet asked.
+   *
+   * Stored rather than dismissed in the session because the offer is per DECISION, not per visit:
+   * an operator who said "keep weekly" and then toggled the picker off and on again would otherwise
+   * be asked the same question forever. Nothing reads this but the settings panel — the cadence
+   * itself lives on the schedule row, which is the one place a cadence is meant to be legible.
+   */
+  keepProductMasterWeekly?: boolean;
+  /**
    * Bead labels this project nominates as value signals (anton-prng), highest tier first — the input
    * to `jobValueScore`, which is what ranks governed work for admission. anton ships NO vocabulary:
    * absent/empty means work ranks on its native fields alone (age), because a label anton guessed at

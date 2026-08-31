@@ -6,6 +6,7 @@ import { describeCron, isFastCadence } from "@/lib/jobs/cadence";
 import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { Toggle } from "@/components/atoms";
+import { Button } from "@/components/ui/button";
 import { CadenceEditor } from "@/components/settings/cadence-editor";
 
 /** One automation's live schedule state. `enabled: null` = this project has no row for it yet. */
@@ -33,6 +34,24 @@ export interface AutomationSpec {
   dependsOn?: string;
   /** Which group it belongs to, so a list of rows reads as three concerns. */
   group: string;
+}
+
+/**
+ * A cadence change worth offering because something ELSE the operator just did changed what this
+ * automation's staleness costs (anton-3xa9). Never applied without an explicit accept, and never
+ * shown without saying why — the table is the one place a cadence is meant to be legible, so a
+ * schedule that moved on its own would break the only surface that can be trusted about it.
+ */
+export interface CadenceOffer {
+  /** The automation whose cadence the offer would change. */
+  automationId: string;
+  /** The cron it would move to, if accepted. */
+  cron: string;
+  /** WHY it is being offered, in the operator's terms. Not the mechanism — the consequence. */
+  reason: string;
+  /** Accept/decline labels, so the offer reads as its own decision rather than as OK/Cancel. */
+  acceptLabel: string;
+  declineLabel: string;
 }
 
 /** Group order — board first (what the operator curates), then health, then delivery. */
@@ -102,15 +121,22 @@ export function AutomationTable({
   automations,
   state,
   defaultCrons,
+  cadenceOffer,
   onCronChange,
   onToggle,
+  onAcceptCadenceOffer,
+  onDeclineCadenceOffer,
 }: {
   automations: AutomationSpec[];
   state: Record<string, AutomationScheduleState>;
   /** DEFAULT_SCHEDULES' cron per type — the cadence "Reset" restores. */
   defaultCrons: Record<string, string>;
+  /** A pending cadence offer, rendered under the row it would change. Absent = nothing to ask. */
+  cadenceOffer?: CadenceOffer | null;
   onCronChange: (id: string, cron: string) => void;
   onToggle: (id: string, next: boolean) => void;
+  onAcceptCadenceOffer?: () => void;
+  onDeclineCadenceOffer?: () => void;
 }) {
   const enabledCount = automations.filter((a) => state[a.id]?.enabled === true).length;
   // Read once for the whole table so every row's countdown and last-run age agree on the instant
@@ -163,7 +189,10 @@ export function AutomationTable({
                     {group}
                   </th>
                 </tr>,
-                ...rows.map((automation) => (
+                // The offer renders directly UNDER the row it would change, not as a page banner:
+                // the answer is "weekly → daily", and that only reads as a decision next to the
+                // cadence it is talking about.
+                ...rows.flatMap((automation) => [
                   <AutomationTableRow
                     key={automation.id}
                     automation={automation}
@@ -175,14 +204,68 @@ export function AutomationTable({
                     defaultCron={defaultCrons[automation.id] ?? state[automation.id].cron}
                     onCronChange={(cron) => onCronChange(automation.id, cron)}
                     onToggle={(next) => onToggle(automation.id, next)}
-                  />
-                )),
+                  />,
+                  cadenceOffer?.automationId === automation.id ? (
+                    <CadenceOfferRow
+                      key={`${automation.id}-offer`}
+                      offer={cadenceOffer}
+                      currentCron={state[automation.id].cron}
+                      onAccept={() => onAcceptCadenceOffer?.()}
+                      onDecline={() => onDeclineCadenceOffer?.()}
+                    />
+                  ) : null,
+                ]),
               ];
             })}
           </tbody>
         </table>
       </div>
     </div>
+  );
+}
+
+/**
+ * The pending cadence offer, as a row of its own. States the consequence first and the cadences
+ * second, because an operator deciding this is weighing "is my judgment load-bearing now?", not
+ * two cron expressions — and both buttons are explicit choices, so walking away changes nothing.
+ */
+function CadenceOfferRow({
+  offer,
+  currentCron,
+  onAccept,
+  onDecline,
+}: {
+  offer: CadenceOffer;
+  /** The cadence that fires today — the left-hand side of the change being offered. */
+  currentCron: string;
+  onAccept: () => void;
+  onDecline: () => void;
+}) {
+  return (
+    <tr className="border-b border-border/60 last:border-b-0">
+      <td colSpan={5} className="px-2.5 pb-2.5">
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2.5"
+        >
+          <div className="flex min-w-[16rem] flex-1 flex-col gap-1">
+            <span className="text-[12.5px] leading-snug text-foreground">{offer.reason}</span>
+            <span className="font-mono text-[11px] text-subtle">
+              {describeCron(currentCron)} → {describeCron(offer.cron)}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={onDecline}>
+              {offer.declineLabel}
+            </Button>
+            <Button size="sm" onClick={onAccept}>
+              {offer.acceptLabel}
+            </Button>
+          </div>
+        </div>
+      </td>
+    </tr>
   );
 }
 

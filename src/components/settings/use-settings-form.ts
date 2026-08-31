@@ -60,6 +60,15 @@ export interface SettingsForm {
   dirtySections: (typeof SECTIONS)[number][];
   saving: boolean;
   save: () => Promise<void>;
+  /**
+   * One settings PATCH, queued behind every other one this page has open — the raw response, so a
+   * caller that writes a single field surfaces its own errors (see {@link useSettingsForm}).
+   *
+   * Exposed because Save is not the only writer of that row: the automation panel's cadence opt-out
+   * (anton-3xa9) persists its answer the moment it is given, over a form the operator may be halfway
+   * through saving.
+   */
+  patchSettings: (body: Record<string, unknown>) => Promise<Response>;
 }
 
 /**
@@ -99,6 +108,10 @@ export function useSettingsForm({
   // Local row ids only — never persisted, and never reused, so a React key is stable for the life
   // of the row it was minted for.
   const nextRowId = useRef(draft.variantRows.length + draft.valueLabelRows.length);
+  // The tail of this page's settings PATCHes and how many are still open — together they run one at
+  // a time without deferring a lone write (see {@link patchSettings}).
+  const writes = useRef<Promise<void>>(Promise.resolve());
+  const writesOpen = useRef(0);
 
   function set<K extends keyof SettingsDraft>(key: K, value: SettingsDraft[K]) {
     setDraft((prev) => ({ ...prev, [key]: value }));
@@ -113,10 +126,35 @@ export function useSettingsForm({
 
   const dirty = dirtyFields(draft, baseline, bundledAgentIds, earned);
 
+  /**
+   * A settings PATCH, queued behind every other one this page has open.
+   *
+   * The route read-modify-writes the whole settings JSON, so two requests in flight against it are a
+   * lost update: both read the stored row, and whichever writes last drops the other's fields. This
+   * page has two writers to that row — "Save changes" and the automation panel's cadence opt-out,
+   * which appears over a form the operator may be halfway through saving — so the answer that came
+   * back with a success toast could be the one silently discarded. Ordering them end to end is what
+   * makes each PATCH read a row that already carries the one before it.
+   */
+  function patchSettings(body: Record<string, unknown>): Promise<Response> {
+    const send = () => sendSettingsPatch(slug, body);
+    // Straight through when nothing else is open — the queue exists to order concurrent writes, not
+    // to defer a lone one behind a microtask. Chained on SETTLE rather than success, so a write that
+    // threw still lets the next one run and the tail never carries a rejection nothing awaits.
+    const sent = writesOpen.current === 0 ? send() : writes.current.then(send, send);
+    writesOpen.current += 1;
+    const settled = () => {
+      writesOpen.current -= 1;
+    };
+    writes.current = sent.then(settled, settled);
+    return sent;
+  }
+
   async function save() {
     setSaving(true);
     try {
-      const stored = await patchSettings(slug, settingsPatchBody(draft, bundledAgentIds, agents));
+      const res = await patchSettings(settingsPatchBody(draft, bundledAgentIds, agents));
+      const stored = await storedSettings(res);
       // The new baseline is what the server STORED, not what we sent: the PATCH deep-merges
       // (budgetPolicy), prunes (half-filled variant rows, a missing reviewer we deliberately
       // omitted) and recomputes, so the response row is the only honest answer to "what is saved
@@ -187,6 +225,7 @@ export function useSettingsForm({
     dirtySections: SECTIONS.filter((s) => s.dirtyKeys.some((key) => dirty[key])),
     saving,
     save,
+    patchSettings,
   };
 }
 
@@ -200,20 +239,21 @@ function moved<T extends Row>(rows: T[], id: string, delta: -1 | 1): T[] {
   return next;
 }
 
-/** Persist the whole form. Throws the server's own message so the caller can surface it verbatim. */
-async function patchSettings(
-  slug: string,
-  body: Record<string, unknown>,
-): Promise<EditableSettings | undefined> {
-  const res = await fetch(`/api/projects/${slug}/settings`, {
+/** Send one settings PATCH. Queueing is the caller's job (see {@link SettingsForm.patchSettings}). */
+function sendSettingsPatch(slug: string, body: Record<string, unknown>): Promise<Response> {
+  return fetch(`/api/projects/${slug}/settings`, {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  const stored = (await res.json().catch(() => null)) as {
+}
+
+/** The row a save stored. Throws the server's own message so the caller can surface it verbatim. */
+async function storedSettings(res: Response): Promise<EditableSettings | undefined> {
+  const body = (await res.json().catch(() => null)) as {
     settings?: EditableSettings;
     error?: string;
   } | null;
-  if (!res.ok) throw new Error(stored?.error ?? "Save failed");
-  return stored?.settings;
+  if (!res.ok) throw new Error(body?.error ?? "Save failed");
+  return body?.settings;
 }
