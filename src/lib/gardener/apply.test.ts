@@ -29,6 +29,7 @@ import {
   CLUSTER,
   cold,
   DEFER,
+  failAfterWrite,
   failOn,
   FILED,
   inReview,
@@ -1025,6 +1026,94 @@ describe("the product master's moves", () => {
       );
       // Neither write: the reservation was not stolen and the label never went on.
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("hands the reservation back when the claim write commits and then fails", async () => {
+      // The one failure the CAS cannot answer with a result: `bd assign` commits and the process
+      // running it times out, so the swap REJECTS. Letting that propagate would report a start that
+      // wrote nothing over a target now reserved without `approved` — the one state no retry clears.
+      failAfterWrite.set("assign:anton-a", 1);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      // The write's own reason, over a board handed straight back to where the proposal found it.
+      expect(err.message).toContain("bd assign timed out");
+      expect(calls.slice(0, 2)).toEqual(["assign anton-a operator-1", "assign anton-a "]);
+      expect(calls.filter((c) => c.startsWith("approve"))).toEqual([]);
+      expect(err.changed).toEqual([]);
+    });
+
+    it("names the stranded reservation a failed claim write left behind", async () => {
+      // Same ambiguity with the hand-back refused too: the pair is half-applied and only a human can
+      // settle it, so the failure has to name the bead rather than report an untouched board.
+      failAfterWrite.set("assign:anton-a", 1);
+      failOn.set("assign:anton-a", 2);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a could not be reserved for this start \(bd assign timed out\) and the reservation that write left behind could not be released either/,
+      );
+      expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("fails the start when a failed claim write cannot be re-read at all", async () => {
+      // Nothing proves what landed, so the honest report is a failed start naming the bead it may
+      // have written — not a settled ask, and not a hand-back over ownership no read established.
+      failAfterWrite.set("assign:anton-a", 1);
+      onWrite((call) => {
+        if (call === "assign anton-a operator-1") liveBeads.set("anton-a", undefined);
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a could not be reserved for this start \(bd assign timed out\) and could not be re-read to find out whether that reservation landed anyway/,
+      );
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("leaves a reservation a failed claim write did not take", async () => {
+      // The same rejection over a board that shows somebody else holding the target: either the
+      // write never landed or it has been overtaken since, and unassigning would steal their claim
+      // in the name of undoing ours.
+      failAfterWrite.set("assign:anton-a", 1);
+      onWrite((call) => {
+        if (call === "assign anton-a operator-1") {
+          liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+        }
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch((e) => e)) as Error;
+
+      expect(err.message).toContain("bd assign timed out");
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+    });
+
+    it("leaves a reservation that already locks another anton process's grant", async () => {
+      // This machine's identity is shared by every anton process on it, so a pair that reads WHOLE —
+      // reserved and approved — is a start somebody else is about to make, not the half-applied
+      // state this reconcile exists to clear. Handing it back would cancel their start.
+      failAfterWrite.set("assign:anton-a", 1);
+      onWrite((call) => {
+        if (call === "assign anton-a operator-1") {
+          liveBeads.set("anton-a", startable({ assignee: "operator-1", labels: [LABELS.approved] }));
+        }
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch((e) => e)) as Error;
+
+      expect(err.message).toContain("bd assign timed out");
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
     });
 
     it("hands the reservation back when another writer granted the gate mid-swap", async () => {

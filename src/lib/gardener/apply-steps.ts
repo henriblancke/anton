@@ -864,10 +864,14 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
  *
  * Answers whether the gate was granted HERE: a label that landed in the swap's own window makes this
  * a no-op with a reservation to hand back, which is {@link grantedByAnother}'s question.
+ *
+ * A swap that FAILS is not a swap that lost, and it is reconciled before it propagates — see
+ * {@link reserveForStart}: bd can commit the reservation and then die, which strands the same pair
+ * this ordering exists to keep whole.
  */
 async function grantApproval(repo: string, id: string): Promise<boolean> {
   const operator = await resolveOperator();
-  const swap = await swapUnderLock(repo, id)(undefined, operator);
+  const swap = await reserveForStart(repo, id, operator);
   if (!swap.ok) {
     throw new SubjectMovedError(
       `${id} was claimed by ${swap.owner ?? "another writer"} since this proposal was decided — approving it now would start a run on work somebody else has reserved`,
@@ -886,6 +890,68 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
   }
   await assertReservationHeld(repo, id, swap, operator);
   return true;
+}
+
+/**
+ * Take the reservation, and settle a swap that FAILED rather than lost.
+ *
+ * A lost race comes back as a result; a bd subprocess that times out or exits nonzero comes back as
+ * a rejection — and only the first says what the board holds. `bd assign` commits before the process
+ * that ran it reports, so a rejection can leave the reservation standing, and letting it propagate
+ * would report a start that wrote nothing over a target now assigned WITHOUT `approved`: the one
+ * half-applied state no retry clears, because the picker's eligibility bars every holder and every
+ * re-apply re-asks {@link startBarred}. So the board is re-read and the claim either handed back or
+ * named as stranded, exactly as the label write's own failure path does.
+ *
+ * With no identity to write there is nothing to reconcile — that swap is a verified no-op that never
+ * reaches bd (`beads/claim.ts`), so its failure came from the read alone and propagates untouched.
+ */
+async function reserveForStart(
+  repo: string,
+  id: string,
+  operator: string | undefined,
+): Promise<SwapResult> {
+  try {
+    return await swapUnderLock(repo, id)(undefined, operator);
+  } catch (err) {
+    if (!operator) throw err;
+    throw await strandedReservation(repo, id, operator, err);
+  }
+}
+
+/**
+ * What a failed reservation left on the board, as the error the start fails with.
+ *
+ * The re-read is the only evidence there is: the write reported nothing, so whether it landed is a
+ * question only the board answers. A holder that is not us means the failure wrote nothing we could
+ * take back — either the assign never landed, or somebody has taken the target since, and unassigning
+ * theirs would steal it in the name of an undo. An APPROVED target held by our own identity is left
+ * alone for the reason every other rollback here gives: that identity is shared by every anton
+ * process on this machine, and the pair reading whole means the claim locks a grant somebody else's
+ * start is about to run on.
+ *
+ * Only the strand is re-worded; every other path fails with the write's own error, because the
+ * reason the start failed is what a retry needs and the undo has nothing to add to it.
+ */
+async function strandedReservation(
+  repo: string,
+  id: string,
+  operator: string,
+  err: unknown,
+): Promise<unknown> {
+  const live = await beads.show(repo, id).catch(() => undefined);
+  if (!live) {
+    return new StrandedWriteError(
+      `${id} could not be reserved for this start (${messageOf(err)}) and could not be re-read to find out whether that reservation landed anyway — if it did, it is assigned to ${operator} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+      [id],
+    );
+  }
+  if (claimHolder(live) !== operator || beads.isApproved(live)) return err;
+  if (await releaseReservation(repo, id, operator)) return err;
+  return new StrandedWriteError(
+    `${id} could not be reserved for this start (${messageOf(err)}) and the reservation that write left behind could not be released either — it is assigned to ${operator} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+    [id],
+  );
 }
 
 /**

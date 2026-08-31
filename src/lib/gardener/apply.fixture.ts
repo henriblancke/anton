@@ -39,6 +39,12 @@ export const liveBeads = new Map<string, Bead | undefined>();
  * one" is the only way to test a rollback that itself fails.
  */
 export const failOn = new Map<string, number>();
+/**
+ * Writes primed to LAND on the board and THEN reject, keyed the same way — a bd subprocess that
+ * committed its write before it timed out or exited nonzero. The ambiguous half of a failure:
+ * {@link failOn} models one that never reached the board, this one a caller that cannot tell.
+ */
+export const failAfterWrite = new Map<string, number>();
 const seen = new Map<string, number>();
 
 let snapshot: Bead[] = [];
@@ -78,7 +84,8 @@ export function record(verb: string, ...args: string[]): Promise<string> {
   calls.push(call);
   const nth = (seen.get(key) ?? 0) + 1;
   seen.set(key, nth);
-  if (failOn.get(key) === nth) return Promise.reject(new Error(`bd ${verb} exploded`));
+  const committed = failAfterWrite.get(key) === nth;
+  if (!committed && failOn.get(key) === nth) return Promise.reject(new Error(`bd ${verb} exploded`));
   // bd reflects a write immediately, and this module re-reads what it wrote — the rollback before it
   // undoes a move, the next approval before it re-applies one. A board that answered with pre-write
   // state would make those guards untestable.
@@ -92,6 +99,7 @@ export function record(verb: string, ...args: string[]): Promise<string> {
   if (verb === "approve") setLive(args[0] as string, { labels: withLabel(args[0] as string) });
   if (verb === "untag") setLive(args[0] as string, { labels: withoutLabels(args[0] as string, (args[1] ?? "").split(",")) });
   afterWrite?.(call);
+  if (committed) return Promise.reject(new Error(`bd ${verb} timed out`));
   return Promise.resolve("");
 }
 
@@ -140,6 +148,7 @@ export function listBoard(extra: string[]): Promise<Bead[]> {
 export function resetSeam(): void {
   calls.length = 0;
   failOn.clear();
+  failAfterWrite.clear();
   seen.clear();
   liveBeads.clear();
   afterWrite = undefined;
