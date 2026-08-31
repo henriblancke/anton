@@ -362,15 +362,14 @@ function referencesWord(
 /** Files read as MDX — markdown prose around code that runs. */
 const MDX_FILE = /\.mdx$/i;
 
-/** MDX's ESM block: the only place an import or export can stand. */
-const MDX_ESM_LINE = /^\s*(?:import|export)\b/;
-
 /**
- * An ESM statement as JavaScript spells one, rather than a paragraph opening with the word
- * `export`. `MDX_ESM_LINE` can afford to be loose — a prose line it reads as code only leaves a
- * signal standing — but leaving a line's backticks unmasked runs the other way: unmasking the span
- * in ``export the `Widget` helper`` would let that sentence prove a caller and delete a true
- * finding. So the keyword has to be followed by something markdown prose does not put there.
+ * MDX's ESM block: the only place an import or export can stand, spelled as JavaScript spells one
+ * rather than as a paragraph opening with the word `export`. The keyword alone is not enough, in
+ * either of the two places this is asked. Reading `export Widget from the old build` as code lets
+ * a sentence prove its own caller and delete a true finding — and carries that down the paragraph,
+ * since the block runs to the blank line. Leaving that line's backticks unmasked runs the same
+ * way: the span in ``export the `Widget` helper`` would prove a caller too. So the keyword has to
+ * be followed by something markdown prose does not put there.
  */
 const MDX_ESM_STATEMENT =
   /^\s*(?:import\s*(?:[({*'"]|type\b)|import\s+[A-Za-z_$][\w$]*\s*(?:,|from\b)|export\s+(?:default\b|type\b|\*|\{|const\b|let\b|var\b|class\b|(?:async\s+)?function\b))/;
@@ -616,7 +615,7 @@ function mdxOpenLines(code: string[], raw: string[]): boolean[] {
       esm = false;
       continue;
     }
-    if (depth === 0 && !esm && MDX_ESM_LINE.test(line)) esm = true;
+    if (depth === 0 && !esm && MDX_ESM_STATEMENT.test(line)) esm = true;
     for (const char of punctuation(line, () => depth > 0 || esm)) {
       // Only braces hold an expression open; an import's list can also wrap in `(` or `[`, which
       // are ordinary punctuation in the markdown around it.
@@ -639,7 +638,7 @@ function mdxOpenLines(code: string[], raw: string[]): boolean[] {
  * code, so nothing more has to precede the symbol on it.
  */
 function referencesMdx(line: string | undefined, symbol: string, open = false): boolean {
-  if (line !== undefined && (open || MDX_ESM_LINE.test(line))) return referencesWord(line, symbol);
+  if (line !== undefined && (open || MDX_ESM_STATEMENT.test(line))) return referencesWord(line, symbol);
   return referencesWord(line, symbol, (head) => TAG_HEAD.test(head) || insideExpression(head));
 }
 
@@ -1271,12 +1270,23 @@ function maskJsxRendered(line: string): { masked: string; depth: number } {
 type JsxLine =
   /** Program — nothing above it renders. */
   | "code"
-  /** The rendered children of a tag still open above. */
-  | "text"
   /** The attribute list of a tag whose `>` has not arrived yet. */
   | "tag"
   /** A static prop's quoted value, still unterminated, and the quote that opened it. */
-  | { prop: string };
+  | { prop: string }
+  /**
+   * The rendered children of the tags still open above, and how many of them there are. The count
+   * is what a closing tag on the line is subtracted from: collapsing every depth to one parent
+   * ends the outer element's text on a child's `</span>`, and the prose behind it reads as program.
+   */
+  | { text: number }
+  /**
+   * An interpolation the lines above left open, at the brace depth it still stands at, inside the
+   * elements holding it. The depth is carried because the expression can close on the line that
+   * names the symbol — `<span />} Widget was removed` — and past that brace the parent's children
+   * resume, so a line inside an expression is not program all the way across.
+   */
+  | { expression: number; text: number };
 
 /**
  * The line with every tag it finishes blanked out, how many elements those tags leave open, and
@@ -1372,13 +1382,13 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
   for (const [index, line] of code.entries()) {
     states.push(
       expression > 0
-        ? "code"
+        ? { expression, text: depth }
         : tag
           ? quote === undefined
             ? "tag"
             : { prop: quote }
           : depth > 0
-            ? "text"
+            ? { text: depth }
             : "code",
     );
     if (!raw[index]?.trim()) {
@@ -1436,6 +1446,12 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
  * counting that page as a caller deletes a true finding about a genuinely unused symbol.
  *
  * `state` is what the lines above left open — see `jsxLineStates` for why that bound is kept tight.
+ * It carries how many elements stand open, not merely that one does: a `</span>` closed two levels
+ * deep ends the child it names and leaves the `<div>` around it rendering, so reading any depth as
+ * a single parent makes the prose behind that tag program again. An open interpolation carries its
+ * brace depth for the same reason — it can close on this very line, and what follows the brace is
+ * the parent's children rather than more program.
+ *
  * The tags the head finishes are counted the way `jsxLineStates` counts a whole line, so a child
  * element rendered before the prose leaves its parent open rather than ending it:
  * `<p><strong>Note:</strong> Widget was removed</p>` shows the symbol to a reader, and reading the
@@ -1454,15 +1470,25 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
  * so the child text resumes after a `{…}` or an `&mdash;` instead of reading as program.
  */
 function referencesJsx(line: string | undefined, symbol: string, state: JsxLine = "code"): boolean {
-  const wrapped = typeof state === "object" ? state.prop : undefined;
+  const wrapped = typeof state === "object" && "prop" in state ? state.prop : undefined;
+  const parents = typeof state === "object" && "text" in state ? state.text : 0;
+  const opened = typeof state === "object" && "expression" in state ? state.expression : 0;
   return referencesWord(line, symbol, (raw) => {
-    const { masked: head } = maskJsxRendered(raw);
+    let before = raw;
+    if (opened > 0) {
+      const end = jsxExpressionEnd(before, opened);
+      // The expression still runs where the symbol stands, so the symbol is inside the program it
+      // holds; only past the brace that closes it is the parent rendering text again.
+      if (end.at < 0) return true;
+      before = before.slice(end.at + 1);
+    }
+    const { masked: head } = maskJsxRendered(before);
     if (wrapped !== undefined && !head.includes(wrapped)) return false;
-    const within: JsxLine = wrapped === undefined ? state : "tag";
-    if (within === "tag" && JSX_PROP_LINE.test(head)) return false;
+    const inTag = wrapped !== undefined || state === "tag";
+    if (inTag && JSX_PROP_LINE.test(head)) return false;
     if (JSX_PROP_TEXT.test(head)) return false;
     const { net, remainder, after } = jsxTags(head);
-    const open = (within === "text" ? 1 : 0) + net;
+    const open = (inTag ? 0 : parents) + net;
     return open <= 0 || JSX_CODE.test(remainder.slice(after));
   });
 }

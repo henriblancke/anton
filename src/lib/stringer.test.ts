@@ -1532,6 +1532,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // MDX opens its ESM block on a statement, not on a paragraph that happens to start with the
+    // keyword: `export Widget from the old build` is a sentence. Reading it as code lets the prose
+    // prove its own caller — and carries that mistake down the paragraph, since the block runs to
+    // the blank line — while the statement beside it still counts.
+    it("reads an MDX paragraph opening with an ESM keyword as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/notes.mdx": "export Widget from the old build.\n",
+        "docs/para.mdx": "export was dropped from the docs\nWidget was removed in favour of Panel.\n",
+        "docs/uses.mdx": "export const value = Widget()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/para.mdx");
+    });
+
     // The ESM block is not the only executable place a backtick can stand: a braced expression runs
     // too, so the template literal in ``{`${Widget()}`}`` interpolates a real call. Masking it as a
     // markdown span leaves that caller unseen and the finding standing.
@@ -2401,6 +2425,59 @@ describe("scan", () => {
           "    Widget was removed in favour of Panel\n  </div>\n);\n",
         "src/ui/live.tsx":
           "export const Live = () => (\n  <div>\n    {ready &&\n      Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // Elements nest down the page, and how many stand open is what the line under them is reading:
+    // the prose after a `</span>` closed two levels deep is still the `<div>`'s text. Counting one
+    // parent for any depth subtracts that child and reads the sentence as program, so a page naming
+    // a removed component proves its own caller — while the interpolation after the same closing
+    // tag stays the call it is.
+    it("reads JSX text after a closing tag nested two deep as prose, and still counts a call there", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <div>\n    <span>\n      gone\n" +
+          "    </span> Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    <span>\n      gone\n" +
+          "    </span> {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A wrapped child expression can also end on the line that names the symbol: `{ready &&` closes
+    // with `<span />}` and the parent's children resume behind that brace. Reading the whole line as
+    // the program the expression opened lets the prose after it prove its own caller — while the
+    // interpolation written in the same place is still the call it is.
+    it("resumes JSX text past the brace that closes a wrapped expression, and still counts a call there", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <div>\n    {ready &&\n" +
+          "      <span />} Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    {ready &&\n" +
+          "      <span />} {Widget()}\n  </div>\n);\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/ui/widget.tsx", "Widget"),
