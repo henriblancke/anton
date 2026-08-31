@@ -3181,6 +3181,77 @@ describe("scan", () => {
       expect(result.duplication.dropped).toMatchObject([{ path: "src/notes.ts" }]);
     });
 
+    // Hash comments are not what makes `//` prose: Lua has neither, and spells floor division the
+    // way Python does. Derived from the absence of `#`, the marker reads as a comment there and a
+    // genuine clone of wrapped arithmetic is dropped as a block of notes.
+    it("reads a leading `//` as floor division in a language with no comment rule for it", async () => {
+      const repo = writeRepo({
+        "src/ratio.lua": [
+          "local function ratio(total, divisor, scale)",
+          "  return (",
+          "    total",
+          "    // divisor",
+          "    // scale",
+          "  )",
+          "end",
+          "",
+        ].join("\n"),
+        "src/notes.ts": [
+          "export const ready = true;",
+          "// the reporter starts here",
+          "// and stops on the next tick",
+          "// which is what this note is for",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/ratio.lua", 3]], 3),
+        clone([["src/notes.ts", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/ratio.lua"]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/notes.ts" }]);
+    });
+
+    // `function` heads a declaration only where the language says so. In Python it is an ordinary
+    // identifier, so a multiline CALL through it opens a parameter list that no `)` closes for it,
+    // and every line of live work through the real closer is dropped as a signature.
+    it("reads a leading `function(` as a call in a language that declares no function keyword", async () => {
+      const repo = writeRepo({
+        "src/dispatch.py": [
+          "function = registry.lookup(name)",
+          "function(",
+          "    collect(rows),",
+          "    summarize(rows),",
+          "    flush(rows),",
+          ")",
+          "",
+        ].join("\n"),
+        "src/header.ts": [
+          "export function header(",
+          "  prefix: string,",
+          "  suffix: string,",
+          "  trailer: string,",
+          ") {",
+          "  return join(prefix, suffix, trailer);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/dispatch.py", 2]], 3),
+        clone([["src/header.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals.map((s) => s.FilePath)).toEqual(["src/dispatch.py"]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/header.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 signature");
+    });
+
     // A backtick opens a template only where one can open. Inside a quoted string or a trailing
     // comment it is text, and reading it as an opener would file every line below it as template
     // text — turning whole parameter lists into code and keeping the windows this filter is for.

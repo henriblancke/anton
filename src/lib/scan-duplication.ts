@@ -59,6 +59,38 @@ const HASH_COMMENT_EXTENSIONS = [
 const SPACED_HASH_EXTENSIONS = [".sh", ".bash", ".zsh", ".yaml", ".yml"];
 
 /**
+ * Where `//` opens a comment. An ALLOW-list, not "every language that lacks `#` comments": Lua
+ * spells floor division `//` exactly as Python does, so a wrapped expression there leads its
+ * continuation lines with an operator, and reading those as prose drops a genuine clone of
+ * arithmetic. A language anton has no rule for keeps its signals rather than losing them to C's
+ * grammar.
+ */
+const SLASH_COMMENT_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".go",
+  ".rs",
+  ".java",
+  ".kt",
+  ".kts",
+  ".scala",
+  ".swift",
+  ".dart",
+  ".c",
+  ".h",
+  ".cc",
+  ".cpp",
+  ".hpp",
+  ".cs",
+];
+
+/**
  * Where a block comment NESTS — Rust, Swift, Scala, Kotlin and Dart close an outer `/*` only on the
  * closer that MATCHES it. Everywhere else the first closer ends the comment however many openers
  * preceded it, and counting depth there would run the comment past its close over the rest of the
@@ -155,6 +187,26 @@ const BINDING_DECLARATION_EXTENSIONS = [
   ".mjs",
   ".cjs",
   ".rs",
+];
+
+/**
+ * Where `function foo(` and `const f = (` are DECLARATION headers — the JS/TS family, whose tail
+ * grammar (`) {`, `) =>`) these recognizers are written against. `function` is an ordinary
+ * identifier elsewhere: a multiline Python call (`function(do_first(),`) opens a parameter list no
+ * `)` ever closes for it, and every executable line through the real closer inherits `signature`
+ * and is dropped. An ALLOW-list for the same reason as the type, import and binding ones above — a
+ * language whose declarations are spelled differently keeps its signals rather than borrowing JS's
+ * grammar. Rust is off it: `let total = (` opens a parenthesized expression there, never a closure.
+ */
+const FUNCTION_HEADER_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
 ];
 
 /**
@@ -1368,6 +1420,7 @@ function classifyLines(
   opts: {
     hashComments: boolean;
     spacedHash: boolean;
+    slashComments: boolean;
     tripleQuotes: readonly TripleQuote[] | undefined;
     heredocs: boolean;
     nestedComments: boolean;
@@ -1376,6 +1429,7 @@ function classifyLines(
     importDeclarations: boolean;
     typeDeclarations: boolean;
     bindingDeclarations: boolean;
+    functionHeaders: boolean;
     jsx: boolean;
   },
 ): LineClass[] {
@@ -1389,10 +1443,10 @@ function classifyLines(
   // Same boundary for `/* … */`: in a `#`-comment language a `/*` is a path or a glob (`rm /tmp/*`),
   // and reading it as a comment opener would swallow the rest of the file.
   const blockComments = !opts.hashComments;
-  // And for `//`, which marks a comment only where the language says so. Python spells floor
-  // division `//`, so a wrapped expression (`value = (total\n  // divisor\n)`) leads lines that
-  // plainly compute with one; read as prose they would drop the window as non-code.
-  const slashComments = !opts.hashComments;
+  // `//` marks a comment only in the languages that spell one that way. Python and Lua both spell
+  // floor division `//`, so a wrapped expression (`value = (total\n  // divisor\n)`) leads lines
+  // that plainly compute with one; read as prose they would drop the window as non-code.
+  const slashComments = opts.slashComments;
   // Which spelling of the side-effect import this language uses: Go's requires the blank name,
   // since its bare quoted form binds the package instead.
   const sideEffectImport = opts.boundBareImport ? BLANK_IMPORT : SIDE_EFFECT_IMPORT;
@@ -1666,8 +1720,8 @@ function classifyLines(
       continue;
     }
 
-    const declared = FUNCTION_START.test(line);
-    if (declared || ARROW_START.test(line)) {
+    const declared = opts.functionHeaders && FUNCTION_START.test(line);
+    if (declared || (opts.functionHeaders && ARROW_START.test(line))) {
       const open = parenDelta(line);
       // Only a header whose parameter list runs on is a declaration BLOCK; one that closes on its
       // own line is a single line of real code and is counted as such — as is one that defaults.
@@ -1814,6 +1868,7 @@ function sourceIndex(repoPath: string) {
       lines: classifyLines(source, {
         hashComments: HASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         spacedHash: SPACED_HASH_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        slashComments: SLASH_COMMENT_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         tripleQuotes: TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext))
           ? TRIPLE_QUOTES
           : DOUBLE_TRIPLE_QUOTE_EXTENSIONS.some((ext) => rel.endsWith(ext))
@@ -1826,6 +1881,7 @@ function sourceIndex(repoPath: string) {
         importDeclarations: IMPORT_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         typeDeclarations: TYPE_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         bindingDeclarations: BINDING_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        functionHeaders: FUNCTION_HEADER_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         jsx: JSX_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
