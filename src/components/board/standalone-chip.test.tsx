@@ -3,30 +3,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { contractStatusOf } from "@/lib/beads/contract";
 import type { Bead } from "@/lib/beads/types";
-import type { StandaloneItem } from "@/lib/types";
+import { makeStandaloneItem } from "@/components/board/standalone-item.fixture";
 import { StandaloneChip } from "@/components/board/standalone-chip";
 import { StandaloneGroup } from "@/components/board/standalone-group";
 import { TypeBadge } from "@/components/board/type-language";
 
-function makeItem(over: Partial<StandaloneItem> = {}): StandaloneItem {
-  return {
-    id: "t-1",
-    title: "Loose task",
-    type: "task",
-    status: "open",
-    stage: "backlog",
-    approved: false,
-    assignee: null,
-    createdAt: "",
-    createdBy: null,
-    blockedBy: [],
-    ready: true,
-    unread: false,
-    deferred: false,
-    abandoned: false,
-    ...over,
-  };
-}
+const makeItem = makeStandaloneItem;
 
 describe("StandaloneChip", () => {
   it("renders a task chip with its type label and an Approve & run affordance in the backlog", () => {

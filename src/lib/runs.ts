@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
@@ -80,6 +80,18 @@ export async function listRunsPaged(
   return rows.map(toSummary);
 }
 
+function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
+  return {
+    ...toSummary(row),
+    leaseExpiresAt: toEpoch(row.leaseExpiresAt),
+    error: row.error ?? undefined,
+    jobId: row.jobId ?? undefined,
+    reviewScore: row.reviewScore ?? undefined,
+    formula: row.formula ?? undefined,
+    formulaVariant: row.formulaVariant ?? undefined,
+  };
+}
+
 export async function getRunDetail(
   projectId: string,
   runId: string,
@@ -90,22 +102,29 @@ export async function getRunDetail(
     .where(and(eq(schema.runs.projectId, projectId), eq(schema.runs.id, runId)))
     .limit(1);
   const row = rows[0];
-  if (!row) return undefined;
-  return {
-    ...toSummary(row),
-    leaseExpiresAt: toEpoch(row.leaseExpiresAt),
-    error: row.error ?? undefined,
-    formula: row.formula ?? undefined,
-    formulaVariant: row.formulaVariant ?? undefined,
-  };
+  return row ? toDetail(row) : undefined;
 }
 
 // ── Write path (anton-dzh.5): db-injectable so the runner/tests share one connection ──
+
+/**
+ * The next value of the `runs.write_seq` counter, taken inside the statement that writes the row —
+ * SQLite serializes writers, so MAX+1 is atomic there and needs no separate sequence table.
+ *
+ * Stamped by EVERY write path below, without exception: the column is only settlement order
+ * (see its note in schema.ts) because a settled run's last write is its settlement, and a write
+ * that skipped the stamp would leave that run ordered by the second-granular proxy instead.
+ */
+function nextWriteSeq() {
+  return sql`(SELECT IFNULL(MAX(w.write_seq), 0) + 1 FROM runs w)`;
+}
 
 export interface CreateRunInput {
   id: string;
   projectId: string;
   epicBeadId: string;
+  /** The execute-epic job starting this attempt (anton-rgso) — see the column's own note. */
+  jobId?: string;
   ticketBeadId?: string;
   worktreePath?: string;
   branch?: string;
@@ -121,6 +140,7 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     id: input.id,
     projectId: input.projectId,
     epicBeadId: input.epicBeadId,
+    jobId: input.jobId,
     ticketBeadId: input.ticketBeadId,
     worktreePath: input.worktreePath,
     branch: input.branch,
@@ -129,12 +149,15 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     status: input.status ?? "running",
     startedAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
+    writeSeq: nextWriteSeq(),
   });
   return input.id;
 }
 
 export type RunPatch = Partial<{
   status: RunStatus;
+  /** Rewritten on every resume: the job behind the attempt is the one a cancel would name. */
+  jobId: string | null;
   ticketBeadId: string | null;
   worktreePath: string | null;
   branch: string | null;
@@ -145,6 +168,8 @@ export type RunPatch = Partial<{
   formulaVariant: string | null;
   attempts: number;
   error: string | null;
+  /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
+  reviewScore: number | null;
   endedAt: number; // ms; converted to seconds
 }>;
 
@@ -155,7 +180,10 @@ export async function updateRun(
   id: string,
   patch: RunPatch,
 ): Promise<void> {
-  const set: Record<string, unknown> = { updatedAt: secDate(clock.now()) };
+  const set: Record<string, unknown> = {
+    updatedAt: secDate(clock.now()),
+    writeSeq: nextWriteSeq(),
+  };
   for (const [k, v] of Object.entries(patch)) {
     if (k === "endedAt" && typeof v === "number") set.endedAt = secDate(v);
     else set[k] = v;
@@ -186,6 +214,7 @@ export async function settleParkedRun(
       error: reason,
       endedAt: secDate(nowMs),
       updatedAt: secDate(nowMs),
+      writeSeq: nextWriteSeq(),
     })
     .where(
       and(
@@ -248,13 +277,66 @@ export async function listRecentRuns(
   projectId: string,
   limit: number,
 ): Promise<RunSummary[]> {
-  const rows = await db
+  return (await recentRunRows(db, projectId, limit)).map(toSummary);
+}
+
+/**
+ * The newest `limit` runs of a project, in a TOTAL order (anton-rgso).
+ *
+ * `updatedAt` is stored whole-second, so runs settling in the same second tie on it — and with
+ * concurrent execution that is ordinary, not exotic. Left as the only key, SQLite is free to return
+ * such a tie either way round, and the autopilot breakers read this list as a sequence: one
+ * delivered run placed before rather than after two same-second failures resets a streak instead of
+ * latching it, and at the boundary the `limit` itself would take different rows on different reads.
+ *
+ * `writeSeq` breaks it, and breaks it CORRECTLY: it is a global counter stamped on every write to a
+ * run row, so a settled run's stamp is the instant it settled, ordered against every other run's at
+ * a granularity the second-wide timestamps cannot express. Start order would only be a proxy, and a
+ * proxy that inverts exactly where it is needed — a run started first can finish after one started
+ * later — so a later-started delivery would sort newest and reset a streak that the failure it
+ * actually settled before should have kept.
+ *
+ * `startedAt` and `rowid` remain behind it for the rows written before the column existed, whose
+ * `writeSeq` is null: deterministic, which is the weaker property those rows can still have.
+ */
+function recentRunRows(
+  db: AntonDb,
+  projectId: string,
+  limit: number,
+  offset = 0,
+): Promise<(typeof schema.runs.$inferSelect)[]> {
+  return db
     .select()
     .from(schema.runs)
     .where(eq(schema.runs.projectId, projectId))
-    .orderBy(desc(schema.runs.updatedAt))
-    .limit(limit);
-  return rows.map(toSummary);
+    .orderBy(
+      desc(schema.runs.updatedAt),
+      desc(schema.runs.writeSeq),
+      desc(schema.runs.startedAt),
+      sql`rowid desc`,
+    )
+    .limit(limit)
+    .offset(offset);
+}
+
+/**
+ * {@link listRecentRuns} with each run's ERROR and review SCORE attached (anton-rgso, anton-cekf).
+ * Both autopilot breakers read a column the list view has no use for: the consecutive-failure one
+ * compares failures BY their message — that is how it tells one broken environment from several hard
+ * tickets — and the score-regression one judges each attempt on the score that attempt earned.
+ * db-injectable and read-only, like its sibling.
+ *
+ * `offset` pages further back in that same total order. The score breaker needs it because it
+ * collapses a target's repeat attempts onto one entry, so how many ROWS its window costs is not
+ * knowable before the read (see `jobs/picker-score-breaker.ts`).
+ */
+export async function listRecentRunOutcomes(
+  db: AntonDb,
+  projectId: string,
+  limit: number,
+  offset = 0,
+): Promise<RunDetail[]> {
+  return (await recentRunRows(db, projectId, limit, offset)).map(toDetail);
 }
 
 /**
@@ -317,8 +399,10 @@ export async function findRunFormulaForBranch(
         isNotNull(schema.runs.formula),
       ),
     )
-    // `updatedAt` is second-granular, so two attempts inside one second can tie; `startedAt` breaks it.
-    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.startedAt))
+    // `updatedAt` is second-granular, so two attempts inside one second can tie; `writeSeq` — the
+    // per-write counter — breaks it by which attempt actually settled last, with `startedAt` behind
+    // it for rows written before that column existed.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
     .limit(1);
   const row = rows[0];
   if (!row?.formula) return undefined;

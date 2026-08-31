@@ -1,0 +1,103 @@
+import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+
+import { makeStandaloneItem } from "@/components/board/standalone-item.fixture";
+import { ChipHeader, ChipMeta, prLabel } from "@/components/board/standalone-chip-parts";
+
+describe("prLabel", () => {
+  it("shortens a bead external-ref to its PR number", () => {
+    expect(prLabel("gh-218")).toBe("#218");
+    expect(prLabel("https://github.com/o/r/pull/42")).toBe("#42");
+  });
+
+  it("falls back to the raw ref when no trailing number is there to shorten", () => {
+    expect(prLabel("gh-main")).toBe("gh-main");
+  });
+});
+
+describe("ChipHeader", () => {
+  it("goes inert under the chip's open trigger but keeps a linked PR clickable", () => {
+    const html = renderToStaticMarkup(
+      <ChipHeader
+        item={makeStandaloneItem({ prRef: "gh-42", prUrl: "https://x/pull/42" })}
+        hasOverlay
+      />,
+    );
+    expect(html).toContain("pointer-events-none"); // the row itself must not eat the overlay's clicks
+    expect(html).toContain("pointer-events-auto"); // …the PR link opts back in
+    expect(html).toContain("https://x/pull/42");
+  });
+
+  it("keeps the row live when no overlay sits behind it", () => {
+    const html = renderToStaticMarkup(<ChipHeader item={makeStandaloneItem()} hasOverlay={false} />);
+    expect(html).not.toContain("pointer-events-none");
+  });
+
+  it("leaves an unlinked PR ref un-clickable rather than a dead link", () => {
+    const html = renderToStaticMarkup(
+      <ChipHeader item={makeStandaloneItem({ prRef: "gh-42" })} hasOverlay />,
+    );
+    expect(html).toContain("#42");
+    expect(html).not.toContain("pointer-events-auto");
+  });
+
+  it("green-tints a shipped PR and never an abandoned one", () => {
+    const shipped = makeStandaloneItem({ stage: "done", prRef: "gh-42" });
+    expect(renderToStaticMarkup(<ChipHeader item={shipped} hasOverlay />)).toContain("text-stage-done");
+    expect(
+      renderToStaticMarkup(<ChipHeader item={{ ...shipped, abandoned: true }} hasOverlay />),
+    ).not.toContain("text-stage-done");
+  });
+
+  it("pulses `working` only while implementing without a PR to point at", () => {
+    const working = makeStandaloneItem({ stage: "implementing" });
+    expect(renderToStaticMarkup(<ChipHeader item={working} hasOverlay />)).toContain("working");
+    // Once the PR is up it speaks for the run; two live indicators would say the same thing twice.
+    expect(
+      renderToStaticMarkup(<ChipHeader item={{ ...working, prRef: "gh-42" }} hasOverlay />),
+    ).not.toContain("working");
+  });
+
+  it("marks a self-filed bug that is still awaiting triage", () => {
+    const html = renderToStaticMarkup(
+      <ChipHeader item={makeStandaloneItem({ type: "bug", unread: true })} hasOverlay />,
+    );
+    expect(html).toContain('aria-label="Unread"');
+  });
+});
+
+describe("ChipMeta", () => {
+  it("carries the type, id, agent and risk of the item", () => {
+    const html = renderToStaticMarkup(
+      <ChipMeta
+        item={makeStandaloneItem({ agent: "nextjs", risk: "high" })}
+        deferred={false}
+        hasOverlay
+      />,
+    );
+    expect(html).toContain("t-1");
+    expect(html).toContain("Task");
+    expect(html).toContain("nextjs");
+    expect(html).toContain("high");
+  });
+
+  it("shows blockers only in the backlog, where they still hold a run back", () => {
+    const blocked = makeStandaloneItem({ ready: false, blockedBy: ["t-9"] });
+    expect(renderToStaticMarkup(<ChipMeta item={blocked} deferred={false} hasOverlay />)).toContain(
+      "blocked by t-9",
+    );
+    expect(
+      renderToStaticMarkup(
+        <ChipMeta item={{ ...blocked, stage: "implementing" }} deferred={false} hasOverlay />,
+      ),
+    ).not.toContain("blocked by t-9");
+  });
+
+  it("renders the snoozed chip from the passed (optimistic) value, not the item's own flag", () => {
+    // The chip flips the moment the operator snoozes; `item.deferred` only catches up on the next poll.
+    const html = renderToStaticMarkup(
+      <ChipMeta item={makeStandaloneItem({ deferred: false })} deferred hasOverlay />,
+    );
+    expect(html).toContain("snoozed");
+  });
+});

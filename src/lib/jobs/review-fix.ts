@@ -46,7 +46,14 @@ import {
   type Actionable,
   type PrReview,
 } from "../git/pr";
-import { createWorktree, findWorktree, removeWorktree, worktreePathFor, type Worktree } from "../git/worktree";
+import {
+  createWorktree,
+  findWorktree,
+  removeWorktree,
+  withWorktreeClaim,
+  worktreePathFor,
+  type Worktree,
+} from "../git/worktree";
 import { resolveOperator } from "../operator";
 import {
   getProjectById,
@@ -140,6 +147,21 @@ export function inReviewEpics(
     if (epicBeadId) return b.id === epicBeadId; // targeted run — ownership bypassed
     return ownedByOperator(b, operator);
   });
+}
+
+/**
+ * Who this job is, as the worktree claim records it. The same name goes to `createWorktree`, which
+ * refuses to hand a claimed checkout to anyone but its holder.
+ *
+ * The job id is part of it because "review-fix" alone is not one holder: the project-wide sweep and
+ * a gate-check's targeted fix for the same epic are two jobs that `enqueueReviewFixIfAbsent`
+ * deliberately allows to coexist, and a claim they share is no claim at all — `conflictingClaim`
+ * only rejects a holder whose owner differs from the caller, so the second job would reuse the
+ * checkout and interleave its fetch/merge/claude/commit/push with the first's in one directory.
+ * Distinct owners make that the conflict it is; the readable prefix keeps refusal logs legible.
+ */
+export function claimOwnerFor(jobId: string): string {
+  return `review-fix#${jobId}`;
 }
 
 /** Build the runner handler bound to a db/clock. Register it as the "review-fix" handler. */
@@ -246,11 +268,18 @@ async function handleEpic(args: {
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return; // nothing to fix on this PR yet.
 
-  // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
-  // sync it with origin, and pre-merge the base if GitHub reports a conflict.
-  const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number });
+  // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
+  // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
+  // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
+  // the commit and push behind it.
+  const claimOwner = claimOwnerFor(ctx.jobId);
+  await withWorktreeClaim(repo, branch, claimOwner, async () => {
+    // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
+    // sync it with origin, and pre-merge the base if GitHub reports a conflict.
+    const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number, claimOwner });
 
-  await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
+    await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
+  });
 }
 
 /**
@@ -268,10 +297,18 @@ async function prepareFixWorktree(args: {
   baseBranch: string | undefined;
   pr: PrReview;
   number: number;
+  /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
+  claimOwner: string;
 }): Promise<{ worktree: Worktree; conflicts: string[] }> {
-  const { ctx, repo, branch, settings, baseBranch, pr, number } = args;
+  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } = args;
 
-  const worktree = await createWorktree({ repoPath: repo, branch, baseBranch: settings.baseBranch, warm: false });
+  const worktree = await createWorktree({
+    repoPath: repo,
+    branch,
+    baseBranch: settings.baseBranch,
+    warm: false,
+    claimedBy: claimOwner,
+  });
   // Fail loudly here rather than letting a missing worktree ride through the best-effort git steps
   // below — `safe()` swallows their errors, so the first thing to actually report the problem would
   // be `spawn <claude> ENOENT` from the cwd, which names the wrong culprit entirely (anton-2wvb).
@@ -477,8 +514,64 @@ async function notifyReReview(args: {
 
 // ── merge finalization (anton-ner.5) ──
 
+/** A child whose commit is on the branch — `in_progress` included, see {@link undeliveredAtMerge}. */
+const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
+
 /**
- * Finalize an epic whose PR merged: close the epic + any still-open child tickets, drop the
+ * Delivery evidence: a status that means a commit landed, and no won't-do decision on top of it.
+ * An abandoned child is closed but explicitly undelivered (execute-epic drops it from `live` for
+ * the same reason), so it carries no mechanism for the tickets behind it.
+ */
+const deliveredAtMerge = (b: Bead | undefined): boolean =>
+  !!b && DELIVERED_AT_MERGE.has(b.status) && !beads.isAbandoned(b);
+
+/**
+ * The children a merged target must NOT close — the tickets its run deliberately left for a human
+ * (anton-67xj.1). A merge says the branch shipped, not that every ticket under the target ran, and
+ * closing one that never ran turns the bd note it carries into a pointer at work the board now
+ * reads as delivered.
+ *
+ * Two shapes, one rule. A ticket the run BLOCKED says so in its status — its budget ran out and its
+ * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. Two narrower
+ * sub-shapes — a timeout that fired after the commit, and a post-commit failure — do leave work on
+ * the branch; they are held back for the same reason all the same, because their note asks a human
+ * to review and close by hand, not because nothing landed. A ticket that merely WAITS on a blocked
+ * one was never dispatched (anton-67xj) and stays `open` so the board keeps offering it, so nothing
+ * but the `blocks` edge distinguishes it from an ordinary open child. Hence the transitive closure
+ * over the run's own `blocks` edges.
+ *
+ * A DELIVERED dependent stops the walk. Its commit is on the branch whatever its blocker did — the
+ * run carries on past a timeout, so a ticket behind one still gets dispatched — and the tickets
+ * behind IT have the mechanism they were written against. Delivery is `closed`, or `in_progress`:
+ * a child's close write is best-effort (execute-epic), so a transient bd failure leaves a ticket
+ * that committed claimed and mid-stage. Reading that bookkeeping failure as "never ran" would
+ * strand shipped work open, when the merge is precisely what repairs it. An ABANDONED child is the
+ * exception (deliveredAtMerge): closed on a human's won't-do, with no commit behind it, so the walk
+ * passes straight through to whatever waited on it.
+ */
+export function undeliveredAtMerge(children: Bead[]): Set<string> {
+  const byId = new Map(children.map((c) => [c.id, c]));
+  const keep = new Set(children.filter((c) => c.status === "blocked").map((c) => c.id));
+  // blocker id → the run's own tickets waiting on it; edges leaving the run are another gate's
+  // business (a ticket held on an outside blocker was never in this run's dispatch set).
+  const dependents = new Map<string, string[]>();
+  for (const e of beads.edgesOf(children)) {
+    if (e.type !== "blocks" || !byId.has(e.from) || !byId.has(e.to)) continue;
+    dependents.set(e.to, [...(dependents.get(e.to) ?? []), e.from]);
+  }
+  const queue = [...keep];
+  while (queue.length) {
+    for (const dependent of dependents.get(queue.shift()!) ?? []) {
+      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent))) continue;
+      keep.add(dependent); // never revisited, so a cycle terminates
+      queue.push(dependent);
+    }
+  }
+  return keep;
+}
+
+/**
+ * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, drop the
  * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
  *
  * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
@@ -496,7 +589,10 @@ export async function finalizeMergedEpic(args: {
   repo: string;
   projectId: string;
   epic: Bead;
-  /** The run target's whole ticket subtree (runTickets); open ones close alongside the epic. */
+  /**
+   * The run target's whole ticket subtree (runTickets), carrying its inline `blocks` edges. Open
+   * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
+   */
   children: Bead[];
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;
@@ -509,8 +605,13 @@ export async function finalizeMergedEpic(args: {
   //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
   //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
   //    orphaning a still-open ticket/epic behind a run already marked done.
+  //    The target itself always closes — its PR merged — but the children its run never delivered
+  //    are held back (undeliveredAtMerge), or the board loses the work a human still has to run.
+  const undelivered = undeliveredAtMerge(children);
   const stillOpen = new Map(
-    [...children, epic].filter((b) => b.status !== "closed").map((b) => [b.id, b]),
+    [...children.filter((b) => !undelivered.has(b.id)), epic]
+      .filter((b) => b.status !== "closed")
+      .map((b) => [b.id, b]),
   ); // by id: a leaf run target is its own ticket, so it can appear on both sides
   const closed = await safe(() =>
     beads.batch(repo, [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id }))),

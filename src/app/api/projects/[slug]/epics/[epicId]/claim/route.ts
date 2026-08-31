@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, withClaimLock, type SwapResult } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, stealRefused, withClaimLock, type SwapResult } from "@/lib/beads/claim";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { resolveOperator } from "@/lib/operator";
 import { deriveStage } from "@/lib/ticket-view";
@@ -162,9 +162,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // Already claimed by someone else → stealing must be explicit, so a claim can't silently stomp a
   // teammate's reservation. Re-claiming your own is idempotent and needs no steal.
   if (owner && owner !== operator && !(await readSteal(request))) {
-    return NextResponse.json(
-      { error: `${epicId} is already claimed by ${owner} — pass { steal: true } to take it over`, owner },
-      { status: 409 },
+    return stealRefused(
+      `${epicId} is already claimed by ${owner} — pass { steal: true } to take it over`,
+      owner,
     );
   }
 
@@ -200,9 +200,9 @@ export const DELETE = withProject<{ slug: string; epicId: string }>(async (reque
     const operator = await resolveOperator();
     if (owner !== operator) {
       if (!(await readSteal(request))) {
-        return NextResponse.json(
-          { error: `${epicId} is claimed by ${owner} — pass { steal: true } to release someone else's claim`, owner },
-          { status: 409 },
+        return stealRefused(
+          `${epicId} is claimed by ${owner} — pass { steal: true } to release someone else's claim`,
+          owner,
         );
       }
       // A steal with no resolvable operator identity (no ANTON_OPERATOR, no global git user.name) is
@@ -211,12 +211,9 @@ export const DELETE = withProject<{ slug: string; epicId: string }>(async (reque
       // standing between a crafted body and a teammate's reservation. POST/approve both refuse a steal
       // they can't attribute; a release must too — clearing someone's claim is no less consequential.
       if (!operator) {
-        return NextResponse.json(
-          {
-            error: `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is releasing someone else's claim`,
-            owner,
-          },
-          { status: 409 },
+        return stealRefused(
+          `${epicId} is claimed by ${owner} — set ANTON_OPERATOR (or git user.name) to identify who is releasing someone else's claim`,
+          owner,
         );
       }
     }

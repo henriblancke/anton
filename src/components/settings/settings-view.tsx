@@ -6,6 +6,7 @@ import type { Project } from "@/lib/types";
 import { PageHeader } from "@/components/atoms";
 import { AgentsSection } from "@/components/settings/sections/agents-section";
 import { AutomationSection } from "@/components/settings/sections/automation-section";
+import { AutopilotSection } from "@/components/settings/sections/autopilot-section";
 import { DangerSection } from "@/components/settings/sections/danger-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
@@ -89,14 +90,15 @@ export function SettingsView({
     polling: active === "automation",
   });
 
-  // Elements, not components: building all twelve costs a `createElement` each and keeps the panel
-  // choice a lookup rather than a twelve-arm chain — only the one this renders ever mounts.
+  // Elements, not components: building all thirteen costs a `createElement` each and keeps the panel
+  // choice a lookup rather than a thirteen-arm chain — only the one this renders ever mounts.
   const panels: Record<SectionId, ReactNode> = {
     general: <GeneralSection project={project} form={form} />,
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,
     execution: <ExecutionSection form={form} />,
+    autopilot: <AutopilotSection form={form} />,
     value: <ValueSection form={form} labelVocabulary={labelVocabulary} />,
     gates: <GatesSection form={form} />,
     review: <ReviewSection form={form} agents={agents} />,

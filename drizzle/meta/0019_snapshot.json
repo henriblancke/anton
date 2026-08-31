@@ -1,9 +1,115 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "c53bcfab-7262-4082-9100-106a0deef8ae",
+  "id": "6dd0e9ff-c7c0-4c05-a549-d0902b569a59",
   "prevId": "86398029-0c11-4911-8897-839ab1ca8015",
   "tables": {
+    "autopilot_disarms": {
+      "name": "autopilot_disarms",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "evidence_json": {
+          "name": "evidence_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'[]'"
+        },
+        "escalation_id": {
+          "name": "escalation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "disarmed_at": {
+          "name": "disarmed_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch())"
+        },
+        "rearmed_at": {
+          "name": "rearmed_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "rearmed_by": {
+          "name": "rearmed_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "autopilot_disarms_latched_unique": {
+          "name": "autopilot_disarms_latched_unique",
+          "columns": [
+            "project_id"
+          ],
+          "isUnique": true,
+          "where": "\"autopilot_disarms\".\"rearmed_at\" is null"
+        },
+        "autopilot_disarms_project_idx": {
+          "name": "autopilot_disarms_project_idx",
+          "columns": [
+            "project_id",
+            "disarmed_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "autopilot_disarms_project_id_projects_id_fk": {
+          "name": "autopilot_disarms_project_id_projects_id_fk",
+          "tableFrom": "autopilot_disarms",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
     "board_picker_plans": {
       "name": "board_picker_plans",
       "columns": {
@@ -483,20 +589,6 @@
         },
         "last_error": {
           "name": "last_error",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "outcome": {
-          "name": "outcome",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "outcome_note": {
-          "name": "outcome_note",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

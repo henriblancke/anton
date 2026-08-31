@@ -78,6 +78,15 @@ export interface EditableSettings {
   };
   /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
   valueLabels?: string[];
+  /**
+   * The autopilot brakes (anton-nmy7): when anton stops STARTING work. `autopilotWipLimit` is a
+   * self-clearing hold; the other three latch a disarm only a human re-arms. Each absent value
+   * falls back to its shipped default.
+   */
+  autopilotWipLimit?: number;
+  autopilotFailureStreak?: number;
+  autopilotScoreFloor?: number;
+  autopilotScoreWindow?: number;
 }
 
 /** Per-automation schedule state from the server; a missing row means "not scheduled yet". */

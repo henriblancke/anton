@@ -13,7 +13,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
-import { parseGardenerPlan } from "./detections";
+import { withBeadWriteLock } from "../beads/claim-lock";
+import { parseGardenerPlan, proposalFingerprint } from "./detections";
 import {
   apply,
   applyWith,
@@ -23,6 +24,7 @@ import {
   CARD,
   child,
   CLOSE,
+  CARRIED,
   CLUSTER,
   cold,
   DEFER,
@@ -111,9 +113,42 @@ describe("the plan a proposal carries — read strictly, because it decides what
   it.each([
     ["subjects swapped under a kept fingerprint", { ...REPARENT, subjects: ["anton-zzz"] }],
     ["a target redirected under a kept fingerprint", { ...REPARENT, target: "anton-elsewhere" }],
-    ["a subject appended under a kept fingerprint", { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] }],
+    ["a subject appended under a kept fingerprint", { ...REPARENT, subjects: ["anton-a", "anton-b"] }],
+    ["a cluster's target redirected under a kept fingerprint", { ...CLUSTER, target: "anton-elsewhere" }],
   ])("rejects %s", (_case, value) => {
     expect(parseGardenerPlan(value)).toBeUndefined();
+  });
+
+  // The one kind whose subject list the FINGERPRINT does not cover (anton-9hpp): a cluster's
+  // membership is re-derived every patrol, so hashing it gave the same claim a fresh fingerprint
+  // each time and four proposals for one target stood open at once. Suppression is target-shaped
+  // for that reason — two memberships under one target are one open ask.
+  it("fingerprints a cluster by its target, so any membership is the same open ask", () => {
+    const grown = planFor({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-a", "anton-b", "anton-c"],
+      target: CARD.id,
+    });
+    expect(grown.fingerprint).toBe(CLUSTER.fingerprint);
+    expect(grown.subjectChecksum).not.toBe(CLUSTER.subjectChecksum);
+  });
+
+  // …and the guard the fingerprint gave up is carried by the CHECKSUM instead, so the membership is
+  // still bound. Without it, editing the list manufactures the grouping evidence apply re-derives:
+  // naming a ticket the home already carries makes it an in-place member, and a single loose bead
+  // rides under a home no fresh patrol would propose for it.
+  it("rejects a cluster whose membership was edited under a kept fingerprint", () => {
+    const grown = { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] };
+    expect(parseGardenerPlan(grown)).toBeUndefined();
+    // A dropped guard is an edit too — a plan that simply omits it is not a plan the emitter wrote.
+    const unguarded: Record<string, unknown> = { ...CLUSTER };
+    delete unguarded.subjectChecksum;
+    expect(parseGardenerPlan(unguarded)).toBeUndefined();
+    // The kinds whose fingerprint already binds the list carry none, and one appearing is the same
+    // tell: a plan whose identity says more than its execution does.
+    const guarded = { ...REPARENT, subjectChecksum: CLUSTER.subjectChecksum };
+    expect(parseGardenerPlan(guarded)).toBeUndefined();
   });
 
   // `move` and `retireAs` are the two fields the hash can't cover, so the kind→verb pairing is what
@@ -130,6 +165,50 @@ describe("the plan a proposal carries — read strictly, because it decides what
   it("accepts subjects in any order — the identity is the set, not the listing", () => {
     const reordered = { ...CLUSTER, subjects: ["anton-b", "anton-a"] };
     expect(parseGardenerPlan(reordered)).toEqual(reordered);
+  });
+
+  // …and a set has no repeats. The target-identified kind is the one the hash cannot catch this on,
+  // and it is also the one that counts its subjects: `groupedUnder` would read one bead listed twice
+  // as two members, so a single bead already under the home would settle as an applied cluster no
+  // detector ever derived.
+  it("rejects a subject named twice, which a target's own identity cannot catch", () => {
+    expect(parseGardenerPlan({ ...CLUSTER, subjects: ["anton-a", "anton-a"] })).toBeUndefined();
+    // The same bar on the kinds whose hash would have caught it anyway — one rule, not two.
+    expect(parseGardenerPlan({ ...REPARENT, subjects: ["anton-a", "anton-a"] })).toBeUndefined();
+  });
+
+  /**
+   * The rollout (anton-9hpp): a cluster proposal filed BEFORE the claim moved to its target hashes
+   * the membership it was found with. Rejecting it would strand every one already open — apply would
+   * report "no readable proposal move" forever while the next patrol filed a fresh-format duplicate
+   * beside it, which is the duplicate state target-identity exists to remove. So the older identity
+   * is accepted on read, and only for the kind whose identity actually moved.
+   */
+  it("accepts the membership hash a cluster filed before the identity moved still carries", () => {
+    const legacy = {
+      ...CLUSTER,
+      fingerprint: proposalFingerprint(
+        "parentless-cluster",
+        `parentless-cluster:${[...CLUSTER.subjects].sort().join("+")}>${CLUSTER.target}`,
+      ),
+    };
+    expect(legacy.fingerprint).not.toBe(CLUSTER.fingerprint);
+    expect(parseGardenerPlan(legacy)).toEqual(legacy);
+
+    // And it reads back WITHOUT the subject guard, which the older emitter never wrote: that
+    // fingerprint hashes the membership itself, so the list it binds is already bound.
+    const unguarded: Record<string, unknown> = { ...legacy };
+    delete unguarded.subjectChecksum;
+    expect(parseGardenerPlan(unguarded)).toEqual(unguarded);
+    // …but a guard that disagrees with the list is still an edit, whichever identity carries it.
+    expect(parseGardenerPlan({ ...legacy, subjectChecksum: "0".repeat(12) })).toBeUndefined();
+
+    // The concession is that kind's alone: nothing else ever hashed anything but its own subjects.
+    const wrongKind = {
+      ...REPARENT,
+      fingerprint: proposalFingerprint("container-orphan", "container-orphan:*>anton-card"),
+    };
+    expect(parseGardenerPlan(wrongKind)).toBeUndefined();
   });
 });
 
@@ -209,6 +288,66 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ).rejects.toMatchObject({
       failure: "refused",
       message: expect.stringContaining("no longer reads as applied"),
+    });
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  /**
+   * A cluster whose every surviving member somebody already filed under the home settles without a
+   * step — so the per-step premise locks (apply-steps.ts `lockedBeads`) never run, and the settlement
+   * is the only thing standing between the container claim and a proposal closed as applied over it.
+   * `deleteTicket` takes the deleted ticket's own lock and no other, so neither end of the plan
+   * orders that write against this one.
+   *
+   * Asserted as the lock rather than through a staged race, like the step's own: the harm is exactly
+   * that the window is invisible to a fresh read.
+   */
+  it("takes the write lock of the carriers a settled cluster's home premise rests on", async () => {
+    // The direct carrier, and then the bead a nested one reaches the home THROUGH — deleting the
+    // intermediate cuts the carrier loose without touching the carrier itself.
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const cases: [string, Bead[]][] = [
+      [CARRIED.id, [CARD, CARRIED]],
+      [note.id, [CARD, note, child("anton-t0", note.id)]],
+    ];
+    for (const [held, home] of cases) {
+      resetSeam();
+      const proposal = proposalFor(CLUSTER);
+      const board = [...home, child("anton-a", CARD.id), child("anton-b", CARD.id), proposal];
+      let release = () => {};
+      const queued = withBeadWriteLock(REPO, held, () => new Promise<void>((r) => (release = r)));
+
+      const run = apply(proposal, board);
+      try {
+        await new Promise((r) => setTimeout(r, 10));
+        expect(calls, `${held} was not held`).toEqual([]);
+      } finally {
+        release();
+        await queued;
+      }
+      await expect(run).resolves.toMatchObject({ changed: [] });
+    }
+  });
+
+  // And the settlement counts the SAME narrowed set the locks cover. A ticket filed under the home
+  // since the decision is one nothing here holds, so letting it carry the container premise would
+  // restore the very race the locks close — the counted carrier can be deleted a moment later.
+  it("refuses to settle a cluster whose home swapped its ticket for one nothing locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set(CARRIED.id, bead(CARRIED.id)); // the counted ticket is detached…
+    liveBeads.set("anton-t1", child("anton-t1", CARD.id)); // …and an unlocked one takes its place
+
+    await expect(
+      apply(proposal, [
+        CARD,
+        CARRIED,
+        child("anton-a", CARD.id),
+        child("anton-b", CARD.id),
+        proposal,
+      ]),
+    ).rejects.toMatchObject({
+      failure: "refused",
+      message: expect.stringContaining("no longer carries the tickets this proposal was decided against"),
     });
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
@@ -340,7 +479,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const result = await apply(
       proposal,
-      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal],
       "policy",
       controller.signal,
     );
@@ -357,7 +496,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const result = await apply(
       proposal,
-      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal],
       "policy",
       controller.signal,
     );
@@ -374,7 +513,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // only half holds.
   it("serializes two approvals of one cluster — the loser writes nothing", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, bead("anton-a"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal];
     setSnapshot(board); // the winner's close lands on this board, and is what the loser then reads
 
     const [winner, loser] = await Promise.allSettled([
@@ -397,7 +536,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(CLUSTER);
     liveBeads.set("anton-a", child("anton-a", CARD.id));
 
-    const result = await apply(proposal, [CARD, bead("anton-a"), bead("anton-b"), proposal]);
+    const result = await apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]);
 
     expect(result.changed).toEqual(["anton-b"]);
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-b anton-card"]);

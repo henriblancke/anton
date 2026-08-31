@@ -26,6 +26,12 @@ export const runs = sqliteTable("runs", {
   projectId: text("project_id").notNull().references(() => projects.id),
   epicBeadId: text("epic_bead_id").notNull(),
   ticketBeadId: text("ticket_bead_id"),
+  // The execute-epic job currently behind this run (anton-rgso), rewritten when a resume picks the
+  // parked row back up. The durable half of "did an operator stop this attempt": a cancel is
+  // recorded on the JOB and never on the run, and the two stamps can be days apart — a job parked on
+  // a usage limit is cancelled whenever the operator gets to it — so a timestamp match cannot tell
+  // that cancel from a genuine failure. Null on rows written before this column existed.
+  jobId: text("job_id"),
   worktreePath: text("worktree_path"),
   branch: text("branch"),
   model: text("model"),
@@ -38,13 +44,33 @@ export const runs = sqliteTable("runs", {
   formulaVariant: text("formula_variant"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
+  // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports
+  // one. The board carries the same number as a `review-score:<n>` label, but that label is the
+  // TARGET's latest score, not any one attempt's: a rerun that settles without being reviewed would
+  // lend its target's old score to a new run row, and the score-regression breaker would judge — and
+  // freeze — a project on reviews that happened before those runs, or before the operator's last
+  // re-arm. Recorded per attempt so the join cannot lie.
+  reviewScore: integer("review_score"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),
   startedAt: ts("started_at"),
   endedAt: ts("ended_at"),
   updatedAt: ts("updated_at").notNull().default(now),
-});
+  // A global counter stamped on every write to this row (anton-rgso), so the rows carry the one
+  // thing no timestamp here can: SETTLEMENT ORDER. Every `ts` column is whole-second, and with
+  // per-project concurrency two runs settling in the same second is ordinary — but the autopilot
+  // breakers read the run list as a sequence, where a delivery placed before rather than after a
+  // failure resets a streak instead of latching it. Start order is only a proxy for settlement
+  // order and inverts precisely when the runs overlap; a run's LAST write is its settlement, so
+  // descending `writeSeq` is settlement order by construction. Null on rows written before this
+  // column existed, which fall back to that proxy.
+  writeSeq: integer("write_seq"),
+}, (table) => [
+  // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
+  // write an index lookup instead of a table scan.
+  index("runs_write_seq_idx").on(table.writeSeq),
+]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
 export const jobs = sqliteTable(
@@ -52,7 +78,7 @@ export const jobs = sqliteTable(
   {
     id: text("id").primaryKey(),
     // execute-epic | review-fix | nightly-stringer | orphan-grooming | sync-push | run-health |
-    // unstick | gate-check | gardener
+    // unstick | gate-check | gardener | product-master | board-picker | worktree-reaper
     type: text("type").notNull(),
     projectId: text("project_id").references(() => projects.id),
     payloadJson: text("payload_json").notNull().default("{}"),
@@ -199,6 +225,52 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
   /** Denormalized so a lane badge / refresh token needn't parse the blob. */
   targetCount: integer("target_count").notNull().default(0),
 });
+
+/**
+ * The autopilot's DISARM latch, per project (anton-5c8h / R4.6). A disarm is the half of the brake
+ * that does not clear itself: a score regression or a run of failures freezes the picker until a
+ * human looks at the evidence and re-arms it, and this row is both the freeze and the audit trail of
+ * who lifted it.
+ *
+ * Only the disarm is stored. A HOLD (the WIP limit) is derived from live run/PR state on every pass
+ * and clears the moment that state changes — persisting it would create a second, staler answer to a
+ * question the board can already answer, and a stale hold is a stopped autopilot nobody can explain.
+ *
+ * Append-only rather than one row per project: `rearmed_at` closes a disarm instead of deleting it,
+ * so "this project was disarmed for score regression twice last week, and Henri re-armed it both
+ * times" survives. The partial unique index is what keeps at most ONE latched at a time, the same
+ * shape `escalations_open_unique` uses for the same reason.
+ */
+export const autopilotDisarms = sqliteTable(
+  "autopilot_disarms",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** `DisarmReason` (src/lib/autopilot-breaker.ts): score-regression | consecutive-failures. */
+    reason: text("reason").notNull(),
+    /** Why, in the detector's own words — the sentence the lane header prints under the heading. */
+    detail: text("detail").notNull(),
+    /** `string[]`: the score series or the failed runs. The operator's whole case for re-arming. */
+    evidenceJson: text("evidence_json").notNull().default("[]"),
+    /** The escalation this disarm raised (R4.6), so the header's `Investigate` lands on it. */
+    escalationId: text("escalation_id"),
+    disarmedAt: ts("disarmed_at").notNull().default(now),
+    /** Null while the breaker is latched. Set by an explicit human re-arm, never by a pass. */
+    rearmedAt: ts("rearmed_at"),
+    /** WHO re-armed it (`resolveOperator`) — a re-arm is a decision, and decisions have an author. */
+    rearmedBy: text("rearmed_by"),
+  },
+  (table) => [
+    // At most one LATCHED disarm per project: a second detector tripping while the first is unlifted
+    // must not stack a second freeze the operator has to clear twice.
+    uniqueIndex("autopilot_disarms_latched_unique")
+      .on(table.projectId)
+      .where(sql`${table.rearmedAt} is null`),
+    index("autopilot_disarms_project_idx").on(table.projectId, table.disarmedAt),
+  ],
+);
 
 /**
  * One gardener patrol's hygiene report (anton-3nv7). Unlike `run_health_reports` this is one row PER

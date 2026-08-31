@@ -172,6 +172,8 @@ describe("persistReviewScores", () => {
   it("keeps going when a board write fails — a degraded history never fails a landed run", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     comment.mockRejectedValueOnce(new Error("bd locked"));
+    // The score still comes back for the run row: a degraded BOARD history must not cost the
+    // breaker the number this attempt actually earned.
     await expect(
       persistReviewScores("/repo", "anton-t", {
         ...result({
@@ -181,7 +183,7 @@ describe("persistReviewScores", () => {
           ],
         }),
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(8);
     expect(comment).toHaveBeenCalledTimes(2); // round 2 still written
     expect(setReviewScore).toHaveBeenCalledWith("/repo", "anton-t", 8, []);
   });
