@@ -26,6 +26,7 @@ import {
   HUMAN_GATE_ARMED_LABEL,
   NeedsHumanError,
   orderTickets,
+  reopenableAfterStop,
   ParkedAskError,
   reviewParkMessage,
   runReadiness,
@@ -1088,5 +1089,54 @@ describe("isForeignRunOwner — what proves another machine owns the branch (ant
   it("refuses any other failure — a crash is not a foreign owner", () => {
     expect(isForeignRunOwner(new Error("boom"))).toBe(false);
     expect(isForeignRunOwner(undefined)).toBe(false);
+  });
+});
+
+describe("reopenableAfterStop — whose timed-out ticket is it now (PR #199 review)", () => {
+  /** The state runTicket's rolled-back timeout leaves behind, and the run's release then unowns. */
+  const stalled = (over: Partial<Bead> = {}): Bead =>
+    ({
+      id: "t1",
+      title: "t1",
+      status: "blocked",
+      labels: ["not-delivered"],
+      ...over,
+    }) as Bead;
+
+  it("reopens the ticket this run's timeout left blocked", () => {
+    expect(reopenableAfterStop(stalled())).toBe(true);
+  });
+
+  it("reopens one the best-effort block write never reached", () => {
+    // `beads.setStatus(blocked)` is best-effort in the timeout path, so its failure leaves the bead
+    // `in_progress` and unowned — which `bd update --claim` refuses just as flatly.
+    expect(reopenableAfterStop(stalled({ status: "in_progress" }))).toBe(true);
+  });
+
+  it("leaves a ticket somebody has since CLAIMED alone", () => {
+    // A resumed attempt on another machine took this bead while the run walked its independent
+    // tickets. Resetting it to `open` advertises live work as claimable and invites a second run.
+    expect(
+      reopenableAfterStop(stalled({ status: "in_progress", assignee: "someone@else" })),
+    ).toBe(false);
+  });
+
+  it("leaves a human's own verdict alone", () => {
+    // Closed or abandoned is a person's decision about this ticket; reopening re-queues work they
+    // just killed.
+    expect(reopenableAfterStop(stalled({ status: "closed" }))).toBe(false);
+    expect(
+      reopenableAfterStop(stalled({ status: "closed", labels: ["not-delivered", "abandoned"] })),
+    ).toBe(false);
+  });
+
+  it("leaves a ticket that has since been RE-RUN alone", () => {
+    // runTicket clears `not-delivered` the moment it claims the bead, so a marker that is gone means
+    // another attempt is delivering this work — its status is that run's to hold, not ours to reset.
+    expect(reopenableAfterStop(stalled({ labels: [] }))).toBe(false);
+  });
+
+  it("writes nothing to a ticket already back at `open`", () => {
+    expect(reopenableAfterStop(stalled({ status: "open" }))).toBe(false);
   });
 });

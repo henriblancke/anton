@@ -1574,6 +1574,17 @@ async function applyRehome(
         // onto the winner instead — the rival reaches that same bead, so the preserved tickets stay
         // under one target. A delete that fails leaves finalization undone rather than a second run
         // target on the board asking to be approved.
+        //
+        // …but only while it is still ANTON'S to delete, on a read taken HERE rather than on the
+        // `mine` read the winner was elected from (PR #199 review). `beads.delete` is irreversible,
+        // and a human approving this epic or a worker claiming it is exactly what the losing rivals
+        // above are guarded against — this side of the race needs the same guard, since the same
+        // window sits between that election read and this call. A follow-up anton cannot prove is
+        // still untouched (or cannot re-read at all) is left standing and the source held open; the
+        // next sweep converges anyway, because a touched epic is neither a reuse candidate nor a
+        // rival, so the tickets still end up under exactly one home.
+        const ours = await reread(followUp);
+        if (!ours || !untouched(ours)) return { ...none, unfinished: followUp };
         if (!(await safe(() => beads.delete(repo, followUp))))
           return { ...none, unfinished: followUp };
         // …unless the winner has since become somebody's run, which is the one thing tickets must

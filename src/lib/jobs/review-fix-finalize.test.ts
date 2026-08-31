@@ -618,6 +618,39 @@ describe("finalizeMergedEpic", () => {
     expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
   });
 
+  it("leaves its OWN losing follow-up standing once somebody takes it (PR #199 review)", async () => {
+    // The window between electing the winner and deleting the loser is the same one the losing
+    // rivals above are guarded against: a human can approve this epic, or a worker claim it, and
+    // `bd delete --force` is irreversible — it would take a globally claimed run off the board.
+    // So the delete is decided on a read taken immediately before it, and a follow-up that has
+    // been taken is left standing with the merged source held open. The next sweep converges
+    // anyway: a touched epic is neither a reuse candidate nor a rival.
+    const rival = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+      created_at: "2026-01-01T00:00:00.000Z",
+    } as Bead;
+    createdAt.set("epic-2", "2026-01-01T00:00:05.000Z"); // ours loses — it is the younger
+    listMock.mockResolvedValueOnce([]).mockResolvedValue([rival]);
+    const board = showMock.getMockImplementation()!;
+    let ourReads = 0;
+    showMock.mockImplementation(async (repo: string, id: string) => {
+      // A worker claims our follow-up after the election read and before the delete.
+      if (id === "epic-2" && ++ourReads > 1) assignees.set("epic-2", "op-2");
+      return board(repo, id);
+    });
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(deleteMock).not.toHaveBeenCalled();
+    // Nothing moves onto the winner either — the preserved ticket would then be split across two
+    // live homes — and finalization is left undone, so the merged target stays open.
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   it("reconciles a younger rival whose process died after creating it (PR #199 review)", async () => {
     // The losing process normally deletes its own duplicate the moment it sees this one — but a
     // process that crashes right after its create never gets there. Cleaning up only this process's

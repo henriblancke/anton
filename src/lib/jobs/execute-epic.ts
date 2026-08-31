@@ -1987,6 +1987,28 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // logged with its repair, the escalation every other must-land write on this seam makes.
       if (!ctx.signal.aborted) {
         for (const stalled of timedOut.filter((t) => !t.committed)) {
+          // Decided on a read taken HERE, not on the ledger (PR #199 review) — see
+          // {@link reopenableAfterStop} for the state that read has to still find.
+          const live = await beads.show(repo, stalled.id).catch(() => undefined);
+          // A read that failed is not evidence the ticket is still ours, and a reopen written on
+          // that silence is the very overwrite this guard exists to prevent — so it takes the same
+          // escalation as a refused write: left as it stands, with the repair named.
+          if (!live) {
+            console.error(
+              `[execute-epic] ${epicBeadId}: could not re-read ${stalled.id} to reopen it, so its ` +
+                `status stands — if it is still \`blocked\`, runTicket's claim gate refuses it and ` +
+                `the resume this run advertises dies on it. Check it by hand: bd show ${stalled.id}`,
+            );
+            continue;
+          }
+          if (!reopenableAfterStop(live)) {
+            console.warn(
+              `[execute-epic] ${epicBeadId}: left ${stalled.id} as it stands (status ` +
+                `${live.status}${ownerOf(live) ? `, held by ${ownerOf(live)}` : ""}) — it moved on ` +
+                `from the timeout this run recorded, so reopening it is not this run's call`,
+            );
+            continue;
+          }
           if (!(await mustPersist(() => beads.setStatus(repo, stalled.id, "open")))) {
             console.error(
               `[execute-epic] ${epicBeadId}: could not reopen ${stalled.id} — it stays \`blocked\`, ` +
@@ -4458,6 +4480,34 @@ export interface SkipCause {
 export interface TicketTimeoutOutcome {
   id: string;
   committed: boolean;
+}
+
+/**
+ * Whether a LIVE read of a ticket this run's budget stopped is still the run's to reopen
+ * (PR #199 review).
+ *
+ * A stopping run puts the timeouts it absorbed back at `open`, because the resume it advertises
+ * starts at runTicket's hard claim gate and that gate refuses the status the timeout left. But the
+ * ledger it works from is a snapshot taken when the timeout landed, and the run walked every
+ * independent ticket behind it before it stopped: in that window a resumed attempt elsewhere can
+ * have claimed the bead, and a human can have closed or abandoned it. Rewriting the status then
+ * downgrades live work or undoes a person's decision, so the reopen is decided on the board as it
+ * is now, against the state THIS run's timeout path leaves behind:
+ *
+ * - still carrying `not-delivered` — the marker runTicket clears the moment anyone re-runs the
+ *   ticket, so it surviving means nobody has;
+ * - unowned — the run gave its reservation back a few lines above, and an assignee that appeared
+ *   since is somebody else's claim;
+ * - `blocked`, or `in_progress` when the timeout's best-effort block write did not land — the two
+ *   statuses the claim gate refuses, and the only two this path exists to repair. `open` needs no
+ *   write; `closed` is a human's verdict.
+ */
+export function reopenableAfterStop(b: Bead): boolean {
+  return (
+    beads.isNotDelivered(b) &&
+    ownerOf(b) === undefined &&
+    (b.status === "blocked" || b.status === "in_progress")
+  );
 }
 
 /**
