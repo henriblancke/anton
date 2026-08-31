@@ -175,6 +175,31 @@ describe("settings route — agents allowlist + autonomy (anton-46w)", () => {
     expect("budgetAware" in persisted()).toBe(false);
   });
 
+  it("PATCH persists the keep-weekly answer, and GET restores it (anton-3xa9)", async () => {
+    // The opt-out only works if it survives the session that gave it — otherwise arming the picker
+    // asks the same question forever.
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.keepProductMasterWeekly).toBe(true);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings.keepProductMasterWeekly).toBe(true);
+  });
+
+  it("PATCH rejects a non-boolean keepProductMasterWeekly (anton-3xa9)", async () => {
+    for (const bad of ["yes", 1, {}]) {
+      const res = await PATCH(patchReq({ keepProductMasterWeekly: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it('PATCH "" / null clears keepProductMasterWeekly back to unasked (anton-3xa9)', async () => {
+    await PATCH(patchReq({ keepProductMasterWeekly: true }), ctx("tmp"));
+    const res = await PATCH(patchReq({ keepProductMasterWeekly: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect("keepProductMasterWeekly" in persisted()).toBe(false);
+  });
+
   it("PATCH persists a budgetPolicy, and GET restores it (anton-egrg)", async () => {
     const budgetPolicy = { daytimeReservePct: 25, weeklyTargetPct: 80 };
     const res = await PATCH(patchReq({ budgetPolicy }), ctx("tmp"));
@@ -443,8 +468,66 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect((await get.json()).settings).toMatchObject({ reviewMinScore: 0, reviewLowScoreRounds: 3 });
   });
 
+  it("PATCH persists the consecutive-failure streak, including 0 as the off switch (anton-rgso)", async () => {
+    const res = await PATCH(patchReq({ autopilotFailureStreak: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().autopilotFailureStreak).toBe(5);
+
+    // 0 is a VALUE here, not a clear: it is how the operator turns the breaker off.
+    const off = await PATCH(patchReq({ autopilotFailureStreak: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotFailureStreak).toBe(0);
+
+    for (const bad of [11, -1, 2.5, "three"]) {
+      const rejected = await PATCH(patchReq({ autopilotFailureStreak: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotFailureStreak/);
+    }
+    expect(persisted().autopilotFailureStreak).toBe(0);
+  });
+
+  it("PATCH persists the score floor and window, including 0 as the off switch (anton-cekf)", async () => {
+    const res = await PATCH(patchReq({ autopilotScoreFloor: 8, autopilotScoreWindow: 4 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted()).toMatchObject({ autopilotScoreFloor: 8, autopilotScoreWindow: 4 });
+
+    // 0 is a VALUE for the floor — the operator's opt-out — and out of range for the window, which
+    // has no meaning at zero runs.
+    const off = await PATCH(patchReq({ autopilotScoreFloor: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotScoreFloor).toBe(0);
+
+    for (const bad of [11, -1, 2.5, "seven"]) {
+      const rejected = await PATCH(patchReq({ autopilotScoreFloor: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotScoreFloor/);
+    }
+    for (const bad of [0, 11, 1.5]) {
+      const rejected = await PATCH(patchReq({ autopilotScoreWindow: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotScoreWindow/);
+    }
+    expect(persisted()).toMatchObject({ autopilotScoreFloor: 0, autopilotScoreWindow: 4 });
+  });
+
+  it("PATCH persists the WIP limit, including 0 as the off switch (anton-wy9y)", async () => {
+    const res = await PATCH(patchReq({ autopilotWipLimit: 5 }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().autopilotWipLimit).toBe(5);
+
+    // 0 is a VALUE here, not a clear: it is how an operator who reviews faster than anton ships
+    // turns the hold off.
+    const off = await PATCH(patchReq({ autopilotWipLimit: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.autopilotWipLimit).toBe(0);
+
+    for (const bad of [21, -1, 1.5, "three"]) {
+      const rejected = await PATCH(patchReq({ autopilotWipLimit: bad }), ctx("tmp"));
+      expect(rejected.status).toBe(400);
+      expect((await rejected.json()).error).toMatch(/autopilotWipLimit/);
+    }
+    expect(persisted().autopilotWipLimit).toBe(0);
+  });
+
   it("PATCH rejects out-of-range score-alarm thresholds", async () => {
-    for (const bad of [11, -1, 4.5, "low"]) {
+    for (const bad of [11, -1, 4.5, "low", "7", true]) {
       const res = await PATCH(patchReq({ reviewMinScore: bad }), ctx("tmp"));
       expect(res.status).toBe(400);
       expect((await res.json()).error).toMatch(/reviewMinScore/);

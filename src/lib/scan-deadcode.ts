@@ -1235,7 +1235,7 @@ const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![
  * The delimiters JSX spells its own syntax with — the only punctuation that means anything between
  * a tag and its children, since code stands there solely inside a `{…}`.
  */
-const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]=;\\|\``;
+const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]=\\|\``;
 
 /**
  * The brackets a call is spelled with, which are the program's outside every element —
@@ -1246,11 +1246,19 @@ const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]=;\\|\``;
 const JSX_PARENS = String.raw`()`;
 
 /**
+ * The statement terminator, which ends a line of program — `const half = total / 2;` — and joins
+ * two clauses inside an element: `<p>Deprecated; Widget was removed</p>` shows the symbol to a
+ * reader the way a doc page does, and reading that semicolon as program lets a prose-only page
+ * prove its own caller and delete a true finding.
+ */
+const JSX_STATEMENT = String.raw`;`;
+
+/**
  * Every delimiter that means something on a line standing outside an element. A generic closes with
  * the same `>` a tag does — `new Map<Widget>()` — so text that claims to be rendered has to read as
  * a sentence before it is believed, or a real call goes uncounted.
  */
-const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_PARENS}`;
+const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_PARENS}${JSX_STATEMENT}`;
 
 /**
  * Arithmetic, which is program text on a line standing outside every element — `const half =
@@ -1263,7 +1271,10 @@ const JSX_OPERATORS = String.raw`&+*/`;
 /** Anything that makes a line outside an element program — an interpolation, a call, arithmetic. */
 const JSX_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}${JSX_OPERATORS}]`);
 
-/** That same test for text a tag has opened, where an operator or an aside is punctuation the page shows. */
+/**
+ * That same test for text a tag has opened, where an operator, an aside and the semicolon between
+ * two clauses are punctuation the page shows.
+ */
 const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_CHILD_DELIMITERS}]`);
 
 /** What a reader sees: a tag this line leaves open, with only prose behind it. */

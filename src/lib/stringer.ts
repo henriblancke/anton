@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
 import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
+import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
 import { PoisonError } from "./jobs/errors";
 
 const execFileAsync = promisify(execFile);
@@ -178,6 +179,11 @@ export interface ScanResult {
    * counted them (see {@link filterCouplingSignals}).
    */
   coupling: CouplingFilter;
+  /**
+   * What the non-code filter removed from `signals` before anyone counted them — the duplication
+   * signals whose reported block holds no executable statement (see {@link filterDuplicationSignals}).
+   */
+  duplication: DuplicationFilter;
   /**
    * What the reference check removed from `signals` — dead-code findings whose symbol has callers
    * elsewhere in the tree — before anyone counted them (see {@link filterDeadcodeSignals}).
@@ -592,7 +598,8 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
  *
  * It is also the one seam where a signal can still be dropped from BOTH readers at once — see
- * {@link dropUntrackedSignals}, {@link filterCouplingSignals} and {@link filterDeadcodeSignals}.
+ * {@link dropUntrackedSignals}, {@link filterCouplingSignals}, {@link filterDuplicationSignals} and
+ * {@link filterDeadcodeSignals}.
  */
 async function readAnnotatedSignals(
   scanFile: string,
@@ -602,6 +609,7 @@ async function readAnnotatedSignals(
   signals: ScanSignal[];
   untracked: UntrackedFilter;
   coupling: CouplingFilter;
+  duplication: DuplicationFilter;
   deadcode: DeadcodeFilter;
 }> {
   let parsed: unknown;
@@ -634,17 +642,21 @@ async function readAnnotatedSignals(
   }
 
   const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
-  // Coupling before deadcode: it reads the source of the modules a signal names, so it should never
-  // be paid for a finding the index already contradicted. Deadcode last: one `git grep` per symbol
-  // is cheap but not free, so it runs over only what both filters left.
+  // Coupling after untracked: it reads the source of the modules a signal names, so it should never
+  // be paid for a finding the index already contradicted.
   const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, tracked);
-  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, coupled, {
+  // Same reason, same order: reading the source at a reported clone window is only worth paying for
+  // a finding the index hasn't already contradicted.
+  const { kept: deduped, duplication } = await filterDuplicationSignals(repoPath, coupled);
+  // Deadcode last: one `git grep` per symbol is cheap but not free, so it runs over only what every
+  // cheaper filter left.
+  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, deduped, {
     exclude: opts.exclude,
     abort: opts.abort,
   });
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
-  return { signals: kept, untracked, coupling, deadcode };
+  return { signals: kept, untracked, coupling, duplication, deadcode };
 }
 
 /**
@@ -710,12 +722,7 @@ export async function scan(opts: {
     throw await rejectWithBaselineRestored(toScanError(err, { timeoutMs }), unwind);
   }
 
-  let read: {
-    signals: ScanSignal[];
-    untracked: UntrackedFilter;
-    coupling: CouplingFilter;
-    deadcode: DeadcodeFilter;
-  };
+  let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;
   try {
     read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
       exclude,
@@ -737,6 +744,7 @@ export async function scan(opts: {
     collectorFailures: parseCollectorFailures(stderr),
     untracked: read.untracked,
     coupling: read.coupling,
+    duplication: read.duplication,
     deadcode: read.deadcode,
     deltaState: {
       ...(before ? { before } : {}),

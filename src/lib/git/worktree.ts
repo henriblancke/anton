@@ -9,6 +9,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
+import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
@@ -44,12 +45,27 @@ async function git(repoPath: string, args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+/** Git's own first line for a failed command — what a one-line reaper log can carry. */
+function gitError(err: unknown): string {
+  const e = err as { stderr?: string; message?: string };
+  const text = e.stderr?.trim() || e.message || String(err);
+  return text.split("\n")[0].slice(0, 200);
+}
+
+/**
+ * The directory anton creates this repo's run worktrees under. Also what the reaper scopes its sweep
+ * to — a checkout outside it is not anton's to judge, whatever branch it holds.
+ */
+export function worktreesRootFor(repoPath: string): string {
+  return (
+    process.env[WORKTREES_ROOT_ENV] ??
+    join(dirname(repoPath), ".anton-worktrees", basenameOf(repoPath))
+  );
+}
+
 /** Where a worktree for `branch` should live. Outside the main working tree to avoid bd noise. */
 export function worktreePathFor(repoPath: string, branch: string): string {
-  const root =
-    process.env[WORKTREES_ROOT_ENV] ??
-    join(dirname(repoPath), ".anton-worktrees", basenameOf(repoPath));
-  return join(root, sanitizeBranch(branch));
+  return join(worktreesRootFor(repoPath), sanitizeBranch(branch));
 }
 
 function basenameOf(p: string): string {
@@ -62,47 +78,395 @@ export function sanitizeBranch(branch: string): string {
 }
 
 /**
+ * Serialize whatever touches ONE branch's checkout — creating it, and the reaper's check-and-delete.
+ * Without it the two interleave: the sweep proves a branch is residue, a run starts and checks that
+ * very branch out, and the sweep then force-removes the fresh checkout with its uncommitted work.
+ * Under the lock the sweep's last-moment re-read either SEES the starting run, or the run waits for
+ * the removal and recreates what it needs.
+ *
+ * Per branch, so unrelated runs and sweeps still overlap, and in-process only: anton's runs and its
+ * sweeps share one job runner, which is the whole population racing here. A SECOND anton process
+ * over the same repo does not see this map at all — what holds it off is the git worktree lock
+ * {@link withWorktreeClaim} takes, plus each destructive caller's last-moment re-read.
+ */
+const branchLocks = new Map<string, Promise<void>>();
+
+function branchKey(repoPath: string, branch: string): string {
+  return `${resolve(repoPath)}\u0000${branch}`;
+}
+
+export async function withBranchLock<T>(
+  repoPath: string,
+  branch: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = branchKey(repoPath, branch);
+  const prior = branchLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolveHeld) => (release = resolveHeld));
+  const chain = prior.then(() => held);
+  branchLocks.set(key, chain);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    // Nobody queued behind us, so the key is dropped: the map tracks live contention, not history.
+    if (branchLocks.get(key) === chain) branchLocks.delete(key);
+  }
+}
+
+/**
+ * Who is actively USING a branch's checkout, keyed like the branch lock. Both destructive policies
+ * prove a checkout is residue from RUN ROWS AND THE BOARD, and neither of those crosses a process
+ * boundary: review-fix writes no run row at all, and one anton's run rows say nothing to a second
+ * anton over the same repository. Either way the reader concludes "the bead is still open, release
+ * the worktree" and force-removes a directory somebody is working in, discarding uncommitted work
+ * and failing every command that follows. A claim is the missing evidence — the only thing a
+ * teardown and a sweep re-read about a checkout their own rows cannot account for — so every job
+ * that drives claude in a checkout holds one for as long as it is in there: an execute run for the
+ * length of the run, review-fix for the length of the fix.
+ *
+ * This map is only the IN-PROCESS half of the claim; the durable half is a real `git worktree lock`
+ * on the checkout (see {@link withWorktreeClaim}), which is what a second anton process — whose
+ * teardown would otherwise force-remove the directory this one is fixing in — can actually see.
+ */
+const worktreeClaims = new Map<string, string[]>();
+
+/** Marks a `git worktree lock` reason as anton's claim rather than another tool's lock. */
+const CLAIM_LOCK_PREFIX = "anton-claim";
+
+/** A claim lock's payload, parsed back out of git's lock reason. */
+export interface ClaimLock {
+  owner: string;
+  pid: number;
+  host: string;
+}
+
+/** The lock reason a claim writes. The pid and host are what makes a crashed claim recognizable. */
+function claimLockReason(owner: string): string {
+  return `${CLAIM_LOCK_PREFIX} ${owner.replace(/\s+/g, "-")} pid=${process.pid} host=${hostname()}`;
+}
+
+/** The claim a lock reason encodes, or undefined when the lock is not anton's to reason about. */
+export function parseClaimLock(reason: string | undefined): ClaimLock | undefined {
+  const m = reason?.trim().match(new RegExp(`^${CLAIM_LOCK_PREFIX} (\\S+) pid=(\\d+) host=(\\S+)$`));
+  return m ? { owner: m[1], pid: Number(m[2]), host: m[3] } : undefined;
+}
+
+/** Whether a pid is still running. EPERM means it exists but belongs to another user. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * The still-live claim a lock reason names, or undefined when the reason is not a claim at all or
+ * names a process on THIS machine that has since died. A crashed anton leaves its lock behind, and a
+ * lock nothing may ever break turns one crash into a checkout and branch that leak forever. A claim
+ * recorded on another host is never judged — its pid means nothing here — so it is honoured as-is.
+ */
+export function liveClaimLock(
+  reason: string | undefined,
+  alive: (pid: number) => boolean = pidAlive,
+  host: string = hostname(),
+): ClaimLock | undefined {
+  const claim = parseClaimLock(reason);
+  if (!claim) return undefined;
+  return claim.host === host && !alive(claim.pid) ? undefined : claim;
+}
+
+/** How a live claim reads in a refusal log. */
+export function describeClaimLock(claim: ClaimLock): string {
+  return `${claim.owner} is using the checkout (pid ${claim.pid} on ${claim.host})`;
+}
+
+/**
+ * Hold `branch`'s checkout for as long as `fn` runs. The claim is taken UNDER the branch lock, so it
+ * either lands before a removal starts or waits for that removal to finish — a claim can never be
+ * taken in the window a reaper has already decided to delete in. `fn` itself runs outside the lock:
+ * it drives a claude session for minutes, which no other run's teardown may be blocked on.
+ *
+ * The claim is recorded twice, because one anton process is not the whole population: in the map
+ * above for this process's own reaper, and as a `git worktree lock` on the checkout for every other
+ * process. Nothing about a checkout being in use is implicit to git — a second anton's teardown
+ * force-removes whatever its own rows say is residue — so without that lock a concurrent process
+ * deletes the directory this claim exists to protect, uncommitted fix and all.
+ */
+export async function withWorktreeClaim<T>(
+  repoPath: string,
+  branch: string,
+  owner: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  await acquireWorktreeClaim(repoPath, branch, owner);
+  try {
+    return await fn();
+  } finally {
+    await releaseWorktreeClaim(repoPath, branch, owner);
+  }
+}
+
+/**
+ * The unscoped half of {@link withWorktreeClaim}, for a holder whose lifetime is not a callback: an
+ * execute run claims its checkout for as long as it is executing, then must GIVE THE CLAIM BACK
+ * before its own teardown — the teardown force-removes the checkout, and a live claim (this
+ * process's included) is exactly what refuses that. Prefer the scoped form wherever the claim does
+ * wrap a block; whoever calls this owes a {@link releaseWorktreeClaim} on every exit path.
+ */
+export async function acquireWorktreeClaim(
+  repoPath: string,
+  branch: string,
+  owner: string,
+): Promise<void> {
+  const key = branchKey(repoPath, branch);
+  await withBranchLock(repoPath, branch, async () => {
+    // First claimant wins. Refusing here — not at the createWorktree that follows — is what makes
+    // the claim exclusive even before the checkout exists: two jobs that both claimed an unmaterialized
+    // branch would each see the other in `holders` and BOTH be refused their own checkout.
+    const other = (worktreeClaims.get(key) ?? []).find((h) => h !== owner);
+    if (other) {
+      throw new Error(`[worktree] cannot claim ${branch} for ${owner}: ${other} is using the checkout`);
+    }
+    worktreeClaims.set(key, [...(worktreeClaims.get(key) ?? []), owner]);
+    try {
+      await lockClaimedWorktree(repoPath, branch, owner);
+    } catch (err) {
+      // The map entry alone protects nothing outside this process, so a claim that could not be
+      // recorded on the checkout is no claim: drop it and fail rather than run the fix in a
+      // directory a second anton is still free to force-remove.
+      dropClaim(key, owner);
+      throw err;
+    }
+  });
+}
+
+/**
+ * Give back a claim taken by {@link acquireWorktreeClaim}. Idempotent — a holder that releases on
+ * its teardown path AND in a `finally` must not pay a second, spurious unlock — and taken under the
+ * branch lock, so the git lock is lifted and the map cleared as one step no teardown can read
+ * halfway through.
+ */
+export async function releaseWorktreeClaim(
+  repoPath: string,
+  branch: string,
+  owner: string,
+): Promise<void> {
+  const key = branchKey(repoPath, branch);
+  await withBranchLock(repoPath, branch, async () => {
+    if (!worktreeClaims.get(key)?.includes(owner)) return; // never held, or already given back
+    if (dropClaim(key, owner)) await releaseClaimLock(repoPath, branch);
+  });
+}
+
+/** Drop one holder's in-process claim. True when it was the last, so the git lock may come off. */
+function dropClaim(key: string, owner: string): boolean {
+  const held = worktreeClaims.get(key) ?? [];
+  const at = held.indexOf(owner);
+  const rest = at === -1 ? held : held.filter((_, i) => i !== at);
+  if (rest.length > 0) {
+    worktreeClaims.set(key, rest);
+    return false;
+  }
+  worktreeClaims.delete(key);
+  return true;
+}
+
+/**
+ * Put the claim on the checkout itself, where another process can see it. Applies only once the
+ * checkout exists — at claim time it usually does not (review-fix claims the branch, then
+ * materializes it), and {@link createWorktree} takes the lock for the live claim the moment it does.
+ *
+ * Throws when the lock cannot be installed. The git lock is the ONLY half of the claim a second
+ * anton can read, so proceeding without it means running the fix in a directory another process's
+ * teardown is still free to force-remove, uncommitted work and all — a failure to record the claim
+ * has to fail the claim.
+ */
+async function lockClaimedWorktree(repoPath: string, branch: string, owner: string): Promise<void> {
+  const record = (await listWorktrees(repoPath)).find((r) => !r.isMain && r.branch === branch);
+  if (!record) return; // not materialized yet — createWorktree locks it when it is
+  if (record.locked) {
+    const live = liveClaimLock(record.lockReason);
+    // This process's own claim already says what we want said — a second holder needs no second lock.
+    if (live && live.pid === process.pid && live.host === hostname()) return;
+    // Another anton's live claim, or another tool's lock, is never ours to break or to write over.
+    if (live) throw new Error(`[worktree] cannot claim ${record.path} for ${owner}: ${describeClaimLock(live)}`);
+    if (!parseClaimLock(record.lockReason)) {
+      throw new Error(
+        `[worktree] cannot claim ${record.path} for ${owner}: it is locked by another owner ` +
+          `(${record.lockReason || "no reason given"})`,
+      );
+    }
+    await unlockWorktree(repoPath, record.path); // a dead claim's leftovers
+  }
+  try {
+    await git(repoPath, ["worktree", "lock", "--reason", claimLockReason(owner), record.path]);
+  } catch (err) {
+    throw new Error(
+      `[worktree] could not lock ${record.path} for ${owner}'s claim, so a second anton process ` +
+        `could not see it and might remove the checkout: ${gitError(err)}`,
+    );
+  }
+}
+
+/** How hard a released claim tries to come off before an operator has to be told about it. */
+const CLAIM_RELEASE_ATTEMPTS = 3;
+const CLAIM_RELEASE_BACKOFF_MS = 100;
+
+/**
+ * Lift only THIS process's own claim lock: another anton may since have taken the checkout over.
+ *
+ * Retried, because the lock names a pid that is still running: a transient `git` failure here leaves
+ * every later reaper pass — in this process and every other — reading the leftovers as a live claim,
+ * leaking the worktree and its branch until anton restarts. A release that still cannot be proven is
+ * reported loudly with the command that clears it by hand, never swallowed.
+ */
+async function releaseClaimLock(repoPath: string, branch: string): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= CLAIM_RELEASE_ATTEMPTS; attempt++) {
+    try {
+      const record = (await listWorktrees(repoPath)).find(
+        (r) => !r.isMain && r.branch === branch && r.locked,
+      );
+      const claim = parseClaimLock(record?.lockReason);
+      if (!record || claim?.pid !== process.pid || claim.host !== hostname()) return;
+      await git(repoPath, ["worktree", "unlock", record.path]);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (attempt < CLAIM_RELEASE_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, CLAIM_RELEASE_BACKOFF_MS * attempt));
+      }
+    }
+  }
+  console.error(
+    `[worktree] could not release this process's claim on ${branch} after ${CLAIM_RELEASE_ATTEMPTS} ` +
+      `attempts, so every reaper pass will keep reading it as in use — clear it with ` +
+      `\`git -C ${repoPath} worktree unlock ${worktreePathFor(repoPath, branch)}\`: ${gitError(lastError)}`,
+  );
+}
+
+/** Best-effort `git worktree unlock` — a lock that outlives its holder must not be permanent. */
+async function unlockWorktree(repoPath: string, path: string): Promise<void> {
+  try {
+    await git(repoPath, ["worktree", "unlock", path]);
+  } catch {
+    // Already unlocked, or the record is gone; the caller's removal reports the real outcome.
+  }
+}
+
+/**
+ * The job holding this branch's checkout, or undefined when nothing is. Read under the branch lock
+ * by anything about to delete the checkout — outside it the answer is already stale. In-process
+ * only: a claim held by ANOTHER anton is seen at the moment of removal instead, as the git worktree
+ * lock {@link removeWorktree} refuses on.
+ */
+export function worktreeClaimHolder(repoPath: string, branch: string): string | undefined {
+  return worktreeClaims.get(branchKey(repoPath, branch))?.[0];
+}
+
+/**
+ * The job already holding this branch's checkout when someone OTHER than that holder asks for it,
+ * or undefined when the caller may have it. Both halves of the claim are consulted, because each
+ * covers what the other cannot: this process's map, and the `git worktree lock` a second anton
+ * process leaves — the only evidence of a claim that survives crossing a process boundary.
+ *
+ * Our own process's lock is deliberately not a conflict on its own: the map above is the live
+ * answer for it, and a lock this process failed to release (see {@link releaseClaimLock}) must not
+ * lock the branch out of every later run until anton restarts.
+ */
+function conflictingClaim(
+  holders: string[],
+  record: WorktreeRecord | undefined,
+  caller: string | undefined,
+): string | undefined {
+  const other = holders.find((h) => h !== caller);
+  if (other) return `${other} is using the checkout`;
+  const live = record?.locked ? liveClaimLock(record.lockReason) : undefined;
+  if (live && !(live.pid === process.pid && live.host === hostname())) return describeClaimLock(live);
+  return undefined;
+}
+
+/**
  * Create (or reuse) an isolated worktree + branch off `baseBranch` (default: the repo's current
  * HEAD branch). Idempotent: if a worktree for `branch` already exists it is returned as-is
  * (supports crash recovery / resumable runs). `warm: true` runs project setup (deps install — see
  * {@link resolveWarmCommand}), and is a no-op when nothing is needed.
+ *
+ * Reuse is refused while ANOTHER job holds the checkout (see {@link withWorktreeClaim}). Handing
+ * the same directory to two jobs is worse than failing the second: review-fix and an execute run
+ * would drive git, claude, tests and commits over one working tree, interleaving each other's
+ * edits. The claim holder itself says so with `claimedBy` — it materializes its own checkout under
+ * its claim, and refusing that would deadlock the very job the claim is for.
  */
 export async function createWorktree(opts: {
   repoPath: string;
   branch: string;
   baseBranch?: string;
   warm?: boolean;
+  /**
+   * The claim holder this checkout is being created for, when the caller is one — an execute run
+   * (for the length of the run) or review-fix (for the length of the fix). The claim is installed on
+   * the checkout as part of `git worktree add`, so no window exists in which it reads as unclaimed.
+   */
+  claimedBy?: string;
   /** Abort an in-flight install so an operator's kill doesn't hold the run's slot for the full warm timeout. */
   signal?: AbortSignal;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
-  const existing = await findWorktree(repoPath, branch);
-  // A registration can outlive its checkout: `git worktree list` reports an administrative record,
-  // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
-  // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
-  // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
-  if (existing && existsSync(existing.path)) {
-    if (warm) await warmWorktree(existing, signal);
-    return existing;
-  }
-  // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
-  if (existing) await forgetStaleWorktree(repoPath, existing.path);
+  // Only the registration is serialized against the reaper (see withBranchLock) — warming stays
+  // outside it. A cold install runs for minutes, and by the time it starts the checkout exists and
+  // the run row already names the branch, which is what the sweep re-reads before deleting anything.
+  const wt = await withBranchLock(repoPath, branch, async (): Promise<Worktree> => {
+    // A claim can be held before the checkout exists (review-fix claims, then materializes), and the
+    // git lock that makes it visible to another anton process can only be taken once it does.
+    const holders = worktreeClaims.get(branchKey(repoPath, branch)) ?? [];
+    const record = (await listWorktrees(repoPath)).find((r) => r.branch === branch);
+    const conflict = conflictingClaim(holders, record, opts.claimedBy);
+    if (conflict) {
+      throw new Error(
+        `[worktree] refusing to hand ${branch}'s checkout to a second job: ${conflict}`,
+      );
+    }
+    const claimed = holders[0];
+    const existing: Worktree | null = record
+      ? { path: record.path, branch, baseBranch: branch, repoPath }
+      : null;
+    // A registration can outlive its checkout: `git worktree list` reports an administrative record,
+    // and the directory may already be gone (anton-2wvb). Reusing such a path hands a non-existent
+    // cwd to `spawn`, which fails as ENOENT naming the *executable* — an error that reads as a
+    // missing `claude` binary and sends debugging in entirely the wrong direction. Verify on disk.
+    if (existing && existsSync(existing.path)) {
+      if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
+      return existing;
+    }
+    // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
+    if (existing) await forgetStaleWorktree(repoPath, existing.path);
 
-  const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
-  const path = worktreePathFor(repoPath, branch);
-  await mkdir(dirname(path), { recursive: true });
+    const baseBranch = opts.baseBranch ?? (await currentBranch(repoPath));
+    const path = worktreePathFor(repoPath, branch);
+    await mkdir(dirname(path), { recursive: true });
 
-  if (await branchExists(repoPath, branch)) {
-    await git(repoPath, ["worktree", "add", path, branch]);
-  } else {
-    await git(repoPath, ["worktree", "add", path, "-b", branch, baseBranch]);
-  }
+    // `--lock` as part of the ADD, never a `worktree lock` after it: git documents the two-step form
+    // as racy, and this is the race that matters — between the two commands a concurrent anton's
+    // teardown reads a fresh, unlocked checkout on the expected branch and force-removes it.
+    const lockArgs = claimed ? ["--lock", "--reason", claimLockReason(claimed)] : [];
+    if (await branchExists(repoPath, branch)) {
+      await git(repoPath, ["worktree", "add", ...lockArgs, path, branch]);
+    } else {
+      await git(repoPath, ["worktree", "add", ...lockArgs, path, "-b", branch, baseBranch]);
+    }
 
-  // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
-  // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
-  const resolvedPath = await realpath(path);
-  const wt: Worktree = { path: resolvedPath, branch, baseBranch, repoPath };
+    // Canonicalize so the path matches what `git worktree list --porcelain` reports (symlinked
+    // tmp dirs on macOS otherwise make repeat lookups return a different-looking path).
+    return { path: await realpath(path), branch, baseBranch, repoPath };
+  });
+
   if (warm) await warmWorktree(wt, signal);
   return wt;
 }
@@ -134,6 +498,22 @@ async function currentBranch(repoPath: string): Promise<string> {
   } catch {
     return "HEAD";
   }
+}
+
+/**
+ * Every local branch under `prefix/`. This is the reaper's proof that a branch still EXISTS: a run
+ * row outlives the branch it names, so without it every settled run this project ever ran stays a
+ * sweep candidate — and a permanent `gh` call — forever. It is also the only way branch-only residue
+ * is seen at all, since a branch whose run row is gone (a recreated `anton.db`) has nothing else
+ * pointing at it.
+ */
+export async function listBranches(repoPath: string, prefix: string): Promise<string[]> {
+  const out = await git(repoPath, [
+    "for-each-ref",
+    "--format=%(refname:short)",
+    `refs/heads/${prefix}/`,
+  ]);
+  return out.split("\n").filter(Boolean);
 }
 
 async function branchExists(repoPath: string, branch: string): Promise<boolean> {
@@ -289,51 +669,210 @@ async function stampWarmed(worktreePath: string, label: string): Promise<void> {
   }
 }
 
-/** Return the existing worktree for `branch`, or null. Parses `git worktree list --porcelain`. */
-export async function findWorktree(repoPath: string, branch: string): Promise<Worktree | null> {
+/** One registered checkout, as `git worktree list --porcelain` reports it. */
+export interface WorktreeRecord {
+  path: string;
+  /** The checked-out branch; absent for a detached or bare checkout. */
+  branch?: string;
+  /** Locked — by whichever tool created it. A locked checkout is never anton's to remove. */
+  locked: boolean;
+  /** The lock's reason when git carries one (`git worktree lock --reason`). */
+  lockReason?: string;
+  /** The repo's own working tree, which is never a run worktree. */
+  isMain: boolean;
+}
+
+/** Every checkout git has registered for `repoPath`, main worktree first. */
+export async function listWorktrees(repoPath: string): Promise<WorktreeRecord[]> {
   const out = await git(repoPath, ["worktree", "list", "--porcelain"]);
-  const blocks = out.split(/\n\n+/);
-  const refName = `refs/heads/${branch}`;
-
-  for (const block of blocks) {
-    const lines = block.split("\n");
-    const pathLine = lines.find((l) => l.startsWith("worktree "));
-    const branchLine = lines.find((l) => l.startsWith("branch "));
-    if (!pathLine || !branchLine) continue;
-    if (branchLine.slice("branch ".length) !== refName) continue;
-
-    const path = pathLine.slice("worktree ".length);
-    return { path, branch, baseBranch: branch, repoPath };
+  const records: WorktreeRecord[] = [];
+  for (const block of out.split(/\n\n+/)) {
+    const lines = block.split("\n").filter(Boolean);
+    const path = lines.find((l) => l.startsWith("worktree "))?.slice("worktree ".length);
+    if (!path) continue;
+    const ref = lines.find((l) => l.startsWith("branch "))?.slice("branch ".length);
+    // git writes a bare `locked` line, or `locked <reason>` when one was given.
+    const lock = lines.find((l) => l === "locked" || l.startsWith("locked "));
+    records.push({
+      path,
+      branch: ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined,
+      locked: lock !== undefined,
+      lockReason: lock?.slice("locked ".length).trim() || undefined,
+      isMain: records.length === 0,
+    });
   }
-  return null;
+  return records;
+}
+
+/** Return the existing worktree for `branch`, or null. */
+export async function findWorktree(repoPath: string, branch: string): Promise<Worktree | null> {
+  const record = (await listWorktrees(repoPath)).find((w) => w.branch === branch);
+  return record ? { path: record.path, branch, baseBranch: branch, repoPath } : null;
+}
+
+/** What {@link removeWorktree} actually did — the evidence a reaper's log is written from. */
+export interface WorktreeRemoval {
+  /**
+   * True only when a checkout that WAS there is now gone. A path that was already absent reports
+   * false: a report that counts it as reclaimed inflates every sweep with residue nobody removed.
+   */
+  removed: boolean;
+  /** Why the checkout was left alone. Absent when it was removed (or was never there). */
+  skipped?: string;
+  branchDeleted: boolean;
+  /**
+   * Git's own words for a branch deletion that FAILED with the branch still present — a ref lock, or
+   * a checkout outside this sweep's scope holding it. Absent when the branch went, and absent when it
+   * was already gone: those two are the difference a reaper's log must not blur.
+   */
+  branchSkipped?: string;
+}
+
+/**
+ * Whether the checkout is locked and with what reason, read from the `locked` file in the admin
+ * directory its own `.git` marker points at. This needs neither the repo's index nor `git worktree
+ * list`, so it is what still settles the question when the listing itself is unreadable. Undefined
+ * means "cannot tell" — never "not locked".
+ */
+async function lockedInAdminDir(
+  wt: Worktree,
+): Promise<{ locked: boolean; reason?: string } | undefined> {
+  try {
+    const marker = await readFile(join(wt.path, ".git"), "utf8");
+    const gitDir = marker.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+    if (!gitDir) return undefined;
+    // Resolved against the CHECKOUT, not the process cwd: git writes an absolute gitdir today, but a
+    // relative one (an older git, a moved repo) would otherwise be looked up under wherever anton
+    // happens to be running — and a lock that can't be found reads as "not locked".
+    const lockFile = join(resolve(wt.path, gitDir.trim()), "locked");
+    if (!existsSync(lockFile)) return { locked: false };
+    const reason = await readFile(lockFile, "utf8").catch(() => "");
+    return { locked: true, reason: reason.trim() || undefined };
+  } catch {
+    return undefined;
+  }
+}
+
+/** What {@link removalBlocker} concluded about a checkout it was asked to remove. */
+interface RemovalGuard {
+  /** Why the checkout must be left alone; absent when it is anton's to remove. */
+  blocker?: string;
+  /** A crashed anton's own claim lock is still on it — break that lock before removing. */
+  staleClaimLock?: boolean;
+}
+
+/**
+ * How a lock on the checkout is judged. Another tool's lock always blocks. anton's own claim lock
+ * blocks while the process holding it is alive — that is the whole point of it, and the one signal a
+ * concurrent anton has that the checkout is in use — but a claim whose process died on this machine
+ * is leftovers, not evidence, and is broken rather than honoured forever.
+ */
+function judgeLock(reason: string | undefined, source?: string): RemovalGuard {
+  const live = liveClaimLock(reason);
+  if (live) return { blocker: source ? `${describeClaimLock(live)} — ${source}` : describeClaimLock(live) };
+  if (parseClaimLock(reason)) return { staleClaimLock: true };
+  const detail = reason ?? "no reason given";
+  return { blocker: `locked by another owner (${source ? `${detail} — ${source}` : detail})` };
+}
+
+/**
+ * Why `wt` must be left alone, or an empty guard when it is anton's to remove. Two cases, both read
+ * from git at the moment of removal rather than trusted from a caller's snapshot.
+ *
+ * Someone LOCKED the checkout — another tool, or another anton process holding a claim on it (see
+ * {@link withWorktreeClaim}): `git worktree remove --force` refuses a locked worktree, and the
+ * orphan fallback below would then delete a directory another owner is working in — the lock is
+ * precisely the statement that it must not.
+ *
+ * Or the path is no longer this branch's. Removal is by path and `--force` never checks what is on
+ * it, so a path re-registered between a caller's `listWorktrees` snapshot and this call would be
+ * deleted with whatever uncommitted work is on it. ANY registration that is not exactly this branch
+ * blocks, including a detached HEAD: a reaper reaching a historical run's canonical path with a
+ * branch-only candidate cannot tell anton's own checkout from a replacement someone else put there,
+ * and the two cost opposite amounts to get wrong — an unreapable checkout is one skipped line in the
+ * sweep's report, a wrongly reaped one is somebody's work. A caller with no branch to compare —
+ * project teardown removes by recorded path alone — is unaffected.
+ *
+ * An unreadable listing erases that evidence, so for a checkout still ON DISK it fails CLOSED: the
+ * lock is re-read from the admin directory, and one that can be neither proven nor ruled out is left
+ * for a later pass rather than force-deleted. A path that is already gone has nothing to destroy, so
+ * pruning and branch deletion still proceed — that is the moved/deleted-repo case the fallback below
+ * exists to serve.
+ */
+async function removalBlocker(wt: Worktree): Promise<RemovalGuard> {
+  const target = resolve(wt.path);
+  const records = await listWorktrees(wt.repoPath).catch(() => null);
+  if (records === null) {
+    if (!existsSync(wt.path)) return {};
+    const lock = await lockedInAdminDir(wt);
+    if (lock === undefined) {
+      return { blocker: "git's worktree list is unreadable, so another owner's lock cannot be ruled out" };
+    }
+    if (!lock.locked) return {};
+    return judgeLock(lock.reason, "its lock file, read directly — git's worktree list was unreadable");
+  }
+  const record = records.find((r) => resolve(r.path) === target);
+  if (record?.locked) return judgeLock(record.lockReason);
+  if (wt.branch && record && record.branch !== wt.branch) {
+    const holder = record.branch ? record.branch : "a detached checkout";
+    return { blocker: `git registers ${holder} at that checkout now, not ${wt.branch}` };
+  }
+  return {};
 }
 
 /**
  * Remove the worktree (force, so dirty state is discarded) and prune. If `deleteBranch` is set,
- * also delete the branch. Safe to call when the worktree is already gone (idempotent).
+ * also delete the branch. Safe to call when the worktree is already gone (idempotent), and a no-op
+ * that REPORTS itself when the checkout is locked by another owner — including another anton process
+ * holding a claim on it — or the path has since been registered to a different branch (see
+ * {@link removalBlocker}).
  */
 export async function removeWorktree(
   wt: Worktree,
   opts?: { deleteBranch?: boolean },
-): Promise<void> {
-  if (existsSync(wt.path)) {
+): Promise<WorktreeRemoval> {
+  const guard = await removalBlocker(wt);
+  if (guard.blocker) return { removed: false, skipped: guard.blocker, branchDeleted: false };
+
+  const existed = existsSync(wt.path);
+  if (existed) {
+    // A crashed anton's claim lock still sits on the checkout, and `git worktree remove --force`
+    // refuses a locked worktree — break the dead claim rather than leaking the checkout forever.
+    if (guard.staleClaimLock) await unlockWorktree(wt.repoPath, wt.path);
     try {
       await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
     } catch {
+      // git refuses a checkout another owner locked in exactly the same way it fails on a moved repo,
+      // and a lock taken after the pre-check above lands here. Re-read it before the fallback: the
+      // recursive delete is for a STALE registration, never for a checkout someone just claimed —
+      // that owner's uncommitted work is precisely what the lock says must not be destroyed.
+      const raced = await removalBlocker(wt);
+      if (raced.blocker) return { removed: false, skipped: raced.blocker, branchDeleted: false };
+      if (raced.staleClaimLock) {
+        // A dead claim's lock appearing only now is the one refusal a retry can clear.
+        await unlockWorktree(wt.repoPath, wt.path);
+        try {
+          await git(wt.repoPath, ["worktree", "remove", "--force", wt.path]);
+        } catch {
+          // Still refused — fall through to the orphan check, which proves ownership before deleting.
+        }
+      }
       // The main repository may have been moved or partially deleted before anton is asked to
       // forget it. In that case git cannot remove the worktree, but the checkout is still ours if
       // its .git file points into this repo's worktree administration directory. Remove only that
       // narrowly verified orphan; never recursively delete an arbitrary path from a database row.
-      try {
-        const gitFile = await readFile(join(wt.path, ".git"), "utf8");
-        const adminRoot = resolve(wt.repoPath, ".git", "worktrees") + sep;
-        const gitDir = gitFile.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
-        if (gitDir && resolve(gitDir).startsWith(adminRoot)) {
-          await rm(wt.path, { recursive: true, force: true });
+      if (existsSync(wt.path)) {
+        try {
+          const gitFile = await readFile(join(wt.path, ".git"), "utf8");
+          const adminRoot = resolve(wt.repoPath, ".git", "worktrees") + sep;
+          const gitDir = gitFile.match(/^gitdir:\s*(.+)\s*$/m)?.[1];
+          if (gitDir && resolve(wt.path, gitDir.trim()).startsWith(adminRoot)) {
+            await rm(wt.path, { recursive: true, force: true });
+          }
+        } catch {
+          // Missing/unreadable marker means ownership cannot be proven; leave it for residue
+          // verification to report instead of risking user data.
         }
-      } catch {
-        // Missing/unreadable marker means ownership cannot be proven; leave it for residue
-        // verification to report instead of risking user data.
       }
     }
   }
@@ -344,11 +883,18 @@ export async function removeWorktree(
     // best-effort
   }
 
+  let branchDeleted = false;
+  let branchSkipped: string | undefined;
   if (opts?.deleteBranch) {
     try {
       await git(wt.repoPath, ["branch", "-D", wt.branch]);
-    } catch {
-      // branch already gone
+      branchDeleted = true;
+    } catch (err) {
+      // A failure is not proof of absence. The branch may still be checked out somewhere git won't
+      // delete it from under, or held by a ref lock — and it then stays a candidate on every later
+      // sweep, so only git's own answer may decide whether the log says "gone" or "refused".
+      if (await branchExists(wt.repoPath, wt.branch)) branchSkipped = gitError(err);
     }
   }
+  return { removed: existed && !existsSync(wt.path), branchDeleted, branchSkipped };
 }

@@ -66,6 +66,7 @@ export const DEFAULT_PROPOSAL_AUTONOMY_POLICY: ProposalAutonomyPolicy = {
   oversized: "propose",
   "low-value": "propose",
   "degraded-approval": "propose",
+  "withheld-approval": "propose",
 };
 
 function isAutonomy(value: unknown): value is ProposalAutonomy {
@@ -97,16 +98,18 @@ export function resolveProposalAutonomyPolicy(overrides?: unknown): ProposalAuto
 
 /**
  * What a wrong move COSTS — the reversibility grouping the settings control already presents to the
- * founder (settings-view.tsx `AUTONOMY_GROUPS`), reused here because a bar is a price and these are
+ * founder (settings-autonomy.ts `AUTONOMY_GROUPS`), reused here because a bar is a price and these are
  * the three prices this board knows how to name:
  *
  *   • `reversible` — the graph moves; one bd write puts it back and nothing is recorded as having
  *     happened.
  *   • `dequeued`   — the bead and its contract survive untouched, but nothing picks it up next. A
  *     wrong one is a week the bead sat still, found only by reading the record.
- *   • `history`    — the close is a CLAIM about what happened ("this shipped", "that replaced it").
- *     Reopening is one write; the claim outlives it, in the board's history and in every report
- *     already taken from it.
+ *   • `history`    — the write outlives its own undo. A close is a CLAIM about what happened ("this
+ *     shipped", "that replaced it"); an approve STARTS a run. Reopening is one write and undoing a
+ *     grant is two — the label, then the reservation, since nothing releases a target still shown as
+ *     approved — but the claim stays in the board's history and in every report already taken from
+ *     it, and the run it released has already spent what it spent.
  */
 export type AutonomyTier = "reversible" | "dequeued" | "history";
 
@@ -159,6 +162,11 @@ export function autonomyTierOf(plan: { move: GardenerMove; retireAs?: RetireVerb
       return "dequeued";
     case "retire":
       return plan.retireAs === "defer" ? "dequeued" : "history";
+    case "approve":
+      // The one move that STARTS work, and the dearest thing here to get wrong: what follows the
+      // label is a run that spends tokens and opens a PR, and withdrawing the approval afterwards
+      // does not un-run it. That outliving of the undo is exactly what this tier prices.
+      return "history";
     case "split":
       // No mechanical move at all, so this is never reached through {@link autonomyFor} — the manual
       // floor answers first. Priced at the dearest tier regardless: a move that fell through to the

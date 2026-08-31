@@ -12,6 +12,7 @@ import { appendSessionLog } from "../sessions";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
 import { describeDeadcodeFilter } from "../scan-deadcode";
+import { describeDuplicationFilter } from "../scan-duplication";
 import { summarizeSignals, type ScanCounts } from "../scan-health";
 import {
   describeCollectorFailure,
@@ -141,6 +142,12 @@ async function reportScanDiagnostics(
       console.warn(`[nightly-stringer] ${project.slug}: ${deadcodeLine}`);
     }
   }
+
+  // Duplication signals over blocks that hold no statement (anton-vb2h). This filter can remove
+  // most of a scan, so it says so out loud: silence here would be indistinguishable from a
+  // duplication collector that found nothing.
+  const duplicationLine = describeDuplicationFilter(result.duplication);
+  if (duplicationLine) await appendSessionLog(logPath, `[stringer] ${duplicationLine}\n`);
 }
 
 /**

@@ -13,19 +13,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
-import { parseGardenerPlan } from "./detections";
+import { withBeadWriteLock } from "../beads/claim-lock";
+import { parseGardenerPlan, proposalFingerprint } from "./detections";
 import {
   apply,
   applyWith,
+  APPROVE,
   bead,
   blockedBy,
   calls,
   CARD,
   child,
   CLOSE,
+  CARRIED,
   CLUSTER,
   cold,
   DEFER,
+  failAfterWrite,
   failOn,
   FILED,
   inReview,
@@ -44,6 +48,7 @@ import {
   resetSeam,
   setSnapshot,
   showBead,
+  startable,
   SUPERSEDE,
   warm,
 } from "./apply.fixture";
@@ -73,9 +78,15 @@ vi.mock("../beads/bd", async () => {
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
+      approve: (_cwd: string, id: string) => record("approve", id),
+      assign: (_cwd: string, id: string, actor: string) => record("assign", id, actor),
+      unassign: (_cwd: string, id: string) => record("assign", id, ""),
     },
   };
 });
+
+/** The machine identity an approve auto-claims under — resolved from git/env in production. */
+vi.mock("../operator", () => ({ resolveOperator: async () => "operator-1" }));
 
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
@@ -111,9 +122,42 @@ describe("the plan a proposal carries — read strictly, because it decides what
   it.each([
     ["subjects swapped under a kept fingerprint", { ...REPARENT, subjects: ["anton-zzz"] }],
     ["a target redirected under a kept fingerprint", { ...REPARENT, target: "anton-elsewhere" }],
-    ["a subject appended under a kept fingerprint", { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] }],
+    ["a subject appended under a kept fingerprint", { ...REPARENT, subjects: ["anton-a", "anton-b"] }],
+    ["a cluster's target redirected under a kept fingerprint", { ...CLUSTER, target: "anton-elsewhere" }],
   ])("rejects %s", (_case, value) => {
     expect(parseGardenerPlan(value)).toBeUndefined();
+  });
+
+  // The one kind whose subject list the FINGERPRINT does not cover (anton-9hpp): a cluster's
+  // membership is re-derived every patrol, so hashing it gave the same claim a fresh fingerprint
+  // each time and four proposals for one target stood open at once. Suppression is target-shaped
+  // for that reason — two memberships under one target are one open ask.
+  it("fingerprints a cluster by its target, so any membership is the same open ask", () => {
+    const grown = planFor({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-a", "anton-b", "anton-c"],
+      target: CARD.id,
+    });
+    expect(grown.fingerprint).toBe(CLUSTER.fingerprint);
+    expect(grown.subjectChecksum).not.toBe(CLUSTER.subjectChecksum);
+  });
+
+  // …and the guard the fingerprint gave up is carried by the CHECKSUM instead, so the membership is
+  // still bound. Without it, editing the list manufactures the grouping evidence apply re-derives:
+  // naming a ticket the home already carries makes it an in-place member, and a single loose bead
+  // rides under a home no fresh patrol would propose for it.
+  it("rejects a cluster whose membership was edited under a kept fingerprint", () => {
+    const grown = { ...CLUSTER, subjects: ["anton-a", "anton-b", "anton-c"] };
+    expect(parseGardenerPlan(grown)).toBeUndefined();
+    // A dropped guard is an edit too — a plan that simply omits it is not a plan the emitter wrote.
+    const unguarded: Record<string, unknown> = { ...CLUSTER };
+    delete unguarded.subjectChecksum;
+    expect(parseGardenerPlan(unguarded)).toBeUndefined();
+    // The kinds whose fingerprint already binds the list carry none, and one appearing is the same
+    // tell: a plan whose identity says more than its execution does.
+    const guarded = { ...REPARENT, subjectChecksum: CLUSTER.subjectChecksum };
+    expect(parseGardenerPlan(guarded)).toBeUndefined();
   });
 
   // `move` and `retireAs` are the two fields the hash can't cover, so the kind→verb pairing is what
@@ -130,6 +174,50 @@ describe("the plan a proposal carries — read strictly, because it decides what
   it("accepts subjects in any order — the identity is the set, not the listing", () => {
     const reordered = { ...CLUSTER, subjects: ["anton-b", "anton-a"] };
     expect(parseGardenerPlan(reordered)).toEqual(reordered);
+  });
+
+  // …and a set has no repeats. The target-identified kind is the one the hash cannot catch this on,
+  // and it is also the one that counts its subjects: `groupedUnder` would read one bead listed twice
+  // as two members, so a single bead already under the home would settle as an applied cluster no
+  // detector ever derived.
+  it("rejects a subject named twice, which a target's own identity cannot catch", () => {
+    expect(parseGardenerPlan({ ...CLUSTER, subjects: ["anton-a", "anton-a"] })).toBeUndefined();
+    // The same bar on the kinds whose hash would have caught it anyway — one rule, not two.
+    expect(parseGardenerPlan({ ...REPARENT, subjects: ["anton-a", "anton-a"] })).toBeUndefined();
+  });
+
+  /**
+   * The rollout (anton-9hpp): a cluster proposal filed BEFORE the claim moved to its target hashes
+   * the membership it was found with. Rejecting it would strand every one already open — apply would
+   * report "no readable proposal move" forever while the next patrol filed a fresh-format duplicate
+   * beside it, which is the duplicate state target-identity exists to remove. So the older identity
+   * is accepted on read, and only for the kind whose identity actually moved.
+   */
+  it("accepts the membership hash a cluster filed before the identity moved still carries", () => {
+    const legacy = {
+      ...CLUSTER,
+      fingerprint: proposalFingerprint(
+        "parentless-cluster",
+        `parentless-cluster:${[...CLUSTER.subjects].sort().join("+")}>${CLUSTER.target}`,
+      ),
+    };
+    expect(legacy.fingerprint).not.toBe(CLUSTER.fingerprint);
+    expect(parseGardenerPlan(legacy)).toEqual(legacy);
+
+    // And it reads back WITHOUT the subject guard, which the older emitter never wrote: that
+    // fingerprint hashes the membership itself, so the list it binds is already bound.
+    const unguarded: Record<string, unknown> = { ...legacy };
+    delete unguarded.subjectChecksum;
+    expect(parseGardenerPlan(unguarded)).toEqual(unguarded);
+    // …but a guard that disagrees with the list is still an edit, whichever identity carries it.
+    expect(parseGardenerPlan({ ...legacy, subjectChecksum: "0".repeat(12) })).toBeUndefined();
+
+    // The concession is that kind's alone: nothing else ever hashed anything but its own subjects.
+    const wrongKind = {
+      ...REPARENT,
+      fingerprint: proposalFingerprint("container-orphan", "container-orphan:*>anton-card"),
+    };
+    expect(parseGardenerPlan(wrongKind)).toBeUndefined();
   });
 });
 
@@ -209,6 +297,66 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     ).rejects.toMatchObject({
       failure: "refused",
       message: expect.stringContaining("no longer reads as applied"),
+    });
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  /**
+   * A cluster whose every surviving member somebody already filed under the home settles without a
+   * step — so the per-step premise locks (apply-steps.ts `lockedBeads`) never run, and the settlement
+   * is the only thing standing between the container claim and a proposal closed as applied over it.
+   * `deleteTicket` takes the deleted ticket's own lock and no other, so neither end of the plan
+   * orders that write against this one.
+   *
+   * Asserted as the lock rather than through a staged race, like the step's own: the harm is exactly
+   * that the window is invisible to a fresh read.
+   */
+  it("takes the write lock of the carriers a settled cluster's home premise rests on", async () => {
+    // The direct carrier, and then the bead a nested one reaches the home THROUGH — deleting the
+    // intermediate cuts the carrier loose without touching the carrier itself.
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const cases: [string, Bead[]][] = [
+      [CARRIED.id, [CARD, CARRIED]],
+      [note.id, [CARD, note, child("anton-t0", note.id)]],
+    ];
+    for (const [held, home] of cases) {
+      resetSeam();
+      const proposal = proposalFor(CLUSTER);
+      const board = [...home, child("anton-a", CARD.id), child("anton-b", CARD.id), proposal];
+      let release = () => {};
+      const queued = withBeadWriteLock(REPO, held, () => new Promise<void>((r) => (release = r)));
+
+      const run = apply(proposal, board);
+      try {
+        await new Promise((r) => setTimeout(r, 10));
+        expect(calls, `${held} was not held`).toEqual([]);
+      } finally {
+        release();
+        await queued;
+      }
+      await expect(run).resolves.toMatchObject({ changed: [] });
+    }
+  });
+
+  // And the settlement counts the SAME narrowed set the locks cover. A ticket filed under the home
+  // since the decision is one nothing here holds, so letting it carry the container premise would
+  // restore the very race the locks close — the counted carrier can be deleted a moment later.
+  it("refuses to settle a cluster whose home swapped its ticket for one nothing locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set(CARRIED.id, bead(CARRIED.id)); // the counted ticket is detached…
+    liveBeads.set("anton-t1", child("anton-t1", CARD.id)); // …and an unlocked one takes its place
+
+    await expect(
+      apply(proposal, [
+        CARD,
+        CARRIED,
+        child("anton-a", CARD.id),
+        child("anton-b", CARD.id),
+        proposal,
+      ]),
+    ).rejects.toMatchObject({
+      failure: "refused",
+      message: expect.stringContaining("no longer carries the tickets this proposal was decided against"),
     });
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
@@ -340,7 +488,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const result = await apply(
       proposal,
-      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal],
       "policy",
       controller.signal,
     );
@@ -357,7 +505,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
 
     const result = await apply(
       proposal,
-      [CARD, bead("anton-a"), bead("anton-b"), proposal],
+      [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal],
       "policy",
       controller.signal,
     );
@@ -374,7 +522,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
   // only half holds.
   it("serializes two approvals of one cluster — the loser writes nothing", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, bead("anton-a"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal];
     setSnapshot(board); // the winner's close lands on this board, and is what the loser then reads
 
     const [winner, loser] = await Promise.allSettled([
@@ -397,7 +545,7 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     const proposal = proposalFor(CLUSTER);
     liveBeads.set("anton-a", child("anton-a", CARD.id));
 
-    const result = await apply(proposal, [CARD, bead("anton-a"), bead("anton-b"), proposal]);
+    const result = await apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]);
 
     expect(result.changed).toEqual(["anton-b"]);
     expect(calls.filter((c) => c.startsWith("reparent"))).toEqual(["reparent anton-b anton-card"]);
@@ -762,6 +910,530 @@ describe("the product master's moves", () => {
       expect(err.message).toContain("database is locked");
       // The ask stays open and the label stays on: a board anton cannot see whole authorises nothing.
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+  });
+
+  /**
+   * The start (anton-gmbz) — the mirror of the withdrawal above, and the one move that releases a
+   * run rather than tidying the board. Its fence is the picker's own eligibility, re-asked under the
+   * subject's write lock: still open, still unclaimed, still unapproved, still clearing the gate.
+   */
+  describe("granting the approval the board's next work is missing", () => {
+    it("auto-claims the target and THEN labels it, in the approve route's own order", async () => {
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      // The reservation first: `approved` is what locks it, so a label ahead of the claim leaves a
+      // window a teammate's steal is still legal in — on work anton is about to run.
+      expect(calls[0]).toBe("assign anton-a operator-1");
+      expect(calls[1]).toBe("approve anton-a");
+      expect(result.changed).toEqual(["anton-a"]);
+      expect(calls.at(-1)).toBe(
+        "close anton-p1 applied: approved anton-a, so a run can start on it",
+      );
+    });
+
+    it("settles when somebody granted it by hand — the ask's outcome, whoever wrote it", async () => {
+      await applyWith(proposalFor(APPROVE), [warm("anton-a", { labels: [LABELS.approved] })]);
+
+      // No second claim over their reservation, and no fence refusal over the write that granted it.
+      expect(calls.filter((c) => !c.startsWith("note") && !c.startsWith("close"))).toEqual([]);
+      expect(calls.at(-1)).toMatch(/close anton-p1 applied: anton-a already carries `approved`/);
+    });
+
+    // The retry after a grant this apply could not prove it still held (apply-steps.ts
+    // `assertReservationHeld` leaves the label standing and the ask open). The label is the whole
+    // ask, so the proposal CONVERGES rather than refusing forever over a reservation no later read
+    // can attribute — see `planApprove` for what carries the ownership assertion instead.
+    it("settles an approved target whatever became of its reservation", async () => {
+      await applyWith(proposalFor(APPROVE), [
+        warm("anton-a", { labels: [LABELS.approved], assignee: "teammate" }),
+      ]);
+
+      expect(calls.filter((c) => !c.startsWith("note") && !c.startsWith("close"))).toEqual([]);
+      expect(calls.at(-1)).toMatch(/close anton-p1 applied: anton-a already carries `approved`/);
+    });
+
+    // Every one of these leaves the OTHER bars untouched — the bead stays open, unclaimed and
+    // unapproved while its Acceptance is edited away or a blocker is drawn — so only re-deriving the
+    // gate refuses them. Asked of the snapshot here; the same helper is re-asked under the lock below.
+    it.each([
+      ["a run has since claimed", () => startable({ assignee: "someone", status: "in_progress", updated_at: "2026-07-15T00:00:00Z" }), /queue a start on work another run already owns/],
+      ["a human has since reserved", () => startable({ assignee: "teammate" }), /work anton may start — held by teammate \(claimed\)/],
+      ["lost its Acceptance", () => cold("anton-a"), /work anton may start — .*no Acceptance criteria.* \(approval-gap\)/],
+      ["gained a blocker", () => blockedBy("anton-a", "anton-z", { acceptance_criteria: "- [ ] it ships", updated_at: "2025-01-01T00:00:00Z" }), /work anton may start — .*\(blocked\)/],
+      ["stopped being a run target", () => child("anton-a", "anton-card", { acceptance_criteria: "- [ ] it ships", updated_at: "2025-01-01T00:00:00Z" }), /work anton may start — .*\(not-a-run-target\)/],
+      ["settled", () => bead("anton-a", { status: "closed" }), /anton-a is closed — approving it would queue nothing/],
+    ])("refuses a target %s since the ask was filed", async (_why, subject, reason) => {
+      const err = (await applyWith(proposalFor(APPROVE), [
+        subject(),
+        bead("anton-z"),
+        CARD,
+      ]).catch((e) => e)) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(reason);
+      // The ask stays open with the reason on it, and the label was never written.
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("refuses a start whose target was rewritten since the ask was filed", async () => {
+      // The bead still clears every gate — it is the JUDGMENT that went stale. "This is the work
+      // worth starting next" was read off a contract somebody has since replaced, and no board read
+      // restates it, so the filing stamp is the only fence there is.
+      const err = (await applyWith(proposalFor(APPROVE), [
+        startable({ updated_at: "2026-07-15T00:00:00Z" }),
+      ]).catch((e) => e)) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /no longer the bead whose contract this start was judged from, and approving it now would set a run loose on work somebody has since rewritten/,
+      );
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("refuses a gate that broke between the decision and the write, under the bead's own lock", async () => {
+      // The snapshot shows a startable target; the read taken inside the write lock shows its
+      // Acceptance gone. Status, liveness, claim and the premise stamp are all as the plan found
+      // them, so nothing but the re-derived gate can catch it.
+      liveBeads.set("anton-a", cold("anton-a"));
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/anton-a is no longer work anton may start/);
+      expect(err.message).toMatch(/no Acceptance criteria/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("refuses a reservation taken between the fence and the write, losing the swap", async () => {
+      // The last window there is: the fence's board read cleared, and a teammate's `bd assign` from
+      // a shell — which takes no in-process lock — lands before the auto-claim. The CAS is what sees
+      // it, and losing is the board declining, not a bd failure.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+      };
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate since this proposal was decided — approving it now would start a run on work somebody else has reserved/,
+      );
+      // Neither write: the reservation was not stolen and the label never went on.
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    it("hands the reservation back when the claim write commits and then fails", async () => {
+      // The one failure the CAS cannot answer with a result: `bd assign` commits and the process
+      // running it times out, so the swap REJECTS. Letting that propagate would report a start that
+      // wrote nothing over a target now reserved without `approved` — the one state no retry clears.
+      failAfterWrite.set("assign:anton-a", 1);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      // The write's own reason, over a board handed straight back to where the proposal found it.
+      expect(err.message).toContain("bd assign timed out");
+      expect(calls.slice(0, 2)).toEqual(["assign anton-a operator-1", "assign anton-a "]);
+      expect(calls.filter((c) => c.startsWith("approve"))).toEqual([]);
+      expect(err.changed).toEqual([]);
+    });
+
+    it("names the stranded reservation a failed claim write left behind", async () => {
+      // Same ambiguity with the hand-back refused too: the pair is half-applied and only a human can
+      // settle it, so the failure has to name the bead rather than report an untouched board.
+      failAfterWrite.set("assign:anton-a", 1);
+      failOn.set("assign:anton-a", 2);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a could not be reserved for this start \(bd assign timed out\) and the reservation that write left behind could not be released either/,
+      );
+      expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("fails the start when a failed claim write cannot be re-read at all", async () => {
+      // Nothing proves what landed, so the honest report is a failed start naming the bead it may
+      // have written — not a settled ask, and not a hand-back over ownership no read established.
+      failAfterWrite.set("assign:anton-a", 1);
+      onWrite((call) => {
+        if (call === "assign anton-a operator-1") liveBeads.set("anton-a", undefined);
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a could not be reserved for this start \(bd assign timed out\) and could not be re-read to find out whether that reservation landed anyway/,
+      );
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("leaves a reservation a failed claim write did not take", async () => {
+      // The same rejection over a board that shows somebody else holding the target: either the
+      // write never landed or it has been overtaken since, and unassigning would steal their claim
+      // in the name of undoing ours.
+      failAfterWrite.set("assign:anton-a", 1);
+      onWrite((call) => {
+        if (call === "assign anton-a operator-1") {
+          liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+        }
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch((e) => e)) as Error;
+
+      expect(err.message).toContain("bd assign timed out");
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+    });
+
+    it("leaves a reservation that already locks another anton process's grant", async () => {
+      // This machine's identity is shared by every anton process on it, so a pair that reads WHOLE —
+      // reserved and approved — is a start somebody else is about to make, not the half-applied
+      // state this reconcile exists to clear. Handing it back would cancel their start.
+      failAfterWrite.set("assign:anton-a", 1);
+      onWrite((call) => {
+        if (call === "assign anton-a operator-1") {
+          liveBeads.set("anton-a", startable({ assignee: "operator-1", labels: [LABELS.approved] }));
+        }
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch((e) => e)) as Error;
+
+      expect(err.message).toContain("bd assign timed out");
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+    });
+
+    it("hands the reservation back when another writer granted the gate mid-swap", async () => {
+      // The one bar no fence above can hold: the start fence delegates to the picker's eligibility,
+      // which ignores `approved` by design — so a shell `bd label`, taking no in-process lock, can
+      // land between the subject's re-read and the CAS. Keeping the claim would convert somebody
+      // else's unreserved grant into this machine's reservation, which is the takeover the settled
+      // path promises never to make.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) {
+          liveBeads.set("anton-a", startable({ labels: [LABELS.approved] }));
+        }
+      };
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      // Taken, then handed straight back — and no second grant written over theirs.
+      expect(calls.slice(0, 2)).toEqual(["assign anton-a operator-1", "assign anton-a "]);
+      expect(calls.filter((c) => c.startsWith("approve"))).toEqual([]);
+      // Nothing landed, so the proposal settles over a board this apply has nothing to roll back on.
+      expect(result.changed).toEqual([]);
+    });
+
+    it("leaves a grant another anton process both reserved and labelled", async () => {
+      // Same window, reached through the CAS's idempotent no-op: the other process shares this
+      // machine's identity, so the swap writes nothing — and a release here would unassign a
+      // reservation this apply never took, cancelling that process's start.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) {
+          liveBeads.set("anton-a", startable({ assignee: "operator-1", labels: [LABELS.approved] }));
+        }
+      };
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      expect(calls.filter((c) => !c.startsWith("note") && !c.startsWith("close"))).toEqual([]);
+      expect(result.changed).toEqual([]);
+    });
+
+    it("hands the reservation back when the label write fails, so the retry sees what we saw", async () => {
+      // The one order this pair is unsafe to half-apply in. A claim standing without `approved` is a
+      // target the picker's own eligibility bars from EVERY holder, this machine's included — so
+      // nothing retries it and nothing picks it up until a human unassigns it.
+      failOn.set("approve:anton-a", 1);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.message).toContain("bd approve exploded");
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        "assign anton-a ",
+      ]);
+    });
+
+    it("leaves a reservation this apply did not take, when the label write fails", async () => {
+      // The CAS's idempotent no-op: another anton process on this machine resolves to the SAME
+      // identity, and its claim lands between the fence's read and the swap. The end state is
+      // already what we asked for, so the swap writes nothing — and the rollback must not hand back
+      // a reservation it never took, which would cancel that other process's start.
+      failOn.set("approve:anton-a", 1);
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) {
+          liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+        }
+      };
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch((e) => e)) as Error;
+
+      expect(err.message).toContain("bd approve exploded");
+      // Neither half of the claim: nothing was assigned here, so nothing is unassigned either.
+      expect(calls.filter((c) => c.startsWith("assign anton-a"))).toEqual([]);
+      // And the failure is the approve's own — not the strand report, which would name a claim this
+      // apply is not holding.
+      expect(err.message).not.toMatch(/could not be released either/);
+    });
+
+    it("names the stranded reservation when it cannot be handed back either", async () => {
+      // The release is bounded by the same CAS, so a failure here leaves the board in a state only a
+      // human can settle — and saying so is the whole point of failing loud.
+      failOn.set("approve:anton-a", 1);
+      failOn.set("assign:anton-a", 2);
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.message).toMatch(
+        /anton-a could not be approved \(bd approve exploded\) and the reservation taken for that start could not be released either/,
+      );
+      expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+      // The claim is on the board, so the pass has a write to publish and report.
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("settles a grant whose label landed before the process reporting it died", async () => {
+      // `bd label` commits and then times out, so the rejection says nothing about the board — and
+      // the board is APPROVED. Handing the reservation back over that would leave an approved and
+      // unassigned target, which is exactly what the picker offers: another worker starts the run
+      // this apply is reporting as failed. The re-read settles it as the grant it is.
+      failAfterWrite.set("approve:anton-a", 1);
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      expect(result.changed).toEqual(["anton-a"]);
+      // Neither undo runs: the reservation stays with this machine and the label stays on.
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      expect(calls.at(-1)).toBe(
+        "close anton-p1 applied: approved anton-a, so a run can start on it",
+      );
+    });
+
+    it("withdraws a committed grant that landed on somebody else's reservation", async () => {
+      // The settle is fenced, not blind: a grant read back off an ambiguous failure goes through the
+      // same assignee assertion a clean one does, so a label standing over a teammate's claim comes
+      // straight back off.
+      failAfterWrite.set("approve:anton-a", 1);
+      onWrite((call) => {
+        if (call === "approve anton-a") {
+          liveBeads.set("anton-a", startable({ assignee: "teammate", labels: [LABELS.approved] }));
+        }
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate while this start was being approved — the grant was withdrawn/,
+      );
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        `untag anton-a ${LABELS.approved}`,
+      ]);
+    });
+
+    it("leaves the reservation standing when a committed grant cannot be re-read", async () => {
+      // The same ambiguity with no evidence either way. Releasing over a read that proves nothing
+      // could free an approved target for every other machine, so the claim is left standing and the
+      // failure names the bead a human has to settle.
+      failAfterWrite.set("approve:anton-a", 1);
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", undefined);
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a could not be approved \(bd approve timed out\) and could not be re-read to find out whether that grant landed anyway/,
+      );
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("withdraws a grant that landed on a reservation taken while the label was written", async () => {
+      // The window past the CAS: the swap verified the reservation, and a shell `bd assign` lands
+      // while `bd label` is still running. `approved` locks that reservation, so keeping it would
+      // start a run on work the start fence itself bars — held by somebody else.
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      // Refused, not failed: the label came straight back off, so the board is where the ask found it.
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate while this start was being approved — the grant was withdrawn/,
+      );
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        `untag anton-a ${LABELS.approved}`,
+      ]);
+      // Their reservation is theirs: ours is already gone, so nothing here unassigns it.
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+    });
+
+    it("withdraws a grant whose reservation was erased while the label was written", async () => {
+      // The same window with the opposite shape: a shell `bd unassign` rather than a `bd assign`.
+      // An absent holder is not "still ours" — the reservation the CAS took is gone, so returning
+      // success would settle the ask with an approved-but-unassigned target, available to every
+      // other machine instead of reserved for this one.
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable());
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a had the reservation this start took for operator-1 removed while this start was being approved — the grant was withdrawn/,
+      );
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        `untag anton-a ${LABELS.approved}`,
+      ]);
+    });
+
+    it("names the grant it could not withdraw from under the new holder", async () => {
+      failOn.set("untag:anton-a", 1);
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "teammate" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate while this start was being approved and the `approved` label could not be withdrawn/,
+      );
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("hands the reservation back when the gate is taken back off before it is confirmed", async () => {
+      // The assignee half of this window has a twin: a shell `bd label --remove` landing while the
+      // re-read is in flight leaves the target reserved for THIS machine without `approved` — the
+      // one state no retry clears, because the picker's eligibility bars every holder. Settling on
+      // the expected holder alone would close the proposal over exactly that bead.
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a had the `approved` this start wrote taken back off by another writer before the grant could be confirmed — the reservation taken for it was handed back/,
+      );
+      // Claim, grant, hand-back: the board is left where the proposal found it.
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        "assign anton-a ",
+      ]);
+      expect(calls.filter((c) => c.startsWith("close"))).toEqual([]);
+    });
+
+    it("leaves a reservation this apply never took when the gate is taken back off", async () => {
+      // The same window over the CAS's idempotent no-op: another anton process on this machine
+      // shares the identity and claimed first, so the swap wrote nothing. Handing back here would
+      // unassign THEIR reservation in the name of undoing ours.
+      let shows = 0;
+      onShow = (id) => {
+        if (id === "anton-a" && ++shows === 2) liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      };
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/the reservation on it was never this apply's to hold/);
+      expect(calls.filter((c) => c.startsWith("assign anton-a"))).toEqual([]);
+    });
+
+    it("names the stranded pair when the gate went and the reservation cannot be handed back", async () => {
+      failOn.set("assign:anton-a", 2);
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", startable({ assignee: "operator-1" }));
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(/could not be handed back/);
+      expect(err.message).toMatch(/assigned to operator-1 without `approved`/);
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
+    it("fails the start when the target cannot be re-read after the grant", async () => {
+      // The read IS the ownership assertion, so a failed one cannot settle the ask: an intervening
+      // assign or unassign is invisible to it, and returning success would close the proposal over a
+      // reservation nobody checked. The grant is not withdrawn either — a read that proves nothing
+      // would take back a sound approval, or strand the bead as a reservation no retry can clear —
+      // so the bead stays written and the failure names it.
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", undefined);
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a was approved but could not be re-read to confirm it is still reserved for operator-1/,
+      );
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      // The approve landed, so the pass must record a moved board — and must not be told the
+      // opposite by the empty-prefix clause.
+      expect(err.changed).toEqual(["anton-a"]);
+      expect(err.message).not.toMatch(/nothing had been written/);
+      // The proposal stays open over it: nothing settles an ask whose ownership went unproven.
+      expect(calls.filter((c) => c.startsWith("close"))).toEqual([]);
     });
   });
 

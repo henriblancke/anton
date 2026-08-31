@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { eq } from "drizzle-orm";
-import type { Clock } from "./queue";
+import { toMs, type Clock } from "./queue";
 import { Scheduler } from "./scheduler";
 import {
   backfillDefaultSchedules,
@@ -81,6 +81,25 @@ describe("Scheduler.tickOnce", () => {
     const next = row.nextRunAt as Date;
     expect(next.getDate()).toBe(12);
     expect(next.getHours()).toBe(3);
+  });
+
+  it("stamps lastRunAt from the enqueued job's own createdAt, in one write", async () => {
+    // The Automation table pairs a fire with its outcome by matching the job's enqueue time against
+    // this stamp, so the two must be written together and from one instant: a job newer than the
+    // stamp would show its verdict beside an earlier fire's date (anton-znoz review).
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "nightly-stringer",
+      cron: "0 3 * * *",
+    });
+    const sched = new Scheduler({ db: tdb.db, clock });
+
+    clock.set(new Date(2026, 6, 11, 3, 0, 0, 0).getTime());
+    expect(await sched.tickOnce()).toBe(1);
+
+    const job = jobsFor(tdb, "p1")[0];
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect(toMs(row.lastRunAt)).toBe(toMs(job.createdAt));
   });
 
   it("does not double-enqueue on a second tick before the next slot", async () => {
@@ -159,6 +178,31 @@ describe("Scheduler.tickOnce", () => {
     await updateSchedule(tdb.db, clock, id, { enabled: true });
     clock.set(clock.now() + 2 * 60_000);
     expect(await sched.tickOnce()).toBe(1);
+  });
+
+  /**
+   * The settings panel has two writers to one schedule row — an accepted cadence and the row's
+   * toggle — and each patch sends only its own field, so `updateSchedule` fills the other in from
+   * what it read. With the read and the write settled as one unit, the second patch reads what the
+   * first committed; interleaved, both read the same row and the loser's intent is quietly restored.
+   */
+  it("keeps both intents when a cron patch and an enabled patch race the same row", async () => {
+    const id = await createSchedule(tdb.db, clock, {
+      projectId: "p1",
+      type: "product-master",
+      cron: "0 6 * * 1", // weekly
+    });
+
+    await Promise.all([
+      updateSchedule(tdb.db, clock, id, { cron: "0 6 * * *" }), // raise to daily
+      updateSchedule(tdb.db, clock, id, { enabled: false }), // and switch the job off
+    ]);
+
+    const row = tdb.db.select().from(schema.schedules).where(eq(schema.schedules.id, id)).get()!;
+    expect(row.cron).toBe("0 6 * * *");
+    expect(row.enabled).toBe(false);
+    // Whichever order they settled in, a disabled row carries no next fire.
+    expect(row.nextRunAt).toBeNull();
   });
 
   it("collapses missed slots — one enqueue after a long sleep, not one per slot", async () => {

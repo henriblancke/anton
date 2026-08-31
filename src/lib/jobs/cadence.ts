@@ -278,6 +278,20 @@ export function presetForCron(expr: string): CadenceSelection {
   }
 }
 
+/**
+ * The daily cadence a weekly one becomes when it is promoted, keeping the operator's time of day —
+ * `Weekly on Monday at 06:00` → `Daily at 06:00`.
+ *
+ * Null for anything that is not weekly, which is what makes this safe to offer: a cadence that is
+ * already daily or faster has nothing to raise, and a hand-written expression is a choice no offer
+ * gets to rewrite.
+ */
+export function dailyEquivalentOf(expr: string): string | null {
+  const cadence = classify(expr);
+  if (cadence?.kind !== "weekly") return null;
+  return cronForPreset("daily", { hour: cadence.hour, minute: cadence.minute });
+}
+
 /** Below this gap between fires, the UI warns that a cadence is expensive — it never refuses. */
 export const FAST_CADENCE_MINUTES = 5;
 

@@ -216,3 +216,39 @@ export function detailsSummary(draft: TicketDraft, deferred: boolean): string {
 export function hasTicketChanges(original: TicketDraft, draft: TicketDraft): boolean {
   return Object.keys(diffTicketPatch(original, draft)).length > 0;
 }
+
+/**
+ * Only a parentless task/bug is a run target of its own (mirrors `beads.isRunTarget`, which the
+ * approve/claim routes gate on): a child ticket runs via its epic's PR, and a parentless
+ * `learning`/`chore`/etc. is never runnable, so its controls would only ever 422.
+ */
+export function isStandaloneRunTarget(detail: Pick<TicketDetail, "epicId" | "type">): boolean {
+  return !detail.epicId && (detail.type === "task" || detail.type === "bug");
+}
+
+/**
+ * Whether the Approve & run / Force run affordance is offered at all — narrower than the claim
+ * control. A `done` (closed) standalone target has already finished its run and produced its PR, so
+ * re-approving it would only enqueue duplicate/no-op PR work. A snoozed target hides it too: the
+ * whole point of the snooze is "don't pick this up yet", so offering the one control that would
+ * start it immediately contradicts the state it's in.
+ */
+export function canRunTicket(
+  detail: Pick<TicketDetail, "epicId" | "type" | "stage" | "deferred">,
+): boolean {
+  return isStandaloneRunTarget(detail) && detail.stage !== "done" && !detail.deferred;
+}
+
+/**
+ * What the approve POST reports back. A gardener proposal is applied, not run: it names the board
+ * move it made rather than a run that never started (anton-1t3n). Otherwise re-approving an
+ * already-approved target is a Force run, not a first approval.
+ */
+export function runToastMessage(
+  title: string,
+  wasApproved: boolean,
+  applied: string | undefined,
+): string {
+  if (applied) return `Applied — ${applied}`;
+  return wasApproved ? `Re-running "${title}"` : `Approved & running "${title}"`;
+}

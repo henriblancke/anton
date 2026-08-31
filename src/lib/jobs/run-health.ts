@@ -40,6 +40,7 @@ import {
   exhaustedParkAttempts,
   POISON_PARK_PREFIX,
   type JobContext,
+  type JobEffect,
   type JobHandler,
 } from "./runner";
 
@@ -393,7 +394,7 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
   const clock = deps.clock ?? systemClock;
   const readPrActivity = deps.readPrActivity ?? getPrActivity;
 
-  return async function runHealth(ctx: JobContext): Promise<void> {
+  return async function runHealth(ctx: JobContext): Promise<JobEffect> {
     const { projectId } = ctx.payload as RunHealthPayload;
     const project = await getProjectById(db, projectId);
     if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -438,13 +439,8 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     ]);
 
     await ctx.heartbeat();
-    findings.push(
-      ...detectStalePrs(
-        await readInReviewPrs(board, project.repoPath, readPrActivity, ctx),
-        nowMs,
-        thresholds.stalePrHours * 3_600_000,
-      ),
-    );
+    const inReview = await readInReviewPrs(board, project.repoPath, readPrActivity, ctx);
+    findings.push(...detectStalePrs(inReview.prs, nowMs, thresholds.stalePrHours * 3_600_000));
 
     // The report is upserted per project, so saving a partial sweep REPLACES the last good one with
     // something indistinguishable from a clean bill of health. Nothing above is guaranteed to notice
@@ -453,14 +449,41 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     // gated here explicitly. A cancelled sweep must leave the previous report standing.
     ctx.signal.throwIfAborted();
     await saveRunHealthReport(db, clock, { projectId, jobId: ctx.jobId, findings });
+
+    // The report row is replaced every sweep, so writing it is not the effect — FINDING something
+    // is (see {@link sweepOutcome}).
+    return sweepOutcome(findings.length, inReview.skipped);
+  };
+}
+
+/**
+ * The sweep's outcome line. A clean sweep is the healthy outcome and says so — but only when it
+ * actually swept everything: a PR whose activity couldn't be read was never checked for staleness,
+ * so a sweep that skipped one reports as PARTIAL rather than as a clean bill of health, and a sweep
+ * that did find stalls carries the skipped count beside them (anton-znoz review). Exported for the
+ * unit test — the report row is replaced every sweep, so this note is the only record of a pass that
+ * ran on incomplete input.
+ */
+export function sweepOutcome(findingCount: number, skippedPrReads: number): JobEffect {
+  const skipped = skippedPrReads > 0 ? `${skippedPrReads} PR check(s) skipped` : "";
+  if (findingCount > 0) {
+    return {
+      changed: true,
+      note: skipped ? `${findingCount} finding(s); ${skipped}` : `${findingCount} finding(s)`,
+    };
+  }
+  return {
+    changed: false,
+    note: skipped ? `partial sweep — ${skipped}; no stalls in what was checked` : "no stalls found",
   };
 }
 
 /**
  * Read each in-review target's PR activity. A per-PR failure is logged and skipped rather than
  * failing the sweep: one unreachable PR (a deleted repo, a rate-limited token) must not cost the
- * operator the parked-run and dead-lease findings that were already computed. The skip is loud in
- * the logs precisely because a silently under-reported PR class would read as "all clear".
+ * operator the parked-run and dead-lease findings that were already computed. The skips are counted
+ * as well as logged — an unchecked PR class that reported as "all clear" is exactly the false
+ * all-clear this sweep exists to prevent, so the count rides out in the job's outcome note.
  *
  * An ABORT is the one failure that isn't per-PR: the job itself is being cancelled or has timed out,
  * so every remaining read would fail the same way and the report saved at the end would be a partial
@@ -472,16 +495,18 @@ async function readInReviewPrs(
   repo: string,
   readPrActivity: NonNullable<RunHealthDeps["readPrActivity"]>,
   ctx: JobContext,
-): Promise<InReviewPr[]> {
+): Promise<{ prs: InReviewPr[]; skipped: number }> {
   const prs: InReviewPr[] = [];
+  let skipped = 0;
   for (const { bead, prNumber } of inReviewTargets(board)) {
     try {
       prs.push({ beadId: bead.id, activity: await readPrActivity(repo, prNumber, ctx.signal) });
     } catch (e) {
       ctx.signal.throwIfAborted();
+      skipped += 1;
       console.error(`[run-health] could not read PR #${prNumber} for ${bead.id}; skipping`, e);
     }
     await ctx.heartbeat();
   }
-  return prs;
+  return { prs, skipped };
 }

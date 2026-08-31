@@ -15,6 +15,8 @@
  * See DESIGN.md §4.
  */
 import {
+  BUDGET_DEFER_PREFIX,
+  BUDGET_DEFER_PRIOR_SEP,
   activeExecuteEpicId,
   activeExecuteEpicKeys,
   activeJobIdsForProject,
@@ -41,6 +43,7 @@ import {
   toMs,
   type AntonDb,
   type Clock,
+  type JobEffect,
   type JobRow,
   type JobType,
 } from "./queue";
@@ -203,7 +206,17 @@ export interface JobContext {
   report: (info: LiveJobInfo) => void;
 }
 
-export type JobHandler = (ctx: JobContext) => Promise<void>;
+/**
+ * A handler settles by returning: a {@link JobEffect} states whether the run changed anything, and
+ * `void` leaves that unstated. Returning it (rather than reporting through `ctx`) keeps the claim on
+ * the same path as the throw that would have contradicted it — a handler cannot report "nothing to
+ * do" and then fail. The claim is ATTEMPT-local: what an earlier attempt did before it threw is
+ * unreported, which is why a retry's no-op is withheld at settle (see `hasPriorAttempt`).
+ */
+export type JobHandler = (ctx: JobContext) => Promise<JobEffect | void>;
+
+// Re-exported so a handler module imports its whole contract — context, signature, return — from one place.
+export type { JobEffect } from "./queue";
 
 export type Outcome =
   | { kind: "success" }
@@ -322,6 +335,30 @@ export function nextAction(
       };
     }
   }
+}
+
+/**
+ * Did an earlier attempt of this job run without completing? A settling handler only reports what
+ * ITS attempt did, so this is what stops a retry's "nothing to do" from being published as the whole
+ * job's no-op after a previous attempt did durable work and then threw.
+ *
+ * The evidence is on the row: `attempts` counts every lease, so `> 1` means an earlier attempt was
+ * dispatched (including one lost to a crash, which never settles), and a settle that rescheduled
+ * stamps `lastError`, which survives the next lease — the refunded retries (quota, lease-held,
+ * not-wired) rewind `attempts`, so the error is the only trace they leave. A human `resumeJob`
+ * deliberately clears both for a clean slate, so a resumed job's next attempt reads as its first.
+ *
+ * A bare `budget: ` marker is the one `lastError` that proves nothing: the governor stamps it on a
+ * QUEUED row that never ran and it survives into that row's first lease, so counting it would
+ * withhold a genuine first-attempt no-op as "unknown" for every job pacing ever deferred. But a
+ * deferral can also land on a row a REFUNDED attempt already ran (quota, lease-held, not-wired), so
+ * `deferQueuedJobs` carries that attempt's error along inside the marker — evidence again, not pacing.
+ */
+export function hasPriorAttempt(job: Pick<JobRow, "attempts" | "lastError">): boolean {
+  if (job.attempts > 1) return true;
+  if (!job.lastError) return false;
+  if (!job.lastError.startsWith(BUDGET_DEFER_PREFIX)) return true;
+  return job.lastError.includes(BUDGET_DEFER_PRIOR_SEP);
 }
 
 /** An in-flight job's registry entry: the abort handle plus the mutable live-report handle. */
@@ -813,7 +850,7 @@ export class JobRunner {
         continue;
       }
       const retryAtMs = decision.retryAt.getTime();
-      const pacedError = `budget: ${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`;
+      const pacedError = `${BUDGET_DEFER_PREFIX}${decision.reason} — resumes at ${new Date(retryAtMs).toISOString()}`;
 
       // Fully-governed types (everything except execute-epic) — held + deferred wholesale to the
       // pace boundary. There's no per-job bypass for these; the whole bucket is paced.
@@ -847,7 +884,7 @@ export class JobRunner {
           types: ["execute-epic"],
           projectId: pid,
           retryAtMs: immRetryMs,
-          lastError: `budget: ${immediate.reason} — resumes at ${new Date(immRetryMs).toISOString()}`,
+          lastError: `${BUDGET_DEFER_PREFIX}${immediate.reason} — resumes at ${new Date(immRetryMs).toISOString()}`,
           bypass: "only",
         });
         // Every execute-epic row for the project is now deferred (paced + immediate), so hold the
@@ -1016,6 +1053,8 @@ export class JobRunner {
       armTimeout();
 
       let outcome: Outcome;
+      // What the handler reported it did — carried to `settle` so only a COMPLETED job records it.
+      let effect: JobEffect | undefined;
       try {
         if (!handler) throw new Error(`no handler registered for job type "${job.type}"`);
         const ctx: JobContext = {
@@ -1032,7 +1071,7 @@ export class JobRunner {
           signal: controller.signal,
           report: (info) => Object.assign(entry.live, info),
         };
-        await handler(ctx);
+        effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };
       } catch (e) {
         // A timeout abort is a retryable failure with a clear reason (not a poison/quota misread).
@@ -1048,7 +1087,7 @@ export class JobRunner {
         if (timeoutTimer) clearTimeout(timeoutTimer);
       }
 
-      await this.settle(job, outcome, policy);
+      await this.settle(job, outcome, policy, effect);
     } catch (e) {
       // Policy resolution or the settle write itself failed — log and release the slot; the lease
       // expires and the job is reclaimed on a later tick.
@@ -1104,7 +1143,12 @@ export class JobRunner {
     }
   }
 
-  private async settle(job: JobRow, outcome: Outcome, policy: JobPolicy): Promise<void> {
+  private async settle(
+    job: JobRow,
+    outcome: Outcome,
+    policy: JobPolicy,
+    effect?: JobEffect,
+  ): Promise<void> {
     // Re-read attempts (a heartbeat/lease may have advanced updatedAt, not attempts, but be safe).
     const fresh = (await getJob(this.db, job.id)) ?? job;
     // Fast-path a cancel already visible at this read. The queue transition below also compares from
@@ -1116,7 +1160,7 @@ export class JobRunner {
     const action = nextAction(config, fresh, outcome, this.clock.now());
     switch (action.action) {
       case "complete":
-        await complete(this.db, this.clock, job.id);
+        await complete(this.db, this.clock, job.id, effect, { retried: hasPriorAttempt(fresh) });
         break;
       case "reschedule":
         await reschedule(this.db, this.clock, job.id, action.runAtMs, {

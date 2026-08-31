@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { actOnEscalation, isEscalationAction } from "@/lib/escalation-actions";
 import { NotAbandonableError } from "@/lib/abandon";
 import { openEscalations } from "@/lib/escalations";
-import { withProject } from "../../resolve-project";
+import { parseJsonBody, withProject } from "../../resolve-project";
 
 export const dynamic = "force-dynamic";
 
@@ -28,12 +28,8 @@ export const dynamic = "force-dynamic";
  */
 export const POST = withProject<{ slug: string; escalationId: string }>(
   async (request, { project, params }) => {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-    }
+    const { body, response: badBody } = await parseJsonBody(request);
+    if (badBody) return badBody;
 
     const action = (body as { action?: unknown })?.action;
     if (!isEscalationAction(action)) {

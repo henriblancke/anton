@@ -11,8 +11,10 @@
  */
 import { approvalGaps, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { ownerOf as claimHolder, swapUnderLock, type SwapResult } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
+import { resolveOperator } from "../operator";
 import {
   indexBoard,
   isInFlight,
@@ -23,9 +25,12 @@ import {
 } from "./board-index";
 import {
   blockerUnusable,
+  clusterUngrouped,
   DOING,
   EVIDENCE_PREMISE,
   home,
+  heldCarriers,
+  homeCarriesNothing,
   homeClaimed,
   HOME_STANDING,
   homeUnusable,
@@ -37,17 +42,39 @@ import {
   orderingUnstated,
   premiseTouched,
   settledWord,
+  startBarred,
   survivorUnusable,
   takingTicket,
   unapproveNote,
   type ApplyStep,
   type EvidenceFence,
+  type ReparentStep,
   type TicketOwner,
 } from "./apply-plan";
 import { impliesOrdering } from "./relink";
 
 /** A subject the board moved on between the decision and the write. Never a bd failure. */
 export class SubjectMovedError extends Error {}
+
+/**
+ * A step that failed with writes of its OWN left standing — the beads it could not take back.
+ *
+ * The rollback prefix cannot name them: a step joins it only once it has RETURNED, so a step that
+ * half-applied and threw is invisible to the undo (apply.ts `applySteps`). They ride on the error
+ * instead, because `changed` is what tells the pass its board moved (gardener/armed.ts
+ * `movedTheBoard`) — a failure reporting none of them would tell a founder nothing moved over beads
+ * this checkout has moved and cannot un-move.
+ */
+export class StrandedWriteError extends Error {
+  constructor(
+    message: string,
+    /** Beads this failure left written. */
+    readonly stranded: string[],
+  ) {
+    super(message);
+    this.name = "StrandedWriteError";
+  }
+}
 
 /** The verbs that SETTLE the subject — the ones that would strand whatever still hangs under it. */
 const SETTLING: ReadonlySet<ApplyStep["verb"]> = new Set(["close", "supersede"]);
@@ -91,6 +118,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "reprioritize":
     case "link":
     case "reparent":
+    case "approve":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -115,16 +143,44 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
   }
 }
 
-/** Every bead this step rests on, and so every lock it has to hold to write at all. */
+/**
+ * The beads a CLUSTER re-parent's two board-derived premises are read off, beyond its own two ends:
+ * every member the grouping is recomputed over, the home's own tickets the container bar is counted
+ * from, and the beads those tickets reach the home THROUGH — a carrier attributed to the home
+ * across an intermediate is only as durable as that intermediate. None is written to, and none is
+ * derivable from the step's ends — which is why the decision carries them (apply-plan.ts
+ * `ClusterPremise`) and why they are locked (see {@link lockedBeads}).
+ */
+function premiseBeadsOf(step: ApplyStep): string[] {
+  const cluster = step.verb === "reparent" ? step.cluster : undefined;
+  return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
+}
+
+/**
+ * Every bead this step rests on, and so every lock it has to hold to write at all.
+ *
+ * The two ends and the ticket owner are the beads it WRITES to or points at; the cluster premise
+ * beads are the ones it READS to decide whether it may write at all, and they earn the same lock for
+ * the same reason. Without them {@link assertClusterHolds} re-reads state nothing serializes: a
+ * member other than this step's subject can be retitled or relabelled by `updateTicket` after the
+ * board read, so the grouping passes on a title that is already gone — and a home's last qualifying
+ * ticket can be removed by `deleteTicket`, which takes that ticket's lock and no other, so the
+ * home's own lock never orders the deletion against the container bar. The carriers' PATHS earn the
+ * lock by the same deletion: `cardOf` walks the whole parent chain, so deleting a bead between a
+ * carrier and the home leaves that carrier riding no card at all — the container premise gone
+ * without the carrier itself being touched. Held, all three writes either land before the read (and
+ * it refuses) or queue behind this one.
+ */
 function lockedBeads(step: ApplyStep): string[] {
-  return [step.id, counterpartOf(step), ownerOf(step)?.id].filter(
+  return [step.id, counterpartOf(step), ownerOf(step)?.id, ...premiseBeadsOf(step)].filter(
     (id): id is string => id !== undefined,
   );
 }
 
 /**
- * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart and
- * a retirement's ticket owner — and re-judged against reads taken from inside those locks.
+ * One write, taken under the write lock of EVERY bead it rests on — the subject, its counterpart, a
+ * retirement's ticket owner, and a cluster's members and carried tickets ({@link premiseBeadsOf}) —
+ * and re-judged against reads taken from inside those locks.
  *
  * `planApply` decides against the caller's board snapshot, which is already seconds old by the time
  * the first bd write spawns — and the thing it is guarding against, a runner publishing a lease or
@@ -144,24 +200,33 @@ function lockedBeads(step: ApplyStep): string[] {
  * holds it too: handing a ticket to another card takes it out of that set exactly as retiring it
  * does, and leaves the run's commit landing in a PR for a bead that now belongs elsewhere.
  *
- * The body is the checks in the order they have to run, each named for what it refuses. Four of them
+ * The body is the checks in the order they have to run, each named for what it refuses. Five of them
  * buy a whole board read rather than trusting the snapshot: whether the subject still rides the
  * TICKET SET the step captured ({@link assertOwnerUnchanged}), whether a bead about to be SETTLED
  * still has open work under it ({@link assertNothingStranded}), whether a re-parent's home is still
- * the TIER its subject demands ({@link assertHomeFitsSubject}), and whether the board still STATES
- * the ordering a link rests on ({@link assertOrderingStated}). All four earn it the same way — the
- * write that flips the answer is itself a locked write on a bead this step holds. Attaching work
- * under a bead, and moving a bead onto another card, are both re-parents, which take those beads'
- * locks as subject and home; an epic's tier turns entirely on its feature children — it stops being
- * a card, or stops being a container, the moment one lands under it or leaves it, that same locked
- * write; and a link's evidence sits on the PAIR, whose bodies are edited under these very locks
- * (`ticket-detail.ts` `updateTicket`). So those writes genuinely order against each other.
+ * the TIER its subject demands ({@link assertHomeFitsSubject}), whether a cluster's home still
+ * CARRIES work and its members still state one subject ({@link assertClusterHolds}), and whether the
+ * board still STATES the ordering a link rests on ({@link assertOrderingStated}). All five earn it
+ * the same way — the write that flips the answer is itself a locked write on a bead this step holds.
+ * Attaching work under a bead, and moving a bead onto another card, are both re-parents, which take
+ * those beads' locks as subject, home and ticket owner; an epic's tier turns entirely on its feature
+ * children — it stops being a card, or stops being a container, the moment one lands under it or
+ * leaves it, that same locked write; and a link's evidence, like a cluster's grouping, sits on beads
+ * whose bodies and labels are edited under these very locks (`ticket-detail.ts` `updateTicket`). So
+ * those writes genuinely order against each other.
  * The rest of the board-wide topology stays with the snapshot — whether the edge closes a cycle —
  * because it rests on beads no lock taken here covers, so re-deriving it would buy a whole board
  * read and still guarantee nothing.
  *
+ * The two APPROVAL moves buy one each for a different question — not "did the topology move" but
+ * "does the approve gate still say what the ask read": {@link assertStillDegraded} for the
+ * withdrawal, {@link assertStillStartable} for the start. Both are gate re-derivations rather than
+ * serializations, and each refuses the opposite direction of the same drift.
+ *
  * Answers whether this step LANDED a write, which is not the same as whether it succeeded: see
- * {@link alreadySatisfied}.
+ * {@link alreadySatisfied} — and a step the board already satisfies still re-asks its cluster's
+ * premises before it is accepted as one ({@link assertSatisfiedClusterHolds}), because closing the
+ * proposal over it is a decision even when it writes nothing.
  *
  * `signal` is an unattended caller's cancel, and apply.ts hands it here for the FIRST step alone —
  * the only one that can still stop for free. Everything above the write is an await: acquiring the
@@ -184,6 +249,7 @@ export async function applyStep(
 ): Promise<boolean> {
   return withBeadWriteLocks(repo, lockedBeads(step), async () => {
     if (await lockedSubjectSatisfied(repo, step)) {
+      await assertSatisfiedClusterHolds(repo, step);
       signal?.throwIfAborted();
       return false;
     }
@@ -192,10 +258,10 @@ export async function applyStep(
     await assertRetirementHolds(repo, step);
     await assertHomeHolds(repo, step);
     await assertEvidenceHolds(repo, step);
+    await assertStartHolds(repo, step);
     const write = await lockedWrite(repo, step);
     signal?.throwIfAborted();
-    await runStep(repo, write);
-    return true;
+    return runStep(repo, write);
   });
 }
 
@@ -208,6 +274,27 @@ async function lockedSubjectSatisfied(repo: string, step: ApplyStep): Promise<bo
   const moved = subjectMoved(step, subject, Date.now());
   if (moved) throw new SubjectMovedError(moved);
   return subject !== undefined && alreadySatisfied(step, subject);
+}
+
+/**
+ * What a CLUSTER re-parent owes its premises even when the board has already made its move.
+ *
+ * A satisfied step writes nothing, so nothing here can be rolled back — but it is still one of the
+ * moves this proposal is about to be CLOSED as applied over. Reach that state on every member at
+ * once (another approval, or an operator, landing the whole cluster between the decision and these
+ * locks) and no step reaches {@link assertClusterHolds} at all, so the proposal settles as applied
+ * against premises nobody re-asked: a home whose recorded carrier has since gone, or a membership
+ * the regrouping no longer holds. The same fresh board would refuse that ask outright.
+ *
+ * Only the CLUSTER premises, not {@link assertHomeHolds} whole: a subject somebody else already
+ * moved under the home rides the home's ticket set now, which is exactly the change
+ * {@link assertOwnerUnchanged} refuses — and refusing an agreeing move is what the idempotent branch
+ * exists to prevent (see {@link alreadySatisfied}).
+ */
+async function assertSatisfiedClusterHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "reparent" || !step.cluster) return;
+  const doing = `before settling ${step.id}'s move under ${step.parent} as already made`;
+  assertClusterHolds(step, await lockedBoard(repo, doing));
 }
 
 /** The bead this step POINTS AT, re-judged under its own lock by the bar the decision used. */
@@ -238,13 +325,73 @@ async function assertRetirementHolds(repo: string, step: ApplyStep): Promise<voi
 
 /**
  * What a RE-PARENT owes the two run targets it sits between: the home it is about to hang work
- * under, and the ticket set it is taking that work out of.
+ * under, and the ticket set it is taking that work out of — plus, for a cluster, the premises its
+ * home was chosen on.
  */
 async function assertHomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "reparent") return;
   const board = await lockedBoard(repo, `before re-parenting under ${step.parent}`);
   assertOwnerUnchanged(step, board);
   assertHomeFitsSubject(step, board);
+  assertClusterHolds(step, board);
+}
+
+/**
+ * What a CLUSTER re-parent owes the two premises its home was chosen on — the card already filing
+ * work of this kind under it (reparent.ts `MIN_CARRIED_TICKETS`) and the members stating one subject
+ * between them ({@link clusterUngrouped}) — judged from a board read taken INSIDE the locks and
+ * through the same helpers the decision used. Absent on the re-parents that make no such claim.
+ *
+ * `planReparent` asks both of the snapshot, and nothing else here restates either: every check above
+ * asks whether the beads are open, unclaimed, unmoved and the right tier, all of which the writes
+ * that falsify these leave untouched.
+ *
+ * Both order against locks this step holds, and both need locks BEYOND its own two ends, which is
+ * why {@link lockedBeads} takes the whole membership and the home's carried tickets as well. The
+ * home's last ticket leaves by a re-parent — which takes the home's own lock as the ticket's ticket
+ * owner (see {@link ownerOf}) — but also by a `deleteTicket`, which takes only the deleted ticket's
+ * lock, so the container bar is asked over the CARRIERS the decision recorded and this step holds
+ * (apply-plan.ts `homeCarriesNothing`'s `only`) rather than over whatever the board happens to show.
+ * The grouping is read from titles and `area:` labels, edited under the bead's own lock
+ * (`ticket-detail.ts` `updateTicket`) — held here for every member, not just the subject, because a
+ * rename does its damage from either end: the partner that proves the subject still shares a topic
+ * can be the one edited away, and the member edited away can be one this apply has ALREADY moved.
+ * The locks only order one step's own reads, though — they are released between the writes — so the
+ * grouping is re-derived over the whole recorded membership rather than over this step's subject
+ * alone, and a member already sitting under the home that has left the cluster refuses HERE, which
+ * rolls the earlier writes back (apply.ts `applySteps`). Asking only about `step.id` let a
+ * three-member cluster whose first member was retitled after its move pass every later step and
+ * settle over a bead beneath a card it no longer belongs to.
+ *
+ * A carrier attributed to the home THROUGH an intermediate bead is only as ordered as that bead, so
+ * the premise names the whole PATH and this step locks it too (apply-plan.ts
+ * `ClusterPremise.carrierPaths`): deleting an intermediate takes its own lock alone, and it would
+ * otherwise cut the carrier's route to the home between this read and the write — leaving the bar
+ * satisfied by a ticket the board no longer files under the home at all. Which is why the count is
+ * narrowed to the carriers still reaching the home through THOSE beads (reparent.ts
+ * `carriersOnHeldPaths`) rather than to the recorded ids: a carrier re-parented onto a different
+ * intermediate under the same home since the filing reads as carrying it, on a route this step
+ * never locked, and the same deletion cuts it a moment later.
+ *
+ * The count ignores every id the ask NAMED rather than the members left to move: an earlier step of
+ * this same cluster has already landed under the home, and letting it count would let the ask prove
+ * its own premise with the very move it is asking for.
+ */
+function assertClusterHolds(step: ReparentStep, board: BoardIndex): void {
+  const cluster = step.cluster;
+  if (!cluster) return;
+  const target = board.byId.get(step.parent);
+  if (!target) throw new SubjectMovedError(missing(step.parent));
+  const carriers = heldCarriers(board, step.parent, cluster);
+  const leaf = homeCarriesNothing(target, board, new Set(cluster.named), carriers);
+  if (leaf) throw new SubjectMovedError(leaf);
+  // The step's own filing stamp rides along: dropping a member a run claimed since asks the same
+  // dated question the decision asked of it, so a claim the plan already saw is not read as news.
+  const ungrouped = clusterUngrouped(step.id, target, cluster, board, {
+    nowMs: Date.now(),
+    observedAtMs: step.observedAtMs,
+  });
+  if (ungrouped) throw new SubjectMovedError(ungrouped);
 }
 
 /**
@@ -257,6 +404,35 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
   if (step.verb !== "link" || step.kind !== "implied-order") return;
   const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
   assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing));
+}
+
+/**
+ * What an APPROVE owes the target it is about to release a run on — the evidence fence of the one
+ * move that starts work, re-asked from a board read taken INSIDE the subject's own write lock.
+ *
+ * The mirror of {@link assertStillDegraded}, and it exists for the mirror reason: that check refuses
+ * a withdrawal whose gaps were repaired since the decision, and this refuses a start whose target
+ * stopped clearing the gate since the decision. Everything else the locked half asks — status,
+ * liveness, claim, the premise stamp — is untouched by the writes that break the gate: an Acceptance
+ * section edited away, a feature landed under a legacy epic, a `blocks` edge drawn. Without this,
+ * the label goes on work the picker itself would no longer offer, and a run starts on it.
+ *
+ * Genuine serialization for the target's own body (`ticket-detail.ts` `updateTicket` takes this very
+ * lock) and for a claim (beads/claim.ts, the same chain); a narrowing for the rest of the subtree
+ * and for the blocker graph, whose edits take their own beads' locks.
+ */
+async function assertStartHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "approve") return;
+  const board = await lockedBoard(repo, `before approving ${step.id}`);
+  assertStillStartable(step.id, board);
+}
+
+/** The picker's own eligibility, re-asked under the lock through the helper the decision used. */
+function assertStillStartable(id: string, board: BoardIndex): void {
+  const subject = board.byId.get(id);
+  if (!subject) throw new SubjectMovedError(missing(id));
+  const barred = startBarred(subject, board.all, HOME_STANDING.locked);
+  if (barred) throw new SubjectMovedError(barred);
 }
 
 /**
@@ -298,6 +474,12 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // board's state, so there is no write to make — and no second note to leave on a bead whose
   // approval is already gone.
   if (step.verb === "unapprove") return !beads.isApproved(subject);
+  // Its mirror: somebody granted the approval by hand, or a concurrent approve landed it. The GATE
+  // is the whole ask, so there is nothing to write — and no claim to take over their grant, whether
+  // or not they reserved the target with it. An unreserved grant leaves the bead exactly where the
+  // picker's own pool expects it (approved and unassigned), which is why the proposal's acceptance
+  // asserts the gate alone and never a reservation (emit.ts `appliedState`).
+  if (step.verb === "approve") return beads.isApproved(subject);
   return false;
 }
 
@@ -605,21 +787,26 @@ function ownerStarted(
   return `${live.id} was claimed by ${claim} since this proposal was decided — that run has already selected the tickets it will work through, so ${doing} would abort it when its claim reaches a bead the board no longer holds`;
 }
 
-/** The bd verb each step resolves to — the only place this module spawns a write. */
-async function runStep(repo: string, step: ApplyStep): Promise<void> {
+/**
+ * The bd verb each step resolves to — the only place this module spawns a write. Answers whether it
+ * LANDED one: only an approve can reach here and find nothing left to write (see
+ * {@link grantApproval}); every other verb writes unconditionally, because the states that make them
+ * no-ops are caught by {@link alreadySatisfied} before the fences ever run.
+ */
+async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
   switch (step.verb) {
     case "reparent":
       await beads.reparent(repo, step.id, step.parent);
-      return;
+      return true;
     case "link":
       // `bd link a b` = b blocks a, which is the direction the detection states.
       await beads.link(repo, step.id, step.blocker, "blocks");
-      return;
+      return true;
     case "reprioritize":
       // Priority alone — no `currentLabels`, so `buildUpdateArgs` diffs no managed prefix and the
       // bead's `approved` / `stage:*` / `source:*` labels are untouched by the write.
       await beads.update(repo, step.id, { priority: step.priority });
-      return;
+      return true;
     case "unapprove":
       // The note FIRST, then the label. Two writes, and only this order is safe to fail between: a
       // note that lands without the untag leaves the approval standing beside an explanation the
@@ -627,16 +814,362 @@ async function runStep(repo: string, step: ApplyStep): Promise<void> {
       // of the queue saying nothing about why.
       await beads.note(repo, step.id, step.note);
       await beads.untag(repo, step.id, [LABELS.approved]);
-      return;
+      return true;
+    case "approve":
+      return grantApproval(repo, step.id);
     case "close":
       await beads.close(repo, step.id, step.reason);
-      return;
+      return true;
     case "supersede":
       await beads.supersede(repo, step.id, step.replacement);
-      return;
+      return true;
     case "defer":
       await beads.defer(repo, step.id);
-      return;
+      return true;
+  }
+}
+
+/**
+ * Grant the gate the way the approve route grants it: the auto-claim FIRST, then the label — the
+ * same composition, through the same compare-and-swap (`beads/claim.ts`), so the two writers cannot
+ * settle ownership by different rules.
+ *
+ * The order is the route's and only it is safe to fail between. `approved` is what locks the
+ * reservation — the claim route refuses to touch an approved target — so a label that landed ahead
+ * of the claim leaves a window in which a teammate's steal is still legal, on work anton is about to
+ * run. The other order strands the bead instead, which is why the label write is UNWOUND: a claim
+ * standing without `approved` is a reservation nothing picks up and no retry can clear, because
+ * every re-apply re-asks {@link startBarred}, and the picker's eligibility bars any holder — this
+ * machine's own operator included. Releasing it puts the board back where the proposal found it, so
+ * the next pass decides the same question from the same state.
+ *
+ * The CAS is redundant against this process and not against the board: the fence above already
+ * re-read the subject under this very lock, so a claim from another anton write queues behind us —
+ * but bd is shared, and a teammate's `bd assign` from a shell takes no lock at all. Losing the swap
+ * is the board declining, not a bd failure, which is why it refuses as a {@link SubjectMovedError}.
+ *
+ * `resolveOperator` is this machine's identity, memoized after its first read — the same one every
+ * anton job claims under, so a shared board shows whose pipeline the start belongs to. With no
+ * identity resolvable at all the swap is a verified no-op, exactly as it is on the route.
+ *
+ * Only a swap that actually WROTE is unwound. The same identity is shared by every anton process on
+ * this machine, so one of them can take the reservation between the fence's read and the CAS — and
+ * the CAS then reports success without writing, because the end state is already what we asked for.
+ * Releasing on that path would unassign a claim this apply never made, cancelling somebody else's
+ * start in the name of undoing ours.
+ *
+ * The label is not the last word either: the reservation it locks can still be taken while the label
+ * write itself is open, so {@link assertReservationHeld} re-reads the target afterwards and undoes a
+ * grant that landed on somebody else's claim.
+ *
+ * Answers whether the gate was granted HERE: a label that landed in the swap's own window makes this
+ * a no-op with a reservation to hand back, which is {@link grantedByAnother}'s question.
+ *
+ * Neither write is trusted to report its own outcome. bd commits before the process that ran it
+ * returns, so a rejection from either half is reconciled against the board before it propagates —
+ * see {@link reserveForStart} for the claim and {@link settleFailedGrant} for the label.
+ */
+async function grantApproval(repo: string, id: string): Promise<boolean> {
+  const operator = await resolveOperator();
+  const swap = await reserveForStart(repo, id, operator);
+  if (!swap.ok) {
+    throw new SubjectMovedError(
+      `${id} was claimed by ${swap.owner ?? "another writer"} since this proposal was decided — approving it now would start a run on work somebody else has reserved`,
+    );
+  }
+  if (await grantedByAnother(repo, id, swap, operator)) return false;
+  try {
+    await beads.approve(repo, id);
+  } catch (err) {
+    return await settleFailedGrant(repo, id, swap, operator, err);
+  }
+  await assertReservationHeld(repo, id, swap, operator);
+  return true;
+}
+
+/**
+ * Settle a label write that FAILED rather than never landed.
+ *
+ * `bd label` commits before the process that ran it reports, so a timeout or a nonzero exit says
+ * nothing about what the board holds — and assuming "no grant" is the one wrong guess that hurts:
+ * handing the reservation back off an approval that DID land leaves the target approved and
+ * unassigned, which is precisely what the picker offers, so another worker starts the run this apply
+ * is reporting as failed while its proposal stays open. The board is re-read first, and a grant that
+ * landed is settled exactly as a successful one — through {@link assertReservationHeld}, so the
+ * reservation it stands on is held to the same rule either way.
+ *
+ * Only a grant the re-read proves ABSENT is unwound, on the path {@link grantApproval}'s ordering
+ * exists for. A read that answers nothing proves nothing, so the reservation is left standing and
+ * NAMED: releasing it could free an approved target for every other machine, while keeping it costs
+ * a human one look at the bead this error points straight at. With no reservation of ours to hand
+ * back there is nothing to get wrong — that failure propagates untouched, and a label that landed
+ * behind it is a grant the next pass finds already made.
+ */
+async function settleFailedGrant(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+  err: unknown,
+): Promise<boolean> {
+  const live = await beads.show(repo, id).catch(() => undefined);
+  if (live && beads.isApproved(live)) {
+    await assertReservationHeld(repo, id, swap, operator);
+    return true;
+  }
+  if (!swap.wrote) throw err;
+  if (!live) {
+    throw new StrandedWriteError(
+      `${id} could not be approved (${messageOf(err)}) and could not be re-read to find out whether that grant landed anyway — the reservation taken for it is left standing rather than handed back over a read that proves nothing, so a human has to settle whether it is approved`,
+      [id],
+    );
+  }
+  if (await releaseReservation(repo, id, operator)) throw err;
+  throw new StrandedWriteError(
+    `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+    [id],
+  );
+}
+
+/**
+ * Take the reservation, and settle a swap that FAILED rather than lost.
+ *
+ * A lost race comes back as a result; a bd subprocess that times out or exits nonzero comes back as
+ * a rejection — and only the first says what the board holds. `bd assign` commits before the process
+ * that ran it reports, so a rejection can leave the reservation standing, and letting it propagate
+ * would report a start that wrote nothing over a target now assigned WITHOUT `approved`: the one
+ * half-applied state no retry clears, because the picker's eligibility bars every holder and every
+ * re-apply re-asks {@link startBarred}. So the board is re-read and the claim either handed back or
+ * named as stranded, exactly as the label write's own failure path does.
+ *
+ * With no identity to write there is nothing to reconcile — that swap is a verified no-op that never
+ * reaches bd (`beads/claim.ts`), so its failure came from the read alone and propagates untouched.
+ */
+async function reserveForStart(
+  repo: string,
+  id: string,
+  operator: string | undefined,
+): Promise<SwapResult> {
+  try {
+    return await swapUnderLock(repo, id)(undefined, operator);
+  } catch (err) {
+    if (!operator) throw err;
+    throw await strandedReservation(repo, id, operator, err);
+  }
+}
+
+/**
+ * What a failed reservation left on the board, as the error the start fails with.
+ *
+ * The re-read is the only evidence there is: the write reported nothing, so whether it landed is a
+ * question only the board answers. A holder that is not us means the failure wrote nothing we could
+ * take back — either the assign never landed, or somebody has taken the target since, and unassigning
+ * theirs would steal it in the name of an undo. An APPROVED target held by our own identity is left
+ * alone for the reason every other rollback here gives: that identity is shared by every anton
+ * process on this machine, and the pair reading whole means the claim locks a grant somebody else's
+ * start is about to run on.
+ *
+ * Only the strand is re-worded; every other path fails with the write's own error, because the
+ * reason the start failed is what a retry needs and the undo has nothing to add to it.
+ */
+async function strandedReservation(
+  repo: string,
+  id: string,
+  operator: string,
+  err: unknown,
+): Promise<unknown> {
+  const live = await beads.show(repo, id).catch(() => undefined);
+  if (!live) {
+    return new StrandedWriteError(
+      `${id} could not be reserved for this start (${messageOf(err)}) and could not be re-read to find out whether that reservation landed anyway — if it did, it is assigned to ${operator} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+      [id],
+    );
+  }
+  if (claimHolder(live) !== operator || beads.isApproved(live)) return err;
+  if (await releaseReservation(repo, id, operator)) return err;
+  return new StrandedWriteError(
+    `${id} could not be reserved for this start (${messageOf(err)}) and the reservation that write left behind could not be released either — it is assigned to ${operator} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+    [id],
+  );
+}
+
+/**
+ * Re-read the target once the label has landed and refuse a grant that ended up on somebody else's
+ * reservation — the last window of the pair, and the one no fence above can see.
+ *
+ * The swap's post-write read is the newest thing the CAS has, and `beads.approve` is a whole bd
+ * invocation later. A teammate's `bd assign` from a shell takes no in-process lock, so a claim
+ * landing in that window is invisible to every check this step made — and because `approved` is what
+ * LOCKS the reservation (the claim route refuses to touch an approved target), returning success
+ * here would settle the ask over work reserved by somebody the eligibility bars refused outright
+ * ({@link assertStillStartable} bars every holder). Asserting the assignee after the label is what
+ * makes the window narrow enough to matter, exactly as {@link grantedByAnother} does for the label.
+ *
+ * A LOCAL re-read, not the cross-machine settle `beads.claimVerified` pays: a claim published from
+ * another machine is fenced where it counts, at pickup — that protocol waits out its propagation
+ * window and re-asserts the assignee before a run works the target — so sleeping one out here, under
+ * every write lock this step holds, would stall the other writers on this board to re-decide
+ * something the runner decides again anyway. What only this read can catch is the writer sharing
+ * this board right now.
+ *
+ * The grant is UNDONE rather than kept: withdrawing the label puts the board back where the proposal
+ * found it, and the reservation needs no unwinding — a foreign owner means our claim is already
+ * gone.
+ *
+ * A bead we could not re-read is left approved and FAILS the start. Not withdrawn, because untagging
+ * on a read that proves nothing would take back a sound approval, and with the claim still ours it
+ * would strand the bead as a reservation no retry can clear (see {@link grantApproval}) — but not
+ * accepted either: this read IS the assertion, so returning success over it would settle the ask with
+ * ownership nothing proved, exactly the unverified grant the assignee check exists to refuse (the
+ * claim protocol's own re-read, AGENTS.md). An intervening `bd assign` or `bd unassign` is invisible
+ * to a failed read, so the honest report is a failed start naming the bead it left written, not a
+ * settled proposal over a reservation nobody checked.
+ *
+ * An ABSENT holder is the same failure wearing a different face, and only silence proves it is not:
+ * a shell `bd unassign` landing in this window erases the reservation the swap took, and returning
+ * success would settle the ask with an approved-but-unassigned target — work now available to any
+ * machine rather than reserved for this one, which is precisely what the CAS was for. So it passes
+ * only when no identity was resolved at all, because that swap was a verified no-op with no
+ * reservation to lose (see {@link releaseReservation}).
+ *
+ * The GATE is re-asserted off the same read, because the expected holder alone does not prove the
+ * grant survived: a shell `bd label --remove` landing in this window leaves the target reserved for
+ * this machine WITHOUT `approved`, which is the one state no retry clears — the picker's eligibility
+ * bars every holder, so the proposal would settle over a bead nothing can pick up. The reservation
+ * is handed back instead, which puts the board where the proposal found it and lets the next pass
+ * re-ask the question; a hand-back that fails strands the pair and says so.
+ */
+async function assertReservationHeld(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+): Promise<void> {
+  const live = await beads.show(repo, id).catch(() => undefined);
+  if (!live) {
+    throw new StrandedWriteError(
+      `${id} was approved but could not be re-read to confirm it is still reserved for ${operator ?? "nobody"} — the grant stands on the board over ownership this apply could not prove, so the start is reported failed rather than settled and a human has to check who holds it`,
+      [id],
+    );
+  }
+  const holder = claimHolder(live);
+  if (holder === operator || (!holder && !operator)) {
+    if (beads.isApproved(live)) return;
+    return assertGateSurvived(repo, id, swap, operator);
+  }
+  const change = holder
+    ? `was claimed by ${holder}`
+    : `had the reservation this start took for ${operator} removed`;
+  if (await withdrawGrant(repo, id)) {
+    throw new SubjectMovedError(
+      `${id} ${change} while this start was being approved — the grant was withdrawn, so the board is back where this proposal found it`,
+    );
+  }
+  throw new StrandedWriteError(
+    `${id} ${change} while this start was being approved and the \`${LABELS.approved}\` label could not be withdrawn — it now reads as approved work under a reservation this apply never checked, so a run nobody authorised can start on it`,
+    [id],
+  );
+}
+
+/**
+ * The reservation is still ours and the gate it was taken for is gone — hand the claim back and fail
+ * the start. Never returns: reaching it means another writer removed `approved` between
+ * {@link grantApproval}'s label write and its re-read.
+ *
+ * The pair only means something together. A claim without the gate is the half-applied state the
+ * whole ordering exists to avoid: the picker's eligibility bars every holder, this machine's own
+ * operator included, so the target sits reserved and unpickable until a human unassigns it. Handing
+ * the reservation back leaves the board exactly where the proposal found it, and the next pass asks
+ * the same question from the same state.
+ *
+ * Only a swap that WROTE is unwound, for the reason every other rollback here gives: this machine's
+ * identity is shared by every anton process on it, so a no-op swap is somebody else's reservation and
+ * releasing it would cancel their start.
+ */
+async function assertGateSurvived(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+): Promise<never> {
+  const removed = `${id} had the \`${LABELS.approved}\` this start wrote taken back off by another writer before the grant could be confirmed`;
+  if (!swap.wrote || (await releaseReservation(repo, id, operator))) {
+    throw new SubjectMovedError(
+      `${removed} — ${swap.wrote ? "the reservation taken for it was handed back" : "the reservation on it was never this apply's to hold"}, so the board is back where this proposal found it`,
+    );
+  }
+  throw new StrandedWriteError(
+    `${removed} and the reservation taken for that start could not be handed back — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+    [id],
+  );
+}
+
+/**
+ * Take the grant back off, and say whether the board took it. Never throws, for the reason
+ * {@link releaseReservation} does not: the caller is already reporting why the start failed, and an
+ * undo that raised a second error would replace that reason with its own.
+ */
+async function withdrawGrant(repo: string, id: string): Promise<boolean> {
+  try {
+    await beads.untag(repo, id, [LABELS.approved]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Did somebody else grant the gate in the window this CAS just closed? Then the ask is answered, and
+ * the reservation the swap may have taken is handed back rather than kept.
+ *
+ * The label is the one bar no fence above can hold: {@link assertStillStartable} delegates to the
+ * picker's eligibility, which ignores `approved` by design (an approved target is precisely what the
+ * picker offers), so the gap between the subject's re-read and this swap is open to a shell
+ * `bd label` that takes no in-process lock. The swap's own bead is the newest read there is — the
+ * post-write one when it wrote — so asking it here is what makes that window narrow enough to matter.
+ *
+ * Settling rather than refusing, and releasing rather than keeping, is {@link alreadySatisfied}'s
+ * promise held under the lock: the GATE is the whole ask, so their grant is the outcome, and an
+ * unreserved one belongs in the picker's pool where they left it — not converted into this machine's
+ * reservation, which bars every other machine from the work they opened up. Only a swap that WROTE
+ * is unwound, for the reason the label rollback gives: an identity we share with the other anton
+ * processes on this box means a no-op swap is somebody else's claim.
+ */
+async function grantedByAnother(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+): Promise<boolean> {
+  if (!beads.isApproved(swap.bead)) return false;
+  if (swap.wrote && !(await releaseReservation(repo, id, operator))) {
+    throw new StrandedWriteError(
+      `${id} was approved by another writer while this start was reserving it, and the reservation could not be handed back — it is assigned to ${operator ?? "this machine"}, which bars every other machine from picking up work somebody else opened`,
+      [id],
+    );
+  }
+  return true;
+}
+
+/**
+ * Hand back the reservation the failed start took, and say whether the board took it back. Bounded
+ * by the same CAS as the claim, so it releases OUR claim and only ours: a target somebody has since
+ * taken over is theirs, and unassigning it would steal it in the name of an undo.
+ *
+ * Never throws — the caller is already reporting a failure, and a rollback that raised a second one
+ * would replace the reason the start failed with the reason the undo did.
+ */
+async function releaseReservation(
+  repo: string,
+  id: string,
+  operator: string | undefined,
+): Promise<boolean> {
+  // No identity resolved means the swap was a verified no-op, so there is no reservation to unwind.
+  if (!operator) return true;
+  try {
+    return (await swapUnderLock(repo, id)(operator, undefined)).ok;
+  } catch {
+    return false;
   }
 }
 

@@ -49,6 +49,9 @@ vi.mock("../stringer", async (importOriginal) => {
       untracked: { dropped: [] },
       coupling: { dropped: [], recounted: [] },
       deadcode: { dropped: [] },
+      duplication: {
+        dropped: [{ path: "src/doc.ts", kind: "code-clone", reason: "6 comment line(s)" }],
+      },
       deltaState: { before: "state-1", after: "state-2" },
       restoreBaseline: () => scanned.restoreBaseline(),
     }),
@@ -133,5 +136,9 @@ it("reports what the scan lost when the log is writable", async () => {
   const result = await runScan();
   await result.reportDiagnostics();
 
-  expect(readFileSync(logPath, "utf8")).toContain("gitlog");
+  const log = readFileSync(logPath, "utf8");
+  expect(log).toContain("gitlog");
+  // The duplication filter can remove most of a scan; silence would read as a collector that
+  // found nothing (anton-vb2h).
+  expect(log).toContain("dropped 1 duplication signal(s)");
 });

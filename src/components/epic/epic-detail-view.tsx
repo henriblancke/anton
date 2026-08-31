@@ -4,13 +4,14 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { CheckIcon, CircleSlashIcon, RotateCcwIcon, TriangleAlertIcon } from "lucide-react";
+import { CheckIcon, CircleSlashIcon, RotateCcwIcon } from "lucide-react";
 
 import type { EpicCrumb, EpicDetail, ReviewReport, Ticket } from "@/lib/types";
 // The predicate itself, not a page-local copy: approve, the runner, and the board card ask the same one.
 import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { TYPE_LABELS, agentDotClass, ticketProgress } from "@/components/board/board-utils";
@@ -189,15 +190,10 @@ export function EpicDetailView({
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-        <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-          <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-        </span>
-        <p className="text-sm text-risk-high">{error}</p>
-        <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        message={error}
+        onRetry={() => setAttempt((n) => n + 1)}
+      />
     );
   }
 

@@ -201,6 +201,17 @@ export function isRunAlreadyLiveError(e: unknown): e is RunAlreadyLiveError {
   );
 }
 
+/**
+ * Whether the failure PROVES another machine owns this epic's branch — the only basis on which a
+ * caller may hand the branch over to someone else (leave the orphan PR ready, skip the worktree
+ * teardown). An `unproven` lease conflict is this run losing track of its OWN lease and says nothing
+ * about a second owner, so it must not read as one: treated as foreign, it strands resources nobody
+ * else claims. Shared so every such caller applies the same rule.
+ */
+export function isForeignRunOwner(e: unknown): boolean {
+  return isRunAlreadyLiveError(e) && e.conflict === "foreign";
+}
+
 export function isSyncNotWiredError(e: unknown): e is SyncNotWiredError {
   return e instanceof SyncNotWiredError || (e as { name?: string })?.name === "SyncNotWiredError";
 }

@@ -306,6 +306,26 @@ describeBd("run-health e2e (real handler · real bd)", () => {
     expect(await getRunHealthReport(tdb.db, projectId)).toEqual(before);
   });
 
+  it("carries the skipped-read count alongside the findings a partial sweep did produce", async () => {
+    const jobId = await driveJob({
+      db: tdb.db,
+      clock,
+      type: "run-health",
+      handler: (deps) =>
+        makeRunHealthHandler({
+          ...deps,
+          readPrActivity: async () => {
+            throw new Error("gh: rate limited");
+          },
+        }),
+      projectId,
+    });
+
+    const job = await getJob(tdb.db, jobId);
+    expect(job?.outcome).toBe("ok");
+    expect(job?.outcomeNote).toContain("1 PR check(s) skipped");
+  });
+
   it("is idempotent — a second sweep over unchanged state stores the identical report", async () => {
     await sweep();
     const first = await getRunHealthReport(tdb.db, projectId);

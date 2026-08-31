@@ -7,7 +7,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { createDoltSync, type SyncOutcome } from "../beads/bd";
+import { type SyncOutcome } from "../beads/bd";
+import { createDoltSync } from "../beads/sync-coalescer";
 import { PoisonError, SyncNotWiredError } from "./errors";
 import { enqueueSyncPushDeduped, getJob, type Clock } from "./queue";
 import { JobRunner, type JobContext, type RunnerConfig } from "./runner";

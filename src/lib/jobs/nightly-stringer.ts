@@ -18,7 +18,7 @@ import { openPass, type NightlyPass } from "./nightly-stringer-pass";
 import { restoreScanWindow, scanShippedTree, type ScanPass } from "./nightly-stringer-scan";
 import { runTriage } from "./nightly-stringer-triage";
 import { systemClock, type AntonDb, type Clock } from "./queue";
-import type { JobContext, JobHandler } from "./runner";
+import type { JobContext, JobEffect, JobHandler } from "./runner";
 
 export interface NightlyStringerPayload {
   projectId: string;
@@ -36,11 +36,15 @@ export interface NightlyStringerDeps {
  * No new signals is a success, not an error — and a real data point: a clean pass is what a falling
  * trend is made of, so it is recorded like any other, and nothing is dispatched over it.
  */
-async function triageScan(pass: NightlyPass, scanned: ScanPass, ctx: JobContext): Promise<void> {
+async function triageScan(
+  pass: NightlyPass,
+  scanned: ScanPass,
+  ctx: JobContext,
+): Promise<JobEffect> {
   if (scanned.counts.total === 0) {
     await pass.log(`[stringer] no new signals — nothing to triage\n`);
     await pass.recordHealth(scanned);
-    return;
+    return { changed: false, note: "no new signals" };
   }
   await pass.log(`[stringer] ${scanned.counts.total} signal(s) → /scan-triage\n`);
 
@@ -58,10 +62,12 @@ async function triageScan(pass: NightlyPass, scanned: ScanPass, ctx: JobContext)
   await pass.recordHealth(scanned, triage);
   // The triage session wrote its beads via `bd`; push them to the Dolt remote.
   await syncBoard(pass.project.repoPath);
+
+  return { changed: true, note: `triaged ${scanned.counts.total} signal(s)` };
 }
 
 /** One nightly pass, start to settled session — the sequence the job exists to run. */
-async function runNightlyPass(db: AntonDb, clock: Clock, ctx: JobContext): Promise<void> {
+async function runNightlyPass(db: AntonDb, clock: Clock, ctx: JobContext): Promise<JobEffect> {
   const { projectId } = ctx.payload as NightlyStringerPayload;
   const pass = await openPass(db, clock, ctx, projectId);
 
@@ -80,8 +86,9 @@ async function runNightlyPass(db: AntonDb, clock: Clock, ctx: JobContext): Promi
     // the catch below with `scanned` set rather than stranding a consumed --delta window.
     await scanned.reportDiagnostics();
     await ctx.heartbeat();
-    await triageScan(pass, scanned, ctx);
+    const effect = await triageScan(pass, scanned, ctx);
     await pass.end("done");
+    return effect;
   } catch (e) {
     // A pass that scanned and then died still saw the repo. Record what it saw before the failure
     // propagates, so the trend keeps its point and the next scan's delta compares to reality.

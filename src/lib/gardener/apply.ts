@@ -43,13 +43,21 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
-import { notePrefix, planApply, type ApplyMoment, type ApplyStep } from "./apply-plan";
+import {
+  notePrefix,
+  planApply,
+  type ApplyDecision,
+  type ApplyMoment,
+  type ApplyStep,
+  type CarriedPremise,
+} from "./apply-plan";
 import {
   applyStep,
   messageOf,
   oneLine,
   readWholeBoard,
   rollbackSteps,
+  StrandedWriteError,
   SubjectMovedError,
 } from "./apply-steps";
 import {
@@ -225,7 +233,7 @@ async function applyApproved(
     );
   }
   if (decision.status === "settled") {
-    return settleUnwritten(repo, proposal, plan, decision.summary, at, actor, signal);
+    return settleUnwritten(repo, proposal, plan, decision, at, actor, signal);
   }
   return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor, signal);
 }
@@ -282,6 +290,14 @@ async function assertStillOpen(repo: string, proposal: Bead): Promise<void> {
  * them, so a subject moved away or an edge dropped after the route's refresh cannot leave this
  * proposal closed as applied over a board that no longer holds the state its summary names.
  *
+ * The plan's own two ends are not the whole claim either. A settled CLUSTER still asserts its home
+ * is a container, and that premise is counted off tickets the plan never names — so the decision
+ * hands them over ({@link ApplyDecision}'s `carried`) and they are locked and re-counted here just as
+ * a step locks and re-counts them (apply-steps.ts `assertClusterHolds`). Without them `deleteTicket`,
+ * which takes the deleted ticket's own lock and no other, can remove the home's last independent
+ * carrier between the re-read and the close, settling a proposal whose home no longer carries the
+ * work that made it an obvious one.
+ *
  * This path runs no step, so it is where the {@link applyStep} checkpoint would never fire — and it
  * still writes: the settlement's note and close ARE mutations, on the far side of the affected
  * beads' locks and a whole-board re-read. So the cancel is honoured once more here, immediately
@@ -291,13 +307,14 @@ function settleUnwritten(
   repo: string,
   proposal: Bead,
   plan: GardenerPlan,
-  summary: string,
+  decision: Extract<ApplyDecision, { status: "settled" }>,
   at: ApplyMoment,
   actor: ApplyActor,
   signal?: AbortSignal,
 ): Promise<ApplyResult> {
-  return withBeadWriteLocks(repo, affectedBeads(plan), async () => {
-    const drifted = await settledDrifted(repo, plan, at);
+  const carried = decision.carried;
+  return withBeadWriteLocks(repo, affectedBeads(plan, carried), async () => {
+    const drifted = await settledDrifted(repo, plan, at, carried);
     if (drifted) {
       throw await attachFailure(
         repo,
@@ -306,7 +323,7 @@ function settleUnwritten(
       );
     }
     signal?.throwIfAborted();
-    return settleProposal(repo, proposal, plan, summary, [], actor);
+    return settleProposal(repo, proposal, plan, decision.summary, [], actor);
   });
 }
 
@@ -360,7 +377,11 @@ async function applySteps(
  *
  * "Rolled back" is not always the whole truth, which is why the survivors ride along: an undo the
  * board would not take leaves those beads moved (apply-steps.ts `rollbackSteps`), and a `failed` that
- * reported none of them would tell an unattended caller its board is exactly where it left it.
+ * reported none of them would tell an unattended caller its board is exactly where it left it. The
+ * FAILING step's own writes count the same way and no rollback can name them — it never joined the
+ * prefix — so they arrive on the error ({@link StrandedWriteError}), and their presence is also what
+ * suppresses the empty-prefix clause: "nothing had been written" is false over a bead the failure
+ * itself left written, and the message already says what stands.
  */
 async function stepFailure(
   repo: string,
@@ -369,13 +390,15 @@ async function stepFailure(
   e: unknown,
 ): Promise<ProposalApplyError> {
   const rollback = await rollbackSteps(repo, changed);
+  const stranded = e instanceof StrandedWriteError ? e.stranded : [];
   const stale = e instanceof SubjectMovedError && changed.length === 0;
+  const report = stranded.length > 0 && changed.length === 0 ? "" : rollback.report;
   return stale
     ? new ProposalApplyError("refused", `cannot apply ${proposalId}: ${messageOf(e)}`)
     : new ProposalApplyError(
         "failed",
-        `applying ${proposalId} failed: ${messageOf(e)}${rollback.report}`,
-        rollback.survivors,
+        `applying ${proposalId} failed: ${messageOf(e)}${report}`,
+        [...rollback.survivors, ...stranded],
       );
 }
 
@@ -475,20 +498,37 @@ function appliedNote(plan: GardenerPlan, summary: string, actor: ApplyActor): st
     : `${prefix}: applied — ${summary}.`;
 }
 
-/** Every bead a plan's outcome rests on: the subjects it acts on, plus the bead it points at. */
-function affectedBeads(plan: GardenerPlan): string[] {
-  return plan.target ? [...plan.subjects, plan.target] : [...plan.subjects];
+/**
+ * Every bead a plan's outcome rests on: the subjects it acts on, the bead it points at, and — for a
+ * settlement whose summary still rests on the home being a container — the carried tickets that
+ * premise is counted from, plus the beads they reach the home THROUGH (deleting one of those cuts
+ * the carrier's route without touching the carrier itself).
+ */
+function affectedBeads(plan: GardenerPlan, carried?: CarriedPremise): string[] {
+  return [
+    ...plan.subjects,
+    ...(plan.target ? [plan.target] : []),
+    ...(carried ? [...carried.carriers, ...carried.carrierPaths] : []),
+  ];
 }
 
 /**
  * Why the board no longer reads as already-applied, or undefined when it still does. Re-decided from
  * a FRESH board read through `planApply` itself rather than a hand-rolled per-verb re-check, so the
  * confirmation cannot hold the live board to a different bar than the decision held the snapshot to.
+ *
+ * `carried` narrows the home's container bar to the tickets the caller holds locked, for the reason
+ * a step narrows it (apply-plan.ts `homeCarriesNothing`'s `only`): counting freely would let a
+ * ticket filed since — which nothing here serializes — carry a premise, while the carrier that
+ * actually earned it is deleted a moment later. The whole premise rather than its ids, because a
+ * carrier only counts while its route to the home also runs through beads this lock covers
+ * (apply-plan.ts `heldCarriers`).
  */
 async function settledDrifted(
   repo: string,
   plan: GardenerPlan,
   at: ApplyMoment,
+  carried?: CarriedPremise,
 ): Promise<string | undefined> {
   let board: Bead[];
   try {
@@ -497,7 +537,7 @@ async function settledDrifted(
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;
   }
-  const now = planApply(plan, board, { ...at, nowMs: Date.now() });
+  const now = planApply(plan, board, { ...at, nowMs: Date.now() }, carried);
   switch (now.status) {
     case "settled":
       return undefined;

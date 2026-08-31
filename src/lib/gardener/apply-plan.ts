@@ -31,7 +31,17 @@ import {
   type GardenerDetectionKind,
   type GardenerPlan,
 } from "./detections";
+import { ineligibility } from "../jobs/picker-targets";
 import { impliesOrdering } from "./relink";
+import {
+  carriedTickets,
+  carrierPaths,
+  carriersOnHeldPaths,
+  groupedUnder,
+  isClusterTier,
+  MIN_CARRIED_TICKETS,
+  MIN_CLUSTER_SIZE,
+} from "./reparent";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -88,6 +98,15 @@ export type ApplyStep =
          * recorded here as its own baseline and then compared against itself under the lock.
          */
         parentClaim: string;
+        /**
+         * The cluster this step is one move of, or absent for the re-parents that make no grouping
+         * claim (`container-orphan`, `misfiled`) — what the write half needs to re-ask a
+         * `parentless-cluster`'s two board-derived premises under the locks (apply-steps.ts
+         * `assertClusterHolds`). Neither is a property of the bead being moved, so neither is
+         * derivable from the step's two ends alone: the carried-ticket bar has to exclude the ask's
+         * own members, and the grouping predicate reads the whole membership.
+         */
+        cluster?: ClusterPremise;
       })
   /**
    * The two link kinds rest on DIFFERENT evidence, and {@link EvidenceFence.kind} is what tells them
@@ -121,9 +140,93 @@ export type ApplyStep =
        */
       note: string;
     })
+  /**
+   * The mirror of `unapprove`, and the one step that STARTS work rather than tidying the board: it
+   * grants the founder's own gate on the target the pass judged worth running next. It carries no
+   * counterpart and no ticket owner — a withheld-approval subject is a run target itself, so its own
+   * signals are the whole answer — but it IS fenced, because "this is the work worth starting" is a
+   * judgment about the bead's contract that no board read restates ({@link EVIDENCE_PREMISE}).
+   */
+  | (StepSubject & EvidenceFence & { verb: "approve" })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "close"; reason: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "supersede"; replacement: string })
   | (StepSubject & TicketOwner & EvidenceFence & { verb: "defer" });
+
+/** The one verb whose steps come in clusters — the shape both halves of the move are written in. */
+export type ReparentStep = Extract<ApplyStep, { verb: "reparent" }>;
+
+/**
+ * The beads a home's CONTAINER premise — "the board already files work of this kind under it" — is
+ * counted from, named so whoever re-asks it can lock them first.
+ *
+ * Split out from {@link ClusterPremise} because the settling half of an apply needs exactly this
+ * half and none of the rest: a cluster whose every surviving member already sits under the home
+ * writes no step, so it never reaches the per-step locks, yet its summary still claims the home is a
+ * container (apply.ts `settleUnwritten`).
+ */
+export interface CarriedPremise {
+  /**
+   * The home's own pre-existing tickets, as the decision found them — the beads its CONTAINER
+   * premise rests on, and the set the write half re-asks that premise over while holding their
+   * locks (`homeCarriesNothing`'s `only`).
+   *
+   * A count would not survive the trip: the write half has to name the beads to lock them, and an
+   * unnamed ticket can be deleted out from under the re-check between the board read and the write.
+   * Narrower than "whatever the home carries at the write" on purpose — a ticket filed under the
+   * home in the meantime is nothing this approval holds a lock on, so letting it carry the premise
+   * would restore exactly the race the list exists to close.
+   */
+  carriers: string[];
+  /**
+   * The beads those carriers reach the home THROUGH — every ancestor between a carrier and the home
+   * that is not itself a carrier (reparent.ts `carrierPaths`).
+   *
+   * A carrier proves nothing on its own: `cardOf` walks the whole parent chain, so a ticket counted
+   * under the home reaches it only while every bead on that path survives. Deleting one takes that
+   * bead's own lock alone, so the write half locks the path as well as its ends — otherwise the
+   * container bar could pass on a carrier whose route to the home is cut between the read and the
+   * write, which is the leaf-card landing the bar exists to stop.
+   *
+   * The route recorded here is the one that gets locked, so it is also the only route a carrier may
+   * still count on: one re-parented onto a different intermediate under the same home reaches it
+   * through beads this apply never held, and drops out of the count (reparent.ts
+   * `carriersOnHeldPaths`).
+   */
+  carrierPaths: string[];
+}
+
+/**
+ * What a cluster re-parent's two BOARD-DERIVED premises are re-asked over under the locks: the home
+ * already filing work of this kind under it ({@link CarriedPremise}), and the members stating one
+ * subject between them.
+ *
+ * Recorded per step because the write half sees one step at a time, and neither premise is a fact
+ * about the bead being moved. Several lists rather than one: the count has to ignore every id the ask
+ * NAMES — including the ones it has already dropped, which somebody may have filed under the home by
+ * hand — while the grouping is asked of the members the decision actually kept, and both premises
+ * name beads the write half has to LOCK before it can re-ask them of anything (apply-steps.ts
+ * `lockedBeads`).
+ */
+export interface ClusterPremise extends CarriedPremise {
+  /** Every id the proposal named, excluded from the home's carried-ticket count. */
+  named: string[];
+  /** The members the decision's regrouping kept — moving and already in place. */
+  members: string[];
+  /**
+   * The members the board should ALREADY show under the home when this step is re-checked: the ones
+   * the decision found in place, plus every earlier step of the same apply — `applySteps` runs them
+   * in this order, so each step's premise names exactly what has landed by its turn.
+   *
+   * Their own step has run or will never run, so nothing else notices them LEAVING, and the card
+   * test in {@link memberLeftCluster} structurally cannot: it reads a bead moved under a container
+   * epic as still-unreachable work this very proposal is the fix for (see
+   * {@link reparentPremiseGone}), which is right for a member still waiting to move and wrong for
+   * one this apply already placed. Without this, detaching the landed half of a two-member cluster
+   * between the writes leaves it supplying the grouping evidence for the other half's move, and the
+   * proposal settles as applied with one bead under the home.
+   */
+  landed: string[];
+}
 
 /**
  * What a CONTENT-derived move's evidence rests on, carried forward so the locked re-read can re-ask
@@ -187,10 +290,14 @@ type RetirementSubject = StepSubject & TicketOwner & EvidenceFence;
  *     landed its writes and failed before closing the proposal). Nothing to write; the proposal
  *     still closes, which is what makes a retry converge instead of re-applying.
  *   • `refuse` — a precondition the plan rests on is no longer true. Nothing is written at all.
+ *
+ * A settlement carries whatever board-derived premise its summary rests on, exactly as a step does:
+ * writing nothing is not the same as resting on nothing, and the settling half has to lock those
+ * beads and re-count over them before it closes the proposal (apply.ts `settleUnwritten`).
  */
 export type ApplyDecision =
   | { status: "apply"; steps: ApplyStep[]; summary: string }
-  | { status: "settled"; summary: string }
+  | { status: "settled"; summary: string; carried?: CarriedPremise }
   | { status: "refuse"; reason: string };
 
 /**
@@ -225,12 +332,22 @@ export interface ApplyMoment {
  * picked back up) would otherwise apply a move for a problem that no longer exists — undoing the fix
  * instead of the fault. Premise is re-derived from `plan.kind`, which the fingerprint binds, rather
  * than from filing-time state the plan would have to carry.
+ *
+ * `held` is the carried premise the CALLER holds the write locks on, and narrows the home's
+ * container bar to it ({@link heldCarriers}) — the same narrowing a step makes under its own locks
+ * (apply-steps.ts `assertClusterHolds`). A caller holding no locks passes nothing and the bar counts
+ * freely, which is right for a decision taken against a snapshot: it is deciding, not writing.
  */
-export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): ApplyDecision {
+export function planApply(
+  plan: GardenerPlan,
+  board: Bead[],
+  at: ApplyMoment,
+  held?: CarriedPremise,
+): ApplyDecision {
   const index = indexBoard(board);
   switch (plan.move) {
     case "reparent":
-      return planReparent(plan, index, at);
+      return planReparent(plan, index, at, held);
     case "link":
       return planLink(plan, index, at);
     case "retire":
@@ -247,12 +364,19 @@ export function planApply(plan: GardenerPlan, board: Bead[], at: ApplyMoment): A
         status: "refuse",
         reason: `splitting ${list(plan.subjects)} means writing new contracts, which anton will not do on its own — decompose it with \`/shape\` (the proposal's sketch is the starting point) and decline this proposal`,
       };
+    case "approve":
+      return planApprove(plan, index, at);
   }
 }
 
 // ── re-parent ──
 
-function planReparent(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+function planReparent(
+  plan: GardenerPlan,
+  index: BoardIndex,
+  at: ApplyMoment,
+  held?: CarriedPremise,
+): ApplyDecision {
   // A container-orphan detection with no single obvious home deliberately files WITHOUT a target —
   // it asks the approver to pick one. Approving it as-is would have to invent that answer.
   if (!plan.target) {
@@ -263,7 +387,7 @@ function planReparent(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): A
   }
   const target = index.byId.get(plan.target);
   if (!target) return { status: "refuse", reason: missing(plan.target) };
-  const unusable = homeRefusal(plan, target, index, at);
+  const unusable = homeRefusal(plan, target, index, at, held);
   if (unusable) return { status: "refuse", reason: unusable };
   return reparentSteps(plan, target, index, at);
 }
@@ -278,6 +402,7 @@ function homeRefusal(
   target: Bead,
   index: BoardIndex,
   at: ApplyMoment,
+  held?: CarriedPremise,
 ): string | undefined {
   // The home's own state — settled, or owned by a run. Shared with the under-lock re-check in
   // `applyStep`, so the snapshot decision and the write refuse the same home for the same reason.
@@ -287,9 +412,13 @@ function homeRefusal(
   // to `homeUnusable`, so without this the step would record that newcomer's claim as its own
   // baseline and the under-lock re-check ({@link homeClaimed}) would compare it against itself and
   // wave the move through, hanging tickets under a run that has already chosen what it will run.
+  //
+  // Then the CONTAINER bar the cluster detector chose this home on — the one thing about the home
+  // that nothing downstream re-asks, because the survivor re-check reads titles and labels alone.
   const gone =
     homeUnusable(target, at.nowMs) ??
-    claimedSinceFiling(target, at, "hanging work under it", CLAIM_COST.home);
+    claimedSinceFiling(target, at, "hanging work under it", CLAIM_COST.home) ??
+    homeStoppedCarrying(plan, target, index, held);
   if (gone) return gone;
   // Then the tier the taxonomy demands of a home, asked SUBJECT BY SUBJECT: a working-layer bead
   // wants the board card that runs it, a card wants the container epic that groups it, and one
@@ -298,37 +427,416 @@ function homeRefusal(
     const subject = index.byId.get(id);
     // A subject that has left the board is `reparentSubject`'s refusal to name, not this one's.
     if (!subject) continue;
+    // Nor is one that has left the working layer: it is dropped from the move rather than moved
+    // (see {@link clusterMemberLeftLayer}), and asking the tier question of it here would refuse
+    // the whole cluster over a bead nothing is going to write to.
+    if (clusterMemberLeftLayer(plan, subject)) continue;
     const wrongTier = homeWrongTier(subject, target, index, HOME_STANDING.snapshot);
     if (wrongTier) return wrongTier;
   }
   return undefined;
 }
 
-/** One step per subject that still has to move — the whole cluster, or the first refusal it hits. */
+/**
+ * The CONTAINER half of a cluster's "obvious home", asked of the snapshot. Asked of
+ * `parentless-cluster` alone: no other kind chose its home on this evidence.
+ *
+ * `held` narrows the count to the tickets a locked caller can prove nothing is deleting under it
+ * (see {@link homeCarriesNothing}'s `only` and {@link heldCarriers}).
+ */
+function homeStoppedCarrying(
+  plan: GardenerPlan,
+  home: Bead,
+  index: BoardIndex,
+  held?: CarriedPremise,
+): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  return homeCarriesNothing(
+    home,
+    index,
+    new Set(plan.subjects),
+    held && heldCarriers(index, home.id, held),
+  );
+}
+
+/**
+ * The carriers of a recorded premise a locked caller may still count — the ones whose CURRENT route
+ * to the home runs entirely through beads that premise names, and so entirely through beads the
+ * caller locked (reparent.ts {@link carriersOnHeldPaths}).
+ *
+ * The recorded ids alone are not enough. A carrier re-parented onto a different intermediate beneath
+ * the SAME home between the filing and the locks still rides the home, so `cardOf` keeps counting
+ * it — but it now reaches the home through a bead nothing here holds, and `deleteTicket` takes only
+ * the deleted bead's own lock. That intermediate can go between the locked read and the write,
+ * severing the home's last carrier and landing the cluster on a leaf card: the exact race
+ * {@link CarriedPremise.carrierPaths} exists to close, re-opened by a move the carrier's own lock
+ * never ordered against. Dropping the carrier refuses instead, which is what every other premise
+ * change here does.
+ */
+export function heldCarriers(
+  index: BoardIndex,
+  homeId: string,
+  premise: CarriedPremise,
+): Set<string> {
+  const locked = new Set([...premise.carriers, ...premise.carrierPaths]);
+  return new Set(carriersOnHeldPaths(index, homeId, premise.carriers, locked));
+}
+
+/**
+ * Why this home no longer carries work of its own, or undefined — the CONTAINER half of the
+ * cluster detector's "obvious home" (reparent.ts {@link MIN_CARRIED_TICKETS}), re-asked against the
+ * board the writes would land on.
+ *
+ * It is the one premise of a `parentless-cluster` no per-bead check restates: {@link homeUnusable}
+ * asks only whether the card is still open and free, and {@link regroupSurvivors} re-derives the
+ * MEMBERS' half from titles and labels. So a card whose last ticket was deleted or re-homed between
+ * the filing and the approval would take the cluster anyway — and hanging one off a leaf card is
+ * exactly what the bar exists to stop: it turns one PR's worth of work into somebody else's epic.
+ *
+ * `named` is every id the ask names, and they are excluded from the count — along with everything
+ * riding on them (reparent.ts `ridesOnNamed`), because `cardOf` walks the whole chain and a named
+ * member's own children reach the home only THROUGH it. A member somebody filed under the home by
+ * hand since the proposal rides that card now, so counting it or its subtree would let the ask prove
+ * its own premise with the very move it is asking for — as would an EARLIER step of the same
+ * cluster, which is why the write half re-asks this with the same set (apply-steps.ts
+ * `assertClusterHolds`) rather than with whatever is left to move.
+ *
+ * `only` narrows the count to the tickets the caller HOLDS THE LOCKS ON, and the write half always
+ * passes it (see {@link ClusterPremise.carriers}). Counting freely there would leave the premise
+ * resting on beads nothing serialized: `deleteTicket` takes the deleted ticket's own lock and no
+ * other (`ticket-detail.ts`), so the home's lock does not order a deletion against this read, and
+ * the last qualifying ticket could go between the board read and the write — landing the cluster on
+ * a leaf card after all. Restricted to the locked set, a ticket that still counts here cannot be
+ * deleted, re-homed or retyped until this step has written, because all three take its own lock.
+ */
+export function homeCarriesNothing(
+  home: Bead,
+  index: BoardIndex,
+  named: ReadonlySet<string>,
+  only?: ReadonlySet<string>,
+): string | undefined {
+  const carried = carriedTickets(index, home.id, named).filter((id) => only?.has(id) ?? true);
+  if (carried.length >= MIN_CARRIED_TICKETS) return undefined;
+  const lost = only
+    ? `no longer carries the tickets this proposal was decided against`
+    : `carries no tickets of its own any more`;
+  return `${home.id} ${lost} — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if ${home.id} is still the right home`;
+}
+
+/** A subject no longer part of the claim: the board answered it after the proposal was filed. */
+interface Answered {
+  answered: string;
+}
+
+/** A subject that already sits under the home: nothing to write, but still one of the cluster. */
+interface InPlace {
+  inPlace: Bead;
+}
+
+/**
+ * One step per subject that still has to move — the whole cluster, or the first refusal it hits.
+ *
+ * A member the board has ANSWERED since the filing is dropped from the move rather than refusing it
+ * (see {@link Answered}). A cluster's membership is not its identity any more (anton-9hpp), so one
+ * stale member used to make the whole proposal unapplyable forever while its own fingerprint went on
+ * suppressing the fresh, valid cluster the next patrol derived. Dropping it preserves exactly the
+ * property the refusal was protecting — the newer decision is never written over — while leaving the
+ * members nobody has answered movable.
+ *
+ * When nothing is left to move, {@link nothingLeftToMove} answers the ask from what the board now
+ * holds.
+ */
 function reparentSteps(
   plan: GardenerPlan,
   home: Bead,
   index: BoardIndex,
   at: ApplyMoment,
 ): ApplyDecision {
-  const steps: ApplyStep[] = [];
+  const moves: ReparentStep[] = [];
+  const answered: string[] = [];
+  // Members that already sit under the home. They are written to by nobody, but they ARE the cluster
+  // the proposal asked for, so they count towards the subject the survivors must still state between
+  // them — a cluster half-applied by hand is still a cluster.
+  const inPlace: Bead[] = [];
   for (const id of plan.subjects) {
     const moved = reparentSubject(plan, id, home, index, at);
     if (typeof moved === "string") return { status: "refuse", reason: moved };
-    if (moved) steps.push(moved);
+    if ("inPlace" in moved) inPlace.push(moved.inPlace);
+    else if ("answered" in moved) answered.push(moved.answered);
+    else moves.push(moved);
   }
-  return steps.length === 0
-    ? settledInPlace(plan)
-    : {
-        status: "apply",
-        steps,
-        summary: `re-parented ${list(steps.map((s) => s.id))} under ${home.id}`,
-      };
+  const survivors = regroupSurvivors(plan, home, moves, inPlace, index);
+  const steps = survivors.steps;
+  if (steps.length === 0) {
+    return nothingLeftToMove(plan, home, inPlace, answered, survivors, index);
+  }
+  const left = answered.length + survivors.dropped.length;
+  const skipped = left > 0 ? ` (${left} member(s) no longer in the cluster)` : "";
+  return {
+    status: "apply",
+    steps,
+    summary: `re-parented ${list(steps.map((s) => s.id))} under ${home.id}${skipped}`,
+  };
 }
 
 /**
- * What one member of a cluster resolves to: a refusal reason, the step that moves it, or undefined
- * when it already sits where the proposal wants it.
+ * What an approved re-parent with no move left to make ANSWERS with.
+ *
+ * The cluster the board ALREADY holds is asked first, and settles it. Members somebody filed under
+ * the home by hand are the outcome this ask wanted, so once what sits there still states one subject
+ * ({@link clusterStandsInPlace}) there is nothing to write and nothing left to ask. Reporting a
+ * departed member's refusal instead is a proposal no approval can ever settle: the valid cluster is
+ * on the board, so every later approve reaches the same refusal and the ask stays open until a human
+ * declines it by hand.
+ *
+ * Failing that, the board's own answer stands: a cluster the regrouping unravelled reads as
+ * dissolved, which is a better answer for an approver than the departure that started the
+ * unravelling; and a member the board answered is reported as the refusal it is, because no write
+ * happened and an approver reading "settled" would be told the ask landed under a target it never
+ * reached.
+ *
+ * A cluster left with no answer at all — every member moved home by hand, and then retitled out of
+ * the subject they shared — is REFUSED rather than settled ({@link clusterUnravelledInPlace}). What
+ * sits under the home is not the cluster this ask was decided on, so a fresh patrol would propose
+ * nothing, and closing it as applied would put the gardener's name on a grouping nobody derived.
+ */
+function nothingLeftToMove(
+  plan: GardenerPlan,
+  home: Bead,
+  inPlace: Bead[],
+  answered: string[],
+  survivors: Survivors,
+  index: BoardIndex,
+): ApplyDecision {
+  // The container premise rides the settlement the way it rides a step: this path writes no step, so
+  // it is the settling half that has to lock these carriers and re-count over them before it closes
+  // the proposal as applied (apply.ts `settleUnwritten`).
+  if (clusterStandsInPlace(plan, home, inPlace)) {
+    return settledInPlace(inPlace, home.id, carriedPremise(home, index, new Set(plan.subjects)));
+  }
+  if (survivors.dropped.length > 0) {
+    return { status: "refuse", reason: clusterDissolved(home, survivors.dropped) };
+  }
+  const [firstAnswer] = answered;
+  if (firstAnswer) return { status: "refuse", reason: firstAnswer };
+  if (plan.kind === "parentless-cluster") {
+    return { status: "refuse", reason: clusterUnravelledInPlace(home, inPlace) };
+  }
+  return settledInPlace(inPlace, home.id);
+}
+
+/**
+ * How a cluster already sitting where it asked to sit, yet no longer stating one subject, reads to
+ * the approver — the in-place twin of {@link clusterMemberUngrouped}, named over the whole set
+ * because none of these beads is being written to.
+ */
+function clusterUnravelledInPlace(home: Bead, inPlace: Bead[]): string {
+  const sit = inPlace.length === 1 ? "sits" : "sit";
+  return `${list(inPlace.map((b) => b.id))} already ${sit} under ${home.id} but no longer state a subject ${home.id} states too — a title or \`area:\` label was edited since this proposal was decided, and it takes ${MIN_CLUSTER_SIZE} beads stating one subject before a home is obvious; nothing was written, so decline it and re-parent by hand if ${home.id} is still the right home`;
+}
+
+/**
+ * Do the members already under the home still form a cluster on their own — {@link regroupSurvivors}'s
+ * question, asked of the beads that need no write?
+ *
+ * `groupedUnder` reaches a bead only through a group of at least {@link MIN_CLUSTER_SIZE}, so a
+ * non-empty answer IS the cluster the proposal asked for, sitting where it asked for it.
+ */
+function clusterStandsInPlace(plan: GardenerPlan, home: Bead, inPlace: Bead[]): boolean {
+  if (plan.kind !== "parentless-cluster") return false;
+  return groupedUnder(home, inPlace).size > 0;
+}
+
+/**
+ * The home's carried tickets and the beads they reach it through, as the decision found them — what
+ * a cluster's container premise is counted from, and the beads whoever re-asks it has to lock
+ * ({@link CarriedPremise}).
+ */
+function carriedPremise(home: Bead, index: BoardIndex, named: ReadonlySet<string>): CarriedPremise {
+  const carriers = carriedTickets(index, home.id, named);
+  return { carriers, carrierPaths: carrierPaths(index, home.id, carriers) };
+}
+
+/** What is left of a cluster once the members that no longer state its subject are dropped. */
+interface Survivors {
+  steps: ReparentStep[];
+  /** The ids the grouping dropped — what {@link clusterDissolved} names when nothing is left. */
+  dropped: string[];
+}
+
+/**
+ * The survivors re-asked the detector's own question: do these beads still state one subject their
+ * home states too (reparent.ts `groupedUnder`)?
+ *
+ * A proposal's subjects are the UNION of every topic group the home hosts, so one proposal can carry
+ * an escalation pair and a docker pair. Lose one member of each and two unrelated survivors still
+ * clear a raw {@link MIN_CLUSTER_SIZE} count, while a fresh patrol — which groups before it counts —
+ * would emit nothing at all. Counting is therefore not enough: the grouping predicate has to be
+ * recomputed over whoever is left.
+ *
+ * A member no surviving group reaches is DROPPED rather than fatal, exactly like a closed or re-homed
+ * one: its evidence left with the members it agreed with, and refusing over it would hold the pair
+ * that still agrees hostage while the target-only fingerprint suppressed their fresh proposal.
+ *
+ * The membership this settles on rides every surviving step ({@link ClusterPremise}), because it is
+ * what the write half re-asks this same question of under the locks — a title or `area:` edit landing
+ * in the window between the two is invisible to every other bar a step holds.
+ */
+function regroupSurvivors(
+  plan: GardenerPlan,
+  home: Bead,
+  steps: ReparentStep[],
+  inPlace: Bead[],
+  index: BoardIndex,
+): Survivors {
+  if (plan.kind !== "parentless-cluster") return { steps, dropped: [] };
+  const moving = steps.flatMap((step) => {
+    const subject = index.byId.get(step.id);
+    return subject ? [subject] : [];
+  });
+  const grouped = groupedUnder(home, [...moving, ...inPlace]);
+  const named = new Set(plan.subjects);
+  const premise = {
+    named: [...named],
+    members: [...grouped].sort(),
+    ...carriedPremise(home, index, named),
+  };
+  // Grows with the writes: the decision's in-place members have landed before the first step runs,
+  // and each step adds its own subject for the ones after it (see {@link ClusterPremise.landed}).
+  const landed = inPlace.filter((member) => grouped.has(member.id)).map((member) => member.id);
+  return {
+    steps: steps
+      .filter((step) => grouped.has(step.id))
+      .map((step) => {
+        const cluster: ClusterPremise = { ...premise, landed: [...landed] };
+        landed.push(step.id);
+        return { ...step, cluster };
+      }),
+    dropped: steps.filter((step) => !grouped.has(step.id)).map((step) => step.id),
+  };
+}
+
+/**
+ * How a cluster that no longer holds together reads to the approver who has to decide it.
+ *
+ * `detectParentlessClusters` needs {@link MIN_CLUSTER_SIZE} loose beads stating one subject their
+ * home states too before it will call a home obvious — a single loose bead sharing a topic with a
+ * card is the weak evidence this whole detector was rebuilt to stop proposing on (anton-9hpp).
+ * Dropping members must not smuggle the move below that bar, and {@link regroupSurvivors} asks the
+ * detector's own predicate rather than a count, so a two-member cluster with one member re-homed and
+ * a four-member one whose two pairs each lost a member both land here.
+ */
+function clusterDissolved(home: Bead, left: string[]): string {
+  return `${list(left)} is all that is left of this cluster — it takes ${MIN_CLUSTER_SIZE} beads stating one subject ${home.id} states too before a home is obvious, and whatever changed since the filing is the newer reading of where this work belongs; decline it, and re-parent by hand if ${home.id} is still the right home`;
+}
+
+/**
+ * Why the CLUSTER this step is one move of no longer holds, or undefined — the detector's own
+ * grouping predicate (reparent.ts {@link groupedUnder}), re-asked over the whole recorded membership
+ * as it now reads.
+ *
+ * The decision asks it of the approval's snapshot ({@link regroupSurvivors}); the write re-asks it
+ * because the evidence is TITLES and `area:` labels, which every other bar a step holds is blind to
+ * — a rename leaves the bead open, unclaimed, unmoved and the right tier, and the move then lands a
+ * bead under a card it no longer shares a subject with.
+ *
+ * Asked of the WHOLE membership rather than of this step's subject alone, because the per-step locks
+ * are released between the writes. Two questions come out of that:
+ *
+ *   • has a member the board ALREADY has under the home stopped stating the subject? That one is the
+ *     damage, and nothing else is left to notice it: an earlier step of this apply put it there (or
+ *     the decision counted it in place), and a check that only asked whether `subjectId` reached
+ *     some group would pass every later step of a three-member cluster whose first member was
+ *     retitled after its move — settling the proposal over a bead beneath a card it no longer
+ *     belongs to.
+ *   • is the subject about to be written still grouped — over the members still IN the cluster,
+ *     which is what {@link memberLeftCluster} drops, so a lone survivor cannot be carried past a bar
+ *     a fresh patrol would refuse.
+ *
+ * A member somebody has re-homed since is left where they put it: that is a newer decision than this
+ * proposal, and the rollback deliberately does not fight it (apply-steps.ts `rollbackStep`). What it
+ * no longer does is carry the grouping — the whole cluster is refused instead, so the rest of it is
+ * not landed on evidence the board has withdrawn. Every member not yet under the home is its own
+ * step besides, re-read under its own lock when its turn comes — so this is the only place the ones
+ * already there are judged at all.
+ */
+export function clusterUngrouped(
+  subjectId: string,
+  home: Bead,
+  cluster: ClusterPremise,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
+  const inCluster = cluster.members.flatMap((id) => {
+    const member = index.byId.get(id);
+    return member && !memberLeftCluster(member, home, cluster, index, at) ? [member] : [];
+  });
+  const grouped = groupedUnder(home, inCluster);
+  // Asked of the members still IN the cluster: one that left it by being closed or claimed is not a
+  // bead whose SUBJECT changed, and naming an edit that never happened would send the approver
+  // looking for it. It sits where the proposal wanted it, and the dissolution below is its reading.
+  const strayed = inCluster.find(
+    (m) => m.id !== subjectId && !grouped.has(m.id) && sitsUnder(index, m.id, home.id),
+  );
+  if (strayed) return clusterMemberStrayed(strayed.id, home);
+  if (grouped.has(subjectId)) return undefined;
+  // Which refusal the approver reads turns on WHY the grouping came apart: an edit to the beads
+  // themselves, or members that left the cluster and took their half of the evidence with them.
+  return inCluster.length === cluster.members.length
+    ? clusterMemberUngrouped(subjectId, home)
+    : clusterDissolved(
+        home,
+        inCluster.map((member) => member.id),
+      );
+}
+
+/** Is this member already where the cluster's move puts it — by an earlier step of it, or by hand? */
+function sitsUnder(index: BoardIndex, id: string, homeId: string): boolean {
+  const member = index.byId.get(id);
+  return member !== undefined && beads.parentOf(member) === homeId;
+}
+
+/** Why this member no longer states the subject the cluster is grouped on. */
+const clusterMemberUngrouped = (id: string, home: Bead): string =>
+  `${id} no longer states a subject the rest of this cluster and ${home.id} hold in common — a title or \`area:\` label was edited since this proposal was decided, and it takes ${MIN_CLUSTER_SIZE} beads stating one subject ${home.id} states too before a home is obvious`;
+
+/** The same, for a member this apply has already landed under the home — the one it cannot leave. */
+const clusterMemberStrayed = (id: string, home: Bead): string =>
+  `${clusterMemberUngrouped(id, home)}, and it already sits under ${home.id} — landing the rest of this cluster would leave it beneath a card whose work it is no longer part of`;
+
+/**
+ * Has this member left the cluster since the decision, by any of the ways the decision itself drops
+ * one — settled, promoted out of the working layer, picked up by a run, or given another card?
+ *
+ * The same questions {@link clusterMemberGone}, {@link clusterMemberLeftLayer} and
+ * {@link reparentPremiseGone} ask of a subject, asked here of the members whose own step has already
+ * run or will never run — the claim half through {@link subjectBusy}, exactly as the decision asks
+ * it. A live lease alone is not enough: `bd update --claim` writes the assignee and `in_progress` a
+ * moment before its run publishes one, and a member picked up in that window would otherwise go on
+ * supplying the grouping evidence that carries everybody else's move (reparent.ts `isFree` excludes
+ * it from the cluster at detection for the same reason). Dating it against the filing keeps the
+ * baseline honest — a claim the plan itself saw is the thing being proposed against, not news.
+ *
+ * A member already LANDED under the home ({@link ClusterPremise.landed}) is held to one bar more: it
+ * must still sit there.
+ */
+function memberLeftCluster(
+  member: Bead,
+  home: Bead,
+  cluster: ClusterPremise,
+  index: BoardIndex,
+  at: ApplyMoment,
+): boolean {
+  if (!isOpenWork(member) || !isClusterTier(member)) return true;
+  if (subjectBusy(member, at, DOING.reparent)) return true;
+  if (cluster.landed.includes(member.id)) return beads.parentOf(member) !== home.id;
+  const card = index.cards.cardOf(member);
+  return card !== undefined && card !== home.id;
+}
+
+/**
+ * What one member of a cluster resolves to: a refusal reason, the step that moves it, the answer
+ * that drops it, or the bead itself when it already sits where the proposal wants it.
  */
 function reparentSubject(
   plan: GardenerPlan,
@@ -336,11 +844,23 @@ function reparentSubject(
   home: Bead,
   index: BoardIndex,
   at: ApplyMoment,
-): string | ApplyStep | undefined {
+): string | ReparentStep | Answered | InPlace {
   const subject = index.byId.get(id);
-  if (!subject) return missing(id);
+  // A DELETED member left the cluster as surely as a closed or re-homed one, so for the kind whose
+  // claim is its target it is answered rather than fatal — refusing here would hold the members
+  // nobody touched hostage to a bead that no longer exists, while the proposal's own fingerprint
+  // suppressed the fresh cluster the survivors form. Every other kind names the bead its move is
+  // ABOUT, so a missing subject is still the board changing out from under the ask.
+  if (!subject) return clusterMemberDeleted(plan, id) ?? missing(id);
   const currentParent = beads.parentOf(subject) ?? "";
-  if (currentParent === home.id) return undefined; // already where the proposal wants it
+  if (currentParent === home.id) return clusterMemberInPlace(plan, subject, at);
+  // Asked before every safety bar because they are not ones: they decide whether this bead is still
+  // part of the claim at all, and a bead nothing will write to cannot be unsafe to leave alone.
+  const answered =
+    reparentPremiseGone(plan, subject, index) ??
+    clusterMemberLeftLayer(plan, subject) ??
+    clusterMemberGone(plan, subject, at);
+  if (answered) return { answered };
   const barred = reparentBarred(plan, subject, home, index, at);
   if (barred) return barred;
   return {
@@ -356,6 +876,29 @@ function reparentSubject(
     kind: plan.kind,
     observedAtMs: at.observedAtMs,
   };
+}
+
+/**
+ * What a member that ALREADY sits under the home resolves to: the cluster it half-applies, or the
+ * answer that drops it.
+ *
+ * Nothing is written to such a bead, but it still COUNTS — towards the subject the survivors must
+ * state between them ({@link regroupSurvivors}) and towards the floor below which the cluster has
+ * dissolved. So the same question every other member is asked has to be asked of it: is it still one
+ * of the loose beads the cluster was derived from? Closed, claimed, or promoted out of the working
+ * layer, it left the cluster exactly as a re-homed member does — and counting it there would carry
+ * a lone survivor past a bar a fresh patrol would refuse.
+ *
+ * {@link reparentPremiseGone} is deliberately NOT asked: the card it now rides is the home, which is
+ * the outcome this proposal wanted, not a newer decision to preserve.
+ */
+function clusterMemberInPlace(
+  plan: GardenerPlan,
+  subject: Bead,
+  at: ApplyMoment,
+): Answered | InPlace {
+  const answered = clusterMemberLeftLayer(plan, subject) ?? clusterMemberGone(plan, subject, at);
+  return answered ? { answered } : { inPlace: subject };
 }
 
 /** Why this subject cannot be moved under this home, or undefined. */
@@ -381,7 +924,6 @@ function reparentBarred(
   const busy =
     subjectBusy(subject, at, DOING.reparent) ??
     ticketSetBusy(index, subject, at, movingTicket(subject.id)) ??
-    reparentPremiseGone(plan, subject, index) ??
     premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs) ??
     carrierMoved(plan, subject, home, index, at) ??
     premiseTouched(home, EVIDENCE_PREMISE[plan.kind]?.twin, at.observedAtMs);
@@ -393,10 +935,22 @@ function reparentBarred(
   return undefined;
 }
 
-/** Every subject already sits under the target: the ask is answered and nothing is written. */
-function settledInPlace(plan: GardenerPlan): ApplyDecision {
-  const sit = plan.subjects.length === 1 ? "sits" : "sit";
-  return { status: "settled", summary: `${list(plan.subjects)} already ${sit} under ${plan.target}` };
+/**
+ * The subjects that already sit under the target: the ask is answered and nothing is written. Named
+ * from the beads that ARE there rather than from the plan, because a member the board answered
+ * elsewhere is not one of them and telling an approver it sits under the target would be false.
+ */
+function settledInPlace(
+  inPlace: Bead[],
+  target: string,
+  carried?: CarriedPremise,
+): ApplyDecision {
+  const sit = inPlace.length === 1 ? "sits" : "sit";
+  return {
+    status: "settled",
+    summary: `${list(inPlace.map((b) => b.id))} already ${sit} under ${target}`,
+    ...(carried ? { carried } : {}),
+  };
 }
 
 // ── link ──
@@ -664,6 +1218,106 @@ export function unapproveNote(gaps: ApprovalGap[]): string {
   );
 }
 
+// ── approve ──
+
+/**
+ * Granting the approval the board's next work is missing (anton-gmbz) — the mirror of
+ * {@link planUnapprove}, and the only move here that STARTS work.
+ *
+ * It asks the same four questions the picker asks of every candidate ({@link startBarred}) and its
+ * premise is FENCED where the withdrawal's is re-derived, because the two asks rest on opposite
+ * kinds of evidence. "This target no longer clears the gate" is a pure function of the board, so
+ * re-deriving it makes repair a real second answer; "this is the work worth starting next" is a
+ * judgment about the bead's contract that no board read restates, and approving a rescoped one
+ * spends the pass's dearest write on a target nobody judged.
+ *
+ * A target that somebody has ALREADY approved settles, ahead of the fence — the outcome the ask
+ * wanted is the board's state whoever wrote it, and refusing over a stamp would leave the ask open
+ * forever against a board that agrees with it (the same order `planReprioritize` uses).
+ *
+ * On the LABEL alone, ownership unasked — including on the retry after a grant this apply left
+ * standing without proving it still held the reservation (apply-steps.ts `assertReservationHeld`).
+ * A retry cannot tell that grant from another writer's, and demanding the reservation back would
+ * strand the far commoner case: a read that merely failed over a reservation still ours becomes a
+ * proposal nothing can ever close. What carries that assertion instead is the failure itself — it
+ * names the bead it left written, notes the still-open proposal, and no unattended pass re-decides
+ * it, because an open proposal's fingerprint suppresses re-emission (emit.ts
+ * `suppressedFingerprints`). So the only retry is a human who has read that note.
+ */
+function planApprove(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "an approve proposal names exactly one run target" };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  if (beads.isApproved(subject)) {
+    return { status: "settled", summary: `${subject.id} already carries \`${LABELS.approved}\`` };
+  }
+  const barred = approveBarred(plan, subject, index, at);
+  if (barred) return { status: "refuse", reason: barred };
+  return {
+    status: "apply",
+    steps: [
+      {
+        verb: "approve",
+        id: subject.id,
+        claim: runClaimOf(subject),
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
+    summary: `approved ${subject.id}, so a run can start on it`,
+  };
+}
+
+/** Why this target may not be started, or undefined. */
+function approveBarred(
+  plan: GardenerPlan,
+  subject: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
+  if (!isOpenWork(subject)) {
+    return `${subject.id} is ${settledWord(subject)} — approving it would queue nothing`;
+  }
+  // The liveness half first, because {@link startBarred} cannot see it: a bead that is `open` and
+  // unassigned still reads as startable to the picker while a run holds a lease on it or its PR is
+  // up. Then the picker's own eligibility, then the premise no board read restates.
+  return (
+    subjectBusy(subject, at, DOING.approve, CLAIM_COST.start) ??
+    startBarred(subject, index.all, HOME_STANDING.snapshot) ??
+    premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs)
+  );
+}
+
+/**
+ * Why the board itself would not offer this bead as work to start, or undefined — a run target,
+ * `open`, unclaimed, and clearing all four of approval's promises.
+ *
+ * Delegated whole to the picker's own {@link ineligibility} rather than re-derived, for the reason
+ * every other bar in this module is shared: a second definition of "startable" would let an approve
+ * proposal grant the gate on a bead the picker itself refuses, or refuse one a human could approve
+ * by hand. It is also what keeps the move inside the picker's policy instead of beside it.
+ *
+ * Only the STRUCTURAL half — the picker's policy predicate narrows this set further, and that
+ * narrowing belongs to the pass that files the ask, not to the write that executes it.
+ *
+ * Asked twice, like every other bar: once against the caller's snapshot, and again against a board
+ * read taken inside the subject's own write lock (apply-steps.ts `assertStillStartable`). `standing`
+ * is which of the two is speaking — the snapshot states a fact, the write states a CHANGE, because
+ * the decision already cleared this bar (see {@link HOME_STANDING}).
+ */
+export function startBarred(
+  subject: Bead,
+  board: Bead[],
+  standing: HomeStanding,
+): string | undefined {
+  const excluded = ineligibility(subject, board);
+  if (!excluded) return undefined;
+  return `${subject.id} ${standing} work anton may start — ${excluded.detail} (${excluded.reason}) — so approving it would set a run loose on a target the board itself refuses`;
+}
+
 // ── retire ──
 
 function planRetire(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
@@ -894,6 +1548,10 @@ const CLAIM_COST = {
   // the run when the label is gone, so this does not race the run — it ends it.
   approval:
     "would poison the run that owns it, which re-checks the approval after its claim settles and stops when the label is gone",
+  // The one move that does not write OVER a run but beside it: approving work somebody already
+  // holds queues a second start on it rather than pulling it away from the first.
+  start:
+    "would queue a start on work another run already owns, and the approval anton grants is what releases it",
 } as const;
 
 /**
@@ -959,6 +1617,9 @@ function claimedSinceFiling(
  * CARD rather than the raw parent because that is what the move is for — a bead moved under another
  * container is still as unreachable as the proposal says, and re-homing it is still the fix.
  *
+ * The answer drops the bead from the move rather than refusing the plan; only a plan left with
+ * nothing to write reports it as a refusal (see {@link reparentSteps}).
+ *
  * Asked of those two kinds ALONE. A `misfiled` subject rides a perfectly good card already — that is
  * the whole claim — so holding it to this bar would refuse every one of them; its premise is the
  * evidence fence instead ({@link EVIDENCE_PREMISE}).
@@ -972,6 +1633,54 @@ function reparentPremiseGone(
   const card = index.cards.cardOf(subject);
   if (!card) return undefined;
   return `${subject.id} now rides board card ${card} — it was given a home since this proposal was filed, so moving it under ${plan.target} would overwrite that newer decision`;
+}
+
+/**
+ * Why this member is no longer one of the loose beads the cluster was derived from, or undefined.
+ *
+ * `detectParentlessClusters` builds only from beads that are parentless, still wanted, and held by
+ * nobody (reparent.ts `isClusterCandidate`). A card answers the first of those and
+ * {@link reparentPremiseGone} reads it; this reads the other two — a member closed since the filing,
+ * or picked up by a run since it — which are just as much the board answering that bead, and just as
+ * much a reason to leave it alone rather than to refuse everyone else.
+ *
+ * Asked of `parentless-cluster` alone, because only a GROUP claim survives losing a member. The same
+ * facts about a single-subject re-parent are what {@link reparentBarred} refuses the plan over, which
+ * is the honest answer when the plan is that one bead.
+ */
+function clusterMemberGone(plan: GardenerPlan, subject: Bead, at: ApplyMoment): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  if (!isOpenWork(subject)) {
+    return `${subject.id} is ${settledWord(subject)} — it left the cluster after this proposal was filed`;
+  }
+  return subjectBusy(subject, at, DOING.reparent);
+}
+
+/**
+ * The same answer as {@link clusterMemberGone} for the member that is no longer working-layer work
+ * at all — the fourth way a bead leaves a cluster, and the one every bar around it reads as a fatal
+ * home refusal instead.
+ *
+ * `detectParentlessClusters` builds from tasks, bugs and chores (reparent.ts `isClusterTier`).
+ * Promote one to a `feature` and it becomes a board card, so {@link homeWrongTier} refuses the whole
+ * proposal as `feature-under-non-epic` before any member is judged — and the target-only fingerprint
+ * goes on suppressing the fresh proposal the surviving pair would form. Dropping it leaves the
+ * members nobody touched movable, which is what the other three answers already do.
+ */
+function clusterMemberLeftLayer(plan: GardenerPlan, subject: Bead): string | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  if (isClusterTier(subject)) return undefined;
+  return `${subject.id} is a ${subject.issue_type ?? "bead"} now, not the working-layer work this cluster was derived from — it left the cluster after this proposal was filed`;
+}
+
+/**
+ * The same answer as {@link clusterMemberGone} for the member that is not on the board at all —
+ * `bd delete` is the third way one leaves a cluster, and the only one no bead is left to read it
+ * from. Returned already wrapped, because the caller has no subject to hand the other checks.
+ */
+function clusterMemberDeleted(plan: GardenerPlan, id: string): Answered | undefined {
+  if (plan.kind !== "parentless-cluster") return undefined;
+  return { answered: `${missing(id)} — it left the cluster after this proposal was filed` };
 }
 
 /**
@@ -1136,6 +1845,20 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
   // from the fresh board; fencing it would refuse the repair the proposal is half asking for, since
   // repairing a bead is itself a write since the filing.
   "degraded-approval": undefined,
+  // Fenced, unlike its mirror: clearing the gate is re-derivable, but "this is the work worth
+  // starting next" is a judgment about the bead's contract, and starting a run on a rescoped one
+  // spends the pass's dearest write on a target nobody judged.
+  //
+  // The TARGET's contract, not the board's rank around it. A rival unblocked or re-ranked above it
+  // since the filing leaves the ask true and costs nothing: the grant starts no run (the approve
+  // route never enqueues one for a proposal apply), and what runs next is decided at pickup by the
+  // PRIME ranking, which reads the board rather than who carries the label (jobs/picker-targets.ts
+  // tests approval's promises, never the grant). Fencing on whole-board rank inputs would instead
+  // refuse every start over an unrelated write, which is most nights.
+  "withheld-approval": {
+    still: "the bead whose contract this start was judged from",
+    harm: "approving it now would set a run loose on work somebody has since rewritten",
+  },
 };
 
 /**
@@ -1315,6 +2038,7 @@ export const DOING: Record<ApplyStep["verb"], string> = {
   link: "recording it as blocked",
   reprioritize: "re-ranking it",
   unapprove: "withdrawing its approval",
+  approve: "approving it",
   close: "retiring it",
   supersede: "retiring it",
   defer: "retiring it",

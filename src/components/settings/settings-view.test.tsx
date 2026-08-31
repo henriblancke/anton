@@ -34,6 +34,7 @@ const DEFAULT_CRONS = {
   "gate-check": "*/10 * * * *",
   gardener: "0 5 * * *",
   "board-picker": "*/10 * * * *",
+  "product-master": "0 6 * * 1",
 };
 
 type Earned = Parameters<typeof SettingsView>[0]["earned"];
@@ -340,6 +341,98 @@ describe("SettingsView self-review section (anton-of1m)", () => {
   });
 });
 
+/**
+ * The autopilot brakes (anton-nmy7). These four decide when anton stops STARTING work, and one of
+ * them latches a freeze only a human lifts — so an operator who cannot reach them here has to hand
+ * craft an API request to tune or disable a brake that is already holding their project.
+ */
+describe("SettingsView autopilot brakes (anton-nmy7)", () => {
+  showing("autopilot");
+
+  it("falls back to the shipped defaults when nothing is persisted", () => {
+    renderView({});
+    expect((screen.getByLabelText("Open PRs in review") as HTMLInputElement).value).toBe("3");
+    expect((screen.getByLabelText("Failed runs in a row") as HTMLInputElement).value).toBe("3");
+    expect((screen.getByLabelText("Score floor") as HTMLInputElement).value).toBe("7");
+    expect((screen.getByLabelText("Consecutive runs below it") as HTMLInputElement).value).toBe("3");
+  });
+
+  it("seeds every knob from persisted settings (round-trip in)", () => {
+    renderView({
+      autopilotWipLimit: 5,
+      autopilotFailureStreak: 4,
+      autopilotScoreFloor: 8,
+      autopilotScoreWindow: 2,
+    });
+    expect((screen.getByLabelText("Open PRs in review") as HTMLInputElement).value).toBe("5");
+    expect((screen.getByLabelText("Failed runs in a row") as HTMLInputElement).value).toBe("4");
+    expect((screen.getByLabelText("Score floor") as HTMLInputElement).value).toBe("8");
+    expect((screen.getByLabelText("Consecutive runs below it") as HTMLInputElement).value).toBe("2");
+  });
+
+  it("PATCHes the edited brakes on Save (round-trip out)", () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.change(screen.getByLabelText("Open PRs in review"), { target: { value: "6" } });
+    fireEvent.change(screen.getByLabelText("Score floor"), { target: { value: "9" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body).toMatchObject({
+      autopilotWipLimit: 6,
+      autopilotFailureStreak: 3,
+      autopilotScoreFloor: 9,
+      autopilotScoreWindow: 3,
+    });
+  });
+
+  it("sends a disabling 0 as a real value, not as a cleared override", () => {
+    // null would reset the knob to the shipped default — the exact opposite of what an operator
+    // turning a brake off asked for.
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.change(screen.getByLabelText("Failed runs in a row"), { target: { value: "0" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.autopilotFailureStreak).toBe(0);
+  });
+
+  it("says which brakes are off, rather than showing a 0 that reads as 'immediately'", () => {
+    renderView({ autopilotWipLimit: 0, autopilotFailureStreak: 0, autopilotScoreFloor: 0 });
+    expect(screen.getByText(/off · anton starts work however many PRs are waiting on you/)).toBeTruthy();
+    expect(screen.getByText(/off · anton keeps starting runs however many fail/)).toBeTruthy();
+    expect(screen.getByText(/off · anton keeps starting runs however they score/)).toBeTruthy();
+    // The window is meaningless with no floor — disabled, never silently reset.
+    expect((screen.getByLabelText("Consecutive runs below it") as HTMLInputElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("clamps an out-of-range knob to the range the API would have rejected", () => {
+    renderView({});
+    const floor = screen.getByLabelText("Score floor") as HTMLInputElement;
+    fireEvent.change(floor, { target: { value: "99" } });
+    expect(floor.value).toBe("10");
+  });
+
+  it("names the hold's release condition — the one brake nobody has to clear", () => {
+    renderView({});
+    expect(screen.getByText(/releases itself the moment one of those PRs merges or closes/i)).toBeTruthy();
+  });
+
+  it("says abandoned work counts toward the streak, matching what the breaker does", () => {
+    // verdictOf reads `abandoned` as a failure BEFORE it reads `cancelled`. Copy that lumped the
+    // two together would have an operator set the threshold expecting abandons to be ignored.
+    renderView({});
+    expect(
+      screen.getByText(/Runs you cancelled do not count toward the streak; work you abandoned does/i),
+    ).toBeTruthy();
+  });
+});
+
 describe("SettingsView pipeline variants (anton-aa3m)", () => {
   showing("variants");
 
@@ -604,7 +697,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
   it("reads 'not scheduled' when the automation is off or has no row", () => {
     renderView({}, [], stringer({ enabled: false, nextRunAt: undefined }));
 
-    expect(screen.getAllByText("not scheduled").length).toBe(9);
+    expect(screen.getAllByText("not scheduled").length).toBe(10);
     // gardener has no row at all — it still shows the cadence it would be created at.
     expect(cadenceButton("gardener").textContent).toContain("Daily at 05:00");
   });
@@ -677,7 +770,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     );
     try {
       // Rendered from the page's snapshot: due in a minute, and never run.
-      expect(screen.getAllByText("never").length).toBe(9);
+      expect(screen.getAllByText("never").length).toBe(10);
 
       // Arriving at the panel re-reads once — a hash switch is not a navigation, so the snapshot
       // this page was rendered with could be an hour old.
@@ -686,7 +779,7 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
       // Both time columns moved to what the server now holds...
       expect(screen.getByText("in 30m")).toBeTruthy();
       expect(screen.getByText("1m ago")).toBeTruthy();
-      expect(screen.getAllByText("never").length).toBe(8);
+      expect(screen.getAllByText("never").length).toBe(9);
       // ...while the cadence stayed the operator's, not the poll's.
       expect(cadenceButton().textContent).toContain("Every 30 minutes");
 
@@ -903,6 +996,49 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect((screen.getByRole("button", { name: "Reset" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  /**
+   * Two writes to one row are queued, so the second one's call-time view of the row is the FIRST
+   * one's optimistic guess — never the server's. Rolling back to that snapshot leaves the table
+   * reporting a state the server never held, with no error left on screen to explain it.
+   */
+  it("rolls a failed write back to the server's row, not to a queued write's guess", async () => {
+    let failDisable: (() => void) | undefined;
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      (_input, init) => {
+        if (init?.method !== "PATCH") {
+          return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+        }
+        const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+        const refused = () =>
+          new Response(JSON.stringify({ error: `${patch.enabled ? "enable" : "disable"} refused` }), {
+            status: 500,
+          });
+        // The disable is held so the enable is clicked while it is still open.
+        if (patch.enabled === false) {
+          return new Promise<Response>((resolve) => {
+            failDisable = () => resolve(refused());
+          });
+        }
+        return Promise.resolve(refused());
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderView({}, [], stringer());
+
+    const toggle = () => screen.getByRole("switch", { name: "nightly-stringer" });
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle());
+    await waitFor(() => expect(failDisable).toBeTruthy());
+    fireEvent.click(toggle());
+    failDisable!();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disable refused"));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("enable refused"));
+    // Neither write landed, so the row reads what the server still holds: on.
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+  });
+
   it("keeps the enable toggle patching schedules.enabled as before", async () => {
     const fetchMock = stubSchedulePatch({
       type: "gardener",
@@ -970,6 +1106,9 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
     const history = groupBox("Writes history");
     expect(within(history).getByRole("radio", { name: "shipped-orphan · propose" })).toBeTruthy();
     expect(within(history).getByText(/stays in the board's history/)).toBeTruthy();
+    // Undoing an applied grant is not one write — the label comes off before the reservation can be
+    // released, so the copy must price both rather than promise a single undo.
+    expect(within(history).getByText(/Undoing a grant is two/)).toBeTruthy();
   });
 
   it("shows split as not armable, with the reason, rather than offering it", () => {
@@ -1074,7 +1213,7 @@ describe("SettingsView proposal autonomy (anton-3mqq)", () => {
       ),
     ).toBeTruthy();
     expect(
-      within(groupBox("Writes history")).getByText(/the claim it writes outlives the undo/),
+      within(groupBox("Writes history")).getByText(/what it writes outlives the undo/),
     ).toBeTruthy();
   });
 
@@ -1308,5 +1447,665 @@ describe("SettingsView navigation (anton-ue90.3)", () => {
       await waitFor(() => expect(vi.mocked(toast.error)).toHaveBeenCalledWith("nope"));
       expect(save().disabled).toBe(false);
     });
+  });
+});
+
+/**
+ * The cadence coupling (anton-3xa9, design R7.1): arming the board-picker is what turns
+ * product-master's judgment from something a human reads into something anton executes, so it — and
+ * only it — offers to raise that cadence. What is under test is the whole contract of an offer: it
+ * appears on ARM, it says WHY, a refusal sticks, and nothing moves a schedule on its own.
+ */
+describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
+  showing("automation");
+
+  const WEEKLY = "0 6 * * 1";
+  const DAILY = "0 6 * * *";
+
+  /** Both coupled rows as the server would hand them in: picker off, product-master on and weekly. */
+  function coupledSchedules(
+    overrides: { picker?: Record<string, unknown>; pm?: Record<string, unknown> } = {},
+  ) {
+    return [
+      { type: "board-picker", enabled: false, cron: "*/10 * * * *", ...overrides.picker },
+      { type: "product-master", enabled: true, cron: WEEKLY, ...overrides.pm },
+    ];
+  }
+
+  /**
+   * One stub for both writes this panel makes — the schedules PATCH (echoing the row as stored, the
+   * way the route does) and the settings PATCH the opt-out goes through — plus the panel's own GET
+   * poll, which would otherwise reach for a relative URL jsdom cannot serve.
+   */
+  function stubPanelFetch() {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      (input, init) => {
+        const url = String(input);
+        if (init?.method !== "PATCH") {
+          return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+        }
+        if (!url.endsWith("/schedules")) {
+          return Promise.resolve(new Response(JSON.stringify({ settings: {} })));
+        }
+        const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+        const type = patch.type as keyof typeof DEFAULT_CRONS;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              schedule: { enabled: true, cron: DEFAULT_CRONS[type], ...patch },
+            }),
+          ),
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  const patchesTo = (fetchMock: ReturnType<typeof stubPanelFetch>, path: string) =>
+    fetchMock.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === "PATCH" && String(c[0]).endsWith(path),
+    );
+
+  const bodyOf = (call: unknown[]) => JSON.parse((call[1] as RequestInit).body as string);
+
+  const arm = () => fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+  const offer = () => screen.queryByRole("status");
+  const cadenceOf = (name: string) =>
+    screen.getByRole("button", { name: `${name} cadence` }).textContent;
+
+  it("offers the daily cadence once the arm lands, and says why it is asking", async () => {
+    stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    expect(offer()).toBeNull();
+    arm();
+
+    // Not before the write: the offer's premise is that the picker IS armed.
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    const prompt = offer();
+    // The WHY, not the mechanism: the picker consumes these priorities now, so staleness costs
+    // something. And only what the build actually does — the picker records a plan, it starts
+    // nothing — because the offer buys a daily claude session and must not sell an absent feature.
+    expect(prompt!.textContent).toMatch(/ranks what could run next/);
+    expect(prompt!.textContent).toMatch(/starts nothing yet/);
+    expect(prompt!.textContent).not.toMatch(/executed/);
+    expect(prompt!.textContent).toContain("Weekly on Monday at 06:00");
+    expect(prompt!.textContent).toContain("Daily at 06:00");
+    // Asking is not doing — the cadence is untouched until the operator answers.
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+  });
+
+  it("raises the cadence only on an explicit accept, keeping the operator's time of day", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules({ pm: { cron: "30 22 * * 5" } }));
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
+    // The arm itself, then the cadence — 22:30 preserved, only the day-of-week dropped.
+    expect(bodyOf(patchesTo(fetchMock, "/schedules")[1])).toEqual({
+      type: "product-master",
+      cron: "30 22 * * *",
+    });
+    await waitFor(() => expect(cadenceOf("product-master")).toContain("Daily at 22:30"));
+    expect(offer()).toBeNull();
+  });
+
+  it("honours keep-weekly, persists it, and never asks again", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+
+    // The answer is stored, not just dismissed — otherwise the next arm asks it all over again.
+    await waitFor(() => expect(patchesTo(fetchMock, "/settings")).toHaveLength(1));
+    expect(bodyOf(patchesTo(fetchMock, "/settings")[0])).toEqual({
+      keepProductMasterWeekly: true,
+    });
+    expect(offer()).toBeNull();
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+
+    // Disarm, arm again: the question is answered, so it stays answered.
+    arm();
+    arm();
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(3));
+    expect(offer()).toBeNull();
+    expect(patchesTo(fetchMock, "/schedules").every((c) => bodyOf(c).cron === undefined)).toBe(true);
+  });
+
+  it("does not re-ask an operator who already answered in a previous session", () => {
+    stubPanelFetch();
+    renderView({ keepProductMasterWeekly: true }, [], coupledSchedules());
+
+    arm();
+    expect(offer()).toBeNull();
+  });
+
+  it("puts the opt-out back when it could not be stored, rather than swallowing it", async () => {
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((input, init) => {
+      if (init?.method === "PATCH" && String(input).endsWith("/settings")) {
+        return Promise.resolve(new Response(JSON.stringify({ error: "disk full" }), { status: 500 }));
+      }
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { cron: WEEKLY, ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disk full"));
+    // Nothing was stored, so the question comes straight back on screen: an operator told the write
+    // failed and then shown the outcome of it succeeding has to trust two contradictory things.
+    expect(offer()).toBeTruthy();
+
+    // And the standing answer went back with it, so a later arm asks again too.
+    arm();
+    expect(offer()).toBeNull();
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+  });
+
+  it("opens no offer when the arm itself failed — the condition it names never happened", async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      (_input, init) =>
+        Promise.resolve(
+          init?.method === "PATCH"
+            ? new Response(JSON.stringify({ error: "schedule store down" }), { status: 500 })
+            : new Response(JSON.stringify({ schedules: [] })),
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderView({}, [], coupledSchedules());
+
+    arm();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("schedule store down"));
+    // The toggle rolled back, so nothing on screen claims the picker is armed — and nothing offers
+    // to raise a cadence because it is.
+    expect(offer()).toBeNull();
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+  });
+
+  it("disarming changes no cadence and withdraws an unanswered question", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules({ picker: { enabled: true } }));
+
+    // Disarm: no offer, and above all no cadence PATCH — a schedule that sprang back on its own
+    // would make this table untrustworthy about the one thing it exists to report.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(1));
+    expect(bodyOf(patchesTo(fetchMock, "/schedules")[0])).toEqual({
+      type: "board-picker",
+      enabled: false,
+    });
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+
+    // Re-arm with the offer open, then disarm again: the question goes, the cadence stays.
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    expect(offer()).toBeNull();
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+  });
+
+  it("puts the question back when the toggle that withdrew it never landed", async () => {
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      // Only the disables refuse, so the arm that opens the question still lands. Each names its own
+      // row, so the two failures below are told apart by their message.
+      if (patch.enabled === false) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: `${patch.type} store down` }), { status: 500 }),
+        );
+      }
+      const type = patch.type as keyof typeof DEFAULT_CRONS;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ schedule: { enabled: true, cron: DEFAULT_CRONS[type], ...patch } }),
+        ),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    // Disarming withdraws the question ahead of the write — but the write refused, so the picker is
+    // armed after all and the question is true again. Left withdrawn, an operator would have to
+    // cycle the toggle until a write succeeded before they could answer it.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("board-picker store down"));
+    expect(offer()).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "true",
+    );
+
+    // The same for the job the question is ABOUT: a product-master disable that refused leaves it
+    // enabled and weekly, which is the premise the offer names.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    expect(offer()).toBeNull();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("product-master store down"));
+    expect(offer()).toBeTruthy();
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+    expect(screen.getByRole("button", { name: "Raise to daily" })).toBeTruthy();
+  });
+
+  it("puts the offer back when the cadence write failed, so the answer can be given again", async () => {
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      if (patch.cron !== undefined) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: "invalid cron" }), { status: 500 }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: "*/10 * * * *", ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("invalid cron"));
+    // The cadence rolled back to weekly, so the question is true again — and an operator who chose
+    // daily and landed back on weekly with the offer gone would have no way to say it a second time.
+    expect(cadenceOf("product-master")).toContain("Weekly on Monday at 06:00");
+    expect(offer()).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Raise to daily" })).toBeTruthy();
+  });
+
+  it("does not resurrect a question the operator killed while the accept was in flight", async () => {
+    let failCadence: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      if (patch.cron === undefined) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ schedule: { enabled: patch.enabled, cron: "*/10 * * * *", ...patch } }),
+          ),
+        );
+      }
+      return new Promise<Response>((resolve) => {
+        failCadence = () =>
+          resolve(new Response(JSON.stringify({ error: "invalid cron" }), { status: 500 }));
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Raise to daily" }));
+    await waitFor(() => expect(failCadence).toBeTruthy());
+
+    // Disarm with the cadence PATCH still open. The offer's premise is gone, so the failure must
+    // restore nothing: an offer to speed up a pass whose output feeds nothing is a question about
+    // a picker that is now off.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    failCadence!();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("invalid cron"));
+    expect(offer()).toBeNull();
+  });
+
+  it("opens no offer for a job switched off while the arm was still in flight", async () => {
+    let finishArm: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = (row: Record<string, unknown>) =>
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...row } }));
+      if (patch.type !== "board-picker") return Promise.resolve(stored(patch));
+      return new Promise<Response>((resolve) => {
+        finishArm = () => resolve(stored({ cron: "*/10 * * * *", ...patch }));
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(finishArm).toBeTruthy());
+
+    // Switch product-master off with the arm still open. The offer is decided when the arm LANDS,
+    // and by then its premise is gone: asking how often a job that no longer runs should run.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    finishArm!();
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
+    expect(offer()).toBeNull();
+  });
+
+  it("opens no offer for a picker disarmed while its own arm was still in flight", async () => {
+    let finishArm: (() => void) | undefined;
+    let finishDisarm: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = (row: Record<string, unknown>) =>
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...row } }));
+      // Both picker writes are held, so the test decides which response lands first.
+      if (patch.type !== "board-picker") return Promise.resolve(stored(patch));
+      return new Promise<Response>((resolve) => {
+        const answer = () => resolve(stored({ cron: "*/10 * * * *", ...patch }));
+        if (patch.enabled === true) finishArm = answer;
+        else finishDisarm = answer;
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(finishArm).toBeTruthy());
+
+    // Disarm the SAME row with its arm still open. The withdrawal fires before any offer exists, so
+    // nothing but the operator's last click stops the arm's response putting a question on screen
+    // about a picker they have already turned off — and accepting it would raise product-master to
+    // daily for a picker that executes nothing.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    // The disarm is QUEUED, not sent: same row, and the route read-modify-writes it (see
+    // `scheduleWrites`). Its PATCH goes out only once the arm's response has landed.
+    expect(finishDisarm).toBeUndefined();
+    expect(patchesTo(fetchMock, "/schedules")).toHaveLength(1);
+
+    finishArm!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
+    expect(offer()).toBeNull();
+
+    await waitFor(() => expect(finishDisarm).toBeTruthy());
+    finishDisarm!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker disabled"));
+    expect(offer()).toBeNull();
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+  });
+
+  it("asks the question a failed disarm suppressed, once the picker turns out to be armed", async () => {
+    let finishArm: (() => void) | undefined;
+    let failDisarm: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = (row: Record<string, unknown>) =>
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...row } }));
+      if (patch.type !== "board-picker") return Promise.resolve(stored(patch));
+      // Both picker writes are held, so the test decides when each answer lands — the disarm's is
+      // a refusal.
+      return new Promise<Response>((resolve) => {
+        if (patch.enabled === true) finishArm = () => resolve(stored({ cron: "*/10 * * * *", ...patch }));
+        else
+          failDisarm = () =>
+            resolve(new Response(JSON.stringify({ error: "picker store down" }), { status: 500 }));
+      });
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(finishArm).toBeTruthy());
+
+    // Disarm with the arm still open: the arm lands first and its question is rightly suppressed,
+    // because the operator's last click asked for the picker to be off.
+    fireEvent.click(screen.getByRole("switch", { name: "board-picker" }));
+    finishArm!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("board-picker enabled"));
+    await waitFor(() => expect(failDisarm).toBeTruthy());
+    expect(offer()).toBeNull();
+
+    // Then the disarm refuses. The picker is armed after all, and the question that click
+    // suppressed was never asked at all — left unasked, only cycling the toggle would get it back.
+    failDisarm!();
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("picker store down"));
+    await waitFor(() => expect(offer()).toBeTruthy());
+    expect(offer()!.textContent).toContain("Daily at 06:00");
+    expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
+      "true",
+    );
+  });
+
+  it("does not put an answered offer back once its job was switched off mid-write", async () => {
+    let failOptOut: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      if (String(input).endsWith("/settings")) {
+        return new Promise<Response>((resolve) => {
+          failOptOut = () =>
+            resolve(new Response(JSON.stringify({ error: "disk full" }), { status: 500 }));
+        });
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+    await waitFor(() => expect(failOptOut).toBeTruthy());
+
+    // Switching product-master off does not withdraw an offer that is already off screen, so only
+    // re-reading the row catches it: the opt-out failed and is reverted, but the question it
+    // answered is dead on its own terms and must not come back.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    failOptOut!();
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("disk full"));
+    expect(offer()).toBeNull();
+  });
+
+  /**
+   * The opt-out and "Save changes" write the SAME settings row, and the route read-modify-writes the
+   * whole of it — so two in flight at once is a lost update, and the loser is whichever replies
+   * first, with a success toast either way.
+   */
+  it("queues the opt-out behind an open save, so neither PATCH drops the other's fields", async () => {
+    let finishSave: (() => void) | undefined;
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      if (String(input).endsWith("/settings")) {
+        // The form save is held open; the opt-out answers immediately if it ever gets sent.
+        if ((init.body as string).includes("keepProductMasterWeekly")) {
+          return Promise.resolve(new Response(JSON.stringify({ settings: {} })));
+        }
+        return new Promise<Response>((resolve) => {
+          finishSave = () => resolve(new Response(JSON.stringify({ settings: {} })));
+        });
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...patch } })),
+      );
+    });
+    renderView({}, [], coupledSchedules());
+
+    // Stage an edit in another section so Save is offered at all, then come back and raise the offer.
+    fireEvent.click(screen.getByRole("button", { name: "Execution prompt" }));
+    fireEvent.change(screen.getByLabelText("Seed prompt"), { target: { value: "prefer RSC" } });
+    fireEvent.click(screen.getByRole("button", { name: "Automation" }));
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(finishSave).toBeTruthy());
+
+    // Answered with the save still open: the second PATCH must not be sent yet, or it reads a row
+    // the save has not written and rewrites it without the staged prompt.
+    fireEvent.click(screen.getByRole("button", { name: "Keep weekly" }));
+    expect(patchesTo(fetchMock, "/settings")).toHaveLength(1);
+
+    finishSave!();
+    await waitFor(() => expect(patchesTo(fetchMock, "/settings")).toHaveLength(2));
+    expect(bodyOf(patchesTo(fetchMock, "/settings")[1])).toEqual({ keepProductMasterWeekly: true });
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master stays weekly"));
+  });
+
+  it("withdraws the offer when the operator sets that cadence by hand instead", async () => {
+    const fetchMock = stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    // A hand edit answers the question by superseding it. Leaving the offer up would let an accept
+    // afterwards overwrite the cadence just chosen with one computed from the row it replaced.
+    fireEvent.click(screen.getByRole("button", { name: "product-master cadence" }));
+    fireEvent.click(screen.getByRole("button", { name: "Daily" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set cadence" }));
+
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
+    expect(bodyOf(patchesTo(fetchMock, "/schedules")[1]).type).toBe("product-master");
+    expect(offer()).toBeNull();
+  });
+
+  it("withdraws the offer when product-master itself is switched off", async () => {
+    stubPanelFetch();
+    renderView({}, [], coupledSchedules());
+
+    arm();
+    await waitFor(() => expect(offer()).toBeTruthy());
+
+    // Its cadence is moot once it is off — the offer would be asking how often a job that no longer
+    // runs should run.
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    expect(offer()).toBeNull();
+  });
+
+  /**
+   * Two clicks on one row: the route read-modify-writes it, so the second PATCH is queued behind the
+   * first (see `queueRowWrite`) and the first answer describes a row the operator has already moved
+   * past. Applying that answer whole would put the superseded state back on screen — and the offer,
+   * decided against the live rows, would then be asked about it.
+   */
+  it("keeps a queued disable on screen when the enable's response lands first", async () => {
+    const answers: Array<() => void> = [];
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = new Response(JSON.stringify({ schedule: { cron: WEEKLY, ...patch } }));
+      return new Promise<Response>((resolve) => answers.push(() => resolve(stored)));
+    });
+    // Picker already armed and product-master off: enabling it is the half that completes the
+    // coupling, so its response is the one that would open the offer.
+    renderView({}, [], coupledSchedules({ picker: { enabled: true }, pm: { enabled: false } }));
+
+    const pm = () => screen.getByRole("switch", { name: "product-master" });
+    fireEvent.click(pm());
+    await waitFor(() => expect(answers).toHaveLength(1));
+
+    // Switched straight back off. The second write is QUEUED, not sent — but it is what the operator
+    // asked for, and it is already on screen.
+    fireEvent.click(pm());
+    expect(patchesTo(fetchMock, "/schedules")).toHaveLength(1);
+    expect(pm().getAttribute("aria-checked")).toBe("false");
+
+    answers[0]!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master enabled"));
+    // The enable's answer is true of its own write and stale of the row: the later click stands, and
+    // no offer is opened to raise the cadence of a job that is on its way off.
+    expect(pm().getAttribute("aria-checked")).toBe("false");
+    expect(offer()).toBeNull();
+
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master disabled"));
+    expect(pm().getAttribute("aria-checked")).toBe("false");
+    expect(offer()).toBeNull();
+  });
+
+  it("keeps a cadence edit queued behind a toggle, rather than restoring the echoed cron", async () => {
+    const answers: Array<() => void> = [];
+    const fetchMock = stubPanelFetch();
+    fetchMock.mockImplementation((_input, init) => {
+      if (init?.method !== "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ schedules: [] })));
+      }
+      const patch = JSON.parse(init.body as string) as Record<string, unknown>;
+      const stored = new Response(
+        JSON.stringify({ schedule: { enabled: true, cron: WEEKLY, ...patch } }),
+      );
+      return new Promise<Response>((resolve) => answers.push(() => resolve(stored)));
+    });
+    renderView({}, [], coupledSchedules({ picker: { enabled: true }, pm: { enabled: false } }));
+
+    fireEvent.click(screen.getByRole("switch", { name: "product-master" }));
+    await waitFor(() => expect(answers).toHaveLength(1));
+
+    // Retimed while the toggle is still open. The toggle's answer echoes the cadence as it was when
+    // that write ran — weekly — which must not overwrite the daily the operator has just picked.
+    fireEvent.click(screen.getByRole("button", { name: "product-master cadence" }));
+    fireEvent.click(screen.getByRole("button", { name: "Daily" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set cadence" }));
+    expect(cadenceOf("product-master")).toContain("Daily at 06:00");
+
+    answers[0]!();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("product-master enabled"));
+    expect(cadenceOf("product-master")).toContain("Daily at 06:00");
+
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]!();
+    await waitFor(() => expect(patchesTo(fetchMock, "/schedules")).toHaveLength(2));
+    expect(cadenceOf("product-master")).toContain("Daily at 06:00");
+  });
+
+  it("stays quiet when there is nothing to raise", () => {
+    stubPanelFetch();
+    // Already daily — and a hand-written expression or an off product-master are the same silence:
+    // an offer that promised a change it would not make is worse than no offer.
+    const { unmount } = renderView({}, [], coupledSchedules({ pm: { cron: DAILY } }));
+    arm();
+    expect(offer()).toBeNull();
+    unmount();
+
+    renderView({}, [], coupledSchedules({ pm: { enabled: false } }));
+    arm();
+    expect(offer()).toBeNull();
   });
 });

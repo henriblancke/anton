@@ -191,6 +191,28 @@ describe("actOnEscalation — dismiss", () => {
     expect(await actOnEscalation(project, escalation.id, "dismiss")).toMatchObject({ ok: true });
   });
 
+  it("refuses an autopilot disarm — nothing re-raises one, so a dismissal would bury it", async () => {
+    // The strip offers no button on a disarm, but a direct POST bypasses the panel. Dismissed, the
+    // row is gone for good while the project stays frozen: a disarm is raised once, on the latch,
+    // and only the re-arm settles it.
+    const escalation = await open({
+      finding: {
+        kind: "autopilot-disarm",
+        key: "autopilot-disarm:score-regression",
+        reason: "3 consecutive runs scored below 7/10 (6, 5, 4)",
+        since: Date.now(),
+        evidence: ["r1 · anton-a · 6/10"],
+      },
+      epicBeadId: undefined,
+    });
+
+    expect(await actOnEscalation(project, escalation.id, "dismiss")).toEqual({
+      ok: false,
+      reason: "not-dismissable",
+    });
+    expect(rowOf(escalation.id)?.status).toBe("open");
+  });
+
   it("refuses a second dismissal, like every other answer", async () => {
     const escalation = await open({ finding: stalePr() });
     await actOnEscalation(project, escalation.id, "dismiss");

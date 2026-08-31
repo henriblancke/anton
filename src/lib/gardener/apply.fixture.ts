@@ -19,6 +19,7 @@ import type { ApplyActor } from "./apply";
 import {
   detectionSubjectKey,
   proposalFingerprint,
+  subjectChecksum,
   type GardenerPlan,
 } from "./detections";
 
@@ -38,6 +39,12 @@ export const liveBeads = new Map<string, Bead | undefined>();
  * one" is the only way to test a rollback that itself fails.
  */
 export const failOn = new Map<string, number>();
+/**
+ * Writes primed to LAND on the board and THEN reject, keyed the same way — a bd subprocess that
+ * committed its write before it timed out or exited nonzero. The ambiguous half of a failure:
+ * {@link failOn} models one that never reached the board, this one a caller that cannot tell.
+ */
+export const failAfterWrite = new Map<string, number>();
 const seen = new Map<string, number>();
 
 let snapshot: Bead[] = [];
@@ -77,15 +84,34 @@ export function record(verb: string, ...args: string[]): Promise<string> {
   calls.push(call);
   const nth = (seen.get(key) ?? 0) + 1;
   seen.set(key, nth);
-  if (failOn.get(key) === nth) return Promise.reject(new Error(`bd ${verb} exploded`));
+  const committed = failAfterWrite.get(key) === nth;
+  if (!committed && failOn.get(key) === nth) return Promise.reject(new Error(`bd ${verb} exploded`));
   // bd reflects a write immediately, and this module re-reads what it wrote — the rollback before it
   // undoes a move, the next approval before it re-applies one. A board that answered with pre-write
   // state would make those guards untestable.
   if (verb === "reparent") setLive(args[0] as string, { parent: args[1] || undefined });
   if (verb === "close") setLive(args[0] as string, { status: "closed" });
+  // The auto-claim an approve makes VERIFIES itself by reading the assignee back (beads/claim.ts),
+  // so a board that answered with pre-write state would fail every swap as a lost race.
+  if (verb === "assign") setLive(args[0] as string, { assignee: args[1] || undefined });
+  // The grant is re-read too — the approve route asserts the label survived the write it just made,
+  // so a board that never reflected `approved` would answer that assertion with pre-write state.
+  if (verb === "approve") setLive(args[0] as string, { labels: withLabel(args[0] as string) });
+  if (verb === "untag") setLive(args[0] as string, { labels: withoutLabels(args[0] as string, (args[1] ?? "").split(",")) });
   afterWrite?.(call);
+  if (committed) return Promise.reject(new Error(`bd ${verb} timed out`));
   return Promise.resolve("");
 }
+
+/** The bead's labels as the writes so far have left them. */
+function labelsOf(id: string): string[] {
+  return (liveBeads.get(id) ?? snapshot.find((b) => b.id === id))?.labels ?? [];
+}
+
+const withLabel = (id: string): string[] => [...new Set([...labelsOf(id), LABELS.approved])];
+
+const withoutLabels = (id: string, dropped: string[]): string[] =>
+  labelsOf(id).filter((label) => !dropped.includes(label));
 
 /** What the next `bd show` of this bead answers with — the board as the writes have left it. */
 export function setLive(id: string, patch: Partial<Bead>): void {
@@ -122,6 +148,7 @@ export function listBoard(extra: string[]): Promise<Bead[]> {
 export function resetSeam(): void {
   calls.length = 0;
   failOn.clear();
+  failAfterWrite.clear();
   seen.clear();
   liveBeads.clear();
   afterWrite = undefined;
@@ -161,8 +188,16 @@ export function applyWith(proposal: Bead, board: Bead[], actor: ApplyActor = "ap
 
 // ── fixture builders ──
 
+/**
+ * Every fixture bead states ONE subject, because a cluster approval re-derives the grouping its
+ * detection rested on (apply-plan.ts `regroupSurvivors`): a board of `anton-a`-titled beads shares
+ * no topic, so it could not have produced the cluster plans these suites approve. A case that needs
+ * the grouping BROKEN overrides the title, which is the only way it breaks in the field either.
+ */
+const SUBJECT = "escalation banner";
+
 export function bead(id: string, extra: Partial<Bead> = {}): Bead {
-  return { id, title: id, status: "open", issue_type: "task", ...extra };
+  return { id, title: `${id}: ${SUBJECT}`, status: "open", issue_type: "task", ...extra };
 }
 
 /** A bead with a parent, expressed the way `bd list --json` carries it (field + inline edge). */
@@ -199,17 +234,19 @@ export const edged = (from: string, to: string): Bead[] =>
   ["anton-aa", "anton-bb"].map((id) => (id === from ? blockedBy(id, to) : bead(id)));
 
 /**
- * A plan fingerprinted the way the emitter would fingerprint it — through the SAME key builder, not
- * a copy of it, because apply now recomputes that hash from the plan's own fields and a fixture with
- * a hand-rolled fingerprint would prove the opposite of what these tests claim.
+ * A plan fingerprinted and checksummed the way the emitter would do both — through the SAME key
+ * builders, not copies of them, because apply now recomputes each from the plan's own fields and a
+ * fixture with a hand-rolled hash would prove the opposite of what these tests claim.
  */
-export function planFor(input: Omit<GardenerPlan, "fingerprint">): GardenerPlan {
+export function planFor(input: Omit<GardenerPlan, "fingerprint" | "subjectChecksum">): GardenerPlan {
+  const checksum = subjectChecksum(input.kind, input.subjects, input.target, input.detail);
   return {
     ...input,
     fingerprint: proposalFingerprint(
       input.kind,
       detectionSubjectKey(input.kind, input.subjects, input.target, input.detail),
     ),
+    ...(checksum ? { subjectChecksum: checksum } : {}),
   };
 }
 
@@ -281,8 +318,18 @@ export const leased = (id: string, at: number): Bead =>
 /** The other half of the same bar (board-index `isInFlight`): a run whose PR is up. */
 export const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] });
 
-/** A feature card with an open ticket under it — a legal re-parent home. */
+/** A feature card — the tier a working-layer bead's home has to be. */
 export const CARD = bead("anton-card", { issue_type: "feature" });
+
+/**
+ * The ticket {@link CARD} already carries, and the reason a cluster may be hung off it at all: the
+ * detector only calls a card an obvious home when the board ALREADY files work of this kind under it
+ * (reparent.ts `MIN_CARRIED_TICKETS`), and the approval re-asks that against the fresh board. Every
+ * cluster board here carries it for the same reason every fixture bead states one {@link SUBJECT} —
+ * without it these boards could not have produced the plans they approve. A case that needs the bar
+ * BROKEN leaves it off, which is exactly how a card loses its last ticket in the field.
+ */
+export const CARRIED = child("anton-t0", CARD.id);
 
 /** The tier ABOVE a card: an epic, which may only carry cards once it already groups one. */
 export const EPIC = bead("anton-epic", { issue_type: "epic" });
@@ -304,6 +351,21 @@ export const runCard = (extra: Partial<Bead> = {}): Bead =>
 /** The subject as a ticket of {@link runCard}, untouched since the filing like every retirement's. */
 export const ticket = (extra: Partial<Bead> = {}): Bead =>
   child("anton-a", "anton-run", { updated_at: "2025-01-01T00:00:00Z", ...extra });
+
+/**
+ * A run target the picker would offer: a parentless task, untouched since the filing, clearing all
+ * four of approval's promises — and carrying no `approved` label, which is the whole ask. What an
+ * {@link APPROVE} subject has to still look like at approve time.
+ */
+export const startable = (extra: Partial<Bead> = {}): Bead =>
+  cold("anton-a", { acceptance_criteria: "- [ ] it ships", ...extra });
+
+/** The product master's start (anton-gmbz): grant the gate on the work the board ranks next. */
+export const APPROVE = planFor({
+  kind: "withheld-approval",
+  move: "approve",
+  subjects: ["anton-a"],
+});
 
 /** The three retirement plans against one subject, with the board each needs. */
 export const retirements = (board: Bead[]): [GardenerPlan, Bead[]][] => [
