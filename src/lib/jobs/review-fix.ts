@@ -846,6 +846,17 @@ async function releasePreserved(
  * by nobody but that run (which is nobody at all once the release above succeeded). Anything else is
  * another worker's state: left alone, and named in the note instead.
  *
+ * The PARENT is half of "where the run left it" (PR #199 review). Status and owner alone let an
+ * unowned ticket another operator reparented onto a target of their own pass this gate — its
+ * ancestry is never compared with the snapshot — and the reopen then rewrites a status INSIDE their
+ * run, possibly making the ticket runnable there. {@link planRehome} declines to MOVE such a ticket
+ * one bd round trip later, which does nothing about a write already made.
+ *
+ * Read and write are ONE guarded operation, under the same per-bead lock {@link releasePreserved}
+ * takes: split, they leave a window in which a claim or a reparent lands between the evidence and
+ * the write it justifies. The lock orders the claim writes made in THIS process; the cross-process
+ * half stays open on bd's current primitives (beads/claim.ts, anton-od4).
+ *
  * A read that fails writes nothing either — the snapshot is not evidence enough to move a status —
  * and falls back to the same manual remedy a failed write leaves behind.
  */
@@ -858,21 +869,28 @@ async function reopenPreserved(
     ` Its status is also still \`${status}\`, which bd refuses to claim, so a run would stop at ` +
     `that gate: clear it with \`bd update ${bead.id} --status open\`.`;
   if (bead.status === "open") return "";
-  const fresh = await beads.show(repo, bead.id).catch(() => undefined);
-  if (!fresh) return manualRemedy(bead.status);
-  if (fresh.status === "open") return "";
-  const owner = ownerOf(fresh);
-  if (
-    fresh.status !== bead.status ||
-    (owner !== undefined && owner !== runOwner)
-  )
-    return (
-      ` Its status is \`${fresh.status}\`${owner ? ` under ${owner}` : ""} — the board changed after ` +
-      `the run stopped it, so anton left the status alone rather than reopening a ticket someone ` +
-      `else has moved on.`
-    );
-  const reopened = await safe(() => beads.setStatus(repo, bead.id, "open"));
-  return reopened ? "" : manualRemedy(fresh.status);
+  return withBeadWriteLock(repo, bead.id, async () => {
+    const fresh = await beads.show(repo, bead.id).catch(() => undefined);
+    if (!fresh) return manualRemedy(bead.status);
+    if (fresh.status === "open") return "";
+    const owner = ownerOf(fresh);
+    const rehomed = beads.parentOf(fresh) !== beads.parentOf(bead);
+    if (
+      fresh.status !== bead.status ||
+      rehomed ||
+      (owner !== undefined && owner !== runOwner)
+    )
+      return (
+        ` Its status is \`${fresh.status}\`${owner ? ` under ${owner}` : ""}` +
+        (rehomed
+          ? `, under ${beads.parentOf(fresh) ?? "no parent"} rather than the target the run left it in`
+          : "") +
+        ` — the board changed after the run stopped it, so anton left the status alone rather than ` +
+        `reopening a ticket someone else has moved on.`
+      );
+    const reopened = await safe(() => beads.setStatus(repo, bead.id, "open"));
+    return reopened ? "" : manualRemedy(fresh.status);
+  });
 }
 
 /**
@@ -1394,6 +1412,10 @@ async function applyRehome(
   // every outcome below rather than checked once — the moves that CAN be made are still worth
   // making, and the next sweep re-plans what is left.
   const unread = plan.unknown.size > 0 ? epic.id : undefined;
+  // A losing rival follow-up this pass could not take off the board (PR #199 review) — carried onto
+  // every outcome exactly like `unread`, since the moves this pass CAN make are still worth making
+  // and only the close has to wait for the orphan to be settled.
+  let strandedRival: string | undefined;
   // Nothing the plan still allows anton to move means nothing for a follow-up to hold (PR #199).
   // Creating one anyway and deleting it again writes an empty run target to a shared board twice
   // over — and a delete that fails then holds the merged target's close back for a home nobody
@@ -1507,18 +1529,47 @@ async function applyRehome(
     // remaining tickets would be rehomed by no sweep and the merged target could never close, since
     // every later pass repeats that create-and-delete. A rival worth converging on is by
     // construction untouched: it was created moments ago by a process racing this one.
-    const rivals = (
-      await beads.list(repo, ["--status", "all"]).catch(() => undefined)
-    )?.filter((b) => b.id !== followUp && stampedForEpic(b));
+    const afterCreate = await beads
+      .list(repo, ["--status", "all"])
+      .catch(() => undefined);
+    const rivals = afterCreate?.filter(
+      (b) => b.id !== followUp && stampedForEpic(b),
+    );
     // A list that fails cannot rule a duplicate out, and filling a home that may be one splits the
     // preserved tickets across two run targets. The follow-up keeps its stamp, so the next sweep
     // reuses this very epic and reconciles then.
-    if (!rivals) return { ...none, unfinished: followUp };
+    if (!rivals || !afterCreate) return { ...none, unfinished: followUp };
     if (rivals.length > 0) {
       const mine = await reread(followUp);
       if (!mine) return { ...none, unfinished: followUp };
       const winner = [mine, ...rivals].reduce(olderOf);
-      if (winner.id !== followUp) {
+      if (winner.id === followUp) {
+        // Ours WON, so the rivals that lost are ours to reconcile too (PR #199 review). A live
+        // rival process deletes its own duplicate the moment it sees this one — but a process that
+        // crashes right after its create never gets there, and cleanup that only ever runs on this
+        // process's own loser leaves that childless stamped epic on the board for good: the merged
+        // source closes below, so no later sweep re-selects it and reconciles. An empty run target
+        // sitting there asks the founder to approve a run with nothing in it.
+        //
+        // Only an UNTOUCHED, CHILDLESS rival: one a human has since approved or a worker claimed is
+        // a run of its own, and one that already carries tickets is a real home — `bd delete` does
+        // not cascade here, so removing it would strand its children parentless. A rival anton
+        // cannot settle holds the source open instead of being deleted on a guess.
+        for (const rival of rivals) {
+          const live = await reread(rival.id);
+          if (!live) {
+            strandedRival ??= rival.id;
+            continue;
+          }
+          if (
+            !untouched(live) ||
+            afterCreate.some((b) => beads.parentOf(b) === rival.id)
+          )
+            continue;
+          if (!(await safe(() => beads.delete(repo, rival.id))))
+            strandedRival ??= rival.id;
+        }
+      } else {
         // Ours is the duplicate: take it off the board before anything can land on it, and move
         // onto the winner instead — the rival reaches that same bead, so the preserved tickets stay
         // under one target. A delete that fails leaves finalization undone rather than a second run
@@ -1801,11 +1852,26 @@ async function applyRehome(
   if (taken)
     return { id: followUp, moved, nested, pinned, stale, unfinished: followUp };
   if (moved.size > 0)
-    return { id: followUp, moved, nested, pinned, stale, unfinished: unread };
+    return {
+      id: followUp,
+      moved,
+      nested,
+      pinned,
+      stale,
+      unfinished: unread ?? strandedRival,
+    };
   // Nothing moved — the epic is a childless run target no one asked for. Take it back off the
   // board, unless it is a REUSED follow-up an earlier sweep already moved tickets onto: deleting
   // that one would take their only home with it. Nor one a CONCURRENT process created and is
   // filling right now (`disposable`) — its children may not be on this pass's board read at all.
+  //
+  // Nor one that has since become somebody's RUN (PR #199 review). `beads.delete` is an
+  // irreversible `bd delete --force`, and this pass has been reading and writing a shared board
+  // since the follow-up was created or reused — its own description asks to be approved, so a human
+  // approving it or a worker claiming it in that window is exactly the outcome it invites. Deleting
+  // then destroys a target somebody is already running. So the cleanup is decided on a read taken
+  // HERE, and a follow-up anton cannot re-read, or that is no longer untouched, is left standing
+  // with the merged source open for the next sweep to settle.
   //
   // A delete that does NOT land is named back to the caller (PR #199), which then leaves the merged
   // target open and `stage:in-review` rather than closing it. Closing is what makes this epic
@@ -1813,18 +1879,24 @@ async function applyRehome(
   // board for good — and its own description asks to be approved, which puts an empty run target
   // into the claimable queue where execution can only park on "nothing left to run". Left
   // discoverable, the next sweep reuses this same follow-up (`REHOME_OF`) and retries the delete.
-  const unfinished =
-    disposable &&
-    (!reused || !board.some((b) => beads.parentOf(b) === followUp)) &&
-    !(await safe(() => beads.delete(repo, followUp)))
-      ? followUp
-      : undefined;
+  const cleanup = async (): Promise<string | undefined> => {
+    if (!disposable) return undefined;
+    if (reused && board.some((b) => beads.parentOf(b) === followUp))
+      return undefined;
+    const live = await reread(followUp);
+    if (!live) return followUp;
+    if (!untouched(live)) return epic.id;
+    return (await safe(() => beads.delete(repo, followUp)))
+      ? undefined
+      : followUp;
+  };
+  const unfinished = await cleanup();
   return {
     moved: new Set(),
     nested,
     pinned,
     stale,
-    unfinished: unfinished ?? unread,
+    unfinished: unfinished ?? unread ?? strandedRival,
   };
 }
 

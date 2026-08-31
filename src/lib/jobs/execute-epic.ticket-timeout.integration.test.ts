@@ -700,6 +700,89 @@ process.exit(0);`),
       }
     });
 
+    it("leaves a skipped ticket a second run reparented and reserved alone (PR #199 review)", async () => {
+      // The same-actor takeover an owner check alone cannot see: project concurrency lets one
+      // operator own two runs, so a second run can reparent this ticket onto a target of its own
+      // and reserve it there under the very actor string this run claimed it under. An actor-only
+      // CAS matches and clears that live reservation, and the `not-delivered` marker rides along on
+      // work the other run is about to deliver — which sends ITS merge finalization off preserving
+      // and rehoming a ticket that actually shipped. What tells the two runs apart is the rest of
+      // the bead, so the marker and the release land only while the parent and status still read as
+      // this run left them.
+      const epicId = await beads.create(repo, {
+        title: "Reparented mid-run",
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nReparented mid-run",
+      });
+      await beads.approve(repo, epicId);
+      const secondRun = await beads.create(repo, {
+        title: "The other run that took the ticket",
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nThe other run",
+      });
+      const mk = (title: string) =>
+        createTicket(repo, { title, parent: epicId });
+      const stalls = mk("Reparent ticket that cannot converge");
+      const independent = mk("Reparent ticket that owes the stalled one nothing");
+      const dependent = mk("Reparent ticket that builds on the stalled one");
+      await beads.link(repo, dependent, stalls, "blocks");
+
+      const invLog = join(sandbox, "reparent-inv.jsonl");
+      const realBd = resolveBdBin();
+      // The move happens INSIDE the run — after the cascade reserved the dependent for this
+      // operator, before the timeout skips it — which is exactly the window the guard covers.
+      const claude = writeBin(
+        binDir,
+        "claude-hang-reparent",
+        fakeClaudeReadingStdin(`const {spawnSync}=require('child_process');
+const m=prompt.match(/Ticket: (\\S+)/);
+const id=m?m[1]:'unknown';
+fs.appendFileSync(${JSON.stringify(invLog)},id+'\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+if(id===${JSON.stringify(stalls)}){
+  spawnSync(${JSON.stringify(realBd)},['update',${JSON.stringify(dependent)},'--parent',${JSON.stringify(secondRun)}],{cwd:${JSON.stringify(repo)},stdio:'ignore'});
+  e({type:'system',subtype:'init',session_id:'hang'});
+  setInterval(()=>{},1000); // never exits — only the ticket budget can stop it
+  return;
+}
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+id+'\\n');
+e({type:'system',subtype:'init',session_id:'ok'});
+e({type:'assistant',message:{content:[{type:'text',text:'implemented the ticket'}]}});
+e({type:'result',subtype:'success',result:'done',session_id:'ok',num_turns:1,is_error:false});
+process.exit(0);`),
+      );
+
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      try {
+        await driveEpicRun(runner, { projectId, epicBeadId: epicId });
+
+        // Skipped, but nothing about the other run's ticket was rewritten: it keeps its new home,
+        // its reservation, and — decisively — no `not-delivered` marker to survive its delivery.
+        const skipped = await beads.show(repo, dependent);
+        expect(beads.parentOf(skipped)).toBe(secondRun);
+        expect(skipped.assignee).toBe("test-operator");
+        expect(skipped.labels ?? []).not.toContain("not-delivered");
+        // The note still explains why THIS run passed over it, without promising a state anton
+        // deliberately did not write.
+        expect(JSON.stringify(skipped)).toMatch(/board moved this ticket on/i);
+        const invoked = readFileSync(invLog, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        expect(invoked).not.toContain(dependent);
+        // The run still shipped the independent work.
+        expect((await beads.show(repo, independent)).status).toBe("closed");
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+      }
+    });
+
     it("does not park on a held tail that a rolled-back timeout also skipped (anton-67xj)", async () => {
       // The park this closes: a ticket gated by a CROSS-RUN blocker never enters the dispatch loop, so
       // it never entered the skipped set either — and the held tail parked the run unconditionally,
