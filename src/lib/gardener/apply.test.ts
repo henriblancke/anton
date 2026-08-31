@@ -1214,6 +1214,71 @@ describe("the product master's moves", () => {
       expect(err.changed).toEqual(["anton-a"]);
     });
 
+    it("settles a grant whose label landed before the process reporting it died", async () => {
+      // `bd label` commits and then times out, so the rejection says nothing about the board — and
+      // the board is APPROVED. Handing the reservation back over that would leave an approved and
+      // unassigned target, which is exactly what the picker offers: another worker starts the run
+      // this apply is reporting as failed. The re-read settles it as the grant it is.
+      failAfterWrite.set("approve:anton-a", 1);
+
+      const result = await applyWith(proposalFor(APPROVE), [startable()]);
+
+      expect(result.changed).toEqual(["anton-a"]);
+      // Neither undo runs: the reservation stays with this machine and the label stays on.
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+      expect(calls.filter((c) => c.startsWith("untag"))).toEqual([]);
+      expect(calls.at(-1)).toBe(
+        "close anton-p1 applied: approved anton-a, so a run can start on it",
+      );
+    });
+
+    it("withdraws a committed grant that landed on somebody else's reservation", async () => {
+      // The settle is fenced, not blind: a grant read back off an ambiguous failure goes through the
+      // same assignee assertion a clean one does, so a label standing over a teammate's claim comes
+      // straight back off.
+      failAfterWrite.set("approve:anton-a", 1);
+      onWrite((call) => {
+        if (call === "approve anton-a") {
+          liveBeads.set("anton-a", startable({ assignee: "teammate", labels: [LABELS.approved] }));
+        }
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(
+        /anton-a was claimed by teammate while this start was being approved — the grant was withdrawn/,
+      );
+      expect(calls.slice(0, 3)).toEqual([
+        "assign anton-a operator-1",
+        "approve anton-a",
+        `untag anton-a ${LABELS.approved}`,
+      ]);
+    });
+
+    it("leaves the reservation standing when a committed grant cannot be re-read", async () => {
+      // The same ambiguity with no evidence either way. Releasing over a read that proves nothing
+      // could free an approved target for every other machine, so the claim is left standing and the
+      // failure names the bead a human has to settle.
+      failAfterWrite.set("approve:anton-a", 1);
+      onWrite((call) => {
+        if (call === "approve anton-a") liveBeads.set("anton-a", undefined);
+      });
+
+      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("failed");
+      expect(err.message).toMatch(
+        /anton-a could not be approved \(bd approve timed out\) and could not be re-read to find out whether that grant landed anyway/,
+      );
+      expect(calls.filter((c) => c === "assign anton-a ")).toEqual([]);
+      expect(err.changed).toEqual(["anton-a"]);
+    });
+
     it("withdraws a grant that landed on a reservation taken while the label was written", async () => {
       // The window past the CAS: the swap verified the reservation, and a shell `bd assign` lands
       // while `bd label` is still running. `approved` locks that reservation, so keeping it would

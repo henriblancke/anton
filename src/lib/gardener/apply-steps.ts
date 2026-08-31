@@ -865,9 +865,9 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
  * Answers whether the gate was granted HERE: a label that landed in the swap's own window makes this
  * a no-op with a reservation to hand back, which is {@link grantedByAnother}'s question.
  *
- * A swap that FAILS is not a swap that lost, and it is reconciled before it propagates — see
- * {@link reserveForStart}: bd can commit the reservation and then die, which strands the same pair
- * this ordering exists to keep whole.
+ * Neither write is trusted to report its own outcome. bd commits before the process that ran it
+ * returns, so a rejection from either half is reconciled against the board before it propagates —
+ * see {@link reserveForStart} for the claim and {@link settleFailedGrant} for the label.
  */
 async function grantApproval(repo: string, id: string): Promise<boolean> {
   const operator = await resolveOperator();
@@ -881,15 +881,54 @@ async function grantApproval(repo: string, id: string): Promise<boolean> {
   try {
     await beads.approve(repo, id);
   } catch (err) {
-    if (!swap.wrote) throw err;
-    if (await releaseReservation(repo, id, operator)) throw err;
-    throw new StrandedWriteError(
-      `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
-      [id],
-    );
+    return await settleFailedGrant(repo, id, swap, operator, err);
   }
   await assertReservationHeld(repo, id, swap, operator);
   return true;
+}
+
+/**
+ * Settle a label write that FAILED rather than never landed.
+ *
+ * `bd label` commits before the process that ran it reports, so a timeout or a nonzero exit says
+ * nothing about what the board holds — and assuming "no grant" is the one wrong guess that hurts:
+ * handing the reservation back off an approval that DID land leaves the target approved and
+ * unassigned, which is precisely what the picker offers, so another worker starts the run this apply
+ * is reporting as failed while its proposal stays open. The board is re-read first, and a grant that
+ * landed is settled exactly as a successful one — through {@link assertReservationHeld}, so the
+ * reservation it stands on is held to the same rule either way.
+ *
+ * Only a grant the re-read proves ABSENT is unwound, on the path {@link grantApproval}'s ordering
+ * exists for. A read that answers nothing proves nothing, so the reservation is left standing and
+ * NAMED: releasing it could free an approved target for every other machine, while keeping it costs
+ * a human one look at the bead this error points straight at. With no reservation of ours to hand
+ * back there is nothing to get wrong — that failure propagates untouched, and a label that landed
+ * behind it is a grant the next pass finds already made.
+ */
+async function settleFailedGrant(
+  repo: string,
+  id: string,
+  swap: Extract<SwapResult, { ok: true }>,
+  operator: string | undefined,
+  err: unknown,
+): Promise<boolean> {
+  const live = await beads.show(repo, id).catch(() => undefined);
+  if (live && beads.isApproved(live)) {
+    await assertReservationHeld(repo, id, swap, operator);
+    return true;
+  }
+  if (!swap.wrote) throw err;
+  if (!live) {
+    throw new StrandedWriteError(
+      `${id} could not be approved (${messageOf(err)}) and could not be re-read to find out whether that grant landed anyway — the reservation taken for it is left standing rather than handed back over a read that proves nothing, so a human has to settle whether it is approved`,
+      [id],
+    );
+  }
+  if (await releaseReservation(repo, id, operator)) throw err;
+  throw new StrandedWriteError(
+    `${id} could not be approved (${messageOf(err)}) and the reservation taken for that start could not be released either — it is assigned to ${operator ?? "this machine"} without \`${LABELS.approved}\`, which bars every retry until a human unassigns it`,
+    [id],
+  );
 }
 
 /**
