@@ -121,6 +121,36 @@ const IMPORT_DECLARATION_EXTENSIONS = [
   ".dart",
 ];
 
+/**
+ * Where `const x;` / `let x;` / `var x;` DECLARE a binding and run nothing. `let` is an ordinary
+ * command in shell — `let first;` evaluates arithmetic and sets the exit status, which `set -e` then
+ * acts on — so reading it as a declaration there files a duplicated window of real arithmetic as an
+ * erased binding list and drops it. An ALLOW-list for the same reason as the type and import ones
+ * above: a language anton has no rule for keeps its signals rather than losing them to TypeScript's
+ * grammar. Rust is on it because `let x: u32;` is its deferred-init binding, which declares exactly
+ * as much.
+ */
+const BINDING_DECLARATION_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".rs",
+];
+
+/**
+ * Where a `<` can open a JSX tag, so a `/` written TIGHT against one is a tag's punctuation rather
+ * than a comparison. `.ts` and its siblings cannot hold JSX — a `<` there is a comparison or a type
+ * argument list — so `value</[/*]/.source` is the comparison it reads as, and refusing it leaves the
+ * `/*` in that character class to open a comment over every line below. `.js` stays on the list:
+ * React projects write JSX in it as readily as in `.jsx`.
+ */
+const JSX_EXTENSIONS = [".tsx", ".jsx", ".js", ".mjs", ".cjs"];
+
 /** One duplication signal the filter removed, and the proof that removed it. */
 export interface DroppedDuplication {
   /** The file stringer named, as it spelled it. */
@@ -273,7 +303,10 @@ const FUNCTION_START = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
  */
 const ARROW_START = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=]+)?=\s*(?:async\s*)?\(/;
 
-/** `let repo: string;` — a binding with no initializer runs nothing at all. */
+/**
+ * `let repo: string;` — a binding with no initializer runs nothing at all. Read only in the
+ * languages `BINDING_DECLARATION_EXTENSIONS` names, since the same spelling is a command elsewhere.
+ */
 const BARE_DECLARATION = /^(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*(?::[^=;]+)?;$/;
 
 /**
@@ -430,14 +463,15 @@ function closesBlock(before: string): boolean {
  * closes a block, which is told from an object literal's by the same scan and from JSX's self-close
  * by the character AFTER the slash.
  */
-function opensRegex(line: string, start: number): boolean {
+function opensRegex(line: string, start: number, jsx: boolean): boolean {
   const raw = line.slice(0, start);
   const before = raw.trimEnd();
   if (before === "") return true;
-  // A comparison counts only when it stands off from the slash: the trimmed text is what the prefix
-  // is read against, so whether anything WAS trimmed is the whole distinction between `value < /re/`
-  // and a closing tag.
-  if (raw.length > before.length && COMPARISON_PREFIX.test(before)) return true;
+  // A comparison counts only when it stands off from the slash, and only where a tag could be meant
+  // instead: the trimmed text is what the prefix is read against, so whether anything WAS trimmed is
+  // the whole distinction between `value < /re/` and a closing tag. Outside a JSX language no tag
+  // can be meant at all, and the tight `value</re/.source` is the comparison it looks like.
+  if (COMPARISON_PREFIX.test(before) && (!jsx || raw.length > before.length)) return true;
   if (closesControlHead(before)) return true;
   // A `}` that ends a BLOCK hands to a fresh STATEMENT — `if (enabled) {} /[/*]/.test(value);`
   // tests a regex. Read as division, the `/*` inside that character class opens a comment that
@@ -1033,14 +1067,19 @@ function heredocDelimiters(line: string): Heredoc[] {
 
 /**
  * Whether a payload line is the terminator of the heredoc it is inside. Shell ends a heredoc only
- * on a line that is EXACTLY the delimiter, so indentation is part of the comparison — an indented
- * `  EOF` under a plain `<<EOF` is payload, and ending the heredoc there would hand the declaration
- * -looking text below it back to the classifiers. Only `<<-` strips leading TABS (never spaces),
- * which is the whole point of that form.
+ * on a line that is EXACTLY the delimiter, so the whitespace around it is part of the comparison —
+ * an indented `  EOF` under a plain `<<EOF` is payload, and so is a trailing-space `EOF   `. Ending
+ * the heredoc on either would hand the declaration-looking text below it back to the classifiers,
+ * and the commands past the REAL terminator inherit whatever state that text opens. Only `<<-`
+ * strips leading TABS (never spaces), which is the whole point of that form.
+ *
+ * The one thing stripped from the tail is a `\r`, which is not payload but the other half of a CRLF
+ * line ending — `split("\n")` leaves it on every line of such a file, and the delimiter word read
+ * off the opener never carries one.
  */
 function endsHeredoc(raw: string, heredoc: Heredoc): boolean {
   const line = heredoc.tabs ? raw.replace(/^\t+/, "") : raw;
-  return line.trimEnd() === heredoc.word;
+  return line.replace(/\r$/, "") === heredoc.word;
 }
 
 /**
@@ -1056,7 +1095,11 @@ function endsHeredoc(raw: string, heredoc: Heredoc): boolean {
  * same reason in reverse: `pattern = /[/*]/` carries the two characters of an opener inside a
  * character class, and reading them as one would file every line below it as prose.
  */
-function unclosedBlockComment(line: string, nested: boolean): { opener: number; depth: number } {
+function unclosedBlockComment(
+  line: string,
+  nested: boolean,
+  jsx: boolean,
+): { opener: number; depth: number } {
   let i = 0;
   while (i < line.length) {
     const char = line[i];
@@ -1079,7 +1122,7 @@ function unclosedBlockComment(line: string, nested: boolean): { opener: number; 
     }
     // Checked AFTER the comment forms, since a `/*` at a position where a regex could begin is a
     // comment in the grammar too. A slash that opens nothing that closes is left as division.
-    if (char === "/" && opensRegex(line, i)) {
+    if (char === "/" && opensRegex(line, i, jsx)) {
       const end = afterRegex(line, i);
       if (end > 0) {
         i = end;
@@ -1112,6 +1155,7 @@ type QuoteChar = "'" | '"';
 function continuedQuote(
   line: string,
   slashComments: boolean,
+  jsx: boolean,
 ): { opener: number; quote: QuoteChar } | undefined {
   if (!line.endsWith("\\")) return undefined;
   let i = 0;
@@ -1135,7 +1179,7 @@ function continuedQuote(
         i = close + 2;
         continue;
       }
-      if (char === "/" && opensRegex(line, i)) {
+      if (char === "/" && opensRegex(line, i, jsx)) {
         const end = afterRegex(line, i);
         if (end > 0) {
           i = end;
@@ -1185,6 +1229,8 @@ function classifyLines(
     rawStrings: boolean;
     importDeclarations: boolean;
     typeDeclarations: boolean;
+    bindingDeclarations: boolean;
+    jsx: boolean;
   },
 ): LineClass[] {
   const classes: LineClass[] = [];
@@ -1378,7 +1424,7 @@ function classifyLines(
     // start. What precedes the opener is still what the line does; everything after it is prose the
     // lines below inherit, so the state has to be raised here or their delimiters count as syntax.
     if (blockComments) {
-      const { opener, depth: opened } = unclosedBlockComment(line, opts.nestedComments);
+      const { opener, depth: opened } = unclosedBlockComment(line, opts.nestedComments, opts.jsx);
       if (opener >= 0) {
         commentDepth = opened;
         line = line.slice(0, opener).trim();
@@ -1398,7 +1444,7 @@ function classifyLines(
     // neither its text nor the delimiters inside it reach the classifiers below — what precedes the
     // quote is still what the line does. Cut here, after the comment markers, since a quote inside a
     // note opens nothing.
-    const continued = continuedQuote(line, slashComments);
+    const continued = continuedQuote(line, slashComments, opts.jsx);
     if (continued) {
       quoted = continued.quote;
       line = `${line.slice(0, continued.opener)}""`.trim();
@@ -1457,7 +1503,7 @@ function classifyLines(
       classes.push("structural");
       continue;
     }
-    if (BARE_DECLARATION.test(line)) {
+    if (opts.bindingDeclarations && BARE_DECLARATION.test(line)) {
       classes.push("declaration");
       continue;
     }
@@ -1617,6 +1663,8 @@ function sourceIndex(repoPath: string) {
         rawStrings: RAW_STRING_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         importDeclarations: IMPORT_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
         typeDeclarations: TYPE_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        bindingDeclarations: BINDING_DECLARATION_EXTENSIONS.some((ext) => rel.endsWith(ext)),
+        jsx: JSX_EXTENSIONS.some((ext) => rel.endsWith(ext)),
       }),
     };
     cache.set(path, result);
@@ -1655,6 +1703,23 @@ function describeBlock(classes: LineClass[]): string {
       .map(([cls, count]) => `${count} ${cls}`)
       .join(", ") || "nothing"
   );
+}
+
+/**
+ * The window whose make-up the drop is described by: the composition the MOST locations share, the
+ * first of them on a tie. A clone family normally classifies alike, but where one instance is the
+ * odd one out — "4 signature, 1 comment" among five plain "6 comment" blocks — quoting the first
+ * location describes the drop by its exception, and the operator checking the reason finds
+ * something other than what the verdict was reached on.
+ */
+function typicalBlock(blocks: LineClass[][]): LineClass[] {
+  const shared = new Map<string, number>();
+  for (const block of blocks) {
+    const key = describeBlock(block);
+    shared.set(key, (shared.get(key) ?? 0) + 1);
+  }
+  const shareOf = (block: LineClass[]) => shared.get(describeBlock(block)) ?? 0;
+  return blocks.reduce((best, block) => (shareOf(block) > shareOf(best) ? block : best));
 }
 
 /**
@@ -1742,7 +1807,7 @@ async function judge(index: Index, signal: ScanSignal): Promise<Verdict> {
   if (declarative.length <= code) return KEEP;
   // Two different diagnoses for the operator reading the drop: a block that declares, and a block
   // that holds no content line to declare with.
-  const sample = declarative[0];
+  const sample = typicalBlock(declarative);
   const verdict = isEmptyBlock(sample)
     ? "holds nothing but blank and structural lines"
     : "declares rather than computes";

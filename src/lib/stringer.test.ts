@@ -2349,6 +2349,32 @@ describe("scan", () => {
       expect(result.duplication).toEqual({ dropped: [] });
     });
 
+    // The same comparison written TIGHT — `value</[/*]/.source` — is still a comparison in a file
+    // that cannot hold JSX: a `.ts` has no closing tag to confuse it with. Refused as a regex
+    // opener, the `/*` inside the character class opens a comment that runs to the end of the file
+    // and every real duplication window below it is dropped unread.
+    it("reads a tight comparison before a regex outside a JSX language", async () => {
+      const repo = writeRepo({
+        "src/tight.ts": [
+          "export const gated = value</[/*]/.source;",
+          "export function split(value: string) {",
+          "  emit(value);",
+          "  flush(value);",
+          "  report(value);",
+          "}",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["src/tight.ts", 3]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/tight.ts", Line: 3 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
+    });
+
     // The `)` that closes a control-flow head hands to a STATEMENT, not to a value — `if (enabled)
     // /[/*]/.test(value);` runs a regex test as its body. Read as division, the `/*` inside the
     // character class opens a comment that runs to the end of the file and every real duplication
@@ -2899,6 +2925,49 @@ describe("scan", () => {
       expect(drop.reason).not.toContain("declares rather than computes");
     });
 
+    // The composition quoted in the reason is the one the MOST locations share, not whichever
+    // happened to be listed first: an operator checking a drop described by its outlier finds
+    // something other than what the verdict was reached on.
+    it("describes the drop by the composition most of its locations share", async () => {
+      const repo = writeRepo({
+        "src/notes.ts": [
+          "// the section below explains the retry budget,",
+          "// why it is spelled in attempts rather than seconds,",
+          "// and what happens when a caller exhausts it",
+          "",
+        ].join("\n"),
+        "src/a.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+        "src/b.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone(
+          [
+            ["src/notes.ts", 1],
+            ["src/a.ts", 1],
+            ["src/b.ts", 1],
+          ],
+          3,
+        ),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      const [drop] = result.duplication.dropped;
+      expect(drop.reason).toContain("3 import");
+      expect(drop.reason).not.toContain("3 comment");
+    });
+
     // A block comment that closes mid-line does not make the line prose: what follows the closer
     // runs on every pass, so a window of those lines is duplicated computation triage can act on.
     it("classifies the code that follows a closed block comment on the same line", async () => {
@@ -3247,6 +3316,43 @@ describe("scan", () => {
       expect(result.duplication.dropped[0].reason).toContain("3 import");
     });
 
+    // Trailing whitespace is part of the terminator comparison exactly as indentation is: `EOF   `
+    // under a plain `<<EOF` is payload, not the delimiter. Ended there, the generated `function
+    // fake(` below it opens a parameter list no `)` closes, and the commands past the real
+    // terminator inherit it and are dropped as a declaration.
+    it("keeps a heredoc open past a copy of its terminator carrying trailing spaces", async () => {
+      const repo = writeRepo({
+        "scripts/emit.sh": [
+          "#!/usr/bin/env bash",
+          "cat <<EOF > /tmp/sample.js",
+          "EOF   ",
+          "function fake(",
+          "  value,",
+          "EOF",
+          "upload /tmp/sample.js",
+          "notify team",
+          "flush queue",
+          "",
+        ].join("\n"),
+        "src/deps.ts": [
+          'import { readFile } from "node:fs/promises";',
+          'import { join } from "node:path";',
+          'import { spawn } from "node:child_process";',
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/emit.sh", 7]], 3),
+        clone([["src/deps.ts", 1]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/emit.sh", Line: 7 }]);
+      expect(result.duplication.dropped).toMatchObject([{ path: "src/deps.ts" }]);
+      expect(result.duplication.dropped[0].reason).toContain("3 import");
+    });
+
     // The other half of that rule: `<<-` DOES strip leading tabs, which is what the form is for.
     // Left unstripped, the tab-indented terminator never matches, the heredoc runs to the end of the
     // file, and the prose below it reads as payload — so a duplicated comment block is triaged as a
@@ -3273,6 +3379,29 @@ describe("scan", () => {
       expect(result.signals).toEqual([]);
       expect(result.duplication.dropped).toMatchObject([{ path: "scripts/notes.sh" }]);
       expect(result.duplication.dropped[0].reason).toContain("3 comment");
+    });
+
+    // `let` is an ordinary shell command — `let first;` evaluates arithmetic and sets the exit
+    // status `set -e` acts on. Read as the erased binding TypeScript spells the same way, a
+    // duplicated window of that arithmetic is filed as a declaration list and dropped unread.
+    it("reads a shell `let` command as code, not as the bare declaration it spells", async () => {
+      const repo = writeRepo({
+        "scripts/count.sh": [
+          "#!/usr/bin/env bash",
+          "let first;",
+          "let second;",
+          "let third;",
+          "",
+        ].join("\n"),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        clone([["scripts/count.sh", 2]], 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "scripts/count.sh", Line: 2 }]);
+      expect(result.duplication).toEqual({ dropped: [] });
     });
 
     // `for await (…)` hands to a STATEMENT exactly as a plain `for` does, so a regex may follow its
