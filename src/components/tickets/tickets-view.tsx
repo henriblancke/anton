@@ -10,11 +10,11 @@ import {
   CircleSlashIcon,
   ListTodoIcon,
   PlusIcon,
-  TriangleAlertIcon,
 } from "lucide-react";
 
 import type { Stage, TicketRow } from "@/lib/types";
-import { Button, buttonVariants } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import { cn } from "@/lib/utils";
 import { agentDotClass } from "@/components/board/board-utils";
 import { AbandonedChip, RelativeTime } from "@/components/atoms";
@@ -115,15 +115,10 @@ export function TicketsView({
       <TicketsFilters tickets={tickets ?? []} />
 
       {error ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
-          <span className="flex size-11 items-center justify-center rounded-xl border border-risk-high/30 bg-risk-high/10">
-            <TriangleAlertIcon className="size-5 text-risk-high" aria-hidden="true" />
-          </span>
-          <p className="text-sm text-risk-high">{error}</p>
-          <Button size="sm" variant="outline" onClick={() => setAttempt((n) => n + 1)}>
-            Try again
-          </Button>
-        </div>
+        <ErrorState
+          message={error}
+          onRetry={() => setAttempt((n) => n + 1)}
+        />
       ) : tickets === null ? (
         <TicketsSkeleton />
       ) : tickets.length === 0 ? (

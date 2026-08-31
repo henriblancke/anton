@@ -273,6 +273,31 @@ describe("EscalationStrip", () => {
     expect(screen.queryByText(/landed yet/)).toBeNull();
   });
 
+  it("renders an autopilot disarm with its case, and no button that would lie about clearing it", () => {
+    renderStrip([
+      escalation({
+        kind: "autopilot-disarm",
+        findingKey: "autopilot-disarm:score-regression",
+        reason: "3 consecutive runs scored below 7/10 (6, 5, 4)",
+        beadId: undefined,
+        epicBeadId: undefined,
+        runId: undefined,
+        evidence: ["r1 · anton-a · 6/10", "r2 · anton-b · 5/10", "r3 · anton-c · 4/10"],
+      }),
+    ]);
+
+    expect(screen.getByText("Autopilot disarmed")).toBeTruthy();
+    expect(screen.getByText("3 consecutive runs scored below 7/10 (6, 5, 4)")).toBeTruthy();
+    // The series in full: the operator is being asked for a judgment on exactly these numbers.
+    expect(screen.getByText("r2 · anton-b · 5/10")).toBeTruthy();
+    // Re-arming is the whole decision, and it lives on the banner above — nothing here pretends
+    // otherwise. A Dismiss would clear the row for good while the project stayed frozen.
+    expect(screen.getByText(/Re-arm anton in the banner above/)).toBeTruthy();
+    expect(screen.queryByText("Resume")).toBeNull();
+    expect(screen.queryByText("Dismiss")).toBeNull();
+    expect(screen.queryByText("Abandon")).toBeNull();
+  });
+
   it("is announced as its own labelled region", () => {
     const { container } = renderStrip([escalation()]);
     const section = container.querySelector("section");

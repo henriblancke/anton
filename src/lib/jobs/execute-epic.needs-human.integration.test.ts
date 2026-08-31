@@ -371,6 +371,14 @@ process.exit(0);`),
       expect(run.error).toContain(ask);
       expect(run.error).toMatch(/human gate could NOT be created/);
       expect(run.error).not.toMatch(/closing that gate resumes this run/);
+
+      // The JOB has to tell the same story as the row (PR #205 review). Throwing the ask unchanged
+      // would poison-park the job promising "the run is parked until someone answers it" — a wait
+      // no `bd gate resolve` can end, whose exhausted-job escalation names no way out.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.lastError).toContain(ask);
+      expect(job?.lastError).toMatch(/human gate could NOT be created/);
+      expect(job?.lastError).not.toMatch(/parked until someone answers it/);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");

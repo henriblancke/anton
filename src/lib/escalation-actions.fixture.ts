@@ -20,6 +20,7 @@ import { eq } from "drizzle-orm";
 
 import { makeFileDb, type FileDb } from "@/lib/testing/integration";
 import { LABELS, type Bead } from "./beads/bd";
+import type { EscalationFinding } from "./escalations";
 import type { RunHealthFinding } from "./run-health";
 import type { Project } from "./types";
 
@@ -177,7 +178,7 @@ export function finding(o: Partial<RunHealthFinding> = {}): RunHealthFinding {
   };
 }
 
-export async function open(o: { finding?: RunHealthFinding; epicBeadId?: string } = {}) {
+export async function open(o: { finding?: EscalationFinding; epicBeadId?: string } = {}) {
   const { escalation } = await raiseEscalation(getDb(), clock, {
     projectId: "p1",
     finding: o.finding ?? finding(),

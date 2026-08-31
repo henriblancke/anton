@@ -16,6 +16,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { LABELS } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import {
   apply,
   applyWith,
@@ -24,6 +25,7 @@ import {
   CARD,
   child,
   CLOSE,
+  CARRIED,
   CLUSTER,
   cold,
   DEFER,
@@ -44,6 +46,7 @@ import {
   planFor,
   proposalFor,
   record,
+  REPO,
   REPARENT,
   resetSeam,
   runCard,
@@ -187,6 +190,321 @@ describe("under the write lock — what a decided step re-asks before it lands",
     });
     expect(calls).toEqual([
       `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-epic is no longer a container epic — it groups no cards, so it is a run target in its own right, and landing anton-feat under it would demote it: its own run is cancelled and any ticket it carries is left beneath a card nothing will reach (\`ticket-under-container-epic\`)`,
+    ]);
+  });
+
+  /**
+   * The CONTAINER half of a cluster's "obvious home" (reparent.ts `MIN_CARRIED_TICKETS`), re-asked
+   * over the tickets the decision recorded and the step LOCKS. Left with the snapshot, both
+   * approvals pass and the cluster lands on a leaf feature — one PR's worth of work turned into
+   * somebody else's epic.
+   */
+  it("refuses a cluster whose home lost its last ticket since the snapshot", async () => {
+    const proposal = proposalFor(CLUSTER);
+    // The ticket that made anton-card an obvious home is detached between the snapshot and the write.
+    liveBeads.set(CARRIED.id, bead(CARRIED.id));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  // …and the cluster's own members may not stand in for the ticket that left — not even the ones
+  // THIS apply has already moved. Counting them would let the ask prove its own premise with the
+  // very writes it is making, so the last member lands on a card whose only work is the cluster.
+  it("never lets a member it has already moved stand in for the home's own ticket", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    // The home's own ticket leaves the instant the first member lands under it.
+    onWrite((call) => {
+      if (call === "reparent anton-a anton-card") liveBeads.set(CARRIED.id, bead(CARRIED.id));
+    });
+
+    await expect(apply(proposal, board)).rejects.toThrow(
+      /no longer carries the tickets this proposal was decided against/,
+    );
+
+    expect(calls.slice(0, 2)).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-a anton-old", // rolled back: the cluster never had a home to land on
+    ]);
+    expect(calls.some((c) => c.startsWith("reparent anton-b"))).toBe(false);
+  });
+
+  // …and neither may a ticket that landed under the home AFTER the decision. `deleteTicket` takes
+  // the deleted ticket's own lock and no other, so the home's lock does not order a deletion against
+  // this read — which is why the bar is asked over the CARRIERS the decision recorded and this step
+  // locks. A newcomer is a bead nothing here holds, so counting it would leave the premise resting
+  // on a ticket that can vanish between the read and the write.
+  it("refuses a cluster whose home swapped its ticket for one this step never locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set(CARRIED.id, bead(CARRIED.id)); // the counted ticket is detached…
+    liveBeads.set("anton-t1", child("anton-t1", CARD.id)); // …and an unlocked one takes its place
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  /**
+   * The same claim about the carrier's ROUTE. A carrier re-parented onto another intermediate under
+   * the same home since the filing still rides the home, so the count keeps it — but it reaches the
+   * home through a bead this step never locked, and `deleteTicket` takes only that bead's own lock.
+   * Left counted, the premise rests on a route that can be cut between the locked read and the
+   * write, which is the leaf-card landing the recorded paths exist to stop.
+   */
+  it("refuses a cluster whose carrier now reaches the home through a bead this step never locked", async () => {
+    const proposal = proposalFor(CLUSTER);
+    // An exempt-type bead is filed under the home and the carrier moved beneath it — the carrier
+    // itself never leaves anton-card, so nothing but its recorded path can see the change.
+    liveBeads.set("anton-note", child("anton-note", CARD.id, { issue_type: "learning" }));
+    liveBeads.set(CARRIED.id, child(CARRIED.id, "anton-note"));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  // A carrier moved onto an intermediate the decision ALREADY recorded is a route this step holds
+  // end to end, so it still counts — the narrowing drops unlocked paths, not every re-parent.
+  it("still counts a carrier that moved onto a bead its recorded path already names", async () => {
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const nested = child("anton-t0", note.id);
+    const proposal = proposalFor(CLUSTER);
+    // The carrier is re-parented straight onto the card, shortening a route this step locks whole.
+    liveBeads.set(nested.id, child(nested.id, CARD.id));
+
+    await expect(
+      apply(proposal, [CARD, note, nested, bead("anton-a"), bead("anton-b"), proposal]),
+    ).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+  });
+
+  /**
+   * The re-checks above are only worth their board read if the beads they read cannot move while
+   * they run — so the step locks the whole cluster premise, not just its own two ends. A PARTNER's
+   * title is what proves the subject still shares a subject with the home, and the home's own ticket
+   * is what proves it is a container at all; both are edited or deleted under their own per-bead
+   * locks (`ticket-detail.ts`), and neither is the subject, the home or the ticket owner.
+   *
+   * Asserted as the lock itself rather than through a staged race, because the harm is precisely
+   * that the window is invisible to a fresh read: hold the bead, and nothing may be written until it
+   * is released.
+   */
+  it("takes the write lock of every cluster member and carried ticket, not just its own two ends", async () => {
+    for (const held of ["anton-b", CARRIED.id]) {
+      resetSeam();
+      const proposal = proposalFor(CLUSTER);
+      let release = () => {};
+      const queued = withBeadWriteLock(REPO, held, () => new Promise<void>((r) => (release = r)));
+
+      const run = apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]);
+      try {
+        await new Promise((r) => setTimeout(r, 10));
+        expect(calls, `${held} was not held`).toEqual([]);
+      } finally {
+        release();
+        await queued;
+      }
+      await expect(run).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+    }
+  });
+
+  /**
+   * The same claim one level up. A carrier reaches the home through every bead between them
+   * (`cardOf` walks the whole chain), so an intermediate the container count never sees — an exempt
+   * type is nobody's ticket — carries the premise just as the ticket does, and `deleteTicket` takes
+   * its own lock and no other. Unheld, it could go between the board read and the write, cutting the
+   * carrier loose and landing the cluster on a leaf card with the bar still reading as satisfied.
+   */
+  it("takes the write lock of the beads a nested carrier reaches the home through", async () => {
+    const note = child("anton-note", CARD.id, { issue_type: "learning" });
+    const nested = child("anton-t0", note.id);
+    const proposal = proposalFor(CLUSTER);
+    let release = () => {};
+    const queued = withBeadWriteLock(REPO, note.id, () => new Promise<void>((r) => (release = r)));
+
+    const run = apply(proposal, [CARD, note, nested, bead("anton-a"), bead("anton-b"), proposal]);
+    try {
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls, `${note.id} was not held`).toEqual([]);
+    } finally {
+      release();
+      await queued;
+    }
+    await expect(run).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+  });
+
+  /**
+   * The MEMBERS' half of the same claim. A title or `area:` edit takes the bead's own lock
+   * (`ticket-detail.ts` `updateTicket`), which this step holds for the subject and the home — and it
+   * is invisible to every other bar here: the bead stays open, unclaimed, unmoved and the right
+   * tier. Without the re-check the move lands work under a card it no longer shares a subject with.
+   */
+  it("refuses a member retitled out of its cluster since the snapshot", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set("anton-a", bead("anton-a", { title: "anton-a: docker image cache" }));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a no longer states a subject the rest of this cluster and anton-card hold in common — a title or \`area:\` label was edited since this proposal was decided, and it takes 2 beads stating one subject anton-card states too before a home is obvious`,
+    ]);
+  });
+
+  /**
+   * The same claim, asked of the WHOLE membership rather than of the bead about to be written. The
+   * per-step locks are released between the writes, so a member this apply has ALREADY moved can be
+   * retitled out of the cluster while the next step waits — and a check that only asked whether its
+   * own subject reached some group would wave every later member through and settle the proposal
+   * over a bead left beneath a card it no longer belongs to.
+   */
+  it("refuses when a member it has already moved is retitled out of the cluster", async () => {
+    const plan = planFor({
+      kind: "parentless-cluster",
+      move: "reparent",
+      subjects: ["anton-a", "anton-b", "anton-c"],
+      target: CARD.id,
+    });
+    const proposal = proposalFor(plan);
+    const board = [
+      CARD,
+      CARRIED,
+      child("anton-a", "anton-old"),
+      child("anton-b", "anton-old"),
+      child("anton-c", "anton-old"),
+      proposal,
+    ];
+    // anton-a is renamed onto another subject the moment its move lands — the two members left still
+    // agree with each other, so nothing but the whole-cluster re-check can see that it has gone.
+    onWrite((call) => {
+      if (call === "reparent anton-a anton-card") {
+        liveBeads.set("anton-a", child("anton-a", CARD.id, { title: "anton-a: docker image cache" }));
+      }
+    });
+
+    await expect(apply(proposal, board)).rejects.toMatchObject({ failure: "failed" });
+
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-a anton-old", // rolled back: the cluster it was moved as part of is gone
+      `note ${proposal.id} gardener: apply FAILED — applying ${proposal.id} failed: anton-a no longer states a subject the rest of this cluster and anton-card hold in common — a title or \`area:\` label was edited since this proposal was decided, and it takes 2 beads stating one subject anton-card states too before a home is obvious, and it already sits under anton-card — landing the rest of this cluster would leave it beneath a card whose work it is no longer part of — the 1 write(s) already made were rolled back, so the board is unchanged`,
+    ]);
+    expect(calls.some((c) => c.startsWith("reparent anton-c"))).toBe(false);
+  });
+
+  /**
+   * The claim half of the same recompute. `bd update --claim` writes assignee + `in_progress` and
+   * publishes the run-lease a moment later, so a member picked up between the writes reads as free
+   * to every liveness signal — and the detector that formed this cluster excludes a claimed bead
+   * outright (reparent.ts `isFree`). Counted anyway, it supplies the second half of the grouping
+   * evidence while the survivor is moved and the proposal is closed over the pair.
+   */
+  it("refuses when a member it has already moved is claimed before its lease appears", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    onWrite((call) => {
+      if (call !== "reparent anton-a anton-card") return;
+      liveBeads.set(
+        "anton-a",
+        child("anton-a", CARD.id, { assignee: "runner-7", status: "in_progress" }),
+      );
+    });
+
+    await expect(apply(proposal, board)).rejects.toMatchObject({ failure: "failed" });
+
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      "reparent anton-a anton-old", // rolled back: the pair it was moved as half of is gone
+      `note ${proposal.id} gardener: apply FAILED — applying ${proposal.id} failed: anton-b is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too before a home is obvious, and whatever changed since the filing is the newer reading of where this work belongs; decline it, and re-parent by hand if anton-card is still the right home — the 1 write(s) already made were rolled back, so the board is unchanged`,
+    ]);
+  });
+
+  // …but a claim the PLAN itself saw is the state it was decided against, not news: dating it
+  // against the filing stamp is what keeps that baseline honest here as everywhere else, so a
+  // member held since before the ask still counts towards the grouping and the cluster lands.
+  it("counts a member whose claim predates the filing, and applies the cluster", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const held = cold("anton-a", { assignee: "runner-7", status: "in_progress" });
+    liveBeads.set("anton-a", held);
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, held, bead("anton-b"), proposal]),
+    ).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
+  });
+
+  /**
+   * The third way a landed member leaves, and the one the card test is blind to by design: a
+   * re-parent that takes it somewhere no board card carries. `reparentPremiseGone` reads a bead
+   * moved under another CONTAINER as still-unreachable work this proposal is the fix for — right for
+   * a member waiting its turn, wrong for one this apply already placed and somebody has since
+   * detached, which no later step would otherwise notice.
+   */
+  it("refuses when a member it has already moved leaves the home for no card at all", async () => {
+    const proposal = proposalFor(CLUSTER);
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    onWrite((call) => {
+      if (call === "reparent anton-a anton-card") liveBeads.set("anton-a", bead("anton-a"));
+    });
+
+    await expect(apply(proposal, board)).rejects.toMatchObject({ failure: "failed" });
+
+    expect(calls).toEqual([
+      "reparent anton-a anton-card",
+      `note ${proposal.id} gardener: apply FAILED — applying ${proposal.id} failed: anton-b is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too before a home is obvious, and whatever changed since the filing is the newer reading of where this work belongs; decline it, and re-parent by hand if anton-card is still the right home — the 1 write(s) already made were rolled back, except anton-a, which another write has since moved and was left where it now sits`,
+    ]);
+  });
+
+  // The other half of the same recompute: a member a run picked up has LEFT the cluster, exactly as
+  // the decision would drop it, so what is left has to clear the detector's own bar on its own. One
+  // survivor never does — and refusing here, before anything is written, is what stops a lone bead
+  // being filed under a card on the weak evidence this detector was rebuilt to stop proposing on.
+  it("refuses a cluster a member left before the first write, without moving a subject", async () => {
+    const proposal = proposalFor(CLUSTER);
+    liveBeads.set("anton-b", leased("anton-b", Date.now()));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-a is all that is left of this cluster — it takes 2 beads stating one subject anton-card states too before a home is obvious, and whatever changed since the filing is the newer reading of where this work belongs; decline it, and re-parent by hand if anton-card is still the right home`,
+    ]);
+  });
+
+  /**
+   * A step the board has already satisfied writes nothing — but the proposal is still CLOSED as
+   * applied over it. Let every member reach that state (another approval, or an operator, landing
+   * the whole cluster between the decision and these locks) and no step reaches the cluster
+   * re-checks at all, so the ask settles as applied against premises nobody re-asked — here a home
+   * whose recorded ticket has since gone, which the same fresh board would refuse outright.
+   */
+  it("re-asks a cluster's premises for a move the board has already made", async () => {
+    const proposal = proposalFor(CLUSTER);
+    // Somebody else lands the whole cluster, and the home's own ticket leaves with it.
+    liveBeads.set("anton-a", child("anton-a", CARD.id));
+    liveBeads.set("anton-b", child("anton-b", CARD.id));
+    liveBeads.set(CARRIED.id, bead(CARRIED.id));
+
+    await expect(
+      apply(proposal, [CARD, CARRIED, bead("anton-a"), bead("anton-b"), proposal]),
+    ).rejects.toMatchObject({ failure: "refused" });
+
+    expect(calls).toEqual([
+      `note ${proposal.id} gardener: apply FAILED — cannot apply ${proposal.id}: anton-card no longer carries the tickets this proposal was decided against — it was an obvious home only because the board already filed work of this kind under it, and a card carrying none is one PR's worth of work; hanging a cluster off it now would turn it into a container epic, so decline it and re-parent by hand if anton-card is still the right home`,
     ]);
   });
 
@@ -569,7 +887,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // locks, and restoring the old parent over it would clobber a move that is now the board's truth.
   it("leaves a rolled-back subject alone when another write has since moved it", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
     // Somebody else re-parents anton-a the moment this apply moves on to anton-b.
     onWrite((call) => {
@@ -590,7 +908,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // and a later member failing must not restore `undoParent` over the other writer's move.
   it("never rolls back a member the board already satisfied — that write was not ours", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     // Another approval lands anton-a's move between the snapshot and this apply's per-step lock.
     liveBeads.set("anton-a", child("anton-a", CARD.id));
     failOn.set("reparent:anton-b", 1);
@@ -603,13 +921,19 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   });
 
   // A cluster that loses its second subject mid-apply is a PARTIAL application, not a clean refusal:
-  // the prefix has to come back out, and the proposal has to stay open saying so.
+  // the prefix has to come back out, and the proposal has to stay open saying so. The run picks the
+  // member up only once the first move has LANDED — lose it any earlier and the whole-cluster
+  // re-check refuses before anything is written, which is the case above.
   it("rolls back the prefix when a later subject moves under the apply", async () => {
     const proposal = proposalFor(CLUSTER);
-    liveBeads.set("anton-b", leased("anton-b", Date.now()));
+    onWrite((call) => {
+      if (call === "reparent anton-a anton-card") {
+        liveBeads.set("anton-b", leased("anton-b", Date.now()));
+      }
+    });
 
     await expect(
-      apply(proposal, [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal]),
+      apply(proposal, [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal]),
     ).rejects.toMatchObject({ failure: "failed" });
 
     expect(calls).toEqual([
@@ -622,7 +946,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
 
   it("rolls back a half-applied cluster and leaves the proposal OPEN with the error attached", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
 
     await expect(apply(proposal, board)).rejects.toThrow(/rolled back/);
@@ -639,7 +963,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
 
   it("says so loudly when the rollback ITSELF fails — a board a human has to look at", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
     // The SECOND write to anton-a is its undo — fail that too, and the board is left half-moved.
     failOn.set("reparent:anton-a", 2);
@@ -658,7 +982,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
 
   it("reports no surviving write when the rollback put every one of them back", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
 
     const err = await apply(proposal, board).catch((e) => e);
@@ -674,7 +998,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // home's lock as well as the subject's.
   it("leaves a rolled-back subject under a home a run has since started on", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     // The run picks the card up the instant the first member lands under it.
     onWrite((call) => {
       if (call === "reparent anton-a anton-card") {
@@ -698,7 +1022,7 @@ describe("rolling back a cluster that failed part-way — the board must end unc
   // so the step is named for a human instead.
   it("strands a rolled-back subject whose ownership read fails, rather than restoring blind", async () => {
     const proposal = proposalFor(CLUSTER);
-    const board = [CARD, child("anton-a", "anton-old"), bead("anton-b"), proposal];
+    const board = [CARD, CARRIED, child("anton-a", "anton-old"), bead("anton-b"), proposal];
     failOn.set("reparent:anton-b", 1);
     // anton-a becomes unreadable the moment its move lands, so the rollback can't prove it owns it.
     onWrite((call) => {
@@ -723,15 +1047,20 @@ describe("rolling back a cluster that failed part-way — the board must end unc
     const plan = planFor({
       kind: "parentless-cluster",
       move: "reparent",
-      subjects: ["anton-a", "anton-b", "anton-c"],
+      // Four members, so that dropping the two the concurrent write takes out still leaves a pair
+      // stating one subject: the cluster re-check refuses before it writes otherwise, and this test
+      // is about the ROLLBACK of a bd write that exploded.
+      subjects: ["anton-a", "anton-b", "anton-c", "anton-d"],
       target: CARD.id,
     });
     const proposal = proposalFor(plan);
     const board = [
       CARD,
+      CARRIED,
       child("anton-a", "anton-old"),
       child("anton-b", "anton-old"),
       child("anton-c", "anton-old"),
+      child("anton-d", "anton-old"),
       proposal,
     ];
     failOn.set("reparent:anton-c", 1);

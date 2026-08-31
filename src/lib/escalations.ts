@@ -18,9 +18,45 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
-import type { RunHealthFinding, RunHealthFindingKind } from "./run-health";
+import type { RunHealthFindingKind } from "./run-health";
 
 export type EscalationStatus = "open" | "resolved";
+
+/**
+ * What an escalation can be about: every way a run stalls, plus an autopilot DISARM (R4.6).
+ *
+ * A disarm is not a stalled run — it is a frozen policy with no run behind it — but it belongs in
+ * the same strip for the reason the strip exists: it is work that has stopped and will not restart
+ * until a person decides. A disarm that only painted the lane header would be invisible to an
+ * operator who scans "Needs you" and nothing else.
+ */
+export type EscalationKind = RunHealthFindingKind | "autopilot-disarm";
+
+/**
+ * What {@link raiseEscalation} needs from whatever detected the stall. A run-health finding
+ * satisfies it as it stands; the autopilot breakers supply the same shape with no run, bead or job
+ * to point at, and their case in `evidence` instead.
+ */
+export interface EscalationFinding {
+  kind: EscalationKind;
+  /** Stable across passes for the same stall, so re-detecting it updates nothing. */
+  key: string;
+  reason: string;
+  /** ms epoch the stall started. */
+  since: number;
+  ageMs?: number;
+  runId?: string;
+  beadId?: string;
+  jobId?: string;
+  prNumber?: number;
+  prUrl?: string;
+  gateId?: string;
+  /** The ticket that raised a `needs-human` ask — where an answer goes (see EscalationView). */
+  askBeadId?: string;
+  /** One line per run — the case a disarm asks the operator to re-arm (or not) on. */
+  evidence?: string[];
+}
+
 /**
  * How a founder settled an escalation: retry the work, call it won't-do, or acknowledge a stall
  * anton cannot act on (`dismissed` — see escalation-actions.ts). A dismissal settles the ROW only;
@@ -41,7 +77,7 @@ export type EscalationRow = typeof schema.escalations.$inferSelect;
 export interface EscalationView {
   id: string;
   findingKey: string;
-  kind: RunHealthFindingKind;
+  kind: EscalationKind;
   /** Why it's stuck: the park reason, the PR's idle state, the job's last error. */
   reason: string;
   beadId?: string;
@@ -66,6 +102,8 @@ export interface EscalationView {
   since?: number;
   /** How long it had been stuck when the sweep saw it (ms) — the evidence, frozen. */
   ageMs: number;
+  /** The detector's case, one line each — printed in full on the kinds that carry one (a disarm). */
+  evidence?: string[];
   status: EscalationStatus;
   resolution?: EscalationResolution;
   /** Whether the board-native `bd note` landed on the target bead. */
@@ -85,10 +123,10 @@ function toEpoch(value: unknown): number | undefined {
 }
 
 /** The finding an escalation was raised from, or an empty shell when the blob is unreadable. */
-function parseEvidence(json: string): Partial<RunHealthFinding> {
+function parseEvidence(json: string): Partial<EscalationFinding> {
   try {
     const parsed = JSON.parse(json) as unknown;
-    return parsed && typeof parsed === "object" ? (parsed as Partial<RunHealthFinding>) : {};
+    return parsed && typeof parsed === "object" ? (parsed as Partial<EscalationFinding>) : {};
   } catch {
     // A corrupt blob degrades to "no extra evidence" — the row's own columns still carry the
     // reason, target and age, so the escalation stays actionable instead of vanishing.
@@ -101,7 +139,7 @@ export function toEscalationView(row: EscalationRow): EscalationView {
   return {
     id: row.id,
     findingKey: row.findingKey,
-    kind: row.kind as RunHealthFindingKind,
+    kind: row.kind as EscalationKind,
     reason: row.reason,
     beadId: row.beadId ?? undefined,
     epicBeadId: row.epicBeadId ?? undefined,
@@ -114,6 +152,9 @@ export function toEscalationView(row: EscalationRow): EscalationView {
     prUrl: typeof evidence.prUrl === "string" ? evidence.prUrl : undefined,
     since: toEpoch(row.since),
     ageMs: typeof evidence.ageMs === "number" ? evidence.ageMs : 0,
+    evidence: Array.isArray(evidence.evidence)
+      ? evidence.evidence.filter((line): line is string => typeof line === "string")
+      : undefined,
     status: row.status as EscalationStatus,
     resolution: (row.resolution ?? undefined) as EscalationResolution | undefined,
     noted: row.notedAt != null,
@@ -123,7 +164,7 @@ export function toEscalationView(row: EscalationRow): EscalationView {
 
 export interface RaiseEscalationInput {
   projectId: string;
-  finding: RunHealthFinding;
+  finding: EscalationFinding;
   /** The epic a resume would re-enqueue, when the finding names one. */
   epicBeadId?: string;
 }

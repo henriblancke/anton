@@ -5,7 +5,7 @@
  * review-fix.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import { inReviewEpics, parseThreadReport } from "./review-fix";
+import { claimOwnerFor, inReviewEpics, parseThreadReport } from "./review-fix";
 import { LABELS, type Bead } from "../beads/bd";
 
 describe("parseThreadReport (re-exported from ./review-fix)", () => {
@@ -164,5 +164,24 @@ describe("inReviewEpics", () => {
       const closedTheirs = bead({ id: "theirs", issue_type: "epic", assignee: "bob", status: "closed" });
       expect(inReviewEpics([closedTheirs], { epicBeadId: "theirs" })).toEqual([]);
     });
+  });
+});
+
+describe("claimOwnerFor", () => {
+  // enqueueReviewFixIfAbsent lets a project-wide sweep and gate-check's targeted fix for the same
+  // epic coexist. A shared owner string would let the second reuse the first's checkout — the
+  // worktree claim only refuses an owner that DIFFERS from the caller — so both would drive git,
+  // claude, commit and push over one directory.
+  it("gives each job a distinct owner, under a readable prefix", () => {
+    const a = claimOwnerFor("11111111-1111-4111-8111-111111111111");
+    const b = claimOwnerFor("22222222-2222-4222-8222-222222222222");
+    expect(a).not.toBe(b);
+    expect(a.startsWith("review-fix")).toBe(true);
+    expect(a).toContain("11111111-1111-4111-8111-111111111111");
+  });
+
+  it("has no whitespace, so it survives the git lock reason round-trip", () => {
+    // claimLockReason writes `anton-claim <owner> pid=… host=…` and parses the owner back as \S+.
+    expect(claimOwnerFor("job-1")).not.toMatch(/\s/);
   });
 });

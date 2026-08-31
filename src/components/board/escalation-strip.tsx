@@ -7,16 +7,17 @@ import Link from "next/link";
 import { MetaChip } from "@/components/atoms";
 import { EscalationActions } from "@/components/board/escalation-actions";
 import { escalationAge } from "@/components/board/escalation-age";
-import type { EscalationView, RunHealthFindingKind } from "@/lib/types";
+import type { EscalationKind, EscalationView } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** What each class is, said the way a founder would say it. */
-const ESCALATION_LABELS: Record<RunHealthFindingKind, string> = {
+const ESCALATION_LABELS: Record<EscalationKind, string> = {
   "parked-run": "Parked run",
   "stale-pr": "Stale PR",
   "dead-lease": "Dead lease",
   "exhausted-job": "Retries spent",
   "needs-human": "Waiting on you",
+  "autopilot-disarm": "Autopilot disarmed",
 };
 
 /**
@@ -261,6 +262,22 @@ function EscalationRow({ slug, escalation }: { slug: string; escalation: Escalat
             )}{" "}
             as a note before you resume: the resumed session reads notes as binding steering, while
             resolving the gate carries no answer back.
+          </p>
+        ) : null}
+        {/* A disarm is the one row whose case does not fit in its reason: the operator is being
+            asked to judge a series, and a judgment needs what it was made on. Printed in full, for
+            the same reason the lane header prints it — see autopilot-breaker.ts. */}
+        {escalation.kind === "autopilot-disarm" && escalation.evidence?.length ? (
+          <ul className="font-mono text-[11px] text-subtle">
+            {escalation.evidence.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        ) : null}
+        {escalation.kind === "autopilot-disarm" ? (
+          <p className="text-[11px] text-subtle">
+            Re-arm anton in the banner above to clear this — no button here does, because starting
+            work again is the whole decision.
           </p>
         ) : null}
         {!escalation.noted && escalation.beadId ? (
