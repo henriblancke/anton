@@ -1314,10 +1314,21 @@ const JSX_ATTRS = String.raw`(?:"[^"]*"|'[^']*'|[^<>"'])*`;
 const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![/])>)`;
 
 /**
- * The delimiters JSX spells its own syntax with — the only punctuation that means anything between
- * a tag and its children, since code stands there solely inside a `{…}`.
+ * The delimiters JSX spells its own syntax with — a tag's angle brackets and the braces of an
+ * interpolation. They are the only punctuation that can open program between a tag and its
+ * children, since code stands there solely inside a `{…}`.
  */
-const JSX_CHILD_DELIMITERS = String.raw`<>{}\\|\``;
+const JSX_CHILD_DELIMITERS = String.raw`<>{}`;
+
+/**
+ * The backtick a template literal opens with, the backslash that escapes a character inside one,
+ * and the `|` of a union or an `||` — program on a line standing outside every element, and marks a
+ * sentence shows inside one: ``<p>Use `Widget` instead | see the changelog</p>`` renders that
+ * punctuation to a reader, and reading it as program lets a prose-only page prove its own caller
+ * and delete a true finding. None of them opens code between a tag and its children, where a
+ * template literal or an `||` stands inside a `{…}`, which is a delimiter of its own.
+ */
+const JSX_LITERALS = String.raw`\\|\``;
 
 /**
  * The square brackets, which index and list outside every element — `const [first] = items` — and
@@ -1358,7 +1369,7 @@ const JSX_ASSIGNMENT = String.raw`=`;
  * the same `>` a tag does — `new Map<Widget>()` — so text that claims to be rendered has to read as
  * a sentence before it is believed, or a real call goes uncounted.
  */
-const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_BRACKETS}${JSX_PARENS}${JSX_STATEMENT}${JSX_ASSIGNMENT}`;
+const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_LITERALS}${JSX_BRACKETS}${JSX_PARENS}${JSX_STATEMENT}${JSX_ASSIGNMENT}`;
 
 /**
  * Arithmetic, which is program text on a line standing outside every element — `const half =
@@ -1373,7 +1384,8 @@ const JSX_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}${JSX_OPERATORS}]`);
 
 /**
  * That same test for text a tag has opened, where an operator, an aside, a bracketed label, the
- * semicolon between two clauses and the equals sign in a sentence are punctuation the page shows.
+ * semicolon between two clauses, the equals sign in a sentence, a backticked name and the `|`
+ * between two labels are punctuation the page shows.
  */
 const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_CHILD_DELIMITERS}]`);
 

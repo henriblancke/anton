@@ -2781,6 +2781,36 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
     });
 
+    // Prose quotes the name it shows and separates its labels with a pipe. Code stands between a
+    // tag and its children only inside a `{…}`, so the backticks around `Widget` and the `|` beside
+    // them are characters the page renders — reading them as program lets a doc page prove its own
+    // caller, and ends the element so the sentence under them reads as program too. Outside every
+    // element the same marks still open a template literal, and the module that calls through one
+    // keeps counting.
+    it("reads JSX text holding a backticked name or a pipe as prose, and still counts a template literal beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/quoted.tsx": "export const Doc = () => <p>Use `Widget` instead</p>;\n",
+        "src/ui/pipe.tsx": "export const Pipe = () => <p>| Widget was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    Docs | changelog\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const label = `${Widget()}`;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/quoted.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/pipe.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
     // A component spaces its children apart, and JSX gives that gap no meaning: the paragraph under
     // an empty line is still the `<div>`'s text, so closing the element there reads the prose as
     // program and lets a sentence naming a removed component prove its own caller. MDX and markup
