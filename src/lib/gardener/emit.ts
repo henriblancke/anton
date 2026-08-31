@@ -31,6 +31,7 @@ import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { isClaimed, isOpenWork } from "./board-index";
 import {
+  canonicalFingerprintOf,
   concernedBeads,
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
@@ -91,13 +92,22 @@ export const MAX_APPLIES_PER_PASS = 3;
 /**
  * Fingerprints the board says NOT to propose again: every proposal still open, plus every one
  * declined (abandoned). A plainly-closed proposal is absent deliberately — see the module header.
+ *
+ * A proposal answers for the claim its own PLAN makes as well as for the label it carries. The two
+ * are the same string for everything this emitter filed; they differ for a `parentless-cluster`
+ * filed before the claim moved to its target (anton-9hpp), and folding it onto the identity the
+ * detector now derives is what keeps the rollout from filing a fresh-format twin of an ask the
+ * board already carries.
  */
 export function suppressedFingerprints(board: Bead[]): Set<string> {
   const out = new Set<string>();
   for (const bead of board) {
     const fingerprint = fingerprintLabelOf(bead);
     if (!fingerprint) continue;
-    if (isOpenWork(bead) || beads.isAbandoned(bead)) out.add(fingerprint);
+    if (!isOpenWork(bead) && !beads.isAbandoned(bead)) continue;
+    out.add(fingerprint);
+    const canonical = canonicalFingerprintOf(bead);
+    if (canonical) out.add(canonical);
   }
   return out;
 }
@@ -297,13 +307,29 @@ function survivorFirst(a: Bead, b: Bead): number {
   return Number(unclaimedTwin(a)) - Number(unclaimedTwin(b)) || a.id.localeCompare(b.id);
 }
 
-/** One fingerprint the board carries more than once: the proposal that stands, and its twins. */
+/**
+ * One proposal standing for a claim, with the fingerprint label it carried on the snapshot.
+ *
+ * The label is kept BESIDE the claim rather than assumed equal to it: twins grouped by their
+ * canonical claim need not carry the same label (see {@link planReconciliation}), and the locked
+ * re-read every fold takes has to check the bead's ACTUAL label — the record of "this is still the
+ * bead the snapshot judged" — not the claim it was grouped under.
+ */
+export interface ProposalTwin {
+  id: string;
+  label: string;
+}
+
+/** One claim the board carries more than once: the proposal that stands, and its twins. */
 export interface DuplicateProposals {
+  /** The canonical claim the group shares — equal to every twin's label except a legacy one's. */
   fingerprint: string;
   /** The twin that keeps the ask — approved or claimed if any is, else the first filed. */
   keep: string;
+  /** The label the survivor carried, re-checked under the lock before any twin is folded into it. */
+  keepLabel: string;
   /** Twins to fold into `keep`: same claim, nobody acting on them. */
-  fold: string[];
+  fold: ProposalTwin[];
   /** Twins left standing because an approval or a run holds them. Named, never quietly folded. */
   held: string[];
 }
@@ -325,6 +351,14 @@ export interface DuplicateProposals {
  * The survivor is picked by a TOTAL order both machines compute alike, so two patrols reconciling
  * the same board concurrently converge on the same bead rather than folding each other away.
  *
+ * Grouped by the CANONICAL CLAIM each proposal's own plan hashes to, not by the label it happens to
+ * carry (anton-9hpp). The two are the same string for everything the current emitter filed; they
+ * differ for a `parentless-cluster` filed before the claim moved to its target, whose label hashes
+ * the membership it was found with. Label-grouping would leave those pre-rollout siblings — several
+ * open asks for ONE target, each with a different label — unrecognised and standing forever, which
+ * is the exact duplication target identity exists to remove. Each bead's real label rides along in
+ * {@link ProposalTwin} so the locked re-read still validates the bead itself before closing it.
+ *
  * `only` narrows the fold to named claims — what {@link arbitrateEmission} passes so a pass's own
  * arbitration answers for the proposals it just filed and nothing else.
  */
@@ -332,27 +366,30 @@ export function planReconciliation(
   board: Bead[],
   only?: ReadonlySet<string>,
 ): DuplicateProposals[] {
-  const groups = new Map<string, Bead[]>();
+  const groups = new Map<string, Array<{ bead: Bead; twin: ProposalTwin }>>();
   for (const bead of board) {
-    const fingerprint = fingerprintLabelOf(bead);
+    const label = fingerprintLabelOf(bead);
     // Open only: a declined twin is a recorded answer and a plainly-closed one is already folded or
     // applied — neither is a second ask standing on the board.
-    if (!fingerprint || !isProposalBead(bead) || !isOpenWork(bead)) continue;
-    if (only && !only.has(fingerprint)) continue;
-    const group = groups.get(fingerprint);
-    if (group) group.push(bead);
-    else groups.set(fingerprint, [bead]);
+    if (!label || !isProposalBead(bead) || !isOpenWork(bead)) continue;
+    const claim = canonicalFingerprintOf(bead) ?? label;
+    if (only && !only.has(claim)) continue;
+    const entry = { bead, twin: { id: bead.id, label } };
+    const group = groups.get(claim);
+    if (group) group.push(entry);
+    else groups.set(claim, [entry]);
   }
 
   const duplicates: DuplicateProposals[] = [];
   for (const [fingerprint, group] of groups) {
     if (group.length < 2) continue;
-    const [keep, ...twins] = [...group].sort(survivorFirst);
+    const [keep, ...twins] = [...group].sort((a, b) => survivorFirst(a.bead, b.bead));
     duplicates.push({
       fingerprint,
-      keep: keep.id,
-      fold: twins.filter(unclaimedTwin).map((b) => b.id),
-      held: twins.filter((b) => !unclaimedTwin(b)).map((b) => b.id),
+      keep: keep.twin.id,
+      keepLabel: keep.twin.label,
+      fold: twins.filter((t) => unclaimedTwin(t.bead)).map((t) => t.twin),
+      held: twins.filter((t) => !unclaimedTwin(t.bead)).map((t) => t.twin.id),
     });
   }
   return duplicates.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
@@ -364,13 +401,15 @@ export function planReconciliation(
  * silent retraction of the last standing ask.
  *
  * Fails CLOSED — an unreadable survivor answers "no", so the twin is left standing and the next
- * patrol re-asks. Judged on the fingerprint alone, not on openness: a survivor closed since the
- * snapshot was answered (applied, or declined and now suppressed), which is a legitimate end for the
- * ask, while requiring it open would strand duplicate noise whenever an apply settles it mid-fold.
+ * patrol re-asks. Judged on its own LABEL, not on the claim it was grouped under: a legacy survivor
+ * legitimately carries a label the claim does not equal, while a relabelled one is no longer the
+ * bead the snapshot chose. Not judged on openness: a survivor closed since the snapshot was answered
+ * (applied, or declined and now suppressed), which is a legitimate end for the ask, while requiring
+ * it open would strand duplicate noise whenever an apply settles it mid-fold.
  */
 async function survivorHolds(repo: string, duplicate: DuplicateProposals): Promise<boolean> {
   try {
-    return fingerprintLabelOf(await beads.show(repo, duplicate.keep)) === duplicate.fingerprint;
+    return fingerprintLabelOf(await beads.show(repo, duplicate.keep)) === duplicate.keepLabel;
   } catch {
     return false;
   }
@@ -449,7 +488,7 @@ export async function reconcileDuplicateProposals(
 
   for (const duplicate of planReconciliation(board, fingerprints)) {
     result.held.push(...duplicate.held);
-    for (const id of duplicate.fold) {
+    for (const { id, label } of duplicate.fold) {
       // Between every close, like the emission loop: a cancelled patrol must stop writing, and what
       // already landed is board state the caller still has to propagate.
       if (signal?.aborted) return result;
@@ -457,10 +496,10 @@ export async function reconcileDuplicateProposals(
         const folded = await withBeadWriteLocks(repo, [duplicate.keep, id], async () => {
           if (!(await survivorHolds(repo, duplicate))) return false;
           const live = await beads.show(repo, id);
+          // Against the twin's OWN label, which is what the snapshot judged — a bead grouped by its
+          // canonical claim need not carry that claim as its label.
           const stale =
-            fingerprintLabelOf(live) !== duplicate.fingerprint ||
-            !isOpenWork(live) ||
-            !unclaimedTwin(live);
+            fingerprintLabelOf(live) !== label || !isOpenWork(live) || !unclaimedTwin(live);
           if (stale) return false;
           await beads.close(repo, id, foldReason(duplicate.keep, duplicate.fingerprint));
           return true;

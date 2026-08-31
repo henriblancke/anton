@@ -19,6 +19,7 @@ import type { ApplyActor } from "./apply";
 import {
   detectionSubjectKey,
   proposalFingerprint,
+  subjectChecksum,
   type GardenerPlan,
 } from "./detections";
 
@@ -161,8 +162,16 @@ export function applyWith(proposal: Bead, board: Bead[], actor: ApplyActor = "ap
 
 // ── fixture builders ──
 
+/**
+ * Every fixture bead states ONE subject, because a cluster approval re-derives the grouping its
+ * detection rested on (apply-plan.ts `regroupSurvivors`): a board of `anton-a`-titled beads shares
+ * no topic, so it could not have produced the cluster plans these suites approve. A case that needs
+ * the grouping BROKEN overrides the title, which is the only way it breaks in the field either.
+ */
+const SUBJECT = "escalation banner";
+
 export function bead(id: string, extra: Partial<Bead> = {}): Bead {
-  return { id, title: id, status: "open", issue_type: "task", ...extra };
+  return { id, title: `${id}: ${SUBJECT}`, status: "open", issue_type: "task", ...extra };
 }
 
 /** A bead with a parent, expressed the way `bd list --json` carries it (field + inline edge). */
@@ -199,17 +208,19 @@ export const edged = (from: string, to: string): Bead[] =>
   ["anton-aa", "anton-bb"].map((id) => (id === from ? blockedBy(id, to) : bead(id)));
 
 /**
- * A plan fingerprinted the way the emitter would fingerprint it — through the SAME key builder, not
- * a copy of it, because apply now recomputes that hash from the plan's own fields and a fixture with
- * a hand-rolled fingerprint would prove the opposite of what these tests claim.
+ * A plan fingerprinted and checksummed the way the emitter would do both — through the SAME key
+ * builders, not copies of them, because apply now recomputes each from the plan's own fields and a
+ * fixture with a hand-rolled hash would prove the opposite of what these tests claim.
  */
-export function planFor(input: Omit<GardenerPlan, "fingerprint">): GardenerPlan {
+export function planFor(input: Omit<GardenerPlan, "fingerprint" | "subjectChecksum">): GardenerPlan {
+  const checksum = subjectChecksum(input.kind, input.subjects, input.target, input.detail);
   return {
     ...input,
     fingerprint: proposalFingerprint(
       input.kind,
       detectionSubjectKey(input.kind, input.subjects, input.target, input.detail),
     ),
+    ...(checksum ? { subjectChecksum: checksum } : {}),
   };
 }
 
@@ -281,8 +292,18 @@ export const leased = (id: string, at: number): Bead =>
 /** The other half of the same bar (board-index `isInFlight`): a run whose PR is up. */
 export const inReview = (id: string): Bead => bead(id, { labels: ["stage:in-review"] });
 
-/** A feature card with an open ticket under it — a legal re-parent home. */
+/** A feature card — the tier a working-layer bead's home has to be. */
 export const CARD = bead("anton-card", { issue_type: "feature" });
+
+/**
+ * The ticket {@link CARD} already carries, and the reason a cluster may be hung off it at all: the
+ * detector only calls a card an obvious home when the board ALREADY files work of this kind under it
+ * (reparent.ts `MIN_CARRIED_TICKETS`), and the approval re-asks that against the fresh board. Every
+ * cluster board here carries it for the same reason every fixture bead states one {@link SUBJECT} —
+ * without it these boards could not have produced the plans they approve. A case that needs the bar
+ * BROKEN leaves it off, which is exactly how a card loses its last ticket in the field.
+ */
+export const CARRIED = child("anton-t0", CARD.id);
 
 /** The tier ABOVE a card: an epic, which may only carry cards once it already groups one. */
 export const EPIC = bead("anton-epic", { issue_type: "epic" });
