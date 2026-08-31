@@ -1102,6 +1102,77 @@ describe("scan", () => {
       expect(result.deadcode).toEqual({ dropped: [] });
     });
 
+    // An import is a binding taken, not a use made: a module that still imports a symbol it stopped
+    // calling is the stale half of the very finding being checked. Counting that line as a caller
+    // lets one forgotten import delete a true finding about a symbol nothing invokes — while the
+    // file that imports AND uses it names the symbol on a line of its own, which still counts.
+    it("does not count an import of the symbol as a use of it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.tsx": "import { Widget } from './widget';\nexport const Stale = () => null;\n",
+        "src/ui/wrapped.ts": "import {\n  Widget,\n} from './widget';\nexport const kept = 1;\n",
+        "src/ui/types.ts": "import type { Widget } from './widget';\nexport const kept = 1;\n",
+        "src/ui/page.tsx": "import { Widget } from './widget';\nexport const Page = () => <Widget />;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/wrapped.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/types.ts");
+    });
+
+    // The mask ends with the declaration, not with the line holding it: a statement after the `;`
+    // runs, `import('./widget')` is a call rather than a declaration, and a re-export republishes
+    // the symbol under another module's name. Blanking any of those reports a live symbol dead.
+    it("keeps the code beside an import, a dynamic import, and a re-export", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/list.ts": "import { Widget } from './widget'; export const list = [Widget];\n",
+        "src/ui/lazy.ts": "export const lazy = () => import('./widget').then((m) => m.Widget);\n",
+        "src/ui/index.ts": "export { Widget } from './widget';\n",
+        "src/ui/stale.tsx": "import { Widget } from './widget';\nexport const Stale = () => null;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/list.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/lazy.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/index.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
+    });
+
+    // An import that reaches no quoted module specifier belongs to a language that spells one
+    // without a string, and the mask has nothing to end it at. Guessing at its extent would blank
+    // the program under it — including the call that keeps a live symbol out of the report.
+    it("leaves a quoteless import unmasked rather than blanking the code under it", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/Main.java":
+          "import com.example.util.Helper;\n\npublic class Main {\n  void run() { neverCalled(); }\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/Main.java");
+    });
+
     // A name written in prose is being described, not called. Without this the module that documents
     // a symbol keeps it alive forever, and the filter goes blind to the symbols it exists to check.
     it("does not count a name in a comment or a doc as a reference", async () => {
@@ -1392,11 +1463,13 @@ describe("scan", () => {
 
     // MDX wraps. An import list runs over three lines and an expression opens its `{` on one of
     // its own, so the line naming the component carries neither the keyword nor the brace. Reading
-    // each line alone misses the caller and the component goes on being reported dead.
-    it("counts an MDX caller written across lines, and still not the prose beside it", async () => {
+    // each line alone misses the caller under the brace — and reads the wrapped specifier list as
+    // one, though a page that imports a component and never renders it calls nothing.
+    it("counts an MDX caller written across lines, and not a wrapped import on its own", async () => {
       const repo = initRepo({
         "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
         "docs/imports.mdx": "import {\n  Widget,\n} from '../src/ui/widget';\n",
+        "docs/renders.mdx": "import {\n  Widget,\n} from '../src/ui/widget';\n\n<Widget />\n",
         "docs/expression.mdx": "{\n  Widget()\n}\n",
         "docs/notes.mdx": "Widget was removed in favour of Panel.\n",
       });
@@ -1408,8 +1481,9 @@ describe("scan", () => {
 
       expect(result.signals).toEqual([]);
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
-      expect(result.deadcode.dropped[0].reason).toContain("docs/imports.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/renders.mdx");
       expect(result.deadcode.dropped[0].reason).toContain("docs/expression.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/imports.mdx");
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
@@ -1810,15 +1884,15 @@ describe("scan", () => {
     });
 
     // The two shapes with no code punctuation around them at all: a Svelte directive binding
-    // (`use:enhance`) and an Astro frontmatter import, which sits above the markup rather than in
-    // a `<script>`. Both name the symbol as plainly as a call does.
-    it("counts a template directive and an Astro frontmatter import", async () => {
+    // (`use:enhance`) and an Astro frontmatter call, which runs above the markup rather than in a
+    // `<script>`. Both name the symbol as plainly as an ordinary call does.
+    it("counts a template directive and a call in Astro frontmatter", async () => {
       const repo = initRepo({
         "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
         "src/ui/form.svelte": "<form use:Widget>\n</form>\n",
         "src/ui/wrapped.svelte": "<form\n  use:Widget\n>\n</form>\n",
         "src/pages/index.astro":
-          "---\nimport { Widget } from '../ui/widget';\n---\n<main>hello</main>\n",
+          "---\nimport { Widget } from '../ui/widget';\nconst html = Widget();\n---\n<main>{html}</main>\n",
         "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [

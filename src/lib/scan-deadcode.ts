@@ -1474,6 +1474,100 @@ function candidateHits(stdout: string): CandidateHits {
 }
 
 /**
+ * An import declaration's keyword, at the head of a statement — the start of a line, or after the
+ * `;` that closed the one before it. The lookahead keeps the two `import` expressions out:
+ * `import('./widget')` loads a module at runtime and `import.meta` reads the module's own record,
+ * and blanking either would swallow the code written around it on the same line.
+ */
+const IMPORT_HEAD = /(?:^|;)[ \t]*import\b(?![ \t]*[(.])/g;
+
+/**
+ * How far an import declaration may wrap before the mask gives up on it. A real one runs a few
+ * lines; a sentence opening with the word `import` never reaches a module specifier at all, and
+ * bounding the search stops that line from blanking the page below it.
+ */
+const IMPORT_SPAN_LINES = 40;
+
+/** A line an import declaration is plainly unfinished on: broken after `from`, or mid-list. */
+const IMPORT_CONTINUES = /(?:,|\bfrom)[ \t]*$/;
+
+/**
+ * Where the import declaration opened at `at` on line `from` ends: just past the closing quote of
+ * its module specifier, which is the last thing a declaration writes. Undefined when no specifier
+ * turns up.
+ *
+ * The search only follows the statement onto another line while it is visibly unfinished — a
+ * binding list still open, or a break after `from` or a comma. `import com.example.Helper;` ends
+ * where it stands, so a language that spells its imports without a string never drags the mask
+ * over the program below it.
+ */
+function importEnd(
+  code: string[],
+  from: number,
+  at: number,
+): { line: number; at: number } | undefined {
+  let depth = 0;
+  for (let line = from; line < code.length && line - from <= IMPORT_SPAN_LINES; line += 1) {
+    const text = code[line] ?? "";
+    const start = line === from ? at : 0;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (char === "'" || char === '"') {
+        const close = text.indexOf(char, index + 1);
+        return close < 0 ? undefined : { line, at: close + 1 };
+      }
+      if (char === "{" || char === "(" || char === "[") depth += 1;
+      else if (char === "}" || char === ")" || char === "]") depth -= 1;
+    }
+    if (depth <= 0 && !IMPORT_CONTINUES.test(text.slice(start))) return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The code with its import declarations blanked out. A binding a file imports and never uses is not
+ * a caller: `import { Widget } from './widget'` names the symbol as plainly as a call does, so
+ * counting it lets one stale import erase a true finding about a symbol nothing invokes. A file
+ * that uses what it imports writes the name again somewhere else, and that mention still counts.
+ *
+ * The statement is blanked through its module specifier, across however many lines it wraps over,
+ * so a binding list on lines of its own goes with it — and the code after the `;` on a shared line
+ * stays, because it is a statement of its own. An `export … from` is left alone: republishing a
+ * symbol under another module's name is a use of it, not a mention.
+ *
+ * An `import` that reaches no quoted specifier is left standing rather than guessed at, so a
+ * language that spells its imports without one (Python, Java) keeps exactly the check it had.
+ */
+function maskImports(code: string[]): string[] {
+  const masked = [...code];
+  for (let index = 0; index < masked.length; index += 1) {
+    IMPORT_HEAD.lastIndex = 0;
+    let at = 0;
+    for (;;) {
+      IMPORT_HEAD.lastIndex = at;
+      const head = IMPORT_HEAD.exec(masked[index] ?? "");
+      if (!head) break;
+      const opened = head.index + head[0].length - "import".length;
+      const end = importEnd(masked, index, head.index + head[0].length);
+      if (!end) {
+        at = head.index + head[0].length;
+        continue;
+      }
+      if (end.line === index) {
+        masked[index] = blankSpans(masked[index], [[opened, end.at]]);
+      } else {
+        masked[index] = blankSpans(masked[index], [[opened, masked[index].length]]);
+        for (let line = index + 1; line < end.line; line += 1) masked[line] = blankAll(masked[line]);
+        masked[end.line] = blankSpans(masked[end.line], [[0, end.at]]);
+        index = end.line;
+      }
+      at = end.at;
+    }
+  }
+  return masked;
+}
+
+/**
  * The files holding at least one hit that still writes the symbol as code once the comments around
  * it are blanked out. A file is read only when it carries a hit — with its own grammar when anton
  * tracks one, and with the union fallback when it doesn't, since an unrecognized extension is no
@@ -1509,7 +1603,10 @@ async function codeReferencingFiles(
         const raw = text.split("\n");
         const markup = isMarkup ? markupProgram(code, file) : undefined;
         masked.set(file, {
-          code: markup?.code ?? code,
+          // Imports are blanked last, off the program text every state below was tracked through:
+          // an `import` is what opens MDX's ESM block and what a wrapped specifier list continues,
+          // so masking it before those are read would close the block over the lines under it.
+          code: maskImports(markup?.code ?? code),
           open: isMdx ? mdxOpenLines(code, raw) : undefined,
           jsx: isJsx ? jsxLineStates(code, raw) : undefined,
           script: markup?.script,
@@ -1609,7 +1706,10 @@ async function filesMentioning(
  *
  * One reference in ANOTHER file is enough to keep the symbol alive: the collector's own claim is
  * that nothing references it, and a single word-boundary hit on a code line outside its declaration
- * falsifies exactly that. Every file this scan reports as declaring the symbol is excluded, because
+ * falsifies exactly that — a line that imports the symbol excepted, since a binding a file took and
+ * never used is the stale half of the same finding.
+ *
+ * Every file this scan reports as declaring the symbol is excluded, because
  * a symbol always mentions itself there — counting a declaration would drop every signal, which is
  * the one outcome worse than counting phantoms. `opts.exclude` is the scan's own exclusion set, so the search covers the files stringer
  * inspected and no others — a committed build or vendor tree is not a caller of the source it copied.
