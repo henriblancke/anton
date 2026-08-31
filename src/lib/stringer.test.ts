@@ -1764,6 +1764,49 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
     });
 
+    // A quoted brace does not close the expression around it, and a backtick inside one that is
+    // still open is a template literal rather than a markdown code span: reading `{ready ? "}" :
+    // `${Widget()}`}` the other way blanks the literal and the caller it interpolates, and the live
+    // component goes on being reported dead.
+    it("counts an MDX template literal beside a quoted brace in the same expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/live.mdx": '{ready\n  ? "}"\n  : `${Widget()}`}\n',
+        "docs/notes.mdx": "The `Widget` helper was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/live.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // Markdown writes a literal brace as `\{`, which opens no expression. Counting it reads the
+    // sentence behind it as code, so a page that only mentions the symbol proves its own caller and
+    // erases a genuinely unused one — while a real expression on the same page still counts.
+    it("reads an escaped brace in MDX prose as text, not an open expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "Rendered with {Widget()} on the page.\n",
+        "docs/notes.mdx": "Use \\{ before Widget in prose.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
     // A `.tsx` file is a program, but not everything on its lines runs: the text a tag opens and a
     // plain string prop are what the page shows a reader. Reading either as code lets a page that
     // merely names the symbol prove its own caller and erase a genuinely unused one — while the
@@ -1810,14 +1853,14 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("db/notes.sql");
     });
 
-    // A file anton has no grammar for still has block comments: `.hcl` writes them `/* ... */`, and
-    // their continuation lines carry no marker for the line test to see. Accepting one as code
+    // A file anton has no grammar for still has block comments: `.jsonnet` writes them `/* ... */`,
+    // and their continuation lines carry no marker for the line test to see. Accepting one as code
     // deletes a genuine finding — while a real call below the block still has to count.
     it("tracks block comments in a file anton has no grammar for, and still counts its callers", async () => {
       const repo = initRepo({
         "src/lib/orphan.ts": "export function neverCalled() {}\n",
-        "infra/notes.hcl": "/*\nneverCalled was removed\n*/\nlocals {}\n",
-        "infra/caller.hcl": "/*\nneverCalled is called below.\n*/\nvalue = neverCalled()\n",
+        "infra/notes.jsonnet": "/*\nneverCalled was removed\n*/\n{}\n",
+        "infra/caller.jsonnet": "/*\nneverCalled is called below.\n*/\n{ value: neverCalled() }\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/lib/orphan.ts", "neverCalled"),
@@ -1827,8 +1870,31 @@ describe("scan", () => {
 
       expect(result.signals).toEqual([]);
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
-      expect(result.deadcode.dropped[0].reason).toContain("infra/caller.hcl");
-      expect(result.deadcode.dropped[0].reason).not.toContain("infra/notes.hcl");
+      expect(result.deadcode.dropped[0].reason).toContain("infra/caller.jsonnet");
+      expect(result.deadcode.dropped[0].reason).not.toContain("infra/notes.jsonnet");
+    });
+
+    // HCL comments with `#` and `//`, both of which can open after code — a shape the unknown-
+    // language line test cannot see, so `ami = "ami-1" # neverCalled was removed` reads as a call
+    // and deletes a true finding. A real HCL call on the line beside one still has to count.
+    it("masks an HCL comment opened after code, and still counts the call beside one", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "infra/notes.tf":
+          'variable "ami" {\n  default = "ami-1" # neverCalled was removed\n' +
+          "  tags = {} // neverCalled went with it\n}\n",
+        "infra/caller.tf": "locals {\n  hook = neverCalled(var.env) # still wired up\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("infra/caller.tf");
+      expect(result.deadcode.dropped[0].reason).not.toContain("infra/notes.tf");
     });
 
     it("drops an unused type the same way, and reads a whole-word reference only", async () => {

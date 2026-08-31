@@ -178,6 +178,15 @@ const COMMENT_SYNTAX: FileSyntax[] = [
     nested: true,
   },
   {
+    // HCL comments with `#` as well as `//`, and the unknown-language fallback reads neither once
+    // code precedes it: `ami = "ami-1" # Widget was removed` keeps its prose, which then proves a
+    // caller and deletes a true finding. Terraform and the tools sharing its syntax are where a
+    // repo actually carries that line.
+    files: /\.(?:tf|tfvars|hcl)$/i,
+    line: ["#", "//"],
+    block: [["/*", "*/"]],
+  },
+  {
     files: /\.(?:sh|bash|zsh|ya?ml|toml)$/i,
     line: ["#"],
     block: [],
@@ -410,20 +419,28 @@ function closingBacktickRun(line: string, from: number, length: number): number 
  * A backtick inside an open braced expression is a template literal rather than a code span: MDX
  * runs `` {`${Widget()}`} ``, so blanking it would hide a real caller. Braces inside a blanked span
  * don't count — a `{` shown in an example opens nothing.
+ *
+ * The depth is read past what an expression quotes, the way `punctuation` reads it: in
+ * ``{ready ? "}" : `${Widget()}`}`` the quoted brace is text, and closing the expression on it
+ * leaves the template literal beside it looking like a markdown code span, blanked along with the
+ * caller it interpolates. A quote only delimits inside an expression — at depth 0 an apostrophe is
+ * prose — and a backslash escapes what follows it either way, so markdown's `` \` `` opens no span.
  */
 function maskMdxCodeSpans(line: string, depth = 0): { masked: string; depth: number } {
   const spans: [number, number][] = [];
+  let quote: string | undefined;
   let at = 0;
   while (at < line.length) {
     const char = line[at];
-    if (char === "{") depth += 1;
+    if (quote !== undefined) {
+      if (char === "\\") at += 1;
+      else if (char === quote) quote = undefined;
+    } else if (char === "\\") at += 1;
+    else if (depth > 0 && QUOTE.test(char)) quote = char;
+    else if (char === "{") depth += 1;
     else if (char === "}") depth = Math.max(0, depth - 1);
     else if (char === "`") {
       const openEnd = backtickRunEnd(line, at);
-      if (depth > 0) {
-        at = openEnd;
-        continue;
-      }
       const close = closingBacktickRun(line, openEnd, openEnd - at);
       spans.push([at, close ?? line.length]);
       if (close === undefined) break;
@@ -509,6 +526,11 @@ const QUOTE = /["'`]/;
  * quote only delimits inside code — in prose an apostrophe is an apostrophe, and reading one as a
  * string would swallow the braces of the expression behind it and hand the rest of the line back
  * to the markup rules.
+ *
+ * A backslash escapes what follows it outside a string as well as inside one: markdown writes a
+ * literal brace as `\{`, so `Use \{ before Widget in prose` opens no expression, and counting
+ * that brace reads the sentence as code and deletes a true finding. Outside prose the escape costs
+ * nothing — a bare backslash is not punctuation in any program this reads.
  */
 function* punctuation(text: string, inCode: () => boolean): Generator<string> {
   let quote: string | undefined;
@@ -517,7 +539,8 @@ function* punctuation(text: string, inCode: () => boolean): Generator<string> {
     if (quote !== undefined) {
       if (char === "\\") at += 1;
       else if (char === quote) quote = undefined;
-    } else if (inCode() && QUOTE.test(char)) quote = char;
+    } else if (char === "\\") at += 1;
+    else if (inCode() && QUOTE.test(char)) quote = char;
     else yield char;
   }
 }
