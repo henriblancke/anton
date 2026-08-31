@@ -1154,6 +1154,55 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
     });
 
+    // CommonJS spells the same stale binding as a declaration: `const { Widget } = require(...)`
+    // takes the name without calling it, so counting that line deletes a true finding exactly as a
+    // forgotten `import` would. Only the binding is discounted — the initializer beside it still
+    // carries the call that keeps a live symbol out of the report.
+    it("does not count a CommonJS require binding as a use of it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.js": "const { Widget } = require('./widget');\nmodule.exports = 1;\n",
+        "src/ui/wrapped.js": "const {\n  Widget,\n} = require('./widget');\nmodule.exports = 2;\n",
+        "src/ui/renamed.js": "const Renamed = require('./widget').Widget;\nmodule.exports = 3;\n",
+        "src/ui/calls.js": "const html = require('./widget').Widget();\nmodule.exports = html;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/calls.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/wrapped.js");
+    });
+
+    // The mask stops at the `=` of a `require` declaration and nowhere else: a value binding names
+    // the symbol on the right of its own `=`, and a `const` that never reaches one must leave the
+    // lines under it alone.
+    it("keeps a value declaration and the code under an unterminated binding", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/alias.js": "const alias = Widget;\nmodule.exports = alias;\n",
+        "src/ui/late.js": "const {\n  other,\n} = require('./other');\nmodule.exports = () => Widget();\n",
+        "src/ui/other.js": "module.exports = { other: 1 };\n",
+        "src/ui/stale.js": "const { Widget } = require('./widget');\nmodule.exports = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/alias.js");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/late.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+    });
+
     // An import that reaches no quoted module specifier belongs to a language that spells one
     // without a string, and the mask has nothing to end it at. Guessing at its extent would blank
     // the program under it — including the call that keeps a live symbol out of the report.

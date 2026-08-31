@@ -1763,6 +1763,85 @@ function importEnd(
 }
 
 /**
+ * A declaration keyword at the head of a statement — the start of a line, or after the `;` that
+ * closed the one before it. CommonJS spells an import as a binding, so its stale half hides behind
+ * `const`, `let` or `var` rather than behind `import`.
+ */
+const REQUIRE_HEAD = /(?:^|;)[ \t]*(?:const|let|var)\b/g;
+
+/** A `require` of a quoted module specifier, where an initializer starts. */
+const REQUIRE_CALL = /^[ \t]*require[ \t]*\([ \t]*['"]/;
+
+/**
+ * Where the binding of the declaration opened at `at` on line `from` ends: at the `=` that starts
+ * its initializer, and only when that initializer is a `require` of a quoted module specifier.
+ * Undefined for every other declaration — `const total = count + 1` binds a value, not a module,
+ * and blanking its pattern would swallow a name the program computes with.
+ *
+ * The search follows the binding onto another line only while a destructuring pattern is still
+ * open, so a `const` that never reaches an `=` cannot drag the mask over the code below it.
+ */
+function requireBindingEnd(
+  code: string[],
+  from: number,
+  at: number,
+): { line: number; at: number } | undefined {
+  let depth = 0;
+  for (let line = from; line < code.length && line - from <= IMPORT_SPAN_LINES; line += 1) {
+    const text = code[line] ?? "";
+    const start = line === from ? at : 0;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (char === "{" || char === "(" || char === "[") depth += 1;
+      else if (char === "}" || char === ")" || char === "]") depth -= 1;
+      else if (char === ";") return undefined;
+      else if (char === "=" && depth <= 0)
+        return REQUIRE_CALL.test(text.slice(index + 1)) ? { line, at: index } : undefined;
+    }
+    if (depth <= 0) return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The code with its CommonJS binding lists blanked out. `const { Widget } = require('./widget')`
+ * takes a binding exactly as `import { Widget } from './widget'` does, so a module that still
+ * requires a symbol it stopped calling would otherwise read as its own caller and erase a true
+ * finding — the same stale half the ESM mask exists to discount.
+ *
+ * Only the pattern between the declaration keyword and its `=` is blanked, never the initializer:
+ * `const html = require('./widget').Widget()` calls the symbol on the right of that `=`, and a
+ * mask that reached across it would report a live symbol dead.
+ */
+function maskRequireBindings(code: readonly string[]): string[] {
+  const masked = [...code];
+  for (let index = 0; index < masked.length; index += 1) {
+    let at = 0;
+    for (;;) {
+      REQUIRE_HEAD.lastIndex = at;
+      const head = REQUIRE_HEAD.exec(masked[index] ?? "");
+      if (!head) break;
+      const opened = head.index + head[0].length;
+      const end = requireBindingEnd(masked, index, opened);
+      if (!end) {
+        at = opened;
+        continue;
+      }
+      if (end.line === index) {
+        masked[index] = blankSpans(masked[index], [[opened, end.at]]);
+      } else {
+        masked[index] = blankSpans(masked[index], [[opened, masked[index].length]]);
+        for (let line = index + 1; line < end.line; line += 1) masked[line] = blankAll(masked[line]);
+        masked[end.line] = blankSpans(masked[end.line], [[0, end.at]]);
+        index = end.line;
+      }
+      at = end.at;
+    }
+  }
+  return masked;
+}
+
+/**
  * The code with its import declarations blanked out. A binding a file imports and never uses is not
  * a caller: `import { Widget } from './widget'` names the symbol as plainly as a call does, so
  * counting it lets one stale import erase a true finding about a symbol nothing invokes. A file
@@ -1775,9 +1854,12 @@ function importEnd(
  *
  * An `import` that reaches no quoted specifier is left standing rather than guessed at, so a
  * language that spells its imports without one (Python, Java) keeps exactly the check it had.
+ *
+ * CommonJS `require` bindings are masked first, by `maskRequireBindings`, since a repo can spell
+ * the same stale binding either way.
  */
 function maskImports(code: string[]): string[] {
-  const masked = [...code];
+  const masked = maskRequireBindings(code);
   for (let index = 0; index < masked.length; index += 1) {
     IMPORT_HEAD.lastIndex = 0;
     let at = 0;
