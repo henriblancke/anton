@@ -1047,12 +1047,18 @@ export async function finalizeMergedEpic(args: {
       .filter((b) => b.status !== "closed" && !skip.has(b.id))
       .map((b) => [b.id, b]),
   ); // by id: a leaf run target is its own ticket, so it can appear on both sides
-  const closed = await safe(() =>
-    beads.batch(
-      repo,
-      [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
-    ),
-  );
+  //
+  //    A rehome that left a childless follow-up behind is finalization left undone, so the close is
+  //    held back for the same reason a failure anywhere above holds it back: the epic stays open and
+  //    `stage:in-review`, and the next sweep retries the cleanup on the follow-up it reuses.
+  const closed =
+    followUp.orphaned === undefined &&
+    (await safe(() =>
+      beads.batch(
+        repo,
+        [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
+      ),
+    ));
   if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
 }
 
@@ -1381,9 +1387,19 @@ async function applyRehome(
   // Nothing moved — the epic is a childless run target no one asked for. Take it back off the
   // board, unless it is a REUSED follow-up an earlier sweep already moved tickets onto: deleting
   // that one would take their only home with it.
-  if (!reused || !all.some((b) => beads.parentOf(b) === followUp))
-    await safe(() => beads.delete(repo, followUp));
-  return { moved: new Set(), nested, pinned, stale };
+  //
+  // A delete that does NOT land is named back to the caller (PR #199), which then leaves the merged
+  // target open and `stage:in-review` rather than closing it. Closing is what makes this epic
+  // undiscoverable, so a swallowed cleanup failure would strand the childless follow-up on the
+  // board for good — and its own description asks to be approved, which puts an empty run target
+  // into the claimable queue where execution can only park on "nothing left to run". Left
+  // discoverable, the next sweep reuses this same follow-up (`REHOME_OF`) and retries the delete.
+  const orphaned =
+    (!reused || !all.some((b) => beads.parentOf(b) === followUp)) &&
+    !(await safe(() => beads.delete(repo, followUp)))
+      ? followUp
+      : undefined;
+  return { moved: new Set(), nested, pinned, stale, orphaned };
 }
 
 /**
@@ -1519,6 +1535,13 @@ interface Rehomed {
    * generic remedy either — the operator is told what overtook it instead.
    */
   stale: Map<string, string>;
+  /**
+   * A childless follow-up anton created and could NOT take back off the board. Finalization has
+   * left something undone, so the caller must keep the merged target open and discoverable: closing
+   * it would leave this empty run target on the board permanently, inviting the approval its own
+   * description asks for.
+   */
+  orphaned?: string;
 }
 
 /**

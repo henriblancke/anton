@@ -276,7 +276,22 @@ describe("finalizeMergedEpic", () => {
     // A childless epic is a poison run, not a home — leaving one behind trades an unreachable
     // ticket for an unrunnable target.
     expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(batchMock).toHaveBeenCalledTimes(1); // cleanup landed — finalization completes
     expect(noteMock.mock.calls[0][2]).toContain("could NOT be rehomed");
+  });
+
+  it("keeps the merged target open when the childless follow-up cannot be deleted (PR #199)", async () => {
+    reparentMock.mockRejectedValue(new Error("bd update: DB locked"));
+    deleteMock.mockRejectedValue(new Error("bd delete: DB locked"));
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    // Closing the target is what makes it undiscoverable, so a cleanup that did not land must not
+    // be followed by one: the childless follow-up would sit there for good, asking to be approved
+    // into a run with nothing in it. Left open and `stage:in-review`, the next sweep retries.
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2");
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
   });
 
   it("reuses the follow-up an interrupted sweep already created (PR #199)", async () => {
