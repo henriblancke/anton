@@ -1233,11 +1233,24 @@ const JSX_OPEN_TAG = String.raw`(?:<>|<[A-Za-z][\w.$:-]*(?:\s${JSX_ATTRS})?(?<![
 
 /**
  * The delimiters JSX spells its own syntax with — the only punctuation that means anything between
- * a tag and its children, since code stands there solely inside a `{…}`. A generic closes with the
- * same `>` a tag does — `new Map<string, Widget>()` — so text that claims to be rendered has to
- * read as a sentence before it is believed, or a real call goes uncounted.
+ * a tag and its children, since code stands there solely inside a `{…}`.
  */
-const JSX_DELIMITERS = String.raw`<>{}()[\]=;\\|\``;
+const JSX_CHILD_DELIMITERS = String.raw`<>{}[\]=;\\|\``;
+
+/**
+ * The brackets a call is spelled with, which are the program's outside every element —
+ * `render(Widget)` — and a sentence's inside one: `<p>(Widget was removed)</p>` shows the symbol to
+ * a reader the way a doc page does, and reading that aside as program lets a prose-only page prove
+ * its own caller and delete a true finding.
+ */
+const JSX_PARENS = String.raw`()`;
+
+/**
+ * Every delimiter that means something on a line standing outside an element. A generic closes with
+ * the same `>` a tag does — `new Map<Widget>()` — so text that claims to be rendered has to read as
+ * a sentence before it is believed, or a real call goes uncounted.
+ */
+const JSX_DELIMITERS = `${JSX_CHILD_DELIMITERS}${JSX_PARENS}`;
 
 /**
  * Arithmetic, which is program text on a line standing outside every element — `const half =
@@ -1250,8 +1263,8 @@ const JSX_OPERATORS = String.raw`&+*/`;
 /** Anything that makes a line outside an element program — an interpolation, a call, arithmetic. */
 const JSX_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}${JSX_OPERATORS}]`);
 
-/** That same test for text a tag has opened, where an operator is punctuation the page shows. */
-const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_DELIMITERS}]`);
+/** That same test for text a tag has opened, where an operator or an aside is punctuation the page shows. */
+const JSX_CHILD_CODE = new RegExp(String.raw`[${JSX_CHILD_DELIMITERS}]`);
 
 /** What a reader sees: a tag this line leaves open, with only prose behind it. */
 const JSX_TEXT = new RegExp(String.raw`${JSX_OPEN_TAG}[^${JSX_DELIMITERS}]*$`);
@@ -1505,9 +1518,9 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
     }
     const opener = JSX_TAG_OPEN.exec(rest);
     const { net, remainder } = jsxTags(opener ? rest.slice(0, opener.index) : rest);
-    // Inside an element the line is that element's children, where arithmetic is punctuation the
-    // page shows rather than the program text that ends the run — `<div>` with `A/B testing` under
-    // it still renders the paragraph written below that.
+    // Inside an element the line is that element's children, where arithmetic and the brackets of
+    // an aside are punctuation the page shows rather than the program text that ends the run —
+    // `<div>` with `A/B testing (soon)` under it still renders the paragraph written below that.
     if ((depth > 0 ? JSX_CHILD_CODE : JSX_CODE).test(remainder)) {
       // An interpolation inside an element is that element's child, not the end of it: `<div>` with
       // `{ready &&` under it still renders the prose written after the brace closes. Dropping the

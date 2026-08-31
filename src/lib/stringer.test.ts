@@ -2492,6 +2492,32 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
     });
 
+    // Prose brackets its asides. Code stands between a tag and its children only inside a `{…}`,
+    // so the parentheses around `(deprecated)` are characters the page shows — reading them as
+    // program lets a doc page prove its own caller, and ends the element so the sentence under the
+    // aside reads as program too. The call beside that prose keeps the parentheses it really uses.
+    it("reads JSX text holding parentheses as prose, and still counts a call beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/aside.tsx": "export const Doc = () => <p>(Widget was removed)</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    (deprecated)\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>{Widget()}</p>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/aside.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
     // A child expression wraps onto lines of its own too, and it is the element's child rather
     // than the end of it: `<div>` with `{ready &&` under it still renders the prose written after
     // the brace closes. Ending the parent's text on that opener reads the sentence below as
