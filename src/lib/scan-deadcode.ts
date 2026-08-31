@@ -552,13 +552,17 @@ function* punctuation(text: string, inCode: () => boolean): Generator<string> {
  * that depth — `<p>{version} Widget was removed</p>` renders `Widget` as text once `}` has run —
  * so treating any earlier `{` on the line as still open reads that prose as code, calls the page a
  * caller, and deletes a true finding about a genuinely unused symbol.
+ *
+ * `least` is how many braces the format needs before the text inside them runs: one for Svelte,
+ * Astro and MDX, two for Vue, whose interpolation is `{{ count }}` — a single brace there is a
+ * character the page shows, so counting it reads `<p>Write {Widget} literally</p>` as a call.
  */
-function insideExpression(head: string, depth = 0): boolean {
+function insideExpression(head: string, depth = 0, least = 1): boolean {
   for (const char of punctuation(head, () => depth > 0)) {
     if (char === "{") depth += 1;
     else if (char === "}") depth = Math.max(0, depth - 1);
   }
-  return depth > 0;
+  return depth >= least;
 }
 
 /**
@@ -637,6 +641,21 @@ const MARKUP_FILE = /\.(?:html?|xml|svg|vue|svelte|astro)$/i;
  * about a genuinely unused symbol.
  */
 const COMPONENT_FILE = /\.(?:vue|svelte|astro)$/i;
+
+/** The component format whose interpolation is `{{ … }}`, where a single brace is shown text. */
+const MUSTACHE_FILE = /\.vue$/i;
+
+/**
+ * How a markup file writes an interpolation: not at all in static HTML, XML and SVG, with one
+ * brace in Svelte and Astro, with two in Vue.
+ */
+type MarkupFlavor = "static" | "brace" | "mustache";
+
+/** Which of those a file is, read from its extension. */
+function markupFlavorOf(file: string): MarkupFlavor {
+  if (MUSTACHE_FILE.test(file)) return "mustache";
+  return COMPONENT_FILE.test(file) ? "brace" : "static";
+}
 
 /** Astro puts its module in a `---` fence at the top of the file, above any markup. */
 const ASTRO_FILE = /\.astro$/i;
@@ -742,11 +761,25 @@ const DIRECTIVE_HEAD = new RegExp(String.raw`(?:^|[\s"'])${DIRECTIVE}:\s*$`);
  * telling that continuation from a wrapped paragraph would need the file's tag nesting carried
  * across lines. The bound is kept deliberately: it costs only prose that both wraps and spells a
  * directive prefix right before the symbol.
+ *
+ * Quoted values are walked rather than scanned past, the way `markupOpenAttrs` walks them: the `>`
+ * in `<button onclick="a > b && Widget()"` is part of the handler, and ending the tag there reads
+ * a running attribute as rendered text and leaves a finding standing about a symbol the page calls.
  */
 function openTagHead(markup: string): string | undefined {
-  const open = markup.lastIndexOf("<");
-  if (open < 0) return markup;
-  return markup.includes(">", open) ? undefined : markup.slice(open);
+  if (!markup.includes("<")) return markup;
+  let open = -1;
+  let quote: string | undefined;
+  for (let at = 0; at < markup.length; at += 1) {
+    const char = markup[at];
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+    } else if (open < 0) {
+      if (char === "<") open = at;
+    } else if (char === '"' || char === "'") quote = char;
+    else if (char === ">") open = -1;
+  }
+  return open < 0 ? undefined : markup.slice(open);
 }
 
 /**
@@ -1041,17 +1074,23 @@ function astroFrontmatterEnd(code: string[]): number {
  * still reads as one on the line the call actually sits on, and the quote of a handler whose value
  * wrapped, so the code inside it still reads as code.
  *
- * A tag name and a braced expression only count in a `component` file, where `<Widget />` renders
- * the imported symbol and `{Widget()}` invokes it. In static HTML, XML or SVG the same element is
- * the document's own vocabulary and a brace is a character the page shows — `<p>Write {Widget}
- * literally</p>` names the symbol the way the prose around it does, and reading that as a call
- * deletes a true finding about a genuinely unused symbol.
+ * A tag name and a braced expression only count in a component `flavor`, where `<Widget />`
+ * renders the imported symbol and `{Widget()}` invokes it. In static HTML, XML or SVG the same
+ * element is the document's own vocabulary and a brace is a character the page shows — `<p>Write
+ * {Widget} literally</p>` names the symbol the way the prose around it does, and reading that as a
+ * call deletes a true finding about a genuinely unused symbol. Vue is a component format that
+ * still shows that brace: it interpolates with `{{ … }}`, so only the doubled brace runs there.
+ *
+ * An attribute binds inside the tag that declares it, so both attribute shapes are matched against
+ * the head of the open tag rather than the whole line — the same bound `DIRECTIVE_HEAD` keeps.
+ * `<p>Write onclick=Widget in docs</p>` closed its tag before the symbol, and reading that
+ * sentence as a handler lets a doc page prove its own caller.
  */
 function referencesMarkup(
   line: string | undefined,
   symbol: string,
   state: MarkupLine = {},
-  component = false,
+  flavor: MarkupFlavor = "static",
 ): boolean {
   const { code = [], depth = 0, attr } = state;
   return referencesWord(line, symbol, (head) => {
@@ -1068,11 +1107,11 @@ function referencesMarkup(
     if (attr !== undefined && from === 0 && !markup.includes(attr)) return true;
     const tag = openTagHead(markup);
     return (
-      ATTR_VALUE.test(markup) ||
-      ATTR_VALUE_BARE.test(markup) ||
-      (tag !== undefined && DIRECTIVE_HEAD.test(tag)) ||
-      (component &&
-        (TAG_HEAD.test(markup) || insideExpression(markup, from === 0 ? depth : 0)))
+      (tag !== undefined &&
+        (ATTR_VALUE.test(tag) || ATTR_VALUE_BARE.test(tag) || DIRECTIVE_HEAD.test(tag))) ||
+      (flavor !== "static" &&
+        (TAG_HEAD.test(markup) ||
+          insideExpression(markup, from === 0 ? depth : 0, flavor === "mustache" ? 2 : 1)))
     );
   });
 }
@@ -1164,6 +1203,24 @@ function maskJsxExpressions(line: string): string {
   return out.join("");
 }
 
+/**
+ * A character entity — `&mdash;`, `&#8212;`, `&#x2014;`. JSX writes one wherever the text it renders
+ * needs a character its syntax would otherwise take, so the `&` and `;` an entity spells are the
+ * page's punctuation rather than the program's: leaving them in makes `<p>&mdash; Widget was
+ * removed</p>` read as code, and a paragraph naming a removed component then proves its own caller.
+ */
+const JSX_ENTITY = /&(?:#\d+|#[Xx][\dA-Fa-f]+|[A-Za-z][A-Za-z\d]*);/g;
+
+/** The line with its entities blanked, spaces standing in so offsets keep their meaning. */
+function maskJsxEntities(line: string): string {
+  return line.replace(JSX_ENTITY, (entity) => " ".repeat(entity.length));
+}
+
+/** What a reader sees of a line: its closed interpolations and its entities both blanked out. */
+function maskJsxRendered(line: string): string {
+  return maskJsxEntities(maskJsxExpressions(line));
+}
+
 /** What the line above leaves open, which is what the line under it is reading. */
 type JsxLine =
   /** Program — nothing above it renders. */
@@ -1246,7 +1303,7 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
       quote = undefined;
       continue;
     }
-    const rendered = maskJsxExpressions(line);
+    const rendered = maskJsxRendered(line);
     let rest = rendered;
     if (tag) {
       const end = jsxTagEnd(rest, quote);
@@ -1293,13 +1350,13 @@ function jsxLineStates(code: string[], raw: string[]): JsxLine[] {
  * its own caller and delete a true finding. Past that closing quote the line is the tag's
  * attribute list again, so the static prop after it is still what a reader sees.
  *
- * The interpolations the line already closed are blanked first, so the child text resumes after a
- * `{…}` instead of reading as program.
+ * The interpolations the line already closed are blanked first, along with the entities it renders,
+ * so the child text resumes after a `{…}` or an `&mdash;` instead of reading as program.
  */
 function referencesJsx(line: string | undefined, symbol: string, state: JsxLine = "code"): boolean {
   const wrapped = typeof state === "object" ? state.prop : undefined;
   return referencesWord(line, symbol, (raw) => {
-    const head = maskJsxExpressions(raw);
+    const head = maskJsxRendered(raw);
     if (wrapped !== undefined && !head.includes(wrapped)) return false;
     const within: JsxLine = wrapped === undefined ? state : "tag";
     if (within === "tag" && JSX_PROP_LINE.test(head)) return false;
@@ -1441,7 +1498,7 @@ async function codeReferencingFiles(
     const syntax = commentSyntaxOf(file) ?? UNKNOWN_SYNTAX;
     const isMdx = MDX_FILE.test(file);
     const isMarkup = !isMdx && MARKUP_FILE.test(file);
-    const isComponent = isMarkup && COMPONENT_FILE.test(file);
+    const flavor: MarkupFlavor = isMarkup ? markupFlavorOf(file) : "static";
     const isJsx = !isMdx && !isMarkup && JSX_FILE.test(file);
     if (!masked.has(file)) {
       try {
@@ -1480,7 +1537,7 @@ async function codeReferencingFiles(
             depth: entry.depth?.[line - 1],
             attr: entry.attr?.[line - 1],
           },
-          isComponent,
+          flavor,
         );
       if (isJsx) return referencesJsx(text, symbol, entry.jsx?.[line - 1]);
       return referencesWord(text, symbol);

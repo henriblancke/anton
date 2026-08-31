@@ -1858,6 +1858,53 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
     });
 
+    // An attribute binds inside the tag that declares it. Rendered text that spells one — `<p>Write
+    // onclick=Widget in docs</p>` — is a sentence whose tag closed before the symbol, and reading
+    // it as a handler lets a doc page prove its own caller. The handler that really runs still
+    // counts, including one whose value shows a `>` the tag does not end at.
+    it("does not count a handler attribute spelled in rendered text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html": "<p>Write onclick=Widget in docs</p>\n",
+        "public/quoted.html": '<p>Write <code>onclick="Widget()"</code> in docs</p>\n',
+        "public/app.html": '<button onclick="a > b && Widget()">go</button>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/quoted.html");
+    });
+
+    // Vue interpolates with `{{ … }}`: a single brace in its template is a character the page
+    // shows, so applying Svelte's one-brace rule to a `.vue` file lets prose prove its own caller.
+    // The doubled brace still runs there, and one brace still runs in Svelte and Astro.
+    it("requires doubled braces for a Vue interpolation, and keeps one for Svelte", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.vue": "<template>\n  <p>Write {Widget} literally</p>\n</template>\n",
+        "src/ui/live.vue": "<template>\n  <p>{{ Widget() }}</p>\n</template>\n",
+        "src/ui/live.svelte": "<p>{Widget()}</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.vue");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
     // A `<script>` runs between its tags, not across its line. Rendered text sharing the line with
     // one is still markup, so reading the whole line as code lets that prose prove a caller and
     // delete a true finding — while the script's own body has to keep counting.
@@ -2122,6 +2169,31 @@ describe("scan", () => {
           "export const Note = () => (\n  <p className={styles.note}>\n" +
           "    Widget was removed in favour of Panel\n  </p>\n);\n",
         "src/ui/live.tsx": "export const Live = () => <p>{version} {Widget()}</p>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A character entity is how rendered JSX writes punctuation its syntax would otherwise take:
+    // `<p>&mdash; Widget was removed</p>` is prose. Reading the `&` and `;` it spells as the
+    // program's operators makes that paragraph code again and deletes a true finding, while the
+    // interpolation beside the same entity stays the call it is.
+    it("reads a JSX entity as rendered text, and still counts a call beside one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.tsx": "export const Notes = () => <p>&mdash; Widget was removed</p>;\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <p>\n    &#8212;&nbsp;Widget was removed\n  </p>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>&mdash; {Widget()}</p>;\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/ui/widget.tsx", "Widget"),
