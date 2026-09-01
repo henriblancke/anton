@@ -8,8 +8,10 @@
  * on this screen may call the lane "Ready", because `bd ready` already means *unblocked*.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { DragEndEvent } from "@dnd-kit/core";
 
+import type { BudgetSignal } from "@/lib/budget-line";
 import {
   STAGES,
   type Board,
@@ -19,18 +21,38 @@ import {
   type UpNextEntry,
 } from "@/lib/types";
 
-vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+const toastSuccess = vi.fn();
+const toastError = vi.fn();
+const toastMessage = vi.fn();
+vi.mock("sonner", () => ({
+  toast: {
+    success: (...a: unknown[]) => toastSuccess(...a),
+    error: (...a: unknown[]) => toastError(...a),
+    message: (...a: unknown[]) => toastMessage(...a),
+  },
+}));
 
+const refresh = vi.fn();
 vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
   usePathname: () => "/projects/tmp",
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh }),
 }));
 
-// dnd-kit can't resolve droppables under jsdom's zero-size rects; drag behaviour is covered in
-// epic-board.test.tsx, so the whole surface is inert here.
+// dnd-kit's sensors can't resolve a drop under jsdom's zero-size rects, so the surface is inert and
+// the board's real onDragEnd is captured for the reorder tests to fire a synthetic drop into.
+let dragEndHandler: ((e: DragEndEvent) => void | Promise<void>) | undefined;
 vi.mock("@dnd-kit/core", () => ({
-  DndContext: ({ children }: { children: React.ReactNode }) => children,
+  DndContext: ({
+    children,
+    onDragEnd,
+  }: {
+    children: React.ReactNode;
+    onDragEnd: (e: DragEndEvent) => void;
+  }) => {
+    dragEndHandler = onDragEnd;
+    return children;
+  },
   DragOverlay: ({ children }: { children: React.ReactNode }) => children,
   KeyboardSensor: function KeyboardSensor() {},
   PointerSensor: function PointerSensor() {},
@@ -49,6 +71,19 @@ vi.mock("@dnd-kit/core", () => ({
   }),
 }));
 vi.mock("@dnd-kit/modifiers", () => ({ restrictToWindowEdges: {} }));
+vi.mock("@dnd-kit/sortable", () => ({
+  SortableContext: ({ children }: { children: React.ReactNode }) => children,
+  verticalListSortingStrategy: {},
+  useSortable: () => ({
+    attributes: {},
+    listeners: {},
+    setNodeRef: () => {},
+    setActivatorNodeRef: () => {},
+    transform: null,
+    transition: undefined,
+    isDragging: false,
+  }),
+}));
 vi.mock("@dnd-kit/utilities", () => ({ CSS: { Translate: { toString: () => "" } } }));
 
 const { EpicBoard } = await import("@/components/board/epic-board");
@@ -130,16 +165,48 @@ function cardCount(cardId: string): number {
   return document.querySelectorAll(`a[href="/projects/tmp/epics/${cardId}"]`).length;
 }
 
+/**
+ * The board's fetch surface. Everything the lane touches is answered explicitly: the board poll
+ * 304s, and the budget signal is absent (204) unless a test hands one over.
+ */
+function stubFetch(routes: Record<string, () => Response> = {}) {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    for (const [fragment, answer] of Object.entries(routes)) {
+      if (url.includes(fragment)) return answer();
+    }
+    if (url.includes("/picker/budget")) return new Response(null, { status: 204 });
+    return new Response(null, { status: 304 });
+  });
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+  return fetchMock;
+}
+
+const json = (body: unknown, status = 200) => () =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+/** A governor reading with `sessionPct` left and one run costing 20 session%-points. */
+function budgetSignal(sessionPct: number): BudgetSignal {
+  return {
+    headroom: {
+      sessionPct,
+      sessionReason: "session-headroom",
+      weeklyPct: null,
+      weeklyReason: "weekly-cap",
+    },
+    burn: { "execute-epic": { sessionPct: 20, weeklyPct: 3, seeded: false } },
+  };
+}
+
 beforeEach(() => {
   window.localStorage.clear();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => new Response(null, { status: 304 })) as unknown as typeof fetch,
-  );
+  stubFetch();
 });
 
 afterEach(() => {
   cleanup();
+  dragEndHandler = undefined;
+  vi.clearAllMocks();
   vi.restoreAllMocks();
 });
 
@@ -212,5 +279,214 @@ describe("Up Next lane (anton-t9m4)", () => {
 
     expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull();
     expect(laneOf("anton-run")).toBe("Implementing");
+  });
+});
+
+/**
+ * The budget line, composed into the lane it was built for (anton-vlom / R3.6, anton-7bzg.1). The
+ * placement arithmetic is `budget-line.test.ts`'s; what is pinned here is that the LANE reads the
+ * signal, draws the divider at the position it computes, and words the wait on every card below it.
+ */
+describe("the budget line in the Up Next lane", () => {
+  /** The lane's children in order, as `card:<id>` / `divider` / `waiting:<id>` markers. */
+  function laneRows(): string[] {
+    const lane = screen.getByRole("region", { name: "Up Next" });
+    const rows: string[] = [];
+    // One flat walk, so the order asserted is the order the operator reads down the lane.
+    for (const node of lane.querySelectorAll("*")) {
+      if (node.getAttribute("role") === "separator") {
+        rows.push("divider");
+        continue;
+      }
+      const href = node.tagName === "A" ? node.getAttribute("href") : null;
+      if (!href?.startsWith("/projects/tmp/epics/")) continue;
+      const id = href.split("/").pop()!;
+      rows.push(node.closest('[aria-label^="Waiting"]') ? `waiting:${id}` : `card:${id}`);
+    }
+    return rows;
+  }
+
+  it("draws the dashed line where the remaining headroom runs out", async () => {
+    // 30% headroom at 20% a run: the first pick is affordable, the second is not.
+    stubFetch({ "/picker/budget": json(budgetSignal(30)) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await waitFor(() => expect(screen.getByRole("separator")).toBeTruthy());
+    expect(laneRows()).toEqual(["card:anton-pick2", "divider", "waiting:anton-pick1"]);
+    expect(screen.getByRole("separator").getAttribute("aria-label")).toMatch(/session headroom/);
+    // The reason is on the waiting card too — never carried by the dimming alone.
+    expect(screen.getByRole("group", { name: "Waiting — session headroom" })).toBeTruthy();
+  });
+
+  it("puts every card below the line when the governor is already holding", async () => {
+    stubFetch({ "/picker/budget": json(budgetSignal(0)) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await waitFor(() => expect(screen.getByRole("separator")).toBeTruthy());
+    expect(laneRows()).toEqual(["divider", "waiting:anton-pick2", "waiting:anton-pick1"]);
+  });
+
+  it("draws no line when the governor has nothing to say (204)", async () => {
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await waitFor(() =>
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(([u]) =>
+          String(u).includes("/picker/budget"),
+        ),
+      ).toBe(true),
+    );
+    expect(screen.queryByRole("separator")).toBeNull();
+    expect(laneRows()).toEqual(["card:anton-pick2", "card:anton-pick1"]);
+  });
+
+  it("draws no line when the whole plan is affordable", async () => {
+    stubFetch({ "/picker/budget": json(budgetSignal(500)) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await waitFor(() =>
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(([u]) =>
+          String(u).includes("/picker/budget"),
+        ),
+      ).toBe(true),
+    );
+    expect(screen.queryByRole("separator")).toBeNull();
+  });
+});
+
+/**
+ * The two vetoes, reachable from the lane (anton-jqvy / R3.9). VetoActions' own behaviour is
+ * `veto-actions.test.tsx`'s; what is pinned here is that an operator can actually get at it — the
+ * gap that made the whole server half unreachable.
+ */
+describe("vetoing a pick from the lane", () => {
+  it("posts `not now` for the card it sits on", async () => {
+    const until = Date.now() + 24 * 60 * 60 * 1000;
+    const fetchMock = stubFetch({
+      "/picker/veto": json({ beadId: "anton-pick2", action: "not-now", deferredUntil: until }),
+    });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    // Rank 1 is anton-pick2, so the lane's first `not now` vetoes it and nothing else.
+    fireEvent.click(screen.getAllByRole("button", { name: /not now/i })[0]);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/tmp/picker/veto",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ beadId: "anton-pick2", action: "not-now" }),
+        }),
+      ),
+    );
+    // The hold is stamped on the board immediately, so the card reads as set aside on the click
+    // that set it aside rather than a poll later.
+    await waitFor(() => expect(screen.getByText(/set aside · back in/i)).toBeTruthy());
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(1);
+  });
+
+  it("offers `Never` beside it, which is what carries the operator to the rule", () => {
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+    expect(screen.getAllByRole("button", { name: "Never" })).toHaveLength(2);
+  });
+
+  it("reads a target already set aside as held, instead of offering the veto again", () => {
+    const board = fixture(PLAN);
+    board.columns.backlog = board.columns.backlog.map((e) =>
+      e.id === "anton-pick2" ? { ...e, notNowUntil: Date.now() + 60 * 60 * 1000 } : e,
+    );
+    render(<EpicBoard slug="tmp" initialBoard={board} />);
+
+    expect(screen.getByText(/set aside · back in/i)).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(1);
+  });
+});
+
+/**
+ * Dragging to reorder writes `priority` (R3.8) — the payoff of the architecture: a human steers the
+ * picker through the SAME channel product-master uses, so the correction is ordinary board state
+ * rather than an override to reconcile.
+ */
+describe("reordering the lane", () => {
+  const drop = (activeId: string, overId: string) =>
+    dragEndHandler?.({
+      active: { id: activeId, data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: overId, data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+
+  it("writes the dragged target's new priority through its own bead route", async () => {
+    const fetchMock = stubFetch({ "/epics/anton-pick1": json({ detail: {} }) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    // P2 dragged above P0: to hold the top slot it must carry the top slot's priority.
+    await drop("anton-pick1", "anton-pick2");
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/tmp/epics/anton-pick1",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ priority: 0 }) }),
+      ),
+    );
+    expect(toastSuccess).toHaveBeenCalledWith('Set "Term merge" to P0 · critical');
+  });
+
+  it("demotes a target dragged down to the band it landed in", async () => {
+    const fetchMock = stubFetch({ "/epics/anton-pick2": json({ detail: {} }) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await drop("anton-pick2", "anton-pick1");
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/tmp/epics/anton-pick2",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ priority: 2 }) }),
+      ),
+    );
+  });
+
+  it("renumbers the lane on the drop, rather than leaving a plan reading 2, 1", async () => {
+    stubFetch({ "/epics/anton-pick1": json({ detail: {} }) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await drop("anton-pick1", "anton-pick2");
+
+    await waitFor(() => {
+      const lane = screen.getByRole("region", { name: "Up Next" });
+      expect([...lane.querySelectorAll("h4")].map((h) => h.textContent)).toEqual([
+        "Term merge",
+        "Prune closed beads",
+      ]);
+    });
+    expect(screen.getByRole("group", { name: "Rank 1 — P0 · Feature · unblocks 0" })).toBeTruthy();
+  });
+
+  it("says so instead of writing when the drop is inside one priority band", async () => {
+    const fetchMock = stubFetch();
+    const tied = [
+      entry("anton-pick2", 1, { priority: 2, unblocks: 3 }),
+      entry("anton-pick1", 2, { priority: 2, unblocks: 0 }),
+    ];
+    render(<EpicBoard slug="tmp" initialBoard={fixture(tied)} />);
+
+    await drop("anton-pick1", "anton-pick2");
+
+    await waitFor(() => expect(toastMessage).toHaveBeenCalled());
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/epics/anton-pick1"))).toBe(false);
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("rolls the lane back when the priority write fails", async () => {
+    stubFetch({ "/epics/anton-pick1": json({ error: "anton.db is locked" }, 500) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await drop("anton-pick1", "anton-pick2");
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("anton.db is locked"));
+    const lane = screen.getByRole("region", { name: "Up Next" });
+    expect([...lane.querySelectorAll("h4")].map((h) => h.textContent)).toEqual([
+      "Prune closed beads",
+      "Term merge",
+    ]);
   });
 });

@@ -13,6 +13,8 @@ import {
   filterBoard,
   groupBoardByEpic,
   moveEpicBetweenColumns,
+  reorderPriority,
+  reorderUpNextEntries,
   sortEpics,
   takeUpNext,
   ticketProgress,
@@ -579,5 +581,85 @@ describe("upNextMetaLabel", () => {
     expect(upNextMetaLabel({ beadId: "a", rank: 2, type: "bug", unblocks: 0 })).toBe(
       "no priority · Bug · unblocks 0",
     );
+  });
+});
+
+/**
+ * Dragging to reorder writes `priority` (anton-7bzg / R3.8). Priority is the ONLY channel — the same
+ * one product-master writes on — so what these pin is the arithmetic that turns a drop position into
+ * the one number the picker will re-rank from, and the drops that honestly write nothing.
+ */
+describe("reorderPriority", () => {
+  const plan = (...priorities: (number | undefined)[]): UpNextEntry[] =>
+    priorities.map((priority, index) => ({
+      beadId: `b${index}`,
+      rank: index + 1,
+      ...(priority === undefined ? {} : { priority }),
+      type: "feature" as const,
+      unblocks: 0,
+    }));
+
+  it("promotes a card dragged to the top into the top card's band", () => {
+    expect(reorderPriority(plan(0, 2, 3), "b1", "b0")).toBe(0);
+  });
+
+  it("demotes a card dragged to the bottom into the bottom card's band", () => {
+    expect(reorderPriority(plan(0, 2, 3), "b0", "b2")).toBe(3);
+  });
+
+  it("clamps into the band the drop landed in, never past its new neighbours", () => {
+    // P0 dropped between P1 and P3 takes P1 — enough to sit under it, no more.
+    expect(reorderPriority(plan(1, 3, 0), "b2", "b1")).toBe(1);
+  });
+
+  it("writes nothing when the card is already in the band it was dropped into", () => {
+    // P2 dropped between P0 and P3 needs no change: the ranking already puts it there.
+    expect(reorderPriority(plan(0, 3, 2), "b2", "b1")).toBeNull();
+  });
+
+  it("writes nothing for a reorder inside one priority band", () => {
+    expect(reorderPriority(plan(2, 2, 2), "b2", "b0")).toBeNull();
+  });
+
+  it("gives an unprioritized card an explicit lowest priority — which outranks having none", () => {
+    expect(reorderPriority(plan(3, undefined), "b1", "b0")).toBe(3);
+    expect(reorderPriority(plan(4, undefined), "b1", "b0")).toBe(4);
+  });
+
+  it("answers null for a drop on itself or on a card the plan does not carry", () => {
+    expect(reorderPriority(plan(0, 2), "b0", "b0")).toBeNull();
+    expect(reorderPriority(plan(0, 2), "b0", "gone")).toBeNull();
+  });
+});
+
+describe("reorderUpNextEntries", () => {
+  const plan = (...ids: string[]): UpNextEntry[] =>
+    ids.map((beadId, index) => ({
+      beadId,
+      rank: index + 1,
+      priority: 2,
+      type: "feature" as const,
+      unblocks: 0,
+    }));
+
+  it("moves the target into the slot it was dropped on and renumbers every rank", () => {
+    const next = reorderUpNextEntries(plan("a", "b", "c"), "c", "a", 0);
+
+    expect(next.map((e) => e.beadId)).toEqual(["c", "a", "b"]);
+    expect(next.map((e) => e.rank)).toEqual([1, 2, 3]);
+    expect(next[0].priority).toBe(0);
+  });
+
+  it("moves a target down to the dropped-on slot", () => {
+    expect(reorderUpNextEntries(plan("a", "b", "c"), "a", "c", 3).map((e) => e.beadId)).toEqual([
+      "b",
+      "c",
+      "a",
+    ]);
+  });
+
+  it("leaves the plan alone when either end is not in it", () => {
+    const entries = plan("a", "b");
+    expect(reorderUpNextEntries(entries, "a", "gone", 0)).toEqual(entries);
   });
 });

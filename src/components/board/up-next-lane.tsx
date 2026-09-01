@@ -1,9 +1,18 @@
 "use client";
 
+import { Fragment, useMemo } from "react";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { GripVerticalIcon } from "lucide-react";
+
 import type { UpNextCard } from "@/components/board/board-utils";
 import { UP_NEXT_LABEL, upNextMetaLabel } from "@/components/board/board-utils";
-import { DraggableEpicCard } from "@/components/board/draggable-epic-card";
+import { BudgetDivider, BudgetWaiting, useBudgetSignal } from "@/components/board/budget-line";
+import { EpicCard } from "@/components/board/epic-card";
 import { StandaloneChip } from "@/components/board/standalone-chip";
+import { VetoActions } from "@/components/board/veto-actions";
+import { budgetLine } from "@/lib/budget-line";
+import { cn } from "@/lib/utils";
 
 /**
  * The `Up Next` lane, between Backlog and Implementing (anton-t9m4 / R3.1–R3.4).
@@ -11,12 +20,13 @@ import { StandaloneChip } from "@/components/board/standalone-chip";
  * It owns its cards: the board hands it the ranked plan already subtracted from Backlog
  * (`takeUpNext`), so a bead renders in exactly one lane. It is NOT a stage — the four columns beside
  * it map to bead state, this one is a ranking this machine recorded — so it carries no stage dot, no
- * droppable, and a caption that says whose plan it is. Nothing here is shared board state, and the
- * copy must never let it read as if it were (R3.4).
+ * column droppable, and a caption that says whose plan it is. Nothing here is shared board state,
+ * and the copy must never let it read as if it were (R3.4).
  *
  * The cards themselves are the SAME components Backlog renders. A forked lane card would be a second
  * place a target's approve/claim/release affordances live, and the two would drift; what the lane
- * adds is the ranking's own facts above each card, which is the only thing Backlog cannot say.
+ * adds is the ranking's own facts above each card, the two ways to disagree with a pick (R3.9), and
+ * the dashed line where the budget runs out (R3.6) — none of which Backlog can say.
  */
 export function UpNextLane({
   slug,
@@ -24,6 +34,7 @@ export function UpNextLane({
   budgetAware = false,
   onEpicDeleted,
   onOpenTicket,
+  onVetoed,
 }: {
   slug: string;
   /** Ranked plan cards, in rank order — never empty, since an empty lane is not rendered at all. */
@@ -33,7 +44,16 @@ export function UpNextLane({
   onEpicDeleted?: (epicId: string) => void;
   /** Open a standalone chip's detail dialog (hoisted to the board so one dialog serves all). */
   onOpenTicket?: (ticketId: string) => void;
+  /** A target the operator just set aside, so the board can hold it back before the next poll. */
+  onVetoed?: (beadId: string, untilMs: number) => void;
 }) {
+  // Where this project's quota runs out (anton-vlom / R3.6). The signal is the governor's own
+  // headroom, so a null reading — unreadable usage, or a project that is not budget-aware — draws no
+  // line at all, matching the gate's fail-open rule rather than guessing a position.
+  const signal = useBudgetSignal(slug);
+  const line = useMemo(() => budgetLine(signal, cards.map(() => ({}))), [signal, cards]);
+  const ids = useMemo(() => cards.map((card) => card.entry.beadId), [cards]);
+
   return (
     <section
       data-lane={UP_NEXT_LABEL}
@@ -63,29 +83,121 @@ export function UpNextLane({
         </p>
       </div>
 
-      <div className="flex flex-1 flex-col gap-3 overflow-y-auto rounded-xl border border-transparent p-0.5">
-        {cards.map((card) => (
-          <div key={card.entry.beadId} className="flex flex-col gap-1.5">
-            <UpNextMeta card={card} />
-            {card.kind === "epic" ? (
-              <DraggableEpicCard
+      {/* Sortable, not droppable: the lane is a ranking, so the only drop it accepts is onto another
+          of its own cards — which the board turns into a priority write (R3.8). */}
+      <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+        <div className="flex flex-1 flex-col gap-3 overflow-y-auto rounded-xl border border-transparent p-0.5">
+          {cards.map((card, index) => {
+            const row = (
+              <UpNextRow
                 slug={slug}
-                epic={card.epic}
+                card={card}
                 budgetAware={budgetAware}
-                onDeleted={onEpicDeleted}
+                onEpicDeleted={onEpicDeleted}
+                onOpenTicket={onOpenTicket}
+                onVetoed={onVetoed}
               />
-            ) : (
-              <StandaloneChip
-                slug={slug}
-                item={card.item}
-                budgetAware={budgetAware}
-                onOpen={onOpenTicket}
-              />
-            )}
-          </div>
-        ))}
-      </div>
+            );
+            return (
+              <Fragment key={card.entry.beadId}>
+                {line && index === line.affordable && <BudgetDivider line={line} />}
+                {line && index >= line.affordable ? (
+                  <BudgetWaiting reason={line.reason}>{row}</BudgetWaiting>
+                ) : (
+                  row
+                )}
+              </Fragment>
+            );
+          })}
+        </div>
+      </SortableContext>
     </section>
+  );
+}
+
+/**
+ * One ranked pick: the lane's own facts above the card Backlog would have shown.
+ *
+ * The drag handle lives here rather than on the card, so a target registers exactly one draggable —
+ * dragging it sideways still moves its stage, dragging it within the lane reorders the plan.
+ */
+function UpNextRow({
+  slug,
+  card,
+  budgetAware,
+  onEpicDeleted,
+  onOpenTicket,
+  onVetoed,
+}: {
+  slug: string;
+  card: UpNextCard;
+  budgetAware: boolean;
+  onEpicDeleted?: (epicId: string) => void;
+  onOpenTicket?: (ticketId: string) => void;
+  onVetoed?: (beadId: string, untilMs: number) => void;
+}) {
+  const { beadId } = card.entry;
+  const title = card.kind === "epic" ? card.epic.title : card.item.title;
+  const notNowUntil = card.kind === "epic" ? card.epic.notNowUntil : card.item.notNowUntil;
+
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
+    useSortable({
+      id: beadId,
+      // `upNext` on BOTH ends is what tells the board's drop handler this was a reorder and not a
+      // stage move; `stage` keeps a card draggable out of the lane into a column, as before.
+      data: { upNext: true, ...(card.kind === "epic" ? { stage: card.epic.stage } : {}) },
+    });
+
+  const style = {
+    transform: transform ? CSS.Translate.toString(transform) : undefined,
+    transition,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={cn("flex flex-col gap-1.5", isDragging && "opacity-40")}
+    >
+      <div className="flex items-center gap-2 px-0.5">
+        <UpNextMeta card={card} />
+        {/* The two ways to disagree with the pick, on the pick itself (R3.9). */}
+        <VetoActions
+          slug={slug}
+          beadId={beadId}
+          {...(notNowUntil === undefined ? {} : { notNowUntil })}
+          className="shrink-0"
+          onVetoed={(untilMs) => onVetoed?.(beadId, untilMs)}
+        />
+        <button
+          ref={setActivatorNodeRef}
+          type="button"
+          {...attributes}
+          {...listeners}
+          aria-label={`Reorder "${title}"`}
+          title="Drag to reorder — the new position is written as this target's priority"
+          style={{ touchAction: "none" }}
+          className="flex size-5 shrink-0 cursor-grab items-center justify-center rounded-md text-subtle transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:cursor-grabbing"
+        >
+          <GripVerticalIcon className="size-3.5" aria-hidden="true" />
+        </button>
+      </div>
+      {card.kind === "epic" ? (
+        <EpicCard
+          slug={slug}
+          epic={card.epic}
+          budgetAware={budgetAware}
+          onDeleted={onEpicDeleted}
+        />
+      ) : (
+        <StandaloneChip
+          slug={slug}
+          item={card.item}
+          budgetAware={budgetAware}
+          onOpen={onOpenTicket}
+        />
+      )}
+    </div>
   );
 }
 
@@ -105,7 +217,7 @@ function UpNextMeta({ card }: { card: UpNextCard }) {
     <div
       role="group"
       aria-label={`Rank ${rank} — ${meta}`}
-      className="flex items-center gap-2 px-0.5"
+      className="flex min-w-0 flex-1 items-center gap-2"
     >
       <span
         className="flex size-5 shrink-0 items-center justify-center rounded-md border border-border bg-secondary font-mono text-[10px] leading-none text-muted-foreground"

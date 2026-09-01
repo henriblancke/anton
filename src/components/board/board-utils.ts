@@ -540,3 +540,79 @@ export function moveEpicBetweenColumns(
   next[toStage] = toStage === "backlog" ? inserted.sort(compareBacklogEpics) : inserted;
   return next;
 }
+
+// ── Up Next: dragging to reorder writes priority (anton-7bzg / R3.8) ──────
+//
+// A drag inside the lane steers the picker through the SAME channel product-master writes on — the
+// target's bead `priority` — so there is no override concept to reconcile and the correction
+// propagates as ordinary board state (docs/plans/2026-08-18-002-feat-autopilot-design.md
+// §Architecture). Both helpers are pure so the arithmetic is pinned in board-utils.test.ts rather
+// than inferred from a rendered lane.
+
+/** bd's lowest explicit priority — what an unprioritized bead is charged as, since it ranks last. */
+const LOWEST_PRIORITY = 4;
+
+const priorityOf = (entry: UpNextEntry): number => entry.priority ?? LOWEST_PRIORITY;
+
+/**
+ * The priority the dragged target must carry to hold the slot it was dropped into, or `null` when
+ * the drop asks for nothing the priority channel can say.
+ *
+ * The rule is a clamp, not an assignment: the card's own priority is squeezed into the band its NEW
+ * neighbours define — no better than the one above it, no worse than the one below. That is the
+ * whole expressible content of a drag, because the ranking sorts on priority first and breaks ties
+ * on unblocking value (beads/rank.ts). Dropping a P2 between a P0 and a P3 therefore writes nothing:
+ * the card is already in the band it was dropped into, and inventing a write would claim the
+ * operator changed a decision they didn't.
+ *
+ * `null` is also the answer for a reorder inside ONE band. The caller says so out loud rather than
+ * failing silently — a drag that looks like it landed and wrote nothing is the one outcome that
+ * would teach an operator the lane lies.
+ */
+export function reorderPriority(
+  entries: readonly UpNextEntry[],
+  beadId: string,
+  overBeadId: string,
+): number | null {
+  const from = entries.findIndex((e) => e.beadId === beadId);
+  const to = entries.findIndex((e) => e.beadId === overBeadId);
+  if (from < 0 || to < 0 || from === to) return null;
+
+  // dnd-kit's convention: the moved card ends at the over card's index in the ORIGINAL order, so
+  // the slot's neighbours are read off the list with the moved card already lifted out.
+  const rest = entries.filter((_, index) => index !== from);
+  const above = rest[to - 1];
+  const below = rest[to];
+  const lo = above ? priorityOf(above) : 0;
+  const hi = below ? priorityOf(below) : LOWEST_PRIORITY;
+
+  const next = Math.min(Math.max(priorityOf(entries[from]), lo), hi);
+  // An unprioritized bead landing on P4 IS a change — explicit P4 outranks no priority at all.
+  return next === entries[from].priority ? null : next;
+}
+
+/**
+ * The recorded plan with one target moved to another card's slot, carrying its new priority and with
+ * every rank renumbered from 1.
+ *
+ * Optimistic only: the plan is the picker's, and its next pass re-ranks from the priority just
+ * written. Renumbering matters because the lane prints the rank beside each card — leaving the old
+ * numbers would show a plan reading 2, 1, 3 down the column.
+ */
+export function reorderUpNextEntries(
+  entries: readonly UpNextEntry[],
+  beadId: string,
+  overBeadId: string,
+  priority: number,
+): UpNextEntry[] {
+  const from = entries.findIndex((e) => e.beadId === beadId);
+  const to = entries.findIndex((e) => e.beadId === overBeadId);
+  if (from < 0 || to < 0 || from === to) return [...entries];
+
+  const rest = entries.filter((_, index) => index !== from);
+  const moved: UpNextEntry = { ...entries[from], priority };
+  return [...rest.slice(0, to), moved, ...rest.slice(to)].map((entry, index) => ({
+    ...entry,
+    rank: index + 1,
+  }));
+}

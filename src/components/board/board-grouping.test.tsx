@@ -42,6 +42,19 @@ vi.mock("@dnd-kit/core", () => ({
   }),
 }));
 vi.mock("@dnd-kit/modifiers", () => ({ restrictToWindowEdges: {} }));
+vi.mock("@dnd-kit/sortable", () => ({
+  SortableContext: ({ children }: { children: React.ReactNode }) => children,
+  verticalListSortingStrategy: {},
+  useSortable: () => ({
+    attributes: {},
+    listeners: {},
+    setNodeRef: () => {},
+    setActivatorNodeRef: () => {},
+    transform: null,
+    transition: undefined,
+    isDragging: false,
+  }),
+}));
 vi.mock("@dnd-kit/utilities", () => ({ CSS: { Translate: { toString: () => "" } } }));
 
 const { EpicBoard } = await import("@/components/board/epic-board");

@@ -37,6 +37,8 @@ import {
   filterBoard,
   groupBoardByEpic,
   moveEpicBetweenColumns,
+  reorderPriority,
+  reorderUpNextEntries,
   sortEpics,
   takeUpNext,
   type BoardSort,
@@ -55,6 +57,7 @@ import {
 import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
+import { PRIORITY_LABELS } from "@/components/ticket/ticket-dialog-utils";
 import { cn } from "@/lib/utils";
 
 const BOARD_SORTS: BoardSort[] = ["default", "risk", "size"];
@@ -314,6 +317,81 @@ export function EpicBoard({
     });
   }
 
+  /**
+   * A target the operator just set aside (anton-jqvy / R3.9). Stamped locally so the card reads as
+   * deferred on the click that deferred it — the hold is server state, and the board's own poll is
+   * up to 30s away, which is long enough for an operator to click `not now` twice.
+   */
+  function handleVetoed(beadId: string, untilMs: number) {
+    setBoard((prev) => {
+      if (!prev) return prev;
+      const columns = { ...prev.columns };
+      const standalone = { ...prev.standalone };
+      for (const stage of STAGES) {
+        columns[stage] = (columns[stage] ?? []).map((e) =>
+          e.id === beadId ? { ...e, notNowUntil: untilMs } : e,
+        );
+        standalone[stage] = (standalone[stage] ?? []).map((i) =>
+          i.id === beadId ? { ...i, notNowUntil: untilMs } : i,
+        );
+      }
+      return { ...prev, columns, standalone };
+    });
+  }
+
+  /**
+   * Reorder inside the Up Next lane (R3.8). The drop is persisted as the target's bead `priority` —
+   * the same channel product-master writes on — so there is no override state to reconcile and the
+   * correction reaches the next picker pass as ordinary board state.
+   *
+   * A drop the priority channel cannot express (a reorder inside one band) writes nothing and says
+   * so. Silently accepting it would teach the operator the lane holds an order it does not.
+   */
+  async function reorderUpNext(beadId: string, overBeadId: string) {
+    if (!board) return;
+    const card = upNext.cards.find((c) => c.entry.beadId === beadId);
+    if (!card) return;
+
+    const priority = reorderPriority(
+      upNext.cards.map((c) => c.entry),
+      beadId,
+      overBeadId,
+    );
+    if (priority === null) {
+      toast.message("Nothing to change", {
+        description:
+          "Order inside one priority band is the picker's own tiebreak — how much open work each target unblocks.",
+      });
+      return;
+    }
+
+    const title = card.kind === "epic" ? card.epic.title : card.item.title;
+    const previous = board;
+    setBoard({
+      ...board,
+      upNext: reorderUpNextEntries(board.upNext ?? [], beadId, overBeadId, priority),
+    });
+
+    // A standalone chip is a bead in its own right, so it patches through the ticket route; both
+    // routes validate the priority server-side (parseEpicPatch / parseTicketPatch).
+    const resource = card.kind === "epic" ? "epics" : "tickets";
+    try {
+      const res = await fetch(`/api/projects/${slug}/${resource}/${beadId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ priority }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `Reorder failed (${res.status})`);
+      }
+      toast.success(`Set "${title}" to ${PRIORITY_LABELS[priority]}`);
+    } catch (err) {
+      setBoard(previous);
+      toast.error(err instanceof Error ? err.message : "Failed to reorder");
+    }
+  }
+
   async function handleDragEnd(event: DragEndEvent) {
     draggingRef.current = false;
     setActiveId(null);
@@ -321,7 +399,17 @@ export function EpicBoard({
     if (!board || !over) return;
 
     const epicId = String(active.id);
+    // Both ends inside the lane is a REORDER, not a move: Up Next is a ranking, so the drop changes
+    // the target's priority rather than its stage.
+    if (active.data.current?.upNext && over.data.current?.upNext) {
+      await reorderUpNext(epicId, String(over.id));
+      return;
+    }
+
     const toStage = over.id as Stage;
+    // The lane's cards are droppables too, so `over` is only a column when it says it is — a card
+    // dropped on a lane card from outside must not be read as a move to a stage named after a bead.
+    if (!STAGES.includes(toStage)) return;
     const fromStage = active.data.current?.stage as Stage | undefined;
     if (!fromStage || fromStage === toStage) return;
 
@@ -489,6 +577,7 @@ export function EpicBoard({
                   budgetAware={budgetAware}
                   onEpicDeleted={handleEpicDeleted}
                   onOpenTicket={setOpenTicketId}
+                  onVetoed={handleVetoed}
                 />
               )}
             </Fragment>
