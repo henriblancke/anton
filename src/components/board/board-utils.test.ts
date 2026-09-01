@@ -13,6 +13,7 @@ import {
   filterBoard,
   groupBoardByEpic,
   moveEpicBetweenColumns,
+  removeEpicFromColumns,
   sortEpics,
   ticketProgress,
 } from "@/components/board/board-utils";
@@ -213,6 +214,30 @@ describe("sortEpics", () => {
     const before = epics.map((e) => e.id);
     sortEpics(epics, "size");
     expect(epics.map((e) => e.id)).toEqual(before);
+  });
+});
+
+describe("removeEpicFromColumns", () => {
+  it("drops the epic from whichever column holds it and leaves the rest untouched", () => {
+    const columns: Record<Stage, Epic[]> = {
+      backlog: [makeEpic("e1"), makeEpic("e2")],
+      implementing: [makeEpic("e3")],
+      "in-review": [],
+      done: [],
+    };
+    const next = removeEpicFromColumns(columns, "e3");
+    expect(next.backlog.map((e) => e.id)).toEqual(["e1", "e2"]);
+    expect(next.implementing).toEqual([]);
+  });
+
+  it("is a no-op for an id no column holds", () => {
+    const columns: Record<Stage, Epic[]> = {
+      backlog: [makeEpic("e1")],
+      implementing: [],
+      "in-review": [],
+      done: [],
+    };
+    expect(removeEpicFromColumns(columns, "missing")).toEqual(columns);
   });
 });
 

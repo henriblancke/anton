@@ -358,7 +358,8 @@ export interface EpicLane {
   loose: number;
 }
 
-function emptyStageMap<T>(): Record<Stage, T[]> {
+/** A fresh per-stage bucket map — the shape every column-keyed board structure starts from. */
+export function emptyStageMap<T>(): Record<Stage, T[]> {
   return Object.fromEntries(STAGES.map((stage) => [stage, [] as T[]])) as Record<Stage, T[]>;
 }
 
@@ -419,6 +420,19 @@ export function groupBoardByEpic(
       return byTitle !== 0 ? byTitle : a.epic!.id.localeCompare(b.epic!.id);
     });
   return noEpic ? [...sorted, noEpic] : sorted;
+}
+
+/** Drops an epic (by id) from every stage column, immutably — the optimistic half of a delete, so
+ * the card leaves the board on the confirmation rather than on the next poll. */
+export function removeEpicFromColumns(
+  columns: Record<Stage, Epic[]>,
+  epicId: string,
+): Record<Stage, Epic[]> {
+  const next = emptyStageMap<Epic>();
+  for (const stage of STAGES) {
+    next[stage] = (columns[stage] ?? []).filter((epic) => epic.id !== epicId);
+  }
+  return next;
 }
 
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic
