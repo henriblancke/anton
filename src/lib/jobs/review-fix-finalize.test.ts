@@ -709,6 +709,57 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  it("leaves its OWN losing follow-up standing once tickets hang off it (PR #199 review)", async () => {
+    // Being untouched says who owns the duplicate, not what has been parented to it. Its stamp
+    // makes it a reuse candidate for any other sweep of the same merged target, so one can be
+    // filling it while it is still open, unassigned and unapproved — and `bd delete --force` does
+    // not cascade, so deleting it would leave those tickets parentless.
+    const rival = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+      created_at: "2026-01-01T00:00:00.000Z",
+    } as Bead;
+    createdAt.set("epic-2", "2026-01-01T00:00:05.000Z"); // ours loses — it is the younger
+    const adopted = { ...bead("t9"), parent: "epic-2" } as Bead;
+    parents.set("t9", "epic-2");
+    listMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([rival])
+      // The read taken immediately before the delete — another sweep got there first.
+      .mockResolvedValue([rival, adopted]);
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(deleteMock).not.toHaveBeenCalled();
+    // Nothing moves onto the winner either, and the merged target stays open for the next sweep.
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves its OWN losing follow-up standing when childlessness cannot be read (PR #199 review)", async () => {
+    // A list that fails rules nothing out, and the delete is the irreversible half. Left standing
+    // with the source held open, exactly as a delete that did not land leaves it.
+    const rival = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+      created_at: "2026-01-01T00:00:00.000Z",
+    } as Bead;
+    createdAt.set("epic-2", "2026-01-01T00:00:05.000Z");
+    listMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([rival])
+      .mockRejectedValue(new Error("bd list: DB locked"));
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   it("reconciles a younger rival whose process died after creating it (PR #199 review)", async () => {
     // The losing process normally deletes its own duplicate the moment it sees this one — but a
     // process that crashes right after its create never gets there. Cleaning up only this process's

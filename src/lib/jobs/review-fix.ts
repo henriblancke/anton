@@ -1593,6 +1593,25 @@ async function applyRehome(
         // rival, so the tickets still end up under exactly one home.
         const ours = await reread(followUp);
         if (!ours || !untouched(ours)) return { ...none, unfinished: followUp };
+        // CHILDLESSNESS is re-read here too (PR #199 review). `untouched` answers who OWNS the
+        // follow-up, not what now hangs off it, and this branch never reaches the childless cleanup
+        // below that asks the board that question — a losing duplicate is deleted the moment the
+        // election names it. Its stamp makes it a reuse candidate for any other sweep of this same
+        // merged target, so another process can be parenting tickets to it right now while it is
+        // still open, unassigned and unapproved; `bd delete --force` does not cascade, so deleting
+        // it would leave those tickets parentless. A list that FAILS proves nothing against the
+        // irreversible half — either way the duplicate is left standing and the source held open,
+        // exactly as a delete that did not land leaves it, and the next sweep converges.
+        const beforeDelete = await beads
+          .list(repo, ["--status", "all"])
+          .catch(() => undefined);
+        if (
+          !beforeDelete ||
+          [...afterCreate, ...beforeDelete].some(
+            (b) => beads.parentOf(b) === followUp,
+          )
+        )
+          return { ...none, unfinished: followUp };
         if (!(await safe(() => beads.delete(repo, followUp))))
           return { ...none, unfinished: followUp };
         // …unless the winner has since become somebody's run, which is the one thing tickets must
