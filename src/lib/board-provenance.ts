@@ -97,6 +97,13 @@ export function provenanceVersion(plan?: BoardPickerPlan, policy?: Policy): stri
  * or the policy has since invalidated would be a live claim dressed as a record — so the caller's
  * freshness verdict rides along as {@link BeadProvenance.stale}, which the badge ignores and the
  * button obeys.
+ *
+ * The criterion LINK is the one part of the mark that cannot survive staleness. It is derived from
+ * the policy and board as they read now, and stale means precisely that those are no longer the
+ * inputs the pass decided from — so the criterion it resolves is not provably the one that made the
+ * recorded pick, and pointing history at a replacement rule would misattribute the decision. The
+ * plan carries no policy revision to re-resolve against, so the ref is omitted and the badge falls
+ * back to opening the policy at this bead, with the recorded rule as its words.
  */
 function pickerProvenance({
   board,
@@ -107,10 +114,12 @@ function pickerProvenance({
   const out = new Map<string, BeadProvenance>();
   if (!plan?.entries.length) return out;
 
-  // Projected once for the whole plan rather than per entry: the projection walks the board.
-  const candidates = policy
-    ? new Map(policyCandidates(board).candidates.map((c) => [c.id, c]))
-    : undefined;
+  // Projected once for the whole plan rather than per entry: the projection walks the board. Skipped
+  // outright on a stale plan — the criterion it would resolve is not the one that made the pick.
+  const candidates =
+    policy && !planIsStale
+      ? new Map(policyCandidates(board).candidates.map((c) => [c.id, c]))
+      : undefined;
 
   for (const entry of plan.entries) {
     const candidate = candidates?.get(entry.beadId);

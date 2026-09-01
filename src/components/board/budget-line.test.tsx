@@ -51,8 +51,9 @@ const CARDS = ["anton-a", "anton-b", "anton-c", "anton-d"];
 
 describe("the budget line in a lane", () => {
   it("marks where the remaining headroom is exhausted, with the cards below it waiting", () => {
-    // 50% headroom at 20% a run: two cards are affordable, two wait.
-    const html = lane(signal(50), CARDS);
+    // 40% headroom at 20% a run: the second card spends the last of it (the governor admits the
+    // run that crosses), so two are affordable and two wait.
+    const html = lane(signal(40), CARDS);
 
     expect(html).toContain("≈ budget · session headroom");
     expect(html).toContain('role="separator"');

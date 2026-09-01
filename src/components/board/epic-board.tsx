@@ -376,6 +376,14 @@ export function EpicBoard({
     // poll that LEFT before it settled answers on the pre-veto board and would put the declined
     // target back in the lane with its controls live — long enough (up to a beat) for the operator
     // to decline the same pick twice. Bumping the sequence here discards exactly those.
+    //
+    // The sequence alone is enough here, unlike the reorder and move paths, which also bracket their
+    // write with `writesInFlightRef`. Those two apply their optimistic update BEFORE the request, so
+    // a poll can land mid-flight with an answer the write has not reached yet. This callback fires
+    // only once the veto route has awaited `recordPickerVeto`, so the deferral is already durable
+    // when the sequence moves — and every later read sees it, because both `getBoard` and
+    // `getBoardVersion` read deferrals live rather than from the retained bead snapshot. There is no
+    // in-flight window left to suppress.
     writeSeqRef.current += 1;
     setBoard((prev) => {
       if (!prev) return prev;

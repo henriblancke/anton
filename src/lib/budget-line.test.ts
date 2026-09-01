@@ -35,9 +35,21 @@ const queue = (n: number) => Array.from({ length: n }, () => ({}));
 
 describe("budgetLine", () => {
   it("places the line where the session headroom runs out", () => {
-    // 50% headroom at 20% a run: two fit, the third overruns.
+    // 50% headroom at 20% a run: two fit outright and the third crosses — the governor starts it
+    // anyway, so the line falls after it.
     expect(budgetLine(signal(), queue(5))).toEqual({
-      affordable: 2,
+      affordable: 3,
+      reason: "session-headroom",
+      seeded: false,
+    });
+  });
+
+  it("counts the run that crosses the threshold — the governor admits it", () => {
+    // budgetGate reads the meter BEFORE a run starts and reserves nothing, so a run whose average
+    // is larger than what is left still gets started; only the one after it is held. A line drawn
+    // above it would mark work as waiting that anton is about to run.
+    expect(budgetLine(signal({ sessionPct: 5 }), queue(3))).toEqual({
+      affordable: 1,
       reason: "session-headroom",
       seeded: false,
     });
@@ -45,13 +57,13 @@ describe("budgetLine", () => {
 
   it("names the daytime reserve when that is the session-side hold", () => {
     const line = budgetLine(signal({ sessionPct: 10, sessionReason: "daytime-reserve" }), queue(3));
-    expect(line).toEqual({ affordable: 0, reason: "daytime-reserve", seeded: false });
+    expect(line).toEqual({ affordable: 1, reason: "daytime-reserve", seeded: false });
   });
 
   it("places the line on the weekly side when the weekly budget binds first", () => {
-    // Session affords five runs; the weekly allowance affords one.
+    // Session affords five runs; the weekly allowance (4 points, 3 a run) affords two.
     const line = budgetLine(signal({ sessionPct: 100, weeklyPct: 4 }), queue(5));
-    expect(line).toEqual({ affordable: 1, reason: "weekly-cap", seeded: false });
+    expect(line).toEqual({ affordable: 2, reason: "weekly-cap", seeded: false });
   });
 
   it("names the pace-line when the weekly hold is the throttle band", () => {
@@ -76,7 +88,7 @@ describe("budgetLine", () => {
       signal({ sessionPct: 10, sessionReason: "daytime-reserve", weeklyPct: 1 }),
       queue(2),
     );
-    expect(line).toEqual({ affordable: 0, reason: "weekly-cap", seeded: false });
+    expect(line).toEqual({ affordable: 1, reason: "weekly-cap", seeded: false });
   });
 
   it("puts the line above the whole queue when nothing is affordable now", () => {
@@ -115,7 +127,10 @@ describe("budgetLine", () => {
     });
 
     it("draws nothing for a queue that costs nothing", () => {
-      const free = signal({ sessionPct: 0, weeklyPct: 0 }, { sessionPct: 0, weeklyPct: 0 });
+      // Nothing charged can never exhaust a live budget, so there is no arithmetic to draw a line
+      // from. (An exhausted meter is the separate case above: there the governor holds regardless
+      // of what the queue costs.)
+      const free = signal({ sessionPct: 50, weeklyPct: 10 }, { sessionPct: 0, weeklyPct: 0 });
       expect(budgetLine(free, queue(3))).toBeNull();
     });
   });
@@ -128,15 +143,17 @@ describe("budgetLine", () => {
         "nightly-stringer": { sessionPct: 2, weeklyPct: 0.3, seeded: true },
       },
     };
-    // 2 + 2 + 20 = 24 fits; the second run target would take it to 44.
+    // 2 + 2 + 20 = 24 still fits under 25, so the second run target is the one that crosses — and
+    // the governor starts it, which leaves the third waiting.
     const entries = [
       { jobType: "nightly-stringer" },
       { jobType: "nightly-stringer" },
       {},
       {},
+      {},
     ];
     expect(budgetLine(mixed, entries)).toEqual({
-      affordable: 3,
+      affordable: 4,
       reason: "session-headroom",
       seeded: true,
     });

@@ -315,8 +315,9 @@ describe("the budget line in the Up Next lane", () => {
   }
 
   it("draws the dashed line where the remaining headroom runs out", async () => {
-    // 30% headroom at 20% a run: the first pick is affordable, the second is not.
-    stubFetch({ "/picker/budget": json(budgetSignal(30)) });
+    // 20% headroom at 20% a run: the first pick spends the last of it (the governor admits the run
+    // that crosses), so the second is the one waiting.
+    stubFetch({ "/picker/budget": json(budgetSignal(20)) });
     render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
 
     await waitFor(() => expect(screen.getByRole("separator")).toBeTruthy());

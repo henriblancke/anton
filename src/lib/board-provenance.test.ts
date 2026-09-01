@@ -109,6 +109,27 @@ describe("the picker's mark", () => {
       { kind: "policy", detail: "any claimable run target", stale: true },
     ]);
   });
+
+  /**
+   * The criterion is re-derived from the CURRENT policy and board, and stale says those are not the
+   * ones the pass decided from. A target still admitted — under a rule the operator saved after the
+   * pick — would otherwise get a badge linking history to a rule that never made it.
+   */
+  it("drops the criterion link on a stale plan, keeping the rule it was picked under", () => {
+    const target = bead({ id: "anton-1", issue_type: "bug", labels: ["severity:critical"] });
+    const policy: Policy = { types: ["bug"], labels: [{ namespace: "severity", values: ["critical"] }] };
+
+    const marks = boardProvenance({
+      board: [target],
+      plan: plan(),
+      policy,
+      planIsStale: true,
+    }).get("anton-1");
+
+    expect(marks).toEqual([
+      { kind: "policy", detail: "the work policy armed on this machine", stale: true },
+    ]);
+  });
 });
 
 describe("the product master's mark", () => {

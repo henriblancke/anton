@@ -56,7 +56,11 @@ export interface BudgetLineEntry {
 }
 
 export interface BudgetLine {
-  /** How many leading cards the remaining budget affords. `0` puts the line above the whole queue. */
+  /**
+   * How many leading cards the remaining budget affords — including the one that crosses the
+   * threshold, which the governor admits because it tests the meter before the run rather than
+   * reserving its cost. `0` puts the line above the whole queue.
+   */
   affordable: number;
   /** Which of the governor's holds the queue runs into — the reason the cards below are waiting. */
   reason: DeferReason;
@@ -90,12 +94,13 @@ export function budgetLine(
     const cost = burn[entry.jobType ?? RUN_JOB_TYPE];
     // A type this machine has no average for is a cost we would have to invent. Omit the line.
     if (!cost) return null;
-    session += cost.sessionPct;
-    weekly += cost.weeklyPct;
-    seeded ||= cost.seeded;
 
-    const overSession = session > headroom.sessionPct;
-    const overWeekly = headroom.weeklyPct !== null && weekly > headroom.weeklyPct;
+    // Admit first, charge second — the order the governor itself works in. `budgetGate` reads the
+    // meter BEFORE a run starts and reserves nothing, so the run that spends the last of the
+    // headroom is still admitted and only the one after it waits. Charging first would put the line
+    // one card too high, marking a card as waiting that anton is about to start.
+    const overSession = session >= headroom.sessionPct;
+    const overWeekly = headroom.weeklyPct !== null && weekly >= headroom.weeklyPct;
     if (overSession || overWeekly) {
       // budgetGate's order is session-headroom → weekly-cap → weekly-on-track → daytime-reserve, so
       // only the hard floor beats a weekly hold when both are exhausted.
@@ -107,6 +112,10 @@ export function budgetLine(
         seeded,
       };
     }
+
+    session += cost.sessionPct;
+    weekly += cost.weeklyPct;
+    seeded ||= cost.seeded;
   }
 
   return null;
