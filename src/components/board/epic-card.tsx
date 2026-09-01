@@ -17,12 +17,22 @@ import {
   agentDotClass,
   canStartRun,
   childReadinessCounts,
+  isPickerPick,
   ticketProgress,
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
+import { ProvenanceBadges } from "@/components/board/provenance-badge";
+import {
+  PickDecisionProvider,
+  useCardVeto,
+  usePickDecision,
+} from "@/components/board/pick-decision";
+import { ReleaseAction } from "@/components/board/release-action";
+import { NotNowChip } from "@/components/board/not-now-chip";
+import { VetoActions } from "@/components/board/veto-actions";
 import {
   AbandonedChip,
   BlockedChip,
@@ -45,13 +55,28 @@ function prLabel(ref: string): string {
  * confirmations. A feature is the tier anton runs, so a card must never call itself an epic. */
 const typeWord = (epic: Epic): string => TYPE_LABELS[epic.type].toLowerCase();
 
-export function EpicCard({
-  slug,
-  epic,
-  overlay = false,
-  budgetAware = false,
-  onDeleted,
-}: {
+/**
+ * A card the picker chose, on a surface with no lane row to answer it (the epic swimlanes, PR #212
+ * review): the card carries the pick's decision itself — the two vetoes beside `[Release]`, under
+ * one lock, exactly as an Up Next row does. Everywhere else this is the plain card.
+ *
+ * The provider has to sit OUTSIDE the card, not inside it, or the card's own approve would read the
+ * surrounding context instead of the lock it just created.
+ */
+export function EpicCard(props: EpicCardProps) {
+  const cardVeto = useCardVeto();
+  const { epic } = props;
+  const answerable =
+    cardVeto !== undefined && isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
+  if (!answerable) return <EpicCardBody {...props} />;
+  return (
+    <PickDecisionProvider>
+      <EpicCardBody {...props} cardVeto={cardVeto} />
+    </PickDecisionProvider>
+  );
+}
+
+type EpicCardProps = {
   slug: string;
   epic: Epic;
   overlay?: boolean;
@@ -62,6 +87,18 @@ export function EpicCard({
   budgetAware?: boolean;
   /** Fired after this epic is deleted so the board can drop it from its columns. */
   onDeleted?: (epicId: string) => void;
+};
+
+function EpicCardBody({
+  slug,
+  epic,
+  overlay = false,
+  budgetAware = false,
+  onDeleted,
+  cardVeto,
+}: EpicCardProps & {
+  /** Set when this card owns its pick's vetoes; where the hold they place is reported. */
+  cardVeto?: (beadId: string, untilMs: number) => void;
 }) {
   // Optimistic override only — the source of truth is `epic.approved`, which a later board poll
   // refreshes. Deriving from the prop (rather than seeding local state once) keeps the controls in
@@ -69,8 +106,18 @@ export function EpicCard({
   // immediately on our own click and reverts on failure.
   const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [approving, setApproving] = useState(false);
+  // Approved, but the enqueue threw — the target has no run and `showApprove`'s `!approved` gate
+  // would take the retry away the moment the board catches up (PR #212 review). Held here rather
+  // than inside `[Release]` because it is this gate, not the button, that hides it.
+  const [unrun, setUnrun] = useState(false);
   const approved = epic.approved || optimisticApproved;
   const word = typeWord(epic);
+  // Approve/Queue are answers to the same pick the vetoes above a ranked card decline, so they take
+  // the same lock `[Release]` does (PR #212 review). Queue is the case that needs it most: it
+  // records no accept, so nothing downstream can settle the race for it — a queued run would sit on
+  // a target the operator deferred in the same breath. Outside Up Next there is no provider and the
+  // lock is a no-op, which is what leaves Backlog's single Approve untouched.
+  const decision = usePickDecision();
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -86,6 +133,7 @@ export function EpicCard({
   async function handleApprove(immediate = true) {
     // `immediate` is the run-directly choice (anton-y2ue): true → run now (bypass budget pacing),
     // false → queue for optimal usage. Defaults true so the single (non-budget-aware) button runs now.
+    if (!decision.claim()) return;
     setApproving(true);
     setOptimisticApproved(true);
     try {
@@ -98,12 +146,15 @@ export function EpicCard({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
+      decision.settle();
       toast.success(
         immediate ? `Approved & running "${epic.title}"` : `Queued "${epic.title}" for optimal usage`,
       );
       // The run starts with whatever thin sections it has; say so once, here.
       await toastContractAdvisory(res);
     } catch (err) {
+      // Nothing was approved, so the pick goes back on offer — including to the vetoes.
+      decision.abandon();
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : `Failed to approve ${word}`);
     } finally {
@@ -115,11 +166,17 @@ export function EpicCard({
   // fully blocked epic (nothing it would dispatch can run) must not be startable before its blocker
   // completes. A partially-gated one still is — mirrors the approve route, which gates on the same
   // verdict.
-  const showApprove = epic.stage === "backlog" && !approved && canStartRun(epic);
+  // `unrun` reopens it on an approved target: that approval started nothing, and approving again is
+  // what retries the enqueue.
+  const showApprove = epic.stage === "backlog" && (!approved || unrun) && canStartRun(epic);
   // A contract gap is the other reason a run can't start. It differs from a blocker in what it asks
   // of the founder — a blocker needs waiting, this needs a one-line edit — so the affordance stays in
   // place and names the missing section instead of disappearing (or 422ing on click).
   const contractBlocked = contractBlocks(epic.contract);
+  // The picker chose this target, so shadow mode offers it as a release rather than a plain approve.
+  // A target the operator has set aside keeps its plain Approve: [Release] on a card that reads "set
+  // aside · back in 4h" would offer the very start the veto just declined.
+  const picked = isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
   const { done, total, pct } = ticketProgress(epic);
   const isDone = epic.stage === "done";
 
@@ -225,12 +282,19 @@ export function EpicCard({
 
       <div className="flex flex-wrap gap-1.5">
         <TypeBadge type={epic.type} />
+        {/* Who put this card here, and why — the same grammar on every card that renders, not only
+            in Up Next (anton-cqxd). A done card carries none: the board attaches provenance only
+            while the answer still bears on whether the target should run. */}
+        <ProvenanceBadges slug={slug} beadId={epic.id} provenance={epic.provenance} />
         {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
         {epic.risk && <RiskChip risk={epic.risk} />}
         {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
         {/* Renders only once a review has actually scored this target (anton-tprv). */}
         <ReviewScoreChip score={epic.reviewScore} />
         <ContractChip contract={epic.contract} />
+        {/* A pick the operator set aside is SHOWN set aside — the veto's whole point is that
+            disagreeing does not make the card disappear (anton-jqvy). */}
+        {epic.notNowUntil !== undefined && <NotNowChip untilMs={epic.notNowUntil} />}
       </div>
 
       {epic.stage === "backlog" && !overlay && (
@@ -246,37 +310,62 @@ export function EpicCard({
           {showApprove &&
             (contractBlocked ? (
               <ApproveBlocked violations={epic.contract?.blocking ?? []} />
-            ) : budgetAware ? (
-              // Budget-aware: let the operator run now or hand the run to the governor's pace-line.
-              <span className="pointer-events-auto flex items-center gap-1">
-                <Button
-                  size="xs"
-                  variant="outline"
-                  onClick={() => handleApprove(false)}
-                  disabled={approving}
-                  title="Queue this run for the budget governor to pace against the weekly plan"
-                >
-                  Queue
-                </Button>
-                <Button
-                  size="xs"
-                  onClick={() => handleApprove(true)}
-                  disabled={approving}
-                  title="Approve and run now, bypassing budget pacing (the session limit still applies)"
-                >
-                  {approving ? "…" : "Approve"}
-                </Button>
-              </span>
             ) : (
-              <Button
-                size="xs"
-                onClick={() => handleApprove()}
-                disabled={approving}
-                className="pointer-events-auto"
-              >
-                {approving ? "Approving…" : "Approve"}
-              </Button>
+              <span className="pointer-events-auto flex items-center gap-1">
+                {/* Budget-aware: the operator can still hand this run to the governor's pace-line
+                    instead of starting it. Release is always the immediate half, so the two never
+                    make the same promise twice. */}
+                {budgetAware && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => handleApprove(false)}
+                    disabled={approving || decision.state !== "open"}
+                    title="Queue this run for the budget governor to pace against the weekly plan"
+                  >
+                    Queue
+                  </Button>
+                )}
+                {/* A card the picker chose is started with [Release], not Approve (anton-d2h6 /
+                    R3.5): same route, same gates, same run — plus the accept that turns the
+                    operator's agreement into evidence. One button, never two, so the card never
+                    offers two answers to "start this". */}
+                {picked ? (
+                  <ReleaseAction
+                    slug={slug}
+                    beadId={epic.id}
+                    title={epic.title}
+                    disabled={approving}
+                    onReleased={() => {
+                      setUnrun(false);
+                      setOptimisticApproved(true);
+                    }}
+                    onApprovedWithoutRun={() => setUnrun(true)}
+                  />
+                ) : (
+                  <Button
+                    size="xs"
+                    onClick={() => handleApprove(true)}
+                    disabled={approving || decision.state !== "open"}
+                    title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+                  >
+                    {approving ? "Approving…" : "Approve"}
+                  </Button>
+                )}
+              </span>
             ))}
+          {/* The two ways to disagree with the pick (R3.9), on the card because this surface has no
+              row to put them on. Same lock as the Release beside them: one answer per pick. */}
+          {cardVeto && picked && (
+            <VetoActions
+              slug={slug}
+              beadId={epic.id}
+              {...(decision.planId === undefined ? {} : { planId: decision.planId })}
+              title={epic.title}
+              className="pointer-events-auto"
+              onVetoed={(untilMs) => cardVeto(epic.id, untilMs)}
+            />
+          )}
           <ConfirmDeleteButton
             onConfirm={handleDelete}
             iconOnly

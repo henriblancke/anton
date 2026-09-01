@@ -175,6 +175,7 @@ describe("board stamp", () => {
 describe("staleness", () => {
   const plan = {
     projectId: "p1",
+    planId: "plan-1",
     generatedAt: Math.floor(NOW / 1000),
     stamp: stampBoard([bead()], OBSERVED),
     entries: [entry()],
@@ -208,6 +209,105 @@ describe("staleness", () => {
     const shapedPlan = { ...plan, stamp: stampBoard(before, OBSERVED) };
 
     expect(isPlanStale(shapedPlan, stampBoard(after, OBSERVED + 1))).toBe(true);
+  });
+
+  /**
+   * The other half of the decision. An operator editing `pickerPolicy` changes who may be started
+   * without touching a bead, so a fence over the beads alone would keep calling the old plan current
+   * — and the lane would go on offering a start the new policy refuses until the next pass ran.
+   */
+  it("catches a policy saved after the plan was computed", () => {
+    const board = [bead()];
+    const unarmed = { ...plan, stamp: stampBoard(board, OBSERVED) };
+
+    expect(isPlanStale(unarmed, stampBoard(board, OBSERVED + 1, { types: ["bug"] }))).toBe(true);
+  });
+
+  it("holds still when the policy is re-saved unchanged", () => {
+    const board = [bead()];
+    const policy = { types: ["feature", "bug"], labels: [{ namespace: "domain", values: ["eng"] }] };
+    const armed = { ...plan, stamp: stampBoard(board, OBSERVED, policy) };
+
+    // Same criteria, authored in another order — the same policy, so the same fence.
+    const resaved = {
+      types: ["bug", "feature"],
+      labels: [{ namespace: "domain", values: ["eng"] }],
+    };
+    expect(isPlanStale(armed, stampBoard(board, OBSERVED + 1, resaved))).toBe(false);
+  });
+
+  it("catches an armed policy being cleared", () => {
+    const board = [bead()];
+    const armed = { ...plan, stamp: stampBoard(board, OBSERVED, { types: ["feature"] }) };
+
+    expect(isPlanStale(armed, stampBoard(board, OBSERVED + 1))).toBe(true);
+  });
+
+  /**
+   * The third decision input, and the only one no digest can carry: a deferral is anton's own state
+   * with a wall-clock expiry, so a hold running out re-admits a target while every hashed input sits
+   * still. Without this the re-eligible bead would stay out of Up Next — and unstartable there —
+   * until the next scheduled pass rewrote the plan.
+   */
+  describe("deferrals", () => {
+    const held = {
+      ...plan,
+      exclusions: [{ beadId: "anton-b", reason: "deferred" as const, detail: "you set this aside" }],
+    };
+    const current = stampBoard([bead()], OBSERVED + 1);
+
+    it("holds still while the hold the pass acted on is still held", () => {
+      expect(isPlanStale(held, current, new Map([["anton-b", NOW + 86_400_000]]))).toBe(false);
+    });
+
+    it("goes stale once a target it set aside is no longer deferred", () => {
+      expect(isPlanStale(held, current, new Map())).toBe(true);
+      expect(isPlanStale(held, current)).toBe(true);
+    });
+
+    it("ignores exclusions the operator never made — those are the board's own answer", () => {
+      const blocked = {
+        ...plan,
+        exclusions: [{ beadId: "anton-b", reason: "blocked" as const }],
+      };
+
+      expect(isPlanStale(blocked, current, new Map())).toBe(false);
+    });
+  });
+
+  /**
+   * The same rule, for the window in which NO PASS RUNS (PR #212 review). The exclusion above is
+   * written by a later pass; with the picker disarmed or failing for the whole deferral window there
+   * is no such pass, so the vetoed target is still an ENTRY. Left to the exclusion rule alone, the
+   * generation would read current again the moment the hold lapsed and re-offer the pick under the
+   * very plan id whose decline stops `recordPickerAccept` recording the release — a start that
+   * silently teaches the track record nothing.
+   */
+  describe("declines against this generation", () => {
+    const current = stampBoard([bead()], OBSERVED + 1);
+    const vetoed = new Set(["anton-a"]);
+
+    it("holds still while the hold that veto placed is still running", () => {
+      const held = new Map([["anton-a", NOW + 86_400_000]]);
+
+      expect(isPlanStale(plan, current, held, vetoed)).toBe(false);
+    });
+
+    it("retires the generation once that hold runs out, with no pass in between", () => {
+      expect(isPlanStale(plan, current, new Map(), vetoed)).toBe(true);
+      expect(isPlanStale(plan, current, undefined, vetoed)).toBe(true);
+    });
+
+    it("ignores a decline against a target this plan does not pick", () => {
+      expect(isPlanStale(plan, current, new Map(), new Set(["anton-z"]))).toBe(false);
+    });
+
+    // The caller keys the set on THIS plan id, so an earlier generation's decline never reaches
+    // here — but the predicate must also stand on its own when no caller supplies one.
+    it("holds still when nothing declined it", () => {
+      expect(isPlanStale(plan, current, new Map(), new Set())).toBe(false);
+      expect(isPlanStale(plan, current)).toBe(false);
+    });
   });
 });
 
@@ -352,6 +452,59 @@ describe("plan storage", () => {
 
     expect(second.entriesJson).toBe(first.entriesJson);
     expect(second.exclusionsJson).toBe(first.exclusionsJson);
+  });
+
+  /**
+   * The plan's own identity, which is what a verdict answers (PR #212 review). The board digest
+   * cannot serve: it describes the decision INPUTS, so a pass that re-admits a target once its veto
+   * expires stamps the same digest the decline was filed against, and the new pick would inherit the
+   * old answer.
+   */
+  describe("the plan's generation id", () => {
+    it("carries over while the pass keeps deciding the same plan", async () => {
+      const input = { projectId, stamp: stamp(), entries: [entry()], exclusions: [excluded()] };
+
+      await saveBoardPickerPlan(tdb.db, clock, input);
+      const first = (await getBoardPickerPlan(tdb.db, projectId))!.planId;
+      await saveBoardPickerPlan(tdb.db, clock, input);
+
+      expect(first).not.toBe("");
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).toBe(first);
+    });
+
+    it("is minted afresh the moment the pass decides differently", async () => {
+      await saveBoardPickerPlan(tdb.db, clock, { projectId, stamp: stamp(), entries: [entry()], exclusions: [] });
+      const first = (await getBoardPickerPlan(tdb.db, projectId))!.planId;
+
+      await saveBoardPickerPlan(tdb.db, clock, {
+        projectId,
+        stamp: stamp(),
+        entries: [entry({ beadId: "anton-b" })],
+        exclusions: [],
+      });
+
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).not.toBe(first);
+    });
+
+    // The regression this id exists for: veto → the window closes → the same target, ranked the same
+    // way, against a board and a policy nobody touched. Same digest, and it must NOT be the same pick.
+    it("never re-issues the id of a plan a veto has since answered", async () => {
+      const offered = { projectId, stamp: stamp(), entries: [entry()], exclusions: [] };
+      await saveBoardPickerPlan(tdb.db, clock, offered);
+      const before = (await getBoardPickerPlan(tdb.db, projectId))!.planId;
+
+      // The pass that sees the deferral: the target drops out of the ranking and is named as held.
+      await saveBoardPickerPlan(tdb.db, clock, {
+        projectId,
+        stamp: stamp(),
+        entries: [],
+        exclusions: [excluded({ beadId: "anton-a", reason: "deferred", detail: "vetoed" })],
+      });
+      // And the pass after the window closes, over the very same board.
+      await saveBoardPickerPlan(tdb.db, clock, offered);
+
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).not.toBe(before);
+    });
   });
 
   it("degrades a corrupt blob to nothing recorded, leaving the count to show the discrepancy", async () => {

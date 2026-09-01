@@ -10,10 +10,13 @@
  * It composes rather than re-derives, in the order the answer narrows:
  *
  *   1. {@link eligibleTargets} — the structural claimable set, plus a stated reason per refusal.
- *   2. the {@link PickerPolicy} — the standing approval, narrowing that set. A refusal here is a
+ *   2. the operator's VETOES ({@link PickerRuntime.deferrals}, anton-jqvy) — a target set aside by
+ *      hand leaves the plan as `deferred` before any rule is consulted, because "you said not now"
+ *      and "your policy refuses this" are different answers and only one of them is theirs.
+ *   3. the {@link PickerPolicy} — the standing approval, narrowing that set. A refusal here is a
  *      `policy` exclusion, so "why not this one?" stays answerable for a bead the board would have
  *      allowed but the operator's rule does not.
- *   3. {@link rankTargets} — the PRIME order over what survived.
+ *   4. {@link rankTargets} — the PRIME order over what survived.
  *
  * The result is the plan `saveBoardPickerPlan` records verbatim: the pass decides once and the
  * surfaces read it, rather than three of them re-ranking a board that moves between them.
@@ -27,6 +30,7 @@ import {
   type PickerExclusion,
   type PickerPlanEntry,
 } from "../board-picker-plan";
+import type { Policy } from "../policy/types";
 import { eligibleTargets } from "./picker-targets";
 
 /**
@@ -66,14 +70,25 @@ export const ADMIT_ALL_POLICY: PickerPolicy = {
 /**
  * The pass's runtime state — the facts about anton itself, as opposed to the board or the policy.
  *
- * Only the observation instant today, and deliberately passed in rather than read here: a decision
- * that called the clock would not be a function of its inputs, and the stamp is what makes a
- * recorded plan's staleness detectable. WIP, quota and breaker state join it in the brakes feature,
- * which is what needs them — this pass starts nothing, so nothing here can be over budget.
+ * The observation instant and the operator's live vetoes, and both deliberately passed in rather
+ * than read here: a decision that called the clock or the store would not be a function of its
+ * inputs, and the stamp is what makes a recorded plan's staleness detectable. WIP, quota and breaker
+ * state join them in the brakes feature, which is what needs them — this pass starts nothing, so
+ * nothing here can be over budget.
  */
 export interface PickerRuntime {
   /** When the board snapshot was read (epoch ms), in the gardener's `observedAtMs` sense. */
   observedAtMs: number;
+  /**
+   * Targets the operator vetoed, bead id → when the deferral expires (epoch ms) — the pass's own
+   * state, resolved by the caller from `picker-veto.ts` exactly as the policy is resolved from
+   * settings. Absent means nothing is deferred.
+   *
+   * Held as a map rather than a set so the exclusion can say until WHEN: "not now" is a pacing
+   * answer with a bound, and an exclusion that stated only the fact would leave the lane unable to
+   * tell a deferred target from a vanished one.
+   */
+  deferrals?: ReadonlyMap<string, number>;
 }
 
 /** What one pass decided — exactly the plan {@link saveBoardPickerPlan} persists. */
@@ -88,6 +103,13 @@ export interface BoardPickerDecision {
 export function decideBoardPickerPlan(input: {
   board: Bead[];
   policy: PickerPolicy;
+  /**
+   * The AUTHORED policy behind {@link input.policy}, when the project has armed one — carried only
+   * so the recorded fence covers it ({@link stampBoard}). Separate from the predicate because they
+   * answer different questions: one admits a target, the other says WHICH revision of the operator's
+   * rules did, which is what makes a plan detectably out of date after a settings edit.
+   */
+  armedPolicy?: Policy;
   runtime: PickerRuntime;
 }): BoardPickerDecision {
   const { eligible, exclusions } = eligibleTargets(input.board);
@@ -95,7 +117,22 @@ export function decideBoardPickerPlan(input: {
   const admitted: Bead[] = [];
   const ruleFor = new Map<string, string>();
   const refused: PickerExclusion[] = [...exclusions];
+  const deferrals = input.runtime.deferrals;
   for (const target of eligible) {
+    // The operator's own answer outranks the policy's (anton-jqvy). Tested BEFORE admission so a
+    // vetoed target reads as `deferred` rather than as whatever the rule would have said about it —
+    // "you said not now" and "your policy refuses this" are different answers to "why not this one?",
+    // and only one of them is the operator's.
+    const until = deferrals?.get(target.id);
+    if (until !== undefined) {
+      refused.push({
+        beadId: target.id,
+        reason: "deferred",
+        detail: `you set this aside — anton offers it again after ${new Date(until).toISOString()}`,
+      });
+      continue;
+    }
+
     const verdict = input.policy.admits(target);
     if (!verdict.admitted) {
       refused.push({ beadId: target.id, reason: "policy", detail: verdict.detail });
@@ -117,7 +154,7 @@ export function decideBoardPickerPlan(input: {
   });
 
   return {
-    stamp: stampBoard(input.board, input.runtime.observedAtMs),
+    stamp: stampBoard(input.board, input.runtime.observedAtMs, input.armedPolicy),
     entries,
     exclusions: sortExclusions(refused),
   };

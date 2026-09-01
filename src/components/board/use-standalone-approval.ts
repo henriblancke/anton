@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import type { StandaloneItem } from "@/lib/types";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { usePickDecision } from "@/components/board/pick-decision";
 import { readAppliedSummary } from "@/components/board/proposal-applied";
 
 /**
@@ -33,8 +34,12 @@ export interface StandaloneApproval {
   deferred: boolean;
   /** An approve is in flight; the affordance disables rather than double-firing. */
   running: boolean;
+  /** This chip's pick is being answered — or has been — by another control on it. */
+  locked: boolean;
   /** `immediate`: true → run now (bypass budget pacing), false → queue for optimal usage. */
   approveRun: (immediate?: boolean) => Promise<void>;
+  /** Lock the chip's run affordance for an approval another control drove (the picker's [Release]). */
+  setApproved: () => void;
   /** Record a snooze toggle's result until the board's own poll reports it. */
   setDeferred: (deferred: boolean) => void;
 }
@@ -53,6 +58,11 @@ export function useStandaloneApproval(slug: string, item: StandaloneItem): Stand
   const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [running, setRunning] = useState(false);
   const [optimisticDeferred, setOptimisticDeferred] = useState<boolean | null>(null);
+  // Approve and Queue answer the same pick the vetoes above a ranked chip decline, so they take the
+  // lock `[Release]` takes (PR #212 review) — Queue especially, since it records no accept and so
+  // leaves nothing downstream to settle the race: without this it can queue a run on the very target
+  // the operator is deferring. Off a ranked chip there is no provider and the lock is a no-op.
+  const decision = usePickDecision();
 
   // Reconciled during render — the props-changed reset pattern, not an effect.
   if (optimisticDeferred !== null && optimisticDeferred === item.deferred) {
@@ -60,6 +70,7 @@ export function useStandaloneApproval(slug: string, item: StandaloneItem): Stand
   }
 
   async function approveRun(immediate = true) {
+    if (!decision.claim()) return;
     setRunning(true);
     setOptimisticApproved(true);
     try {
@@ -72,11 +83,14 @@ export function useStandaloneApproval(slug: string, item: StandaloneItem): Stand
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
+      decision.settle();
       const applied = await readAppliedSummary(res);
       toast.success(approveOutcomeMessage({ applied, immediate, title: item.title }));
       // The run starts with whatever thin sections it has; say so once, here.
       await toastContractAdvisory(res);
     } catch (err) {
+      // Nothing was approved, so the pick goes back on offer — including to the vetoes.
+      decision.abandon();
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : "Failed to approve run");
     } finally {
@@ -88,7 +102,9 @@ export function useStandaloneApproval(slug: string, item: StandaloneItem): Stand
     approved: item.approved || optimisticApproved,
     deferred: optimisticDeferred ?? item.deferred,
     running,
+    locked: decision.state !== "open",
     approveRun,
+    setApproved: () => setOptimisticApproved(true),
     setDeferred: setOptimisticDeferred,
   };
 }

@@ -18,11 +18,13 @@
  * db-injectable (like run-health) so the pass and its tests share one connection; the UI read path
  * goes through the shared anton.db.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
+import { policyDigest } from "./policy/digest";
+import type { Policy } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /**
@@ -41,6 +43,8 @@ import type { AntonDb, Clock } from "./jobs/queue";
  *   • `blocked`          — an unmet blocker on the `blocks` graph.
  *   • `approval-gap`     — fails one of the approve gate's four promises (`approval-gate.ts`).
  *   • `policy`           — structurally claimable, but the standing policy does not admit it.
+ *   • `deferred`         — the operator vetoed this pick (`picker-veto.ts`), and the bounded window
+ *                          they bought with it has not run out. Their answer, not a rule's.
  */
 export type PickerExclusionReason =
   | "not-a-run-target"
@@ -50,7 +54,8 @@ export type PickerExclusionReason =
   | "needs-human"
   | "blocked"
   | "approval-gap"
-  | "policy";
+  | "policy"
+  | "deferred";
 
 /** One target in the plan, at the position the ranking gave it. */
 export interface PickerPlanEntry {
@@ -74,8 +79,8 @@ export interface PickerExclusion {
 }
 
 /**
- * The board snapshot a plan was computed from, carried on the record so staleness is detectable
- * rather than assumed from the clock.
+ * The decision inputs a plan was computed from — the board snapshot AND the policy in force —
+ * carried on the record so staleness is detectable rather than assumed from the clock.
  */
 export interface BoardStamp {
   /**
@@ -83,7 +88,7 @@ export interface BoardStamp {
    * change to a bead counts as having happened "since we looked".
    */
   observedAtMs: number;
-  /** {@link stampBoard}'s digest over the snapshot. Two boards agree iff their digests do. */
+  /** {@link stampBoard}'s digest over those inputs. Two reads agree iff their digests do. */
   digest: string;
   /** How many beads the digest covers. */
   beadCount: number;
@@ -91,6 +96,11 @@ export interface BoardStamp {
 
 export interface BoardPickerPlan {
   projectId: string;
+  /**
+   * Identity of this GENERATION of the plan — what a verdict names when it answers one of its picks
+   * ({@link planIdFor}).
+   */
+  planId: string;
   /** The picker job that produced it; absent for a plan written outside the job (tests). */
   jobId?: string;
   /** Unix seconds, matching every other timestamp this app hands the UI. */
@@ -161,12 +171,19 @@ function digestLine(bead: Bead): string {
 }
 
 /**
- * Stamp a board snapshot. Order-independent — the lines are sorted before hashing — because two
- * reads of an unchanged board may return the beads in any order, and a stamp that disagreed with
- * itself over that would report every plan stale.
+ * Stamp the inputs one decision was made from. Order-independent — the lines are sorted before
+ * hashing — because two reads of an unchanged board may return the beads in any order, and a stamp
+ * that disagreed with itself over that would report every plan stale.
+ *
+ * The armed POLICY is hashed alongside the beads (anton-t9m4 review): admission is a function of
+ * both, so an operator who narrows `pickerPolicy` without touching a bead has invalidated the plan
+ * just as surely as a claim would have. A fence over the beads alone would keep offering a start the
+ * new policy refuses until the next pass ran. Absent means the project has armed none, which is its
+ * own state and digests differently from any policy.
  */
-export function stampBoard(board: Bead[], observedAtMs: number): BoardStamp {
+export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy): BoardStamp {
   const hash = createHash("sha256");
+  hash.update(`policy\t${policyDigest(policy)}\n`);
   for (const line of board.map(digestLine).sort()) hash.update(`${line}\n`);
   return {
     observedAtMs,
@@ -182,9 +199,34 @@ export function stampBoard(board: Bead[], observedAtMs: number): BoardStamp {
  * touched is still the current answer, and a plan computed a second ago against a board that has
  * since moved is not. The lane must show the second one as stale rather than present a ranking of
  * beads whose state it no longer describes.
+ *
+ * The operator's live vetoes are the third decision input, and the ONLY one the digest cannot carry:
+ * a deferral is anton's own state with a wall-clock expiry, not a bead field, so a hold running out
+ * re-admits a target while every hashed input sits still. A plan is therefore also stale once a
+ * target it set aside as `deferred` is no longer held — otherwise the newly eligible bead would stay
+ * out of Up Next until the next scheduled pass rewrote the plan. A veto ARRIVING needs no such fence:
+ * the lane subtracts live deferrals from the plan it reads (`upNextEntries`), which is a narrower and
+ * faster answer than withholding the whole ranking.
+ *
+ * `declined` closes that same rule's gap when NO PASS RUNS (PR #212 review). The rule above reads the
+ * exclusion a later pass wrote, so it fires only if a pass got to rewrite the plan; with the picker
+ * disarmed or failing for the whole window, the vetoed target is still an ENTRY here and the plan
+ * reads current again the moment its hold lapses. It would then be re-offered under the very
+ * generation whose decline makes `recordPickerAccept` refuse the release's accept — a start with no
+ * evidence, skewing the track record earned autonomy reads. So a decline recorded against THIS
+ * generation retires it as soon as the hold it placed runs out, whether or not a pass observed the
+ * veto. While the hold is live nothing changes: the lane still subtracts that one card.
  */
-export function isPlanStale(plan: BoardPickerPlan, current: BoardStamp): boolean {
-  return plan.stamp.digest !== current.digest;
+export function isPlanStale(
+  plan: BoardPickerPlan,
+  current: BoardStamp,
+  deferrals?: ReadonlyMap<string, number>,
+  declined?: ReadonlySet<string>,
+): boolean {
+  if (plan.stamp.digest !== current.digest) return true;
+  const lapsed = (beadId: string) => !deferrals?.has(beadId);
+  if (plan.exclusions.some((x) => x.reason === "deferred" && lapsed(x.beadId))) return true;
+  return plan.entries.some((e) => declined?.has(e.beadId) && lapsed(e.beadId));
 }
 
 /**
@@ -217,6 +259,48 @@ function toEpoch(value: unknown): number {
 }
 
 /**
+ * The identity of the plan generation being saved — the name a verdict records when it answers one
+ * of this plan's picks (`picker-veto.ts`).
+ *
+ * NOT the board digest, and that is the whole point (PR #212 review). The digest covers the decision
+ * INPUTS — the board and the armed policy — so it is legitimately REUSABLE: a target vetoed on
+ * Monday is re-admitted by a later pass over a board and a policy nobody has touched, and that pass
+ * stamps a byte-identical digest. A verdict keyed to it would make the new pick inherit the old
+ * decline, so the release would start the run and record no accept, quietly skewing the track record
+ * earned autonomy reads.
+ *
+ * Carried over when the pass re-decides the SAME plan, though — the digest, the ranking and the
+ * exclusions all unchanged. The accept and the veto are written by two routes that each read the
+ * plan for themselves, and a fresh id on every ten-minute no-op tick would let a rerun landing
+ * between those two reads hand them different names for one pick, which is exactly the collision
+ * `pickAlreadyAnswered` exists to catch. A veto changes the exclusions, so the pass that re-admits
+ * the target after the window closes is never mistaken for the one that offered it before.
+ */
+async function planIdFor(
+  db: AntonDb,
+  projectId: string,
+  decided: { boardDigest: string; entriesJson: string; exclusionsJson: string },
+): Promise<string> {
+  const [prev] = await db
+    .select({
+      planId: schema.boardPickerPlans.planId,
+      boardDigest: schema.boardPickerPlans.boardDigest,
+      entriesJson: schema.boardPickerPlans.entriesJson,
+      exclusionsJson: schema.boardPickerPlans.exclusionsJson,
+    })
+    .from(schema.boardPickerPlans)
+    .where(eq(schema.boardPickerPlans.projectId, projectId))
+    .limit(1);
+  const unchanged =
+    prev !== undefined &&
+    prev.planId !== "" &&
+    prev.boardDigest === decided.boardDigest &&
+    prev.entriesJson === decided.entriesJson &&
+    prev.exclusionsJson === decided.exclusionsJson;
+  return unchanged ? prev.planId : randomUUID();
+}
+
+/**
  * Write the project's plan, replacing the previous one. One row per project by construction, so
  * this is an upsert rather than an append — a pass that admits nothing stores an empty plan, which
  * is the signal "decided, nothing to start" and NOT "never ran".
@@ -236,16 +320,20 @@ export async function saveBoardPickerPlan(
   // assigned means a caller that built the list some other way still records the queue it decided.
   const entries = [...input.entries].sort((a, b) => a.rank - b.rank);
   const exclusions = sortExclusions(input.exclusions);
+  const decided = {
+    boardDigest: input.stamp.digest,
+    entriesJson: JSON.stringify(entries),
+    exclusionsJson: JSON.stringify(exclusions),
+  };
   const row = {
     projectId: input.projectId,
     jobId: input.jobId ?? null,
+    planId: await planIdFor(db, input.projectId, decided),
     generatedAt: secDate(clock.now()),
-    boardDigest: input.stamp.digest,
     boardObservedAtMs: input.stamp.observedAtMs,
     boardBeadCount: input.stamp.beadCount,
-    entriesJson: JSON.stringify(entries),
-    exclusionsJson: JSON.stringify(exclusions),
     targetCount: entries.length,
+    ...decided,
   };
   await db
     .insert(schema.boardPickerPlans)
@@ -278,6 +366,7 @@ export async function getBoardPickerPlan(
   if (!row) return undefined;
   return {
     projectId: row.projectId,
+    planId: row.planId,
     jobId: row.jobId ?? undefined,
     generatedAt: toEpoch(row.generatedAt),
     stamp: {

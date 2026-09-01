@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { TriangleAlertIcon } from "lucide-react";
@@ -37,12 +37,17 @@ import {
   filterBoard,
   groupBoardByEpic,
   moveEpicBetweenColumns,
+  reorderPriority,
+  reorderUpNextEntries,
   sortEpics,
+  takeUpNext,
   type BoardSort,
 } from "@/components/board/board-utils";
 import { BoardFilters } from "@/components/board/board-filters";
 import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
+import { PlanGenerationProvider } from "@/components/board/pick-decision";
+import { UpNextLane } from "@/components/board/up-next-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
@@ -53,8 +58,18 @@ import {
 import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
+import { PRIORITY_LABELS } from "@/components/ticket/ticket-dialog-utils";
+import { cn } from "@/lib/utils";
 
 const BOARD_SORTS: BoardSort[] = ["default", "risk", "size"];
+
+/** Stand-in stage map for the render before a board has landed — nothing here mutates it. */
+const NO_COLUMNS: Record<Stage, Epic[]> = Object.freeze({
+  backlog: [],
+  implementing: [],
+  "in-review": [],
+  done: [],
+}) as Record<Stage, Epic[]>;
 
 const sortSelectClassName =
   "h-8 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
@@ -125,22 +140,56 @@ export function EpicBoard({
   const draggingRef = useRef(false);
   const versionRef = useRef(initialBoard?.version);
   const loadingRef = useRef(false);
+  // Bumped as each board write settles. A poll fetched against the PRE-write version is answered on
+  // the route's non-blocking path with the retained pre-write board stamped with the version the
+  // write already advanced to — believing that after the write restores both the stale board and a
+  // token the next poll 304s on, silently undoing the drag. Comparing the sequence a poll left with
+  // against the current one discards exactly those.
+  const writeSeqRef = useRef(0);
+  // Board writes currently in flight. The sequence above only catches polls that land AFTER a write
+  // settles; one that lands DURING it is just as stale — the drag is optimistic-only until the PATCH
+  // returns, and the reorder path has no authoritative board to re-adopt afterwards, so accepting
+  // that poll reverts the lane on screen until the next beat. Suppress for the whole write instead.
+  const writesInFlightRef = useRef(0);
+  // One lane reorder at a time (PR #212 review). Suppressing polls is not enough: a second drop
+  // applied optimistically while the first PATCH is out is erased by the first's rollback, and its
+  // own success reconciles nothing — the lane would show an order neither write asked for. The ref
+  // refuses the second drop synchronously; the state disables the lane's handles so it can't start.
+  const reorderingRef = useRef(false);
+  const [reordering, setReordering] = useState(false);
+  // The live `load`, so a write that invalidates more than it can reconcile itself (a lane reorder,
+  // which retires the whole recorded plan server-side) can re-read the board on its own settle
+  // instead of leaving a stale surface up for a poll interval.
+  const loadRef = useRef<((force?: boolean) => Promise<void>) | undefined>(undefined);
+  const queuedForceRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     async function load(force = false) {
-      if (loadingRef.current) return;
+      if (loadingRef.current) {
+        // A forced read is never dropped on the floor: the poll already in flight left before the
+        // write and its answer will be discarded on `writeSeq`, so returning here would leave
+        // nobody to re-read. Run it once that one settles.
+        if (force) queuedForceRef.current = true;
+        return;
+      }
       loadingRef.current = true;
       try {
         const version = versionRef.current;
+        const writeSeq = writeSeqRef.current;
         const suffix = !force && version !== undefined ? `?version=${encodeURIComponent(version)}` : "";
         const res = await fetch(`/api/projects/${slug}/board${suffix}`);
         if (res.status === 304) return;
         if (!res.ok) throw new Error(`Failed to load board (${res.status})`);
         const data = (await res.json()) as { board: Board };
-        if (!cancelled && !draggingRef.current) {
+        if (
+          !cancelled &&
+          !draggingRef.current &&
+          writesInFlightRef.current === 0 &&
+          writeSeq === writeSeqRef.current
+        ) {
           versionRef.current = data.board.version;
           setBoard(data.board);
           setError(null);
@@ -157,12 +206,20 @@ export function EpicBoard({
         }
       } finally {
         loadingRef.current = false;
+        if (queuedForceRef.current && !cancelled) {
+          queuedForceRef.current = false;
+          await load(true);
+        }
       }
     }
+    loadRef.current = load;
 
     async function poll() {
-      // Skip work while the tab is hidden or a card is being dragged; keep the loop alive.
-      if (document.visibilityState === "visible" && !draggingRef.current) await load();
+      // Skip work while the tab is hidden, a card is being dragged, or a write is settling; keep
+      // the loop alive.
+      if (document.visibilityState === "visible" && !draggingRef.current && writesInFlightRef.current === 0) {
+        await load();
+      }
       if (!cancelled) timer = setTimeout(() => void poll(), BOARD_POLL_MS);
     }
 
@@ -178,10 +235,31 @@ export function EpicBoard({
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
+      queuedForceRef.current = false;
+      loadRef.current = undefined;
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [slug, attempt, initialBoard]);
+
+  /**
+   * Adopt a REFRESHED server board. `board` is seeded from `initialBoard` once and client-owned
+   * after that, so a `router.refresh()` — how `[Release]` answers a lost claim race, and how the
+   * ticket dialog answers a save — re-renders the page for nothing: the stale card keeps offering a
+   * pick that already 409s until the next beat. The refreshed prop IS the authoritative read, so
+   * take it directly rather than spending a second fetch on the same answer.
+   *
+   * The mount value is skipped (it already seeded state), and an interaction in flight wins: its own
+   * settle has the last word on the board it is optimistically showing.
+   */
+  const seededBoardRef = useRef(initialBoard);
+  useEffect(() => {
+    if (initialBoard === null || initialBoard === seededBoardRef.current) return;
+    seededBoardRef.current = initialBoard;
+    if (draggingRef.current || writesInFlightRef.current > 0) return;
+    versionRef.current = initialBoard.version;
+    setBoard(initialBoard);
+  }, [initialBoard]);
 
   // A re-arm ends in router.refresh(), which re-renders the page and hands down a FRESH read. Drop
   // the polled answer whenever that happens, so the band clears on the click that cleared the latch
@@ -258,6 +336,39 @@ export function EpicBoard({
     ) as Record<Stage, Epic[]>;
   }, [narrowed, sort]);
 
+  // The Up Next lane and the Backlog it was taken out of (anton-t9m4). Computed on the SORTED,
+  // narrowed board so the lane obeys the same filters as everything else, and subtracted rather than
+  // overlaid so no bead renders twice (R3.3). Only in the stage view: the lane is a column position
+  // between Backlog and Implementing, and the epic swimlanes group by product rather than by stage —
+  // so there the cards stay in Backlog, where they still appear exactly once. They are still PICKS
+  // there, mark and all, so the grouped view carries the plan's generation itself
+  // (`PlanGenerationProvider` below) rather than losing it with the lane.
+  const upNext = useMemo(
+    () =>
+      takeUpNext(
+        sortedColumns ?? NO_COLUMNS,
+        narrowed?.standalone,
+        grouping === "stage" ? board?.upNext : undefined,
+      ),
+    [sortedColumns, narrowed, grouping, board?.upNext],
+  );
+  // The same ranking, UNFILTERED — what the lane places its budget line on. `upNext.cards` is only
+  // what the narrowing left, and a hidden pick still spends the quota: charging the visible cards
+  // from zero would show a target as affordable that the whole plan puts below the line.
+  const upNextPlan = useMemo(
+    () =>
+      grouping === "stage" && board
+        ? takeUpNext(board.columns, board.standalone, board.upNext).cards.map(
+            (card) => card.entry.beadId,
+          )
+        : [],
+    [grouping, board],
+  );
+  // An empty lane is worse than none: with no plan recorded — or a picker the operator disarmed —
+  // "Up Next" with nothing under it reads as "anton has nothing to start" rather than "no pass is
+  // running here" (R3.4).
+  const hasUpNext = upNext.cards.length > 0;
+
   // The swimlanes are a regrouping of the very cards above — the sorted columns feed both views, so
   // a lane's cards carry the chosen sort and there is no second board to keep in step.
   const lanes = useMemo(
@@ -284,6 +395,172 @@ export function EpicBoard({
     });
   }
 
+  /**
+   * A target the operator just set aside (anton-jqvy / R3.9). Stamped locally so the card reads as
+   * deferred on the click that deferred it — the hold is server state, and the board's own poll is
+   * up to 30s away, which is long enough for an operator to click `not now` twice.
+   *
+   * It also leaves Up Next on that click. The lane is driven by the recorded plan, which the next
+   * picker pass rewrites up to ten minutes from now — so without this the declined target would keep
+   * its place in the ranking it was just refused a place in.
+   */
+  const handleVetoed = useCallback((beadId: string, untilMs: number) => {
+    // A veto is a board write like any other: the deferral it records moves the board version, so a
+    // poll that LEFT before it settled answers on the pre-veto board and would put the declined
+    // target back in the lane with its controls live — long enough (up to a beat) for the operator
+    // to decline the same pick twice. Bumping the sequence here discards exactly those.
+    //
+    // The sequence alone is enough here, unlike the reorder and move paths, which also bracket their
+    // write with `writesInFlightRef`. Those two apply their optimistic update BEFORE the request, so
+    // a poll can land mid-flight with an answer the write has not reached yet. This callback fires
+    // only once the veto route has awaited `recordPickerVeto`, so the deferral is already durable
+    // when the sequence moves — and every later read sees it, because both `getBoard` and
+    // `getBoardVersion` read deferrals live rather than from the retained bead snapshot. There is no
+    // in-flight window left to suppress.
+    writeSeqRef.current += 1;
+    setBoard((prev) => {
+      if (!prev) return prev;
+      const columns = { ...prev.columns };
+      const standalone = { ...prev.standalone };
+      for (const stage of STAGES) {
+        columns[stage] = (columns[stage] ?? []).map((e) =>
+          e.id === beadId ? { ...e, notNowUntil: untilMs } : e,
+        );
+        standalone[stage] = (standalone[stage] ?? []).map((i) =>
+          i.id === beadId ? { ...i, notNowUntil: untilMs } : i,
+        );
+      }
+      // The lane is ABSENT, never empty (types.ts): vetoing its last card drops it rather than
+      // leaving an "Up Next" heading over nothing, which reads as "anton has nothing to start".
+      const { upNext: ranked, ...rest } = prev;
+      const upNext = ranked?.filter((entry) => entry.beadId !== beadId);
+      return { ...rest, columns, standalone, ...(upNext?.length ? { upNext } : {}) };
+    });
+  }, []);
+
+  /**
+   * Reorder inside the Up Next lane (R3.8). The drop is persisted as the target's bead `priority` —
+   * the same channel product-master writes on — so there is no override state to reconcile and the
+   * correction reaches the next picker pass as ordinary board state.
+   *
+   * A drop the priority channel cannot express — a reorder inside one band, or a slot the picker's
+   * own tiebreak would take back — writes nothing and says so. Silently accepting it would teach the
+   * operator the lane holds an order it does not.
+   */
+  async function reorderUpNext(beadId: string, overBeadId: string) {
+    if (!board) return;
+    // Serialized, not interleaved: this rollback restores the pre-drag ORDER, so a second reorder
+    // applied while the first is out would be undone by the first's failure even though its own
+    // write succeeded. The lane withdraws itself after a successful reorder anyway, so refusing the
+    // second drop costs a beat — where accepting it costs the operator an order nobody asked for.
+    if (reorderingRef.current) {
+      toast.message("One reorder at a time", {
+        description: "The last drop is still being written. Try again once it settles.",
+      });
+      return;
+    }
+    const card = upNext.cards.find((c) => c.entry.beadId === beadId);
+    if (!card) return;
+
+    const verdict = reorderPriority(
+      upNext.cards.map((c) => c.entry),
+      beadId,
+      overBeadId,
+    );
+    if (verdict.kind !== "write") {
+      toast.message(
+        verdict.kind === "settled" ? "Nothing to change" : "That order can't be written",
+        {
+          description:
+            verdict.kind === "settled"
+              ? "The plan already ranks this target where you dropped it."
+              : "Priority is the only channel a drag has, and no priority holds that slot — inside one band the picker ranks by how much open work each target unblocks, then by age.",
+        },
+      );
+      return;
+    }
+    const { priority } = verdict;
+
+    const title = card.kind === "epic" ? card.epic.title : card.item.title;
+    // Only the lane moves, and it moves on the LATEST board: a poll can land during the PATCH, and
+    // both writing and reverting a whole pre-drag snapshot would throw that poll's result away.
+    const previousUpNext = board.upNext;
+    reorderingRef.current = true;
+    setReordering(true);
+    writesInFlightRef.current += 1;
+    setBoard((prev) => {
+      if (!prev) return prev;
+      const { upNext: ranked, ...rest } = prev;
+      const upNext = reorderUpNextEntries(ranked ?? [], beadId, overBeadId, priority);
+      // Absent, never empty (types.ts). A reorder that finds nothing to move — the lane emptied
+      // under us between the drag and this update — must drop the key rather than project an
+      // "Up Next" heading over nothing.
+      return { ...rest, ...(upNext.length ? { upNext } : {}) };
+    });
+
+    // A standalone chip is a bead in its own right, so it patches through the ticket route; both
+    // routes validate the priority server-side (parseEpicPatch / parseTicketPatch).
+    const resource = card.kind === "epic" ? "epics" : "tickets";
+    let withdrew = false;
+    try {
+      const res = await fetch(`/api/projects/${slug}/${resource}/${beadId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ priority }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `Reorder failed (${res.status})`);
+      }
+      // The write advanced the snapshot version while RETAINING the pre-write beads, so a poll
+      // carrying the pre-write token would take the non-blocking path and serve that retained
+      // snapshot — re-showing the very order this drag just corrected (anton-4g35, for the
+      // stage-move path). Unlike the move endpoint, a priority PATCH answers with the epic/ticket
+      // detail rather than a board, so there is no authoritative version to adopt: drop the token
+      // instead, and the next poll asks versionlessly and takes the blocking, post-write path.
+      versionRef.current = undefined;
+      // A reprioritized bead is one the recorded plan no longer describes (isPlanStale), so the
+      // post-write board withholds the lane AND drops the live policy mark `[Release]` reads
+      // (isPickerPick). Both are re-read the moment this write settles (`withdrew` below) rather
+      // than at the next poll: for that whole beat the lane would otherwise go on offering Release
+      // against a plan the server has already invalidated, and that click starts an ordinary
+      // approval with none of the picker accept the button promises. Dropping the lane client-side
+      // is not enough — its cards would fall back into Backlog still carrying a live mark only the
+      // server can retire.
+      withdrew = true;
+      // Say what the withdrawal is, or it reads as the drag having failed.
+      toast.success(`Set "${title}" to ${PRIORITY_LABELS[priority]}`, {
+        description: "The lane re-ranks from it on the next board-picker pass.",
+      });
+    } catch (err) {
+      setBoard((prev) => {
+        if (!prev) return prev;
+        const { upNext: ranked, ...rest } = prev;
+        // Restore the pre-drag ORDER, not the pre-drag lane. A veto can land between the drop and
+        // this rollback and it drops its target from the lane; writing `previousUpNext` back whole
+        // would re-offer the pick the operator just declined until the next poll. Keep only what
+        // the current lane still ranks, so both updates stand.
+        const stillRanked = new Set((ranked ?? []).map((entry) => entry.beadId));
+        const restored = (previousUpNext ?? []).filter((entry) => stillRanked.has(entry.beadId));
+        return { ...rest, ...(restored.length ? { upNext: restored } : {}) };
+      });
+      toast.error(err instanceof Error ? err.message : "Failed to reorder");
+    } finally {
+      // Every poll that left before this point asked on the pre-write version, so its answer is
+      // about a board that no longer exists. Bump on failure too: a rejected PATCH is not proof the
+      // server wrote nothing. Order matters — the sequence takes over the moment the in-flight
+      // suppression lifts, so no poll slips between the two.
+      writeSeqRef.current += 1;
+      writesInFlightRef.current -= 1;
+      reorderingRef.current = false;
+      setReordering(false);
+    }
+
+    // After the sequence bump, never inside the write: a read issued before it would answer on the
+    // superseded `writeSeq` and be discarded by `load` — which is exactly the poll this replaces.
+    if (withdrew) await loadRef.current?.(true);
+  }
+
   async function handleDragEnd(event: DragEndEvent) {
     draggingRef.current = false;
     setActiveId(null);
@@ -291,7 +568,17 @@ export function EpicBoard({
     if (!board || !over) return;
 
     const epicId = String(active.id);
+    // Both ends inside the lane is a REORDER, not a move: Up Next is a ranking, so the drop changes
+    // the target's priority rather than its stage.
+    if (active.data.current?.upNext && over.data.current?.upNext) {
+      await reorderUpNext(epicId, String(over.id));
+      return;
+    }
+
     const toStage = over.id as Stage;
+    // The lane's cards are droppables too, so `over` is only a column when it says it is — a card
+    // dropped on a lane card from outside must not be read as a move to a stage named after a bead.
+    if (!STAGES.includes(toStage)) return;
     const fromStage = active.data.current?.stage as Stage | undefined;
     if (!fromStage || fromStage === toStage) return;
 
@@ -299,6 +586,7 @@ export function EpicBoard({
     if (!epic) return;
 
     const previous = board;
+    writesInFlightRef.current += 1;
     setBoard({ ...board, columns: moveEpicBetweenColumns(board.columns, epicId, toStage) });
 
     try {
@@ -326,6 +614,11 @@ export function EpicBoard({
     } catch (err) {
       setBoard(previous);
       toast.error(err instanceof Error ? err.message : "Failed to move card");
+    } finally {
+      // Same as the reorder path: a poll fetched against the pre-move version must not be believed
+      // now that the move has settled.
+      writeSeqRef.current += 1;
+      writesInFlightRef.current -= 1;
     }
   }
 
@@ -418,33 +711,64 @@ export function EpicBoard({
               No cards to group yet
             </p>
           ) : (
-            <div className="flex flex-col divide-y divide-border">
-              {lanes.map((lane) => (
-                <EpicLaneView
-                  key={lane.epic?.id ?? "no-epic"}
-                  slug={slug}
-                  lane={lane}
-                  budgetAware={budgetAware}
-                  onEpicDeleted={handleEpicDeleted}
-                  onOpenTicket={setOpenTicketId}
-                />
-              ))}
-            </div>
+            // The picks stay in their epic's Backlog slice here — no lane, so no row to carry the
+            // generation they were drawn from, and none to carry the vetoes either. The surface
+            // supplies both: without the generation `[Release]` would post an unnamed accept the
+            // server resolves against whatever plan is current by then, and without the veto sink
+            // this layout would offer the operator no way to REFUSE a pick at all (PR #212 review).
+            <PlanGenerationProvider
+              {...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId })}
+              onVetoed={handleVetoed}
+            >
+              <div className="flex flex-col divide-y divide-border">
+                {lanes.map((lane) => (
+                  <EpicLaneView
+                    key={lane.epic?.id ?? "no-epic"}
+                    slug={slug}
+                    lane={lane}
+                    budgetAware={budgetAware}
+                    onEpicDeleted={handleEpicDeleted}
+                    onOpenTicket={setOpenTicketId}
+                  />
+                ))}
+              </div>
+            </PlanGenerationProvider>
           )}
         </div>
       ) : (
-        <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+        <div
+          className={cn(
+            "grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2",
+            hasUpNext ? "xl:grid-cols-5" : "xl:grid-cols-4",
+          )}
+        >
           {STAGES.map((stage) => (
-            <BoardColumn
-              key={stage}
-              stage={stage}
-              epics={sortedColumns?.[stage] ?? []}
-              standalone={narrowed?.standalone[stage] ?? []}
-              slug={slug}
-              budgetAware={budgetAware}
-              onEpicDeleted={handleEpicDeleted}
-              onOpenTicket={setOpenTicketId}
-            />
+            <Fragment key={stage}>
+              <BoardColumn
+                stage={stage}
+                epics={upNext.columns[stage] ?? []}
+                standalone={upNext.standalone[stage] ?? []}
+                slug={slug}
+                budgetAware={budgetAware}
+                onEpicDeleted={handleEpicDeleted}
+                onOpenTicket={setOpenTicketId}
+              />
+              {/* Between Backlog and Implementing, never left of Backlog: flow direction is
+                  load-bearing, so a card must not move left as it advances (R3.1). */}
+              {stage === "backlog" && hasUpNext && (
+                <UpNextLane
+                  slug={slug}
+                  cards={upNext.cards}
+                  plan={upNextPlan}
+                  {...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId })}
+                  budgetAware={budgetAware}
+                  reordering={reordering}
+                  onEpicDeleted={handleEpicDeleted}
+                  onOpenTicket={setOpenTicketId}
+                  onVetoed={handleVetoed}
+                />
+              )}
+            </Fragment>
           ))}
         </div>
       )}
