@@ -12,7 +12,15 @@ import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
 import type { RunHealthFinding } from "../run-health";
 import type { RunRow } from "../runs";
-import { classifyFinding, escalationNote, usageWindowEnd, type UnstickContext } from "./unstick";
+import type { EscalationRow } from "../escalations";
+import { blockedByPoison, parkedOnGateClause } from "./errors";
+import {
+  classifyFinding,
+  escalationNote,
+  partitionOpenEscalations,
+  usageWindowEnd,
+  type UnstickContext,
+} from "./unstick";
 
 const NOW = 1_700_000_000_000;
 const HOUR = 3_600_000;
@@ -521,5 +529,81 @@ describe("escalationNote", () => {
     const note = escalationNote(finding({ reason: "parked:\n  agent exited 1\n" }), ESC_ID);
     expect(note).not.toContain("\n");
     expect(note).toContain("parked: agent exited 1");
+  });
+});
+
+/**
+ * Which open escalations a pass re-checks. The split is where "the report stopped carrying it"
+ * becomes a CANDIDATE for retirement rather than a verdict — get it wrong in either direction and
+ * the panel either nags about stalls that ended or silently dismisses ones that haven't.
+ */
+describe("partitionOpenEscalations", () => {
+  function row(kind: string, findingKey: string, reason = ""): EscalationRow {
+    return {
+      id: `esc-${findingKey}`,
+      projectId: "p1",
+      findingKey,
+      kind,
+      reason,
+      beadId: null,
+      epicBeadId: null,
+      runId: null,
+      jobId: null,
+      since: null,
+      evidenceJson: "{}",
+      status: "open",
+      resolution: null,
+      notedAt: null,
+      raisedAt: secDate(NOW),
+      updatedAt: secDate(NOW),
+    };
+  }
+
+  const reported = [finding({ key: "parked-run:r-1" })];
+  const ids = (rows: EscalationRow[]) => rows.map((r) => r.findingKey);
+
+  it("leaves a row the current report still carries to the finding loop", () => {
+    // Retiring it here would churn it settle-raise every pass: the loop re-raises it anyway.
+    const pending = partitionOpenEscalations([row("parked-run", "parked-run:r-1")], reported);
+    expect(ids(pending.endedStalls)).toEqual([]);
+    expect(ids(pending.blockedJobWaits)).toEqual([]);
+  });
+
+  it("makes a row the report dropped a candidate for the live re-check", () => {
+    const pending = partitionOpenEscalations([row("parked-run", "parked-run:r-2")], reported);
+    expect(ids(pending.endedStalls)).toEqual(["parked-run:r-2"]);
+  });
+
+  it("reconciles every gate wait, reported or not — nothing else can retire one", () => {
+    const wait = row("needs-human", "needs-human:g-1");
+    const stillReported = partitionOpenEscalations([wait], [finding({ key: "needs-human:g-1" })]);
+    expect(ids(stillReported.gateWaits)).toEqual(["needs-human:g-1"]);
+    const orphaned = partitionOpenEscalations([wait], reported);
+    expect(ids(orphaned.gateWaits)).toEqual(["needs-human:g-1"]);
+    // A gate wait is never an ended stall: the gate list, not a job read, is what retires it.
+    expect(ids(orphaned.endedStalls)).toEqual([]);
+  });
+
+  it.each([
+    ["a run that armed its own ask", parkedOnGateClause("g-1")],
+    ["a job refused behind someone else's gate", blockedByPoison("t-1", ["g-1"]).message],
+  ])("spots the exhausted-job row that is a gate's wait wearing a second face: %s", (_, reason) => {
+    const pending = partitionOpenEscalations(
+      [row("exhausted-job", "exhausted-job:j-1", reason)],
+      reported,
+    );
+    expect(ids(pending.blockedJobWaits)).toEqual(["exhausted-job:j-1"]);
+    // Kept in the general set too: once the gate is answered, only the job's own re-check can
+    // retire the row.
+    expect(ids(pending.endedStalls)).toEqual(["exhausted-job:j-1"]);
+  });
+
+  it("leaves an ordinary exhausted-job row to its own live re-check", () => {
+    const pending = partitionOpenEscalations(
+      [row("exhausted-job", "exhausted-job:j-2", "retries spent: agent exited 1")],
+      reported,
+    );
+    expect(ids(pending.blockedJobWaits)).toEqual([]);
+    expect(ids(pending.endedStalls)).toEqual(["exhausted-job:j-2"]);
   });
 });
