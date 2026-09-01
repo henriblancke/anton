@@ -377,14 +377,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // Force run, a resumed job queued before the label landed, an API enqueue. Poison, not retry:
     // no number of attempts turns human work into agent work, and parking puts it back in front of
     // the operator who has to do it.
-    if (beads.isHumanWork(target)) {
-      throw new PoisonEpic(
-        `target ${epicBeadId} is labelled ${LABELS.agentHuman} — a person executes this work, not ` +
-          `an agent, so it is never claimable and no run can deliver it. It stays on the board as ` +
-          `approved work waiting for an operator: do it by hand and close the bead, or drop the ` +
-          `label if an agent can in fact do it and run it again`,
-      );
-    }
+    if (beads.isHumanWork(target)) throw humanTargetPoison(epicBeadId);
 
     // Unit-ness is type-only (isUnit reads `issue_type`), so unlike the grouping shape it genuinely
     // can't change across a pull — capture it here, while `target` is narrowed, and reuse it against
@@ -788,8 +781,8 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     This verdict is also what the ticket loop dispatches by (anton-1two), so the gate and the
       //     dispatch can't disagree about which tickets a cross-run blocker holds: `gated` is read
       //     from the same pulled board the loop iterates.
-      //     Both bindings are reassigned once by the human-ticket arm below (0b-pre), which puts a
-      //     new blocker on the board and so changes this same verdict.
+      //     Both bindings are reassigned once by the human-ticket arm (0b-pre), which runs after the
+      //     run-lease is confirmed and puts a new blocker on the board, changing this same verdict.
       let freshReadiness = computeReadiness(all);
       if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, all);
       let gated = new Set(freshReadiness.gated);
@@ -842,110 +835,6 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // re-applies this allowlist gate there — the worktree needed to prove commit presence doesn't
       // exist yet at this point.
       const isResumeSkipped = (t: Bead) => resumeSkipped(t, standaloneRun);
-
-      // 0b-pre. A ticket only a PERSON can do becomes a gate at its own boundary (anton-mv70).
-      //     `agent:human` resolves to no specialist prompt, so dispatching it falls through to the
-      //     DEFAULT agent and spends the ticket's whole budget improvising at a credential, a
-      //     purchase or a taste call. The target-level refusal at the top of this handler covers a
-      //     human RUN TARGET; this covers a human ticket INSIDE an otherwise ordinary run, which no
-      //     claimable-set exclusion can reach — the feature is the claimable thing, not its child.
-      //     A gate, not a park of the whole run: the ask blocks the ticket and (through the graph's
-      //     own transitive closure) the steps that depend on it, while every independent sibling
-      //     still runs to the branch — the partial-gating rule anton-1two/anton-4hxl already set.
-      //     Armed through the SAME helper as the run-level ask (`armHumanGate`), so re-entering the
-      //     run reuses the wait instead of stacking a second one, and nothing but a person's
-      //     `bd gate resolve` ends it. That resolve is the whole answer: bd refuses to close a bead
-      //     an open gate blocks, so anton closes the ticket for them on the way back in
-      //     ({@link answeredHumanGate}) — otherwise the resume would land straight back on a fresh
-      //     arm of the same ask.
-      //     Resume-skipped tickets are excluded exactly as the gates below exclude them: a human
-      //     ticket already closed is finished work, and arming a wait on it would ask for something
-      //     that already happened.
-      //     The verdict is then re-read from the board the gates are ON, so the dispatch loop holds
-      //     them by the ordinary blocked-child rule rather than a second, parallel notion of "held".
-      const humanTickets = tickets.filter((t) => !isResumeSkipped(t) && beads.isHumanWork(t));
-      if (humanTickets.length > 0) {
-        // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet:
-        // held for this pass, closed by the resume that follows the blocker (see the loop below).
-        const answeredButBlocked = new Map<string, string[]>();
-        // Every wait THIS pass armed, so a kill landing BETWEEN two arms can take them back (PR #213
-        // review). `armHumanGate` undoes only the gate it was arming when the signal flipped; the
-        // ones earlier iterations armed are already returned, and each promises a person that
-        // resolving it resumes a run that is no longer coming back for it.
-        const armedHere: ArmedTicketGate[] = [];
-        try {
-          for (const t of humanTickets) {
-            // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
-            // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
-            const answered = answeredHumanGate(all, t);
-            if (answered) {
-              // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
-              // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
-              // cannot be closed until that work lands. Closing anyway throws a plain error the runner
-              // retries identically until the attempts are gone — a cryptic bd message and no sibling
-              // ever dispatched. Hold the ticket instead: the person's half is done and must not be
-              // asked for again (so no re-arm), the code it waits on is not, and the resume that
-              // follows that blocker closes it into this same branch.
-              const stillBlocked = openBlockersOf(all, t.id);
-              if (stillBlocked.length > 0) {
-                answeredButBlocked.set(t.id, stillBlocked);
-                console.log(
-                  `[execute-epic] ${epicBeadId}: holding ${t.id} — its human gate ${answered.id} is ` +
-                    `answered but it is still blocked by ${stillBlocked.join(", ")}`,
-                );
-                continue;
-              }
-              await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
-              console.log(
-                `[execute-epic] ${epicBeadId}: closed ${t.id} — a person answered its human gate ` +
-                  `${answered.id}`,
-              );
-              continue;
-            }
-            armedHere.push({
-              ticketId: t.id,
-              gate: await armHumanGate(
-                repo,
-                t.id,
-                { ticketId: t.id, ask: humanTicketAsk(t) },
-                ctx.signal,
-              ),
-            });
-          }
-        } catch (e) {
-          throw await undoCancelledTicketGates(armedHere, ctx.signal, e);
-        }
-        // Re-read the board the gates and closes are ON — the ticket SET as well as the verdict. A
-        // ticket closed just above is done work now, and the loop below reads its status off these
-        // objects to skip it.
-        all = await loadAllIssues(repo, { strictGates: true });
-        freshChildren = runTickets(all, epicBeadId);
-        tickets = standaloneRun ? [target] : freshChildren;
-        freshReadiness = computeReadiness(all);
-        // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
-        // the same rule as any other blocked child rather than reaching it as open human work and
-        // parking on the "it should be held by a gate" backstop. Its blockers join the list the park
-        // names — an in-run sibling never appears in the rollup, and the tail would otherwise name a
-        // held ticket with nothing to wait for.
-        if (answeredButBlocked.size > 0) {
-          freshReadiness = {
-            blockers: [
-              ...new Set([
-                ...freshReadiness.blockers,
-                ...[...answeredButBlocked.values()].flat(),
-              ]),
-            ],
-            gated: [...new Set([...freshReadiness.gated, ...answeredButBlocked.keys()])],
-            runnable: freshReadiness.runnable,
-          };
-        }
-        gated = new Set(freshReadiness.gated);
-        // Every ticket is human work (or held behind it): there is nothing for an agent to do here,
-        // so park BEFORE any worktree, claim or session exists rather than opening a run that can
-        // only deliver an empty diff. The park names the gates and their asks (blockedRunPoison), so
-        // the row a person acts on is the wait itself.
-        if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, all);
-      }
 
       // 0b. Dispatch honors the active-agents allowlist for anton's BUNDLED specialists (anton-dm7);
       // the project's own `.claude/agents` (userAgentIds) are always allowed. PARK, don't skip:
@@ -1279,6 +1168,128 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           );
         }
       };
+
+      // 0b-pre. A ticket only a PERSON can do becomes a gate at its own boundary (anton-mv70).
+      //     `agent:human` resolves to no specialist prompt, so dispatching it falls through to the
+      //     DEFAULT agent and spends the ticket's whole budget improvising at a credential, a
+      //     purchase or a taste call. The target-level refusal at the top of this handler covers a
+      //     human RUN TARGET; this covers a human ticket INSIDE an otherwise ordinary run, which no
+      //     claimable-set exclusion can reach — the feature is the claimable thing, not its child.
+      //     A gate, not a park of the whole run: the ask blocks the ticket and (through the graph's
+      //     own transitive closure) the steps that depend on it, while every independent sibling
+      //     still runs to the branch — the partial-gating rule anton-1two/anton-4hxl already set.
+      //     Armed through the SAME helper as the run-level ask (`armHumanGate`), so re-entering the
+      //     run reuses the wait instead of stacking a second one, and nothing but a person's
+      //     `bd gate resolve` ends it. That resolve is the whole answer: bd refuses to close a bead
+      //     an open gate blocks, so anton closes the ticket for them on the way back in
+      //     ({@link answeredHumanGate}) — otherwise the resume would land straight back on a fresh
+      //     arm of the same ask.
+      //     Resume-skipped tickets are excluded exactly as the allowlist and contract gates above
+      //     exclude them: a human ticket already closed is finished work, and arming a wait on it
+      //     would ask for something that already happened.
+      //     Armed AFTER the run-lease is published, arbitrated and confirmed (step 1c) and before
+      //     any worktree, claim or session exists, because arming is a WRITE (PR #213 review). Every
+      //     gate above it is read-only, so two machines starting the same target race through them
+      //     together — and `armHumanGate` reads the board and then creates, so armed ahead of the
+      //     lease both would create a wait for the same ticket. Neither park then names the twin: an
+      //     all-human target parks both attempts at the readiness check below without either ever
+      //     taking a lease, and on a mixed target the attempt that later loses the lease leaves its
+      //     gates standing for an operator to reconcile by hand. Behind the lease exactly one run
+      //     reaches here, so the wait a person answers is the only one on the board. Parking here
+      //     still costs nothing — no checkout has been warmed — and `finally` clears the lease this
+      //     run published on the way out.
+      //     The verdict is then re-read from the board the gates are ON, so the dispatch loop holds
+      //     them by the ordinary blocked-child rule rather than a second, parallel notion of "held".
+      const humanTickets = tickets.filter((t) => !isResumeSkipped(t) && beads.isHumanWork(t));
+      if (humanTickets.length > 0) {
+        // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet:
+        // held for this pass, closed by the resume that follows the blocker (see the loop below).
+        const answeredButBlocked = new Map<string, string[]>();
+        // Every wait THIS pass armed, so a kill landing BETWEEN two arms can take them back (PR #213
+        // review). `armHumanGate` undoes only the gate it was arming when the signal flipped; the
+        // ones earlier iterations armed are already returned, and each promises a person that
+        // resolving it resumes a run that is no longer coming back for it.
+        const armedHere: ArmedTicketGate[] = [];
+        try {
+          for (const t of humanTickets) {
+            // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
+            // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
+            const answered = answeredHumanGate(all, t);
+            if (answered) {
+              // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
+              // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
+              // cannot be closed until that work lands. Closing anyway throws a plain error the runner
+              // retries identically until the attempts are gone — a cryptic bd message and no sibling
+              // ever dispatched. Hold the ticket instead: the person's half is done and must not be
+              // asked for again (so no re-arm), the code it waits on is not, and the resume that
+              // follows that blocker closes it into this same branch.
+              const stillBlocked = openBlockersOf(all, t.id);
+              if (stillBlocked.length > 0) {
+                answeredButBlocked.set(t.id, stillBlocked);
+                console.log(
+                  `[execute-epic] ${epicBeadId}: holding ${t.id} — its human gate ${answered.id} is ` +
+                    `answered but it is still blocked by ${stillBlocked.join(", ")}`,
+                );
+                continue;
+              }
+              await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
+              console.log(
+                `[execute-epic] ${epicBeadId}: closed ${t.id} — a person answered its human gate ` +
+                  `${answered.id}`,
+              );
+              continue;
+            }
+            armedHere.push({
+              ticketId: t.id,
+              gate: await armHumanGate(
+                repo,
+                t.id,
+                { ticketId: t.id, ask: humanTicketAsk(t) },
+                ctx.signal,
+              ),
+            });
+          }
+        } catch (e) {
+          throw await undoCancelledTicketGates(armedHere, ctx.signal, e);
+        }
+        // Re-read the board the gates and closes are ON — the TARGET, the ticket SET and the
+        // verdict. A ticket closed just above is done work now, and the loop below reads its status
+        // off these objects to skip it.
+        all = await loadAllIssues(repo, { strictGates: true });
+        // Adopt the refreshed target, not just its children (PR #213 review). Every `armHumanGate`
+        // above pulls the shared board first, so a relabel another machine pushed lands in exactly
+        // this read — and a `target` left at its pre-arm snapshot would carry the superseded labels
+        // through every step that follows. `agent:human` is the one that must be re-asked: the
+        // backstop at the top of this handler judged a bead the board no longer describes, nothing
+        // downstream re-reads the label, and the run would hand a person's work to the default agent.
+        target = adoptRefreshedTarget(all, epicBeadId, target);
+        freshChildren = runTickets(all, epicBeadId);
+        tickets = standaloneRun ? [target] : freshChildren;
+        freshReadiness = computeReadiness(all);
+        // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
+        // the same rule as any other blocked child rather than reaching it as open human work and
+        // parking on the "it should be held by a gate" backstop. Its blockers join the list the park
+        // names — an in-run sibling never appears in the rollup, and the tail would otherwise name a
+        // held ticket with nothing to wait for.
+        if (answeredButBlocked.size > 0) {
+          freshReadiness = {
+            blockers: [
+              ...new Set([
+                ...freshReadiness.blockers,
+                ...[...answeredButBlocked.values()].flat(),
+              ]),
+            ],
+            gated: [...new Set([...freshReadiness.gated, ...answeredButBlocked.keys()])],
+            runnable: freshReadiness.runnable,
+          };
+        }
+        gated = new Set(freshReadiness.gated);
+        // Every ticket is human work (or held behind it): there is nothing for an agent to do here,
+        // so park BEFORE any worktree, claim or session exists rather than opening a run that can
+        // only deliver an empty diff. The park names the gates and their asks (blockedRunPoison), so
+        // the row a person acts on is the wait itself.
+        if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, all);
+      }
 
       // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
       // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
@@ -2753,6 +2764,43 @@ export function humanGateReason(targetId: string, { ticketId, ask }: HumanAsk): 
   return `${ticketId} needs a human: ${
     ask ?? `${targetId} stopped for a human, but the agent named no ask`
   }`;
+}
+
+/**
+ * The run target as the board describes it NOW, adopted after a step that refreshed from the shared
+ * board (anton-mv70, PR #213 review).
+ *
+ * A re-read that rebuilds only the ticket set leaves the target itself at a pre-refresh snapshot,
+ * and every check downstream then judges labels the board has already moved on from. `agent:human`
+ * is the label that cannot survive that: the backstop at the top of the handler is the ONLY place
+ * that asks it, so a target relabelled while the run was starting would go on to dispatch a person's
+ * work to the default agent. Refused here in the backstop's own words ({@link humanTargetPoison}).
+ *
+ * A target that has vanished from the refreshed board keeps the caller's object rather than throwing
+ * — losing the bead is {@link runTargetDrift}'s question, asked under the run-lease, and answering it
+ * twice in two different voices is how the two drift apart.
+ */
+export function adoptRefreshedTarget(board: Bead[], targetId: string, current: Bead): Bead {
+  const fresh = board.find((b) => b.id === targetId);
+  if (!fresh) return current;
+  if (beads.isHumanWork(fresh)) throw humanTargetPoison(targetId);
+  return fresh;
+}
+
+/**
+ * The refusal a run target labelled `agent:human` settles with (anton-mv70).
+ *
+ * Shared by the top-of-handler backstop and the post-arm re-read in step 0b-pre (PR #213 review), so
+ * a label that only becomes visible once the run has started is refused in exactly the same words —
+ * and neither site can drift into telling an operator something different about the same bead.
+ */
+function humanTargetPoison(targetId: string): PoisonEpic {
+  return new PoisonEpic(
+    `target ${targetId} is labelled ${LABELS.agentHuman} — a person executes this work, not ` +
+      `an agent, so it is never claimable and no run can deliver it. It stays on the board as ` +
+      `approved work waiting for an operator: do it by hand and close the bead, or drop the ` +
+      `label if an agent can in fact do it and run it again`,
+  );
 }
 
 /**

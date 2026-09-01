@@ -122,6 +122,20 @@ process.exit(0);`),
       .where(eq(schema.projects.id, projectId));
   };
 
+  /** Persist (or clear, with `undefined`) an active-agents allowlist on the sandbox project. */
+  const setActiveAgents = async (agents: string[] | undefined) => {
+    const proj = (
+      await tdb.db.select().from(schema.projects).where(eq(schema.projects.id, projectId))
+    )[0];
+    const base = JSON.parse(proj.settingsJson ?? "{}") as Record<string, unknown>;
+    if (agents) base.agents = agents;
+    else delete base.agents;
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify(base) })
+      .where(eq(schema.projects.id, projectId));
+  };
+
   /** A `gh` that dumps the `--body` it was handed; reports no open PR, like the fixture's default. */
   const capturingGh = (name: string, bodyDump: string) =>
     writeBin(
@@ -372,6 +386,57 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       expect(dispatched(log)).toEqual([]);
       expect(beads.getPrRef(await beads.show(repo, feature)) ?? null).toBeNull();
     } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("arms nothing when the run parks before it holds the run-lease (PR #213 review)", async () => {
+    // Arming is a WRITE, and a run that never wins the run-lease has no right to leave one. Held
+    // where it was — ahead of every pre-lease gate — two machines starting the same target race
+    // through those read-only gates together and `armHumanGate` reads-then-creates, so both create a
+    // wait for the same ticket and the loser parks leaving its twin behind for an operator to
+    // reconcile by hand. So the arm moved behind the lease, and this pins the observable half of
+    // that: a run stopped by a gate BEFORE the lease leaves the human ticket bare.
+    //
+    // The allowlist gate is the stopper here because it is cheap to provoke and sits exactly in the
+    // window that used to arm — a disabled specialist on a SIBLING, which parks the whole feature.
+    const feature = await beads.create(repo, {
+      title: "Wire up the vendor integration",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nVendor",
+    });
+    await beads.approve(repo, feature);
+    const sign = createTicket(repo, {
+      title: "Sign the order form",
+      parent: feature,
+      labels: [LABELS.agentHuman],
+    });
+    const build = createTicket(repo, {
+      title: "Build the client",
+      parent: feature,
+      labels: ["agent:terraform"],
+    });
+
+    const log = join(sandbox, "pre-lease-park.jsonl");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-pre-lease", log);
+    let jobId: string | undefined;
+    try {
+      await setActiveAgents(["fastapi"]); // terraform disabled → the run parks at the allowlist gate
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: feature });
+
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain("Settings → Agents");
+      expect(job?.lastError).toContain(build);
+
+      // The whole point: no wait was left on the human ticket by a run that never got a lease.
+      expect(await gatesBlocking(sign)).toEqual([]);
+      expect(dispatched(log)).toEqual([]);
+    } finally {
+      await setActiveAgents(undefined); // every other case runs with no allowlist persisted
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }

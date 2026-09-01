@@ -16,6 +16,7 @@ import {
   RunAlreadyLiveError,
 } from "./errors";
 import {
+  adoptRefreshedTarget,
   askSettleError,
   claudeResumeDecision,
   continuationPrompt,
@@ -427,6 +428,36 @@ describe("runTargetDrift — the target's own shape in that same window (anton-e
     const board = [bead("f-1", { issue_type: "feature" }), bead("t-1", { parent: "f-1" })];
     expect(runTargetDrift("f-1", board)).toBeUndefined();
     expect(runTargetDrift("t-1", board)).toBe("it now hangs under f-1, whose run owns it as a ticket");
+  });
+});
+
+describe("adoptRefreshedTarget — the target the human-ticket arm re-reads (PR #213 review)", () => {
+  const bead = (id: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "feature", ...extra }) as Bead;
+
+  // The failure this closes: `armHumanGate` pulls the shared board before every arm, so a relabel
+  // another machine pushed becomes visible in the re-read that follows. That re-read rebuilt only
+  // the ticket set, so `target` stayed at its pre-arm snapshot — and since the top-of-handler
+  // backstop is the ONLY place that asks `agent:human`, the run went on to dispatch a person's work
+  // to the default agent.
+  it("refuses a target relabelled agent:human while the gates were being armed", () => {
+    const stale = bead("f-1");
+    const board = [bead("f-1", { labels: [LABELS.agentHuman] }), bead("t-1", { parent: "f-1" })];
+    expect(() => adoptRefreshedTarget(board, "f-1", stale)).toThrow(PoisonEpic);
+    expect(() => adoptRefreshedTarget(board, "f-1", stale)).toThrow(/is labelled agent:human/);
+  });
+
+  it("adopts the refreshed bead so later steps read the board's labels, not the pre-arm ones", () => {
+    const stale = bead("f-1", { labels: ["approved"] });
+    const fresh = bead("f-1", { labels: ["approved", "agent:fastapi"] });
+    expect(adoptRefreshedTarget([fresh, bead("t-1", { parent: "f-1" })], "f-1", stale)).toBe(fresh);
+  });
+
+  // Losing the bead is runTargetDrift's question, asked under the run-lease. Answering it here too
+  // would give an operator two different accounts of the same disappearance.
+  it("keeps the caller's target when the refreshed board no longer carries it", () => {
+    const stale = bead("f-1");
+    expect(adoptRefreshedTarget([bead("other")], "f-1", stale)).toBe(stale);
   });
 });
 
