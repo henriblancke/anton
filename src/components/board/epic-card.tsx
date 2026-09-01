@@ -17,6 +17,7 @@ import {
   agentDotClass,
   canStartRun,
   childReadinessCounts,
+  isPickerPick,
   ticketProgress,
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
@@ -24,6 +25,7 @@ import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { ProvenanceBadges } from "@/components/board/provenance-badge";
+import { ReleaseAction } from "@/components/board/release-action";
 import {
   AbandonedChip,
   BlockedChip,
@@ -122,6 +124,10 @@ export function EpicCard({
   // of the founder — a blocker needs waiting, this needs a one-line edit — so the affordance stays in
   // place and names the missing section instead of disappearing (or 422ing on click).
   const contractBlocked = contractBlocks(epic.contract);
+  // The picker chose this target, so shadow mode offers it as a release rather than a plain approve.
+  // A target the operator has set aside keeps its plain Approve: [Release] on a card that reads "set
+  // aside · back in 4h" would offer the very start the veto just declined.
+  const picked = isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
   const { done, total, pct } = ticketProgress(epic);
   const isDone = epic.stage === "done";
 
@@ -255,36 +261,45 @@ export function EpicCard({
           {showApprove &&
             (contractBlocked ? (
               <ApproveBlocked violations={epic.contract?.blocking ?? []} />
-            ) : budgetAware ? (
-              // Budget-aware: let the operator run now or hand the run to the governor's pace-line.
-              <span className="pointer-events-auto flex items-center gap-1">
-                <Button
-                  size="xs"
-                  variant="outline"
-                  onClick={() => handleApprove(false)}
-                  disabled={approving}
-                  title="Queue this run for the budget governor to pace against the weekly plan"
-                >
-                  Queue
-                </Button>
-                <Button
-                  size="xs"
-                  onClick={() => handleApprove(true)}
-                  disabled={approving}
-                  title="Approve and run now, bypassing budget pacing (the session limit still applies)"
-                >
-                  {approving ? "…" : "Approve"}
-                </Button>
-              </span>
             ) : (
-              <Button
-                size="xs"
-                onClick={() => handleApprove()}
-                disabled={approving}
-                className="pointer-events-auto"
-              >
-                {approving ? "Approving…" : "Approve"}
-              </Button>
+              <span className="pointer-events-auto flex items-center gap-1">
+                {/* Budget-aware: the operator can still hand this run to the governor's pace-line
+                    instead of starting it. Release is always the immediate half, so the two never
+                    make the same promise twice. */}
+                {budgetAware && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    onClick={() => handleApprove(false)}
+                    disabled={approving}
+                    title="Queue this run for the budget governor to pace against the weekly plan"
+                  >
+                    Queue
+                  </Button>
+                )}
+                {/* A card the picker chose is started with [Release], not Approve (anton-d2h6 /
+                    R3.5): same route, same gates, same run — plus the accept that turns the
+                    operator's agreement into evidence. One button, never two, so the card never
+                    offers two answers to "start this". */}
+                {picked ? (
+                  <ReleaseAction
+                    slug={slug}
+                    beadId={epic.id}
+                    title={epic.title}
+                    disabled={approving}
+                    onReleased={() => setOptimisticApproved(true)}
+                  />
+                ) : (
+                  <Button
+                    size="xs"
+                    onClick={() => handleApprove(true)}
+                    disabled={approving}
+                    title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+                  >
+                    {approving ? "Approving…" : "Approve"}
+                  </Button>
+                )}
+              </span>
             ))}
           <ConfirmDeleteButton
             onConfirm={handleDelete}

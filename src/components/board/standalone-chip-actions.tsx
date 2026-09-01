@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
+import { ReleaseAction } from "@/components/board/release-action";
+import { isPickerPick } from "@/components/board/board-utils";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
 /**
@@ -21,19 +23,22 @@ export function canOfferRun(item: StandaloneItem, approved: boolean, deferred: b
 }
 
 /**
- * The run affordance in its three shapes: inert-and-explaining when the contract blocks the run,
- * split into Queue/Approve when the project is budget-aware (anton-y2ue), and a single
- * "Approve & run" otherwise. Renders nothing when this chip may not offer a run.
+ * The run affordance in its shapes: inert-and-explaining when the contract blocks the run, `[Release]`
+ * when the board-picker chose this target, split into Queue/Approve when the project is budget-aware
+ * (anton-y2ue), and a single "Approve & run" otherwise. Renders nothing when this chip may not offer
+ * a run.
  *
  * A contract gap withholds the run the way an open blocker does, but asks for an edit rather than a
  * wait — so the affordance stays put and names the missing section instead of failing on click
  * (mirrors the card).
  */
 export function ApproveRunAction({
+  slug,
   item,
   budgetAware,
   approval,
 }: {
+  slug: string;
   item: StandaloneItem;
   budgetAware: boolean;
   approval: StandaloneApproval;
@@ -45,27 +50,45 @@ export function ApproveRunAction({
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;
   }
 
-  if (budgetAware) {
+  // A chip the picker chose starts with [Release] (anton-d2h6 / R3.5) — the same approve route and
+  // the same run, plus the accept that records the operator agreed with the pick. A target already
+  // set aside keeps the plain approve: offering [Release] there would re-offer the declined start.
+  const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
+
+  if (budgetAware || picked) {
     return (
-      // Budget-aware: run now or hand the run to the governor's pace-line.
+      // Budget-aware: run now or hand the run to the governor's pace-line. Release is always the
+      // immediate half, so the pair never makes the same promise twice.
       <span className="pointer-events-auto flex items-center gap-1">
-        <Button
-          size="xs"
-          variant="outline"
-          onClick={() => approveRun(false)}
-          disabled={running}
-          title="Queue this run for the budget governor to pace against the weekly plan"
-        >
-          Queue
-        </Button>
-        <Button
-          size="xs"
-          onClick={() => approveRun(true)}
-          disabled={running}
-          title="Approve and run now, bypassing budget pacing (the session limit still applies)"
-        >
-          {running ? "…" : "Approve"}
-        </Button>
+        {budgetAware && (
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={() => approveRun(false)}
+            disabled={running}
+            title="Queue this run for the budget governor to pace against the weekly plan"
+          >
+            Queue
+          </Button>
+        )}
+        {picked ? (
+          <ReleaseAction
+            slug={slug}
+            beadId={item.id}
+            title={item.title}
+            disabled={running}
+            onReleased={approval.setApproved}
+          />
+        ) : (
+          <Button
+            size="xs"
+            onClick={() => approveRun(true)}
+            disabled={running}
+            title="Approve and run now, bypassing budget pacing (the session limit still applies)"
+          >
+            {running ? "…" : "Approve"}
+          </Button>
+        )}
       </span>
     );
   }
@@ -104,7 +127,7 @@ export function ChipBacklogActions({
       />
       {/* Queue · Approve · Snooze share one line (anton-tc6y); snooze is pushed to the right. */}
       <div className="flex items-center gap-1">
-        <ApproveRunAction item={item} budgetAware={budgetAware} approval={approval} />
+        <ApproveRunAction slug={slug} item={item} budgetAware={budgetAware} approval={approval} />
         <SnoozeButton
           slug={slug}
           ticketId={item.id}

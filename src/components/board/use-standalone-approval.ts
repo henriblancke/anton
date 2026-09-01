@@ -35,6 +35,8 @@ export interface StandaloneApproval {
   running: boolean;
   /** `immediate`: true → run now (bypass budget pacing), false → queue for optimal usage. */
   approveRun: (immediate?: boolean) => Promise<void>;
+  /** Lock the chip's run affordance for an approval another control drove (the picker's [Release]). */
+  setApproved: () => void;
   /** Record a snooze toggle's result until the board's own poll reports it. */
   setDeferred: (deferred: boolean) => void;
 }
@@ -89,6 +91,7 @@ export function useStandaloneApproval(slug: string, item: StandaloneItem): Stand
     deferred: optimisticDeferred ?? item.deferred,
     running,
     approveRun,
+    setApproved: () => setOptimisticApproved(true),
     setDeferred: setOptimisticDeferred,
   };
 }

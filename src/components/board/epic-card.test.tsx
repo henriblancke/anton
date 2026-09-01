@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { Bead } from "@/lib/beads/types";
 import { contractStatusOf } from "@/lib/beads/contract";
 import type { Epic } from "@/lib/types";
 import { EpicCard } from "@/components/board/epic-card";
+
+// `[Release]` is the card's one interactive leaf that needs a router (it re-reads the lane after a
+// lost claim race); these cases render to static markup, where no App Router is mounted.
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }) }));
 
 function makeEpic(over: Partial<Epic> = {}): Epic {
   const ready = over.ready ?? true;
@@ -267,5 +271,53 @@ describe("EpicCard provenance", () => {
 
     expect(html).not.toContain("◈");
     expect(html).not.toContain("criterion=types");
+  });
+});
+
+/**
+ * `[Release]` (anton-d2h6 / R3.5). While the picker only proposes — nothing starts unattended — a
+ * card it chose is started by hand, from the card, with the same approval every other target gets.
+ */
+describe("EpicCard — releasing a pick", () => {
+  const pick = { kind: "policy" as const, ref: "labels:domain", detail: "the armed policy" };
+
+  it("offers Release on a card the picker chose, in place of the plain Approve", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ provenance: [pick] })} />,
+    );
+    expect(html).toContain(">Release<");
+    expect(html).not.toContain(">Approve<");
+  });
+
+  it("keeps the plain Approve on a card the picker never chose", () => {
+    const html = renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />);
+    expect(html).toContain(">Approve<");
+    expect(html).not.toContain(">Release<");
+  });
+
+  it("keeps Queue beside Release on a budget-aware project — pacing is still a choice", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ provenance: [pick] })} budgetAware />,
+    );
+    expect(html).toContain(">Queue<");
+    expect(html).toContain(">Release<");
+  });
+
+  it("withholds Release from a target the operator set aside — the veto already declined that start", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ provenance: [pick], notNowUntil: Date.now() + 60_000 })}
+      />,
+    );
+    expect(html).not.toContain(">Release<");
+    expect(html).toContain(">Approve<");
+  });
+
+  it("withholds Release where approval itself is withheld — a blocked target starts no run", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ ready: false, provenance: [pick] })} />,
+    );
+    expect(html).not.toContain(">Release<");
   });
 });

@@ -9,8 +9,12 @@ import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, stealRefused, withClaimLock } from "@/lib/beads/claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
+import { getBoardPickerPlan } from "@/lib/board-picker-plan";
+import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
+import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
+import { recordPickerAccept } from "@/lib/picker-veto";
 import type { Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
@@ -33,19 +37,55 @@ export const dynamic = "force-dynamic";
  * Take over button posts `{ steal: true }` with no `immediate` field, and a pure ownership transfer
  * must not promote a teammate's paced ("Queue for optimal usage") job to an immediate `bypassBudget`
  * run the operator never requested.
+ *
+ * `release` is the Up Next lane's one-click start (anton-d2h6 / R3.5). It changes NOTHING about what
+ * this route does — a release is exactly this approval, with the same contract gate, structure gate,
+ * blocker check, auto-claim and enqueue — and only adds what release MEANS that approve does not: the
+ * target was anton's pick and the operator agreed with it, so the choice is recorded as an accept.
  */
 async function readApprovalBody(
   request: Request,
-): Promise<{ steal: boolean; immediate: boolean; immediateExplicit: boolean }> {
+): Promise<{ steal: boolean; immediate: boolean; immediateExplicit: boolean; release: boolean }> {
   try {
-    const body = (await request.json()) as { steal?: unknown; immediate?: unknown };
+    const body = (await request.json()) as { steal?: unknown; immediate?: unknown; release?: unknown };
     return {
       steal: body?.steal === true,
       immediate: body?.immediate !== false,
       immediateExplicit: body?.immediate === true,
+      release: body?.release === true,
     };
   } catch {
-    return { steal: false, immediate: true, immediateExplicit: false };
+    return { steal: false, immediate: true, immediateExplicit: false, release: false };
+  }
+}
+
+/**
+ * Record the operator's ACCEPT of the picker's pick — the half of a release that an ordinary approve
+ * has no reason to write (anton-d2h6).
+ *
+ * The pick is resolved from the recorded plan HERE, exactly as the veto route resolves its own
+ * provenance server-side: the rank and the board digest name the decision being accepted, and a
+ * client-supplied one could name any. A target the current plan no longer carries still records — the
+ * pass may have re-ranked since the operator looked — and simply records no rank.
+ *
+ * Best-effort, like the enqueue it follows: the approval has landed and the run has started, so a
+ * write to anton.db that falls over must not fail a release the operator already got. The accept is
+ * evidence about the picker, never a gate on the run.
+ */
+async function recordRelease(projectId: string, beadId: string): Promise<void> {
+  try {
+    const db = getDb();
+    const plan = await getBoardPickerPlan(db, projectId);
+    const entry = plan?.entries.find((e) => e.beadId === beadId);
+    await recordPickerAccept(db, systemClock, {
+      projectId,
+      beadId,
+      ...(entry?.rule ? { rule: entry.rule } : {}),
+      ...(entry ? { rank: entry.rank } : {}),
+      ...(plan?.stamp.digest ? { planDigest: plan.stamp.digest } : {}),
+    });
+  } catch (err) {
+    console.error(`[approve] failed to record the picker accept for ${beadId}`, err);
   }
 }
 
@@ -216,7 +256,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // Read before the approve below, which would otherwise make every request look like a re-approve.
   // See the enqueue gate at the end for what this distinguishes.
   const wasApproved = beads.isApproved(target);
-  const { steal, immediate, immediateExplicit } = await readApprovalBody(request);
+  const { steal, immediate, immediateExplicit, release } = await readApprovalBody(request);
   // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
   // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
   // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
@@ -489,6 +529,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   } catch (err) {
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
+
+  // A release is this approval plus its answer to the picker (anton-d2h6). Gated on a run actually
+  // having been enqueued: an accept for a run that never started would be evidence of nothing, and
+  // earned autonomy reads these counts to decide whether the picker may ever be armed.
+  if (release && jobId) await recordRelease(project.id, epicId);
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local
   // state, so don't block the response on a `bd dolt pull/commit/push` a slow/unreachable remote

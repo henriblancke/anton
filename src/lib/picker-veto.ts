@@ -62,6 +62,17 @@ export interface PickerDeferral {
   untilMs: number;
 }
 
+/** The other half of the record: what an operator ACCEPTED, and which pick they accepted. */
+export interface RecordAcceptInput {
+  projectId: string;
+  beadId: string;
+  /** The admitting rule the plan recorded for this pick, when the caller read one. */
+  rule?: string;
+  rank?: number;
+  /** The board digest of the plan being answered — what identifies the PICK, not just the bead. */
+  planDigest?: string;
+}
+
 export interface RecordVetoInput {
   projectId: string;
   beadId: string;
@@ -114,6 +125,53 @@ export async function recordPickerVeto(
     decidedAt: secDate(nowMs),
   });
   return { beadId: input.beadId, untilMs: secDate(untilMs).getTime() };
+}
+
+/**
+ * Record an accept: the operator RELEASED this pick, so anton's choice became a run (anton-d2h6).
+ *
+ * The mirror of the veto above — same table, same shape, opposite verdict — because earned autonomy
+ * weighs accepts against declines, and two stores for one track record would be two answers that can
+ * disagree. An accept defers nothing: agreeing with a pick has no window to bound.
+ *
+ * Idempotent per PICK rather than per click. A release that hits the enqueue dedupe (a double-click,
+ * a retry after a slow response) starts no second run, so it must not leave a second accept inflating
+ * the evidence a future arming decision reads. The pick is identified by the plan digest the decision
+ * was recorded under; a release against no recorded plan has no pick to dedupe on and always records.
+ */
+export async function recordPickerAccept(
+  db: AntonDb,
+  clock: Clock,
+  input: RecordAcceptInput,
+): Promise<void> {
+  if (input.planDigest) {
+    const existing = await db
+      .select({ id: schema.pickerVerdicts.id })
+      .from(schema.pickerVerdicts)
+      .where(
+        and(
+          eq(schema.pickerVerdicts.projectId, input.projectId),
+          eq(schema.pickerVerdicts.beadId, input.beadId),
+          eq(schema.pickerVerdicts.verdict, "accepted"),
+          eq(schema.pickerVerdicts.planDigest, input.planDigest),
+        ),
+      )
+      .limit(1);
+    if (existing.length > 0) return;
+  }
+  await db.insert(schema.pickerVerdicts).values({
+    id: randomUUID(),
+    projectId: input.projectId,
+    beadId: input.beadId,
+    verdict: "accepted",
+    action: "release",
+    rule: input.rule ?? null,
+    criterion: null,
+    rank: input.rank ?? null,
+    planDigest: input.planDigest ?? null,
+    deferredUntil: null,
+    decidedAt: secDate(clock.now()),
+  });
 }
 
 /**

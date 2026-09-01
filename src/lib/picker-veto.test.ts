@@ -13,6 +13,7 @@ import {
   deferralVersion,
   listPickerVerdicts,
   pickerTrackRecord,
+  recordPickerAccept,
   recordPickerVeto,
 } from "./picker-veto";
 import type { Clock } from "./jobs/queue";
@@ -153,6 +154,60 @@ describe("the decline record", () => {
       declined: 1,
       settled: 2,
     });
+  });
+});
+
+describe("recording an accept", () => {
+  it("records the release against the pick it answers, and defers nothing", async () => {
+    await recordPickerAccept(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      rule: "the work policy armed on this machine",
+      rank: 1,
+      planDigest: "cafebabecafebabe",
+    });
+
+    expect(await listPickerVerdicts(test.db, PROJECT)).toEqual([
+      expect.objectContaining({
+        beadId: "anton-a",
+        verdict: "accepted",
+        action: "release",
+        rule: "the work policy armed on this machine",
+        rank: 1,
+        planDigest: "cafebabecafebabe",
+      }),
+    ]);
+    // Agreeing with a pick has no window to bound, so it holds nothing out of the next plan.
+    expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(0);
+  });
+
+  it("counts one accept per PICK, so a re-released target never inflates the record", async () => {
+    const pick = { projectId: PROJECT, beadId: "anton-a", rank: 1, planDigest: "d1" };
+    await recordPickerAccept(test.db, clock, pick);
+    nowMs = NOW + 5_000;
+    await recordPickerAccept(test.db, clock, pick);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 1, settled: 1 });
+  });
+
+  it("records again once a later plan re-picks it — a new decision is a new answer", async () => {
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" });
+    nowMs = NOW + 60_000;
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d2" });
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 2, settled: 2 });
+  });
+
+  it("records a release against no recorded plan — there is no pick to dedupe on", async () => {
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a" });
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a" });
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 2 });
+  });
+
+  it("keeps another project's record its own", async () => {
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" });
+    expect(await pickerTrackRecord(test.db, OTHER)).toEqual({ accepted: 0, declined: 0, settled: 0 });
   });
 });
 

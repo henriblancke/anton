@@ -4,6 +4,7 @@
  */
 import {
   STAGES,
+  type BeadProvenance,
   type Epic,
   type EpicCrumb,
   type IssueType,
@@ -241,6 +242,21 @@ export function ticketProgress(epic: { tickets: Ticket[] }): {
  */
 export function canStartRun(epic: Pick<Epic, "childReadiness">): boolean {
   return epic.childReadiness !== "blocked";
+}
+
+/**
+ * Is this card one of the board-picker's current picks — the targets the Up Next projection holds?
+ *
+ * Read off the provenance the board already attaches (`◈ policy`, board-provenance.ts), which is set
+ * for exactly the beads in the recorded plan. A second signal on the card would be a second answer to
+ * "did the picker choose this", and the badge and the `[Release]` button beside it must never
+ * disagree about that.
+ *
+ * What it gates is shadow mode's affordance: while nothing starts unattended, a pick is offered with
+ * `[Release]` rather than the plain `Approve` every other backlog card carries (R3.5).
+ */
+export function isPickerPick(provenance: BeadProvenance[] | undefined): boolean {
+  return provenance?.some((mark) => mark.kind === "policy") ?? false;
 }
 
 /**
