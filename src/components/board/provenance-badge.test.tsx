@@ -47,6 +47,12 @@ describe("◈ PM", () => {
     // What the pass claimed rides in the title, so the badge says why before it is clicked.
     expect(html).toContain("mispriority");
   });
+
+  it("renders nothing without a proposal to open — never a link built from a missing ref", () => {
+    // `ref` is optional on the wire. The proposal IS this badge's evidence, so an entry missing one
+    // degrades to no badge rather than to a link that navigates off the board.
+    expect(render({ kind: "pm", detail: "mispriority" })).toBe("");
+  });
 });
 
 describe("a writer this build has no wording for", () => {

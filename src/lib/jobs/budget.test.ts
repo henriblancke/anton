@@ -501,13 +501,21 @@ describe("budgetHeadroom (the budget line's placement input, anton-vlom)", () =>
   it("reports the weekly cap when the pace-line is above it", () => {
     // Late week: the pace-line has risen past the cap, so the cap is the only weekly hold left.
     const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.99, weeklyPct: 88, sessionPct: 10 }), POLICY, NIGHT);
-    expect(h).toMatchObject({ weeklyPct: 12, weeklyReason: "weekly-cap" });
+    expect(h).toMatchObject({ weeklyPct: 12, weeklyReason: "weekly-cap", weeklyInclusive: true });
   });
 
   it("reports the pace-line inside the throttle band, not the cap it hasn't reached", () => {
     // Mid-week, ahead of pace: idle-fill runs free to the throttle floor (80), and no further.
     const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 62, sessionPct: 10 }), POLICY, NIGHT);
-    expect(h).toMatchObject({ weeklyPct: 18, weeklyReason: "weekly-on-track" });
+    // Held up by the throttle floor, which — like the cap — the gate defers AT.
+    expect(h).toMatchObject({ weeklyPct: 18, weeklyReason: "weekly-on-track", weeklyInclusive: true });
+  });
+
+  it("marks the pace-line itself exclusive — the gate defers only PAST the ceiling", () => {
+    // Late enough in the week that the pace-line has risen clear of the throttle floor (80) without
+    // reaching the cap: 100 × 0.8 + 5 = 85 is the limit, and `usage > 85` is what defers.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.8, weeklyPct: 82, sessionPct: 10 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ weeklyPct: 3, weeklyReason: "weekly-on-track", weeklyInclusive: false });
   });
 
   it("reports no weekly headroom without a weekly signal — unknown, not zero", () => {

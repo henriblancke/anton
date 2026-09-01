@@ -175,6 +175,7 @@ function UpNextRow({
         <VetoActions
           slug={slug}
           beadId={beadId}
+          title={title}
           {...(notNowUntil === undefined ? {} : { notNowUntil })}
           className="shrink-0"
           onVetoed={(untilMs) => onVetoed?.(beadId, untilMs)}

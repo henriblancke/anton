@@ -201,6 +201,7 @@ function budgetSignal(sessionPct: number): BudgetSignal {
       sessionReason: "session-headroom",
       weeklyPct: null,
       weeklyReason: "weekly-cap",
+      weeklyInclusive: true,
     },
     burn: { "execute-epic": { sessionPct: 20, weeklyPct: 3, seeded: false } },
   };

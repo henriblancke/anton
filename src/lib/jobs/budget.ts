@@ -318,6 +318,13 @@ export interface BudgetHeadroom {
   weeklyPct: number | null;
   /** Which weekly hold bounds it: the cap, or the pace-line inside the throttle band. */
   weeklyReason: Extract<DeferReason, "weekly-cap" | "weekly-on-track">;
+  /**
+   * Whether spending exactly {@link weeklyPct} already trips the hold. The cap and the throttle
+   * floor bite AT their threshold (`usage >= limit`); the pace-line bites only PAST it
+   * (`usage > ceiling`), so a caller that charged both inclusively would hold back one run the
+   * gate admits.
+   */
+  weeklyInclusive: boolean;
 }
 
 export function budgetHeadroom(
@@ -345,14 +352,20 @@ export function budgetHeadroom(
   const cap = policy.weeklyTargetPct;
   let weeklyPct: number | null = null;
   let weeklyReason: BudgetHeadroom["weeklyReason"] = "weekly-cap";
+  let weeklyInclusive = true;
   if (!Number.isNaN(weeklyResetMs) && cap > 0) {
     // Below the throttle floor spending is free whatever the pace (idle-fill, anton-ld7j), so the
     // pace-line only binds where it sits above that floor — and never above the cap.
     const throttleFloor = cap - policy.throttleBandPct;
     const paceCeiling = cap * elapsedWeekFraction(now, weeklyResetMs, policy.weekMs) + policy.paceSlackPct;
     const weeklyLimit = Math.min(cap, Math.max(throttleFloor, paceCeiling));
+    const remaining = weeklyLimit - usage.weeklyPct;
     weeklyReason = weeklyLimit < cap ? "weekly-on-track" : "weekly-cap";
-    weeklyPct = Math.max(0, weeklyLimit - usage.weeklyPct);
+    // Which comparison the gate makes at the limit. Only the pace-line is exclusive, and only where
+    // it is what binds — a limit pinned to the cap or held up by the throttle floor defers AT it.
+    // Already over (`remaining` clamped to 0) is inclusive too: there is nothing left to spend.
+    weeklyInclusive = remaining <= 0 || weeklyLimit >= cap || paceCeiling < throttleFloor;
+    weeklyPct = Math.max(0, remaining);
   }
 
   return {
@@ -360,6 +373,7 @@ export function budgetHeadroom(
     sessionReason: reserveHolds ? "daytime-reserve" : "session-headroom",
     weeklyPct,
     weeklyReason,
+    weeklyInclusive,
   };
 }
 

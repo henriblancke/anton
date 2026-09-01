@@ -32,12 +32,15 @@ import { cn } from "@/lib/utils";
 export function VetoActions({
   slug,
   beadId,
+  title,
   notNowUntil,
   className,
   onVetoed,
 }: {
   slug: string;
   beadId: string;
+  /** The target's title, for the confirmation — the operator set a thing aside, not an id. */
+  title: string;
   /** When the target's current hold expires (epoch ms), when one is already running. */
   notNowUntil?: number;
   className?: string;
@@ -65,7 +68,7 @@ export function VetoActions({
 
       if (action === "not-now") {
         toast.success("Set aside", {
-          description: `anton offers ${beadId} again in ${formatCountdown(new Date(until ?? Date.now()).toISOString())}.`,
+          description: `anton offers "${title}" again in ${formatCountdown(new Date(until ?? Date.now()).toISOString())}.`,
         });
         // The hold is server state the card reads, so a refresh is what draws it as deferred.
         router.refresh();

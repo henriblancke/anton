@@ -99,8 +99,13 @@ export function budgetLine(
     // meter BEFORE a run starts and reserves nothing, so the run that spends the last of the
     // headroom is still admitted and only the one after it waits. Charging first would put the line
     // one card too high, marking a card as waiting that anton is about to start.
+    // Each side is charged at the boundary the gate itself tests. Both session holds defer AT their
+    // threshold; on the weekly side only the pace-line defers past it (`weeklyInclusive`), so a card
+    // whose burn lands exactly on the pace ceiling is one the governor still starts.
     const overSession = session >= headroom.sessionPct;
-    const overWeekly = headroom.weeklyPct !== null && weekly >= headroom.weeklyPct;
+    const overWeekly =
+      headroom.weeklyPct !== null &&
+      (headroom.weeklyInclusive ? weekly >= headroom.weeklyPct : weekly > headroom.weeklyPct);
     if (overSession || overWeekly) {
       // budgetGate's order is session-headroom → weekly-cap → weekly-on-track → daytime-reserve, so
       // only the hard floor beats a weekly hold when both are exhausted.

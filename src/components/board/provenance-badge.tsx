@@ -16,8 +16,12 @@ const MARK = "◈";
 interface ProvenanceGrammar {
   /** The badge's visible word — the only thing that differs between writers. */
   label: string;
-  /** Concrete evidence for the claim. A badge that opened nothing would be decoration. */
-  href: (slug: string, beadId: string, provenance: BeadProvenance) => string;
+  /**
+   * Concrete evidence for the claim. A badge that opened nothing would be decoration — so a writer
+   * whose entry carries no evidence to open answers `null` and the badge is dropped entirely,
+   * rather than linking at a ref the board never sent.
+   */
+  href: (slug: string, beadId: string, provenance: BeadProvenance) => string | null;
   title: (provenance: BeadProvenance) => string;
 }
 
@@ -45,8 +49,9 @@ const GRAMMAR: Partial<Record<ProvenanceKind, ProvenanceGrammar>> = {
   },
   pm: {
     label: "PM",
-    // Any run target's detail page answers for any bead id, and a proposal is an ordinary bead.
-    href: (slug, _beadId, { ref }) => `/projects/${slug}/epics/${ref}`,
+    // Any run target's detail page answers for any bead id, and a proposal is an ordinary bead —
+    // but the proposal IS the evidence here, so an entry without one has nothing to open.
+    href: (slug, _beadId, { ref }) => (ref ? `/projects/${slug}/epics/${ref}` : null),
     title: ({ ref, detail }) =>
       `Product master proposed ${detail ?? "a move"} on this bead${ref ? ` (${ref})` : ""} — open the proposal and its evidence`,
   },
@@ -76,9 +81,15 @@ export function ProvenanceBadge({
   const grammar = GRAMMAR[provenance.kind];
   if (!grammar) return null;
 
+  // `ref` is optional on the wire, so a writer that omitted it leaves nothing to open. Dropping the
+  // badge is the same degradation an unknown kind gets — a link built from a missing ref would
+  // navigate somewhere the operator never asked for.
+  const href = grammar.href(slug, beadId, provenance);
+  if (!href) return null;
+
   return (
     <Link
-      href={grammar.href(slug, beadId, provenance)}
+      href={href}
       title={grammar.title(provenance)}
       onClick={(e) => e.stopPropagation()}
       className={cn(

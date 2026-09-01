@@ -37,7 +37,7 @@ function stubFetch(body: unknown, status = 200) {
 }
 
 function mount(over: Partial<Parameters<typeof VetoActions>[0]> = {}) {
-  return render(<VetoActions slug="anton" beadId="anton-a" {...over} />);
+  return render(<VetoActions slug="anton" beadId="anton-a" title="Ship the lane" {...over} />);
 }
 
 describe("✕ not now", () => {
@@ -57,6 +57,11 @@ describe("✕ not now", () => {
       }),
     );
     expect(onVetoed).toHaveBeenCalledWith(UNTIL);
+    // The operator set a thing aside, not an id — the confirmation names what they recognise.
+    expect(success).toHaveBeenCalledWith(
+      "Set aside",
+      expect.objectContaining({ description: expect.stringContaining('"Ship the lane"') }),
+    );
     // It sets one target aside; it never navigates away from the board.
     expect(push).not.toHaveBeenCalled();
   });

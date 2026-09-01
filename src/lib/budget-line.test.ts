@@ -19,6 +19,7 @@ function headroom(over: Partial<BudgetHeadroom> = {}): BudgetHeadroom {
     sessionReason: "session-headroom",
     weeklyPct: null,
     weeklyReason: "weekly-cap",
+    weeklyInclusive: true,
     ...over,
   };
 }
@@ -72,6 +73,22 @@ describe("budgetLine", () => {
       queue(2),
     );
     expect(line).toEqual({ affordable: 0, reason: "weekly-on-track", seeded: false });
+  });
+
+  it("admits the card that lands exactly on the pace ceiling — the gate defers only past it", () => {
+    // 6 weekly points at 3 a run: the second card's burn ends ON the ceiling, and budgetGate's
+    // pacing test is strict (`usage > ceiling`), so the third still starts. Only the fourth waits.
+    const line = budgetLine(
+      signal({ sessionPct: 100, weeklyPct: 6, weeklyReason: "weekly-on-track", weeklyInclusive: false }),
+      queue(4),
+    );
+    expect(line).toEqual({ affordable: 3, reason: "weekly-on-track", seeded: false });
+  });
+
+  it("holds the card that lands exactly on the weekly cap — that hold bites AT its threshold", () => {
+    // The same arithmetic against an inclusive limit (`usage >= cap`): the second card is held.
+    const line = budgetLine(signal({ sessionPct: 100, weeklyPct: 6 }), queue(4));
+    expect(line).toEqual({ affordable: 2, reason: "weekly-cap", seeded: false });
   });
 
   it("reports the session floor when both sides run out on the same card", () => {
