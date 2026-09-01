@@ -217,3 +217,55 @@ describe("EpicCard — a vetoed target", () => {
     );
   });
 });
+
+/**
+ * Provenance badges (anton-cqxd / R3.7) ride on the CARD, not on one lane: an operator scanning
+ * Backlog or Implementing must be able to answer "which subsystem put this here?" without opening
+ * anything.
+ */
+describe("EpicCard provenance", () => {
+  it("marks the picker's pick and links at the rule that admitted it", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({
+          provenance: [{ kind: "policy", ref: "labels:severity", detail: "the armed policy" }],
+        })}
+      />,
+    );
+
+    expect(html).toContain("◈");
+    expect(html).toContain("policy");
+    expect(html).toContain("criterion=labels%3Aseverity");
+    // The card's own bead, so the panel opens at THIS bead's evaluated criteria.
+    expect(html).toContain("bead=anton-1");
+  });
+
+  it("marks a product-master proposal and links at the proposal itself", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ provenance: [{ kind: "pm", ref: "anton-9", detail: "low-value" }] })}
+      />,
+    );
+
+    expect(html).toContain("PM");
+    expect(html).toContain("/projects/anton/epics/anton-9");
+  });
+
+  it("says nothing about a card no unattended writer touched", () => {
+    expect(renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />)).not.toContain("◈");
+  });
+
+  it("never badges a done card — provenance answers whether to RUN this, and it has run", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ stage: "done", provenance: [{ kind: "policy", ref: "types" }] })}
+      />,
+    );
+
+    expect(html).not.toContain("◈");
+    expect(html).not.toContain("criterion=types");
+  });
+});

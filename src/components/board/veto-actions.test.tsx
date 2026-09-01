@@ -6,7 +6,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { VetoActions, criterionLabel, policyHref } from "@/components/board/veto-actions";
+import { VetoActions } from "@/components/board/veto-actions";
+import { criterionLabel, policyHref } from "@/lib/policy/href";
 
 const refresh = vi.fn();
 const push = vi.fn();

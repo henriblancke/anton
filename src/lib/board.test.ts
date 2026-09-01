@@ -61,6 +61,22 @@ vi.mock("./picker-veto", async () => {
   };
 });
 
+// Same seam, same reason, for the two reads a card's provenance badges come from (anton-cqxd): the
+// picker's recorded plan and the policy it was picked under both live in anton.db. `pickerPlan` is
+// what the picker last decided here, and every test but the provenance ones runs with no plan.
+let pickerPlan: import("./board-picker-plan").BoardPickerPlan | undefined;
+
+vi.mock("./board-picker-plan", async () => {
+  const actual =
+    await vi.importActual<typeof import("./board-picker-plan")>("./board-picker-plan");
+  return { ...actual, latestBoardPickerPlan: async () => pickerPlan };
+});
+
+vi.mock("./projects", async () => {
+  const actual = await vi.importActual<typeof import("./projects")>("./projects");
+  return { ...actual, getProjectSettings: async () => ({}) };
+});
+
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
@@ -71,6 +87,7 @@ beforeEach(() => {
   hygieneReport = undefined;
   scanHealth = undefined;
   deferrals = new Map();
+  pickerPlan = undefined;
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1110,5 +1127,68 @@ describe("picker vetoes on the board (anton-jqvy)", () => {
     deferrals = new Map([["t-1", UNTIL]]);
     const board = await getBoard(project);
     expect(await getBoardVersion(project)).toBe(board.version);
+  });
+});
+
+/**
+ * Provenance badges (anton-cqxd / R3.7) are joined onto the cards the board serves, so every surface
+ * that renders a card renders them — the lane is one reader of this data, never its owner.
+ */
+describe("provenance on the board (anton-cqxd)", () => {
+  const planFor = (beadId: string): import("./board-picker-plan").BoardPickerPlan => ({
+    projectId: "p1",
+    generatedAt: 1_770_000_000,
+    stamp: { observedAtMs: 1_770_000_000_000, digest: "d1", beadCount: 1 },
+    entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
+    exclusions: [],
+  });
+
+  it("marks the picker's pick on a card and on a chip alike", async () => {
+    listMock.mockResolvedValue([
+      makeBead({ id: "f-1", title: "A feature", issue_type: "feature" }),
+      makeBead({ id: "t-1", title: "A loose task" }),
+    ]);
+    pickerPlan = {
+      ...planFor("f-1"),
+      entries: [
+        { beadId: "f-1", rank: 1, rule: "any claimable run target" },
+        { beadId: "t-1", rank: 2, rule: "any claimable run target" },
+      ],
+    };
+
+    const board = await getBoard(project);
+    expect(board.columns.backlog.find((e) => e.id === "f-1")?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target" },
+    ]);
+    expect(board.standalone.backlog.find((i) => i.id === "t-1")?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target" },
+    ]);
+  });
+
+  it("never badges a done target — provenance is about whether to run it", async () => {
+    listMock.mockResolvedValue([
+      makeBead({ id: "f-1", title: "A shipped feature", issue_type: "feature", status: "closed" }),
+    ]);
+    pickerPlan = planFor("f-1");
+
+    expect((await getBoard(project)).columns.done[0]?.provenance).toBeUndefined();
+  });
+
+  it("leaves a target no unattended writer touched unmarked", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    expect((await getBoard(project)).standalone.backlog[0]?.provenance).toBeUndefined();
+  });
+
+  it("moves the refresh token when the picker records a new plan", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    const clean = (await getBoard(project)).version;
+
+    resetIssueSnapshots();
+    pickerPlan = planFor("t-1");
+    const picked = (await getBoard(project)).version;
+    expect(picked).not.toBe(clean);
+
+    // The poll path compares against the same token, or the badge never reaches the tab.
+    expect(await getBoardVersion(project)).toBe(picked);
   });
 });

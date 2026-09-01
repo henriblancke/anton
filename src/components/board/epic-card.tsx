@@ -23,6 +23,7 @@ import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
+import { ProvenanceBadges } from "@/components/board/provenance-badge";
 import {
   AbandonedChip,
   BlockedChip,
@@ -226,6 +227,10 @@ export function EpicCard({
 
       <div className="flex flex-wrap gap-1.5">
         <TypeBadge type={epic.type} />
+        {/* Who put this card here, and why — the same grammar on every card that renders, not only
+            in Up Next (anton-cqxd). A done card carries none: the board attaches provenance only
+            while the answer still bears on whether the target should run. */}
+        <ProvenanceBadges slug={slug} beadId={epic.id} provenance={epic.provenance} />
         {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
         {epic.risk && <RiskChip risk={epic.risk} />}
         {epic.size && <MetaChip>size:{epic.size}</MetaChip>}

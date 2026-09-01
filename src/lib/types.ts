@@ -234,12 +234,46 @@ export interface Epic {
    */
   notNowUntil?: number;
   /**
+   * Who put this card where it is, and why (anton-cqxd) — one entry per unattended writer that
+   * touched it. Empty/absent means nothing automated claims this bead. Never carried on a DONE card:
+   * provenance answers "should this run?", which a shipped target no longer asks.
+   */
+  provenance?: BeadProvenance[];
+  /**
    * The product epic this card sits under, when its parent is an `epic` bead — the grouping key for
    * the board's epic swimlanes (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a
    * top-level run target, which collects in the "No epic" lane.
    */
   epic?: EpicCrumb;
   tickets: Ticket[];
+}
+
+/**
+ * WHICH unattended writer put a bead where it is, and what to read to check the judgment
+ * (anton-cqxd / R3.7).
+ *
+ * ONE grammar for every writer, because there are three of them and they all write to the board with
+ * nobody watching: the board-picker admits a target under the standing policy, the product master
+ * proposes a move on it, and the repair passes rewrite one that came back blocked. Three bespoke
+ * indicators would make the board unreadable — the badge is always `◈ <writer>`, and what differs is
+ * the word and where it lands.
+ *
+ * `repaired` is RESERVED, not rendered: the kind exists so the repair passes extend this grammar
+ * instead of inventing a second one, and a surface renders nothing for a kind it has no wording for
+ * (see `provenance-badge.tsx`).
+ */
+export type ProvenanceKind = "policy" | "pm" | "repaired";
+
+export interface BeadProvenance {
+  kind: ProvenanceKind;
+  /**
+   * What the badge opens — a policy criterion key for `policy`, the proposal's bead id for `pm`.
+   * Absent is a real answer: a project whose policy narrows nothing this bead satisfies has no
+   * criterion to open at, and the badge falls back to the panel rather than to a broken link.
+   */
+  ref?: string;
+  /** What that writer decided, in its own words — the badge's tooltip, never its label. */
+  detail?: string;
 }
 
 /**
@@ -280,6 +314,8 @@ export interface StandaloneItem {
   abandoned: boolean;
   /** Held out of the picker's plan by an operator veto, exactly as on a card (Epic.notNowUntil). */
   notNowUntil?: number;
+  /** Who put this chip where it is, exactly as on a card (Epic.provenance). */
+  provenance?: BeadProvenance[];
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors

@@ -56,7 +56,7 @@ export function StandaloneChip({
         />
       )}
       <ChipHeader item={item} hasOverlay={hasOverlay} />
-      <ChipMeta item={item} deferred={approval.deferred} hasOverlay={hasOverlay} />
+      <ChipMeta slug={slug} item={item} deferred={approval.deferred} hasOverlay={hasOverlay} />
       {item.stage === "backlog" && (
         <ChipBacklogActions
           slug={slug}

@@ -80,32 +80,46 @@ const PRIORITIES = [0, 1, 2, 3, 4];
 const MAX_LISTED = 40;
 
 /**
- * Which criterion a deep link asked this editor to open at (anton-jqvy).
+ * The location, as an external system this component may only READ (anton-jqvy, anton-cqxd).
  *
- * `Never` on a picked target lands here with `?criterion=<PolicyCriterionKey>` beside the `#policy`
- * hash, so the veto arrives on the CONTROL that admitted the bead rather than on a panel of twelve.
- * Read from the URL through `useSyncExternalStore` for the same reason the active section is: the
- * location is an external system the server cannot see, and this is the shape that renders nothing
- * on the server and the highlight on the client without a hydration mismatch — and without dragging
- * the settings page behind a `useSearchParams` Suspense boundary.
- *
- * Advisory only. It highlights and scrolls; it never edits, disables or preselects anything, because
- * `Never` opens the policy and the operator writes the rule.
+ * Module-level so the subscription is stable across renders, and shaped this way — rather than as a
+ * `useSearchParams` read — because the deep link must render nothing on the server and its effect on
+ * the client without a hydration mismatch, and without dragging the whole settings page behind a
+ * Suspense boundary.
  */
-function useHighlightedCriterion(): string | undefined {
+function subscribeToLocation(onChange: () => void): () => void {
+  window.addEventListener("popstate", onChange);
+  window.addEventListener("hashchange", onChange);
+  return () => {
+    window.removeEventListener("popstate", onChange);
+    window.removeEventListener("hashchange", onChange);
+  };
+}
+
+/** One search param off the current URL, or undefined on the server and when it is absent. */
+function useUrlParam(name: string): string | undefined {
   const raw = useSyncExternalStore(
-    (onChange) => {
-      window.addEventListener("popstate", onChange);
-      window.addEventListener("hashchange", onChange);
-      return () => {
-        window.removeEventListener("popstate", onChange);
-        window.removeEventListener("hashchange", onChange);
-      };
-    },
-    () => new URLSearchParams(window.location.search).get("criterion"),
+    subscribeToLocation,
+    () => new URLSearchParams(window.location.search).get(name),
     () => null,
   );
   return raw ?? undefined;
+}
+
+/**
+ * What a deep link asked this editor to open at: a criterion to land on, and the bead that link was
+ * about.
+ *
+ * Two callers, arriving for opposite reasons and landing in the same place. `Never` on a pick
+ * (anton-jqvy) sends the operator at the criterion that admitted it, to TIGHTEN it. A card's
+ * `◈ policy` badge (anton-cqxd) sends them at the same criterion to CHECK it, and names the bead so
+ * the panel can open its evaluation instead of a list of forty.
+ *
+ * Advisory only. It highlights, opens and scrolls; it never edits, disables or preselects anything,
+ * because the operator writes the rule.
+ */
+function usePolicyDeepLink(): { criterion?: string; bead?: string } {
+  return { criterion: useUrlParam("criterion"), bead: useUrlParam("bead") };
 }
 
 /**
@@ -178,7 +192,7 @@ export function PolicyDraftSection({
   boardUnavailable?: boolean;
 }) {
   const router = useRouter();
-  const highlighted = useHighlightedCriterion();
+  const { criterion: highlighted, bead: focusBead } = usePolicyDeepLink();
   const armed = stored !== undefined;
   const [policy, setPolicy] = useState<Policy>(stored ?? draft.policy);
   const [saving, setSaving] = useState(false);
@@ -671,6 +685,7 @@ export function PolicyDraftSection({
           excluded={excluded}
           total={candidates.length}
           notStartable={notStartable}
+          focusBead={focusBead}
         />
       )}
 
@@ -784,11 +799,18 @@ function MatchPanel({
   excluded,
   total,
   notStartable,
+  focusBead,
 }: {
   matched: PolicyCandidate[];
   excluded: { candidate: PolicyCandidate; failed: { label: string; reason: string }[] }[];
   total: number;
   notStartable: number;
+  /**
+   * The bead a `◈ policy` badge arrived from (anton-cqxd). Its list opens and its row is marked, so
+   * the badge's promise — "the rule that matched, WITH this bead's evaluated criteria" — is kept
+   * without the operator hunting a list capped at {@link MAX_LISTED}.
+   */
+  focusBead?: string;
 }) {
   if (total === 0) {
     return (
@@ -820,17 +842,26 @@ function MatchPanel({
       )}
 
       {matched.length > 0 && (
-        <details>
+        <details open={matched.some((c) => c.id === focusBead)}>
           <summary className="cursor-pointer text-[11.5px] text-subtle hover:text-foreground">
             See them ({matched.length})
           </summary>
           <ul className="mt-1.5 flex flex-col gap-1">
-            {matched.slice(0, MAX_LISTED).map((c) => (
-              <li key={c.id} className="flex gap-2 text-[11.5px]">
-                <span className="shrink-0 font-mono text-[10.5px] text-subtle">{c.id}</span>
-                <span className="truncate text-foreground">{c.title}</span>
-              </li>
-            ))}
+            {focusFirst(matched, (c) => c.id, focusBead)
+              .slice(0, MAX_LISTED)
+              .map((c) => (
+                <li
+                  key={c.id}
+                  {...(c.id === focusBead ? { "aria-current": "true" as const } : {})}
+                  className={cn(
+                    "flex gap-2 rounded-sm text-[11.5px]",
+                    c.id === focusBead && "bg-primary/10 px-1 ring-1 ring-primary/30",
+                  )}
+                >
+                  <span className="shrink-0 font-mono text-[10.5px] text-subtle">{c.id}</span>
+                  <span className="truncate text-foreground">{c.title}</span>
+                </li>
+              ))}
             {matched.length > MAX_LISTED && (
               <li className="text-[11px] text-subtle">
                 …and {matched.length - MAX_LISTED} more
@@ -841,15 +872,23 @@ function MatchPanel({
       )}
 
       {excluded.length > 0 && (
-        <details>
+        <details open={excluded.some((e) => e.candidate.id === focusBead)}>
           <summary className="cursor-pointer text-[11.5px] text-subtle hover:text-foreground">
             Why not the rest? ({excluded.length})
           </summary>
           <ul className="mt-1.5 flex flex-col gap-1">
-            {excluded.slice(0, MAX_LISTED).map(({ candidate, failed }) => (
+            {focusFirst(excluded, (e) => e.candidate.id, focusBead)
+              .slice(0, MAX_LISTED)
+              .map(({ candidate, failed }) => (
               <li key={candidate.id}>
-                <details>
-                  <summary className="flex cursor-pointer gap-2 text-[11.5px] hover:text-foreground">
+                <details open={candidate.id === focusBead}>
+                  <summary
+                    {...(candidate.id === focusBead ? { "aria-current": "true" as const } : {})}
+                    className={cn(
+                      "flex cursor-pointer gap-2 rounded-sm text-[11.5px] hover:text-foreground",
+                      candidate.id === focusBead && "bg-primary/10 px-1 ring-1 ring-primary/30",
+                    )}
+                  >
                     <span className="shrink-0 font-mono text-[10.5px] text-subtle">
                       {candidate.id}
                     </span>
@@ -875,6 +914,18 @@ function MatchPanel({
       )}
     </div>
   );
+}
+
+/**
+ * The deep-linked bead first, everything else in its existing order. Both lists are capped at
+ * {@link MAX_LISTED}, so a badge that opened the panel on a bead sitting at position 200 would
+ * otherwise land on a list that does not contain it — the one case where the link silently fails.
+ */
+function focusFirst<T>(items: T[], idOf: (item: T) => string, focusBead?: string): T[] {
+  if (!focusBead) return items;
+  const index = items.findIndex((item) => idOf(item) === focusBead);
+  if (index <= 0) return items;
+  return [items[index], ...items.slice(0, index), ...items.slice(index + 1)];
 }
 
 /**
@@ -906,7 +957,7 @@ function NamespaceCriterion({
   /** Discovery read these values as a scale — a hint beside the control, never a gate on it. */
   scaleLike: boolean;
   why?: PolicyRationale;
-  /** A `Never` veto sent the operator here to tighten THIS criterion (see useHighlightedCriterion). */
+  /** A deep link sent the operator at THIS criterion — to tighten or to check it (usePolicyDeepLink). */
   highlighted?: boolean;
   onToggleValue: (value: string) => void;
   onRanked: (ranked: boolean) => void;
@@ -1173,7 +1224,7 @@ function Criterion({
         <span className="font-mono text-[11px] font-medium text-foreground">{label}</span>
         {highlighted && (
           <span className="text-[10.5px] text-subtle">
-            this admitted the target you declined
+            this admitted the bead you came from
           </span>
         )}
         {onRemove && (

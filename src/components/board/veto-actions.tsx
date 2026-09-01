@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { criterionLabel, policyHref } from "@/lib/policy/href";
 import { formatCountdown } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
@@ -21,6 +22,9 @@ import { cn } from "@/lib/utils";
  * `Never` does not edit anything. It navigates. An action that quietly narrowed a standing policy off
  * one card would be anton writing the operator's rules for them, which is the one thing the whole
  * approval design refuses.
+ *
+ * Where `Never` lands — the policy panel, at the criterion the server named — is `policyHref`'s
+ * (`lib/policy/href.ts`), shared with the `◈ policy` badge that opens the same rule to read it.
  *
  * A leaf, and deliberately the smallest one: the surrounding card is server-rendered, and only these
  * two controls need to be interactive.
@@ -119,21 +123,4 @@ export function VetoActions({
       </Button>
     </span>
   );
-}
-
-/**
- * Where `Never` lands: the settings page's policy panel, with the criterion to tighten named in the
- * query so the editor can highlight the control rather than the operator hunting for it.
- *
- * The panel itself is selected by the HASH, which is how every settings section is addressed
- * (`useActiveSection`); the criterion rides beside it as a search param because a hash holds one id.
- */
-export function policyHref(slug: string, criterion?: string): string {
-  const base = `/projects/${slug}/settings`;
-  return criterion ? `${base}?criterion=${encodeURIComponent(criterion)}#policy` : `${base}#policy`;
-}
-
-/** A criterion key as the editor labels it — `severity:`, not `labels:severity`. */
-export function criterionLabel(criterion: string): string {
-  return criterion.startsWith("labels:") ? `${criterion.slice("labels:".length)}:` : criterion;
 }

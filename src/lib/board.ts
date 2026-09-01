@@ -14,6 +14,9 @@ import {
   type HygieneReport,
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
+import { latestBoardPickerPlan, type BoardPickerPlan } from "./board-picker-plan";
+import { boardProvenance, provenanceVersion } from "./board-provenance";
+import { getDb } from "./db";
 import { deferralVersion, latestPickerDeferrals } from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
 import {
@@ -24,6 +27,8 @@ import {
   type ScanHealth,
 } from "./scan-health";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
+import type { Policy } from "./policy/types";
+import { getProjectSettings, resolvePickerPolicy } from "./projects";
 import {
   boardCards,
   isRunTicket,
@@ -36,6 +41,7 @@ import {
 } from "./ticket-view";
 import {
   STAGES,
+  type BeadProvenance,
   type Board,
   type Epic,
   type Project,
@@ -57,22 +63,25 @@ function boardVersion(
   hygiene: string,
   scan: string,
   vetoes: string,
+  provenance: string,
   repoPath: string,
 ): string {
-  return `${snapshotVersion}:${hygiene}:${scan}:${vetoes}:${getSyncStatusToken(repoPath)}`;
+  return `${snapshotVersion}:${hygiene}:${scan}:${vetoes}:${provenance}:${getSyncStatusToken(repoPath)}`;
 }
 
 export async function getBoardVersion(project: Project): Promise<string> {
-  const [hygiene, scan, deferrals] = await Promise.all([
+  const [hygiene, scan, deferrals, plan] = await Promise.all([
     readHygieneVersion(project),
     readScanHealthVersion(project),
     readDeferrals(project),
+    readPickerPlan(project),
   ]);
   return boardVersion(
     issueSnapshotVersion(project.repoPath),
     hygiene,
     scan,
     deferralVersion(deferrals),
+    provenanceVersion(plan),
     project.repoPath,
   );
 }
@@ -128,6 +137,30 @@ async function readDeferrals(project: Project): Promise<Map<string, number>> {
   }
 }
 
+/**
+ * The picker's latest recorded plan — where a card's `◈ policy` provenance comes from (anton-cqxd).
+ * Degrades to "the picker has never run here" on an anton.db failure, exactly as the reads above do:
+ * a missing badge is a board with less explanation on it, a throw is no board at all.
+ */
+async function readPickerPlan(project: Project): Promise<BoardPickerPlan | undefined> {
+  try {
+    return await latestBoardPickerPlan(project.id);
+  } catch (err) {
+    console.error(`[board] picker plan read failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
+/** The policy armed on this machine — what `◈ policy` anchors at. Fail-soft for the same reason. */
+async function readPickerPolicy(project: Project): Promise<Policy | undefined> {
+  try {
+    return resolvePickerPolicy(await getProjectSettings(getDb(), project.id));
+  } catch (err) {
+    console.error(`[board] picker policy read failed for ${project.slug}`, err);
+    return undefined;
+  }
+}
+
 async function readScanHealthVersion(project: Project): Promise<string> {
   try {
     return await latestScanHealthVersion(project.id);
@@ -154,14 +187,17 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Read beads and their snapshot version together: a background refresh can land mid-build, so
   // stamping the response with a separately-read version would let it advance past the data served
   // here — the client would then poll that version, 304, and never see this board's data refreshed.
-  // The bead read (bd) and the anton.db reads (hygiene, scan health, picker vetoes) are independent
-  // — run them concurrently so the slowest sets the board's latency instead of their sum.
-  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan, deferrals] =
+  // The bead read (bd) and the anton.db reads (hygiene, scan health, picker vetoes, the picker's
+  // plan and policy) are independent — run them concurrently so the slowest sets the board's latency
+  // instead of their sum.
+  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan, deferrals, plan, policy] =
     await Promise.all([
       readAllIssues(project.repoPath, opts),
       readHygiene(project),
       readScanHealth(project),
       readDeferrals(project),
+      readPickerPlan(project),
+      readPickerPolicy(project),
     ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
@@ -283,6 +319,14 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Chips read the same way in every column (unread-first, then newest), independent of epic order.
   for (const stage of STAGES) standalone[stage].sort(compareStandalone);
 
+  // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
+  // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
+  const provenance = boardProvenance({ board: allBeads, plan, policy });
+  // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
+  // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
+  const marksFor = (stage: Stage, id: string): BeadProvenance[] | undefined =>
+    stage === "done" ? undefined : provenance.get(id);
+
   // Resolve PR links from the repo's origin remote (once) so `gh-<n>` refs become clickable.
   const base = await githubBaseUrl(project.repoPath);
   for (const stage of STAGES) {
@@ -291,12 +335,16 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       // A vetoed target reads as SET ASIDE on the board, never as silently missing (anton-jqvy).
       const held = deferrals.get(epic.id);
       if (held !== undefined) epic.notNowUntil = held;
+      const marks = marksFor(stage, epic.id);
+      if (marks?.length) epic.provenance = marks;
       for (const ticket of epic.tickets) attachPrUrl(ticket, base);
     }
     for (const item of standalone[stage]) {
       attachPrUrl(item, base);
       const held = deferrals.get(item.id);
       if (held !== undefined) item.notNowUntil = held;
+      const marks = marksFor(stage, item.id);
+      if (marks?.length) item.provenance = marks;
     }
   }
 
@@ -311,6 +359,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       hygieneVersion(hygiene),
       scanHealthVersion(scan),
       deferralVersion(deferrals),
+      provenanceVersion(plan),
       project.repoPath,
     ),
     columns,
