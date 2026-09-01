@@ -639,4 +639,43 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
     expect(await executeEpicJobs(epic)).toHaveLength(0);
   });
+
+  // Same window, different verdict (PR #214 review). `humanTarget` answers "does a run start at
+  // all", and the executor decides that from the label as of the write — so a label landing between
+  // the pre-lock read and the locked one must be what the response reports. Taken from the stale
+  // read, this approval would tell the operator their run started while the job is already poison.
+  // Synchronization mirrors the container race above: the write holds the lock and releases only
+  // once the pre-lock gates have answered.
+  it("reads humanTarget off the locked bead when the label lands mid-approval", async () => {
+    actAs("anton-test");
+    const target = await beads.create(repo, {
+      title: "Becomes a person's job mid-approval",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+
+    let gatesPassed!: () => void;
+    const gatesDone = new Promise<void>((resolve) => (gatesPassed = resolve));
+
+    const { withBeadWriteLock } = await import("@/lib/beads/claim-lock");
+    const labelLanded = withBeadWriteLock(repo, target, async () => {
+      await gatesDone;
+      await beads.tag(repo, target, ["agent:human"]);
+    });
+
+    const request = jsonRequest("POST");
+    Object.defineProperty(request, "json", {
+      value: async () => {
+        gatesPassed();
+        await labelLanded;
+        return {};
+      },
+    });
+
+    const res = await POST(request, ctx("approvy", target));
+    await labelLanded;
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).humanTarget).toBe(true);
+  });
 });

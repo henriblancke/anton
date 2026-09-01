@@ -159,6 +159,31 @@ describe("OperatorQueue", () => {
     expect(screen.getByRole("link", { name: "anton-f1" })).toBeTruthy();
   });
 
+  it("tells a run target's row what closes it, since no run ever will", () => {
+    // Beads close when a run finishes the work, and this one is refused before dispatch — so the
+    // row that is the whole ask has to name what settles it, or the operator does the work and then
+    // hunts the board for a completion button that does not exist (PR #214 review).
+    render(<OperatorQueue slug="anton" items={[item({ id: "anton-t9" })]} onOpenTicket={() => {}} />);
+
+    const row = screen.getByRole("listitem").textContent ?? "";
+    expect(row).toContain("nothing closes it for you");
+    expect(row).toContain("bd close anton-t9");
+  });
+
+  it("leaves that closing line off a ticket, whose run target owns the settling", () => {
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[
+          item({ id: "anton-f1.1", runTarget: { id: "anton-f1", title: "Ship billing" }, holdsRun: true }),
+        ]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("listitem").textContent ?? "").not.toContain("bd close");
+  });
+
   it("marks an ask someone has already picked up, and leaves an untouched one unchipped", () => {
     // Without it an in-progress ask reads exactly like one nobody has opened — the queue's own
     // reason for keeping `in_progress` rows is that the work is being done (PR #214 review).

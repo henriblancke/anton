@@ -125,7 +125,7 @@ function QueueRow({
         </MetaChip>
       </div>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-        {/* The bead itself — every control for editing, claiming or closing it already lives there,
+        {/* The bead itself — every control for editing, claiming or settling it already lives there,
             so this band opens it rather than reproducing them. WHERE it lives differs by shape, the
             same split the tickets table makes: a run target gets the epic page, whose actions
             (Approve, Force run) are exactly the ones it can take, while a PARENTED ticket has none
@@ -163,6 +163,16 @@ function QueueRow({
           <span className="text-muted-foreground">Resolve &amp; resume</span> on its &ldquo;Waiting
           on you&rdquo; row above. That is what restarts the run, and the run is what closes this
           ticket.
+        </p>
+      ) : null}
+      {/* A target row is the whole ask, and no surface in anton finishes it: beads close when a run
+          does the work, and this one refuses to run at all. Naming what closes it is the honest
+          version of that — the alternative is an operator doing the work and then hunting the board
+          for a button that does not exist (PR #214 review). */}
+      {!item.runTarget ? (
+        <p className="text-[11px] text-subtle">
+          No run starts on it, so nothing closes it for you — do the work, then{" "}
+          <span className="font-mono text-muted-foreground">bd close {item.id}</span>.
         </p>
       ) : null}
       {/* The target is a person's work too, so anton refuses the run at the target and never reaches

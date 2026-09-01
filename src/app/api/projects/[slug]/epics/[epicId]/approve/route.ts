@@ -478,7 +478,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // already in review — and both still hit the target-level poison when re-run. Conditioning this on
   // a non-empty dispatch set would answer those with silence about the one thing that decides the
   // outcome (PR #214 review).
-  const humanTarget = willEnqueue && beads.isHumanWork(target);
+  //
+  // Filled from the LOCKED read below, not from the pre-lock `target`: the label can be added or
+  // removed in the window between them, and the executor acts on the label as of the write. Deciding
+  // it here would announce a started run for a target that is already poison, or promise silence
+  // about a run that in fact never starts (PR #214 review).
+  let humanTarget = false;
 
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
@@ -564,6 +569,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // re-check refuses the draft.
     const refusal = notRunTargetReason(locked, lockedBoard);
     if (refusal) return { refused: refusal } as const;
+
+    // The human-target verdict, taken off the same locked read the approval writes against — see the
+    // declaration above for why the pre-lock read is not good enough.
+    humanTarget = willEnqueue && beads.isHumanWork(locked);
 
     // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
     // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the original
