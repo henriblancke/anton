@@ -50,7 +50,9 @@ export interface EpicDetailSummary {
 
 export function summarizeEpicDetail({ epic, tickets }: EpicDetail): EpicDetailSummary {
   const { done, total, pct } = ticketProgress({ tickets });
-  const inProgress = tickets.filter((t) => t.stage === "implementing").length;
+  // Abandoned tickets leave every count, not just the denominator ticketProgress trims — mixing the
+  // two populations would inflate inProgressPct and floor `todo` to zero.
+  const inProgress = tickets.filter((t) => t.stage === "implementing" && !t.abandoned).length;
 
   return {
     done,

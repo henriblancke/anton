@@ -54,6 +54,7 @@ describe("summarizeEpicDetail", () => {
           makeTicket({ id: "t-2", stage: "implementing" }),
           makeTicket({ id: "t-3", stage: "backlog" }),
           makeTicket({ id: "t-4", stage: "done", abandoned: true }),
+          makeTicket({ id: "t-5", stage: "implementing", abandoned: true }),
         ],
       }),
     );
@@ -65,7 +66,7 @@ describe("summarizeEpicDetail", () => {
       done: 1,
       inProgress: 1,
       todo: 1,
-      abandoned: 1,
+      abandoned: 2,
       pct: 33,
       inProgressPct: 33,
     });
