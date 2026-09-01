@@ -1611,7 +1611,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     is dropped for the same reason (anton-t1mo) — leaving it in would put it in the PR body
       //     as delivered and hand the reviewer a diff it isn't in. One stopped AFTER its commit
       //     stays: its code is in the diff, so dropping it would hide work the reviewer must read.
-      const delivered = live.filter((t) => !rolledBack.has(t.id));
+      //     A HUMAN ticket goes for the same reason (anton-mv70): a person did it outside this
+      //     branch — 0b-pre closed it on the way back in — so no commit here carries it. Leaving it
+      //     would advertise a signature or a purchase in the PR body as delivered by a diff that
+      //     cannot contain it, and hand the review gate a contract no code in the diff can satisfy,
+      //     parking the run at review after the person already did their part.
+      const delivered = live.filter((t) => !rolledBack.has(t.id) && !beads.isHumanWork(t));
 
       // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is
       // only correct while SOMETHING landed — carrying on here would run the review gate over an

@@ -23,6 +23,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { beads, gateReason, LABELS, type Gate } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import * as schema from "../db/schema";
@@ -80,18 +81,56 @@ describeBd("execute-epic e2e — a human ticket inside a run (real handler · re
     return (await beads.gateList(repo)).filter((g) => blocking.has(g.id));
   };
 
-  /** A claude that records which ticket it was dispatched for, then leaves a diff. */
-  const loggingClaude = (name: string, log: string) =>
+  /**
+   * A claude that records which ticket it was dispatched for, then leaves a diff.
+   *
+   * Review dispatches are told apart by the reporting-protocol marker and answered with a clean
+   * verdict — they are NOT implementation, so folding them into the ticket log (the review prompt
+   * renders every ticket as `### Ticket: …`) would read as a dispatch that never happened. When
+   * `reviewLog` is given, each review prompt is kept whole: it is the contract the gate hands the
+   * reviewer, and what that contract lists is what the resume case has to pin.
+   */
+  const loggingClaude = (name: string, log: string, reviewLog?: string) =>
     writeBin(
       binDir,
       name,
-      fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
-fs.appendFileSync(${JSON.stringify(log)},(m?m[1]:'unknown')+'\\n');
-fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+      fakeClaudeReadingStdin(`let text='done';
+if(prompt.includes('## Reporting format (required)')){
+  ${reviewLog ? `fs.appendFileSync(${JSON.stringify(reviewLog)},prompt);` : ""}
+  text='Reviewed.\\n\\n\`\`\`json\\n'+JSON.stringify({score:9,rationale:'clean',findings:[]})+'\\n\`\`\`\\n';
+}else{
+  const m=prompt.match(/Ticket: (\\S+)/);
+  fs.appendFileSync(${JSON.stringify(log)},(m?m[1]:'unknown')+'\\n');
+  fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+}
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'ht'});
-e({type:'result',subtype:'success',result:'done',session_id:'ht',num_turns:1,is_error:false});
+e({type:'assistant',message:{content:[{type:'text',text}]}});
+e({type:'result',subtype:'success',result:text,session_id:'ht',num_turns:1,is_error:false});
 process.exit(0);`),
+    );
+
+  /** Turn the pre-PR self-review gate on for the sandbox project (the fixture ships it off). */
+  const setReviewEnabled = async (enabled: boolean) => {
+    const proj = (
+      await tdb.db.select().from(schema.projects).where(eq(schema.projects.id, projectId))
+    )[0];
+    const base = JSON.parse(proj.settingsJson ?? "{}") as Record<string, unknown>;
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ ...base, reviewEnabled: enabled }) })
+      .where(eq(schema.projects.id, projectId));
+  };
+
+  /** A `gh` that dumps the `--body` it was handed; reports no open PR, like the fixture's default. */
+  const capturingGh = (name: string, bodyDump: string) =>
+    writeBin(
+      binDir,
+      name,
+      `const fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='list'){console.log('[]');process.exit(0);}
+const i=a.indexOf('--body');if(i>=0){fs.writeFileSync(${JSON.stringify(bodyDump)},a[i+1]);}
+console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
     );
 
   const dispatched = (log: string): string[] => {
@@ -197,8 +236,16 @@ process.exit(0);`),
     const feature = await gatedFeature("Ship the invoices page");
 
     const log = join(sandbox, "human-ticket-resume-inv.jsonl");
+    const reviewLog = join(sandbox, "human-ticket-resume-review.txt");
+    const bodyDump = join(sandbox, "human-ticket-resume-body.txt");
     const runner = makeEpicRunner(ctx);
-    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-human-ticket-resume", log);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-human-ticket-resume", log, reviewLog);
+    // The PRODUCTION configuration: the self-review gate is on when unset, so a resume that opens
+    // its PR has to survive the gate too. With it off (the fixture's default) this case would pass
+    // while every real run of the same shape parked at review.
+    const prevGh = process.env.ANTON_GH_BIN;
+    process.env.ANTON_GH_BIN = capturingGh("gh-human-ticket-resume", bodyDump);
+    await setReviewEnabled(true);
     let jobId: string | undefined;
     try {
       jobId = await driveEpicRun(runner, { projectId, epicBeadId: feature.id });
@@ -223,12 +270,34 @@ process.exit(0);`),
       expect(invoked).not.toContain(feature.human);
       expect((await beads.show(repo, feature.human)).status).toBe("closed");
 
-      // The tail ran into the SAME branch and the single PR opened.
+      // The tail ran into the SAME branch and the single PR opened — through the review gate, not
+      // around it.
       const done = await beads.show(repo, feature.id);
       expect(done.labels ?? []).toContain("stage:in-review");
       expect(beads.getPrRef(done) ?? null).not.toBeNull();
+
+      // What this run DELIVERED is what its diff carries, and a person's work is not in it. The
+      // reviewer is handed the two agent tickets as the contract to judge — never the human one,
+      // whose Acceptance no commit on this branch can satisfy and which would therefore block the
+      // PR at review after the person already did their part.
+      const reviewed = readFileSync(reviewLog, "utf8");
+      expect(reviewed).toContain(`Ticket: ${feature.ready}`);
+      expect(reviewed).toContain(`Ticket: ${feature.dependent}`);
+      expect(reviewed).not.toContain(`Ticket: ${feature.human}`);
+      expect(reviewed).not.toContain(HUMAN_TITLE);
+      expect(reviewed).toContain("Tickets in this run: 2");
+
+      // …and the PR body advertises the same two, so it can't claim a signature as delivered code.
+      const body = readFileSync(bodyDump, "utf8");
+      expect(body).toContain(`- ${feature.ready} —`);
+      expect(body).toContain(`- ${feature.dependent} —`);
+      expect(body).not.toContain(feature.human);
+      expect(body).not.toContain(HUMAN_TITLE);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (prevGh) process.env.ANTON_GH_BIN = prevGh;
+      else delete process.env.ANTON_GH_BIN;
+      await setReviewEnabled(false);
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });
