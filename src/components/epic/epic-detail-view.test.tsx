@@ -10,7 +10,8 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { contractStatusOf } from "@/lib/beads/contract";
 import type { EpicDetail } from "@/lib/types";
 import { makeEpic } from "@/components/board/epic.fixture";
-import { DetailBreadcrumb, EpicDetailView } from "@/components/epic/epic-detail-view";
+import { DetailBreadcrumb } from "@/components/epic/epic-detail-header";
+import { EpicDetailView } from "@/components/epic/epic-detail-view";
 
 // The graph is ReactFlow — measured, canvas-ish, and irrelevant to the header actions under test.
 vi.mock("@/components/epic/dependency-graph", () => ({ DependencyGraph: () => null }));
