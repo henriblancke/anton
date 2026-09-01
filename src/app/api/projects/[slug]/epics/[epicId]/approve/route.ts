@@ -88,6 +88,10 @@ async function readApprovalBody(
  * write to anton.db that falls over must not fail a release the operator already got. The accept is
  * evidence about the picker, never a gate on the run — which is also why every failure here fails
  * CLOSED, recording nothing rather than an accept it could not stand behind.
+ *
+ * The deferral read below is the cheap guard, not the decisive one: a veto posted from another tab
+ * while this request was in flight is invisible to it. `recordPickerAccept` re-asks the question
+ * holding the write lock, so at most one of the two verdicts ever lands on a pick (PR #212 review).
  */
 async function recordRelease(projectId: string, beadId: string, board: Bead[]): Promise<void> {
   try {
@@ -107,13 +111,16 @@ async function recordRelease(projectId: string, beadId: string, board: Bead[]): 
     if (isPlanStale(plan, stampBoard(board, Date.now(), policy), deferrals)) {
       return skip("the board has moved past the plan that picked it");
     }
-    await recordPickerAccept(db, systemClock, {
+    // The store settles a veto that landed while this request was in flight — the deferral read above
+    // cannot see one still being written — so ask it what happened rather than assume the accept did.
+    const refusal = await recordPickerAccept(db, systemClock, {
       projectId,
       beadId,
       ...(entry.rule ? { rule: entry.rule } : {}),
       rank: entry.rank,
       ...(plan.stamp.digest ? { planDigest: plan.stamp.digest } : {}),
     });
+    if (refusal === "vetoed") skip("the operator vetoed this pick first");
   } catch (err) {
     console.error(`[approve] failed to record the picker accept for ${beadId}`, err);
   }

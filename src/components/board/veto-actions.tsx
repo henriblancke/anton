@@ -66,6 +66,17 @@ export function VetoActions({
       const body = (await res.json().catch(() => null)) as
         | { error?: string; deferredUntil?: number; criterion?: string | null }
         | null;
+      // 409 is the other half of this pick answering first: a release already accepted the very
+      // decision this veto declines, and the server records one answer per pick. So the pick IS
+      // settled — hand it to the settled state rather than back to the controls, and re-read, since
+      // this surface is provably behind a run that has already started.
+      if (res.status === 409) {
+        decision.settle();
+        toast.error(body?.error ?? "That pick was already released");
+        router.refresh();
+        setPending(undefined);
+        return;
+      }
       if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
 
       const until = body?.deferredUntil;

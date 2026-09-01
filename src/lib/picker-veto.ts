@@ -96,6 +96,51 @@ function msOf(value: unknown): number | undefined {
 }
 
 /**
+ * ONE ANSWER PER PICK, settled where the race actually is (PR #212 review).
+ *
+ * The accept and the decline are written by two different routes, so nothing on the client can
+ * serialize them: the same pick open in two tabs, or a budget-aware card whose `Queue` sits beside
+ * its veto controls, can land a release and a veto against the SAME decision. Recording both would
+ * leave the track record earned autonomy reads holding two contradictory answers to one question,
+ * and the target deferred while its own run is under way.
+ *
+ * So each writer takes the write lock BEFORE it reads (an IMMEDIATE transaction — nothing can commit
+ * between the guard and the insert) and records nothing when this pick already carries the OPPOSITE
+ * verdict. First answer wins; the second is told it lost rather than contradicting it.
+ *
+ * Scoped to the PICK — project + bead + plan digest — not to the bead: a later plan that re-picks the
+ * same target is a new decision and takes its own answer. A digest-less verdict answers no recorded
+ * pick and stays unconstrained, exactly as `picker_verdicts_accept_unique` leaves it.
+ */
+function pickAlreadyAnswered(
+  tx: Pick<AntonDb, "select">,
+  input: { projectId: string; beadId: string; planDigest?: string },
+  verdict: PickerVerdict,
+): boolean {
+  if (!input.planDigest) return false;
+  return (
+    tx
+      .select({ id: schema.pickerVerdicts.id })
+      .from(schema.pickerVerdicts)
+      .where(
+        and(
+          eq(schema.pickerVerdicts.projectId, input.projectId),
+          eq(schema.pickerVerdicts.beadId, input.beadId),
+          eq(schema.pickerVerdicts.planDigest, input.planDigest),
+          eq(schema.pickerVerdicts.verdict, verdict),
+        ),
+      )
+      .limit(1)
+      .all().length > 0
+  );
+}
+
+/** What a veto did: the hold it placed, or the release that answered this pick first. */
+export type PickerVetoOutcome =
+  | { recorded: true; deferral: PickerDeferral }
+  | { recorded: false; reason: "released" };
+
+/**
  * Record a veto: a decline against this pick, deferring the target for the bounded window.
  *
  * BOTH vetoes defer, and for the same window. `Never` differs in where it sends the operator next —
@@ -103,29 +148,50 @@ function msOf(value: unknown): number | undefined {
  * out: a veto that left the card in the very next pass's plan while its author was still editing the
  * rule would be a veto that did nothing. The window bounds it either way, so a `Never` whose policy
  * edit is abandoned quietly reverts to "anton may offer this again", which is the honest outcome.
+ *
+ * Refused outright when a release already accepted this pick (see {@link pickAlreadyAnswered}): the
+ * run is under way, so there is nothing left to set aside, and the caller reports that rather than
+ * filing a decline against a decision the operator already took the other side of. A REPEAT decline
+ * is untouched — a second veto extends the window, and that is the same answer, not the opposite one.
  */
 export async function recordPickerVeto(
   db: AntonDb,
   clock: Clock,
   input: RecordVetoInput,
-): Promise<PickerDeferral> {
+): Promise<PickerVetoOutcome> {
   const nowMs = clock.now();
   const untilMs = nowMs + PICKER_DEFER_WINDOW_MS;
-  await db.insert(schema.pickerVerdicts).values({
-    id: randomUUID(),
-    projectId: input.projectId,
-    beadId: input.beadId,
-    verdict: "declined",
-    action: input.action,
-    rule: input.rule ?? null,
-    criterion: input.criterion ?? null,
-    rank: input.rank ?? null,
-    planDigest: input.planDigest ?? null,
-    deferredUntil: secDate(untilMs),
-    decidedAt: secDate(nowMs),
-  });
-  return { beadId: input.beadId, untilMs: secDate(untilMs).getTime() };
+  return db.transaction(
+    (tx) => {
+      if (pickAlreadyAnswered(tx, input, "accepted")) {
+        return { recorded: false, reason: "released" } as const;
+      }
+      tx.insert(schema.pickerVerdicts)
+        .values({
+          id: randomUUID(),
+          projectId: input.projectId,
+          beadId: input.beadId,
+          verdict: "declined",
+          action: input.action,
+          rule: input.rule ?? null,
+          criterion: input.criterion ?? null,
+          rank: input.rank ?? null,
+          planDigest: input.planDigest ?? null,
+          deferredUntil: secDate(untilMs),
+          decidedAt: secDate(nowMs),
+        })
+        .run();
+      return {
+        recorded: true,
+        deferral: { beadId: input.beadId, untilMs: secDate(untilMs).getTime() },
+      } as const;
+    },
+    { behavior: "immediate" },
+  );
 }
+
+/** Why an accept recorded nothing: the same pick was vetoed, or already accepted. */
+export type PickerAcceptRefusal = "vetoed" | "duplicate";
 
 /**
  * Record an accept: the operator RELEASED this pick, so anton's choice became a run (anton-d2h6).
@@ -143,28 +209,42 @@ export async function recordPickerVeto(
  * separate existence check and both write. So the conflict is resolved where it is atomic — against
  * `picker_verdicts_accept_unique`, the partial index over accepted verdicts — and a digest-less
  * accept, which that index leaves unconstrained (NULLs are distinct), still always records.
+ *
+ * And refused outright when a veto already declined this pick (see {@link pickAlreadyAnswered}). The
+ * approve route asks the same question off its pre-write snapshot, but that read cannot see a veto
+ * still in flight; this one holds the write lock, so the two verdicts cannot both land. The run is
+ * NOT refused with it — the operator asked for it and approve is approve — only the evidence is,
+ * which is the half that has to stay consistent.
  */
 export async function recordPickerAccept(
   db: AntonDb,
   clock: Clock,
   input: RecordAcceptInput,
-): Promise<void> {
-  await db
-    .insert(schema.pickerVerdicts)
-    .values({
-      id: randomUUID(),
-      projectId: input.projectId,
-      beadId: input.beadId,
-      verdict: "accepted",
-      action: "release",
-      rule: input.rule ?? null,
-      criterion: null,
-      rank: input.rank ?? null,
-      planDigest: input.planDigest ?? null,
-      deferredUntil: null,
-      decidedAt: secDate(clock.now()),
-    })
-    .onConflictDoNothing();
+): Promise<PickerAcceptRefusal | undefined> {
+  return db.transaction(
+    (tx) => {
+      if (pickAlreadyAnswered(tx, input, "declined")) return "vetoed" as const;
+      const written = tx
+        .insert(schema.pickerVerdicts)
+        .values({
+          id: randomUUID(),
+          projectId: input.projectId,
+          beadId: input.beadId,
+          verdict: "accepted",
+          action: "release",
+          rule: input.rule ?? null,
+          criterion: null,
+          rank: input.rank ?? null,
+          planDigest: input.planDigest ?? null,
+          deferredUntil: null,
+          decidedAt: secDate(clock.now()),
+        })
+        .onConflictDoNothing()
+        .run();
+      return written.changes > 0 ? undefined : ("duplicate" as const);
+    },
+    { behavior: "immediate" },
+  );
 }
 
 /**

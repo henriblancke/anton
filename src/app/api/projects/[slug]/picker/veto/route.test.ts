@@ -11,7 +11,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
 import { saveBoardPickerPlan } from "@/lib/board-picker-plan";
-import { PICKER_DEFER_WINDOW_MS, activeDeferrals, listPickerVerdicts } from "@/lib/picker-veto";
+import {
+  PICKER_DEFER_WINDOW_MS,
+  activeDeferrals,
+  listPickerVerdicts,
+  recordPickerAccept,
+} from "@/lib/picker-veto";
 import type { Bead } from "@/lib/beads/types";
 import type { Policy } from "@/lib/policy/types";
 
@@ -129,6 +134,29 @@ describe("POST /picker/veto", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ criterion: null });
     expect((await listPickerVerdicts(tdb.db, "p1"))[0]?.verdict).toBe("declined");
+  });
+
+  it("409s a pick a release already accepted, recording no contradicting decline", async () => {
+    // Two tabs on one pick: the release records the accept, and the veto that follows must not file
+    // a decline against the decision the operator already took the other side of.
+    await saveBoardPickerPlan(tdb.db, { now: () => NOW }, {
+      projectId: "p1",
+      stamp: { observedAtMs: NOW, digest: "cafebabecafebabe", beadCount: 1 },
+      entries: [{ beadId: "anton-a", rank: 1, rule: "the work policy armed on this machine" }],
+      exclusions: [],
+    });
+    await recordPickerAccept(tdb.db, { now: () => NOW }, {
+      projectId: "p1",
+      beadId: "anton-a",
+      planDigest: "cafebabecafebabe",
+    });
+
+    const res = await POST(req({ beadId: "anton-a", action: "not-now" }), ctx("tmp"));
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/already released/);
+    expect((await listPickerVerdicts(tdb.db, "p1")).map((v) => v.verdict)).toEqual(["accepted"]);
+    expect((await activeDeferrals(tdb.db, "p1", new Date())).size).toBe(0);
   });
 
   it("refuses a body that names no target or an action it does not have", async () => {

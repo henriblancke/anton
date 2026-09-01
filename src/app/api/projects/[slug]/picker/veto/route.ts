@@ -36,6 +36,11 @@ const bodySchema = z.object({
  * A `never` on a project with no armed policy, or one whose policy narrows nothing this bead
  * satisfies, returns `criterion: null`. That is an answer, not a failure: the editor opens at the
  * panel and the operator authors the first rule.
+ *
+ * A pick gets ONE answer, and this route does not own that gate — the store does, under the write
+ * lock (`recordPickerVeto`), because the opposite verdict is written by the approve route and no
+ * client-side lock spans two tabs. A veto that loses the race to a release answers 409: the run is
+ * under way, so there is nothing left to defer.
  */
 export const POST = withProject<{ slug: string }>(async (request, { project }) => {
   const parsed = bodySchema.safeParse(await request.json().catch(() => null));
@@ -56,7 +61,7 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
   const criterion =
     action === "never" ? await resolveCriterion(project, beadId).catch(() => undefined) : undefined;
 
-  const deferral = await recordPickerVeto(db, systemClock, {
+  const outcome = await recordPickerVeto(db, systemClock, {
     projectId: project.id,
     beadId,
     action,
@@ -66,10 +71,21 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
     ...(criterion ? { criterion } : {}),
   });
 
+  // The release answered this pick first, and the store settles that race rather than the client:
+  // recording the decline too would claim the operator both started and set aside one decision.
+  if (!outcome.recorded) {
+    return NextResponse.json(
+      {
+        error: `${beadId} was already released — that pick is running, so there is nothing to set aside`,
+      },
+      { status: 409 },
+    );
+  }
+
   return NextResponse.json({
     beadId,
     action,
-    deferredUntil: deferral.untilMs,
+    deferredUntil: outcome.deferral.untilMs,
     criterion: criterion ?? null,
   });
 });

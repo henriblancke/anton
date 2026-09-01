@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { PickDecisionProvider } from "@/components/board/pick-decision";
 import { VetoActions } from "@/components/board/veto-actions";
 import { criterionLabel, policyHref } from "@/lib/policy/href";
 
@@ -77,6 +78,25 @@ describe("✕ not now", () => {
     expect(
       screen.getByRole("button", { name: /not now/i }).hasAttribute("disabled"),
     ).toBe(false);
+  });
+
+  it("settles the pick when a release answered it first, rather than offering the veto again", async () => {
+    // The server records one answer per pick, so a 409 is not a failed write to retry — it is the
+    // other half of the decision, already landed. Re-reading is what redraws the card as running.
+    stubFetch({ error: "anton-a was already released — that pick is running" }, 409);
+    render(
+      <PickDecisionProvider>
+        <VetoActions slug="anton" beadId="anton-a" title="Ship the lane" />
+      </PickDecisionProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /not now/i }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("already released"));
+    // Settled, not handed back: the pick HAS its answer, so neither veto is on offer again.
+    expect(screen.getByRole("button", { name: /not now/i }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Never" }).hasAttribute("disabled")).toBe(true);
   });
 });
 

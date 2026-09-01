@@ -225,8 +225,10 @@ describe("recording an accept", () => {
     nowMs = NOW + 60_000;
     const second = await recordPickerVeto(test.db, clock, veto);
 
-    expect(second.untilMs).toBe(nowMs + PICKER_DEFER_WINDOW_MS);
-    expect((await activeDeferrals(test.db, PROJECT, at(nowMs))).get("anton-a")).toBe(second.untilMs);
+    expect(second).toMatchObject({ recorded: true });
+    const untilMs = second.recorded ? second.deferral.untilMs : undefined;
+    expect(untilMs).toBe(nowMs + PICKER_DEFER_WINDOW_MS);
+    expect((await activeDeferrals(test.db, PROJECT, at(nowMs))).get("anton-a")).toBe(untilMs);
   });
 
   it("records again once a later plan re-picks it — a new decision is a new answer", async () => {
@@ -247,6 +249,86 @@ describe("recording an accept", () => {
   it("keeps another project's record its own", async () => {
     await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" });
     expect(await pickerTrackRecord(test.db, OTHER)).toEqual({ accepted: 0, declined: 0, settled: 0 });
+  });
+});
+
+/**
+ * ONE ANSWER PER PICK (PR #212 review). The accept and the decline come from two different routes,
+ * so a pick open in two tabs can be released and vetoed at once — and only the store can decide that,
+ * because no client-side lock spans two tabs. What these pin is the shape of the refusal: first
+ * answer wins, the loser records NOTHING, and only the OPPOSITE verdict on the SAME pick conflicts.
+ */
+describe("opposite verdicts on one pick", () => {
+  const PICK = { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" };
+
+  it("refuses a veto of a pick a release already accepted, and defers nothing", async () => {
+    await recordPickerAccept(test.db, clock, PICK);
+
+    const outcome = await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" });
+
+    expect(outcome).toEqual({ recorded: false, reason: "released" });
+    // The run is under way, so nothing is set aside and the record keeps the single answer it had.
+    expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(0);
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 1, declined: 0 });
+  });
+
+  it("refuses an accept of a pick a veto already declined, and keeps the hold", async () => {
+    await recordPickerVeto(test.db, clock, { ...PICK, action: "never" });
+
+    expect(await recordPickerAccept(test.db, clock, PICK)).toBe("vetoed");
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 0, declined: 1 });
+    expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(1);
+  });
+
+  it("settles a release and a veto that OVERLAP on exactly one verdict", async () => {
+    // Neither request can see the other's write before it commits, which is the whole race the
+    // client-side lock cannot cover: the store takes the write lock before it reads.
+    await Promise.all([
+      recordPickerAccept(test.db, clock, PICK),
+      recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" }),
+    ]);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ settled: 1 });
+  });
+
+  it("answers a LATER plan's pick freshly — a new decision is not the old one's opposite", async () => {
+    await recordPickerAccept(test.db, clock, PICK);
+
+    const outcome = await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      action: "not-now",
+      planDigest: "d2",
+    });
+
+    expect(outcome).toMatchObject({ recorded: true });
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 1, declined: 1 });
+  });
+
+  it("leaves a digest-less verdict unconstrained — it answers no recorded pick", async () => {
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a" });
+
+    const outcome = await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      action: "not-now",
+    });
+
+    expect(outcome).toMatchObject({ recorded: true });
+  });
+
+  it("keeps another project's identical pick its own", async () => {
+    await recordPickerAccept(test.db, clock, PICK);
+
+    const outcome = await recordPickerVeto(test.db, clock, {
+      projectId: OTHER,
+      beadId: "anton-a",
+      action: "not-now",
+      planDigest: "d1",
+    });
+
+    expect(outcome).toMatchObject({ recorded: true });
   });
 });
 
