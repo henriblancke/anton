@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { STAGES, type Board, type Epic, type StandaloneItem, type Stage } from "@/lib/types";
+import { makeEpicRow } from "@/components/board/epic.fixture";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
@@ -53,28 +54,7 @@ const CARD_IDS = ["anton-1", "anton-2", "anton-3"];
 
 type Grouping = "Stage" | "Epic";
 
-function epic(id: string, over: Partial<Epic> = {}): Epic {
-  return {
-    id,
-    title: id,
-    type: "feature",
-    approved: false,
-    stage: "backlog",
-    assignee: null,
-    createdAt: "2026-07-20T00:00:00.000Z",
-    createdBy: null,
-    blockedBy: [],
-    ready: true,
-    childReadiness: "ready",
-    readyChildren: [],
-    blockedChildren: [],
-    rank: 0,
-    priority: 2,
-    abandoned: false,
-    tickets: [],
-    ...over,
-  };
-}
+const epic = makeEpicRow;
 
 function standalone(id: string, over: Partial<StandaloneItem> = {}): StandaloneItem {
   return {

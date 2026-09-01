@@ -69,6 +69,12 @@ export const TYPE_BADGE: Record<IssueType, string> = {
   chore: "border-type-chore/30 bg-type-chore/10 text-type-chore",
 };
 
+/** A run target's work type in sentence case — "feature", "epic", "task" — for ids, titles and
+ * confirmations. A feature is the tier anton runs, so a card must never call itself an epic. */
+export function typeWord(type: IssueType): string {
+  return TYPE_LABELS[type].toLowerCase();
+}
+
 /**
  * The board, narrowed to one product epic. Every epic badge points here, so "click the badge to see
  * this epic's work" has a single URL shape across the detail breadcrumb and the feature cards

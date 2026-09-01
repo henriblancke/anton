@@ -2,18 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { makeStandaloneItem } from "@/components/board/standalone-item.fixture";
-import { ChipHeader, ChipMeta, prLabel } from "@/components/board/standalone-chip-parts";
-
-describe("prLabel", () => {
-  it("shortens a bead external-ref to its PR number", () => {
-    expect(prLabel("gh-218")).toBe("#218");
-    expect(prLabel("https://github.com/o/r/pull/42")).toBe("#42");
-  });
-
-  it("falls back to the raw ref when no trailing number is there to shorten", () => {
-    expect(prLabel("gh-main")).toBe("gh-main");
-  });
-});
+import { ChipHeader, ChipMeta } from "@/components/board/standalone-chip-parts";
 
 describe("ChipHeader", () => {
   it("goes inert under the chip's open trigger but keeps a linked PR clickable", () => {

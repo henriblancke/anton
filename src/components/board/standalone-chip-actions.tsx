@@ -4,10 +4,10 @@ import type { StandaloneItem } from "@/lib/types";
 // The predicate itself, not a chip-local copy: approve and the runner ask the same one.
 import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
 import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
+import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
 /**
@@ -38,42 +38,19 @@ export function ApproveRunAction({
   budgetAware: boolean;
   approval: StandaloneApproval;
 }) {
-  const { approved, deferred, running, approveRun } = approval;
-  if (!canOfferRun(item, approved, deferred)) return null;
+  if (!canOfferRun(item, approval.approved, approval.deferred)) return null;
 
   if (contractBlocks(item.contract)) {
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;
   }
 
-  if (budgetAware) {
-    return (
-      // Budget-aware: run now or hand the run to the governor's pace-line.
-      <span className="pointer-events-auto flex items-center gap-1">
-        <Button
-          size="xs"
-          variant="outline"
-          onClick={() => approveRun(false)}
-          disabled={running}
-          title="Queue this run for the budget governor to pace against the weekly plan"
-        >
-          Queue
-        </Button>
-        <Button
-          size="xs"
-          onClick={() => approveRun(true)}
-          disabled={running}
-          title="Approve and run now, bypassing budget pacing (the session limit still applies)"
-        >
-          {running ? "…" : "Approve"}
-        </Button>
-      </span>
-    );
-  }
-
   return (
-    <Button size="xs" onClick={() => approveRun()} disabled={running} className="pointer-events-auto">
-      {running ? "Starting…" : "Approve & run"}
-    </Button>
+    <ApproveRunButtons
+      budgetAware={budgetAware}
+      approval={approval}
+      label="Approve & run"
+      busyLabel="Starting…"
+    />
   );
 }
 

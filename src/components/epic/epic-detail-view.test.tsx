@@ -9,6 +9,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 
 import { contractStatusOf } from "@/lib/beads/contract";
 import type { EpicDetail } from "@/lib/types";
+import { makeEpic } from "@/components/board/epic.fixture";
 import { DetailBreadcrumb, EpicDetailView } from "@/components/epic/epic-detail-view";
 
 // The graph is ReactFlow — measured, canvas-ish, and irrelevant to the header actions under test.
@@ -81,27 +82,7 @@ describe("EpicDetailView run actions", () => {
 
   function renderDetail(description: string, over: Partial<EpicDetail["epic"]> = {}) {
     const detail: EpicDetail = {
-      epic: {
-        id: "anton-1",
-        title: "Resumable crawl checkpoints",
-        type: "feature",
-        approved: false,
-        stage: "backlog",
-        assignee: null,
-        createdAt: "2026-07-20T00:00:00.000Z",
-        createdBy: null,
-        blockedBy: [],
-        ready: true,
-        childReadiness: "ready",
-        readyChildren: [],
-        blockedChildren: [],
-        rank: 0,
-        priority: 2,
-        abandoned: false,
-        contract: contractOf(description),
-        tickets: [],
-        ...over,
-      },
+      epic: makeEpic({ contract: contractOf(description), ...over }),
       description,
       tickets: [],
       edges: [],

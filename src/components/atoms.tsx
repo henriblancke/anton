@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { CircleSlashIcon, LockIcon, LockOpenIcon, MoonIcon } from "lucide-react";
+import { CircleSlashIcon, GitPullRequestIcon, LockIcon, LockOpenIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
@@ -81,6 +81,61 @@ export function PrLink({
     >
       {children}
     </a>
+  );
+}
+
+/** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
+export function prLabel(ref: string): string {
+  const m = /(\d+)\s*$/.exec(ref);
+  return m ? `#${m[1]}` : ref;
+}
+
+/**
+ * The linked-PR chip every run-target surface shows — feature card, standalone chip, ticket header,
+ * PR link control. One shape so a PR reads the same wherever it appears: a new-tab link (inert
+ * without a url) around a tinted meta chip. `tone` follows what the PR now means — `pr` while it is
+ * under review, `done` once merged — and `icon` drops the glyph where the label already carries the
+ * meaning (the done card's "merged #218").
+ */
+export function PrChip({
+  href,
+  tone = "pr",
+  icon = true,
+  className,
+  children,
+}: {
+  href?: string;
+  tone?: "pr" | "done";
+  icon?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <PrLink href={href} className={className}>
+      <MetaChip tone={tone}>
+        {icon && <GitPullRequestIcon className="size-2.5" aria-hidden="true" />}
+        {children}
+      </MetaChip>
+    </PrLink>
+  );
+}
+
+/**
+ * The live "working" marker a run target shows while it is implementing and has no PR yet — the one
+ * place on a card that says a run is moving right now. Pulsing dot plus the word, never a chip: it
+ * is a state, not metadata.
+ */
+export function WorkingPulse({ className }: { className?: string }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 text-[10px] text-stage-implementing",
+        className,
+      )}
+    >
+      <span className="size-1.5 rounded-full bg-stage-implementing anton-pulse" aria-hidden="true" />
+      working
+    </span>
   );
 }
 
