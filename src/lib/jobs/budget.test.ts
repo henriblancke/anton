@@ -9,6 +9,7 @@ import {
   admissibleJobs,
   admitJob,
   budgetGate,
+  budgetHeadroom,
   DEFAULT_BUDGET_POLICY,
   isBehindPace,
   jobValueScore,
@@ -472,5 +473,108 @@ describe("isBehindPace (shaping-nudge input)", () => {
 
   it("is false on a null read — never nags when the pace is unknown", () => {
     expect(isBehindPace(null, POLICY, NOON)).toBe(false);
+  });
+});
+
+describe("budgetHeadroom (the budget line's placement input, anton-vlom)", () => {
+  it("returns null on a null read — the line is omitted, never guessed", () => {
+    expect(budgetHeadroom(null, POLICY, NOON)).toBeNull();
+  });
+
+  it("reports the session floor's remaining points at night", () => {
+    // Night: the daytime reserve is not in force, so the hard floor (100 − 5) is what's left.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 50, sessionPct: 60 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ sessionPct: 35, sessionReason: "session-headroom" });
+  });
+
+  it("reports the daytime reserve inside the day window — the tighter hold on the same meter", () => {
+    // On pace, so the reserve holds: 100 − 40 = 60 is the ceiling, 20 points below current usage.
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 40 }), POLICY, NOON);
+    expect(h).toMatchObject({ sessionPct: 20, sessionReason: "daytime-reserve" });
+  });
+
+  it("waives the daytime reserve when behind the weekly plan — work spills into the day", () => {
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NOON);
+    expect(h).toMatchObject({ sessionPct: 55, sessionReason: "session-headroom" });
+  });
+
+  it("says how much weekly burn the behind-pace waiver survives — it is not permanent", () => {
+    // A projection spends weekly budget as it walks the queue, and the reserve is waived only while
+    // usage stays behind pace: 35 more points (the 45-point line, less the 10 already spent) and the
+    // gate stops waiving it, from which point the reserve's own ceiling (60) is what binds.
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NOON);
+    expect(h?.reserveWaiver).toEqual({ afterWeeklyPct: 35, sessionPct: 20 });
+  });
+
+  it("carries no waiver where the reserve is not being waived at all", () => {
+    // Night (out of the day window), and on-pace daytime (the reserve holds outright): in neither
+    // case is there a waiver to expire, so a projection has nothing to re-apply.
+    expect(
+      budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NIGHT)
+        ?.reserveWaiver,
+    ).toBeNull();
+    expect(
+      budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 40 }), POLICY, NOON)
+        ?.reserveWaiver,
+    ).toBeNull();
+    // No weekly signal: no pace to be behind, so the reserve was never waived either.
+    expect(
+      budgetHeadroom(makeUsage({ sessionPct: 40, weeklyPct: 10, weeklyResetAt: null }), POLICY, NOON)
+        ?.reserveWaiver,
+    ).toBeNull();
+  });
+
+  it("reports the weekly cap when the pace-line is above it", () => {
+    // Late week: the pace-line has risen past the cap, so the cap is the only weekly hold left.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.99, weeklyPct: 88, sessionPct: 10 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ weeklyPct: 12, weeklyReason: "weekly-cap", weeklyInclusive: true });
+  });
+
+  it("reports the pace-line inside the throttle band, not the cap it hasn't reached", () => {
+    // Mid-week, ahead of pace: idle-fill runs free to the throttle floor (80), and no further.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 62, sessionPct: 10 }), POLICY, NIGHT);
+    // Held up by the throttle floor, which — like the cap — the gate defers AT.
+    expect(h).toMatchObject({ weeklyPct: 18, weeklyReason: "weekly-on-track", weeklyInclusive: true });
+  });
+
+  it("marks the pace-line itself exclusive — the gate defers only PAST the ceiling", () => {
+    // Late enough in the week that the pace-line has risen clear of the throttle floor (80) without
+    // reaching the cap: 100 × 0.8 + 5 = 85 is the limit, and `usage > 85` is what defers.
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.8, weeklyPct: 82, sessionPct: 10 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ weeklyPct: 3, weeklyReason: "weekly-on-track", weeklyInclusive: false });
+  });
+
+  it("reports no weekly headroom without a weekly signal — unknown, not zero", () => {
+    const usage = makeUsage({ sessionPct: 10, weeklyPct: 40, weeklyResetAt: null });
+    expect(budgetHeadroom(usage, POLICY, NIGHT)?.weeklyPct).toBeNull();
+  });
+
+  it("never reports negative headroom once a hold is already tripped", () => {
+    const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 99, sessionPct: 99 }), POLICY, NIGHT);
+    expect(h).toMatchObject({ sessionPct: 0, weeklyPct: 0 });
+  });
+
+  it("agrees with the gate on whether work may start now", () => {
+    // The property the budget line rests on: a surface that computed its own idea of "remaining"
+    // would draw a line the governor does not keep. Zero on either side must mean the gate defers.
+    //
+    // The sampled points sit OFF the exact pace-line (ceilings here are 15 / 55 / 95): landing on
+    // it exactly is the one hair's-width disagreement — the gate admits the run that would cross
+    // the line, this reports no room for it — and it is a one-card difference on a float coincidence.
+    for (const now of [NOON, NIGHT]) {
+      for (const sessionPct of [0, 40, 59, 61, 94, 96]) {
+        for (const weeklyPct of [0, 50, 79, 86, 96, 100]) {
+          for (const elapsed of [0.1, 0.5, 0.9]) {
+            const usage = usageAt(now, { elapsed, weeklyPct, sessionPct });
+            const h = budgetHeadroom(usage, POLICY, now);
+            const affordsOne = h!.sessionPct > 0 && (h!.weeklyPct === null || h!.weeklyPct > 0);
+            expect(
+              affordsOne,
+              `now=${now} session=${sessionPct} weekly=${weeklyPct} elapsed=${elapsed}`,
+            ).toBe(budgetGate(usage, POLICY, now).admit);
+          }
+        }
+      }
+    }
   });
 });

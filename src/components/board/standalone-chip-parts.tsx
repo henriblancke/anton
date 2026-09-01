@@ -3,11 +3,20 @@ import { GitPullRequestIcon } from "lucide-react";
 import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { CopyButton } from "@/components/ui/copy-button";
-import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
+import {
+  AbandonedChip,
+  BlockedChip,
+  MetaChip,
+  PrLink,
+  RiskChip,
+  SnoozedChip,
+} from "@/components/atoms";
 import { ReviewScoreChip } from "@/components/review-score";
+import { NotNowChip } from "@/components/board/not-now-chip";
 import { TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { ContractChip } from "@/components/board/contract-mark";
+import { ProvenanceBadges } from "@/components/board/provenance-badge";
 
 /**
  * The read-only rows of a standalone chip. Both sit above the chip's full-bleed open trigger, so
@@ -57,10 +66,13 @@ export function ChipHeader({ item, hasOverlay }: { item: StandaloneItem; hasOver
 
 /** Badge row: what this item is, who runs it, and every condition holding it back. */
 export function ChipMeta({
+  slug,
   item,
   deferred,
   hasOverlay,
 }: {
+  /** Project slug — the provenance badges link out to this project's evidence. */
+  slug: string;
   item: StandaloneItem;
   /** Snooze as the chip currently shows it — the optimistic value, not always `item.deferred`. */
   deferred: boolean;
@@ -77,6 +89,8 @@ export function ChipMeta({
       <CopyButton value={item.id} label="ticket id" className="pointer-events-auto font-mono text-[10px]">
         {item.id}
       </CopyButton>
+      {/* Same grammar as the epic card's: an epic-of-one is still a card anton picked (anton-cqxd). */}
+      <ProvenanceBadges slug={slug} beadId={item.id} provenance={item.provenance} />
       {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
       {item.risk && <RiskChip risk={item.risk} />}
       {/* Renders only once a review has actually scored this target (anton-tprv). */}
@@ -86,6 +100,9 @@ export function ChipMeta({
       {item.stage !== "done" && <ContractChip contract={item.contract} />}
       {item.abandoned && <AbandonedChip />}
       {deferred && <SnoozedChip />}
+      {/* Vetoed, not vanished (anton-jqvy) — and its own chip, because a bounded hold anton lifts
+          itself is not the same thing as the snooze a human has to undo. */}
+      {item.notNowUntil !== undefined && <NotNowChip untilMs={item.notNowUntil} />}
     </div>
   );
 }

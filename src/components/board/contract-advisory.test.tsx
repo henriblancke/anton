@@ -160,6 +160,29 @@ describe("human gates", () => {
     expect(info.mock.calls[0][0]).toBe("1 ticket needs you");
   });
 
+  // The one shape where "anton runs the rest" is false: execute-epic poisons a human TARGET before
+  // it dispatches anything under it, so no agent-run starts at all.
+  it("says no run starts when the target itself is the human work", async () => {
+    await toastContractAdvisory(
+      jsonRes({ humanGates: ["anton-1 → Buy the domain"], humanTarget: true }),
+    );
+
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0][0]).toBe("This one is yours");
+    const description = descriptionMarkup(info);
+    expect(description).toContain("no agent-run starts");
+    expect(description).not.toContain("anton runs the rest");
+  });
+
+  it("still promises the rest of the run when only its tickets are human", async () => {
+    await toastContractAdvisory(
+      jsonRes({ humanGates: ["anton-1 → Buy the domain"], humanTarget: false }),
+    );
+
+    expect(info.mock.calls[0][0]).toBe("1 ticket needs you");
+    expect(descriptionMarkup(info)).toContain("anton runs the rest");
+  });
+
   it("never throws when the gate toast fails to render", async () => {
     info.mockImplementationOnce(() => {
       throw new Error("toaster unmounted");

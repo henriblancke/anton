@@ -25,6 +25,15 @@ function humanGatesOf(body: unknown): string[] {
   return linesOf((body as { humanGates?: unknown } | null)?.humanGates);
 }
 
+/**
+ * Whether the approved TARGET is itself a person's work, which is a different outcome from a run
+ * that merely contains some (PR #214 review): anton refuses a `agent:human` target outright, before
+ * dispatching any of its children, so no agent-run starts at all.
+ */
+function humanTargetOf(body: unknown): boolean {
+  return (body as { humanTarget?: unknown } | null)?.humanTarget === true;
+}
+
 /** A string list, or nothing — a malformed field is never worth a half-rendered toast. */
 function linesOf(field: unknown): string[] {
   return Array.isArray(field) ? field.filter((l): l is string => typeof l === "string") : [];
@@ -42,9 +51,25 @@ function linesOf(field: unknown): string[] {
  */
 export async function toastContractAdvisory(res: Response): Promise<void> {
   try {
-    const body = await res.json().catch(() => null);
+    toastAdvisoryGaps(await res.json().catch(() => null));
+  } catch (err) {
+    console.error("[contract-advisory] failed to read advisory gaps", err);
+  }
+}
+
+/**
+ * The same report, for a caller that has ALREADY read the body — a response body can only be
+ * consumed once, and a surface that inspects the 200 payload before deciding the run really started
+ * (`release-action.tsx`, which reads `jobId`) has nothing left to hand {@link toastContractAdvisory}.
+ *
+ * NEVER throws, for the same reason as above.
+ */
+export function toastAdvisoryGaps(body: unknown): void {
+  try {
     warnSpecGaps(gapsOf(body));
-    warnHumanGates(humanGatesOf(body));
+    const gates = humanGatesOf(body);
+    if (humanTargetOf(body)) noteHumanTarget(gates);
+    else warnHumanGates(gates);
   } catch (err) {
     console.error("[contract-advisory] failed to surface advisory gaps", err);
   }
@@ -90,6 +115,28 @@ function warnHumanGates(gates: string[]): void {
           ))}
         </ul>
       </div>
+    ),
+  });
+}
+
+/**
+ * The target itself is the human work, so there is no "rest" for anton to run (PR #214 review): the
+ * executor refuses a `agent:human` target before it dispatches anything under it, and promising a
+ * partial run here would leave the operator waiting on a run that never starts.
+ *
+ * The gate lines are deliberately NOT listed. Any human children under this target are moot — no
+ * dispatch reaches them — and naming them would read as work anton is about to hold, which is the
+ * exact claim this toast exists to withdraw.
+ */
+function noteHumanTarget(gates: string[]): void {
+  if (gates.length === 0) return;
+  toast.info("This one is yours", {
+    duration: 10_000,
+    description: (
+      <span>
+        It&apos;s labelled <span className="font-mono">agent:human</span>, so no agent-run starts —
+        anton hands the whole target back rather than dispatching any of it.
+      </span>
     ),
   });
 }

@@ -10,8 +10,8 @@
  *
  * Which beads reach this band, and in what order, is the read's job — see operator-queue.test.ts.
  */
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { OperatorQueue } from "@/components/board/operator-queue";
 import type { OperatorQueueItem } from "@/lib/types";
@@ -32,7 +32,7 @@ describe("OperatorQueue", () => {
   it("renders nothing when no work is yours", () => {
     // Not an empty state: a band saying "nothing waiting on you" claims the queue was checked and
     // found clear, which is indistinguishable here from a board that simply has no human work.
-    const { container } = render(<OperatorQueue slug="anton" items={[]} />);
+    const { container } = render(<OperatorQueue slug="anton" items={[]} onOpenTicket={() => {}} />);
     expect(container.innerHTML).toBe("");
   });
 
@@ -41,6 +41,7 @@ describe("OperatorQueue", () => {
       <OperatorQueue
         slug="anton"
         items={[item({ goal: "Register anton.dev before the launch post.", risk: "low", size: "S" })]}
+        onOpenTicket={() => {}}
       />,
     );
     expect(screen.getByText("Yours to do")).toBeTruthy();
@@ -51,10 +52,53 @@ describe("OperatorQueue", () => {
     expect(screen.getByText("3d ago")).toBeTruthy();
   });
 
-  it("links each row to its bead, where the controls already live", () => {
-    render(<OperatorQueue slug="anton" items={[item()]} />);
+  it("links a run target to its epic page, where its run actions live", () => {
+    render(<OperatorQueue slug="anton" items={[item()]} onOpenTicket={() => {}} />);
     const link = screen.getByRole("link", { name: "Buy the domain" });
     expect(link.getAttribute("href")).toBe("/projects/anton/epics/anton-t1");
+  });
+
+  it("opens a parented ticket in the ticket dialog, not the run-target page", () => {
+    // The epic page offers run-target actions — Approve, Force run — and approving a parented task
+    // is rejected outright, so it is the one surface that cannot answer this row. The dialog is
+    // where the ticket's editor and state controls actually live.
+    const onOpenTicket = vi.fn();
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[
+          item({
+            id: "anton-f1.1",
+            title: "Sign the contract",
+            runTarget: { id: "anton-f1", title: "Ship billing" },
+          }),
+        ]}
+        onOpenTicket={onOpenTicket}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: "Sign the contract" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Sign the contract" }));
+    expect(onOpenTicket).toHaveBeenCalledWith("anton-f1.1");
+  });
+
+  it("sends a held row to the gate that resumes the run, not to closing the ticket", () => {
+    // The run holds an open human gate on this ticket and anton never auto-resolves it: the operator
+    // resolves it from the escalation strip and the resumed run closes the ticket. Telling them to
+    // close it instead leaves the gate open and the run parked for good.
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[item({ id: "anton-f1.1", runTarget: { id: "anton-f1", title: "Ship billing" } })]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    const held = screen.getByRole("listitem").textContent ?? "";
+    expect(held).toContain("Resolve & resume");
+    expect(held).toContain("Waiting on you");
+    expect(held).toContain("the run is what closes this ticket");
+    expect(held).not.toMatch(/until you close this/);
   });
 
   it("separates a run nothing will start from a run already held", () => {
@@ -67,6 +111,7 @@ describe("OperatorQueue", () => {
           item({ id: "anton-f1.1", runTarget: { id: "anton-f1", title: "Ship billing" } }),
           item({ id: "anton-t2", title: "Sign the contract" }),
         ]}
+        onOpenTicket={() => {}}
       />,
     );
     expect(screen.getByText("holds a run")).toBeTruthy();
@@ -85,6 +130,7 @@ describe("OperatorQueue", () => {
           item({ id: "anton-t2", title: "Older" }),
           item({ id: "anton-t1", title: "Oldest" }),
         ]}
+        onOpenTicket={() => {}}
       />,
     );
     const titles = screen

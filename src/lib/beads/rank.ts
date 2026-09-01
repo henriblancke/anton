@@ -160,6 +160,18 @@ export function unblockCounter(board: Bead[]): (id: string) => number {
 }
 
 /**
+ * Everything the order sorts on, without the bead — so a surface holding only a projection of a
+ * target (the Up Next lane's entries) can ask what the ranking WOULD do without reconstructing one.
+ */
+export interface PrimeKey {
+  id: string;
+  /** bd priority; `undefined` sorts after every explicit one, exactly as on {@link RankedTarget}. */
+  priority?: number;
+  unblocks: number;
+  createdAt: string;
+}
+
+/**
  * The rank order itself — priority, then unblocking value, then age, then id.
  *
  * Total: two distinct beads never compare equal, because the id tiebreak cannot tie. That is not a
@@ -171,7 +183,7 @@ export function unblockCounter(board: Bead[]): (id: string) => number {
  * how each machine's runtime reads a malformed stamp. `id` compares by code unit, never
  * `localeCompare`, for the same reason — a locale-sensitive order is not the same order twice.
  */
-export function comparePrimeOrder(a: RankedTarget, b: RankedTarget): number {
+export function comparePrimeKeys(a: PrimeKey, b: PrimeKey): number {
   const priorityA = a.priority ?? UNPRIORITIZED;
   const priorityB = b.priority ?? UNPRIORITIZED;
   if (priorityA !== priorityB) return priorityA - priorityB; // P0 first, unset last
@@ -179,8 +191,16 @@ export function comparePrimeOrder(a: RankedTarget, b: RankedTarget): number {
   const ageA = a.createdAt || UNDATED;
   const ageB = b.createdAt || UNDATED;
   if (ageA !== ageB) return ageA < ageB ? -1 : 1; // oldest first
-  if (a.bead.id === b.bead.id) return 0;
-  return a.bead.id < b.bead.id ? -1 : 1;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
+/** {@link comparePrimeKeys} over ranked beads — the comparator `rankTargets` sorts with. */
+export function comparePrimeOrder(a: RankedTarget, b: RankedTarget): number {
+  return comparePrimeKeys(
+    { id: a.bead.id, priority: a.priority, unblocks: a.unblocks, createdAt: a.createdAt },
+    { id: b.bead.id, priority: b.priority, unblocks: b.unblocks, createdAt: b.createdAt },
+  );
 }
 
 /**

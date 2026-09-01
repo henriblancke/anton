@@ -1322,3 +1322,180 @@ describe("draft evidence goes with the criterion it explained", () => {
     expect(screen.queryByRole("note")).toBeNull();
   });
 });
+
+/**
+ * The `Never` deep link (anton-jqvy). A veto that dumped the operator on a twelve-criterion panel
+ * would be a rule change nobody makes, so the criterion arrives named — and only ever highlighted:
+ * `Never` opens the policy, it does not rewrite it.
+ */
+describe("the criterion a Never veto opened the editor at", () => {
+  const openAt = (criterion?: string) => {
+    window.history.replaceState(
+      null,
+      "",
+      criterion ? `/projects/tmp/settings?criterion=${encodeURIComponent(criterion)}#policy` : "/projects/tmp/settings#policy",
+    );
+  };
+
+  afterEach(() => window.history.replaceState(null, "", "/"));
+
+  it("highlights the native criterion the link names, and nothing else", () => {
+    openAt("types");
+    renderPanel();
+
+    expect(screen.getByRole("group", { name: "Issue type" }).getAttribute("aria-current")).toBe("true");
+    expect(screen.getByRole("group", { name: "Priority" }).hasAttribute("aria-current")).toBe(false);
+    // Named, so the operator knows why this control is ringed rather than guessing.
+    expect(
+      within(screen.getByRole("group", { name: "Issue type" })).getByText(
+        /admitted the bead you came from/i,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("highlights a discovered-namespace criterion by its own name", () => {
+    openAt("labels:severity");
+    renderPanel();
+
+    expect(screen.getByRole("group", { name: "severity:" }).getAttribute("aria-current")).toBe("true");
+    expect(screen.getByRole("group", { name: "Issue type" }).hasAttribute("aria-current")).toBe(false);
+  });
+
+  it("changes NOTHING about the policy — the link highlights, it never tightens", () => {
+    openAt("types");
+    const fetchMock = stubFetch();
+    renderPanel();
+
+    // The controls still hold exactly the proposal, and no write went out on render.
+    expect(checked("bug")).toBe("true");
+    expect(checked("feature")).toBe("false");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("highlights nothing when the link names no criterion", () => {
+    openAt();
+    renderPanel();
+
+    expect(
+      screen.getAllByRole("group").every((g) => !g.hasAttribute("aria-current")),
+    ).toBe(true);
+  });
+});
+
+/**
+ * The `◈ policy` badge's deep link (anton-cqxd / R3.7). It lands on the same criterion `Never` does
+ * — the two arrive for opposite reasons, to tighten and to check — but it also names the BEAD, and
+ * the badge's promise is "the rule that matched, WITH this bead's evaluated criteria". A panel that
+ * opened on a collapsed list of forty would not be keeping it.
+ */
+describe("the bead a provenance badge opened the editor about", () => {
+  const openAbout = (bead: string, criterion?: string) => {
+    const params = new URLSearchParams();
+    if (criterion) params.set("criterion", criterion);
+    params.set("bead", bead);
+    window.history.replaceState(null, "", `/projects/tmp/settings?${params}#policy`);
+  };
+
+  afterEach(() => window.history.replaceState(null, "", "/"));
+
+  it("opens the matched list on the bead it names, and marks its row", () => {
+    openAbout("anton-1");
+    renderPanel({ candidates: CANDIDATES });
+
+    const seeThem = disclosure("See them");
+    expect(seeThem.hasAttribute("open")).toBe(true);
+    const row = within(seeThem).getByText("anton-1").closest("li") as HTMLElement;
+    expect(row.getAttribute("aria-current")).toBe("true");
+  });
+
+  it("opens a REFUSED bead's own criteria — why not this one is the same question", () => {
+    // `types ∈ {bug}` refuses the chore, so it lands in the excluded list with its reason.
+    openAbout("anton-3");
+    renderPanel({ candidates: CANDIDATES });
+
+    const whyNot = disclosure("Why not the rest?");
+    expect(whyNot.hasAttribute("open")).toBe(true);
+    const row = within(whyNot).getByText("anton-3").closest("details") as HTMLElement;
+    expect(row.hasAttribute("open")).toBe(true);
+    // The criterion that refused it, named — that IS the bead's evaluated criteria.
+    expect(row.textContent).toMatch(/severity:.*the policy admits only/);
+  });
+
+  it("highlights the criterion beside the bead when the link names one", () => {
+    openAbout("anton-1", "types");
+    renderPanel({ candidates: CANDIDATES });
+
+    expect(screen.getByRole("group", { name: "Issue type" }).getAttribute("aria-current")).toBe(
+      "true",
+    );
+    expect(disclosure("See them").hasAttribute("open")).toBe(true);
+  });
+
+  it("leaves both lists closed when the link names no bead", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings#policy");
+    renderPanel({ candidates: CANDIDATES });
+
+    expect(disclosure("See them").hasAttribute("open")).toBe(false);
+    expect(disclosure("Why not the rest?").hasAttribute("open")).toBe(false);
+  });
+
+  it("changes NOTHING about the policy — the badge opens the rule, it never edits it", () => {
+    openAbout("anton-1", "types");
+    const fetchMock = stubFetch();
+    renderPanel({ candidates: CANDIDATES });
+
+    expect(checked("bug")).toBe("true");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The deep link's other half: the ringed criterion has to be ON SCREEN. The panel is taller than the
+ * viewport, so a highlight below the fold is a highlight nobody sees — and a scroll that repeated
+ * would drag the viewport back to the ring on every keystroke of the edit the operator came to make.
+ */
+describe("scrolling the deep-linked criterion into view", () => {
+  afterEach(() => {
+    window.history.replaceState(null, "", "/");
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  });
+
+  /** jsdom implements no layout and defines no scrollIntoView at all — which is why the panel calls
+   *  it optionally. Installed here so the call can be observed rather than performed. */
+  function stubScrollIntoView() {
+    const scroll = vi.fn();
+    (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView = scroll;
+    return scroll;
+  }
+
+  it("scrolls to the criterion the link names, and to nothing else", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings?criterion=types#policy");
+    const scroll = stubScrollIntoView();
+    renderPanel();
+
+    expect(scroll).toHaveBeenCalledTimes(1);
+    expect(scroll.mock.instances[0]).toBe(screen.getByRole("group", { name: "Issue type" }));
+  });
+
+  it("does not snap back to the ring while the operator edits the panel", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings?criterion=types#policy");
+    const scroll = stubScrollIntoView();
+    renderPanel({ candidates: CANDIDATES });
+    scroll.mockClear();
+
+    // Any edit re-renders every criterion. The scroll belongs to ARRIVING at the deep link, not to
+    // rendering it, so re-rendering must not move the viewport.
+    fireEvent.change(screen.getByLabelText("Minimum priority"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("switch", { name: "severity:minor" }));
+
+    expect(scroll).not.toHaveBeenCalled();
+  });
+
+  it("scrolls nothing when the link names no criterion", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings#policy");
+    const scroll = stubScrollIntoView();
+    renderPanel();
+
+    expect(scroll).not.toHaveBeenCalled();
+  });
+});

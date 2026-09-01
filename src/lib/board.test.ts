@@ -48,15 +48,69 @@ vi.mock("./scan-health", async () => {
   };
 });
 
+// Same seam, same reason, for the picker vetoes the board folds into its cards and its freshness
+// token (anton-jqvy): an unstubbed read reaches the real anton.db. `deferrals` is what this
+// project's operator has set aside, and every test but the veto ones runs with nothing deferred.
+let deferrals = new Map<string, number>();
+// The other half of that read: which of the recorded plan's picks already carry a decline against
+// THIS generation, holds expired included — what retires a generation no pass rewrote.
+let declined = new Set<string>();
+
+vi.mock("./picker-veto", async () => {
+  const actual = await vi.importActual<typeof import("./picker-veto")>("./picker-veto");
+  return {
+    ...actual,
+    latestPickerDeferrals: async () => deferrals,
+    latestDeclinedPicks: async () => declined,
+  };
+});
+
+// Same seam, same reason, for the two reads a card's provenance badges come from (anton-cqxd): the
+// picker's recorded plan and the policy it was picked under both live in anton.db. `pickerPlan` is
+// what the picker last decided here, and every test but the provenance ones runs with no plan.
+let pickerPlan: import("./board-picker-plan").BoardPickerPlan | undefined;
+
+vi.mock("./board-picker-plan", async () => {
+  const actual =
+    await vi.importActual<typeof import("./board-picker-plan")>("./board-picker-plan");
+  return { ...actual, latestBoardPickerPlan: async () => pickerPlan };
+});
+
+// Whether a board-picker pass still runs here (anton-t9m4): the lane is a projection of what that
+// pass would start next, and the badge is derived from a plan only while one is being kept. Stubbed
+// at the schedule seam so no test needs anton.db; armed is the default, as it is for a project the
+// operator has never switched off.
+let pickerArmed = true;
+
+vi.mock("./schedules", async () => {
+  const actual = await vi.importActual<typeof import("./schedules")>("./schedules");
+  return { ...actual, isScheduleEnabled: async () => pickerArmed };
+});
+
+// The policy armed on this machine (anton-t9m4 review): half of the plan's freshness fence, so a
+// test can move it without touching a bead. Unarmed by default, as a project that never set one.
+let projectSettings: { pickerPolicy?: import("./policy/types").Policy } = {};
+
+vi.mock("./projects", async () => {
+  const actual = await vi.importActual<typeof import("./projects")>("./projects");
+  return { ...actual, getProjectSettings: async () => projectSettings };
+});
+
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
+const { stampBoard } = await import("./board-picker-plan");
 
 beforeEach(() => {
   resetIssueSnapshots();
   listMock.mockReset();
   hygieneReport = undefined;
   scanHealth = undefined;
+  deferrals = new Map();
+  declined = new Set();
+  pickerPlan = undefined;
+  pickerArmed = true;
+  projectSettings = {};
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1091,5 +1145,336 @@ describe("getBoard — the operator queue", () => {
     ]);
 
     expect((await getBoard(project)).operatorQueue).toEqual([]);
+  });
+});
+
+/**
+ * A vetoed target reads as SET ASIDE on the board rather than silently gone (anton-jqvy). The hold
+ * is machine-local anton.db state, so it also has to move the freshness token — including when it
+ * expires, which is not a write anything else would notice.
+ */
+describe("picker vetoes on the board (anton-jqvy)", () => {
+  const UNTIL = 1_800_086_400_000;
+
+  it("marks a deferred card and a deferred chip, leaving both on the board", async () => {
+    listMock.mockResolvedValue([
+      makeBead({ id: "f-1", title: "A feature", issue_type: "feature" }),
+      makeBead({ id: "t-1", title: "A loose task" }),
+    ]);
+    deferrals = new Map([
+      ["f-1", UNTIL],
+      ["t-1", UNTIL],
+    ]);
+
+    const board = await getBoard(project);
+    expect(board.columns.backlog.find((e) => e.id === "f-1")?.notNowUntil).toBe(UNTIL);
+    expect(board.standalone.backlog.find((i) => i.id === "t-1")?.notNowUntil).toBe(UNTIL);
+  });
+
+  it("leaves a target anton was never vetoed on unmarked", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    expect((await getBoard(project)).standalone.backlog[0]?.notNowUntil).toBeUndefined();
+  });
+
+  it("moves the refresh token when a veto lands AND when its window closes", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    const clean = (await getBoard(project)).version;
+
+    resetIssueSnapshots();
+    deferrals = new Map([["t-1", UNTIL]]);
+    const held = (await getBoard(project)).version;
+    expect(held).not.toBe(clean);
+
+    // An expiry is not a write: the active set shrinks on its own, and the token has to follow it
+    // or the card stays drawn as deferred until something unrelated moves.
+    resetIssueSnapshots();
+    deferrals = new Map();
+    expect((await getBoard(project)).version).toBe(clean);
+  });
+
+  it("agrees with the version the poll path compares against", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    deferrals = new Map([["t-1", UNTIL]]);
+    const board = await getBoard(project);
+    expect(await getBoardVersion(project)).toBe(board.version);
+  });
+});
+
+/**
+ * Provenance badges (anton-cqxd / R3.7) are joined onto the cards the board serves, so every surface
+ * that renders a card renders them — the lane is one reader of this data, never its owner.
+ */
+describe("provenance on the board (anton-cqxd)", () => {
+  /** Stamped over the board it ranks — an unstale plan, as a pass that just ran would have left. */
+  const planFor = (board: Bead[], beadId: string): import("./board-picker-plan").BoardPickerPlan => ({
+    projectId: "p1",
+    planId: "plan-1",
+    generatedAt: 1_770_000_000,
+    stamp: stampBoard(board, 1_770_000_000_000),
+    entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
+    exclusions: [],
+  });
+
+  it("marks the picker's pick on a card and on a chip alike", async () => {
+    const board = [
+      makeBead({ id: "f-1", title: "A feature", issue_type: "feature" }),
+      makeBead({ id: "t-1", title: "A loose task" }),
+    ];
+    listMock.mockResolvedValue(board);
+    pickerPlan = {
+      ...planFor(board, "f-1"),
+      entries: [
+        { beadId: "f-1", rank: 1, rule: "any claimable run target" },
+        { beadId: "t-1", rank: 2, rule: "any claimable run target" },
+      ],
+    };
+
+    const served = await getBoard(project);
+    expect(served.columns.backlog.find((e) => e.id === "f-1")?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target" },
+    ]);
+    expect(served.standalone.backlog.find((i) => i.id === "t-1")?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target" },
+    ]);
+  });
+
+  it("stops badging picks once the pass that would refresh them is switched off", async () => {
+    const board = [makeBead({ id: "t-1", title: "A loose task" })];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planFor(board, "t-1");
+    pickerArmed = false;
+
+    // The badge is what `[Release]` is derived from (isPickerPick), so a plan left behind by a
+    // disabled schedule would keep offering to record accepts against a pass that no longer runs.
+    expect((await getBoard(project)).standalone.backlog[0]?.provenance).toBeUndefined();
+  });
+
+  it("never badges a done target — provenance is about whether to run it", async () => {
+    const board = [
+      makeBead({ id: "f-1", title: "A shipped feature", issue_type: "feature", status: "closed" }),
+    ];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planFor(board, "f-1");
+
+    expect((await getBoard(project)).columns.done[0]?.provenance).toBeUndefined();
+  });
+
+  it("leaves a target no unattended writer touched unmarked", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    expect((await getBoard(project)).standalone.backlog[0]?.provenance).toBeUndefined();
+  });
+
+  it("moves the refresh token when the picker records a new plan", async () => {
+    const board = [makeBead({ id: "t-1", title: "A loose task" })];
+    listMock.mockResolvedValue(board);
+    const clean = (await getBoard(project)).version;
+
+    resetIssueSnapshots();
+    pickerPlan = planFor(board, "t-1");
+    const picked = (await getBoard(project)).version;
+    expect(picked).not.toBe(clean);
+
+    // The poll path compares against the same token, or the badge never reaches the tab.
+    expect(await getBoardVersion(project)).toBe(picked);
+  });
+
+  it("holds the refresh token still while the pass is switched off", async () => {
+    const board = [makeBead({ id: "t-1", title: "A loose task" })];
+    listMock.mockResolvedValue(board);
+    pickerArmed = false;
+    const quiet = await getBoardVersion(project);
+
+    // A disarmed board carries no provenance at all, so a plan row written before the pass was
+    // switched off cannot change what is served. A token that still moved on it would break the
+    // poll's 304 and spend a full board read to hand back byte-identical data.
+    resetIssueSnapshots();
+    pickerPlan = planFor(board, "t-1");
+    expect(await getBoardVersion(project)).toBe(quiet);
+    // And the two halves still agree: the poll's token is the one the served board carries.
+    const served = await getBoard(project);
+    expect(await getBoardVersion(project)).toBe(served.version);
+  });
+});
+
+/**
+ * The Up Next lane's server half (anton-t9m4 / R3.1–R3.4). The lane claims this is the order anton
+ * would start work in NOW — a stricter promise than the badge beside it, which only records the rule
+ * a target WAS picked under. So it is withheld whole on every fact that makes the recorded ranking
+ * no longer that: a disarmed pass, a board the plan predates, and — per pick — a veto since.
+ */
+describe("the Up Next lane on the board (anton-t9m4)", () => {
+  const feature = () => makeBead({ id: "f-1", title: "A feature", issue_type: "feature" });
+
+  /** A plan recorded against exactly this board — what a pass that just ran would have written. */
+  function planOver(board: Bead[], beadId: string): import("./board-picker-plan").BoardPickerPlan {
+    return {
+      projectId: "p1",
+      planId: "plan-1",
+      generatedAt: 1_770_000_000,
+      stamp: stampBoard(board, 1_770_000_000_000),
+      entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+  }
+
+  it("projects the lane from a plan the board still matches", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+
+    expect((await getBoard(project)).upNext).toEqual([
+      { beadId: "f-1", rank: 1, type: "feature", unblocks: 0, createdAt: "" },
+    ]);
+  });
+
+  it("withholds the lane when the board has moved past the plan", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    // The pass ranked a board this one no longer is — a target claimed, blocked or reprioritized
+    // since. Showing the old order would answer "what is next?" with a board that has gone.
+    pickerPlan = {
+      ...planOver(board, "f-1"),
+      stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
+    };
+
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("withholds the lane while the picker is disarmed", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    pickerArmed = false;
+
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("drops a pick the operator vetoed since the pass ran", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    deferrals = new Map([["f-1", 1_770_000_100_000]]);
+
+    // Out of the lane, but still on the board: a set-aside target returns to Backlog, it does not
+    // vanish. And the lane is ABSENT rather than empty (Board.upNext) — an "Up Next" heading over
+    // nothing would read as "anton has nothing to start".
+    const served = await getBoard(project);
+    expect(served.upNext).toBeUndefined();
+    expect("upNext" in served).toBe(false);
+    expect(served.columns.backlog.map((e) => e.id)).toEqual(["f-1"]);
+  });
+
+  it("withholds the lane once a hold the pass acted on runs out", async () => {
+    const board = [feature(), makeBead({ id: "f-2", title: "Set aside", issue_type: "feature" })];
+    listMock.mockResolvedValue(board);
+    // A pass that ran while `f-2` was vetoed: the target is in the plan only as an exclusion, and no
+    // hashed input changes when its window closes. Without the deferral half of the fence the lane
+    // would keep presenting a ranking that cannot offer `f-2` until the next pass rewrote it.
+    pickerPlan = {
+      ...planOver(board, "f-1"),
+      exclusions: [{ beadId: "f-2", reason: "deferred", detail: "you set this aside" }],
+    };
+    deferrals = new Map([["f-2", 1_770_000_100_000]]);
+    expect((await getBoard(project)).upNext).toHaveLength(1);
+
+    resetIssueSnapshots();
+    deferrals = new Map();
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("withholds the lane once a veto's hold runs out with no pass to record it", async () => {
+    const board = [feature(), makeBead({ id: "f-2", title: "Next", issue_type: "feature" })];
+    listMock.mockResolvedValue(board);
+    // The picker was disarmed (or failing) for the whole window, so no pass ever rewrote the plan
+    // into one that excludes `f-1` as `deferred` — the decline against this generation is all there
+    // is. While the hold runs the lane just drops that card, as it does for any live veto.
+    pickerPlan = {
+      ...planOver(board, "f-1"),
+      entries: [
+        { beadId: "f-1", rank: 1, rule: "any claimable run target" },
+        { beadId: "f-2", rank: 2, rule: "any claimable run target" },
+      ],
+    };
+    declined = new Set(["f-1"]);
+    deferrals = new Map([["f-1", 1_770_000_100_000]]);
+    expect((await getBoard(project)).upNext).toEqual([
+      { beadId: "f-2", rank: 2, type: "feature", unblocks: 0, createdAt: "" },
+    ]);
+
+    // Once it lapses the generation is retired outright: re-offering `f-1` here would offer a start
+    // whose accept `recordPickerAccept` refuses, against the decline already standing on this plan.
+    resetIssueSnapshots();
+    deferrals = new Map();
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("withholds the lane when the operator narrows the policy without touching a bead", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    // Recorded by a pass that ran under NO policy — the fence covers both halves of that decision.
+    pickerPlan = planOver(board, "f-1");
+    expect((await getBoard(project)).upNext).toHaveLength(1);
+
+    resetIssueSnapshots();
+    // A settings save admits or excludes targets while every bead digest stays byte-identical. The
+    // plan now ranks under a rule the operator has replaced, so it is not what anton would start.
+    projectSettings = { pickerPolicy: { types: ["bug"] } };
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("moves the refresh token on a policy save, so the poll cannot 304 past the withdrawal", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    const armed = await getBoardVersion(project);
+
+    projectSettings = { pickerPolicy: { types: ["bug"] } };
+    expect(await getBoardVersion(project)).not.toBe(armed);
+  });
+});
+
+/**
+ * `[Release]` is derived from the `◈ policy` badge (isPickerPick), and the badge outlives the plan it
+ * came from — it records the rule a target WAS picked under. The button claims something stronger:
+ * that this is what anton would start NOW. So the mark carries the freshness verdict the lane is
+ * withheld on, and the two can never disagree.
+ */
+describe("a pick the board has moved past (anton-t9m4)", () => {
+  const feature = () => makeBead({ id: "f-1", title: "A feature", issue_type: "feature" });
+
+  it("keeps the badge but flags it stale once the board no longer matches the plan", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = {
+      projectId: "p1",
+      planId: "plan-1",
+      generatedAt: 1_770_000_000,
+      stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
+      entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+
+    const served = await getBoard(project);
+    expect(served.upNext).toBeUndefined();
+    expect(served.columns.backlog[0]?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target", stale: true },
+    ]);
+  });
+
+  it("leaves the mark unflagged while the plan still describes the board", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = {
+      projectId: "p1",
+      planId: "plan-1",
+      generatedAt: 1_770_000_000,
+      stamp: stampBoard(board, 1_770_000_000_000),
+      entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+
+    expect((await getBoard(project)).columns.backlog[0]?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target" },
+    ]);
   });
 });

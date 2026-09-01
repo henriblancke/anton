@@ -1,8 +1,14 @@
+"use client";
+
 import { UserRoundIcon } from "lucide-react";
 import Link from "next/link";
 
 import { MetaChip, RelativeTime, RiskChip } from "@/components/atoms";
 import type { OperatorQueueItem } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+const TITLE_CLASS =
+  "rounded-sm text-[13px] font-medium text-foreground underline-offset-2 hover:underline focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none";
 
 /**
  * The work anton hands back, in one list (anton-qfso.1).
@@ -11,7 +17,7 @@ import type { OperatorQueueItem } from "@/lib/types";
  * right call, because no agent can spend a credential, sign a thing, or make a taste call. But an
  * exclusion is not a destination: without this band the work simply stops appearing anywhere a
  * founder looks, which trades a wasted run for a lost ticket. Here it stays approved, ordered, and
- * one click from the bead that carries its controls.
+ * one click from the surface that carries its controls.
  *
  * Quiet on purpose. This sits below the escalation strip and must not compete with it: an escalation
  * is work that STOPPED and hands you a button to unstick it, while every row here is work that is
@@ -22,7 +28,16 @@ import type { OperatorQueueItem } from "@/lib/types";
  * claim, and the honest version of it here is silence: the same rule `rankAttention`'s `reported`
  * flag encodes and the escalation strip restates.
  */
-export function OperatorQueue({ slug, items }: { slug: string; items: OperatorQueueItem[] }) {
+export function OperatorQueue({
+  slug,
+  items,
+  onOpenTicket,
+}: {
+  slug: string;
+  items: OperatorQueueItem[];
+  /** Opens a parented ticket in the board's shared TicketDialog — see {@link QueueRow}. */
+  onOpenTicket: (ticketId: string) => void;
+}) {
   if (items.length === 0) return null;
 
   return (
@@ -51,7 +66,7 @@ export function OperatorQueue({ slug, items }: { slug: string; items: OperatorQu
               className="mt-0.5 w-0.5 shrink-0 self-stretch rounded-full bg-border"
               aria-hidden="true"
             />
-            <QueueRow slug={slug} item={item} />
+            <QueueRow slug={slug} item={item} onOpenTicket={onOpenTicket} />
           </li>
         ))}
       </ul>
@@ -65,7 +80,15 @@ export function OperatorQueue({ slug, items }: { slug: string; items: OperatorQu
  * what a founder does next — a held run is already burning a worktree, while a human target is
  * simply not moving.
  */
-function QueueRow({ slug, item }: { slug: string; item: OperatorQueueItem }) {
+function QueueRow({
+  slug,
+  item,
+  onOpenTicket,
+}: {
+  slug: string;
+  item: OperatorQueueItem;
+  onOpenTicket: (ticketId: string) => void;
+}) {
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -80,13 +103,24 @@ function QueueRow({ slug, item }: { slug: string; item: OperatorQueueItem }) {
       </div>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
         {/* The bead itself — every control for editing, claiming or closing it already lives there,
-            so this band links rather than reproducing them. */}
-        <Link
-          href={`/projects/${slug}/epics/${item.id}`}
-          className="rounded-sm text-[13px] font-medium text-foreground underline-offset-2 hover:underline focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
-        >
-          {item.title}
-        </Link>
+            so this band opens it rather than reproducing them. WHERE it lives differs by shape, the
+            same split the tickets table makes: a run target gets the epic page, whose actions
+            (Approve, Force run) are exactly the ones it can take, while a PARENTED ticket has none
+            of those — approving it is rejected outright — and belongs in the TicketDialog, which is
+            the only surface carrying its editor and state controls. */}
+        {item.runTarget ? (
+          <button
+            type="button"
+            onClick={() => onOpenTicket(item.id)}
+            className={cn(TITLE_CLASS, "text-left")}
+          >
+            {item.title}
+          </button>
+        ) : (
+          <Link href={`/projects/${slug}/epics/${item.id}`} className={TITLE_CLASS}>
+            {item.title}
+          </Link>
+        )}
         <span className="font-mono text-[11px] text-subtle">{item.id}</span>
       </div>
       {/* The ask, not just its title: deciding whether to answer something now is deciding on what
@@ -96,6 +130,10 @@ function QueueRow({ slug, item }: { slug: string; item: OperatorQueueItem }) {
           {item.goal}
         </p>
       ) : null}
+      {/* What actually releases the run, which is NOT closing this ticket (PR #214 review). The run
+          holds an open human gate on it, and anton never resolves that gate itself — the operator
+          answers it from the escalation strip above, and the resumed run is what closes the ticket.
+          A row that said "close this" would leave the gate open and the run parked for good. */}
       {item.runTarget ? (
         <p className="text-[11px] text-subtle">
           Holds{" "}
@@ -105,7 +143,9 @@ function QueueRow({ slug, item }: { slug: string; item: OperatorQueueItem }) {
           >
             {item.runTarget.id}
           </Link>{" "}
-          — its run waits here until you close this.
+          — do the work, then <span className="text-muted-foreground">Resolve &amp; resume</span> on
+          its &ldquo;Waiting on you&rdquo; row above. That is what restarts the run, and the run is
+          what closes this ticket.
         </p>
       ) : null}
     </div>

@@ -362,7 +362,27 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.humanGates).toEqual([`${personWork} → Buy the domain`]);
+    // The target itself is agent work, so the run really does start and hold — absent, not false.
+    expect(body).not.toHaveProperty("humanTarget");
     expect(beads.isApproved(await beads.show(repo, target))).toBe(true);
+  });
+
+  it("marks a human TARGET as a run that never starts, not one that stops", async () => {
+    // PR #214 review: execute-epic poisons a target labelled `agent:human` before it dispatches a
+    // single child, so the "anton runs the rest" toast the gate lines earn would be a promise about
+    // a run that never begins. The distinction rides in the body, not in the client's guesswork.
+    const target = await beads.create(repo, {
+      title: "Buy the domain",
+      type: "task",
+      acceptance: "- [ ] the domain resolves",
+      labels: ["agent:human"],
+    });
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.humanGates).toEqual([`${target} → Buy the domain`]);
+    expect(body.humanTarget).toBe(true);
   });
 
   it("says nothing about human work on a run that stops for nobody", async () => {
@@ -373,7 +393,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     const res = await approve(target);
     expect(res.status).toBe(200);
     // Absent, not empty: an empty list is still a thing the client has to decide not to say.
-    expect(await res.json()).not.toHaveProperty("humanGates");
+    const body = await res.json();
+    expect(body).not.toHaveProperty("humanGates");
+    expect(body).not.toHaveProperty("humanTarget");
   });
 
   it("approves a bead repaired since the board last read it — the gate reads fresh", async () => {
