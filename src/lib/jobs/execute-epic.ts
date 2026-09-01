@@ -369,6 +369,22 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
     // resumed) when the abandon landed; a job that was RUNNING is cancelled by the abandon itself.
     if (beads.isAbandoned(target)) return;
 
+    // Work only a person can do never reaches an agent (anton-mv70). `agent:human` names the one
+    // specialist anton does not have, so dispatching it would fall through to the DEFAULT agent and
+    // spend a run flailing at a credential, a purchase or a taste call. The claimable set already
+    // excludes it (beads.isHumanWork); this is the backstop for every other way a run starts —
+    // Force run, a resumed job queued before the label landed, an API enqueue. Poison, not retry:
+    // no number of attempts turns human work into agent work, and parking puts it back in front of
+    // the operator who has to do it.
+    if (beads.isHumanWork(target)) {
+      throw new PoisonEpic(
+        `target ${epicBeadId} is labelled ${LABELS.agentHuman} — a person executes this work, not ` +
+          `an agent, so it is never claimable and no run can deliver it. It stays on the board as ` +
+          `approved work waiting for an operator: do it by hand and close the bead, or drop the ` +
+          `label if an agent can in fact do it and run it again`,
+      );
+    }
+
     // Unit-ness is type-only (isUnit reads `issue_type`), so unlike the grouping shape it genuinely
     // can't change across a pull — capture it here, while `target` is narrowed, and reuse it against
     // the freshly-pulled board in step 0; `target` is a `let` reassigned there, so reading it inside
