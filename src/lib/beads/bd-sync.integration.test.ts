@@ -14,6 +14,7 @@ import {
   initBareRemote,
   makeBdRepo,
   removeTempRepo,
+  tmpProject,
   type BdRepo,
 } from "@/lib/testing/integration";
 import { beads } from "./bd";
@@ -38,10 +39,7 @@ describeBd("beads.sync integration (real bd · local bare remote)", () => {
     // it's set explicitly here.
     execFileSync("bd", ["config", "set", "export.auto", "false"], { cwd: repo, stdio: "ignore" });
 
-    project = {
-      id: "x", slug: "tmp", name: "tmp", repoPath: repo,
-      defaultBranch: "main", hasBeads: true, createdAt: 0,
-    };
+    project = tmpProject(repo);
   });
 
   afterAll(() => {

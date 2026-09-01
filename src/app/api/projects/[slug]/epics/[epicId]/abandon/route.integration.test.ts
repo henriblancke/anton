@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { beads } from "@/lib/beads/bd";
 import { resetIssueSnapshots } from "@/lib/beads/snapshot";
-import { type BdRepo, describeBd, jsonRequest, makeBdRepo, paramsCtx } from "@/lib/testing/integration";
+import { type BdRepo, describeBd, jsonRequest, makeBdRepo, paramsCtx, tmpProject } from "@/lib/testing/integration";
 import type { EpicAbandonResult } from "@/lib/abandon";
 import type { Project } from "@/lib/types";
 
@@ -39,15 +39,7 @@ describeBd("epic abandon route (real bd)", () => {
   beforeAll(async () => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "proj-1",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo, { id: "proj-1" });
     epicId = await beads.create(repo, { title: "Half-built thing", type: "epic" });
     doneChild = await beads.create(repo, {
       title: "Already shipped",
@@ -123,15 +115,7 @@ describeBd("container epic abandon cancels its features' runs (real bd)", () => 
   beforeAll(async () => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "proj-2",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo, { id: "proj-2" });
     containerId = await beads.create(repo, { title: "Product outcome", type: "epic" });
     featureId = await beads.create(repo, {
       title: "The shippable unit",

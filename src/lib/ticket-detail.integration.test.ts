@@ -5,7 +5,7 @@
  * epic-detail.integration.test.ts. Skipped when `bd`/`git` aren't installed.
  */
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, tmpProject, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { resetIssueSnapshots } from "./beads/snapshot";
 import { deleteTicket, getTicketDetail, updateTicket } from "./ticket-detail";
@@ -19,15 +19,7 @@ describeBd("ticket-detail integration (real bd)", () => {
   beforeAll(() => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "x",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo);
   });
 
   afterAll(() => {
