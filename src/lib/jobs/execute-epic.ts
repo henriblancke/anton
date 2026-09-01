@@ -1131,10 +1131,16 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         //     Read out of the board rather than off `target`, which widens back to
         //     `Bead | undefined` inside this closure; the drift gate above already proved it is here.
         const confirmedTarget = confirmedBoard.find((b) => b.id === epicBeadId);
+        //     The CHILDREN are adopted for the same reason, not just compared (PR #213 review). The
+        //     drift gate above asks about IDs, so a child RELABELLED `agent:human` inside the lease
+        //     window passes it untouched — and a grouped run that carried its pre-lease objects
+        //     forward would classify human work off the superseded labels below and hand the ticket
+        //     to the default agent. The confirmed objects are the ones every later label read
+        //     answers. A standalone run's ticket IS its target, so the two never diverge.
+        freshChildren = confirmedChildren;
         if (confirmedTarget) {
           target = adoptRefreshedTarget(confirmedBoard, epicBeadId, confirmedTarget);
-          //   A standalone run's ticket IS its target, so the two never diverge.
-          if (standaloneRun) tickets = [target];
+          tickets = standaloneRun ? [target] : freshChildren;
         }
       });
 
@@ -1219,30 +1225,25 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     run published on the way out.
       //     The verdict is then re-read from the board the gates are ON, so the dispatch loop holds
       //     them by the ordinary blocked-child rule rather than a second, parallel notion of "held".
-      const humanTickets = tickets.filter((t) => !isResumeSkipped(t) && beads.isHumanWork(t));
-      if (humanTickets.length > 0) {
-        // What a person answered is closed here, what they have not is armed, and what their answer
-        // cannot yet release is reported back as held.
-        const answeredButBlocked = await armHumanTicketGates(
-          repo,
-          epicBeadId,
-          all,
-          humanTickets,
-          ctx.signal,
-        );
-        // Re-read the board the gates and closes are ON — the TARGET, the ticket SET and the
-        // verdict. A ticket closed just above is done work now, and the loop below reads its status
-        // off these objects to skip it.
-        all = await loadAllIssues(repo, { strictGates: true });
-        // Adopt the refreshed target, not just its children (PR #213 review). Every `armHumanGate`
-        // above pulls the shared board first, so a relabel another machine pushed lands in exactly
-        // this read — and a `target` left at its pre-arm snapshot would carry the superseded labels
-        // through every step that follows. `agent:human` is the one that must be re-asked: the
-        // backstop at the top of this handler judged a bead the board no longer describes, nothing
-        // downstream re-reads the label, and the run would hand a person's work to the default agent.
-        target = adoptRefreshedTarget(all, epicBeadId, target);
-        freshChildren = runTickets(all, epicBeadId);
-        tickets = standaloneRun ? [target] : freshChildren;
+      //     Classification and arming loop together ({@link preflightHumanTickets}): each arm pulls
+      //     the shared board, so a sibling relabelled in that window is only ever caught by
+      //     re-classifying what the refresh brought back.
+      const humanPreflight = await preflightHumanTickets({
+        repo,
+        targetId: epicBeadId,
+        board: all,
+        target,
+        children: freshChildren,
+        standaloneRun,
+        isResumeSkipped,
+        signal: ctx.signal,
+      });
+      if (humanPreflight.armed) {
+        const { answeredButBlocked } = humanPreflight;
+        all = humanPreflight.board;
+        target = humanPreflight.target;
+        freshChildren = humanPreflight.children;
+        tickets = humanPreflight.tickets;
         freshReadiness = computeReadiness(all);
         // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
         // the same rule as any other blocked child rather than reaching it as open human work and
@@ -2914,13 +2915,20 @@ export async function armHumanTicketGates(
   board: Bead[],
   humanTickets: Bead[],
   signal: AbortSignal | undefined,
+  /**
+   * The waits the CALLER has already armed for this run, appended to here. {@link
+   * preflightHumanTickets} makes several passes, and a kill in a later one must take back the
+   * earlier passes' gates too — each is a wait promising a person that resolving it resumes a run
+   * that is not coming back.
+   */
+  armedSoFar?: ArmedTicketGate[],
 ): Promise<Map<string, string[]>> {
   // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet: held
   // for this pass, closed by the resume that follows the blocker.
   const answeredButBlocked = new Map<string, string[]>();
-  // Every wait THIS pass armed, so a kill landing between two arms — or after the last one — can
+  // Every wait this run armed, so a kill landing between two arms — or after the last one — can
   // take them back.
-  const armedHere: ArmedTicketGate[] = [];
+  const armedHere: ArmedTicketGate[] = armedSoFar ?? [];
   // The tickets this pass has already closed: closed to bd, still open in `board`.
   const closedHere = new Set<string>();
   try {
@@ -2967,6 +2975,103 @@ export async function armHumanTicketGates(
     throw await undoCancelledTicketGates(armedHere, signal, e);
   }
   return answeredButBlocked;
+}
+
+/** What a run adopts from {@link preflightHumanTickets} once it has acted on human work. */
+export interface HumanTicketPreflight {
+  /** The board the closes and the arms landed on — what the run recomputes its verdict from. */
+  board: Bead[];
+  target: Bead;
+  children: Bead[];
+  tickets: Bead[];
+  /** Tickets whose gate a person answered but whose ordinary blockers still hold them. */
+  answeredButBlocked: Map<string, string[]>;
+  /** False when the run has no human work at all — nothing was written, nothing to adopt. */
+  armed: boolean;
+}
+
+/**
+ * How many classify→arm→refresh passes a run makes before it gives up and retries (PR #213 review).
+ * Each pass acts on at least one ticket no earlier pass saw, so a board that settles takes two: one
+ * to arm, one to confirm the refresh found nothing new. More than a handful means the labels are
+ * still moving under this run, which a fresh attempt re-gates better than a loop here can.
+ */
+export const MAX_HUMAN_TICKET_PASSES = 5;
+
+/**
+ * The human tickets' preflight (anton-mv70): classify the run's tickets, arm what a person owns,
+ * then re-classify what the refresh brought back.
+ *
+ * The loop is the point (PR #213 review). {@link armHumanTicketGates} pulls the shared board before
+ * each arm, so a sibling another machine relabelled `agent:human` mid-pass lands in the refresh
+ * below — adopted, but never classified. Readiness never asks about the label, so that ticket stays
+ * dispatchable and the run only notices at the dispatch loop's backstop, which parks telling the
+ * operator to resolve a wait nobody ever armed. Re-classifying until a pass finds nothing new is
+ * what makes the arm and the labels agree.
+ *
+ * Only tickets no earlier pass handled are re-armed, so a wait is never stacked on an ask that
+ * already has one, and a ticket held on an ordinary blocker is not re-asked for.
+ */
+export async function preflightHumanTickets(args: {
+  repo: string;
+  targetId: string;
+  /** The board the tickets were read from — the pre-pass snapshot. */
+  board: Bead[];
+  target: Bead;
+  /** The target's working-layer subtree; the run's tickets when it groups children. */
+  children: Bead[];
+  standaloneRun: boolean;
+  isResumeSkipped: (t: Bead) => boolean;
+  signal: AbortSignal | undefined;
+}): Promise<HumanTicketPreflight> {
+  const { repo, targetId, standaloneRun, isResumeSkipped, signal } = args;
+  let { board, target, children } = args;
+  const ticketsOf = () => (standaloneRun ? [target] : children);
+  const answeredButBlocked = new Map<string, string[]>();
+  const handled = new Set<string>();
+  // Carried ACROSS passes so a kill in a later one takes back the earlier passes' waits too.
+  const armedGates: ArmedTicketGate[] = [];
+  let armed = false;
+
+  for (let pass = 0; ; pass++) {
+    const humanTickets = ticketsOf().filter(
+      (t) => !handled.has(t.id) && !isResumeSkipped(t) && beads.isHumanWork(t),
+    );
+    if (humanTickets.length === 0) break;
+    // Plain Error, not a park: the labels are still moving, and the next attempt re-gates from a
+    // board that has settled rather than this run arming behind a moving target forever.
+    if (pass >= MAX_HUMAN_TICKET_PASSES) {
+      throw new Error(
+        `${targetId} kept finding newly-labelled ${LABELS.agentHuman} tickets after ` +
+          `${MAX_HUMAN_TICKET_PASSES} arming passes (${humanTickets.map((t) => t.id).join(", ")}) ` +
+          `— retrying so the run gates a settled board rather than dispatching a person's work`,
+      );
+    }
+    armed = true;
+    for (const t of humanTickets) handled.add(t.id);
+    // What a person answered is closed here, what they have not is armed, and what their answer
+    // cannot yet release is reported back as held.
+    for (const [id, blockers] of await armHumanTicketGates(
+      repo,
+      targetId,
+      board,
+      humanTickets,
+      signal,
+      armedGates,
+    )) {
+      answeredButBlocked.set(id, blockers);
+    }
+    // Re-read the board the gates and the closes are ON — the TARGET and the ticket SET. A ticket
+    // closed just above is done work now, and the dispatch loop reads its status off these objects.
+    // The target is adopted, not just its children: every `armHumanGate` pulls the shared board
+    // first, so a relabel another machine pushed lands in exactly this read, and a `target` left at
+    // its pre-arm snapshot would carry the superseded labels through every step that follows.
+    board = await loadAllIssues(repo, { strictGates: true });
+    target = adoptRefreshedTarget(board, targetId, target);
+    children = runTickets(board, targetId);
+  }
+
+  return { board, target, children, tickets: ticketsOf(), answeredButBlocked, armed };
 }
 
 /**
