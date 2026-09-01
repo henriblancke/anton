@@ -603,6 +603,19 @@ interface FieldSpec {
   ok: (value: unknown) => boolean;
 }
 
+/**
+ * The table itself, with requiredness DERIVED from each field's own declared type rather than left
+ * to the row to remember: a property {@link GardenerPlan} declares non-optional must say
+ * `required: true`, and one it declares optional must not. That is what makes a field added to the
+ * plan a type error twice over — once for the missing row, once for a row that would let the read
+ * skip a value the plan says is always there.
+ */
+type PlanFieldSpecs = {
+  [K in keyof GardenerPlan]-?: undefined extends GardenerPlan[K]
+    ? FieldSpec & { required?: false }
+    : FieldSpec & { required: true };
+};
+
 /** A bead id, or any other string a plan carries that must not be empty. */
 const isId = (value: unknown): boolean => typeof value === "string" && value.length > 0;
 
@@ -634,18 +647,18 @@ const PLAN_FIELDS = {
   },
   detail: { shape: "a non-empty parameter", ok: isId },
   subjectChecksum: { shape: "a digest", ok: (v) => typeof v === "string" },
-} satisfies Record<keyof GardenerPlan, FieldSpec>;
+} satisfies PlanFieldSpecs;
 
 const PLAN_FIELD_NAMES = Object.keys(PLAN_FIELDS) as (keyof GardenerPlan)[];
 
 /**
- * A rule that reads the plan as a WHOLE: presence that depends on the move, the kind→verb pairing,
- * and the identities recomputed from the fields themselves. Ordered, and the first violation is the
- * one reported — so each rule may assume the ones above it held.
+ * A rule that reads the plan as a WHOLE: presence that depends on the move, and the kind→verb
+ * pairing. Ordered, and the first violation is the one reported — so each rule may assume the ones
+ * above it held.
  */
 interface PlanRule {
   field: keyof GardenerPlan;
-  violation: (plan: GardenerPlan, form: IdentityForm | undefined) => string | undefined;
+  violation: (plan: GardenerPlan) => string | undefined;
 }
 
 const PLAN_RULES: readonly PlanRule[] = [
@@ -667,18 +680,30 @@ const PLAN_RULES: readonly PlanRule[] = [
   },
   { field: "retireAs", violation: retireViolation },
   { field: "detail", violation: (plan) => detailViolation(plan.kind, plan.detail) },
-  {
-    field: "fingerprint",
-    violation: (_plan, form) =>
-      form ? undefined : "does not hash the kind, subjects, target and detail filed with it",
-  },
+];
+
+/** What a fingerprint that stands for none of the fields filed with it is refused as. */
+const FINGERPRINT_UNBOUND = "does not hash the kind, subjects, target and detail filed with it";
+
+/**
+ * A rule that reads the plan AGAINST THE IDENTITY its fingerprint turned out to be — so it runs only
+ * once the fingerprint held, and takes that {@link IdentityForm} rather than "maybe one". The
+ * ordering the fingerprint rule used to impose by sitting above these in one list is a type here: a
+ * rule that needs the form cannot be written into {@link PLAN_RULES}, which has none to give.
+ */
+interface IdentityRule {
+  field: keyof GardenerPlan;
+  violation: (plan: GardenerPlan, form: IdentityForm) => string | undefined;
+}
+
+const IDENTITY_RULES: readonly IdentityRule[] = [
   { field: "subjectChecksum", violation: checksumViolation },
 ];
 
 /**
  * Read a plan back off a bead's metadata, or say which field refused it. Validated against
- * {@link PLAN_FIELDS} and {@link PLAN_RULES} rather than cast: this value decides which beads get
- * MUTATED, so anything the emitter did not write — a hand-edited metadata blob, a plan from a future
+ * {@link PLAN_FIELDS}, {@link PLAN_RULES} and {@link IDENTITY_RULES} rather than cast: this value
+ * decides which beads get MUTATED, so anything the emitter did not write — a hand-edited metadata blob, a plan from a future
  * anton that added a move — must read as "no readable plan" and stop the apply, not fall through to
  * a default branch.
  *
@@ -708,9 +733,15 @@ export function readGardenerPlan(value: unknown): PlanRead {
   const read = readPlanFields(raw);
   if ("rejected" in read) return read;
 
+  for (const rule of PLAN_RULES) {
+    const reason = rule.violation(read.plan);
+    if (reason) return { rejected: { field: rule.field, reason } };
+  }
+
   const { kind, subjects, target, detail, fingerprint } = read.plan;
   const form = identityForm(kind, subjects, target, detail, fingerprint);
-  for (const rule of PLAN_RULES) {
+  if (!form) return { rejected: { field: "fingerprint", reason: FINGERPRINT_UNBOUND } };
+  for (const rule of IDENTITY_RULES) {
     const reason = rule.violation(read.plan, form);
     if (reason) return { rejected: { field: rule.field, reason } };
   }
@@ -786,7 +817,7 @@ function retireViolation(plan: GardenerPlan): string | undefined {
  * membership itself, so the list is already bound, and requiring a field the older emitter never
  * wrote would strand exactly the proposals {@link identityForm} exists to keep readable.
  */
-function checksumViolation(plan: GardenerPlan, form: IdentityForm | undefined): string | undefined {
+function checksumViolation(plan: GardenerPlan, form: IdentityForm): string | undefined {
   const expected = subjectChecksum(plan.kind, plan.subjects, plan.target, plan.detail);
   const carried = plan.subjectChecksum;
   if (expected === undefined) {
@@ -801,19 +832,42 @@ function checksumViolation(plan: GardenerPlan, form: IdentityForm | undefined): 
 }
 
 /**
- * The move a PROPOSAL BEAD carries, if it carries a readable one. The plan has already been checked
- * against ITSELF ({@link parseGardenerPlan} recomputes the fingerprint from the fields it parsed);
+ * The move a PROPOSAL BEAD carries, or which field refused it. The plan has already been checked
+ * against ITSELF ({@link readGardenerPlan} recomputes the fingerprint from the fields it parsed);
  * what this adds is the bead's own label, the third record of the same claim. A mismatch anywhere
  * means the bead was assembled by something other than the emitter — which is exactly when applying
  * it blind is worst.
+ *
+ * This is the read the APPLY takes, so the field a refusal names reaches the operator holding the
+ * unappliable proposal ({@link describePlanRejection}) rather than only a direct caller of the
+ * parse: a proposal that will never apply is one a human has to fix by hand, and "which field" is
+ * the whole of what they need.
+ */
+export function readProposalPlan(bead: {
+  labels?: string[];
+  metadata?: Record<string, unknown>;
+}): PlanRead {
+  const read = readGardenerPlan(bead.metadata?.[GARDENER_PLAN_KEY]);
+  if ("rejected" in read) return read;
+  return fingerprintLabelOf(bead) === read.plan.fingerprint
+    ? read
+    : { rejected: { field: "fingerprint", reason: "is not the one the bead is labelled with" } };
+}
+
+/**
+ * The same read for every caller that only decides WHETHER a bead carries a move — suppression,
+ * counting, the views. {@link readProposalPlan} is it with the refusal's field kept.
  */
 export function proposalPlanOf(bead: { labels?: string[]; metadata?: Record<string, unknown> }):
   | GardenerPlan
   | undefined {
-  const plan = parseGardenerPlan(bead.metadata?.[GARDENER_PLAN_KEY]);
-  if (!plan) return undefined;
-  return fingerprintLabelOf(bead) === plan.fingerprint ? plan : undefined;
+  const read = readProposalPlan(bead);
+  return "plan" in read ? read.plan : undefined;
 }
+
+/** The refusal as one clause, for a message that has to tell a human which field to go look at. */
+export const describePlanRejection = ({ field, reason }: PlanRejection): string =>
+  `${field} ${reason}`;
 
 /**
  * The fingerprint this proposal's own plan hashes to TODAY, whatever label the bead carries — or

@@ -13,10 +13,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  describePlanRejection,
   makeDetection,
   parseGardenerPlan,
   planOf,
   readGardenerPlan,
+  readProposalPlan,
   type GardenerPlan,
   type PlanRejection,
 } from "./detections";
@@ -181,5 +183,47 @@ describe("the reason, which is what the field spec buys", () => {
 
   it("distinguishes a fingerprint's FORMAT from a fingerprint that no longer hashes its fields", () => {
     expect(rejection({ ...ORPHAN, subjects: ["anton-zzz"] }).reason).toMatch(/does not hash/);
+  });
+});
+
+/**
+ * The refusal has to survive the read the APPLY takes, not just the parse: every production path
+ * reaches a proposal bead through {@link readProposalPlan}, so a field that rots is only diagnosable
+ * if the field's name gets that far ({@link applyProposal} puts it in the message the operator sees).
+ */
+describe("the read a proposal bead is applied through keeps the field", () => {
+  const beadFor = (plan: GardenerPlan, labels = [plan.fingerprint]) => ({
+    labels,
+    metadata: { gardener: plan },
+  });
+
+  it("reads the plan back off the bead the emitter filed", () => {
+    expect(readProposalPlan(beadFor(CLUSTER))).toEqual({ plan: CLUSTER });
+  });
+
+  it("names the field a rotted plan failed on rather than reducing it to nothing", () => {
+    const edited = { ...STALE, retireAs: "close" };
+    expect(readProposalPlan(beadFor(edited as GardenerPlan))).toEqual({
+      rejected: { field: "retireAs", reason: expect.stringMatching(/retires as defer/) },
+    });
+  });
+
+  // The bead's own label is the third record of the claim, and disagreeing with it is a rejection
+  // like any other — not a silently different failure mode.
+  it("refuses a plan the bead's label does not answer for, naming the fingerprint", () => {
+    const read = readProposalPlan(beadFor(ORPHAN, [CLUSTER.fingerprint]));
+    expect("rejected" in read && read.rejected.field).toBe("fingerprint");
+  });
+
+  it("has no plan to read when the bead carries no metadata at all", () => {
+    expect(readProposalPlan({ labels: [ORPHAN.fingerprint] })).toEqual({
+      rejected: { field: "(plan)", reason: "is not an object" },
+    });
+  });
+
+  it("reads as one clause a message can carry", () => {
+    expect(describePlanRejection(rejection(without(STALE, "retireAs")))).toMatch(
+      /^retireAs .*no default verb/,
+    );
   });
 });
