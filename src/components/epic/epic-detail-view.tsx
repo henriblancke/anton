@@ -17,7 +17,7 @@ import { CopyButton } from "@/components/ui/copy-button";
 import { TYPE_LABELS, agentDotClass, ticketProgress } from "@/components/board/board-utils";
 import { AbandonedChip, MetaChip, RelativeTime, RiskChip, StagePill } from "@/components/atoms";
 import { ClaimControl } from "@/components/board/claim-control";
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastApprovalOutcome } from "@/components/board/contract-advisory";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { EpicBadge } from "@/components/board/epic-badge";
 import { PrLinkControl } from "@/components/board/pr-link-control";
@@ -216,15 +216,16 @@ export function EpicDetailView({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Run failed (${res.status})`);
       }
-      toast.success(
-        opts.force
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here.
+      await toastApprovalOutcome(res, {
+        started: opts.force
           ? `Re-running "${title}"`
           : immediate
             ? `Run started for "${title}"`
             : `Queued "${title}" for optimal usage`,
-      );
-      // The run starts with whatever thin sections it has; say so once, here.
-      await toastContractAdvisory(res);
+        title,
+      });
       setAttempt((n) => n + 1);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start run");

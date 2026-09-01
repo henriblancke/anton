@@ -6,12 +6,17 @@
  * The approve route refuses a BLOCKING gap and reports the advisory ones in its 200 body: the run is
  * starting despite them, so they cost quality, not runnability. Nothing else surfaces them at that
  * moment — the board chip is behind on the card the operator just left — so every surface that
- * starts a run reads the body here and says it once, next to its own success toast.
+ * starts a run reads the body here and says it once.
  *
  * The run's human gates ride the same body and the same call (anton-qfso.2). They cost the operator
  * their own time rather than the run's quality, so they get their own toast — but one entry point
  * owns the read, because a Response body can only be consumed once and "says it once" must hold for
  * a surface that was written before either advisory existed.
+ *
+ * That entry point owns the SUCCESS toast too (PR #214 review). A surface that phrases its own
+ * "…& running" before this read announces a run for a target anton hands straight back, and the
+ * notice below would then contradict a message the operator has already read. Every surface passes
+ * the line it would show for a run that starts and lets the response decide whether it is true.
  */
 import { toast } from "sonner";
 
@@ -39,38 +44,49 @@ function linesOf(field: unknown): string[] {
   return Array.isArray(field) ? field.filter((l): l is string => typeof l === "string") : [];
 }
 
+/** What an accepted approve is announced as, before the response gets a say in it. */
+export interface ApprovalOutcome {
+  /** This surface's own wording for the run it just started — used unless no run starts. */
+  started: string;
+  /** The target's title, for the line that stands in for {@link ApprovalOutcome.started}. */
+  title: string;
+}
+
 /**
- * Surface what the approve/run POST reported about the run it just started, if anything. Consumes
- * the response body, so callers pass a response they've already accepted as ok. Silent on a
+ * Announce an accepted approve: what it did, then what it costs. Consumes the response body, so
+ * callers pass a response they've already accepted as ok. Beyond the success line it is silent on a
  * conformant target with no human work (the common case) and on a body that carries neither — a run
- * must never be held up by its own reporting, so a malformed payload is simply nothing to say.
+ * must never be held up by its own reporting, so a malformed payload is simply nothing to add.
  *
  * NEVER throws, which is what lets every caller await it inside the `try` that wraps its approve.
  * The approval has already landed by the time this runs; a failure here rethrown into that `try`
  * would roll the optimistic state back and toast an error for work that actually succeeded.
  */
-export async function toastContractAdvisory(res: Response): Promise<void> {
+export async function toastApprovalOutcome(res: Response, outcome: ApprovalOutcome): Promise<void> {
   try {
-    toastAdvisoryGaps(await res.json().catch(() => null));
+    reportApprovalOutcome(await res.json().catch(() => null), outcome);
   } catch (err) {
-    console.error("[contract-advisory] failed to read advisory gaps", err);
+    console.error("[contract-advisory] failed to read the approve response", err);
   }
 }
 
 /**
  * The same report, for a caller that has ALREADY read the body — a response body can only be
  * consumed once, and a surface that inspects the 200 payload before deciding the run really started
- * (`release-action.tsx`, which reads `jobId`) has nothing left to hand {@link toastContractAdvisory}.
+ * (`release-action.tsx`, which reads `jobId`) has nothing left to hand {@link toastApprovalOutcome}.
  *
  * NEVER throws, for the same reason as above.
  */
-export function toastAdvisoryGaps(body: unknown): void {
+export function reportApprovalOutcome(body: unknown, outcome: ApprovalOutcome): void {
   try {
+    const humanTarget = humanTargetOf(body);
+    // The success line first: it is the answer to the click, and the notices below qualify it.
+    toast.success(humanTarget ? `Approved "${outcome.title}" — no run starts` : outcome.started);
     warnSpecGaps(gapsOf(body));
-    if (humanTargetOf(body)) noteHumanTarget();
+    if (humanTarget) noteHumanTarget();
     else warnHumanGates(humanGatesOf(body));
   } catch (err) {
-    console.error("[contract-advisory] failed to surface advisory gaps", err);
+    console.error("[contract-advisory] failed to surface the approve outcome", err);
   }
 }
 

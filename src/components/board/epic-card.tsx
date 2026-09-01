@@ -21,7 +21,7 @@ import {
   ticketProgress,
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastApprovalOutcome } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { ProvenanceBadges } from "@/components/board/provenance-badge";
@@ -147,11 +147,14 @@ function EpicCardBody({
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
       decision.settle();
-      toast.success(
-        immediate ? `Approved & running "${epic.title}"` : `Queued "${epic.title}" for optimal usage`,
-      );
-      // The run starts with whatever thin sections it has; say so once, here.
-      await toastContractAdvisory(res);
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here.
+      await toastApprovalOutcome(res, {
+        started: immediate
+          ? `Approved & running "${epic.title}"`
+          : `Queued "${epic.title}" for optimal usage`,
+        title: epic.title,
+      });
     } catch (err) {
       // Nothing was approved, so the pick goes back on offer — including to the vetoes.
       decision.abandon();
