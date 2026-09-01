@@ -26,7 +26,9 @@ import {
   HUMAN_GATE_ARMED_LABEL,
   NeedsHumanError,
   orderTickets,
+  reopenAbsorbedTimeouts,
   reopenableAfterStop,
+  type ReopenBoard,
   ParkedAskError,
   reviewParkMessage,
   runReadiness,
@@ -37,9 +39,19 @@ import {
   ticketBlockNote,
   ticketSetDrift,
 } from "./execute-epic";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
 import type { ResolvedStep } from "./run-formula";
+
+/** A promise the test resolves by hand, to hold a lock open across a deliberate interleave. */
+function defer(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;
@@ -1138,5 +1150,147 @@ describe("reopenableAfterStop — whose timed-out ticket is it now (PR #199 revi
 
   it("writes nothing to a ticket already back at `open`", () => {
     expect(reopenableAfterStop(stalled({ status: "open" }))).toBe(false);
+  });
+});
+
+describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock (PR #199 review)", () => {
+  /** A fresh repo path per case: the lock's chain map is process-wide, so keys are what isolates. */
+  let repos = 0;
+  const repo = () => `/tmp/reopen-timeouts-${++repos}`;
+
+  /** The board as a mutable row, so a competing claim and the reopen contend over ONE state. */
+  function board(initial: Partial<Bead> = {}) {
+    let row = {
+      id: "t1",
+      title: "t1",
+      status: "blocked",
+      labels: ["not-delivered"],
+      ...initial,
+    } as Bead;
+    return {
+      get current() {
+        return row;
+      },
+      show: async () => row,
+      setStatus: async (_cwd: string, _id: string, status: string) => {
+        row = { ...row, status } as Bead;
+      },
+      claim: (actor: string) => {
+        row = { ...row, status: "in_progress", assignee: actor } as Bead;
+      },
+    };
+  }
+
+  /** Drain the queue, so "did it read yet?" is answered after everything that could have run. */
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it("reopens a rolled-back timeout and leaves a committed one blocked", async () => {
+    const bd = board();
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], bd);
+    expect(bd.current.status).toBe("open");
+
+    const committed = board();
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: true }], committed);
+    expect(committed.current.status).toBe("blocked");
+  });
+
+  it("holds the lock across the read, so a claim cannot land between predicate and write", async () => {
+    // The race this closes: a concurrent claim (another run's claim gate, an operator's Claim) that
+    // arrives after the ticket reads as reopenable. Unserialized, the unconditional `open` below
+    // would knock that freshly-claimed bead back into `bd ready` while its agent runs.
+    const path = repo();
+    const bd = board();
+    const reading = defer(); // the reopen has entered its re-read
+    const release = defer(); // …and is held there until the competing claim has been attempted
+
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+      show: async () => {
+        reading.resolve();
+        await release.promise;
+        return bd.show();
+      },
+      setStatus: bd.setStatus,
+    });
+
+    await reading.promise;
+    let claimed = false;
+    const claim = withBeadWriteLock(path, "t1", async () => {
+      bd.claim("someone@else");
+      claimed = true;
+    });
+    await settle();
+    expect(claimed).toBe(false); // queued on the bead's chain, not landing mid-sequence
+
+    release.resolve();
+    await Promise.all([reopen, claim]);
+
+    // The reopen finished on the ticket it read; the claim then took the ticket it left at `open`.
+    expect(bd.current.status).toBe("in_progress");
+    expect(bd.current.assignee).toBe("someone@else");
+  });
+
+  it("sees a claim taken before its turn and writes nothing", async () => {
+    // The other order on the same chain: the claim wins, and the reopen's re-read — taken INSIDE
+    // the lock, so it cannot be stale — finds an owner and leaves the ticket alone.
+    const path = repo();
+    const bd = board();
+    const held = defer();
+    const writes: string[] = [];
+    // Hold the ticket's lock so the claim is guaranteed to reach the chain before the reopen does.
+    const gate = withBeadWriteLock(path, "t1", () => held.promise);
+    const claim = withBeadWriteLock(path, "t1", async () => {
+      bd.claim("someone@else");
+    });
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+      show: bd.show,
+      setStatus: async (cwd, id, status) => {
+        writes.push(status);
+        return bd.setStatus(cwd, id, status);
+      },
+    });
+
+    held.resolve();
+    await Promise.all([gate, claim, reopen]);
+
+    expect(writes).toEqual([]);
+    expect(bd.current.status).toBe("in_progress");
+    expect(bd.current.assignee).toBe("someone@else");
+  });
+
+  it("takes the lock before it reads, so the predicate can never be decided outside it", async () => {
+    const path = repo();
+    const bd = board();
+    const held = defer();
+    let read = false;
+    const gate = withBeadWriteLock(path, "t1", () => held.promise);
+
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+      show: async () => {
+        read = true;
+        return bd.show();
+      },
+      setStatus: bd.setStatus,
+    } as ReopenBoard);
+
+    await settle();
+    expect(read).toBe(false); // still queued — nothing has been decided yet
+
+    held.resolve();
+    await Promise.all([gate, reopen]);
+    expect(read).toBe(true);
+    expect(bd.current.status).toBe("open");
+  });
+
+  it("leaves the ticket as it stands when the re-read fails, and never throws", async () => {
+    const bd = board();
+    await expect(
+      reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], {
+        show: async () => {
+          throw new Error("bd unavailable");
+        },
+        setStatus: bd.setStatus,
+      } as ReopenBoard),
+    ).resolves.toBeUndefined();
+    expect(bd.current.status).toBe("blocked");
   });
 });

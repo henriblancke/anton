@@ -1992,39 +1992,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // here leaves the ticket `blocked` with nothing said anywhere, so the resume the park promises
       // dies on its first step for a reason nobody can see. A refusal that outlives the retries is
       // logged with its repair, the escalation every other must-land write on this seam makes.
-      if (!ctx.signal.aborted) {
-        for (const stalled of timedOut.filter((t) => !t.committed)) {
-          // Decided on a read taken HERE, not on the ledger (PR #199 review) — see
-          // {@link reopenableAfterStop} for the state that read has to still find.
-          const live = await beads.show(repo, stalled.id).catch(() => undefined);
-          // A read that failed is not evidence the ticket is still ours, and a reopen written on
-          // that silence is the very overwrite this guard exists to prevent — so it takes the same
-          // escalation as a refused write: left as it stands, with the repair named.
-          if (!live) {
-            console.error(
-              `[execute-epic] ${epicBeadId}: could not re-read ${stalled.id} to reopen it, so its ` +
-                `status stands — if it is still \`blocked\`, runTicket's claim gate refuses it and ` +
-                `the resume this run advertises dies on it. Check it by hand: bd show ${stalled.id}`,
-            );
-            continue;
-          }
-          if (!reopenableAfterStop(live)) {
-            console.warn(
-              `[execute-epic] ${epicBeadId}: left ${stalled.id} as it stands (status ` +
-                `${live.status}${ownerOf(live) ? `, held by ${ownerOf(live)}` : ""}) — it moved on ` +
-                `from the timeout this run recorded, so reopening it is not this run's call`,
-            );
-            continue;
-          }
-          if (!(await mustPersist(() => beads.setStatus(repo, stalled.id, "open")))) {
-            console.error(
-              `[execute-epic] ${epicBeadId}: could not reopen ${stalled.id} — it stays \`blocked\`, ` +
-                `which runTicket's claim gate refuses, so the resume this run advertises would die ` +
-                `on it. Clear it by hand: bd update ${stalled.id} --status open`,
-            );
-          }
-        }
-      }
+      if (!ctx.signal.aborted) await reopenAbsorbedTimeouts(repo, epicBeadId, timedOut);
       // Resolved HERE — after the release awaits, immediately before the settle that would arm the
       // gate — so a kill landing mid-unwind still converts (anton-287p). Nothing above this line
       // branches on the distinction (the release runs the same for either error), so the late read
@@ -4515,6 +4483,76 @@ export function reopenableAfterStop(b: Bead): boolean {
     ownerOf(b) === undefined &&
     (b.status === "blocked" || b.status === "in_progress")
   );
+}
+
+/**
+ * The bd surface {@link reopenAbsorbedTimeouts} decides and writes through, declared structurally
+ * (like claim.ts's `AssigneeStore`) so tests can drive the sequence without a real board.
+ */
+export interface ReopenBoard {
+  show: (cwd: string, id: string) => Promise<Bead>;
+  setStatus: (cwd: string, id: string, status: string) => Promise<unknown>;
+}
+
+/**
+ * Put the ROLLED-BACK timeouts a stopping run absorbed back at `open`, each decided and written
+ * under that ticket's OWN write lock (PR #199 review).
+ *
+ * {@link reopenableAfterStop} is what makes the write safe, but a predicate read that nothing
+ * serializes only says the bead was ours a moment ago. Another run's claim gate
+ * ({@link beads.claimVerified}) and an operator's Claim both write on the per-bead chain in
+ * beads/claim-lock, so either could land between the read and this unconditional `open` and knock a
+ * freshly-claimed `in_progress` ticket back into `bd ready` while its agent runs. Holding the lock
+ * across both makes the two orders real: the claim wins and the locked re-read sees its owner, or it
+ * queues behind this and finds `open`. Ordering is process-local by construction (see claim-lock);
+ * the cross-machine half is anton-od4, which is why the predicate stays either way.
+ *
+ * Nothing inside may take that lock again, on pain of deadlock — `show`/`setStatus` are bare bd
+ * spawns, unlike claimVerified and the claim CAS.
+ *
+ * Never throws: this runs on the stopping path, where one refused bd write must not hide the run's
+ * own error. Every refusal is logged with the repair instead.
+ */
+export async function reopenAbsorbedTimeouts(
+  repo: string,
+  epicBeadId: string,
+  timedOut: readonly TicketTimeoutOutcome[],
+  board: ReopenBoard = beads,
+): Promise<void> {
+  for (const stalled of timedOut.filter((t) => !t.committed)) {
+    await withBeadWriteLock(repo, stalled.id, async () => {
+      // Decided on a read taken HERE, not on the ledger (PR #199 review).
+      const live = await board.show(repo, stalled.id).catch(() => undefined);
+      // A read that failed is not evidence the ticket is still ours, and a reopen written on that
+      // silence is the very overwrite this guard exists to prevent — so it takes the same escalation
+      // as a refused write: left as it stands, with the repair named.
+      if (!live) {
+        console.error(
+          `[execute-epic] ${epicBeadId}: could not re-read ${stalled.id} to reopen it, so its ` +
+            `status stands — if it is still \`blocked\`, runTicket's claim gate refuses it and ` +
+            `the resume this run advertises dies on it. Check it by hand: bd show ${stalled.id}`,
+        );
+        return;
+      }
+      if (!reopenableAfterStop(live)) {
+        console.warn(
+          `[execute-epic] ${epicBeadId}: left ${stalled.id} as it stands (status ` +
+            `${live.status}${ownerOf(live) ? `, held by ${ownerOf(live)}` : ""}) — it moved on ` +
+            `from the timeout this run recorded, so reopening it is not this run's call`,
+        );
+        return;
+      }
+      // The retries stay INSIDE the lock: a window reopened between attempts is the same window the
+      // lock exists to close, and a claim can only land in it if we let go.
+      if (!(await mustPersist(() => board.setStatus(repo, stalled.id, "open")))) {
+        console.error(
+          `[execute-epic] ${epicBeadId}: could not reopen ${stalled.id} — it stays \`blocked\`, ` +
+            `which runTicket's claim gate refuses, so the resume this run advertises would die ` +
+            `on it. Clear it by hand: bd update ${stalled.id} --status open`,
+        );
+      }
+    });
+  }
 }
 
 /**
