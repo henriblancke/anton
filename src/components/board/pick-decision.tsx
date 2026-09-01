@@ -31,8 +31,9 @@ export type PickDecision = {
   /** `open` — answerable. `deciding` — a write is out. `settled` — this pick has its answer. */
   state: "open" | "deciding" | "settled";
   /**
-   * The plan generation this pick was displayed from, when it came from a recorded plan. Undefined
-   * outside a provider: a Backlog card is not a pick, so its approve answers no decision.
+   * The plan generation this pick was displayed from, when it came from a recorded plan — from the
+   * pick's own provider, or failing that from the surface's ({@link PlanGenerationProvider}).
+   * Undefined under neither: a Backlog card is not a pick, so its approve answers no decision.
    */
   planId?: string;
   /** Take the pick synchronously; `false` means another control already holds or settled it. */
@@ -51,6 +52,32 @@ const OPEN: PickDecision = {
 };
 
 const PickDecisionContext = createContext<PickDecision>(OPEN);
+
+/** The plan generation on screen, for surfaces that render picks without a per-pick provider. */
+const PlanGenerationContext = createContext<string | undefined>(undefined);
+
+/**
+ * The generation the cards below were drawn from, where the picks are NOT rows of the lane (PR #212
+ * review).
+ *
+ * The epic swimlanes are that surface: Up Next is a column position, so grouping by epic leaves the
+ * picks in their epic's Backlog slice — still marked, still offering `[Release]`, but with no lane
+ * row to carry the generation. Without one the server resolves the accept against whatever plan is
+ * current, so a later pass that re-picked the bead would be credited with an agreement to a pick the
+ * operator never saw.
+ *
+ * The GENERATION only, never the lock. The lock is per pick (see {@link PickDecisionProvider}); one
+ * spanning a whole board would let answering one card freeze every other.
+ */
+export function PlanGenerationProvider({
+  planId,
+  children,
+}: {
+  planId?: string;
+  children: React.ReactNode;
+}) {
+  return <PlanGenerationContext.Provider value={planId}>{children}</PlanGenerationContext.Provider>;
+}
 
 export function PickDecisionProvider({
   planId,
@@ -84,5 +111,15 @@ export function PickDecisionProvider({
 }
 
 export function usePickDecision(): PickDecision {
-  return useContext(PickDecisionContext);
+  const decision = useContext(PickDecisionContext);
+  // A per-pick provider names its own generation; anything else falls back to the one the surface is
+  // showing, so a control outside the lane still answers the decision it was drawn from.
+  const generation = useContext(PlanGenerationContext);
+  return useMemo(
+    () =>
+      decision.planId !== undefined || generation === undefined
+        ? decision
+        : { ...decision, planId: generation },
+    [decision, generation],
+  );
 }

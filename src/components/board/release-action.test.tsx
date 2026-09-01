@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ReleaseAction } from "@/components/board/release-action";
-import { PickDecisionProvider } from "@/components/board/pick-decision";
+import { PickDecisionProvider, PlanGenerationProvider } from "@/components/board/pick-decision";
 
 const refresh = vi.fn();
 const success = vi.fn();
@@ -75,6 +75,49 @@ describe("releasing one pick", () => {
       <PickDecisionProvider planId="plan-a">
         <ReleaseAction slug="anton" beadId="anton-a" title="Resumable crawl checkpoints" />
       </PickDecisionProvider>,
+    );
+
+    release();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ release: true, immediate: true, planId: "plan-a" }),
+      }),
+    );
+  });
+
+  it("names the generation the SURFACE carries when the pick has no row of its own", async () => {
+    // The epic swimlanes render picks in their epic's Backlog slice, with no lane row to hold the
+    // generation. Without the surface's own the accept would be resolved from whatever plan is
+    // current by then — a decision the operator never saw (PR #212 review).
+    const fetchMock = stubFetch({ jobId: "job-1" });
+    render(
+      <PlanGenerationProvider planId="plan-a">
+        <ReleaseAction slug="anton" beadId="anton-a" title="Resumable crawl checkpoints" />
+      </PlanGenerationProvider>,
+    );
+
+    release();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ release: true, immediate: true, planId: "plan-a" }),
+      }),
+    );
+  });
+
+  it("keeps the pick's OWN generation when it has one, over the surface's", async () => {
+    // A lane row names the decision it drew; a surface further out may already be showing a newer
+    // plan. The nearer answer is the one the operator looked at.
+    const fetchMock = stubFetch({ jobId: "job-1" });
+    render(
+      <PlanGenerationProvider planId="plan-b">
+        <PickDecisionProvider planId="plan-a">
+          <ReleaseAction slug="anton" beadId="anton-a" title="Resumable crawl checkpoints" />
+        </PickDecisionProvider>
+      </PlanGenerationProvider>,
     );
 
     release();

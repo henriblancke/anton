@@ -225,6 +225,36 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect((await verdictsFor(epic)).map((r) => r.verdict)).toEqual(["accepted"]);
   });
 
+  it("withdraws the reserved accept when nothing ends up running the target", async () => {
+    // The release answers its pick BEFORE it enqueues, so a veto from another tab cannot land in the
+    // window the run start would otherwise hold open (PR #212 review). The price of reserving early
+    // is a run that never follows: this take-over of a BLOCKED target deliberately enqueues nothing,
+    // and an accept for a run that never started is evidence of nothing — so the reservation comes
+    // back out, leaving the record exactly as an unreleased pick's.
+    const blocker = await beads.create(repo, {
+      title: "Reservation blocker",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+    const target = await beads.create(repo, {
+      title: "Reserved but never run",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+    await beads.link(repo, target, blocker, "blocks");
+    await beads.assign(repo, target, "someone-else");
+    await beads.approve(repo, target);
+    await planFor(target);
+
+    actAs("anton-test");
+    const res = await approve(target, { release: true, steal: true });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { jobId?: string }).jobId).toBeUndefined();
+    expect(await executeEpicJobs(target)).toHaveLength(0);
+
+    expect(await verdictsFor(target)).toHaveLength(0);
+  });
+
   it("leaves an ordinary approve unrecorded — only a release answers the picker", async () => {
     actAs("anton-test");
     const epic = await runTarget("Plain approve");

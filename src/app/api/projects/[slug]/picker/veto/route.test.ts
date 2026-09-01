@@ -180,7 +180,7 @@ describe("POST /picker/veto", () => {
         beadId: "anton-a",
         planId: current,
       }),
-    ).toBeUndefined();
+    ).toMatchObject({ recorded: true });
   });
 
   it("records no pick when the veto names no generation at all", async () => {

@@ -250,6 +250,11 @@ export async function recordPickerVeto(
 /** Why an accept recorded nothing: the same pick was vetoed, or already accepted. */
 export type PickerAcceptRefusal = "vetoed" | "duplicate";
 
+/** What an accept did: the row it filed (so its writer can take it back), or why it filed none. */
+export type PickerAcceptOutcome =
+  | { recorded: true; id: string }
+  | { recorded: false; reason: PickerAcceptRefusal };
+
 /**
  * Record an accept: the operator RELEASED this pick, so anton's choice became a run (anton-d2h6).
  *
@@ -273,19 +278,26 @@ export type PickerAcceptRefusal = "vetoed" | "duplicate";
  * still in flight; this one holds the write lock, so the two verdicts cannot both land. The run is
  * NOT refused with it — the operator asked for it and approve is approve — only the evidence is,
  * which is the half that has to stay consistent.
+ *
+ * The row's id rides back on success so the caller can WITHDRAW it (see {@link withdrawPickerAccept}).
+ * The release reserves its answer before it starts the run — that is what keeps a veto from landing
+ * in between — so it needs a way to take the reservation back when no run follows it.
  */
 export async function recordPickerAccept(
   db: AntonDb,
   clock: Clock,
   input: RecordAcceptInput,
-): Promise<PickerAcceptRefusal | undefined> {
+): Promise<PickerAcceptOutcome> {
   return db.transaction(
     (tx) => {
-      if (pickAlreadyAnswered(tx, input, "declined")) return "vetoed" as const;
+      if (pickAlreadyAnswered(tx, input, "declined")) {
+        return { recorded: false, reason: "vetoed" } as const;
+      }
+      const id = randomUUID();
       const written = tx
         .insert(schema.pickerVerdicts)
         .values({
-          id: randomUUID(),
+          id,
           projectId: input.projectId,
           beadId: input.beadId,
           verdict: "accepted",
@@ -299,10 +311,26 @@ export async function recordPickerAccept(
         })
         .onConflictDoNothing()
         .run();
-      return written.changes > 0 ? undefined : ("duplicate" as const);
+      return written.changes > 0
+        ? ({ recorded: true, id } as const)
+        : ({ recorded: false, reason: "duplicate" } as const);
     },
     { behavior: "immediate" },
   );
+}
+
+/**
+ * Take back an accept whose run never followed it (PR #212 review).
+ *
+ * The release RESERVES its answer before it enqueues, so a veto racing it cannot slip in between the
+ * run starting and the decision being settled. The cost of reserving early is that the run may still
+ * fail to start — and an accept for a run that never started is evidence of nothing. So the reserver
+ * compensates: it deletes the row it wrote, by id, and only ever that one. A veto that lost the race
+ * meanwhile stays lost, which is the honest outcome — it was answered, and the answer was withdrawn,
+ * not overturned.
+ */
+export async function withdrawPickerAccept(db: AntonDb, id: string): Promise<void> {
+  await db.delete(schema.pickerVerdicts).where(eq(schema.pickerVerdicts.id, id));
 }
 
 /**

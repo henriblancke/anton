@@ -16,6 +16,7 @@ import {
   pickerTrackRecord,
   recordPickerAccept,
   recordPickerVeto,
+  withdrawPickerAccept,
 } from "./picker-veto";
 import type { Clock } from "./jobs/queue";
 
@@ -330,6 +331,43 @@ describe("recording an accept", () => {
 });
 
 /**
+ * WITHDRAWING A RESERVED ACCEPT (PR #212 review). The release answers its pick BEFORE it enqueues, so
+ * a veto cannot land in the window the run start would otherwise hold open — and the price is a run
+ * that then fails to start, which must leave no accept behind.
+ */
+describe("withdrawing an accept", () => {
+  const PICK = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+
+  it("takes back exactly the row it reserved, leaving the pick answerable again", async () => {
+    const outcome = await recordPickerAccept(test.db, clock, PICK);
+    expect(outcome.recorded).toBe(true);
+
+    await withdrawPickerAccept(test.db, outcome.recorded ? outcome.id : "");
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: 0,
+      declined: 0,
+      settled: 0,
+    });
+    // The evidence is gone, so the pick takes an answer again — the reservation was withdrawn, not
+    // converted into a decline.
+    expect(await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" })).toMatchObject({
+      recorded: true,
+    });
+  });
+
+  it("leaves every other verdict alone", async () => {
+    const kept = await recordPickerAccept(test.db, clock, { ...PICK, beadId: "anton-b" });
+    const dropped = await recordPickerAccept(test.db, clock, PICK);
+
+    await withdrawPickerAccept(test.db, dropped.recorded ? dropped.id : "");
+
+    expect((await listPickerVerdicts(test.db, PROJECT)).map((r) => r.beadId)).toEqual(["anton-b"]);
+    expect(kept.recorded).toBe(true);
+  });
+});
+
+/**
  * ONE ANSWER PER PICK (PR #212 review). The accept and the decline come from two different routes,
  * so a pick open in two tabs can be released and vetoed at once — and only the store can decide that,
  * because no client-side lock spans two tabs. What these pin is the shape of the refusal: first
@@ -352,7 +390,10 @@ describe("opposite verdicts on one pick", () => {
   it("refuses an accept of a pick a veto already declined, and keeps the hold", async () => {
     await recordPickerVeto(test.db, clock, { ...PICK, action: "never" });
 
-    expect(await recordPickerAccept(test.db, clock, PICK)).toBe("vetoed");
+    expect(await recordPickerAccept(test.db, clock, PICK)).toEqual({
+      recorded: false,
+      reason: "vetoed",
+    });
 
     expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 0, declined: 1 });
     expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(1);

@@ -14,7 +14,7 @@ import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
-import { activeDeferrals, recordPickerAccept } from "@/lib/picker-veto";
+import { activeDeferrals, recordPickerAccept, withdrawPickerAccept } from "@/lib/picker-veto";
 import { getProjectSettings, resolvePickerPolicy } from "@/lib/projects";
 import { isScheduleEnabled } from "@/lib/schedules";
 import type { ApprovalRunOutcome, Project } from "@/lib/types";
@@ -45,7 +45,7 @@ export const dynamic = "force-dynamic";
  * blocker check, auto-claim and enqueue — and only adds what release MEANS that approve does not: the
  * target was anton's pick and the operator agreed with it, so the choice is recorded as an accept.
  * The flag ASKS for that record; whether the target really was a live pick is re-derived server-side
- * (see {@link recordRelease}), because a client cannot be the witness to its own evidence.
+ * (see {@link reserveRelease}), because a client cannot be the witness to its own evidence.
  *
  * `planId` rides with it: the plan GENERATION the operator was looking at, exactly as the veto route
  * takes one (PR #212 review). The client is not trusted to say the target was a pick, but it IS the
@@ -106,21 +106,33 @@ async function readApprovalBody(request: Request): Promise<{
  * Judged against `board` — the pre-write snapshot this request already read — not a fresh one: the
  * approval's own label and claim would otherwise invalidate the very plan they are answering.
  *
- * Best-effort, like the enqueue it follows: the approval has landed and the run has started, so a
- * write to anton.db that falls over must not fail a release the operator already got. The accept is
- * evidence about the picker, never a gate on the run — which is also why every failure here fails
- * CLOSED, recording nothing rather than an accept it could not stand behind.
+ * RESERVED BEFORE THE RUN, not recorded after it (PR #212 review). The accept and the veto are the
+ * two answers to one pick, and only the store can settle which lands — so the release must take its
+ * answer before it enqueues, or a veto posted from another tab slips into the window the enqueue
+ * holds open and declines a pick whose run is already starting. Answering first collapses that
+ * window: the loser is told it lost by a decision that was already durable.
  *
- * The deferral read below is the cheap guard, not the decisive one: a veto posted from another tab
- * while this request was in flight is invisible to it. `recordPickerAccept` re-asks the question
- * holding the write lock, so at most one of the two verdicts ever lands on a pick (PR #212 review).
+ * The price of reserving early is a run that then fails to start, and an accept for a run that never
+ * started is evidence of nothing — so this hands back the row id and the caller withdraws it in
+ * exactly that case ({@link withdrawPickerAccept}).
+ *
+ * Best-effort, like the enqueue that follows it: the approval has already landed, so a write to
+ * anton.db that falls over must not fail a release the operator already got. The accept is evidence
+ * about the picker, never a gate on the run — which is also why every failure here fails CLOSED,
+ * recording nothing rather than an accept it could not stand behind.
+ *
+ * The deferral read below is the cheap guard, not the decisive one: a veto still being written is
+ * invisible to it. `recordPickerAccept` re-asks the question holding the write lock, so at most one
+ * of the two verdicts ever lands on a pick (PR #212 review).
+ *
+ * @returns the id of the accept this request filed, or undefined when it recorded nothing.
  */
-async function recordRelease(
+async function reserveRelease(
   projectId: string,
   beadId: string,
   board: Bead[],
   displayedPlanId?: string,
-): Promise<void> {
+): Promise<string | undefined> {
   try {
     const db = getDb();
     const [plan, armed, policy, deferrals] = await Promise.all([
@@ -129,8 +141,10 @@ async function recordRelease(
       getProjectSettings(db, projectId).then(resolvePickerPolicy),
       activeDeferrals(db, projectId, new Date()),
     ]);
-    const skip = (why: string) =>
-      void console.warn(`[approve] release of ${beadId} recorded no accept: ${why}`);
+    const skip = (why: string) => {
+      console.warn(`[approve] release of ${beadId} recorded no accept: ${why}`);
+      return undefined;
+    };
     const entry = plan?.entries.find((e) => e.beadId === beadId);
     if (!armed) return skip("the picker is disarmed");
     if (!plan || !entry) return skip("no recorded plan picks this target");
@@ -143,16 +157,24 @@ async function recordRelease(
     }
     // The store settles a veto that landed while this request was in flight — the deferral read above
     // cannot see one still being written — so ask it what happened rather than assume the accept did.
-    const refusal = await recordPickerAccept(db, systemClock, {
+    const outcome = await recordPickerAccept(db, systemClock, {
       projectId,
       beadId,
       ...(entry.rule ? { rule: entry.rule } : {}),
       rank: entry.rank,
       ...(plan.planId ? { planId: plan.planId } : {}),
     });
-    if (refusal === "vetoed") skip("the operator vetoed this pick first");
+    if (outcome.recorded) return outcome.id;
+    // A duplicate is the SAME accept restated (a double-click, a retry): the standing row is not this
+    // request's to withdraw, so it reports nothing reserved.
+    return skip(
+      outcome.reason === "vetoed"
+        ? "the operator vetoed this pick first"
+        : "this pick already carries the operator's accept",
+    );
   } catch (err) {
     console.error(`[approve] failed to record the picker accept for ${beadId}`, err);
+    return undefined;
   }
 }
 
@@ -550,6 +572,18 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
+  // A release is this approval plus its answer to the picker (anton-d2h6), and the answer is taken
+  // BEFORE the run rather than after it (PR #212 review). The accept and the veto are two answers to
+  // one decision, settled in the store under its write lock — so whichever the operator's other tab
+  // posts, it resolves against a verdict that is already durable instead of into the window the
+  // enqueue would otherwise hold open. Only a release that loses the CLAIM race records nothing at
+  // all, which is why this sits after the swap and not before it.
+  //
+  // The evidence rule is unchanged — no accept for a run that never started — and is now kept by
+  // withdrawing the reservation below rather than by waiting for the enqueue's verdict.
+  // Whether the target was a PICK at all is re-derived server-side, off the pre-write snapshot.
+  const acceptId = release ? await reserveRelease(project.id, epicId, allBeads, planId) : undefined;
+
   // Approval is the trigger: enqueue the autonomous execute-epic run (DESIGN.md §2/§7). Two paths:
   //
   // 1. A normal approval / re-approve (NOT a take-over) enqueues via the active-dedupe. This is the
@@ -607,14 +641,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
-  // A release is this approval plus its answer to the picker (anton-d2h6). Gated on a run actually
-  // covering the target: an accept for a run that never started would be evidence of nothing, and
-  // earned autonomy reads these counts to decide whether the picker may ever be armed. A run live on
-  // another machine counts — the operator accepted the pick and the work is running, which is what
-  // the accept records; only a failed or suppressed enqueue leaves nothing to answer for. Whether
-  // the target was a PICK at all is re-derived server-side, off this same pre-write snapshot.
-  if (release && (run === "started" || run === "elsewhere")) {
-    await recordRelease(project.id, epicId, allBeads, planId);
+  // No run, no accept: the reservation above is taken back when nothing ended up covering the
+  // target, because an accept for a run that never started would be evidence of nothing and earned
+  // autonomy reads these counts to decide whether the picker may ever be armed. A run live on
+  // another machine KEEPS it — the operator accepted the pick and the work is running, which is what
+  // the accept records; only a failed or suppressed enqueue leaves nothing to answer for.
+  if (acceptId && run !== "started" && run !== "elsewhere") {
+    await withdrawPickerAccept(getDb(), acceptId).catch((err: unknown) => {
+      console.error(`[approve] failed to withdraw the picker accept for ${epicId}`, err);
+    });
   }
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local

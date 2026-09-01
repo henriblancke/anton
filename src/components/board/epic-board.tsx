@@ -46,6 +46,7 @@ import {
 import { BoardFilters } from "@/components/board/board-filters";
 import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
+import { PlanGenerationProvider } from "@/components/board/pick-decision";
 import { UpNextLane } from "@/components/board/up-next-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
@@ -339,7 +340,9 @@ export function EpicBoard({
   // narrowed board so the lane obeys the same filters as everything else, and subtracted rather than
   // overlaid so no bead renders twice (R3.3). Only in the stage view: the lane is a column position
   // between Backlog and Implementing, and the epic swimlanes group by product rather than by stage —
-  // so there the cards stay in Backlog, where they still appear exactly once.
+  // so there the cards stay in Backlog, where they still appear exactly once. They are still PICKS
+  // there, mark and all, so the grouped view carries the plan's generation itself
+  // (`PlanGenerationProvider` below) rather than losing it with the lane.
   const upNext = useMemo(
     () =>
       takeUpNext(
@@ -696,18 +699,26 @@ export function EpicBoard({
               No cards to group yet
             </p>
           ) : (
-            <div className="flex flex-col divide-y divide-border">
-              {lanes.map((lane) => (
-                <EpicLaneView
-                  key={lane.epic?.id ?? "no-epic"}
-                  slug={slug}
-                  lane={lane}
-                  budgetAware={budgetAware}
-                  onEpicDeleted={handleEpicDeleted}
-                  onOpenTicket={setOpenTicketId}
-                />
-              ))}
-            </div>
+            // The picks stay in their epic's Backlog slice here — no lane, so no row to carry the
+            // generation they were drawn from. The surface carries it instead, or `[Release]` would
+            // post an unnamed accept the server resolves against whatever plan is current by then
+            // (PR #212 review).
+            <PlanGenerationProvider
+              {...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId })}
+            >
+              <div className="flex flex-col divide-y divide-border">
+                {lanes.map((lane) => (
+                  <EpicLaneView
+                    key={lane.epic?.id ?? "no-epic"}
+                    slug={slug}
+                    lane={lane}
+                    budgetAware={budgetAware}
+                    onEpicDeleted={handleEpicDeleted}
+                    onOpenTicket={setOpenTicketId}
+                  />
+                ))}
+              </div>
+            </PlanGenerationProvider>
           )}
         </div>
       ) : (
