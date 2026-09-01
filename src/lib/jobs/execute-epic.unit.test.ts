@@ -27,17 +27,33 @@ import {
   humanGateReason,
   HUMAN_GATE_ARMED_LABEL,
   NeedsHumanError,
+  orderTickets,
+  reopenAbsorbedTimeouts,
+  reopenableAfterStop,
+  type ReopenBoard,
   ParkedAskError,
   reviewParkMessage,
   runReadiness,
   runTargetDrift,
+  skipNote,
+  skippedDependents,
   splitFormulaPhases,
   ticketBlockNote,
   ticketSetDrift,
 } from "./execute-epic";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";
 import type { ResolvedStep } from "./run-formula";
+
+/** A promise the test resolves by hand, to hold a lock open across a deliberate interleave. */
+function defer(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 function ticket(id: string, labels?: string[]): Bead {
   return { id, title: id, status: "open", labels } as Bead;
@@ -211,6 +227,22 @@ describe("runReadiness — what a partially-gated run may start (anton-1two)", (
     const r = runReadiness(board, "F1", true);
     expect(r.runnable).toBe(true);
     expect(r.gated.sort()).toEqual(["t-2", "t-3"]);
+  });
+
+  it("holds a child gated cross-run even when its OTHER blocker is work this run does", () => {
+    // The premise of the held-tail/timeout overlap (anton-67xj): t-2 waits on t-9 in another feature
+    // AND on its own sibling t-1, so it lands in the HELD set and never enters the dispatch loop —
+    // which is why a timeout on t-1 has to be reconciled against the held tail, not just the loop.
+    const board = [
+      feature("F1"),
+      feature("F2"),
+      child("t-1", "F1"),
+      child("t-2", "F1", { dependencies: [blocks("t-2", "t-9"), blocks("t-2", "t-1")] }),
+      child("t-9", "F2"),
+    ];
+    const r = runReadiness(board, "F1", true);
+    expect(r.runnable).toBe(true);
+    expect(r.gated).toEqual(["t-2"]);
   });
 
   it("refuses the run only when NO child can start", () => {
@@ -458,6 +490,123 @@ describe("adoptRefreshedTarget — the target the human-ticket arm re-reads (PR 
   it("keeps the caller's target when the refreshed board no longer carries it", () => {
     const stale = bead("f-1");
     expect(adoptRefreshedTarget([bead("other")], "f-1", stale)).toBe(stale);
+  });
+});
+
+describe("orderTickets / skippedDependents — the run's own dependency graph (anton-67xj)", () => {
+  const dep = (from: string, to: string): BeadDep => ({
+    issue_id: from,
+    depends_on_id: to,
+    type: "blocks",
+  });
+  /** `c` depends on `b`, `b` depends on `a`; `d` is independent of all three. */
+  const chain = (): Bead[] => [
+    ticket("a"),
+    { ...ticket("b"), dependencies: [dep("b", "a")] } as Bead,
+    { ...ticket("c"), dependencies: [dep("c", "b")] } as Bead,
+    ticket("d"),
+  ];
+  const ids = (beads: Bead[]) => beads.map((b) => b.id);
+  /** A ticket the budget stopped BEFORE its commit — the only kind whose skip cascades. */
+  const rolledBack = (...tickets: string[]) => tickets.map((id) => ({ id, committed: false }));
+
+  it("dispatches a chain blocker-first, whatever order the board hands it back in", () => {
+    const board = chain();
+    const shuffled = [board[2], board[3], board[1], board[0]];
+    expect(ids(orderTickets(shuffled, board))).toEqual(["d", "a", "b", "c"]);
+  });
+
+  it("skips the whole chain behind a timed-out ticket, transitively", () => {
+    const board = chain();
+    const cause = skippedDependents(rolledBack("a"), board, board);
+    expect([...cause.keys()].sort()).toEqual(["b", "c"]);
+    // The direct dependent names `a`; the transitive one names the sibling it queued behind — and
+    // both name the ticket a human has to act on.
+    expect(cause.get("b")).toEqual({ waitingOn: "a", stopped: "a" });
+    expect(cause.get("c")).toEqual({ waitingOn: "b", stopped: "a" });
+  });
+
+  it("walks THROUGH an abandoned ticket rather than stopping at it (PR #199)", () => {
+    // The run never dispatches an abandoned `b`, but it still sits on the a→b→c chain: reading the
+    // graph over the live tickets alone drops both of its edges, and `c` runs against a mechanism
+    // `a`'s rollback took off the branch. It is crossed, never named — `c` is the only skip here.
+    const board = chain().map((t) =>
+      t.id === "b" ? ({ ...t, labels: ["abandoned"] } as Bead) : t,
+    );
+    const cause = skippedDependents(rolledBack("a"), board, board);
+    expect([...cause.keys()]).toEqual(["c"]);
+    expect(cause.get("c")).toEqual({ waitingOn: "b", stopped: "a" });
+  });
+
+  it("leaves a ticket with no edge to the timed-out one alone — the run narrows, it does not halt", () => {
+    const board = chain();
+    expect(skippedDependents(rolledBack("a"), board, board).has("d")).toBe(false);
+    // …and a timeout further down the chain takes only what is actually behind it.
+    expect([...skippedDependents(rolledBack("b"), board, board).keys()]).toEqual(["c"]);
+  });
+
+  it("ignores `blocks` edges that leave the run, and non-blocking edges inside it", () => {
+    const outside = [
+      ticket("a"),
+      { ...ticket("b"), dependencies: [dep("b", "x-9")] } as Bead,
+      { ...ticket("c"), dependencies: [{ ...dep("c", "a"), type: "related" }] } as Bead,
+    ];
+    expect(skippedDependents(rolledBack("a"), outside, outside).size).toBe(0);
+  });
+
+  it("terminates on a cycle instead of walking it forever", () => {
+    const cyclic = [
+      { ...ticket("a"), dependencies: [dep("a", "c")] } as Bead,
+      { ...ticket("b"), dependencies: [dep("b", "a")] } as Bead,
+      { ...ticket("c"), dependencies: [dep("c", "b")] } as Bead,
+    ];
+    const cause = skippedDependents(rolledBack("a"), cyclic, cyclic);
+    expect([...cause.keys()].sort()).toEqual(["b", "c"]);
+    // orderTickets can't topologically sort a cycle either — it hands back the input order.
+    expect(ids(orderTickets(cyclic, cyclic))).toEqual(["a", "b", "c"]);
+  });
+
+  it("does NOT cascade a timeout that landed after the ticket committed", () => {
+    const board = chain();
+    // The deadline hit the bookkeeping, not the code: `a`'s work is on the branch, so everything
+    // written against it still has what it needs and must still run. Deleting the committed-ness
+    // check turns this into the whole chain being skipped for work that actually shipped.
+    expect(skippedDependents([{ id: "a", committed: true }], board, board).size).toBe(0);
+    // …and in a run where BOTH happen, only the rolled-back one takes its dependents down: `a`
+    // committed, so `b` still ran; `b` did not, so only `c` behind it is skipped.
+    const mixed = skippedDependents(
+      [
+        { id: "a", committed: true },
+        { id: "b", committed: false },
+      ],
+      board,
+      board,
+    );
+    expect([...mixed.keys()]).toEqual(["c"]);
+    expect(mixed.get("c")).toEqual({ waitingOn: "b", stopped: "b" });
+  });
+
+  it("stops the cascade at a ticket already committed on THIS branch (PR #199 review)", () => {
+    const board = chain();
+    // A resume finds `b` closed on the board with its commit already on this worktree, so it is
+    // delivered whatever `a` did — the same delivered-node stopping rule merge finalization uses.
+    // `c` has the mechanism it was written against, so skipping it would leave valid work out of
+    // the run's pull request for no reason.
+    expect(skippedDependents(rolledBack("a"), board, board, new Set(["b"])).size).toBe(0);
+    // …and a delivered ticket further down stops nothing above it: `b`'s own prerequisite is gone.
+    expect([
+      ...skippedDependents(rolledBack("a"), board, board, new Set(["c"])).keys(),
+    ]).toEqual(["b"]);
+  });
+
+  it("says on the bead which ticket it waited on and which one a human must re-scope", () => {
+    const direct = skipNote({ waitingOn: "a", stopped: "a" });
+    expect(direct).toContain("depends on a, which ran out of time");
+    expect(direct).toMatch(/Re-scope a/);
+
+    const transitive = skipNote({ waitingOn: "b", stopped: "a" });
+    expect(transitive).toContain("depends on b, which was itself skipped behind a");
+    expect(transitive).toMatch(/Re-scope a/);
   });
 });
 
@@ -1036,5 +1185,196 @@ describe("deliveredTickets — what the run's own steps speak for", () => {
     expect((await deliveredTickets([human("t-2")], new Set(), b.has)).map((t) => t.id)).toEqual([
       "t-2",
     ]);
+  });
+});
+
+describe("reopenableAfterStop — whose timed-out ticket is it now (PR #199 review)", () => {
+  /** The state runTicket's rolled-back timeout leaves behind, and the run's release then unowns. */
+  const stalled = (over: Partial<Bead> = {}): Bead =>
+    ({
+      id: "t1",
+      title: "t1",
+      status: "blocked",
+      labels: ["not-delivered"],
+      ...over,
+    }) as Bead;
+
+  it("reopens the ticket this run's timeout left blocked", () => {
+    expect(reopenableAfterStop(stalled())).toBe(true);
+  });
+
+  it("reopens one the best-effort block write never reached", () => {
+    // `beads.setStatus(blocked)` is best-effort in the timeout path, so its failure leaves the bead
+    // `in_progress` and unowned — which `bd update --claim` refuses just as flatly.
+    expect(reopenableAfterStop(stalled({ status: "in_progress" }))).toBe(true);
+  });
+
+  it("leaves a ticket somebody has since CLAIMED alone", () => {
+    // A resumed attempt on another machine took this bead while the run walked its independent
+    // tickets. Resetting it to `open` advertises live work as claimable and invites a second run.
+    expect(
+      reopenableAfterStop(stalled({ status: "in_progress", assignee: "someone@else" })),
+    ).toBe(false);
+  });
+
+  it("leaves a human's own verdict alone", () => {
+    // Closed or abandoned is a person's decision about this ticket; reopening re-queues work they
+    // just killed.
+    expect(reopenableAfterStop(stalled({ status: "closed" }))).toBe(false);
+    expect(
+      reopenableAfterStop(stalled({ status: "closed", labels: ["not-delivered", "abandoned"] })),
+    ).toBe(false);
+  });
+
+  it("leaves a ticket that has since been RE-RUN alone", () => {
+    // runTicket clears `not-delivered` the moment it claims the bead, so a marker that is gone means
+    // another attempt is delivering this work — its status is that run's to hold, not ours to reset.
+    expect(reopenableAfterStop(stalled({ labels: [] }))).toBe(false);
+  });
+
+  it("writes nothing to a ticket already back at `open`", () => {
+    expect(reopenableAfterStop(stalled({ status: "open" }))).toBe(false);
+  });
+});
+
+describe("reopenAbsorbedTimeouts — the predicate and the write, under one lock (PR #199 review)", () => {
+  /** A fresh repo path per case: the lock's chain map is process-wide, so keys are what isolates. */
+  let repos = 0;
+  const repo = () => `/tmp/reopen-timeouts-${++repos}`;
+
+  /** The board as a mutable row, so a competing claim and the reopen contend over ONE state. */
+  function board(initial: Partial<Bead> = {}) {
+    let row = {
+      id: "t1",
+      title: "t1",
+      status: "blocked",
+      labels: ["not-delivered"],
+      ...initial,
+    } as Bead;
+    return {
+      get current() {
+        return row;
+      },
+      show: async () => row,
+      setStatus: async (_cwd: string, _id: string, status: string) => {
+        row = { ...row, status } as Bead;
+      },
+      claim: (actor: string) => {
+        row = { ...row, status: "in_progress", assignee: actor } as Bead;
+      },
+    };
+  }
+
+  /** Drain the queue, so "did it read yet?" is answered after everything that could have run. */
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it("reopens a rolled-back timeout and leaves a committed one blocked", async () => {
+    const bd = board();
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], bd);
+    expect(bd.current.status).toBe("open");
+
+    const committed = board();
+    await reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: true }], committed);
+    expect(committed.current.status).toBe("blocked");
+  });
+
+  it("holds the lock across the read, so a claim cannot land between predicate and write", async () => {
+    // The race this closes: a concurrent claim (another run's claim gate, an operator's Claim) that
+    // arrives after the ticket reads as reopenable. Unserialized, the unconditional `open` below
+    // would knock that freshly-claimed bead back into `bd ready` while its agent runs.
+    const path = repo();
+    const bd = board();
+    const reading = defer(); // the reopen has entered its re-read
+    const release = defer(); // …and is held there until the competing claim has been attempted
+
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+      show: async () => {
+        reading.resolve();
+        await release.promise;
+        return bd.show();
+      },
+      setStatus: bd.setStatus,
+    });
+
+    await reading.promise;
+    let claimed = false;
+    const claim = withBeadWriteLock(path, "t1", async () => {
+      bd.claim("someone@else");
+      claimed = true;
+    });
+    await settle();
+    expect(claimed).toBe(false); // queued on the bead's chain, not landing mid-sequence
+
+    release.resolve();
+    await Promise.all([reopen, claim]);
+
+    // The reopen finished on the ticket it read; the claim then took the ticket it left at `open`.
+    expect(bd.current.status).toBe("in_progress");
+    expect(bd.current.assignee).toBe("someone@else");
+  });
+
+  it("sees a claim taken before its turn and writes nothing", async () => {
+    // The other order on the same chain: the claim wins, and the reopen's re-read — taken INSIDE
+    // the lock, so it cannot be stale — finds an owner and leaves the ticket alone.
+    const path = repo();
+    const bd = board();
+    const held = defer();
+    const writes: string[] = [];
+    // Hold the ticket's lock so the claim is guaranteed to reach the chain before the reopen does.
+    const gate = withBeadWriteLock(path, "t1", () => held.promise);
+    const claim = withBeadWriteLock(path, "t1", async () => {
+      bd.claim("someone@else");
+    });
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+      show: bd.show,
+      setStatus: async (cwd, id, status) => {
+        writes.push(status);
+        return bd.setStatus(cwd, id, status);
+      },
+    });
+
+    held.resolve();
+    await Promise.all([gate, claim, reopen]);
+
+    expect(writes).toEqual([]);
+    expect(bd.current.status).toBe("in_progress");
+    expect(bd.current.assignee).toBe("someone@else");
+  });
+
+  it("takes the lock before it reads, so the predicate can never be decided outside it", async () => {
+    const path = repo();
+    const bd = board();
+    const held = defer();
+    let read = false;
+    const gate = withBeadWriteLock(path, "t1", () => held.promise);
+
+    const reopen = reopenAbsorbedTimeouts(path, "epic-1", [{ id: "t1", committed: false }], {
+      show: async () => {
+        read = true;
+        return bd.show();
+      },
+      setStatus: bd.setStatus,
+    } as ReopenBoard);
+
+    await settle();
+    expect(read).toBe(false); // still queued — nothing has been decided yet
+
+    held.resolve();
+    await Promise.all([gate, reopen]);
+    expect(read).toBe(true);
+    expect(bd.current.status).toBe("open");
+  });
+
+  it("leaves the ticket as it stands when the re-read fails, and never throws", async () => {
+    const bd = board();
+    await expect(
+      reopenAbsorbedTimeouts(repo(), "epic-1", [{ id: "t1", committed: false }], {
+        show: async () => {
+          throw new Error("bd unavailable");
+        },
+        setStatus: bd.setStatus,
+      } as ReopenBoard),
+    ).resolves.toBeUndefined();
+    expect(bd.current.status).toBe("blocked");
   });
 });

@@ -32,6 +32,7 @@ const loadAllIssuesMock = vi.fn();
 const gateCreateMock = vi.fn();
 const gateResolveMock = vi.fn();
 const tagMock = vi.fn();
+const untagMock = vi.fn();
 const pullMock = vi.fn();
 const closeMock = vi.fn();
 
@@ -49,6 +50,7 @@ vi.mock("../beads/bd", async () => {
       gateCreate: (...args: unknown[]) => gateCreateMock(...args),
       gateResolve: (...args: unknown[]) => gateResolveMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
+      untag: (...args: unknown[]) => untagMock(...args),
       pull: (...args: unknown[]) => pullMock(...args),
       close: (...args: unknown[]) => closeMock(...args),
     },
@@ -106,6 +108,7 @@ beforeEach(() => {
   gateCreateMock.mockReset();
   gateResolveMock.mockReset().mockResolvedValue(undefined);
   tagMock.mockReset().mockResolvedValue(undefined);
+  untagMock.mockReset().mockResolvedValue(undefined);
   pullMock.mockReset().mockResolvedValue(undefined);
   closeMock.mockReset().mockResolvedValue(undefined);
 });
@@ -1538,7 +1541,121 @@ describe("preflightHumanTickets — classifying again after the arm's own board 
       "g-sign",
       expect.stringContaining(`no longer labelled ${LABELS.agentHuman}`),
     );
+    // Retired, not answered: the marker goes with the wait, so a later pass cannot read this close
+    // as a person having done work the operator just handed back to an agent (PR #213 review).
+    expect(untagMock).toHaveBeenCalledWith(REPO, "g-sign", [HUMAN_GATE_ARMED_LABEL]);
     expect(gateCreateMock).toHaveBeenCalledTimes(2); // never re-armed on the pass that retired it
     expect(out.answeredButBlocked.size).toBe(0);
+  });
+});
+
+
+// ── what a CLOSED human gate means: answered, or taken back (PR #213 review) ──
+
+/**
+ * A gate anton resolves itself — a cancelled arm, an ask the operator relabelled away, a wait a
+ * newer ask supersedes — must not read as a person's answer on the next run. Nothing on a closed
+ * gate records who ended it, so the armed label is the marker, and every retire strips it.
+ */
+describe("retiring anton's own human gate — a close it made is not an answer", () => {
+  const cancelled = () => {
+    const c = new AbortController();
+    c.abort();
+    return c.signal;
+  };
+
+  /** One armed ticket gate, produced by the real arm so its undo rights are the real ones. */
+  const armOne = async (gateId: string) => {
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue(gateId);
+    const armed = { ticketId: TICKET, gate: await armHumanGate(REPO, "f-1", ASKED) };
+    gateResolveMock.mockClear();
+    untagMock.mockClear();
+    return armed;
+  };
+
+  /** A human ticket held by its own gate. */
+  const humanTicket = (id: string, title: string, gateId: string): Bead =>
+    ({
+      id,
+      title,
+      status: "open",
+      issue_type: "task",
+      labels: [LABELS.agentHuman],
+      dependencies: [{ issue_id: id, depends_on_id: gateId, type: "blocks" }],
+    }) as Bead;
+
+  /** The gate that carried that ticket's ask, now closed — labelled as anton armed it or not. */
+  const closedGate = (id: string, t: Bead, labels: string[]): Gate =>
+    ({
+      ...gate(id, humanGateReason(t.id, { ticketId: t.id, ask: humanTicketAsk(t) }), labels),
+      status: "closed",
+    }) as Gate;
+
+  it("strips the armed label BEFORE it resolves, so no close it made can read as an answer", async () => {
+    const armed = await armOne("g-first");
+
+    await undoCancelledTicketGates([armed], cancelled(), new Error("the run was cancelled"));
+
+    expect(untagMock).toHaveBeenCalledWith(REPO, "g-first", [HUMAN_GATE_ARMED_LABEL]);
+    expect(untagMock.mock.invocationCallOrder[0]).toBeLessThan(
+      gateResolveMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("leaves the wait STANDING when the marker cannot be stripped", async () => {
+    // Resolving anyway would close the gate with the marker intact — a false answer no later run can
+    // tell from a real one. A still-open wait, named in the error, is the recoverable failure.
+    const armed = await armOne("g-first");
+    untagMock.mockRejectedValue(new Error("bd: database is locked"));
+
+    const thrown = (await undoCancelledTicketGates(
+      [armed],
+      cancelled(),
+      new Error("the run was cancelled"),
+    )) as Error;
+
+    expect(gateResolveMock).not.toHaveBeenCalled();
+    expect(thrown.message).toContain(`g-first (${TICKET})`);
+  });
+
+  it("asks again for a ticket whose gate anton took back, rather than closing it", async () => {
+    // The failure this closes: cleanup resolved the gate but left the ticket human and its ask
+    // intact. Read as an answer, the next run closes a still-human ticket without executing it and
+    // without anyone doing the work. With the marker gone there is no answer, so the ask is re-armed
+    // — which is the state the board is actually in.
+    const buy = humanTicket("t-buy", "Buy the Business plan", "g-buy");
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue("g-buy-2");
+
+    const held = await armHumanTicketGates(
+      REPO,
+      "f-1",
+      [buy, closedGate("g-buy", buy, [])],
+      [buy],
+      undefined,
+    );
+
+    expect(held.size).toBe(0);
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(gateCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still closes a ticket whose gate a PERSON resolved — the marker survives their answer", async () => {
+    // The other half of the same contract: nothing untags a gate a human ran `bd gate resolve` on,
+    // so the answer still lands and the exchange the label exists for keeps working.
+    const buy = humanTicket("t-buy", "Buy the Business plan", "g-buy");
+
+    const held = await armHumanTicketGates(
+      REPO,
+      "f-1",
+      [buy, closedGate("g-buy", buy, [HUMAN_GATE_ARMED_LABEL])],
+      [buy],
+      undefined,
+    );
+
+    expect(held.size).toBe(0);
+    expect(closeMock).toHaveBeenCalledWith(REPO, "t-buy", expect.stringContaining("g-buy"));
+    expect(gateCreateMock).not.toHaveBeenCalled();
   });
 });
