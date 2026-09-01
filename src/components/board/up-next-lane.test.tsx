@@ -146,6 +146,7 @@ function fixture(upNext?: UpNextEntry[]): Board {
       Stage,
       StandaloneItem[]
     >,
+    operatorQueue: [],
     ...(upNext ? { upNext, upNextPlanId: PLAN_ID } : {}),
     sync: {
       state: "synced",

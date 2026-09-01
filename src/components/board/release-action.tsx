@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { toastAdvisoryGaps } from "@/components/board/contract-advisory";
+import { reportApprovalOutcome } from "@/components/board/contract-advisory";
 import { usePickDecision } from "@/components/board/pick-decision";
 import type { ApprovalRunOutcome } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -143,9 +143,9 @@ export function ReleaseAction({
       }
       decision.settle();
       onReleased?.();
-      toast.success(`Released "${title}" — running now`);
-      // The run starts with whatever thin sections it has; say so once, here.
-      toastAdvisoryGaps(body);
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here.
+      reportApprovalOutcome(body, { started: `Released "${title}" — running now`, title });
       router.refresh();
     } catch (err) {
       decision.abandon();

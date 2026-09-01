@@ -342,6 +342,124 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
   });
 
+  it("names every human ticket the run will stop for, however deep it nests", async () => {
+    // anton-qfso.2: `agent:human` work is real, approved work the run reaches and then HOLDS for a
+    // person. It never refuses the approval — it is what the operator is signing up for, and the
+    // only moment they can weigh it is here, not three hours into the run.
+    const target = await beads.create(repo, { title: "Feature with human work", type: "feature", acceptance: "- [ ] it works" });
+    const agentWork = await beads.create(repo, { title: "Agent ticket", type: "task", acceptance: "- [ ] it works" });
+    const personWork = await beads.create(repo, {
+      title: "Buy the domain",
+      type: "task",
+      acceptance: "- [ ] the domain resolves",
+      labels: ["agent:human"],
+    });
+    await beads.link(repo, agentWork, target, "parent-child");
+    // A grandchild ships in the same PR, so its gate is this run's gate.
+    await beads.link(repo, personWork, agentWork, "parent-child");
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.humanGates).toEqual([`${personWork} → Buy the domain`]);
+    // The target itself is agent work, so the run really does start and hold — absent, not false.
+    expect(body).not.toHaveProperty("humanTarget");
+    expect(beads.isApproved(await beads.show(repo, target))).toBe(true);
+  });
+
+  it("marks a human TARGET as a run that never starts, not one that stops", async () => {
+    // PR #214 review: execute-epic poisons a target labelled `agent:human` before it dispatches a
+    // single child, so the "anton runs the rest" toast the gate lines earn would be a promise about
+    // a run that never begins. The distinction rides in the body, not in the client's guesswork.
+    const target = await beads.create(repo, {
+      title: "Buy the domain",
+      type: "task",
+      acceptance: "- [ ] the domain resolves",
+      labels: ["agent:human"],
+    });
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.humanGates).toEqual([`${target} → Buy the domain`]);
+    expect(body.humanTarget).toBe(true);
+  });
+
+  it("marks a human target whose run would dispatch nothing — recovery still hits the poison", async () => {
+    // `contractGatedBeads` empties for a grouped target whose children are all closed, which is one
+    // of the Force-run recovery shapes the contract gate deliberately lets through. The target-level
+    // poison still fires on that re-run, so deriving this from the dispatch set would answer the
+    // recovery with silence about the only thing that decides its outcome (PR #214 review).
+    const target = await beads.create(repo, {
+      title: "Sign the contract",
+      type: "feature",
+      acceptance: "- [ ] it works",
+      labels: ["agent:human"],
+    });
+    const done = await beads.create(repo, { title: "Shipped ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, done, target, "parent-child");
+    await beads.close(repo, done);
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.humanTarget).toBe(true);
+    // No ticket is dispatched, so there is no gate line to name — and none is needed.
+    expect(body).not.toHaveProperty("humanGates");
+  });
+
+  it("reports the child gates the LOCKED board carries, not the ones the gate read", async () => {
+    // PR #214 review: the executor reloads the board and gates on `agent:human` as of the write, so
+    // a label that moves between the pre-lock gate read and the claim-locked read must move the
+    // report with it — otherwise the toast omits a stop the run will arm, or promises one for work
+    // an agent will simply do. Both directions ride the same window; the label flips between the
+    // route's two `bd list` reads (its only two — see the read-economy cases below).
+    actAs("anton-test");
+    const target = await beads.create(repo, { title: "Gates move mid-approval", type: "feature", acceptance: "- [ ] it works" });
+    const gains = await beads.create(repo, { title: "Sign the DPA", type: "task", acceptance: "- [ ] it works" });
+    const loses = await beads.create(repo, {
+      title: "Was human work",
+      type: "task",
+      acceptance: "- [ ] it works",
+      labels: ["agent:human"],
+    });
+    await beads.link(repo, gains, target, "parent-child");
+    await beads.link(repo, loses, target, "parent-child");
+
+    const realList = beads.list.bind(beads);
+    let flipped = false;
+    // The route takes exactly two board reads — the gate's, then the claim-locked one — so flipping
+    // immediately before the second puts the change squarely in the window under test.
+    const listSpy = vi.spyOn(beads, "list").mockImplementation(async (cwd, extra) => {
+      if (!flipped && listSpy.mock.calls.length === 2) {
+        flipped = true;
+        await beads.tag(repo, gains, ["agent:human"]);
+        await beads.untag(repo, loses, ["agent:human"]);
+      }
+      return realList(cwd, extra);
+    });
+    try {
+      const res = await approve(target);
+      expect(res.status).toBe(200);
+      expect((await res.json()).humanGates).toEqual([`${gains} → Sign the DPA`]);
+    } finally {
+      listSpy.mockRestore();
+    }
+  });
+
+  it("says nothing about human work on a run that stops for nobody", async () => {
+    const target = await beads.create(repo, { title: "All agent work", type: "feature", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Agent ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, target, "parent-child");
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    // Absent, not empty: an empty list is still a thing the client has to decide not to say.
+    const body = await res.json();
+    expect(body).not.toHaveProperty("humanGates");
+    expect(body).not.toHaveProperty("humanTarget");
+  });
+
   it("approves a bead repaired since the board last read it — the gate reads fresh", async () => {
     // The contract gate rides the same forced fresh read as the blocker gate: a bead whose
     // Acceptance was written after the board snapshot warmed must approve, not 422 on stale text.
@@ -559,5 +677,44 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // Refused before the write: no label, no enqueue — the feature under it is the run target now.
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(false);
     expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
+  // Same window, different verdict (PR #214 review). `humanTarget` answers "does a run start at
+  // all", and the executor decides that from the label as of the write — so a label landing between
+  // the pre-lock read and the locked one must be what the response reports. Taken from the stale
+  // read, this approval would tell the operator their run started while the job is already poison.
+  // Synchronization mirrors the container race above: the write holds the lock and releases only
+  // once the pre-lock gates have answered.
+  it("reads humanTarget off the locked bead when the label lands mid-approval", async () => {
+    actAs("anton-test");
+    const target = await beads.create(repo, {
+      title: "Becomes a person's job mid-approval",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+
+    let gatesPassed!: () => void;
+    const gatesDone = new Promise<void>((resolve) => (gatesPassed = resolve));
+
+    const { withBeadWriteLock } = await import("@/lib/beads/claim-lock");
+    const labelLanded = withBeadWriteLock(repo, target, async () => {
+      await gatesDone;
+      await beads.tag(repo, target, ["agent:human"]);
+    });
+
+    const request = jsonRequest("POST");
+    Object.defineProperty(request, "json", {
+      value: async () => {
+        gatesPassed();
+        await labelLanded;
+        return {};
+      },
+    });
+
+    const res = await POST(request, ctx("approvy", target));
+    await labelLanded;
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).humanTarget).toBe(true);
   });
 });

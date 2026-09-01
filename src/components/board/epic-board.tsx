@@ -51,6 +51,7 @@ import { UpNextLane } from "@/components/board/up-next-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
+import { OperatorQueue } from "@/components/board/operator-queue";
 import {
   AutopilotBreakerBand,
   AutopilotBreakerHeader,
@@ -128,8 +129,9 @@ export function EpicBoard({
   const [sort, setSort] = useState<BoardSort>("default");
   // Stage columns or epic swimlanes — the same cards either way, remembered per project.
   const [grouping, setGrouping] = useBoardGrouping(slug);
-  // The standalone task/bug whose detail dialog is open. Epics still deep-link to their own page;
-  // standalone chips (an epic-of-one) reuse the shared TicketDialog inline.
+  // The ticket whose detail dialog is open. Epics still deep-link to their own page; standalone
+  // chips (an epic-of-one) and the operator queue's parented human tickets — neither of which the
+  // epic page can act on — reuse the shared TicketDialog inline.
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   // The polled breaker, once one has landed — `null` until then, so the server's streamed read is
   // what the first paint uses. Wrapped rather than stored bare because `undefined` is a real answer
@@ -701,6 +703,10 @@ export function EpicBoard({
         )}
       </Suspense>
       <EscalationStrip slug={slug} escalations={escalations} />
+      {/* Below the escalations, never instead of them: a stopped run needs a decision now, while
+          this band is standing work that was always the founder's. It reads the UNFILTERED board on
+          purpose — a queue narrowed by the column filters would quietly under-report what is owed. */}
+      <OperatorQueue slug={slug} items={board.operatorQueue} onOpenTicket={setOpenTicketId} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the
         // single stage strip, at any width.

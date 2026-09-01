@@ -16,7 +16,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { DragEndEvent } from "@dnd-kit/core";
 import { toast } from "sonner";
 
-import { STAGES, type Board, type Epic, type Stage } from "@/lib/types";
+import { STAGES, type Board, type Epic, type EscalationView, type Stage } from "@/lib/types";
 import { STAGE_LABELS } from "@/components/board/board-utils";
 
 const LABEL_TO_STAGE = Object.fromEntries(
@@ -117,6 +117,7 @@ function board(version: string, cardStage: Stage): Board {
     version,
     columns,
     standalone,
+    operatorQueue: [],
     sync: {
       state: "synced",
       lastSyncedAt: 1,
@@ -288,6 +289,53 @@ describe("EpicBoard autopilot breaker (anton-5c8h)", () => {
       ).toBeGreaterThan(readsBefore),
     );
     expect(screen.getByText("Autopilot is holding")).toBeTruthy();
+  });
+});
+
+describe("EpicBoard operator queue (anton-qfso.1)", () => {
+  const stalled: EscalationView = {
+    id: "esc-1",
+    findingKey: "parked-run:r-1",
+    kind: "parked-run",
+    reason: "parked 4h ago: agent exited 1",
+    epicBeadId: "anton-e1",
+    ageMs: 4 * 3_600_000,
+    status: "open",
+    noted: true,
+    raisedAt: 0,
+  };
+
+  it("sits below the escalation strip rather than in place of it", () => {
+    // Both bands answer "what needs you", and they are not the same errand: an escalation is work
+    // that STOPPED and hands over a button, this is standing work that was always the founder's. The
+    // stopped run has to keep the top slot.
+    render(
+      <EpicBoard
+        slug="tmp"
+        initialBoard={{
+          ...board("1:sync", "backlog"),
+          operatorQueue: [
+            {
+              id: "anton-t1",
+              title: "Buy the domain",
+              stage: "backlog",
+              createdAt: "2026-08-09T00:00:00.000Z",
+            },
+          ],
+        }}
+        escalations={[stalled]}
+      />,
+    );
+
+    const needsYou = screen.getByText("Needs you");
+    const yours = screen.getByText("Yours to do");
+    expect(screen.getByText("Buy the domain")).toBeTruthy();
+    expect(needsYou.compareDocumentPosition(yours) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows no band at all when nothing is the operator's", () => {
+    render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
+    expect(screen.queryByText("Yours to do")).toBeNull();
   });
 });
 

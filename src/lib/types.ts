@@ -377,6 +377,36 @@ export interface SyncStatusView {
   stalledForMs: number | null;
 }
 
+/**
+ * One bead on the operator's own queue (anton-qfso.1) — approved, open, `agent:human` work anton
+ * hands back rather than dispatches. Built by `operatorQueue` (lib/operator-queue.ts) off the board
+ * snapshot, so the row carries everything it takes to decide whether to act now: what the ask is,
+ * how long it has been waiting, and which run it holds up.
+ */
+export interface OperatorQueueItem {
+  id: string;
+  title: string;
+  /** The bead's "## Goal" — what the person is actually being asked for. Absent when unstated. */
+  goal?: string;
+  stage: Stage;
+  risk?: string; // from risk:<x>
+  size?: string; // from size:<x>
+  /** ISO timestamp the ask was filed, from the raw bead's created_at. Drives the queue's order. */
+  createdAt: string;
+  /**
+   * The run this ticket rides on. ABSENT on a run target, which is not held up by the work — it IS
+   * the work, and no agent will ever start it.
+   */
+  runTarget?: { id: string; title: string };
+  /**
+   * Whether a run actually reaches this ticket and holds on it. Only meaningful alongside
+   * `runTarget`, and FALSE when that target is itself `agent:human`: execute-epic poisons such a
+   * target before it dispatches a single child, so no gate is ever armed under it and there is no
+   * held run to resume (PR #214 review).
+   */
+  holdsRun?: boolean;
+}
+
 export interface Board {
   projectSlug: string;
   /** Monotonic issue-snapshot version used for change-aware refreshes. */
@@ -385,6 +415,12 @@ export interface Board {
   columns: Record<Stage, Epic[]>;
   /** Standalone (parentless) tasks/bugs grouped by stage, rendered as chips at each column's foot. */
   standalone: Record<Stage, StandaloneItem[]>;
+  /**
+   * Approved work that is the OPERATOR's, not an agent's (anton-qfso.1) — derived from the same
+   * snapshot as the cards, so it costs no read of its own and refreshes on the same poll. Empty
+   * means there is none, which the queue renders as nothing at all.
+   */
+  operatorQueue: OperatorQueueItem[];
   /**
    * The board-picker's recorded plan, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole
    * input. The lane resolves each entry against the BACKLOG column and takes those cards out of it,

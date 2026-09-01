@@ -4,7 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import type { StandaloneItem } from "@/lib/types";
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastApprovalOutcome } from "@/components/board/contract-advisory";
 import { usePickDecision } from "@/components/board/pick-decision";
 import { readAppliedSummary } from "@/components/board/proposal-applied";
 
@@ -85,9 +85,12 @@ export function useStandaloneApproval(slug: string, item: StandaloneItem): Stand
       }
       decision.settle();
       const applied = await readAppliedSummary(res);
-      toast.success(approveOutcomeMessage({ applied, immediate, title: item.title }));
-      // The run starts with whatever thin sections it has; say so once, here.
-      await toastContractAdvisory(res);
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here.
+      await toastApprovalOutcome(res, {
+        started: approveOutcomeMessage({ applied, immediate, title: item.title }),
+        title: item.title,
+      });
     } catch (err) {
       // Nothing was approved, so the pick goes back on offer — including to the vetoes.
       decision.abandon();
