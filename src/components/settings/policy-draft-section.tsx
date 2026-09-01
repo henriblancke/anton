@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
@@ -80,6 +80,35 @@ const PRIORITIES = [0, 1, 2, 3, 4];
 const MAX_LISTED = 40;
 
 /**
+ * Which criterion a deep link asked this editor to open at (anton-jqvy).
+ *
+ * `Never` on a picked target lands here with `?criterion=<PolicyCriterionKey>` beside the `#policy`
+ * hash, so the veto arrives on the CONTROL that admitted the bead rather than on a panel of twelve.
+ * Read from the URL through `useSyncExternalStore` for the same reason the active section is: the
+ * location is an external system the server cannot see, and this is the shape that renders nothing
+ * on the server and the highlight on the client without a hydration mismatch — and without dragging
+ * the settings page behind a `useSearchParams` Suspense boundary.
+ *
+ * Advisory only. It highlights and scrolls; it never edits, disables or preselects anything, because
+ * `Never` opens the policy and the operator writes the rule.
+ */
+function useHighlightedCriterion(): string | undefined {
+  const raw = useSyncExternalStore(
+    (onChange) => {
+      window.addEventListener("popstate", onChange);
+      window.addEventListener("hashchange", onChange);
+      return () => {
+        window.removeEventListener("popstate", onChange);
+        window.removeEventListener("hashchange", onChange);
+      };
+    },
+    () => new URLSearchParams(window.location.search).get("criterion"),
+    () => null,
+  );
+  return raw ?? undefined;
+}
+
+/**
  * The work policy panel (anton-c7iv, anton-qsr1) — and, before anything is armed, the FIRST-ARM
  * PROPOSAL.
  *
@@ -149,6 +178,7 @@ export function PolicyDraftSection({
   boardUnavailable?: boolean;
 }) {
   const router = useRouter();
+  const highlighted = useHighlightedCriterion();
   const armed = stored !== undefined;
   const [policy, setPolicy] = useState<Policy>(stored ?? draft.policy);
   const [saving, setSaving] = useState(false);
@@ -476,7 +506,7 @@ export function PolicyDraftSection({
         onDragEnd={onDragEnd}
       >
         <div className="flex max-w-2xl flex-col gap-3">
-          <Criterion label="Issue type" why={why("types")}>
+          <Criterion label="Issue type" why={why("types")} highlighted={highlighted === "types"}>
             <div className="flex flex-wrap gap-1.5">
               {typeVocabulary.map((type) => (
                 <Chip
@@ -512,7 +542,7 @@ export function PolicyDraftSection({
             )}
           </Criterion>
 
-          <Criterion label="Priority" why={why("priority")}>
+          <Criterion label="Priority" why={why("priority")} highlighted={highlighted === "priority"}>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
               <label className="flex items-center gap-2">
                 at least
@@ -538,7 +568,7 @@ export function PolicyDraftSection({
             )}
           </Criterion>
 
-          <Criterion label="Parentage" why={why("parentage")}>
+          <Criterion label="Parentage" why={why("parentage")} highlighted={highlighted === "parentage"}>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
               <label className="flex items-center gap-2">
                 at least
@@ -565,7 +595,7 @@ export function PolicyDraftSection({
             </p>
           </Criterion>
 
-          <Criterion label="Age" why={why("age")}>
+          <Criterion label="Age" why={why("age")} highlighted={highlighted === "age"}>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
               <label className="flex items-center gap-2">
                 filed at least
@@ -610,6 +640,7 @@ export function PolicyDraftSection({
               }
               scaleLike={scaleLike.has(group.namespace)}
               why={why(`labels:${group.namespace}`)}
+              highlighted={highlighted === `labels:${group.namespace}`}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
               onRanked={(ranked) => setRanked(group.namespace, ranked)}
               onCompare={(compare) => setCompare(group.namespace, compare)}
@@ -617,7 +648,7 @@ export function PolicyDraftSection({
             />
           ))}
 
-          <Criterion label="Blockers" why={why("blockers")}>
+          <Criterion label="Blockers" why={why("blockers")} highlighted={highlighted === "blockers"}>
             <div className="flex items-center gap-2">
               <Toggle
                 checked={policy.requireUnblocked ?? false}
@@ -857,6 +888,7 @@ function NamespaceCriterion({
   locked,
   scaleLike,
   why,
+  highlighted = false,
   onToggleValue,
   onRanked,
   onCompare,
@@ -874,6 +906,8 @@ function NamespaceCriterion({
   /** Discovery read these values as a scale — a hint beside the control, never a gate on it. */
   scaleLike: boolean;
   why?: PolicyRationale;
+  /** A `Never` veto sent the operator here to tighten THIS criterion (see useHighlightedCriterion). */
+  highlighted?: boolean;
   onToggleValue: (value: string) => void;
   onRanked: (ranked: boolean) => void;
   onCompare: (compare: PolicyRankComparison | undefined) => void;
@@ -894,6 +928,7 @@ function NamespaceCriterion({
     <Criterion
       label={`${group.namespace}:`}
       why={why}
+      highlighted={highlighted}
       onRemove={selected.length ? onClear : undefined}
     >
       <div className="flex flex-wrap gap-1.5">
@@ -1104,11 +1139,18 @@ function normalize(policy: Policy): Policy {
 function Criterion({
   label,
   why,
+  highlighted = false,
   onRemove,
   children,
 }: {
   label: string;
   why?: PolicyRationale;
+  /**
+   * A `Never` veto opened the editor at this criterion (anton-jqvy). Marked `aria-current` as well
+   * as ringed, so the operator who arrived by keyboard lands on the same control the ring points at
+   * — a highlight only sighted users can follow is a deep link that only half works.
+   */
+  highlighted?: boolean;
   onRemove?: () => void;
   children: React.ReactNode;
 }) {
@@ -1116,10 +1158,24 @@ function Criterion({
     <div
       role="group"
       aria-label={label}
-      className="flex flex-col gap-1.5 rounded-[10px] border border-border bg-card px-3 py-2.5"
+      {...(highlighted ? { "aria-current": "true" as const } : {})}
+      ref={(node) => {
+        // Only the deep-linked one scrolls, and only when it mounts: the panel is taller than the
+        // viewport, so a highlight below the fold is a highlight nobody sees.
+        if (highlighted) node?.scrollIntoView?.({ block: "center" });
+      }}
+      className={cn(
+        "flex flex-col gap-1.5 rounded-[10px] border bg-card px-3 py-2.5",
+        highlighted ? "border-primary/60 ring-2 ring-primary/30" : "border-border",
+      )}
     >
       <div className="flex items-baseline justify-between gap-2">
         <span className="font-mono text-[11px] font-medium text-foreground">{label}</span>
+        {highlighted && (
+          <span className="text-[10.5px] text-subtle">
+            this admitted the target you declined
+          </span>
+        )}
         {onRemove && (
           <Button size="xs" variant="ghost" onClick={onRemove}>
             Remove

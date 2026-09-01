@@ -26,6 +26,7 @@ import { describeFailureStreak } from "../autopilot-failure-streak";
 import { describeScoreSlide } from "../autopilot-score-slide";
 import { describeWipHold } from "../autopilot-wip";
 import { saveBoardPickerPlan } from "../board-picker-plan";
+import { activeDeferrals } from "../picker-veto";
 import { getProjectById, getProjectSettings, resolvePickerPolicy } from "../projects";
 import { PoisonError } from "./errors";
 import { checkFailureStreak } from "./picker-failure-breaker";
@@ -113,10 +114,14 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // does not keep. An unarmed project keeps the structural default — the pass starts nothing, so
     // an unnarrowed plan is a ranking, not an autopilot.
     const armed = resolvePickerPolicy(await getProjectSettings(db, projectId));
+    // What the operator vetoed and has not un-vetoed by waiting (anton-jqvy). Judged against the
+    // OBSERVATION instant, like the age criterion beside it, so one pass answers "is this still
+    // deferred?" the same way for every target it ranks.
+    const deferrals = await activeDeferrals(db, projectId, new Date(observedAtMs));
     const decision = decideBoardPickerPlan({
       board,
       policy: armed ? armedPickerPolicy(armed, board, new Date(observedAtMs)) : ADMIT_ALL_POLICY,
-      runtime: { observedAtMs },
+      runtime: { observedAtMs, deferrals },
     });
 
     // The board read is the only slow step, and it doesn't heartbeat: two `bd list` calls behind the

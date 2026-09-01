@@ -227,6 +227,58 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
 });
 
 /**
+ * What the operator ANSWERED the picker (anton-jqvy) — one row per verdict on one of its picks.
+ *
+ * The counterpart to the plan above: that row is what anton decided, this table is what a human said
+ * back. `✕ not now` and `Never` both record a DECLINE (release records the accept), so the pair is a
+ * track record — the same evidence base earned autonomy reads for the gardener's kinds
+ * (`gardener/track-record.ts`), for a surface that has no board fingerprint to count off.
+ *
+ * Append-only, and a decline carries its own expiry rather than a flag somebody has to clear: a
+ * veto defers the target for a bounded window ({@link PICKER_DEFER_WINDOW_MS}), so the next pass
+ * skips it and the pass after the window lets it back in. That bound is what keeps this from being
+ * the per-bead blocklist the design refuses — nothing here can silence a target permanently.
+ *
+ * Machine-local, like the plan and the policy it answers: a veto is one operator's pacing decision
+ * on one machine, not shared board state.
+ */
+export const pickerVerdicts = sqliteTable(
+  "picker_verdicts",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The target the verdict is about. Not an FK — beads live on the board, not in anton.db. */
+    beadId: text("bead_id").notNull(),
+    /** `accepted` | `declined` — the two halves of the record earned autonomy counts. */
+    verdict: text("verdict").notNull(),
+    /** `PickerVerdictAction`: which affordance produced it (`not-now`, `never`, `release`). */
+    action: text("action").notNull(),
+    /** The admitting rule the plan recorded, frozen at the moment of the verdict. */
+    rule: text("rule"),
+    /**
+     * The `PolicyCriterionKey` a `Never` opened the policy editor at, when the armed policy had one
+     * to name. Null for a `not-now`, and for a project whose policy narrows nothing.
+     */
+    criterion: text("criterion"),
+    /** The rank the target held in the plan being answered — the pick, not just the bead. */
+    rank: integer("rank"),
+    /** The answered plan's board digest, so a verdict names the DECISION and not only its subject. */
+    planDigest: text("plan_digest"),
+    /** When this target becomes pickable again. Null on an accept — only a decline defers. */
+    deferredUntil: ts("deferred_until"),
+    decidedAt: ts("decided_at").notNull().default(now),
+  },
+  (table) => [
+    // Serves the track-record read ("this project's last N verdicts, newest first").
+    index("picker_verdicts_project_idx").on(table.projectId, table.decidedAt),
+    // Serves the pass's and the board's "which targets are deferred right now" read.
+    index("picker_verdicts_deferred_idx").on(table.projectId, table.deferredUntil),
+  ],
+);
+
+/**
  * The autopilot's DISARM latch, per project (anton-5c8h / R4.6). A disarm is the half of the brake
  * that does not clear itself: a score regression or a run of failures freezes the picker until a
  * human looks at the evidence and re-arms it, and this row is both the freeze and the audit trail of

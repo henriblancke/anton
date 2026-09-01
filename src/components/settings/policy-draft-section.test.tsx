@@ -1322,3 +1322,62 @@ describe("draft evidence goes with the criterion it explained", () => {
     expect(screen.queryByRole("note")).toBeNull();
   });
 });
+
+/**
+ * The `Never` deep link (anton-jqvy). A veto that dumped the operator on a twelve-criterion panel
+ * would be a rule change nobody makes, so the criterion arrives named — and only ever highlighted:
+ * `Never` opens the policy, it does not rewrite it.
+ */
+describe("the criterion a Never veto opened the editor at", () => {
+  const openAt = (criterion?: string) => {
+    window.history.replaceState(
+      null,
+      "",
+      criterion ? `/projects/tmp/settings?criterion=${encodeURIComponent(criterion)}#policy` : "/projects/tmp/settings#policy",
+    );
+  };
+
+  afterEach(() => window.history.replaceState(null, "", "/"));
+
+  it("highlights the native criterion the link names, and nothing else", () => {
+    openAt("types");
+    renderPanel();
+
+    expect(screen.getByRole("group", { name: "Issue type" }).getAttribute("aria-current")).toBe("true");
+    expect(screen.getByRole("group", { name: "Priority" }).hasAttribute("aria-current")).toBe(false);
+    // Named, so the operator knows why this control is ringed rather than guessing.
+    expect(
+      within(screen.getByRole("group", { name: "Issue type" })).getByText(
+        /admitted the target you declined/i,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("highlights a discovered-namespace criterion by its own name", () => {
+    openAt("labels:severity");
+    renderPanel();
+
+    expect(screen.getByRole("group", { name: "severity:" }).getAttribute("aria-current")).toBe("true");
+    expect(screen.getByRole("group", { name: "Issue type" }).hasAttribute("aria-current")).toBe(false);
+  });
+
+  it("changes NOTHING about the policy — the link highlights, it never tightens", () => {
+    openAt("types");
+    const fetchMock = stubFetch();
+    renderPanel();
+
+    // The controls still hold exactly the proposal, and no write went out on render.
+    expect(checked("bug")).toBe("true");
+    expect(checked("feature")).toBe("false");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("highlights nothing when the link names no criterion", () => {
+    openAt();
+    renderPanel();
+
+    expect(
+      screen.getAllByRole("group").every((g) => !g.hasAttribute("aria-current")),
+    ).toBe(true);
+  });
+});

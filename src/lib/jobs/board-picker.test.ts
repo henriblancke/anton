@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
+import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
 import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
 import { listOpenEscalations } from "../escalations";
 import { LABELS } from "../beads/bd";
@@ -132,6 +133,35 @@ describe("makeBoardPickerHandler", () => {
       changed: false,
       note: "nothing claimable to rank",
     });
+  });
+
+  it("keeps a vetoed target out of the NEXT pass's plan, until its window closes", async () => {
+    // R3.9 end to end: the operator's veto is stored, the next pass reads it, and the target leaves
+    // the plan — named as deferred, not silently absent — until the bounded window runs out.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 1 })];
+    const run = makeBoardPickerHandler({ db: t.db, clock });
+
+    await run(fakeCtx());
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual([
+      "t1",
+      "t2",
+    ]);
+
+    await recordPickerVeto(t.db, clock, { projectId: "p1", beadId: "t1", action: "not-now" });
+
+    await run(fakeCtx());
+    const after = await getBoardPickerPlan(t.db, "p1");
+    expect(after?.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(after?.exclusions.find((e) => e.beadId === "t1")?.reason).toBe("deferred");
+
+    // Past the window the pass offers it again — the hold expires on its own, and nothing about the
+    // veto is a per-bead blocklist.
+    const later: Clock = { now: () => NOW + PICKER_DEFER_WINDOW_MS + 1000 };
+    await makeBoardPickerHandler({ db: t.db, clock: later })(fakeCtx());
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual([
+      "t1",
+      "t2",
+    ]);
   });
 
   it("reads the board strictly, so a gate-less read retries instead of recording it as blocked", async () => {

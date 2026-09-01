@@ -14,6 +14,7 @@ import {
   type HygieneReport,
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
+import { deferralVersion, latestPickerDeferrals } from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
 import {
   latestScanHealth,
@@ -55,17 +56,25 @@ function boardVersion(
   snapshotVersion: number,
   hygiene: string,
   scan: string,
+  vetoes: string,
   repoPath: string,
 ): string {
-  return `${snapshotVersion}:${hygiene}:${scan}:${getSyncStatusToken(repoPath)}`;
+  return `${snapshotVersion}:${hygiene}:${scan}:${vetoes}:${getSyncStatusToken(repoPath)}`;
 }
 
 export async function getBoardVersion(project: Project): Promise<string> {
-  const [hygiene, scan] = await Promise.all([
+  const [hygiene, scan, deferrals] = await Promise.all([
     readHygieneVersion(project),
     readScanHealthVersion(project),
+    readDeferrals(project),
   ]);
-  return boardVersion(issueSnapshotVersion(project.repoPath), hygiene, scan, project.repoPath);
+  return boardVersion(
+    issueSnapshotVersion(project.repoPath),
+    hygiene,
+    scan,
+    deferralVersion(deferrals),
+    project.repoPath,
+  );
 }
 
 /**
@@ -101,6 +110,24 @@ async function readScanHealth(project: Project): Promise<ScanHealth | undefined>
   }
 }
 
+/**
+ * The picker vetoes in force (anton-jqvy), bead id → expiry. Degrades to "nothing deferred" on an
+ * anton.db failure for the same reason the reads above do: a veto is pacing, and losing it must
+ * never take the board — where every run is approved — down with it.
+ *
+ * Fed into the freshness token as the ACTIVE set rather than as a write stamp, so a window closing
+ * moves the token on its own: an expiry is not a write, and a card left drawn as deferred after its
+ * hold ran out is a card the operator would think anton had forgotten.
+ */
+async function readDeferrals(project: Project): Promise<Map<string, number>> {
+  try {
+    return await latestPickerDeferrals(project.id);
+  } catch (err) {
+    console.error(`[board] picker deferral read failed for ${project.slug}`, err);
+    return new Map();
+  }
+}
+
 async function readScanHealthVersion(project: Project): Promise<string> {
   try {
     return await latestScanHealthVersion(project.id);
@@ -127,13 +154,15 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Read beads and their snapshot version together: a background refresh can land mid-build, so
   // stamping the response with a separately-read version would let it advance past the data served
   // here — the client would then poll that version, 304, and never see this board's data refreshed.
-  // The bead read (bd) and the anton.db reads (hygiene, scan health) are independent — run them
-  // concurrently so the slowest sets the board's latency instead of their sum.
-  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan] = await Promise.all([
-    readAllIssues(project.repoPath, opts),
-    readHygiene(project),
-    readScanHealth(project),
-  ]);
+  // The bead read (bd) and the anton.db reads (hygiene, scan health, picker vetoes) are independent
+  // — run them concurrently so the slowest sets the board's latency instead of their sum.
+  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan, deferrals] =
+    await Promise.all([
+      readAllIssues(project.repoPath, opts),
+      readHygiene(project),
+      readScanHealth(project),
+      readDeferrals(project),
+    ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
   // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
@@ -259,9 +288,16 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   for (const stage of STAGES) {
     for (const epic of columns[stage]) {
       attachPrUrl(epic, base);
+      // A vetoed target reads as SET ASIDE on the board, never as silently missing (anton-jqvy).
+      const held = deferrals.get(epic.id);
+      if (held !== undefined) epic.notNowUntil = held;
       for (const ticket of epic.tickets) attachPrUrl(ticket, base);
     }
-    for (const item of standalone[stage]) attachPrUrl(item, base);
+    for (const item of standalone[stage]) {
+      attachPrUrl(item, base);
+      const held = deferrals.get(item.id);
+      if (held !== undefined) item.notNowUntil = held;
+    }
   }
 
   return {
@@ -274,6 +310,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       snapshotVersion,
       hygieneVersion(hygiene),
       scanHealthVersion(scan),
+      deferralVersion(deferrals),
       project.repoPath,
     ),
     columns,

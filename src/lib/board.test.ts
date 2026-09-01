@@ -48,6 +48,19 @@ vi.mock("./scan-health", async () => {
   };
 });
 
+// Same seam, same reason, for the picker vetoes the board folds into its cards and its freshness
+// token (anton-jqvy): an unstubbed read reaches the real anton.db. `deferrals` is what this
+// project's operator has set aside, and every test but the veto ones runs with nothing deferred.
+let deferrals = new Map<string, number>();
+
+vi.mock("./picker-veto", async () => {
+  const actual = await vi.importActual<typeof import("./picker-veto")>("./picker-veto");
+  return {
+    ...actual,
+    latestPickerDeferrals: async () => deferrals,
+  };
+});
+
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
@@ -57,6 +70,7 @@ beforeEach(() => {
   listMock.mockReset();
   hygieneReport = undefined;
   scanHealth = undefined;
+  deferrals = new Map();
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1044,5 +1058,57 @@ describe("review scores on the board (anton-tprv)", () => {
 
     expect(trajectory?.scored).toBe(1);
     expect(trajectory?.worst.id).toBe("feat-1");
+  });
+});
+
+/**
+ * A vetoed target reads as SET ASIDE on the board rather than silently gone (anton-jqvy). The hold
+ * is machine-local anton.db state, so it also has to move the freshness token — including when it
+ * expires, which is not a write anything else would notice.
+ */
+describe("picker vetoes on the board (anton-jqvy)", () => {
+  const UNTIL = 1_800_086_400_000;
+
+  it("marks a deferred card and a deferred chip, leaving both on the board", async () => {
+    listMock.mockResolvedValue([
+      makeBead({ id: "f-1", title: "A feature", issue_type: "feature" }),
+      makeBead({ id: "t-1", title: "A loose task" }),
+    ]);
+    deferrals = new Map([
+      ["f-1", UNTIL],
+      ["t-1", UNTIL],
+    ]);
+
+    const board = await getBoard(project);
+    expect(board.columns.backlog.find((e) => e.id === "f-1")?.notNowUntil).toBe(UNTIL);
+    expect(board.standalone.backlog.find((i) => i.id === "t-1")?.notNowUntil).toBe(UNTIL);
+  });
+
+  it("leaves a target anton was never vetoed on unmarked", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    expect((await getBoard(project)).standalone.backlog[0]?.notNowUntil).toBeUndefined();
+  });
+
+  it("moves the refresh token when a veto lands AND when its window closes", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    const clean = (await getBoard(project)).version;
+
+    resetIssueSnapshots();
+    deferrals = new Map([["t-1", UNTIL]]);
+    const held = (await getBoard(project)).version;
+    expect(held).not.toBe(clean);
+
+    // An expiry is not a write: the active set shrinks on its own, and the token has to follow it
+    // or the card stays drawn as deferred until something unrelated moves.
+    resetIssueSnapshots();
+    deferrals = new Map();
+    expect((await getBoard(project)).version).toBe(clean);
+  });
+
+  it("agrees with the version the poll path compares against", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    deferrals = new Map([["t-1", UNTIL]]);
+    const board = await getBoard(project);
+    expect(await getBoardVersion(project)).toBe(board.version);
   });
 });

@@ -195,3 +195,25 @@ describe("EpicCard review score (anton-tprv)", () => {
     expect(html).toContain("review 0/10");
   });
 });
+
+/**
+ * A pick the operator vetoed stays on the board, drawn as set aside (anton-jqvy). A card that simply
+ * stopped being offered would leave the operator wondering what they broke.
+ */
+describe("EpicCard — a vetoed target", () => {
+  const UNTIL = Date.now() + 5 * 60 * 60 * 1000;
+
+  it("shows the hold and how long is left on it", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ notNowUntil: UNTIL })} />,
+    );
+    expect(html).toContain("not now");
+    expect(html).toContain("Resumable crawl checkpoints");
+  });
+
+  it("says nothing about a target nobody vetoed", () => {
+    expect(renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />)).not.toContain(
+      "not now",
+    );
+  });
+});

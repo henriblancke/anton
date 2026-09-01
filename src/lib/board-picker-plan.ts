@@ -39,6 +39,8 @@ import type { AntonDb, Clock } from "./jobs/queue";
  *   • `blocked`          — an unmet blocker on the `blocks` graph.
  *   • `approval-gap`     — fails one of the approve gate's four promises (`approval-gate.ts`).
  *   • `policy`           — structurally claimable, but the standing policy does not admit it.
+ *   • `deferred`         — the operator vetoed this pick (`picker-veto.ts`), and the bounded window
+ *                          they bought with it has not run out. Their answer, not a rule's.
  */
 export type PickerExclusionReason =
   | "not-a-run-target"
@@ -47,7 +49,8 @@ export type PickerExclusionReason =
   | "claimed"
   | "blocked"
   | "approval-gap"
-  | "policy";
+  | "policy"
+  | "deferred";
 
 /** One target in the plan, at the position the ranking gave it. */
 export interface PickerPlanEntry {

@@ -3,7 +3,15 @@ import { GitPullRequestIcon } from "lucide-react";
 import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { CopyButton } from "@/components/ui/copy-button";
-import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
+import {
+  AbandonedChip,
+  BlockedChip,
+  MetaChip,
+  NotNowChip,
+  PrLink,
+  RiskChip,
+  SnoozedChip,
+} from "@/components/atoms";
 import { ReviewScoreChip } from "@/components/review-score";
 import { TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
@@ -86,6 +94,9 @@ export function ChipMeta({
       {item.stage !== "done" && <ContractChip contract={item.contract} />}
       {item.abandoned && <AbandonedChip />}
       {deferred && <SnoozedChip />}
+      {/* Vetoed, not vanished (anton-jqvy) — and its own chip, because a bounded hold anton lifts
+          itself is not the same thing as the snooze a human has to undo. */}
+      {item.notNowUntil !== undefined && <NotNowChip untilMs={item.notNowUntil} />}
     </div>
   );
 }

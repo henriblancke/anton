@@ -224,6 +224,16 @@ export interface Epic {
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
   /**
+   * The operator VETOED this pick and anton is holding it until this instant (epoch ms, anton-jqvy).
+   * Machine-local pacing on anton's own queue — distinct from bd's `deferred` STATUS, which is shared
+   * board state a human has to undo. Absent means nothing is holding it.
+   *
+   * On the card rather than only in the recorded plan because a vetoed target must read as SET ASIDE
+   * rather than as gone: a card that silently stopped being offered would leave the operator
+   * wondering what they broke.
+   */
+  notNowUntil?: number;
+  /**
    * The product epic this card sits under, when its parent is an `epic` bead — the grouping key for
    * the board's epic swimlanes (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a
    * top-level run target, which collects in the "No epic" lane.
@@ -268,6 +278,8 @@ export interface StandaloneItem {
   deferred: boolean;
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
+  /** Held out of the picker's plan by an operator veto, exactly as on a card (Epic.notNowUntil). */
+  notNowUntil?: number;
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors

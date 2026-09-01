@@ -101,3 +101,24 @@ describe("ChipMeta", () => {
     expect(html).toContain("snoozed");
   });
 });
+
+describe("ChipMeta — a vetoed target", () => {
+  const UNTIL = Date.now() + 5 * 60 * 60 * 1000;
+
+  it("draws the picker's bounded hold as its own chip, beside bd's snooze", () => {
+    // Two different things: `snoozed` is shared board state a human undoes, `not now` is anton's own
+    // machine-local hold that expires. One chip for both would conflate them.
+    const html = renderToStaticMarkup(
+      <ChipMeta item={makeStandaloneItem({ notNowUntil: UNTIL })} deferred hasOverlay={false} />,
+    );
+    expect(html).toContain("not now");
+    expect(html).toContain("snoozed");
+  });
+
+  it("says nothing about a target nobody vetoed", () => {
+    const html = renderToStaticMarkup(
+      <ChipMeta item={makeStandaloneItem()} deferred={false} hasOverlay={false} />,
+    );
+    expect(html).not.toContain("not now");
+  });
+});

@@ -27,6 +27,7 @@ import {
   AbandonedChip,
   BlockedChip,
   MetaChip,
+  NotNowChip,
   PartiallyBlockedChip,
   PrLink,
   RiskChip,
@@ -231,6 +232,9 @@ export function EpicCard({
         {/* Renders only once a review has actually scored this target (anton-tprv). */}
         <ReviewScoreChip score={epic.reviewScore} />
         <ContractChip contract={epic.contract} />
+        {/* A pick the operator set aside is SHOWN set aside — the veto's whole point is that
+            disagreeing does not make the card disappear (anton-jqvy). */}
+        {epic.notNowUntil !== undefined && <NotNowChip untilMs={epic.notNowUntil} />}
       </div>
 
       {epic.stage === "backlog" && !overlay && (
