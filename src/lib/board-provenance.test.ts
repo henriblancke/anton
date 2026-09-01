@@ -57,6 +57,7 @@ const MISPRIORITY: DetectionInput = {
 
 const plan = (over: Partial<BoardPickerPlan> = {}): BoardPickerPlan => ({
   projectId: "p1",
+  planId: "plan-1",
   generatedAt: 1_770_000_000,
   stamp: { observedAtMs: 1_770_000_000_000, digest: "d1", beadCount: 3 },
   entries: [{ beadId: "anton-1", rank: 1, rule: "the work policy armed on this machine" }],

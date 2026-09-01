@@ -43,7 +43,7 @@ export function ApproveRunAction({
   budgetAware: boolean;
   approval: StandaloneApproval;
 }) {
-  const { approved, deferred, running, approveRun } = approval;
+  const { approved, deferred, running, locked, approveRun } = approval;
   if (!canOfferRun(item, approved, deferred)) return null;
 
   if (contractBlocks(item.contract)) {
@@ -65,7 +65,7 @@ export function ApproveRunAction({
             size="xs"
             variant="outline"
             onClick={() => approveRun(false)}
-            disabled={running}
+            disabled={running || locked}
             title="Queue this run for the budget governor to pace against the weekly plan"
           >
             Queue
@@ -83,7 +83,7 @@ export function ApproveRunAction({
           <Button
             size="xs"
             onClick={() => approveRun(true)}
-            disabled={running}
+            disabled={running || locked}
             title="Approve and run now, bypassing budget pacing (the session limit still applies)"
           >
             {running ? "…" : "Approve"}
@@ -94,7 +94,12 @@ export function ApproveRunAction({
   }
 
   return (
-    <Button size="xs" onClick={() => approveRun()} disabled={running} className="pointer-events-auto">
+    <Button
+      size="xs"
+      onClick={() => approveRun()}
+      disabled={running || locked}
+      className="pointer-events-auto"
+    >
       {running ? "Starting…" : "Approve & run"}
     </Button>
   );

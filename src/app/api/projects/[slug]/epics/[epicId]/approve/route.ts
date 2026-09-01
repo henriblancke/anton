@@ -68,8 +68,8 @@ async function readApprovalBody(
  * has no reason to write (anton-d2h6).
  *
  * The pick is resolved from the recorded plan HERE, exactly as the veto route resolves its own
- * provenance server-side: the rank and the board digest name the decision being accepted, and a
- * client-supplied one could name any.
+ * provenance server-side: the rank and the plan's generation id name the decision being accepted,
+ * and a client-supplied one could name any.
  *
  * And the pick must still BE one (PR #212 review). The flag is a client's claim that this target was
  * anton's pick, so a stale lane, a retried request, or any direct caller can set it on a target the
@@ -118,7 +118,7 @@ async function recordRelease(projectId: string, beadId: string, board: Bead[]): 
       beadId,
       ...(entry.rule ? { rule: entry.rule } : {}),
       rank: entry.rank,
-      ...(plan.stamp.digest ? { planDigest: plan.stamp.digest } : {}),
+      ...(plan.planId ? { planId: plan.planId } : {}),
     });
     if (refusal === "vetoed") skip("the operator vetoed this pick first");
   } catch (err) {

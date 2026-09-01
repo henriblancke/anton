@@ -175,6 +175,7 @@ describe("board stamp", () => {
 describe("staleness", () => {
   const plan = {
     projectId: "p1",
+    planId: "plan-1",
     generatedAt: Math.floor(NOW / 1000),
     stamp: stampBoard([bead()], OBSERVED),
     entries: [entry()],
@@ -416,6 +417,59 @@ describe("plan storage", () => {
 
     expect(second.entriesJson).toBe(first.entriesJson);
     expect(second.exclusionsJson).toBe(first.exclusionsJson);
+  });
+
+  /**
+   * The plan's own identity, which is what a verdict answers (PR #212 review). The board digest
+   * cannot serve: it describes the decision INPUTS, so a pass that re-admits a target once its veto
+   * expires stamps the same digest the decline was filed against, and the new pick would inherit the
+   * old answer.
+   */
+  describe("the plan's generation id", () => {
+    it("carries over while the pass keeps deciding the same plan", async () => {
+      const input = { projectId, stamp: stamp(), entries: [entry()], exclusions: [excluded()] };
+
+      await saveBoardPickerPlan(tdb.db, clock, input);
+      const first = (await getBoardPickerPlan(tdb.db, projectId))!.planId;
+      await saveBoardPickerPlan(tdb.db, clock, input);
+
+      expect(first).not.toBe("");
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).toBe(first);
+    });
+
+    it("is minted afresh the moment the pass decides differently", async () => {
+      await saveBoardPickerPlan(tdb.db, clock, { projectId, stamp: stamp(), entries: [entry()], exclusions: [] });
+      const first = (await getBoardPickerPlan(tdb.db, projectId))!.planId;
+
+      await saveBoardPickerPlan(tdb.db, clock, {
+        projectId,
+        stamp: stamp(),
+        entries: [entry({ beadId: "anton-b" })],
+        exclusions: [],
+      });
+
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).not.toBe(first);
+    });
+
+    // The regression this id exists for: veto → the window closes → the same target, ranked the same
+    // way, against a board and a policy nobody touched. Same digest, and it must NOT be the same pick.
+    it("never re-issues the id of a plan a veto has since answered", async () => {
+      const offered = { projectId, stamp: stamp(), entries: [entry()], exclusions: [] };
+      await saveBoardPickerPlan(tdb.db, clock, offered);
+      const before = (await getBoardPickerPlan(tdb.db, projectId))!.planId;
+
+      // The pass that sees the deferral: the target drops out of the ranking and is named as held.
+      await saveBoardPickerPlan(tdb.db, clock, {
+        projectId,
+        stamp: stamp(),
+        entries: [],
+        exclusions: [excluded({ beadId: "anton-a", reason: "deferred", detail: "vetoed" })],
+      });
+      // And the pass after the window closes, over the very same board.
+      await saveBoardPickerPlan(tdb.db, clock, offered);
+
+      expect((await getBoardPickerPlan(tdb.db, projectId))!.planId).not.toBe(before);
+    });
   });
 
   it("degrades a corrupt blob to nothing recorded, leaving the count to show the discrepancy", async () => {

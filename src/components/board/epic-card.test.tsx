@@ -3,37 +3,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { Bead } from "@/lib/beads/types";
 import { contractStatusOf } from "@/lib/beads/contract";
-import type { Epic } from "@/lib/types";
 import { EpicCard } from "@/components/board/epic-card";
+import { makeEpic } from "@/components/board/epic.fixture";
 
 // `[Release]` is the card's one interactive leaf that needs a router (it re-reads the lane after a
 // lost claim race); these cases render to static markup, where no App Router is mounted.
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }) }));
-
-function makeEpic(over: Partial<Epic> = {}): Epic {
-  const ready = over.ready ?? true;
-  return {
-    id: "anton-1",
-    title: "Resumable crawl checkpoints",
-    type: "feature",
-    approved: false,
-    stage: "backlog",
-    assignee: null,
-    createdAt: "2026-07-20T00:00:00.000Z",
-    createdBy: null,
-    blockedBy: [],
-    ready,
-    // Mirrors toEpic's own fallback: a fixture that says only `ready: false` means fully blocked.
-    childReadiness: ready ? "ready" : "blocked",
-    readyChildren: [],
-    blockedChildren: [],
-    rank: 0,
-    priority: 2,
-    abandoned: false,
-    tickets: [],
-    ...over,
-  };
-}
 
 describe("EpicCard type language", () => {
   it("presents a feature card as a feature, not an epic", () => {

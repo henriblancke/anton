@@ -50,7 +50,7 @@ export interface PickerVerdictRow {
   rule?: string;
   criterion?: PolicyCriterionKey;
   rank?: number;
-  planDigest?: string;
+  planId?: string;
   /** Epoch ms the deferral expires; absent when the verdict defers nothing. */
   deferredUntilMs?: number;
   decidedAtMs: number;
@@ -69,8 +69,8 @@ export interface RecordAcceptInput {
   /** The admitting rule the plan recorded for this pick, when the caller read one. */
   rule?: string;
   rank?: number;
-  /** The board digest of the plan being answered — what identifies the PICK, not just the bead. */
-  planDigest?: string;
+  /** The generation id of the plan being answered — what identifies the PICK, not just the bead. */
+  planId?: string;
 }
 
 export interface RecordVetoInput {
@@ -82,7 +82,7 @@ export interface RecordVetoInput {
   /** The criterion `Never` opens the editor at; absent when the policy narrows nothing. */
   criterion?: PolicyCriterionKey;
   rank?: number;
-  planDigest?: string;
+  planId?: string;
 }
 
 function secDate(ms: number): Date {
@@ -108,16 +108,17 @@ function msOf(value: unknown): number | undefined {
  * between the guard and the insert) and records nothing when this pick already carries the OPPOSITE
  * verdict. First answer wins; the second is told it lost rather than contradicting it.
  *
- * Scoped to the PICK — project + bead + plan digest — not to the bead: a later plan that re-picks the
- * same target is a new decision and takes its own answer. A digest-less verdict answers no recorded
- * pick and stays unconstrained, exactly as `picker_verdicts_accept_unique` leaves it.
+ * Scoped to the PICK — project + bead + plan id — not to the bead: a later plan that re-picks the
+ * same target is a new decision and takes its own answer, which is why the id names the plan
+ * GENERATION and never the reusable board digest (`planIdFor`). A plan-less verdict answers no
+ * recorded pick and stays unconstrained, exactly as `picker_verdicts_accept_unique` leaves it.
  */
 function pickAlreadyAnswered(
   tx: Pick<AntonDb, "select">,
-  input: { projectId: string; beadId: string; planDigest?: string },
+  input: { projectId: string; beadId: string; planId?: string },
   verdict: PickerVerdict,
 ): boolean {
-  if (!input.planDigest) return false;
+  if (!input.planId) return false;
   return (
     tx
       .select({ id: schema.pickerVerdicts.id })
@@ -126,7 +127,7 @@ function pickAlreadyAnswered(
         and(
           eq(schema.pickerVerdicts.projectId, input.projectId),
           eq(schema.pickerVerdicts.beadId, input.beadId),
-          eq(schema.pickerVerdicts.planDigest, input.planDigest),
+          eq(schema.pickerVerdicts.planId, input.planId),
           eq(schema.pickerVerdicts.verdict, verdict),
         ),
       )
@@ -176,7 +177,7 @@ export async function recordPickerVeto(
           rule: input.rule ?? null,
           criterion: input.criterion ?? null,
           rank: input.rank ?? null,
-          planDigest: input.planDigest ?? null,
+          planId: input.planId ?? null,
           deferredUntil: secDate(untilMs),
           decidedAt: secDate(nowMs),
         })
@@ -202,12 +203,13 @@ export type PickerAcceptRefusal = "vetoed" | "duplicate";
  *
  * Idempotent per PICK rather than per click. A release that hits the enqueue dedupe (a double-click,
  * a retry after a slow response) starts no second run, so it must not leave a second accept inflating
- * the evidence a future arming decision reads. The pick is identified by the plan digest the decision
- * was recorded under; a release against no recorded plan has no pick to dedupe on and always records.
+ * the evidence a future arming decision reads. The pick is identified by the id of the plan
+ * generation it was offered by; a release against no recorded plan has no pick to dedupe on and
+ * always records.
  *
  * The dedupe is the INSERT, not a read before it: two overlapping releases of one pick both pass a
  * separate existence check and both write. So the conflict is resolved where it is atomic — against
- * `picker_verdicts_accept_unique`, the partial index over accepted verdicts — and a digest-less
+ * `picker_verdicts_accept_unique`, the partial index over accepted verdicts — and a plan-less
  * accept, which that index leaves unconstrained (NULLs are distinct), still always records.
  *
  * And refused outright when a veto already declined this pick (see {@link pickAlreadyAnswered}). The
@@ -235,7 +237,7 @@ export async function recordPickerAccept(
           rule: input.rule ?? null,
           criterion: null,
           rank: input.rank ?? null,
-          planDigest: input.planDigest ?? null,
+          planId: input.planId ?? null,
           deferredUntil: null,
           decidedAt: secDate(clock.now()),
         })
@@ -360,7 +362,7 @@ export async function listPickerVerdicts(
     ...(row.rule ? { rule: row.rule } : {}),
     ...(row.criterion ? { criterion: row.criterion as PolicyCriterionKey } : {}),
     ...(typeof row.rank === "number" ? { rank: row.rank } : {}),
-    ...(row.planDigest ? { planDigest: row.planDigest } : {}),
+    ...(row.planId ? { planId: row.planId } : {}),
     ...(msOf(row.deferredUntil) !== undefined ? { deferredUntilMs: msOf(row.deferredUntil)! } : {}),
     decidedAtMs: msOf(row.decidedAt) ?? 0,
   }));

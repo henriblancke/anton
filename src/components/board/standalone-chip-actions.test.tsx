@@ -19,6 +19,7 @@ const approval = (over: Partial<StandaloneApproval> = {}): StandaloneApproval =>
   approved: false,
   deferred: false,
   running: false,
+  locked: false,
   approveRun: vi.fn(),
   setApproved: vi.fn(),
   setDeferred: vi.fn(),

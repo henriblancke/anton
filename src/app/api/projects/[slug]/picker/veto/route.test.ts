@@ -10,7 +10,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
-import { saveBoardPickerPlan } from "@/lib/board-picker-plan";
+import { getBoardPickerPlan, saveBoardPickerPlan } from "@/lib/board-picker-plan";
 import {
   PICKER_DEFER_WINDOW_MS,
   activeDeferrals,
@@ -85,9 +85,12 @@ describe("POST /picker/veto", () => {
       verdict: "declined",
       action: "not-now",
       rank: 3,
-      planDigest: "cafebabecafebabe",
+      // The plan GENERATION it answers, never the board digest — that digest comes back the moment a
+      // later pass re-admits this target, and the new pick must not inherit this decline.
+      planId: (await getBoardPickerPlan(tdb.db, "p1"))!.planId,
       rule: "the work policy armed on this machine",
     });
+    expect(row.planId).not.toBe("cafebabecafebabe");
     expect([...(await activeDeferrals(tdb.db, "p1", new Date())).keys()]).toEqual(["anton-a"]);
   });
 
@@ -148,7 +151,7 @@ describe("POST /picker/veto", () => {
     await recordPickerAccept(tdb.db, { now: () => NOW }, {
       projectId: "p1",
       beadId: "anton-a",
-      planDigest: "cafebabecafebabe",
+      planId: (await getBoardPickerPlan(tdb.db, "p1"))!.planId,
     });
 
     const res = await POST(req({ beadId: "anton-a", action: "not-now" }), ctx("tmp"));

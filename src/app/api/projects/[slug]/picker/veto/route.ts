@@ -28,7 +28,7 @@ const bodySchema = z.object({
  * open the editor on the control that would keep work like this out. That resolution is server-side
  * because it needs the board and the stored policy; the client only carries the answer into a URL.
  *
- * The plan is read for provenance, not for permission: a veto records the rank and the board digest
+ * The plan is read for provenance, not for permission: a veto records the rank and the generation id
  * of the decision it answers, so the record names a PICK rather than only a bead. A target the
  * current plan does not carry is still vetoable — the pass may have re-ranked since the operator
  * looked — and simply records no rank.
@@ -67,7 +67,7 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
     action,
     ...(entry?.rule ? { rule: entry.rule } : {}),
     ...(entry ? { rank: entry.rank } : {}),
-    ...(plan?.stamp.digest ? { planDigest: plan.stamp.digest } : {}),
+    ...(plan?.planId ? { planId: plan.planId } : {}),
     ...(criterion ? { criterion } : {}),
   });
 

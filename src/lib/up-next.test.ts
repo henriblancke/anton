@@ -33,6 +33,7 @@ function blocks(dependent: string, blocker: string) {
 function plan(entries: PickerPlanEntry[]): BoardPickerPlan {
   return {
     projectId: "p1",
+    planId: "plan-1",
     generatedAt: 1_770_000_000,
     stamp: { observedAtMs: 1_770_000_000_000, digest: "abc", beadCount: entries.length },
     entries,

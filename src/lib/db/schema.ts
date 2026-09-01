@@ -201,6 +201,17 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
     .references(() => projects.id),
   /** The picker job that produced this plan, so an entry traces back to its job row. */
   jobId: text("job_id"),
+  /**
+   * Identity of this GENERATION of the plan — what a verdict names when it answers one of its picks
+   * (`picker_verdicts.plan_id`).
+   *
+   * Distinct from `board_digest`, and that distinction is the point: the digest describes the INPUTS
+   * (board + policy) and is legitimately reusable, so a pass that re-admits a target once its veto
+   * expires stamps the very digest the decline was filed against. Keyed on that, the new pick would
+   * inherit the old answer. Minted fresh whenever the pass decides anything different, and carried
+   * over when it re-decides the same plan.
+   */
+  planId: text("plan_id").notNull().default(""),
   generatedAt: ts("generated_at").notNull().default(now),
   /**
    * Digest of the board snapshot the plan was ranked against. A surface compares it with a digest of
@@ -264,8 +275,11 @@ export const pickerVerdicts = sqliteTable(
     criterion: text("criterion"),
     /** The rank the target held in the plan being answered — the pick, not just the bead. */
     rank: integer("rank"),
-    /** The answered plan's board digest, so a verdict names the DECISION and not only its subject. */
-    planDigest: text("plan_digest"),
+    /**
+     * The answered plan's generation id (`board_picker_plans.plan_id`), so a verdict names the
+     * DECISION and not only its subject. Null when no recorded plan carried the target.
+     */
+    planId: text("plan_id"),
     /** When this target becomes pickable again. Null on an accept — only a decline defers. */
     deferredUntil: ts("deferred_until"),
     decidedAt: ts("decided_at").notNull().default(now),
@@ -279,10 +293,10 @@ export const pickerVerdicts = sqliteTable(
     // conflict-ignoring insert. Two concurrent releases of one pick (a double-click, a retry) start
     // a single run through the enqueue dedupe, so they must not leave two accepts inflating the
     // track record earned autonomy reads. Partial on the accepted verdict because a DECLINE is
-    // legitimately repeatable — a second veto extends the window. A digest-less accept answers no
+    // legitimately repeatable — a second veto extends the window. A plan-less accept answers no
     // recorded pick and stays unconstrained: SQLite treats NULLs as distinct.
     uniqueIndex("picker_verdicts_accept_unique")
-      .on(table.projectId, table.beadId, table.planDigest)
+      .on(table.projectId, table.beadId, table.planId)
       .where(sql`${table.verdict} = 'accepted'`),
   ],
 );

@@ -121,7 +121,7 @@ describe("the decline record", () => {
       rule: "the work policy armed on this machine",
       criterion: "labels:domain",
       rank: 2,
-      planDigest: "cafebabecafebabe",
+      planId: "cafebabecafebabe",
     });
 
     const [row] = await listPickerVerdicts(test.db, PROJECT);
@@ -132,7 +132,7 @@ describe("the decline record", () => {
       rule: "the work policy armed on this machine",
       criterion: "labels:domain",
       rank: 2,
-      planDigest: "cafebabecafebabe",
+      planId: "cafebabecafebabe",
     });
   });
 
@@ -181,7 +181,7 @@ describe("recording an accept", () => {
       beadId: "anton-a",
       rule: "the work policy armed on this machine",
       rank: 1,
-      planDigest: "cafebabecafebabe",
+      planId: "cafebabecafebabe",
     });
 
     expect(await listPickerVerdicts(test.db, PROJECT)).toEqual([
@@ -191,7 +191,7 @@ describe("recording an accept", () => {
         action: "release",
         rule: "the work policy armed on this machine",
         rank: 1,
-        planDigest: "cafebabecafebabe",
+        planId: "cafebabecafebabe",
       }),
     ]);
     // Agreeing with a pick has no window to bound, so it holds nothing out of the next plan.
@@ -199,7 +199,7 @@ describe("recording an accept", () => {
   });
 
   it("counts one accept per PICK, so a re-released target never inflates the record", async () => {
-    const pick = { projectId: PROJECT, beadId: "anton-a", rank: 1, planDigest: "d1" };
+    const pick = { projectId: PROJECT, beadId: "anton-a", rank: 1, planId: "d1" };
     await recordPickerAccept(test.db, clock, pick);
     nowMs = NOW + 5_000;
     await recordPickerAccept(test.db, clock, pick);
@@ -208,7 +208,7 @@ describe("recording an accept", () => {
   });
 
   it("counts one accept when two releases of the same pick OVERLAP", async () => {
-    const pick = { projectId: PROJECT, beadId: "anton-a", rank: 1, planDigest: "d1" };
+    const pick = { projectId: PROJECT, beadId: "anton-a", rank: 1, planId: "d1" };
     // A read-then-insert lets both requests pass the check before either writes. The unique index is
     // what makes the second one a no-op instead of a second accept.
     await Promise.all([
@@ -220,7 +220,7 @@ describe("recording an accept", () => {
   });
 
   it("leaves a DECLINE against the same plan repeatable — a second veto extends the window", async () => {
-    const veto = { projectId: PROJECT, beadId: "anton-a", action: "not-now" as const, planDigest: "d1" };
+    const veto = { projectId: PROJECT, beadId: "anton-a", action: "not-now" as const, planId: "d1" };
     await recordPickerVeto(test.db, clock, veto);
     nowMs = NOW + 60_000;
     const second = await recordPickerVeto(test.db, clock, veto);
@@ -232,9 +232,9 @@ describe("recording an accept", () => {
   });
 
   it("records again once a later plan re-picks it — a new decision is a new answer", async () => {
-    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" });
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planId: "d1" });
     nowMs = NOW + 60_000;
-    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d2" });
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planId: "d2" });
 
     expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 2, settled: 2 });
   });
@@ -247,7 +247,7 @@ describe("recording an accept", () => {
   });
 
   it("keeps another project's record its own", async () => {
-    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" });
+    await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planId: "d1" });
     expect(await pickerTrackRecord(test.db, OTHER)).toEqual({ accepted: 0, declined: 0, settled: 0 });
   });
 });
@@ -259,7 +259,7 @@ describe("recording an accept", () => {
  * answer wins, the loser records NOTHING, and only the OPPOSITE verdict on the SAME pick conflicts.
  */
 describe("opposite verdicts on one pick", () => {
-  const PICK = { projectId: PROJECT, beadId: "anton-a", planDigest: "d1" };
+  const PICK = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
 
   it("refuses a veto of a pick a release already accepted, and defers nothing", async () => {
     await recordPickerAccept(test.db, clock, PICK);
@@ -299,7 +299,7 @@ describe("opposite verdicts on one pick", () => {
       projectId: PROJECT,
       beadId: "anton-a",
       action: "not-now",
-      planDigest: "d2",
+      planId: "d2",
     });
 
     expect(outcome).toMatchObject({ recorded: true });
@@ -325,7 +325,7 @@ describe("opposite verdicts on one pick", () => {
       projectId: OTHER,
       beadId: "anton-a",
       action: "not-now",
-      planDigest: "d1",
+      planId: "d1",
     });
 
     expect(outcome).toMatchObject({ recorded: true });

@@ -1156,6 +1156,7 @@ describe("provenance on the board (anton-cqxd)", () => {
   /** Stamped over the board it ranks — an unstale plan, as a pass that just ran would have left. */
   const planFor = (board: Bead[], beadId: string): import("./board-picker-plan").BoardPickerPlan => ({
     projectId: "p1",
+    planId: "plan-1",
     generatedAt: 1_770_000_000,
     stamp: stampBoard(board, 1_770_000_000_000),
     entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
@@ -1256,6 +1257,7 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
   function planOver(board: Bead[], beadId: string): import("./board-picker-plan").BoardPickerPlan {
     return {
       projectId: "p1",
+      planId: "plan-1",
       generatedAt: 1_770_000_000,
       stamp: stampBoard(board, 1_770_000_000_000),
       entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
@@ -1367,6 +1369,7 @@ describe("a pick the board has moved past (anton-t9m4)", () => {
     listMock.mockResolvedValue(board);
     pickerPlan = {
       projectId: "p1",
+      planId: "plan-1",
       generatedAt: 1_770_000_000,
       stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
       entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
@@ -1385,6 +1388,7 @@ describe("a pick the board has moved past (anton-t9m4)", () => {
     listMock.mockResolvedValue(board);
     pickerPlan = {
       projectId: "p1",
+      planId: "plan-1",
       generatedAt: 1_770_000_000,
       stamp: stampBoard(board, 1_770_000_000_000),
       entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],

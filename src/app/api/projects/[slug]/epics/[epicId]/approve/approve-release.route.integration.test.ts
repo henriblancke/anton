@@ -17,7 +17,12 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { actAs, executeEpicJobs, setupApproveSuite, type ApproveSuiteCtx } from "../approve.fixture";
 import { describeBd } from "@/lib/testing/integration";
-import { saveBoardPickerPlan, stampBoard, type BoardStamp } from "@/lib/board-picker-plan";
+import {
+  getBoardPickerPlan,
+  saveBoardPickerPlan,
+  stampBoard,
+  type BoardStamp,
+} from "@/lib/board-picker-plan";
 import { loadAllIssues } from "@/lib/beads/issues";
 import { listPickerVerdicts, pickerTrackRecord, recordPickerVeto } from "@/lib/picker-veto";
 
@@ -49,17 +54,19 @@ async function liveStamp(): Promise<BoardStamp> {
   return stampBoard(board, Date.now());
 }
 
-/** Record a plan that ranks `beadId` first, so a release has a pick to answer. Returns its digest —
- *  what a recorded accept must name as the decision it answers. */
+/** Record a plan that ranks `beadId` first, so a release has a pick to answer. Returns the plan's
+ *  GENERATION id — what a recorded accept must name as the decision it answers, and deliberately not
+ *  the reusable board digest. */
 async function planFor(beadId: string, stamp?: BoardStamp): Promise<string> {
   const fence = stamp ?? (await liveStamp());
+  const project = await projectId();
   await saveBoardPickerPlan(getDb(), { now: () => Date.now() }, {
-    projectId: await projectId(),
+    projectId: project,
     stamp: fence,
     entries: [{ beadId, rank: 1, rule: "the work policy armed on this machine" }],
     exclusions: [],
   });
-  return fence.digest;
+  return (await getBoardPickerPlan(getDb(), project))!.planId;
 }
 
 /** Every accept/decline recorded against `beadId` on the seeded project. */
@@ -96,7 +103,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
   it("performs exactly the approval — approve, auto-claim, one run — and records the accept", async () => {
     actAs("anton-test");
     const epic = await runTarget("Released target");
-    const digest = await planFor(epic);
+    const planId = await planFor(epic);
 
     const res = await approve(epic, { release: true });
     expect(res.status).toBe(200);
@@ -118,7 +125,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
         verdict: "accepted",
         action: "release",
         rank: 1,
-        planDigest: digest,
+        planId,
         rule: "the work policy armed on this machine",
       }),
     ]);

@@ -18,7 +18,7 @@
  * db-injectable (like run-health) so the pass and its tests share one connection; the UI read path
  * goes through the shared anton.db.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { contractStatusOf } from "./beads/contract";
@@ -93,6 +93,11 @@ export interface BoardStamp {
 
 export interface BoardPickerPlan {
   projectId: string;
+  /**
+   * Identity of this GENERATION of the plan — what a verdict names when it answers one of its picks
+   * ({@link planIdFor}).
+   */
+  planId: string;
   /** The picker job that produced it; absent for a plan written outside the job (tests). */
   jobId?: string;
   /** Unix seconds, matching every other timestamp this app hands the UI. */
@@ -239,6 +244,48 @@ function toEpoch(value: unknown): number {
 }
 
 /**
+ * The identity of the plan generation being saved — the name a verdict records when it answers one
+ * of this plan's picks (`picker-veto.ts`).
+ *
+ * NOT the board digest, and that is the whole point (PR #212 review). The digest covers the decision
+ * INPUTS — the board and the armed policy — so it is legitimately REUSABLE: a target vetoed on
+ * Monday is re-admitted by a later pass over a board and a policy nobody has touched, and that pass
+ * stamps a byte-identical digest. A verdict keyed to it would make the new pick inherit the old
+ * decline, so the release would start the run and record no accept, quietly skewing the track record
+ * earned autonomy reads.
+ *
+ * Carried over when the pass re-decides the SAME plan, though — the digest, the ranking and the
+ * exclusions all unchanged. The accept and the veto are written by two routes that each read the
+ * plan for themselves, and a fresh id on every ten-minute no-op tick would let a rerun landing
+ * between those two reads hand them different names for one pick, which is exactly the collision
+ * `pickAlreadyAnswered` exists to catch. A veto changes the exclusions, so the pass that re-admits
+ * the target after the window closes is never mistaken for the one that offered it before.
+ */
+async function planIdFor(
+  db: AntonDb,
+  projectId: string,
+  decided: { boardDigest: string; entriesJson: string; exclusionsJson: string },
+): Promise<string> {
+  const [prev] = await db
+    .select({
+      planId: schema.boardPickerPlans.planId,
+      boardDigest: schema.boardPickerPlans.boardDigest,
+      entriesJson: schema.boardPickerPlans.entriesJson,
+      exclusionsJson: schema.boardPickerPlans.exclusionsJson,
+    })
+    .from(schema.boardPickerPlans)
+    .where(eq(schema.boardPickerPlans.projectId, projectId))
+    .limit(1);
+  const unchanged =
+    prev !== undefined &&
+    prev.planId !== "" &&
+    prev.boardDigest === decided.boardDigest &&
+    prev.entriesJson === decided.entriesJson &&
+    prev.exclusionsJson === decided.exclusionsJson;
+  return unchanged ? prev.planId : randomUUID();
+}
+
+/**
  * Write the project's plan, replacing the previous one. One row per project by construction, so
  * this is an upsert rather than an append — a pass that admits nothing stores an empty plan, which
  * is the signal "decided, nothing to start" and NOT "never ran".
@@ -258,16 +305,20 @@ export async function saveBoardPickerPlan(
   // assigned means a caller that built the list some other way still records the queue it decided.
   const entries = [...input.entries].sort((a, b) => a.rank - b.rank);
   const exclusions = sortExclusions(input.exclusions);
+  const decided = {
+    boardDigest: input.stamp.digest,
+    entriesJson: JSON.stringify(entries),
+    exclusionsJson: JSON.stringify(exclusions),
+  };
   const row = {
     projectId: input.projectId,
     jobId: input.jobId ?? null,
+    planId: await planIdFor(db, input.projectId, decided),
     generatedAt: secDate(clock.now()),
-    boardDigest: input.stamp.digest,
     boardObservedAtMs: input.stamp.observedAtMs,
     boardBeadCount: input.stamp.beadCount,
-    entriesJson: JSON.stringify(entries),
-    exclusionsJson: JSON.stringify(exclusions),
     targetCount: entries.length,
+    ...decided,
   };
   await db
     .insert(schema.boardPickerPlans)
@@ -300,6 +351,7 @@ export async function getBoardPickerPlan(
   if (!row) return undefined;
   return {
     projectId: row.projectId,
+    planId: row.planId,
     jobId: row.jobId ?? undefined,
     generatedAt: toEpoch(row.generatedAt),
     stamp: {

@@ -25,6 +25,7 @@ import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { ProvenanceBadges } from "@/components/board/provenance-badge";
+import { usePickDecision } from "@/components/board/pick-decision";
 import { ReleaseAction } from "@/components/board/release-action";
 import {
   AbandonedChip,
@@ -75,6 +76,12 @@ export function EpicCard({
   const [approving, setApproving] = useState(false);
   const approved = epic.approved || optimisticApproved;
   const word = typeWord(epic);
+  // Approve/Queue are answers to the same pick the vetoes above a ranked card decline, so they take
+  // the same lock `[Release]` does (PR #212 review). Queue is the case that needs it most: it
+  // records no accept, so nothing downstream can settle the race for it — a queued run would sit on
+  // a target the operator deferred in the same breath. Outside Up Next there is no provider and the
+  // lock is a no-op, which is what leaves Backlog's single Approve untouched.
+  const decision = usePickDecision();
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -90,6 +97,7 @@ export function EpicCard({
   async function handleApprove(immediate = true) {
     // `immediate` is the run-directly choice (anton-y2ue): true → run now (bypass budget pacing),
     // false → queue for optimal usage. Defaults true so the single (non-budget-aware) button runs now.
+    if (!decision.claim()) return;
     setApproving(true);
     setOptimisticApproved(true);
     try {
@@ -102,12 +110,15 @@ export function EpicCard({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
+      decision.settle();
       toast.success(
         immediate ? `Approved & running "${epic.title}"` : `Queued "${epic.title}" for optimal usage`,
       );
       // The run starts with whatever thin sections it has; say so once, here.
       await toastContractAdvisory(res);
     } catch (err) {
+      // Nothing was approved, so the pick goes back on offer — including to the vetoes.
+      decision.abandon();
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : `Failed to approve ${word}`);
     } finally {
@@ -271,7 +282,7 @@ export function EpicCard({
                     size="xs"
                     variant="outline"
                     onClick={() => handleApprove(false)}
-                    disabled={approving}
+                    disabled={approving || decision.state !== "open"}
                     title="Queue this run for the budget governor to pace against the weekly plan"
                   >
                     Queue
@@ -293,7 +304,7 @@ export function EpicCard({
                   <Button
                     size="xs"
                     onClick={() => handleApprove(true)}
-                    disabled={approving}
+                    disabled={approving || decision.state !== "open"}
                     title="Approve and run now, bypassing budget pacing (the session limit still applies)"
                   >
                     {approving ? "Approving…" : "Approve"}
