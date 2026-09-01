@@ -3011,6 +3011,22 @@ export const MAX_HUMAN_TICKET_PASSES = 5;
  *
  * Only tickets no earlier pass handled are re-armed, so a wait is never stacked on an ask that
  * already has one, and a ticket held on an ordinary blocker is not re-asked for.
+ *
+ * Each refresh is RECONCILED against what the earlier passes decided, not merely adopted (PR #213
+ * review) — the board moved under all three of them:
+ *
+ *   • The ticket SET. `runTickets` on the refreshed board would silently replace the set step 1c
+ *     confirmed under the run-lease, so a child attached mid-arm would enter the run behind the
+ *     approval, contract and agent-allowlist gates that already ran, and a detached one would
+ *     vanish after selection. Judged with the same {@link ticketSetDrift} as step 1c and retried,
+ *     so the next attempt re-gates the whole set.
+ *   • The HOLDS. A ticket whose gate is answered is held on the ordinary prerequisites open in the
+ *     board the pass READ; one that closed in the arm's own window would park the run behind an
+ *     already-closed bead, with no blocker event left to resume it. Re-judged against the refreshed
+ *     board, which closes it instead.
+ *   • The LABEL. An operator who drops `agent:human` mid-arm leaves a wait holding a ticket an
+ *     agent can now run, and the run parks asking a person for work that was reclassified. The gate
+ *     this preflight armed for it is retired.
  */
 export async function preflightHumanTickets(args: {
   repo: string;
@@ -3032,35 +3048,112 @@ export async function preflightHumanTickets(args: {
   // Carried ACROSS passes so a kill in a later one takes back the earlier passes' waits too.
   const armedGates: ArmedTicketGate[] = [];
   let armed = false;
+  // Set by every refresh, cleared by the re-judge it owes: the holds below were decided against the
+  // board the pass READ, and the refresh can already have closed what was holding them.
+  let holdsJudgedOnStaleBoard = false;
+
+  /**
+   * Retire the waits armed for tickets that STOPPED being a person's work (PR #213 review).
+   *
+   * The gate outlives the label: nothing auto-resolves a human gate, so a ticket an operator
+   * reclassified mid-arm stays blocked by an ask that no longer applies, and the run parks asking a
+   * person to do work an agent can now do. Retiring is safe precisely because the ask is retired
+   * with it — this leaves the ticket carrying no wait, which is the correct state for agent work.
+   *
+   * Un-handles the ticket rather than only clearing its gate, so a label that flips back is armed
+   * again by a later pass instead of running ungated.
+   *
+   * THROWS when a resolve fails, naming every gate still standing: the ticket is then blocked by a
+   * wait this run knows is dead and nothing else on the board points at it.
+   */
+  const retireGatesFor = async (tickets: Bead[]): Promise<boolean> => {
+    let wrote = false;
+    const stranded: string[] = [];
+    for (const t of tickets) {
+      const armedGate = armedGates.find((g) => g.ticketId === t.id);
+      if (armedGate) {
+        const resolved = await safe(() =>
+          beads.gateResolve(
+            repo,
+            armedGate.gate.gateId,
+            `${t.id} is no longer labelled ${LABELS.agentHuman} — an agent runs it, so the wait ` +
+              `on a person no longer applies`,
+          ),
+        );
+        // Left handled: the wait still stands, so re-arming it would stack a second one beside it.
+        if (!resolved) {
+          stranded.push(`${armedGate.gate.gateId} (${t.id})`);
+          continue;
+        }
+        armedGates.splice(armedGates.indexOf(armedGate), 1);
+        wrote = true;
+        console.log(
+          `[execute-epic] ${targetId}: resolved human gate ${armedGate.gate.gateId} — ${t.id} no ` +
+            `longer carries ${LABELS.agentHuman}, so an agent runs it after all`,
+        );
+      }
+      handled.delete(t.id);
+      answeredButBlocked.delete(t.id);
+    }
+    if (stranded.length > 0) {
+      throw new Error(
+        `${targetId}'s human gate(s) ${stranded.join(", ")} could not be resolved after their ` +
+          `ticket(s) stopped carrying ${LABELS.agentHuman} — they still block work an agent can ` +
+          `now run, so the run would park asking a person for work the operator reclassified. ` +
+          `Resolve them by hand (\`bd gate resolve\`), then re-run the target`,
+      );
+    }
+    return wrote;
+  };
 
   for (let pass = 0; ; pass++) {
     const humanTickets = ticketsOf().filter(
       (t) => !handled.has(t.id) && !isResumeSkipped(t) && beads.isHumanWork(t),
     );
-    if (humanTickets.length === 0) break;
+    const relabelled = ticketsOf().filter((t) => handled.has(t.id) && !beads.isHumanWork(t));
+    const staleHolds = holdsJudgedOnStaleBoard && answeredButBlocked.size > 0;
+    if (humanTickets.length === 0 && relabelled.length === 0 && !staleHolds) break;
     // Plain Error, not a park: the labels are still moving, and the next attempt re-gates from a
     // board that has settled rather than this run arming behind a moving target forever.
     if (pass >= MAX_HUMAN_TICKET_PASSES) {
+      const moving = [...humanTickets, ...relabelled].map((t) => t.id);
       throw new Error(
         `${targetId} kept finding newly-labelled ${LABELS.agentHuman} tickets after ` +
-          `${MAX_HUMAN_TICKET_PASSES} arming passes (${humanTickets.map((t) => t.id).join(", ")}) ` +
+          `${MAX_HUMAN_TICKET_PASSES} arming passes ` +
+          `(${(moving.length > 0 ? moving : [...answeredButBlocked.keys()]).join(", ")}) ` +
           `— retrying so the run gates a settled board rather than dispatching a person's work`,
       );
     }
     armed = true;
-    for (const t of humanTickets) handled.add(t.id);
-    // What a person answered is closed here, what they have not is armed, and what their answer
-    // cannot yet release is reported back as held.
-    for (const [id, blockers] of await armHumanTicketGates(
-      repo,
-      targetId,
-      board,
-      humanTickets,
-      signal,
-      armedGates,
-    )) {
-      answeredButBlocked.set(id, blockers);
+    let wrote = await retireGatesFor(relabelled);
+    // The holds the refresh may already have released, re-judged against the board it brought back.
+    // Computed AFTER the retire above, which drops the ones that stopped being a person's work.
+    const rejudge = holdsJudgedOnStaleBoard
+      ? ticketsOf().filter((t) => answeredButBlocked.has(t.id) && !isResumeSkipped(t))
+      : [];
+    holdsJudgedOnStaleBoard = false;
+    const batch = [...humanTickets, ...rejudge];
+    if (batch.length > 0) {
+      for (const t of humanTickets) handled.add(t.id);
+      // Dropped before the pass, re-added from its answer: a hold that has been released must not
+      // survive as a stale entry the caller would fold into the run's verdict.
+      for (const t of rejudge) answeredButBlocked.delete(t.id);
+      // What a person answered is closed here, what they have not is armed, and what their answer
+      // cannot yet release is reported back as held.
+      const stillHeld = await armHumanTicketGates(
+        repo,
+        targetId,
+        board,
+        batch,
+        signal,
+        armedGates,
+      );
+      for (const [id, blockers] of stillHeld) answeredButBlocked.set(id, blockers);
+      wrote ||= batch.some((t) => !stillHeld.has(t.id));
     }
+    // Nothing landed on the board this pass — every ticket it touched is still held on the very
+    // board we hold, so a refresh could only re-read what is already here.
+    if (!wrote) break;
     // Re-read the board the gates and the closes are ON — the TARGET and the ticket SET. A ticket
     // closed just above is done work now, and the dispatch loop reads its status off these objects.
     // The target is adopted, not just its children: every `armHumanGate` pulls the shared board
@@ -3068,7 +3161,21 @@ export async function preflightHumanTickets(args: {
     // its pre-arm snapshot would carry the superseded labels through every step that follows.
     board = await loadAllIssues(repo, { strictGates: true });
     target = adoptRefreshedTarget(board, targetId, target);
-    children = runTickets(board, targetId);
+    const refreshed = runTickets(board, targetId);
+    // The refreshed SET is confirmed, never silently adopted (PR #213 review): step 1c proved this
+    // run's ticket set under the run-lease, and a child attached while the arm was writing would
+    // otherwise enter the run behind the approval, contract and agent-allowlist gates that already
+    // ran — or a detached one disappear after selection. Same question, same words as step 1c.
+    const drift = ticketSetDrift(children, refreshed);
+    if (drift) {
+      throw new Error(
+        `${targetId}'s ticket set changed while its human tickets were gated (${drift}) — ` +
+          `retrying so the run re-gates and executes the whole set rather than adopting a ticket ` +
+          `that never passed the gates this run already ran`,
+      );
+    }
+    children = refreshed;
+    holdsJudgedOnStaleBoard = true;
   }
 
   return { board, target, children, tickets: ticketsOf(), answeredButBlocked, armed };

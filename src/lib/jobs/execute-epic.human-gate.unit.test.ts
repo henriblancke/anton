@@ -1455,20 +1455,90 @@ describe("preflightHumanTickets — classifying again after the arm's own board 
   });
 
   it("hands the run back rather than arming behind labels that keep moving", async () => {
-    // Each arm brings another newly-human sibling with it, so no pass ever confirms a settled
-    // board. A plain Error, not a park: the next attempt re-gates from a board that has stopped
-    // moving, which no loop here can wait out.
-    board = [target(), child("t-0", true)];
+    // Each arm relabels another sibling `agent:human`, so no pass ever confirms a settled board. A
+    // plain Error, not a park: the next attempt re-gates from a board that has stopped moving,
+    // which no loop here can wait out. The ticket SET never changes — that is the drift check's
+    // question, and answering it here too would hide the one this bound exists for.
+    const ids = Array.from({ length: MAX_HUMAN_TICKET_PASSES + 1 }, (_, i) => `t-${i}`);
+    const humanThrough = (n: number) => [target(), ...ids.map((id, i) => child(id, i <= n))];
+    board = humanThrough(0);
     gateCreateMock.mockImplementation(async () => {
       const n = gateCreateMock.mock.calls.length;
-      board = [...board, child(`t-${n}`, true)];
+      board = humanThrough(n);
       return `g-${n}`;
     });
 
-    await expect(preflight([child("t-0", true)])).rejects.toThrow(
+    await expect(preflight(ids.map((id, i) => child(id, i === 0)))).rejects.toThrow(
       new RegExp(`kept finding newly-labelled ${LABELS.agentHuman} tickets after ` +
         `${MAX_HUMAN_TICKET_PASSES} arming passes`),
     );
     expect(gateCreateMock).toHaveBeenCalledTimes(MAX_HUMAN_TICKET_PASSES);
+  });
+
+  it("hands the run back when a child is ATTACHED while its human tickets are gated", async () => {
+    // The refresh below would otherwise replace the set step 1c confirmed under the run-lease, and
+    // the newcomer would ride into this run behind the approval, contract and agent-allowlist gates
+    // that already ran on the old set.
+    const human = child("t-buy", true);
+    const ship = child("t-ship", false);
+    board = [target(), human, ship];
+    gateCreateMock.mockImplementationOnce(async () => {
+      board = [target(), human, ship, child("t-new", false)];
+      return "g-buy";
+    });
+
+    await expect(preflight([human, ship])).rejects.toThrow(
+      /ticket set changed while its human tickets were gated \(attached t-new\)/,
+    );
+  });
+
+  it("closes a held ticket whose ordinary blocker landed while the arm was writing", async () => {
+    // The hold was judged against the PRE-arm board, and every arm pulls the shared board — so a
+    // prerequisite that closes in that window leaves the caller parking the run behind a bead that
+    // is already closed, with no blocker event left to resume it.
+    const signed = child("t-sign", true, "g-sign", "t-api");
+    const buy = child("t-buy", true);
+    const api = child("t-api", false);
+    board = [target(), signed, buy, api, answeredGate("g-sign", signed)];
+    gateCreateMock.mockImplementationOnce(async () => {
+      board = [
+        target(),
+        signed,
+        buy,
+        { ...api, status: "closed" } as Bead,
+        answeredGate("g-sign", signed),
+      ];
+      return "g-buy";
+    });
+
+    const out = await preflight([signed, buy, api]);
+
+    expect(out.answeredButBlocked.size).toBe(0);
+    expect(closeMock).toHaveBeenCalledWith(REPO, "t-sign", expect.stringContaining("g-sign"));
+  });
+
+  it("retires the wait it armed when an operator drops the label mid-arm", async () => {
+    // Nothing auto-resolves a human gate, so a ticket reclassified while its own arm was in flight
+    // stays blocked by an ask that no longer applies — and the run parks asking a person to do work
+    // the operator just handed back to an agent.
+    const buy = child("t-buy", true);
+    const sign = child("t-sign", true);
+    board = [target(), buy, sign];
+    gateCreateMock
+      .mockImplementationOnce(async () => "g-buy")
+      .mockImplementationOnce(async () => {
+        board = [target(), buy, child("t-sign", false)];
+        return "g-sign";
+      });
+
+    const out = await preflight([buy, sign]);
+
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-sign",
+      expect.stringContaining(`no longer labelled ${LABELS.agentHuman}`),
+    );
+    expect(gateCreateMock).toHaveBeenCalledTimes(2); // never re-armed on the pass that retired it
+    expect(out.answeredButBlocked.size).toBe(0);
   });
 });
