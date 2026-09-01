@@ -139,6 +139,24 @@ describe("inactiveAgentTickets", () => {
     ]);
   });
 
+  it("never reports agent:human — there is no toggle to enable, and its ticket is gated (anton-mv70)", () => {
+    // Failure path this closes: `agent:human` is in neither AGENT_OPTIONS nor `.claude/agents`, so
+    // under ANY persisted allowlist it read as "a disabled bundled agent" and poison-parked the
+    // WHOLE feature with "enable them in Settings → Agents" — pointing at a switch that cannot
+    // exist and killing the human ticket's independent siblings with it. A human ticket is held by
+    // its own gate instead (0b-pre), and its siblings still ship.
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:human"])], ["fastapi"])).toEqual([]);
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:human"])], [])).toEqual([]);
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:human"])], [], ["my-custom"])).toEqual([]);
+    // …and it does not mask a genuinely disabled agent on a sibling.
+    expect(
+      inactiveAgentTickets(
+        [ticket("t-1", ["agent:human"]), ticket("t-2", ["agent:terraform"])],
+        ["fastapi"],
+      ),
+    ).toEqual([{ id: "t-2", agent: "terraform" }]);
+  });
+
   it("reports every offending ticket, not just the first", () => {
     const out = inactiveAgentTickets(
       [ticket("t-1", ["agent:docker"]), ticket("t-2", ["agent:alembic"]), ticket("t-3", ["agent:fastapi"])],

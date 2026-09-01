@@ -25,6 +25,14 @@ import { doltSync, type SyncMode, type SyncOutcome } from "./sync-coalescer";
 export type { Bead, BeadComment, BeadDep } from "./types";
 import type { Bead } from "./types";
 
+/**
+ * The `agent:` VALUE that names no agent — the half {@link labelValueOf}(labels, "agent") returns,
+ * as distinct from the whole label {@link LABELS.agentHuman}. Exported because the routing
+ * chokepoints read the value, not the label: the active-agents allowlist compares agent ids, and
+ * `human` is not one anybody can enable.
+ */
+export const HUMAN_AGENT = "human";
+
 export const LABELS = {
   approved: "approved",
   stage: (s: "implementing" | "in-review") => `stage:${s}`,
@@ -65,9 +73,9 @@ export const LABELS = {
    * a credential, an account, a purchase, a signature, or a taste call. Every other `agent:<id>`
    * resolves to a specialist prompt, so a human bead left unmarked would dispatch to the DEFAULT
    * agent and burn a run failing at work no agent can do. Written by shaping (skills/bd/SKILL.md),
-   * read here by the two chokepoints that must refuse it — see {@link beads.isHumanWork}.
+   * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
    */
-  agentHuman: "agent:human",
+  agentHuman: `agent:${HUMAN_AGENT}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
@@ -2678,8 +2686,10 @@ export const beads = {
    * Work a PERSON executes, not an agent (`agent:human`, see {@link LABELS.agentHuman}). Approved,
    * shaped, real work — it just resolves to no specialist prompt, so anton must refuse it at every
    * point where a bead turns into a dispatch rather than let it fall through to the default agent.
-   * Shared by {@link isClaimable} (it never enters the claimable set) and execute-epic's run gate
-   * (a forced dispatch is poisoned), so the set anton picks from and the runner agree.
+   * Shared by {@link isClaimable} (it never enters the claimable set), execute-epic's run gate (a
+   * forced dispatch of a human TARGET is poisoned) and its per-ticket gate (a human TICKET inside an
+   * ordinary run is held behind a human gate at its own boundary), so the set anton picks from and
+   * the runner agree at every level of the tree.
    */
   isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
 

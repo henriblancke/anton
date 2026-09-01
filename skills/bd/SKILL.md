@@ -129,7 +129,9 @@ What changes is routing. Every other `agent:` value resolves to a specialist pro
 resolves to none, so a human bead left unmarked would dispatch to the DEFAULT agent and flail at
 work no agent can do. That is why the value exists and why the exclusion below is explicit: a
 `agent:human` bead never enters the claimable set (§1 of `.beads/PRIME.md`), and inside a run it
-becomes a human gate at its boundary rather than a step an agent improvises around.
+becomes a human gate at its boundary rather than a step an agent improvises around — the run does
+every ticket that does not depend on it, then parks on that gate. Resolving the gate is the whole
+answer: anton closes the ticket and runs the rest.
 
 ## Dependency edges
 
