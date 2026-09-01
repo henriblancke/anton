@@ -21,7 +21,7 @@
  * read path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, gt } from "drizzle-orm";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { PolicyCriterionKey } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -144,34 +144,51 @@ function pickAlreadyAnswered(
  * inflate the negative half of the record `pickerTrackRecord` reads and push other decisions out of
  * its rolling window — so the repeat extends the standing decline instead of filing a new one.
  *
- * Keyed on the PICK, like {@link pickAlreadyAnswered}: a plan-less veto answers no recorded decision
- * and has nothing to extend, and a later plan that re-picks the target is a new decision with its
- * own answer.
+ * Keyed on the PICK where there is one, like {@link pickAlreadyAnswered}: a later plan that re-picks
+ * the target is a new decision and takes its own answer.
+ *
+ * A PLAN-LESS veto names no decision to key on, so the HOLD it placed is its identity instead (PR
+ * #212 review): while this target is still deferred, another plan-less veto of it is the same answer
+ * restated — the stale tab the route stripped the generation from, retried after a lost response —
+ * and extends that hold rather than filing a second decline the record would count twice. Once the
+ * window has run out there is nothing standing: the target was offered again and refused again,
+ * which is a new decision.
  */
 function standingDecline(
   tx: Pick<AntonDb, "select">,
   input: { projectId: string; beadId: string; planId?: string },
+  now: Date,
 ) {
-  if (!input.planId) return undefined;
-  return tx
-    .select({
-      id: schema.pickerVerdicts.id,
-      rule: schema.pickerVerdicts.rule,
-      criterion: schema.pickerVerdicts.criterion,
-      rank: schema.pickerVerdicts.rank,
-      deferredUntil: schema.pickerVerdicts.deferredUntil,
-    })
-    .from(schema.pickerVerdicts)
-    .where(
-      and(
-        eq(schema.pickerVerdicts.projectId, input.projectId),
-        eq(schema.pickerVerdicts.beadId, input.beadId),
-        eq(schema.pickerVerdicts.planId, input.planId),
-        eq(schema.pickerVerdicts.verdict, "declined"),
-      ),
-    )
-    .limit(1)
-    .all()[0];
+  const identity = input.planId
+    ? eq(schema.pickerVerdicts.planId, input.planId)
+    : and(
+        isNull(schema.pickerVerdicts.planId),
+        gt(schema.pickerVerdicts.deferredUntil, now),
+      );
+  return (
+    tx
+      .select({
+        id: schema.pickerVerdicts.id,
+        rule: schema.pickerVerdicts.rule,
+        criterion: schema.pickerVerdicts.criterion,
+        rank: schema.pickerVerdicts.rank,
+        deferredUntil: schema.pickerVerdicts.deferredUntil,
+      })
+      .from(schema.pickerVerdicts)
+      .where(
+        and(
+          eq(schema.pickerVerdicts.projectId, input.projectId),
+          eq(schema.pickerVerdicts.beadId, input.beadId),
+          eq(schema.pickerVerdicts.verdict, "declined"),
+          identity,
+        ),
+      )
+      // The longest-standing hold first: a plan-less veto never shortens a window already running, so
+      // the row it extends is the one whose expiry is furthest out.
+      .orderBy(desc(schema.pickerVerdicts.deferredUntil))
+      .limit(1)
+      .all()[0]
+  );
 }
 
 /** What a veto did: the hold it placed, or the release that answered this pick first. */
@@ -207,8 +224,11 @@ export async function recordPickerVeto(
       if (pickAlreadyAnswered(tx, input, "accepted")) {
         return { recorded: false, reason: "released" } as const;
       }
-      const standing = standingDecline(tx, input);
-      const heldUntilMs = Math.max(untilMs, standing ? (msOf(standing.deferredUntil) ?? 0) : 0);
+      const standing = standingDecline(tx, input, new Date(nowMs));
+      const heldUntilMs = Math.max(
+        untilMs,
+        standing ? (msOf(standing.deferredUntil) ?? 0) : 0,
+      );
       if (standing) {
         tx.update(schema.pickerVerdicts)
           .set({
@@ -240,7 +260,10 @@ export async function recordPickerVeto(
       }
       return {
         recorded: true,
-        deferral: { beadId: input.beadId, untilMs: secDate(heldUntilMs).getTime() },
+        deferral: {
+          beadId: input.beadId,
+          untilMs: secDate(heldUntilMs).getTime(),
+        },
       } as const;
     },
     { behavior: "immediate" },
@@ -329,8 +352,13 @@ export async function recordPickerAccept(
  * meanwhile stays lost, which is the honest outcome — it was answered, and the answer was withdrawn,
  * not overturned.
  */
-export async function withdrawPickerAccept(db: AntonDb, id: string): Promise<void> {
-  await db.delete(schema.pickerVerdicts).where(eq(schema.pickerVerdicts.id, id));
+export async function withdrawPickerAccept(
+  db: AntonDb,
+  id: string,
+): Promise<void> {
+  await db
+    .delete(schema.pickerVerdicts)
+    .where(eq(schema.pickerVerdicts.id, id));
 }
 
 /**
@@ -368,7 +396,8 @@ export async function activeDeferrals(
     const untilMs = msOf(row.deferredUntil);
     if (untilMs === undefined) continue;
     const current = held.get(row.beadId);
-    if (current === undefined || untilMs > current) held.set(row.beadId, untilMs);
+    if (current === undefined || untilMs > current)
+      held.set(row.beadId, untilMs);
   }
   return held;
 }
@@ -383,10 +412,15 @@ export async function activeDeferrals(
  */
 export function deferralVersion(held: ReadonlyMap<string, number>): string {
   if (held.size === 0) return "none";
-  const lines = [...held].map(([beadId, untilMs]) => `${beadId}@${untilMs}`).sort();
+  const lines = [...held]
+    .map(([beadId, untilMs]) => `${beadId}@${untilMs}`)
+    .sort();
   // Digested rather than listed: the token rides in a poll's query string, and a project whose
   // operator has vetoed freely would otherwise put every bead id in every board request's URL.
-  return createHash("sha256").update(lines.join(",")).digest("hex").slice(0, 16);
+  return createHash("sha256")
+    .update(lines.join(","))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 /** UI/board read path over the shared anton.db. */
@@ -424,7 +458,10 @@ export async function pickerTrackRecord(
     // The id breaks a `decidedAt` tie (PR #212 review): the column is second-resolution, so two
     // verdicts settled in the same second would otherwise leave the window's composition — and the
     // counts read off it — up to SQLite's row order.
-    .orderBy(desc(schema.pickerVerdicts.decidedAt), desc(schema.pickerVerdicts.id))
+    .orderBy(
+      desc(schema.pickerVerdicts.decidedAt),
+      desc(schema.pickerVerdicts.id),
+    )
     .limit(window);
   const accepted = rows.filter((r) => r.verdict === "accepted").length;
   return { accepted, declined: rows.length - accepted, settled: rows.length };
@@ -442,17 +479,24 @@ export async function listPickerVerdicts(
     .where(eq(schema.pickerVerdicts.projectId, projectId))
     // Same tiebreaker as the counts above: the audit trail and the window it explains must not
     // disagree about which verdicts are the newest.
-    .orderBy(desc(schema.pickerVerdicts.decidedAt), desc(schema.pickerVerdicts.id))
+    .orderBy(
+      desc(schema.pickerVerdicts.decidedAt),
+      desc(schema.pickerVerdicts.id),
+    )
     .limit(limit);
   return rows.map((row) => ({
     beadId: row.beadId,
     verdict: row.verdict as PickerVerdict,
     action: row.action as PickerVerdictAction,
     ...(row.rule ? { rule: row.rule } : {}),
-    ...(row.criterion ? { criterion: row.criterion as PolicyCriterionKey } : {}),
+    ...(row.criterion
+      ? { criterion: row.criterion as PolicyCriterionKey }
+      : {}),
     ...(typeof row.rank === "number" ? { rank: row.rank } : {}),
     ...(row.planId ? { planId: row.planId } : {}),
-    ...(msOf(row.deferredUntil) !== undefined ? { deferredUntilMs: msOf(row.deferredUntil)! } : {}),
+    ...(msOf(row.deferredUntil) !== undefined
+      ? { deferredUntilMs: msOf(row.deferredUntil)! }
+      : {}),
     decidedAtMs: msOf(row.decidedAt) ?? 0,
   }));
 }
