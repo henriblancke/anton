@@ -143,6 +143,18 @@ const cases: Case[] = [
     eligible: ["t1", "t2"],
     exclusions: [],
   },
+  {
+    name: "an `agent:human` run target is refused — a person does that work, so no run may start it",
+    board: [authored("t1", { labels: [LABELS.agentHuman] }), authored("t2")],
+    eligible: ["t2"],
+    exclusions: [{ beadId: "t1", reason: "needs-human", detail: /agent:human/ }],
+  },
+  {
+    name: "`agent:human` outranks a shaping gap — the reason is who owns it, not how it is written",
+    board: [authored("t1", { acceptance_criteria: undefined, labels: [LABELS.agentHuman] })],
+    eligible: [],
+    exclusions: [{ beadId: "t1", reason: "needs-human" }],
+  },
 ];
 
 describe("eligibleTargets", () => {

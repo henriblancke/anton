@@ -348,6 +348,100 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       expect(job?.lastError).toMatch(/is a human gate, not work in flight/);
       expect(job?.lastError).toContain("Buy the Business plan");
       expect(job?.lastError).toContain("bd gate resolve");
+
+      // …and ANSWERING all of it settles the run without a pull request. anton closes both tickets
+      // on the way back in, which leaves the run with nothing delivered: a person did every part of
+      // this feature outside the branch. Carrying on from there would review an empty diff and hand
+      // `gh pr create` a branch with no commits between it and the base — so it parks, naming the
+      // one thing left to do, instead of failing at the PR step.
+      for (const t of [buy, sign]) {
+        const gate = (await gatesBlocking(t))[0];
+        await beads.gateResolve(repo, gate.id, "done — receipt filed");
+      }
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      const settled = await getJob(tdb.db, jobId);
+      expect(settled?.status).toBe("parked");
+      expect(settled?.lastError).toContain("no pull request to open");
+      expect(settled?.lastError).toContain(buy);
+      expect(settled?.lastError).toContain(sign);
+      // The person's work IS recorded — both tickets closed — and still no agent ran and no PR opened.
+      expect((await beads.show(repo, buy)).status).toBe("closed");
+      expect((await beads.show(repo, sign)).status).toBe("closed");
+      expect(dispatched(log)).toEqual([]);
+      expect(beads.getPrRef(await beads.show(repo, feature)) ?? null).toBeNull();
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = successClaude;
+      if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("holds an answered human ticket its OTHER blocker still holds, and closes it once that lands", async () => {
+    // The person can answer the gate before the code the ticket ALSO waits on has shipped ("ship the
+    // API, then sign the DPA"). bd refuses `bd close` on a bead ANY open blocker holds, not just an
+    // open gate, so closing it here threw a plain error the runner retried identically until the
+    // attempts were gone — ending on a cryptic bd message with the freed sibling never dispatched.
+    const feature = await beads.create(repo, {
+      title: "Ship the payouts page",
+      type: "feature",
+      acceptance: "work file exists",
+      description: "## Goal\nPayouts",
+    });
+    await beads.approve(repo, feature);
+    const ready = createTicket(repo, { title: "Payouts — render the table", parent: feature });
+    const human = createTicket(repo, {
+      title: HUMAN_TITLE,
+      parent: feature,
+      labels: [LABELS.agentHuman],
+    });
+    // Two ordinary prerequisites OUTSIDE this run, one per held ticket. They land at different
+    // times, which is what puts the run back at 0b-pre with a sibling to dispatch and the human
+    // ticket's own prerequisite still open — the state that made bd refuse the close.
+    const later = createTicket(repo, { title: "Payouts — wire the ledger", parent: feature });
+    const apiPrereq = createTicket(repo, { title: "Ship the ledger API" });
+    const signPrereq = createTicket(repo, { title: "Ship the payouts API" });
+    await beads.link(repo, later, apiPrereq, "blocks");
+    await beads.link(repo, human, signPrereq, "blocks");
+
+    const log = join(sandbox, "human-ticket-blocked-inv.jsonl");
+    const runner = makeEpicRunner(ctx);
+    process.env.ANTON_CLAUDE_BIN = loggingClaude("claude-human-ticket-blocked", log);
+    let jobId: string | undefined;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: feature });
+      const gate = (await gatesBlocking(human))[0];
+      expect(gate).toBeDefined();
+
+      // The person does their half early and resolves — while the ticket's own prerequisite is
+      // still open — and the OTHER held sibling is freed, so the run has work to come back for.
+      await beads.gateResolve(repo, gate.id, "signed — countersigned copy filed");
+      await beads.close(repo, apiPrereq, "shipped");
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      // PARKED, not failed: the ticket is HELD rather than closed, the freed sibling still ran, and
+      // the park names what the ticket is still waiting for. The answer is never asked for twice —
+      // no second gate was armed on it.
+      const held = await getJob(tdb.db, jobId);
+      expect(held?.status).toBe("parked");
+      expect(held?.lastError).toContain(human);
+      expect(held?.lastError).toContain(signPrereq);
+      expect((await beads.show(repo, human)).status).toBe("open");
+      expect(await gatesBlocking(human)).toHaveLength(0);
+      expect(dispatched(log)).toContain(later);
+      expect(dispatched(log)).not.toContain(human);
+
+      // The prerequisite lands and the resume closes the ticket into this same branch, PR and all.
+      await beads.close(repo, signPrereq, "shipped");
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+      expect((await beads.show(repo, human)).status).toBe("closed");
+      expect(dispatched(log)).not.toContain(human);
+      expect(dispatched(log)).toContain(ready);
+      expect(beads.getPrRef(await beads.show(repo, feature)) ?? null).not.toBeNull();
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
       if (jobId) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");

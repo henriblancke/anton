@@ -865,11 +865,30 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     them by the ordinary blocked-child rule rather than a second, parallel notion of "held".
       const humanTickets = tickets.filter((t) => !isResumeSkipped(t) && beads.isHumanWork(t));
       if (humanTickets.length > 0) {
+        // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet:
+        // held for this pass, closed by the resume that follows the blocker (see the loop below).
+        const answeredButBlocked = new Map<string, string[]>();
         for (const t of humanTickets) {
           // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
           // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
           const answered = answeredHumanGate(all, t);
           if (answered) {
+            // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
+            // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
+            // cannot be closed until that work lands. Closing anyway throws a plain error the runner
+            // retries identically until the attempts are gone — a cryptic bd message and no sibling
+            // ever dispatched. Hold the ticket instead: the person's half is done and must not be
+            // asked for again (so no re-arm), the code it waits on is not, and the resume that
+            // follows that blocker closes it into this same branch.
+            const stillBlocked = openBlockersOf(all, t.id);
+            if (stillBlocked.length > 0) {
+              answeredButBlocked.set(t.id, stillBlocked);
+              console.log(
+                `[execute-epic] ${epicBeadId}: holding ${t.id} — its human gate ${answered.id} is ` +
+                  `answered but it is still blocked by ${stillBlocked.join(", ")}`,
+              );
+              continue;
+            }
             await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
             console.log(
               `[execute-epic] ${epicBeadId}: closed ${t.id} — a person answered its human gate ` +
@@ -886,6 +905,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         freshChildren = runTickets(all, epicBeadId);
         tickets = standaloneRun ? [target] : freshChildren;
         freshReadiness = computeReadiness(all);
+        // A held answered-gate ticket joins the verdict as gated, so the dispatch loop holds it by
+        // the same rule as any other blocked child rather than reaching it as open human work and
+        // parking on the "it should be held by a gate" backstop. Its blockers join the list the park
+        // names — an in-run sibling never appears in the rollup, and the tail would otherwise name a
+        // held ticket with nothing to wait for.
+        if (answeredButBlocked.size > 0) {
+          freshReadiness = {
+            blockers: [
+              ...new Set([
+                ...freshReadiness.blockers,
+                ...[...answeredButBlocked.values()].flat(),
+              ]),
+            ],
+            gated: [...new Set([...freshReadiness.gated, ...answeredButBlocked.keys()])],
+            runnable: freshReadiness.runnable,
+          };
+        }
         gated = new Set(freshReadiness.gated);
         // Every ticket is human work (or held behind it): there is nothing for an agent to do here,
         // so park BEFORE any worktree, claim or session exists rather than opening a run that can
@@ -1628,6 +1664,20 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           `every ticket under ${epicBeadId} ran out of time ` +
             `(${timedOut.map((t) => t.id).join(", ")}) — nothing was delivered. Re-scope them into ` +
             `smaller tickets, or raise this project's ticketTimeoutMinutes, then resume the run`,
+        );
+      }
+
+      // Nothing timed out and still nothing is left to show: every live ticket is human work a
+      // person did outside this branch (anton-mv70) — the resume that closed the last answered gate
+      // lands here with an empty set. The run phase speaks for a diff, so carrying on would review
+      // nothing and hand `gh pr create` a branch with no commits between it and the base. Park
+      // instead, naming the one thing left to do: this target ships no code, so a person settles it.
+      if (delivered.length === 0) {
+        throw new PoisonEpic(
+          `every ticket under ${epicBeadId} is work a person does, not an agent ` +
+            `(${live.map((t) => t.id).join(", ")}) — they are done and nothing was committed on ` +
+            `this branch, so there is no pull request to open. Close ${epicBeadId} by hand to ` +
+            `settle it, or give it a ticket an agent can deliver and resume the run`,
         );
       }
 
@@ -2732,6 +2782,24 @@ function answeredHumanGate(board: Bead[], ticket: Bead): Gate | undefined {
         (b.labels?.includes(HUMAN_GATE_ARMED_LABEL) ?? false) &&
         gateReason(b)?.trim() === reason,
     );
+}
+
+/**
+ * The bead's open prerequisites BY BD'S RULE — every `blocks` dependency that is not closed
+ * (anton-mv70). This is what decides whether `bd close` will be accepted: bd refuses a bead any open
+ * issue holds ("blocked by open issues [...] (use --force to override)"), gate or not.
+ *
+ * Deliberately NOT `standaloneBlockers`: that resolves a child blocker to the RUN TARGET that ships
+ * it, which during this very run is the open feature itself — a ticket whose real prerequisite has
+ * already closed would read as blocked forever and never be closed at all. An unknown dependency
+ * counts as open, the same fail-safe the graph takes: bd holds the close either way.
+ */
+function openBlockersOf(board: Bead[], beadId: string): string[] {
+  const byId = new Map(board.map((b) => [b.id, b]));
+  return (board.find((b) => b.id === beadId)?.dependencies ?? [])
+    .filter((d) => d.type === "blocks")
+    .map((d) => d.depends_on_id)
+    .filter((id) => byId.get(id)?.status !== "closed");
 }
 
 /**
