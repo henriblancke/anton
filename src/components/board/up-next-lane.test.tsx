@@ -448,7 +448,15 @@ describe("reordering the lane", () => {
         expect.objectContaining({ method: "PATCH", body: JSON.stringify({ priority: 0 }) }),
       ),
     );
-    expect(toastSuccess).toHaveBeenCalledWith('Set "Term merge" to P0 · critical');
+    // The lane withdraws itself once the write lands (a reprioritized bead is one the recorded plan
+    // no longer describes), so the toast says what happens next rather than leaving the withdrawal
+    // to read as a failed drag.
+    expect(toastSuccess).toHaveBeenCalledWith(
+      'Set "Term merge" to P0 · critical',
+      expect.objectContaining({
+        description: "The lane re-ranks from it on the next board-picker pass.",
+      }),
+    );
   });
 
   it("refuses a promotion the picker's own tiebreak would take straight back", async () => {

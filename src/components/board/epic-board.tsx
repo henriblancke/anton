@@ -381,11 +381,14 @@ export function EpicBoard({
     const { priority } = verdict;
 
     const title = card.kind === "epic" ? card.epic.title : card.item.title;
-    const previous = board;
-    setBoard({
-      ...board,
-      upNext: reorderUpNextEntries(board.upNext ?? [], beadId, overBeadId, priority),
-    });
+    // Only the lane moves, and it moves on the LATEST board: a poll can land during the PATCH, and
+    // both writing and reverting a whole pre-drag snapshot would throw that poll's result away.
+    const previousUpNext = board.upNext;
+    setBoard((prev) =>
+      prev
+        ? { ...prev, upNext: reorderUpNextEntries(prev.upNext ?? [], beadId, overBeadId, priority) }
+        : prev,
+    );
 
     // A standalone chip is a bead in its own right, so it patches through the ticket route; both
     // routes validate the priority server-side (parseEpicPatch / parseTicketPatch).
@@ -400,9 +403,23 @@ export function EpicBoard({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Reorder failed (${res.status})`);
       }
-      toast.success(`Set "${title}" to ${PRIORITY_LABELS[priority]}`);
+      // The write advanced the snapshot version while RETAINING the pre-write beads, so a poll
+      // carrying the pre-write token would take the non-blocking path and serve that retained
+      // snapshot — re-showing the very order this drag just corrected (anton-4g35, for the
+      // stage-move path). Unlike the move endpoint, a priority PATCH answers with the epic/ticket
+      // detail rather than a board, so there is no authoritative version to adopt: drop the token
+      // instead, and the next poll asks versionlessly and takes the blocking, post-write path.
+      versionRef.current = undefined;
+      // A reprioritized bead is one the recorded plan no longer describes (isPlanStale), so that
+      // post-write board withholds the lane until the next pass re-ranks it. Say so, or the
+      // withdrawal reads as the drag having failed.
+      toast.success(`Set "${title}" to ${PRIORITY_LABELS[priority]}`, {
+        description: "The lane re-ranks from it on the next board-picker pass.",
+      });
     } catch (err) {
-      setBoard(previous);
+      setBoard((prev) =>
+        prev ? { ...prev, ...(previousUpNext?.length ? { upNext: previousUpNext } : {}) } : prev,
+      );
       toast.error(err instanceof Error ? err.message : "Failed to reorder");
     }
   }

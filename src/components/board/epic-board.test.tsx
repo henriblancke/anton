@@ -22,7 +22,7 @@ const LABEL_TO_STAGE = Object.fromEntries(
   STAGES.map((s) => [STAGE_LABELS[s], s]),
 ) as Record<string, Stage>;
 
-vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() } }));
 
 // The board reads its Epic/Area narrowing from the URL; a drag-move is orthogonal to it, so this
 // suite runs on an unfiltered URL. The filter behaviour itself is covered in epic-filter.test.tsx.
@@ -304,5 +304,138 @@ describe("EpicBoard veto from the Up Next lane", () => {
 
     await waitFor(() => expect(inUpNext("anton-1")).toBe(false));
     expect(columnOf("anton-1")).toBe("backlog");
+  });
+});
+
+/**
+ * A reorder inside the lane must not flip back (anton-7bzg / R3.8). The priority PATCH answers with
+ * the epic detail, not a board, so there is no post-write version to adopt the way the stage-move
+ * path does (anton-4g35): a client that kept polling on the PRE-WRITE token would take the board
+ * route's non-blocking path, be served the retained pre-write snapshot stamped with the
+ * already-advanced version, and re-show the very order the drag just corrected. Dropping the token
+ * sends the next poll versionless, onto the blocking post-write path.
+ */
+describe("EpicBoard reorder inside Up Next", () => {
+  /** Priority, unblocking value and age as the pass that ranked them recorded them: `anton-2` frees
+   *  more work than the P0 above it, so promoting it is a drop the priority channel can state. */
+  const LANE = {
+    "anton-1": { priority: 0, unblocks: 0, createdAt: "2026-08-01T00:00:00.000Z" },
+    "anton-2": { priority: 2, unblocks: 5, createdAt: "2026-08-02T00:00:00.000Z" },
+  };
+
+  /** A board whose lane ranks `order`, with both targets in the Backlog it was taken out of. */
+  function planned(version: string, order: (keyof typeof LANE)[]): Board {
+    const base = board(version, "backlog");
+    return {
+      ...base,
+      columns: {
+        ...base.columns,
+        backlog: [epic("anton-1", "backlog"), epic("anton-2", "backlog")],
+      },
+      upNext: order.map((beadId, index) => ({
+        beadId,
+        rank: index + 1,
+        type: "feature" as const,
+        ...LANE[beadId],
+      })),
+    };
+  }
+
+  /** The lane's cards, top to bottom — read off the one drag handle each row renders. */
+  const laneOrder = () =>
+    [
+      ...document.querySelectorAll(
+        'section[aria-label="Up Next"] button[aria-label^="Reorder "]',
+      ),
+    ].map((button) =>
+      (button.getAttribute("aria-label") ?? "").replace(/^Reorder "|"$/g, ""),
+    );
+
+  it("keeps the corrected order instead of being served the pre-write plan on the next poll", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/epics/anton-2")) {
+        return new Response(JSON.stringify({ detail: {} }), { status: 200 });
+      }
+      // A poll on the stale token: the retained PRE-WRITE plan, stamped with the version the write
+      // already advanced to. Reaching this at all is the regression.
+      if (url.includes("/board?version=")) {
+        return new Response(
+          JSON.stringify({ board: planned("2:sync", ["anton-1", "anton-2"]) }),
+          { status: 200 },
+        );
+      }
+      // The versionless (blocking, post-write) read: a reprioritized bead is one the recorded plan
+      // no longer describes, so the board withholds the lane until the next pass re-ranks it.
+      if (url.includes("/board")) {
+        const authoritative = planned("2:sync", ["anton-1", "anton-2"]);
+        delete authoritative.upNext;
+        return new Response(JSON.stringify({ board: authoritative }), { status: 200 });
+      }
+      return new Response(null, { status: 304 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync", ["anton-1", "anton-2"])} />);
+    expect(laneOrder()).toEqual(["anton-1", "anton-2"]);
+
+    dragEndHandler?.({
+      active: { id: "anton-2", data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
+
+    // Returning to the tab polls immediately (the interval is 30s).
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/board"))).toBe(true),
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    const boardReads = fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((u) => u.includes("/board"));
+    expect(boardReads.every((u) => !u.includes("version="))).toBe(true);
+    // The lane withdrew itself — it never came back in the order the drag corrected away from.
+    expect(laneOrder()).toEqual([]);
+    expect(columnOf("anton-2")).toBe("backlog");
+  });
+
+  it("keeps what a poll delivered mid-write when the reorder fails", async () => {
+    // The optimistic update and its rollback both run on the LATEST board, not on a snapshot taken
+    // before the PATCH — a poll landing in that gap (the write is a server round-trip) must survive
+    // the rollback rather than be reverted along with the lane.
+    let failPatch: (() => void) | undefined;
+    const patched = new Promise<Response>((resolve) => {
+      failPatch = () => resolve(new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
+    });
+    const arrived = planned("2:sync", ["anton-1", "anton-2"]);
+    arrived.columns.implementing = [epic("anton-3", "implementing")];
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/epics/anton-2")) return patched;
+      if (url.includes("/board")) {
+        return new Response(JSON.stringify({ board: arrived }), { status: 200 });
+      }
+      return new Response(null, { status: 304 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync", ["anton-1", "anton-2"])} />);
+
+    dragEndHandler?.({
+      active: { id: "anton-2", data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
+
+    // A poll lands while the PATCH is still in flight, bringing a card the drag knows nothing about.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(columnOf("anton-3")).toBe("implementing"));
+
+    failPatch?.();
+
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-1", "anton-2"]));
+    expect(columnOf("anton-3")).toBe("implementing");
   });
 });
