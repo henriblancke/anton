@@ -3467,13 +3467,41 @@ export const HUMAN_GATE_ARMED_LABEL = "gate-armed";
  * finds no answer and arms the ask again, which is the state the board is actually in.
  *
  * Untag BEFORE resolve, so neither half failing can leave a false answer behind. A lost untag leaves
- * the gate open and standing — the caller's stranded path, unchanged. A lost resolve leaves it open
- * and unlabelled, which reads as a person's own hold: a later ask leaves it alone instead of
- * superseding it, the safe direction for a wait only a human ends.
+ * the gate open and standing — the caller's stranded path, unchanged.
+ *
+ * A lost RESOLVE puts the marker BACK (PR #213 review). The gate stays open carrying its original
+ * ask, and a ticket ask tells the person reading it to do the work and resolve the gate — so an
+ * unlabelled leftover is the one state that reads as neither anton's wait nor a person's hold: the
+ * answer a person then gives is invisible to {@link answeredHumanGate}, and the next run asks them
+ * for work they already did instead of closing the ticket. Restored only after the gate is confirmed
+ * still OPEN, because a `gateResolve` that failed AFTER landing would otherwise be relabelled into
+ * exactly the false answer the untag-first order exists to prevent. When either the re-read or the
+ * re-tag fails the gate keeps the pre-fix shape — open and unlabelled, which reads as a person's own
+ * hold, the safe direction for a wait only a human ends.
  */
 async function retireArmedGate(repo: string, gateId: string, reason: string): Promise<boolean> {
   if (!(await safe(() => beads.untag(repo, gateId, [HUMAN_GATE_ARMED_LABEL])))) return false;
-  return await safe(() => beads.gateResolve(repo, gateId, reason));
+  if (await safe(() => beads.gateResolve(repo, gateId, reason))) return true;
+  await restoreArmedMarker(repo, gateId);
+  return false;
+}
+
+/**
+ * Put {@link HUMAN_GATE_ARMED_LABEL} back on a gate whose retirement failed — and ONLY while the
+ * board still says that gate is open. Best-effort throughout: every failure here lands on the
+ * pre-existing open-and-unlabelled state, which the caller already treats as stranded.
+ */
+async function restoreArmedMarker(repo: string, gateId: string): Promise<void> {
+  const gate = await beads.show(repo, gateId).catch(() => undefined);
+  // The resolve landed after all and only its reporting failed: anton closed this gate, so the
+  // marker must stay OFF — restoring it there is precisely the false answer.
+  if (gate?.status === "closed") return;
+  if (gate && (await safe(() => beads.tag(repo, gateId, [HUMAN_GATE_ARMED_LABEL])))) return;
+  console.warn(
+    `[execute-epic] human gate ${gateId} could not be resolved and its ${HUMAN_GATE_ARMED_LABEL} ` +
+      `marker could not be restored — while it stands, an answer to it reads as a hold anton ` +
+      `never armed`,
+  );
 }
 
 /**

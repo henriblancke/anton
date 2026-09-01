@@ -33,6 +33,7 @@ const gateCreateMock = vi.fn();
 const gateResolveMock = vi.fn();
 const tagMock = vi.fn();
 const untagMock = vi.fn();
+const showMock = vi.fn();
 const pullMock = vi.fn();
 const closeMock = vi.fn();
 
@@ -51,6 +52,7 @@ vi.mock("../beads/bd", async () => {
       gateResolve: (...args: unknown[]) => gateResolveMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      show: (...args: unknown[]) => showMock(...args),
       pull: (...args: unknown[]) => pullMock(...args),
       close: (...args: unknown[]) => closeMock(...args),
     },
@@ -109,6 +111,8 @@ beforeEach(() => {
   gateResolveMock.mockReset().mockResolvedValue(undefined);
   tagMock.mockReset().mockResolvedValue(undefined);
   untagMock.mockReset().mockResolvedValue(undefined);
+  // The re-read a failed retire makes before it restores the marker: the wait still stands.
+  showMock.mockReset().mockImplementation(async (_repo: string, id: string) => gate(id, REASON, []));
   pullMock.mockReset().mockResolvedValue(undefined);
   closeMock.mockReset().mockResolvedValue(undefined);
 });
@@ -1617,6 +1621,43 @@ describe("retiring anton's own human gate — a close it made is not an answer",
 
     expect(gateResolveMock).not.toHaveBeenCalled();
     expect(thrown.message).toContain(`g-first (${TICKET})`);
+  });
+
+  it("puts the marker BACK when the resolve fails and the wait is still standing", async () => {
+    // The gate keeps its ask, and a ticket ask tells the person to do the work and resolve it. An
+    // unlabelled leftover would make that answer invisible: the next run re-asks for work already
+    // done. Restored, the answer reads as one (PR #213 review).
+    const armed = await armOne("g-first");
+    tagMock.mockClear();
+    gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
+
+    const thrown = (await undoCancelledTicketGates(
+      [armed],
+      cancelled(),
+      new Error("the run was cancelled"),
+    )) as Error;
+
+    expect(tagMock).toHaveBeenCalledWith(REPO, "g-first", [HUMAN_GATE_ARMED_LABEL]);
+    expect(untagMock.mock.invocationCallOrder[0]).toBeLessThan(
+      tagMock.mock.invocationCallOrder[0],
+    );
+    expect(thrown.message).toContain(`g-first (${TICKET})`);
+  });
+
+  it("leaves the marker OFF when the resolve actually landed and only its reporting failed", async () => {
+    // Relabelling a gate anton closed is exactly the false answer the untag-first order exists to
+    // prevent, so the restore is conditioned on the gate still being open.
+    const armed = await armOne("g-first");
+    tagMock.mockClear();
+    gateResolveMock.mockRejectedValue(new Error("bd: connection reset"));
+    showMock.mockImplementation(async (_repo: string, id: string) => ({
+      ...gate(id, REASON, []),
+      status: "closed",
+    }));
+
+    await undoCancelledTicketGates([armed], cancelled(), new Error("the run was cancelled"));
+
+    expect(tagMock).not.toHaveBeenCalled();
   });
 
   it("asks again for a ticket whose gate anton took back, rather than closing it", async () => {
