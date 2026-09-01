@@ -1046,3 +1046,50 @@ describe("review scores on the board (anton-tprv)", () => {
     expect(trajectory?.worst.id).toBe("feat-1");
   });
 });
+
+describe("getBoard — the operator queue", () => {
+  it("carries the approved human work off the same snapshot as the cards", async () => {
+    // anton-qfso.1: `agent:human` beads are excluded from everything anton dispatches (anton-mv70),
+    // so the board payload is where they stay visible — derived here, at no read of its own.
+    listMock.mockResolvedValue([
+      makeBead({
+        id: "feat-1",
+        title: "Ship billing",
+        issue_type: "feature",
+        labels: ["approved"],
+      }),
+      makeBead({
+        id: "feat-1.1",
+        title: "Sign the processor contract",
+        parent: "feat-1",
+        labels: ["agent:human"],
+        created_at: "2026-08-02T00:00:00Z",
+      }),
+      makeBead({
+        id: "feat-1.2",
+        title: "Wire the webhook",
+        parent: "feat-1",
+        labels: ["agent:nextjs"],
+      }),
+      makeBead({
+        id: "task-1",
+        title: "Buy the domain",
+        labels: ["approved", "agent:human"],
+        created_at: "2026-08-09T00:00:00Z",
+      }),
+    ]);
+
+    const board = await getBoard(project);
+
+    expect(board.operatorQueue.map((i) => i.id)).toEqual(["task-1", "feat-1.1"]);
+    expect(board.operatorQueue[1].runTarget).toEqual({ id: "feat-1", title: "Ship billing" });
+  });
+
+  it("is empty for a board with no human work at all", async () => {
+    listMock.mockResolvedValue([
+      makeBead({ id: "feat-1", title: "Ship billing", issue_type: "feature", labels: ["approved"] }),
+    ]);
+
+    expect((await getBoard(project)).operatorQueue).toEqual([]);
+  });
+});

@@ -14,6 +14,7 @@ import {
   type HygieneReport,
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
+import { operatorQueue } from "./operator-queue";
 import { reviewTrajectory } from "./review-trajectory";
 import {
   latestScanHealth,
@@ -244,6 +245,11 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     if (!standalone[stage]) standalone[stage] = [];
   }
 
+  // The operator's own queue (anton-qfso.1): the approved `agent:human` beads anton refuses to
+  // dispatch. Derived from the SAME snapshot as the cards — excluding this work from the agent queue
+  // must not cost a read to find it again.
+  const humanWork = operatorQueue(workBeads);
+
   // Every run target the board holds — cards and standalone chips alike — rolled up into the
   // project's score trend (anton-tprv). Off the labels already in this snapshot: no per-card read.
   const trajectory = reviewTrajectory([...cardBeads, ...orphanTasks]);
@@ -278,6 +284,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     ),
     columns,
     standalone,
+    operatorQueue: humanWork,
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),

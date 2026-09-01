@@ -293,6 +293,29 @@ export interface SyncStatusView {
   stalledForMs: number | null;
 }
 
+/**
+ * One bead on the operator's own queue (anton-qfso.1) — approved, open, `agent:human` work anton
+ * hands back rather than dispatches. Built by `operatorQueue` (lib/operator-queue.ts) off the board
+ * snapshot, so the row carries everything it takes to decide whether to act now: what the ask is,
+ * how long it has been waiting, and which run it holds up.
+ */
+export interface OperatorQueueItem {
+  id: string;
+  title: string;
+  /** The bead's "## Goal" — what the person is actually being asked for. Absent when unstated. */
+  goal?: string;
+  stage: Stage;
+  risk?: string; // from risk:<x>
+  size?: string; // from size:<x>
+  /** ISO timestamp the ask was filed, from the raw bead's created_at. Drives the queue's order. */
+  createdAt: string;
+  /**
+   * The run this ticket stops when it reaches it. ABSENT on a run target, which is not held up by
+   * the work — it IS the work, and no agent will ever start it.
+   */
+  runTarget?: { id: string; title: string };
+}
+
 export interface Board {
   projectSlug: string;
   /** Monotonic issue-snapshot version used for change-aware refreshes. */
@@ -301,6 +324,12 @@ export interface Board {
   columns: Record<Stage, Epic[]>;
   /** Standalone (parentless) tasks/bugs grouped by stage, rendered as chips at each column's foot. */
   standalone: Record<Stage, StandaloneItem[]>;
+  /**
+   * Approved work that is the OPERATOR's, not an agent's (anton-qfso.1) — derived from the same
+   * snapshot as the cards, so it costs no read of its own and refreshes on the same poll. Empty
+   * means there is none, which the queue renders as nothing at all.
+   */
+  operatorQueue: OperatorQueueItem[];
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
   /**

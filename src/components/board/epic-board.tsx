@@ -46,6 +46,7 @@ import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
+import { OperatorQueue } from "@/components/board/operator-queue";
 import {
   AutopilotBreakerBand,
   AutopilotBreakerHeader,
@@ -408,6 +409,10 @@ export function EpicBoard({
         )}
       </Suspense>
       <EscalationStrip slug={slug} escalations={escalations} />
+      {/* Below the escalations, never instead of them: a stopped run needs a decision now, while
+          this band is standing work that was always the founder's. It reads the UNFILTERED board on
+          purpose — a queue narrowed by the column filters would quietly under-report what is owed. */}
+      <OperatorQueue slug={slug} items={board.operatorQueue} />
       {lanes ? (
         // The lanes share one horizontal scroller so every lane's stage columns line up under the
         // single stage strip, at any width.
