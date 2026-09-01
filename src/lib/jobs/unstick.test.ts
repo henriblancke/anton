@@ -12,12 +12,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
+import type { TestDb } from "../db/testing";
 import { LABELS, type Bead, type Gate } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
 import { blockedByPoison, parkedOnGateClause } from "./errors";
 import type { Clock } from "./queue";
+import { makeProjectDb } from "@/lib/testing/project";
 
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<void>>();
@@ -119,11 +120,7 @@ function prActivity(o: Partial<PrActivity> = {}): PrActivity {
 }
 
 beforeEach(() => {
-  t = makeTestDb();
-  t.db
-    .insert(schema.projects)
-    .values({ id: "p1", slug: "p1", name: "p1", repoPath: REPO })
-    .run();
+  t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: REPO });
   // Every epic these tests reference, open and unleased. The pass pulls the board with `--status
   // all`, so a bead missing from it reads as DELETED and settles the finding — the default board has
   // to carry the epics under test, or nothing would ever be resumed or escalated.

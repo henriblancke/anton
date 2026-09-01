@@ -12,7 +12,6 @@
  * safe verbs have nothing to do and the diff is entirely the shadow's to answer for.
  */
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -22,15 +21,15 @@ import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
 import { beads, type Bead } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { GARDENER_DETECTION_KINDS, isProposalBead } from "../gardener/detections";
 import { makeGardenerHandler } from "./gardener";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 describeBd("gardener shadow pass e2e (real handler · real bd)", () => {
   let repoDir: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   let restoreEnv: () => void;
   const clock: Clock = { now: () => Date.now() };
@@ -106,19 +105,14 @@ describeBd("gardener shadow pass e2e (real handler · real bd)", () => {
       stdio: "ignore",
     });
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
+    tdb = makeProjectDb({
       repoPath: repo,
-      defaultBranch: "main",
       // Every kind armed at `shadow`: whatever this board turns out to support, the pass shadows it.
       settingsJson: JSON.stringify({
         proposalAutonomy: Object.fromEntries(GARDENER_DETECTION_KINDS.map((k) => [k, "shadow"])),
       }),
     });
+    projectId = tdb.projectId;
 
     before = await boardBytes();
     const jobId = await driveJob({

@@ -18,16 +18,15 @@
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { makeJobRunner } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import * as schema from "../db/schema";
 import { systemClock } from "./queue";
 import { GATE_EXPIRED_LABEL, GATE_RESUMED_LABEL, makeGateCheckHandler } from "./gate-check";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 /** A child ticket under `parent`, contract-shaped enough for bd to accept it. */
 function createTicket(repo: string, title: string, parent: string): string {
@@ -65,7 +64,7 @@ async function createRun(repo: string, name: string): Promise<{ epic: string; ti
 describeBd("gate-check e2e (real handler · real bd)", () => {
   let bdRepo: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
 
   let timed: { epic: string; ticket: string };
@@ -133,15 +132,8 @@ describeBd("gate-check e2e (real handler · real bd)", () => {
       ),
     ).id as string;
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
 
     // The tickets were created through raw bd, which can't invalidate anton's board snapshot.
     resetIssueSnapshots();

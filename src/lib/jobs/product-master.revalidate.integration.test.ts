@@ -21,7 +21,6 @@
  * Applying goes through `applyProposal` — the same function the approve route calls on a proposal
  * bead; the route around it only maps failures to HTTP statuses.
  */
-import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
@@ -31,12 +30,11 @@ import { contractGaps } from "../beads/contract";
 import { loadAllIssues } from "../beads/issues";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import type { ClaudeResult } from "../claude/driver";
-import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { applyProposal } from "../gardener/apply";
 import { isProposalBead, proposalPlanOf } from "../gardener/detections";
 import { makeProductMasterHandler } from "./product-master";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 /** A complete ticket contract, as the ticket dialog keeps it: every section in the description. */
 const contract = (acceptance: boolean): string =>
@@ -58,7 +56,7 @@ const contract = (acceptance: boolean): string =>
 describeBd("post-approval re-validation e2e (real handler · real bd)", () => {
   let repoDir: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   const clock: Clock = { now: () => 1_700_000_000_000 };
 
@@ -125,15 +123,8 @@ describeBd("post-approval re-validation e2e (real handler · real bd)", () => {
     rotting = await approvedTarget("export the ledger");
     sound = await approvedTarget("rotate the signing key");
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
   }, 180_000);
 
   afterAll(() => {

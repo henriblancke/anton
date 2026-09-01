@@ -8,16 +8,15 @@
  * reachable" are properties that have to hold together.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { PoisonError } from "./errors";
 import { fakeJobContext } from "./pass.fixture";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
 
@@ -32,7 +31,7 @@ const { deferPassSession, messageOf, openPassSession, passProject, pullBoard } =
 const REPO = "/tmp/pass-preamble-repo";
 const clock: Clock = { now: () => 1_700_000_000_000 };
 
-let t: TestDb;
+let t: TestProjectDb;
 let projectId: string;
 let sessionsDir: string;
 let priorSessionsRoot: string | undefined;
@@ -41,15 +40,8 @@ beforeEach(async () => {
   sessionsDir = mkdtempSync(join(tmpdir(), "anton-pass-preamble-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(sessionsDir, "sessions");
-  t = makeTestDb();
-  projectId = randomUUID();
-  await t.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: REPO,
-    defaultBranch: "main",
-  });
+  t = makeProjectDb({ repoPath: REPO });
+  projectId = t.projectId;
   pullMock.mockResolvedValue(undefined);
 });
 

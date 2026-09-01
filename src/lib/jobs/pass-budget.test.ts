@@ -15,6 +15,7 @@ import * as schema from "../db/schema";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { MAX_APPLIES_PER_PASS } from "../gardener/emit";
 import { remainingApplyBudget } from "./pass-budget";
+import { insertProject } from "@/lib/testing/project";
 
 let t: TestDb;
 let workDir: string;
@@ -56,9 +57,7 @@ beforeEach(async () => {
   t = makeTestDb();
   workDir = mkdtempSync(join(tmpdir(), "anton-pass-budget-"));
   logged = [];
-  await t.db
-    .insert(schema.projects)
-    .values({ id: projectId, slug: "p1", name: "p1", repoPath: workDir });
+  insertProject(t.db, { id: projectId, slug: "p1", name: "p1", repoPath: workDir });
   await t.db
     .insert(schema.jobs)
     .values({ id: JOB, type: "product-master", projectId, status: "running" });

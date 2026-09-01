@@ -7,7 +7,7 @@
  * would be indistinguishable from an armed schedule that never fired.
  */
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
-import { makeTestDb, type TestDb } from "../db/testing";
+import type { TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
 import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
@@ -19,6 +19,7 @@ import { PoisonError } from "./errors";
 import type { Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeBoardPickerHandler } from "./board-picker";
+import { makeProjectDb } from "@/lib/testing/project";
 
 const board = vi.hoisted(() => ({ current: [] as Bead[], calls: [] as unknown[][] }));
 vi.mock("../beads/issues", () => ({
@@ -93,11 +94,7 @@ let t: TestDb;
 beforeEach(() => {
   board.current = [];
   board.calls = [];
-  t = makeTestDb();
-  t.db
-    .insert(schema.projects)
-    .values({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" })
-    .run();
+  t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" });
 });
 afterEach(() => t.close());
 

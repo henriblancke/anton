@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { randomUUID } from "node:crypto";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
+import { insertProject } from "@/lib/testing/project";
 
 // One db for the whole file: the jobs service caches a runner singleton bound to getDb() on first
 // use, so every test must share the same connection.
@@ -27,10 +28,8 @@ describe("getRunningJobInfo (service, project-scoped)", () => {
   beforeEach(async () => {
     await tdb.db.delete(schema.jobs);
     await tdb.db.delete(schema.projects);
-    await tdb.db.insert(schema.projects).values([
-      { id: "p-alpha", slug: "alpha", name: "Alpha", repoPath: "/tmp/alpha" },
-      { id: "p-beta", slug: "beta", name: "Beta", repoPath: "/tmp/beta" },
-    ]);
+    insertProject(tdb.db, { id: "p-alpha", slug: "alpha", name: "Alpha", repoPath: "/tmp/alpha" });
+    insertProject(tdb.db, { id: "p-beta", slug: "beta", name: "Beta", repoPath: "/tmp/beta" });
   });
 
   it("returns the reported info for the owning project only, and clears on settle", async () => {

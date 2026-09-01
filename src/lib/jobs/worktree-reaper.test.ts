@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { Bead } from "../beads/bd";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
+import type { TestDb } from "../db/testing";
 import { createWorktree, WORKTREES_ROOT_ENV } from "../git/worktree";
 import {
   beadStateOf,
@@ -24,6 +24,7 @@ import {
 } from "./worktree-reaper";
 import { systemClock } from "./queue";
 import type { JobContext } from "./runner";
+import { makeProjectDb } from "@/lib/testing/project";
 
 describe("beadStateOf", () => {
   const board = [
@@ -132,14 +133,7 @@ suite("worktree-reaper job (real git · real anton.db)", () => {
     execFileSync("git", ["add", "."], { cwd: repo });
     execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: repo });
 
-    tdb = makeTestDb();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "reaper",
-      name: "reaper",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ id: projectId, slug: "reaper", name: "reaper", repoPath: repo });
   });
 
   afterAll(() => {

@@ -35,6 +35,7 @@ import {
   type JobPolicyResolver,
   type RunnerConfig,
 } from "./runner";
+import { insertProject } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -223,12 +224,9 @@ describe("JobRunner (live, in-memory db)", () => {
   });
 
   /** Seed project rows so jobs.project_id FK is satisfied when a test scopes jobs to a project. */
-  async function seedProjects(...ids: string[]) {
-    const schema = await import("../db/schema");
+  function seedProjects(...ids: string[]) {
     for (const id of ids) {
-      await tdb.db
-        .insert(schema.projects)
-        .values({ id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
+      insertProject(tdb.db, { id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
     }
   }
 
@@ -648,7 +646,7 @@ describe("JobRunner (live, in-memory db)", () => {
 
   it("reconcile() reclaims orphaned running jobs and fails only truly-orphaned runs (anton-nbd)", async () => {
     const schema = await import("../db/schema");
-    await seedProjects("A", "B");
+    seedProjects("A", "B");
     const nowMs = clock.now();
 
     // A running execute-epic job whose lease has NOT yet expired — a crash left it in flight. Its
@@ -771,7 +769,7 @@ describe("JobRunner (live, in-memory db)", () => {
   it("gates execute-epic concurrency per project (not globally)", async () => {
     // Concurrency 1 per project, roomy global ceiling. Two epics for A + one for B are due; a
     // single tick may lease only one A (its cap) and one B — the second A stays queued.
-    await seedProjects("A", "B");
+    seedProjects("A", "B");
     const r = policyRunner(async () => {}, () => policy({ concurrency: 1 }));
     await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 1 } });
     await r.enqueue({ type: "execute-epic", projectId: "A", payload: { n: 2 } });
@@ -794,7 +792,7 @@ describe("JobRunner (live, in-memory db)", () => {
     // must still cap the RUNNING count at 1 per project: the per-repo coalescer serializes their
     // pushes, so a second concurrent lease buys nothing and would pile handlers into the global pool
     // under a slow remote. Bound: 1 running + 1 queued.
-    await seedProjects("A");
+    seedProjects("A");
     let concurrent = 0;
     let peak = 0;
     let release!: () => void;
@@ -826,7 +824,7 @@ describe("JobRunner (live, in-memory db)", () => {
   it("autonomy off gates claiming: execute-epic stays queued, and re-enabling resumes it (anton-y3l)", async () => {
     // The autonomy master-switch gates at *claim*: approval-style enqueues still land, but no
     // tick leases the job while the switch is off; flipping it back on resumes on the next tick.
-    await seedProjects("A");
+    seedProjects("A");
     let autonomy = false;
     let ran = 0;
     const r = policyRunner(
@@ -855,7 +853,7 @@ describe("JobRunner (live, in-memory db)", () => {
   it("autonomy off leaves in-flight work untouched and gates only new claims (anton-y3l)", async () => {
     // A job already leased keeps running to completion after the switch turns off; only the
     // not-yet-claimed job is held back.
-    await seedProjects("A");
+    seedProjects("A");
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -902,7 +900,7 @@ describe("JobRunner (live, in-memory db)", () => {
     // Mirrors the scheduler's "skips disabled schedules" but at the runner/dispatch layer — a job
     // already sitting in `queued` (or backoff/quota-rescheduled) is NOT leased while its schedule is
     // off. Uses a plain runner (no policy resolver) to prove the gate is independent of autonomy.
-    await seedProjects("A");
+    seedProjects("A");
     await seedSchedule("A", "review-fix", { enabled: false });
     let ran = 0;
     const r = new JobRunner({ db: tdb.db, clock, config: CONFIG });
@@ -933,7 +931,7 @@ describe("JobRunner (live, in-memory db)", () => {
   it("gates every scheduled job type, and a disabled schedule doesn't starve execute-epic (anton-7l7)", async () => {
     // The gate is keyed on (type, project): a disabled review-fix schedule holds its own job back
     // but leaves the same project's execute-epic dispatch (autonomy on) untouched.
-    await seedProjects("A");
+    seedProjects("A");
     await seedSchedule("A", "review-fix", { enabled: false });
     let reviewRan = 0;
     let epicRan = 0;
@@ -965,7 +963,7 @@ describe("JobRunner (live, in-memory db)", () => {
     // leasable job sorting AFTER them permanently unreachable — enabled schedules and other projects
     // stalled until the disabled ones were re-enabled or removed. Excluding held buckets in the query
     // paginates past the backlog so leasable work is still reached.
-    await seedProjects("A", "B");
+    seedProjects("A", "B");
     await seedSchedule("A", "review-fix", { enabled: false });
 
     // 250 disabled review-fix jobs (> the 200-row scan window) as the earliest-by-runAt prefix.
@@ -1019,7 +1017,7 @@ describe("JobRunner (live, in-memory db)", () => {
         }),
       () => policy({ timeoutMs: 20 }),
     );
-    await seedProjects("A");
+    seedProjects("A");
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     await r.tickOnce();
@@ -1046,7 +1044,7 @@ describe("JobRunner (live, in-memory db)", () => {
       },
       () => policy({ timeoutMs: 20 }),
     );
-    await seedProjects("A");
+    seedProjects("A");
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     await r.tickOnce();
@@ -1065,7 +1063,7 @@ describe("JobRunner (live, in-memory db)", () => {
       },
       () => policy({ maxAttempts: 1 }),
     );
-    await seedProjects("A");
+    seedProjects("A");
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
 
     await r.tickOnce();
@@ -1193,7 +1191,7 @@ describe("JobRunner (live, in-memory db)", () => {
   });
 
   it("abortProject force-aborts the in-flight job and removes the project's queued/running rows (anton-adt)", async () => {
-    await seedProjects("A", "B");
+    seedProjects("A", "B");
     let sawAbort = false;
     const r = runner(async (ctx) => {
       // Block until force-aborted — a stand-in for a long execute-epic run.
@@ -1226,7 +1224,7 @@ describe("JobRunner (live, in-memory db)", () => {
   });
 
   it("abortProject is a safe no-op for a project with no active jobs and leaves settled rows alone", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     const r = runner(async () => {});
     const id = await r.enqueue({ type: "execute-epic", projectId: "A" });
     await r.tickOnce();
@@ -1238,7 +1236,7 @@ describe("JobRunner (live, in-memory db)", () => {
   });
 
   it("quiesceProject rejects new enqueue/resume work and never leases the project again", async () => {
-    await seedProjects("A", "B");
+    seedProjects("A", "B");
     const r = runner(async () => {});
     const parked = await r.enqueue({ type: "execute-epic", projectId: "A" });
     await tdb.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parked));
@@ -1622,12 +1620,9 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
   afterEach(() => tdb.close());
 
-  async function seedProjects(...ids: string[]) {
-    const s = await import("../db/schema");
+  function seedProjects(...ids: string[]) {
     for (const id of ids) {
-      await tdb.db
-        .insert(s.projects)
-        .values({ id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
+      insertProject(tdb.db, { id, slug: id.toLowerCase(), name: id, repoPath: `/tmp/${id}` });
     }
   }
 
@@ -1669,7 +1664,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("defers a tick past the reset boundary: leases nothing and reschedules queued work to retryAt", async () => {
     // Session nearly exhausted (99% ≥ 100 − minSessionHeadroom 5) → session-headroom defer. No known
     // session reset, so retryAt is now + the 5h session window.
-    await seedProjects("A");
+    seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
       async () => {
@@ -1695,7 +1690,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // budgetAware off (resolver → null). leaseDue only scans due rows, so without clearing the
     // governor's own deferrals the job would stay parked until the stale pace boundary — the next
     // tick must pull it back to due-now and lease it.
-    await seedProjects("A");
+    seedProjects("A");
     let budgetAwareOn = true;
     let ran = 0;
     const r = budgetRunner(
@@ -1724,7 +1719,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
 
   it("governs the orphan-grooming cleanup sweep, not just execute-epic", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     const r = budgetRunner(async () => {}, { readUsage: async () => usage({ sessionPct: 99 }) });
     const id = await r.enqueue({ type: "orphan-grooming", projectId: "A" });
 
@@ -1737,7 +1732,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("does NOT govern review-fix or nightly-stringer — they lease immediately even when budget is scarce (anton-d8i4)", async () => {
     // Session 99% ≥ the floor would defer any governed type, but review-fix / nightly-stringer are
     // off the allowlist: a human's PR-review fix and the fixed nightly scan must not be paced.
-    await seedProjects("A");
+    seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
       async () => {
@@ -1758,7 +1753,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("runs an immediate-approved (bypassBudget) execute-epic while pacing a queued one (anton-d8i4)", async () => {
     // Ahead of the weekly pace-line (weekly-on-track), session fresh: a paced job defers, but an
     // immediate-approved one skips pacing and runs now.
-    await seedProjects("A");
+    seedProjects("A");
     const weeklyResetAt = new Date(clock.now() + 3.5 * 24 * 60 * 60 * 1000).toISOString(); // half-week left
     let ran = 0;
     const r = budgetRunner(
@@ -1793,7 +1788,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // only moves `queued` rows, so a paced job that was leased and then crashed sits `running`
     // with an expired lease — it must NOT be reclaimed and restarted ahead of the pace boundary,
     // while a bypass ("Approve") row in the same crashed state reclaims normally.
-    await seedProjects("A");
+    seedProjects("A");
     const s = await import("../db/schema");
     const seedCrashed = async (id: string, payload: object) => {
       await tdb.db.insert(s.jobs).values({
@@ -1832,7 +1827,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("still holds an immediate-approved execute-epic at the session-headroom floor (anton-d8i4)", async () => {
     // The session floor is the one hold "Approve" (immediate) does NOT bypass — it protects the tail
     // of the 5h session, so an immediate run can't blow the cap it would only hit mid-run.
-    await seedProjects("A");
+    seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
       async () => {
@@ -1857,7 +1852,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
 
   it("admits a tick when the governor says work may run", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
       async () => {
@@ -1874,7 +1869,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
 
   it("fails OPEN on a null usage read: no deferral, work leases normally", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     let ran = 0;
     const r = budgetRunner(
       async () => {
@@ -1898,7 +1893,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // (429 backoff, credentials hiccup, usage outage). leaseDue only scans due rows, so returning
     // on the null read without resuming the governor's own deferrals would strand the job until
     // the stale pace boundary — fail-open must pull it back to due-now and lease it.
-    await seedProjects("A");
+    seedProjects("A");
     let meterUp = true;
     let ran = 0;
     const r = budgetRunner(
@@ -1926,7 +1921,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // drops, or the operator loosens the policy) BEFORE that boundary. leaseDue only scans due
     // rows, so without resuming the governor's own deferrals on the admit path the job would stay
     // parked until the stale boundary even though the gate now admits it.
-    await seedProjects("A");
+    seedProjects("A");
     let sessionPct = 99; // session exhausted → defer
     let ran = 0;
     const r = budgetRunner(
@@ -1952,7 +1947,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("keeps the reactive UsageLimitError backstop working with the governor wired", async () => {
     // Governor admits (session fresh), but the handler still hits the wall mid-run: the reactive
     // path must reschedule to the reset and refund the attempt, exactly as without the governor.
-    await seedProjects("A");
+    seedProjects("A");
     const resetAt = Math.floor(clock.now() / 1000) + 3600; // seconds
     const r = budgetRunner(
       async () => {
@@ -1997,7 +1992,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   }
 
   it("value gate: scarce session admits only high-value work, holding cleanup un-deferred (anton-k05r)", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     await seedBurn(2); // measured cost 2% — fits the 15% headroom
     let ran = 0;
     const r = budgetRunner(
@@ -2034,7 +2029,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
 
   it("value gate: a job whose cost cannot fit the remaining session is held even at high value", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     // No burn samples → execute-epic costs the L-tier seed (20%), over the 15% headroom.
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
@@ -2051,7 +2046,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
 
   it("value gate: abundant budget admits low-value cleanup", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 10 }), // 90% headroom ≥ abundant 60 → threshold 0
       readBeadLabels: labelsReader({}),
@@ -2070,7 +2065,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   it("value gate: holds the orphan-grooming cleanup sweep when the session is scarce", async () => {
     // Grooming carries no bead — it IS the low-value cleanup band — so scarce budget holds it
     // without any label read, and it drains later when budget is abundant/behind pace.
-    await seedProjects("A");
+    seedProjects("A");
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
     });
@@ -2081,7 +2076,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
   });
 
   it("value gate: fails open when the bead's labels cannot be read", async () => {
-    await seedProjects("A");
+    seedProjects("A");
     await seedBurn(2);
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
@@ -2100,7 +2095,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
 
   it("value gate: an immediate-approved (bypassBudget) job skips the value gate", async () => {
     // The operator asked for "now" — only the session floor may hold it, not the value threshold.
-    await seedProjects("A");
+    seedProjects("A");
     await seedBurn(2);
     const r = budgetRunner(async () => {}, {
       readUsage: async () => usage({ sessionPct: 85 }),
@@ -2122,7 +2117,7 @@ describe("JobRunner budget governor admission gate (anton-szld)", () => {
     // runnable, so without gating it the reclaim would bypass the admission check and spend the
     // scarce quota. It must be held un-reclaimed — while an admitted high-value QUEUED job in the
     // same project still leases (the hold must not occupy a concurrency slot).
-    await seedProjects("A");
+    seedProjects("A");
     await seedBurn(2);
     let sessionPct = 85; // scarce → high-value only
     let ran = 0;

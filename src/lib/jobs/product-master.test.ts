@@ -12,7 +12,6 @@
  *     not look like a pass that found nothing.
  *   • the fingerprints are anton's, so a second pass over an unfixed board asks once.
  */
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,9 +29,9 @@ import {
   type GardenerPlan,
 } from "../gardener/detections";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
 const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
@@ -119,7 +118,7 @@ const REPO = "/tmp/product-master-repo";
 let nowMs = NOW;
 const clock: Clock = { now: () => nowMs };
 
-let t: TestDb;
+let t: TestProjectDb;
 let projectId: string;
 const nudge = vi.fn();
 /** The prompt the last dispatched session was handed — asserted on for the appended board context. */
@@ -178,15 +177,8 @@ beforeEach(async () => {
   sessionsDir = mkdtempSync(join(tmpdir(), "anton-product-master-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(sessionsDir, "sessions");
-  t = makeTestDb();
-  projectId = randomUUID();
-  await t.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: REPO,
-    defaultBranch: "main",
-  });
+  t = makeProjectDb({ repoPath: REPO });
+  projectId = t.projectId;
 
   writes.length = 0;
   writeVerbMock.mockImplementation((verb, id) =>

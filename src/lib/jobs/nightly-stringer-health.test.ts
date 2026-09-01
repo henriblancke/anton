@@ -4,36 +4,28 @@
  * fail a scan whose beads already landed.
  */
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { emptyScanCounts, type ScanCounts } from "../scan-health";
 import { makeHealthRecorder } from "./nightly-stringer-health";
 import type { ScanPass } from "./nightly-stringer-scan";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const clock: Clock = { now: () => 1_700_000_000_000 };
 
-let t: TestDb;
+let t: TestProjectDb;
 let dir: string;
 let logPath: string;
 let projectId: string;
 
 beforeEach(async () => {
-  t = makeTestDb();
+  t = makeProjectDb({ repoPath: "/tmp/sandbox" });
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-health-"));
   logPath = join(dir, "session.log");
-  projectId = randomUUID();
-  await t.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: "/tmp/sandbox",
-    defaultBranch: "main",
-  });
+  projectId = t.projectId;
 });
 
 afterEach(() => {

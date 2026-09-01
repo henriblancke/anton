@@ -19,6 +19,7 @@ import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Bead } from "../beads/types";
 import type { Clock } from "./queue";
 import { checkFailureStreak } from "./picker-failure-breaker";
+import { insertProject } from "@/lib/testing/project";
 
 const PROJECT = "p1";
 const T0 = 1_800_000_000_000;
@@ -27,8 +28,8 @@ const MINUTE = 60_000;
 let t: TestDb;
 const clock: Clock = { now: () => T0 + 60 * MINUTE };
 
-async function project(settings: Record<string, unknown> = {}): Promise<void> {
-  await t.db.insert(schema.projects).values({
+function project(settings: Record<string, unknown> = {}): void {
+  insertProject(t.db, {
     id: PROJECT,
     slug: "p1",
     name: "P1",
@@ -102,7 +103,7 @@ afterEach(() => t.close());
 
 describe("checkFailureStreak", () => {
   it("latches the disarm with the runs and the point they share", async () => {
-    await project();
+    project();
     await threeFailures();
 
     const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
@@ -120,7 +121,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("holds at N-1", async () => {
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0 });
     await run({ id: "r2", epic: "anton-b", status: "parked", startedMinutes: 15 });
 
@@ -132,7 +133,7 @@ describe("checkFailureStreak", () => {
     // The case a timestamp window cannot see: the job parked (usage limit, awaiting the operator),
     // so the run stopped moving, and the operator stopped it hours later. Matched on the job id the
     // run carries, so the delay is irrelevant.
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({
       id: "r2",
@@ -153,7 +154,7 @@ describe("checkFailureStreak", () => {
     // A queued retry the operator stopped before it ever ran, cancelled inside the earlier run's
     // slack window. The id join refuses it; the timestamp window alone would have excused the
     // failure it never touched.
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({
       id: "r2",
@@ -171,7 +172,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("does not count a run whose job the operator cancelled", async () => {
-    await project();
+    project();
     await threeFailures();
     // Rows from before `runs.job_id` existed, so the epic + the instant is all there is to join on.
     // The middle run's epic was force-stopped while that run was executing.
@@ -182,7 +183,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("still counts a run whose epic was cancelled at some OTHER time", async () => {
-    await project();
+    project();
     await threeFailures();
     // A cancel of anton-b from long before that run existed — a different attempt entirely.
     await cancelledJob("anton-b", -600);
@@ -193,7 +194,7 @@ describe("checkFailureStreak", () => {
   it("gives one cancel to the attempt it hit, not to the retry before it", async () => {
     // A cancel of the RETRY lands inside the previous attempt's slack window when the retry started
     // seconds after that attempt settled. Letting both claim it erases a genuine failure.
-    await project({ autopilotFailureStreak: 2 });
+    project({ autopilotFailureStreak: 2 });
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 15, error: "boom" });
     await run({ id: "r3", epic: "anton-b", status: "failed", startedMinutes: 25.5, error: "boom" });
@@ -206,7 +207,7 @@ describe("checkFailureStreak", () => {
   it("gives one cancel to the retry that was running, not to the same job's earlier attempt", async () => {
     // The runner's automatic retry REUSES the job row and opens a fresh run, so one job id spans
     // both attempts. Cancelling the retry must not reach back and excuse the failure before it.
-    await project({ autopilotFailureStreak: 2 });
+    project({ autopilotFailureStreak: 2 });
     const job = await cancelledJob("anton-b", 30);
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 15, error: "boom", job });
@@ -220,7 +221,7 @@ describe("checkFailureStreak", () => {
     // The retry reuses the job row and opens its own run only once it starts, so a cancel during
     // the backoff has no next attempt to be bounded by. Handing it back to the attempt that failed
     // before it would excuse a genuine failure and keep the breaker from ever firing.
-    await project({ autopilotFailureStreak: 2 });
+    project({ autopilotFailureStreak: 2 });
     const job = await cancelledJob("anton-b", 40);
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({
@@ -240,7 +241,7 @@ describe("checkFailureStreak", () => {
     // The same hole on the pre-`job_id` join: the retry backoff starts at seconds, so a cancel of
     // the queued retry lands well inside the slack an INTERRUPTING cancel needs — and the failure
     // that settled before it is not what the operator stopped.
-    await project({ autopilotFailureStreak: 2 });
+    project({ autopilotFailureStreak: 2 });
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 15, error: "boom" });
     await cancelledJob("anton-b", 25.5);
@@ -250,7 +251,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("counts an abandoned run, whose job the abandon also cancelled", async () => {
-    await project();
+    project();
     await threeFailures();
     await cancelledJob("anton-b", 20);
 
@@ -263,7 +264,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("counts a run whose TICKET was abandoned under it", async () => {
-    await project();
+    project();
     await threeFailures();
     await run({
       id: "r4",
@@ -282,7 +283,7 @@ describe("checkFailureStreak", () => {
     // Cancels are skipped rather than treated as a reset, so a single fixed-size read can stop one
     // row short of a still-consecutive failure — and the project stays armed on a streak that has
     // already tripped.
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     for (let i = 0; i < 18; i += 1) {
       const epic = `anton-x${i}`;
@@ -307,7 +308,7 @@ describe("checkFailureStreak", () => {
   it("keeps paging past more cancels than any row cap would read", async () => {
     // The same bug as above at a larger size: a cap on ROWS READ, rather than on the evidence, lets
     // a long enough run of cancels hide the streak's oldest member and leave the project armed.
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     for (let i = 0; i < 210; i += 1) {
       const epic = `anton-x${i}`;
@@ -330,7 +331,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("resets on a delivered run", async () => {
-    await project();
+    project();
     await threeFailures();
     await run({ id: "r4", epic: "anton-d", status: "done", startedMinutes: 45 });
 
@@ -338,7 +339,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("is off when the operator set the streak to 0", async () => {
-    await project({ autopilotFailureStreak: 0 });
+    project({ autopilotFailureStreak: 0 });
     await threeFailures();
 
     expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
@@ -349,7 +350,7 @@ describe("checkFailureStreak", () => {
     // breaker off. Nothing else repairs that row — re-arming can only answer `not-disarmed`, and the
     // strip refuses to dismiss the kind — so gating the repair behind the config strands it in
     // "Needs you" for good.
-    await project({ autopilotFailureStreak: 0 });
+    project({ autopilotFailureStreak: 0 });
     await disarmWithEscalation(t.db, clock, {
       projectId: PROJECT,
       reason: "consecutive-failures",
@@ -366,14 +367,14 @@ describe("checkFailureStreak", () => {
   });
 
   it("honours an operator's longer streak", async () => {
-    await project({ autopilotFailureStreak: 4 });
+    project({ autopilotFailureStreak: 4 });
     await threeFailures();
 
     expect(await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] })).toBeUndefined();
   });
 
   it("leaves an already-disarmed project alone — a latch is never re-decided", async () => {
-    await project();
+    project();
     await threeFailures();
     await disarmAutopilot(t.db, clock, {
       projectId: PROJECT,
@@ -386,7 +387,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("raises one escalation carrying the same evidence, and stamps it on the disarm", async () => {
-    await project();
+    project();
     await threeFailures();
 
     const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
@@ -406,7 +407,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("stays armed after a re-arm — the runs it read were the ones the operator overruled", async () => {
-    await project();
+    project();
     await threeFailures();
     expect((await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] }))?.latched).toBe(
       true,
@@ -420,7 +421,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("disarms again once NEW runs fail after the re-arm", async () => {
-    await project();
+    project();
     await threeFailures();
     await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
     await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
@@ -436,7 +437,7 @@ describe("checkFailureStreak", () => {
   });
 
   it("counts a failure double under the caller's weigher", async () => {
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "boom" });
     await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 15, error: "boom" });
 

@@ -11,7 +11,6 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { makeTestDb, type TestDb } from "../db/testing";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -35,6 +34,7 @@ import {
   type CookedStep,
   type StepContext,
 } from "./step-registry";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const FORMULA = ".beads/formulas/anton-run.formula.toml";
 
@@ -67,7 +67,7 @@ function fakeClaude(...replies: Array<string | ClaudeResult | Error>) {
 }
 
 let dir: string;
-let tdb: TestDb;
+let tdb: TestProjectDb;
 let projectId: string;
 let runId: string;
 let priorSessionsRoot: string | undefined;
@@ -78,16 +78,9 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "anton-step-registry-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  tdb = makeTestDb();
-  projectId = randomUUID();
+  tdb = makeProjectDb({ repoPath: dir });
+  projectId = tdb.projectId;
   runId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: dir,
-    defaultBranch: "main",
-  });
   await tdb.db.insert(schema.runs).values({
     id: runId,
     projectId,

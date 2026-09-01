@@ -4,37 +4,29 @@
  * in-flight scan, since nightly-stringer writes no run row.
  */
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { PoisonError } from "./errors";
 import { openPass } from "./nightly-stringer-pass";
 import { fakeJobContext } from "./pass.fixture";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const clock: Clock = { now: () => 1_700_000_000_000 };
 
-let t: TestDb;
+let t: TestProjectDb;
 let dir: string;
 let priorSessionsRoot: string | undefined;
 let projectId: string;
 
 beforeEach(async () => {
-  t = makeTestDb();
+  t = makeProjectDb({ repoPath: "/tmp/sandbox" });
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-pass-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  projectId = randomUUID();
-  await t.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: "/tmp/sandbox",
-    defaultBranch: "main",
-  });
+  projectId = t.projectId;
 });
 
 afterEach(() => {

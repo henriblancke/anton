@@ -11,11 +11,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { schema } from "../../db";
-import { makeTestDb, type TestDb } from "../../db/testing";
+import { type TestDb } from "../../db/testing";
 import type { Bead } from "../../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import type { Clock } from "../queue";
 import type { StepContext } from "./context";
+import { makeProjectDb } from "@/lib/testing/project";
 
 export const BRANCH = "anton/anton-8d0f";
 
@@ -65,16 +66,9 @@ export async function openSandbox(name: string): Promise<StepSandbox & { priorSe
   const dir = mkdtempSync(join(tmpdir(), `anton-${name}-`));
   const priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  const tdb = makeTestDb();
-  const projectId = randomUUID();
+  const tdb = makeProjectDb({ repoPath: dir });
+  const projectId = tdb.projectId;
   const runId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: dir,
-    defaultBranch: "main",
-  });
   await tdb.db.insert(schema.runs).values({
     id: runId,
     projectId,

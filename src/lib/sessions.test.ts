@@ -8,16 +8,16 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 
-import { applyMigrationsTo, makeTestDb, type TestDb } from "./db/testing";
+import { applyMigrationsTo } from "./db/testing";
 import { schema } from "./db";
 import { readPassRecords } from "./gardener/record";
 import type { Clock } from "./jobs/queue";
 import { sessionLogPath, startJobSession } from "./sessions";
+import { insertProject, makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -27,7 +27,7 @@ class FakeClock implements Clock {
 }
 
 let dir: string;
-let tdb: TestDb;
+let tdb: TestProjectDb;
 let projectId: string;
 const clock = new FakeClock(1_700_000_000_000);
 let priorSessionsRoot: string | undefined;
@@ -36,15 +36,8 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "anton-job-session-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  tdb = makeTestDb();
-  projectId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: dir,
-    defaultBranch: "main",
-  });
+  tdb = makeProjectDb({ repoPath: dir });
+  projectId = tdb.projectId;
 });
 
 afterEach(() => {
@@ -166,9 +159,7 @@ describe("sessionsByJob", () => {
     // getDb() is lazy, so setting ANTON_DB above is enough — no module re-import needed.
     const { getDb, schema: dbSchema } = await import("./db");
     const db = getDb();
-    await db
-      .insert(dbSchema.projects)
-      .values({ id: "p1", slug: "p1", name: "p1", repoPath: workDir });
+    insertProject(db, { id: "p1", slug: "p1", name: "p1", repoPath: workDir });
     await db.insert(dbSchema.jobs).values([
       { id: "gardener-job", type: "gardener", projectId: "p1", status: "done" },
       { id: "resumed-job", type: "product-master", projectId: "p1", status: "done" },
