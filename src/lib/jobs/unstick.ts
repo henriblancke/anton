@@ -239,7 +239,10 @@ export function usageWindowEnd(
  * head.
  */
 export function classifyFinding(finding: RunHealthFinding, ctx: UnstickContext): UnstickVerdict {
-  const classify = CLASSIFIERS[finding.kind];
+  // Own keys only: report JSON is deserialized without validation, so an inherited
+  // `Object.prototype` name ("toString", "constructor") would resolve to a truthy prototype method
+  // and throw mid-sweep instead of escalating.
+  const classify = Object.hasOwn(CLASSIFIERS, finding.kind) ? CLASSIFIERS[finding.kind] : undefined;
   // A kind with no classifier is a stall nobody taught the pass to judge — a human decides it.
   return classify ? classify(finding, ctx) : escalate(finding.reason);
 }

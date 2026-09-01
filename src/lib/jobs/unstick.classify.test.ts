@@ -360,4 +360,16 @@ describe("classifyFinding — the dispatch over every stuck shape", () => {
       why: "the reported reason",
     });
   });
+
+  it("escalates a prototype-named kind rather than throwing mid-sweep", () => {
+    // `Object.prototype` carries these names, so a bare index would hand back a truthy method and
+    // call it — a TypeError that aborts the whole pass instead of parking one finding.
+    for (const kind of ["toString", "constructor", "valueOf", "__proto__"]) {
+      const f = { ...finding({ kind: "parked-run" }), kind } as unknown as RunHealthFinding;
+      expect(classifyFinding(f, ctxOf())).toEqual({
+        disposition: "escalate",
+        why: "the reported reason",
+      });
+    }
+  });
 });
