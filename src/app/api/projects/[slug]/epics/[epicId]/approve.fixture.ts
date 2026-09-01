@@ -25,6 +25,8 @@ export interface ApproveBody {
   steal?: boolean;
   immediate?: boolean;
   release?: boolean;
+  /** The plan generation a release names — the pick the operator was looking at. */
+  planId?: string;
 }
 
 /**

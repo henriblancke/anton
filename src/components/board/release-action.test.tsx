@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ReleaseAction } from "@/components/board/release-action";
+import { PickDecisionProvider } from "@/components/board/pick-decision";
 
 const refresh = vi.fn();
 const success = vi.fn();
@@ -63,6 +64,39 @@ describe("releasing one pick", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(success).toHaveBeenCalledWith('Released "Resumable crawl checkpoints" — running now');
     await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("names the plan generation on screen, so the accept answers the pick the operator saw", async () => {
+    // A later pass can re-pick the same bead between the render and the click. Without the
+    // generation the route resolves the pick from whatever plan is current, and records an accept
+    // for a decision nobody was shown (PR #212 review).
+    const fetchMock = stubFetch({ jobId: "job-1" });
+    render(
+      <PickDecisionProvider planId="plan-a">
+        <ReleaseAction slug="anton" beadId="anton-a" title="Resumable crawl checkpoints" />
+      </PickDecisionProvider>,
+    );
+
+    release();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        body: JSON.stringify({ release: true, immediate: true, planId: "plan-a" }),
+      }),
+    );
+  });
+
+  it("names none from a card that came from no plan, leaving the route its own resolution", async () => {
+    const fetchMock = stubFetch({ jobId: "job-1" });
+    mount();
+
+    release();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ body: JSON.stringify({ release: true, immediate: true }) }),
+    );
   });
 
   it("says nothing started while the request is in flight, and never fires twice", async () => {

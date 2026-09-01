@@ -9,6 +9,7 @@ import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
 import {
   PICKER_DEFER_WINDOW_MS,
+  PICKER_RECORD_WINDOW,
   activeDeferrals,
   deferralVersion,
   listPickerVerdicts,
@@ -153,6 +154,38 @@ describe("the decline record", () => {
     const after = at(NOW + PICKER_DEFER_WINDOW_MS * 2);
     expect((await activeDeferrals(test.db, PROJECT, after)).size).toBe(0);
     expect((await pickerTrackRecord(test.db, PROJECT)).declined).toBe(1);
+  });
+
+  it("cuts the window at a fixed boundary when verdicts share a timestamp", async () => {
+    // `decided_at` is second-resolution, so a burst of verdicts — a double-click, a seeded fixture,
+    // two tabs answering at once — can tie. Without a tiebreaker the row that falls outside the
+    // window is SQLite's choice, and the counts earned autonomy reads change between two reads of
+    // one table (PR #212 review). The id settles it: the window is the newest by id, always.
+    const row = (i: number) => ({
+      id: `v-${String(i).padStart(2, "0")}`,
+      projectId: PROJECT,
+      beadId: `anton-${i}`,
+      // The lowest id is the only decline, so it is exactly the row the boundary drops.
+      verdict: i === 0 ? "declined" : "accepted",
+      action: i === 0 ? "not-now" : "release",
+      decidedAt: at(NOW),
+    });
+    // Written LAST, so insertion order and id order disagree: a read that fell back to the table's
+    // own row order would keep this decline and drop an accept instead.
+    await test.db
+      .insert(schema.pickerVerdicts)
+      .values([...Array.from({ length: PICKER_RECORD_WINDOW }, (_, i) => row(i + 1)), row(0)]);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
+      accepted: PICKER_RECORD_WINDOW,
+      declined: 0,
+      settled: PICKER_RECORD_WINDOW,
+    });
+    // The audit trail behind the counts reads the same window, in the same order.
+    const listed = await listPickerVerdicts(test.db, PROJECT);
+    expect(listed.map((r) => r.beadId)).toEqual(
+      Array.from({ length: PICKER_RECORD_WINDOW }, (_, i) => `anton-${PICKER_RECORD_WINDOW - i}`),
+    );
   });
 
   it("counts an accept beside the declines, so the record has two sides", async () => {

@@ -46,17 +46,34 @@ export const dynamic = "force-dynamic";
  * target was anton's pick and the operator agreed with it, so the choice is recorded as an accept.
  * The flag ASKS for that record; whether the target really was a live pick is re-derived server-side
  * (see {@link recordRelease}), because a client cannot be the witness to its own evidence.
+ *
+ * `planId` rides with it: the plan GENERATION the operator was looking at, exactly as the veto route
+ * takes one (PR #212 review). The client is not trusted to say the target was a pick, but it IS the
+ * only witness to WHICH decision it was answering — a later pass can have re-picked the same bead
+ * since the card was drawn, and an accept resolved from the newer generation would credit the picker
+ * with an agreement to a pick nobody was shown.
  */
-async function readApprovalBody(
-  request: Request,
-): Promise<{ steal: boolean; immediate: boolean; immediateExplicit: boolean; release: boolean }> {
+async function readApprovalBody(request: Request): Promise<{
+  steal: boolean;
+  immediate: boolean;
+  immediateExplicit: boolean;
+  release: boolean;
+  planId?: string;
+}> {
   try {
-    const body = (await request.json()) as { steal?: unknown; immediate?: unknown; release?: unknown };
+    const body = (await request.json()) as {
+      steal?: unknown;
+      immediate?: unknown;
+      release?: unknown;
+      planId?: unknown;
+    };
+    const planId = typeof body?.planId === "string" ? body.planId.trim() : "";
     return {
       steal: body?.steal === true,
       immediate: body?.immediate !== false,
       immediateExplicit: body?.immediate === true,
       release: body?.release === true,
+      ...(planId && planId.length <= 120 ? { planId } : {}),
     };
   } catch {
     return { steal: false, immediate: true, immediateExplicit: false, release: false };
@@ -67,9 +84,14 @@ async function readApprovalBody(
  * Record the operator's ACCEPT of the picker's pick — the half of a release that an ordinary approve
  * has no reason to write (anton-d2h6).
  *
- * The pick is resolved from the recorded plan HERE, exactly as the veto route resolves its own
- * provenance server-side: the rank and the plan's generation id name the decision being accepted,
- * and a client-supplied one could name any.
+ * WHICH pick is answered comes from the client — the generation it had on screen — and is honoured
+ * only while the recorded plan is still that generation, exactly as the veto route binds its own
+ * verdict (PR #212 review). Its rank and rule are then read off that plan, never off the request: a
+ * client-supplied rank could name any decision. A release that names a generation a later pass has
+ * replaced records NOTHING — the pick it agreed with no longer exists, and crediting the picker with
+ * an accept of the newer one would put an agreement to an unseen decision into the evidence base.
+ * A release that names no generation at all falls back to the recorded plan, which is every caller
+ * that predates the field.
  *
  * And the pick must still BE one (PR #212 review). The flag is a client's claim that this target was
  * anton's pick, so a stale lane, a retried request, or any direct caller can set it on a target the
@@ -93,7 +115,12 @@ async function readApprovalBody(
  * while this request was in flight is invisible to it. `recordPickerAccept` re-asks the question
  * holding the write lock, so at most one of the two verdicts ever lands on a pick (PR #212 review).
  */
-async function recordRelease(projectId: string, beadId: string, board: Bead[]): Promise<void> {
+async function recordRelease(
+  projectId: string,
+  beadId: string,
+  board: Bead[],
+  displayedPlanId?: string,
+): Promise<void> {
   try {
     const db = getDb();
     const [plan, armed, policy, deferrals] = await Promise.all([
@@ -107,6 +134,9 @@ async function recordRelease(projectId: string, beadId: string, board: Bead[]): 
     const entry = plan?.entries.find((e) => e.beadId === beadId);
     if (!armed) return skip("the picker is disarmed");
     if (!plan || !entry) return skip("no recorded plan picks this target");
+    if (displayedPlanId !== undefined && plan.planId !== displayedPlanId) {
+      return skip("a later pass replaced the plan generation the operator answered");
+    }
     if (deferrals.has(beadId)) return skip("the operator vetoed this pick");
     if (isPlanStale(plan, stampBoard(board, Date.now(), policy), deferrals)) {
       return skip("the board has moved past the plan that picked it");
@@ -293,7 +323,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // Read before the approve below, which would otherwise make every request look like a re-approve.
   // See the enqueue gate at the end for what this distinguishes.
   const wasApproved = beads.isApproved(target);
-  const { steal, immediate, immediateExplicit, release } = await readApprovalBody(request);
+  const { steal, immediate, immediateExplicit, release, planId } = await readApprovalBody(request);
   // A pure take-over reassigns the reservation and nothing more (the enqueue gate at the end skips its
   // run), so it bypasses the blocker gate — but never the steal-validity checks below, which still
   // confine it to a backlog target with a resolvable operator identity. Mirrors the enqueue-suppression
@@ -584,7 +614,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // the accept records; only a failed or suppressed enqueue leaves nothing to answer for. Whether
   // the target was a PICK at all is re-derived server-side, off this same pre-write snapshot.
   if (release && (run === "started" || run === "elsewhere")) {
-    await recordRelease(project.id, epicId, allBeads);
+    await recordRelease(project.id, epicId, allBeads, planId);
   }
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local

@@ -27,11 +27,11 @@ import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { ProvenanceBadges } from "@/components/board/provenance-badge";
 import { usePickDecision } from "@/components/board/pick-decision";
 import { ReleaseAction } from "@/components/board/release-action";
+import { NotNowChip } from "@/components/board/not-now-chip";
 import {
   AbandonedChip,
   BlockedChip,
   MetaChip,
-  NotNowChip,
   PartiallyBlockedChip,
   PrLink,
   RiskChip,

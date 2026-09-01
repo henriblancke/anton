@@ -393,7 +393,10 @@ export async function pickerTrackRecord(
     .select({ verdict: schema.pickerVerdicts.verdict })
     .from(schema.pickerVerdicts)
     .where(eq(schema.pickerVerdicts.projectId, projectId))
-    .orderBy(desc(schema.pickerVerdicts.decidedAt))
+    // The id breaks a `decidedAt` tie (PR #212 review): the column is second-resolution, so two
+    // verdicts settled in the same second would otherwise leave the window's composition — and the
+    // counts read off it — up to SQLite's row order.
+    .orderBy(desc(schema.pickerVerdicts.decidedAt), desc(schema.pickerVerdicts.id))
     .limit(window);
   const accepted = rows.filter((r) => r.verdict === "accepted").length;
   return { accepted, declined: rows.length - accepted, settled: rows.length };
@@ -409,7 +412,9 @@ export async function listPickerVerdicts(
     .select()
     .from(schema.pickerVerdicts)
     .where(eq(schema.pickerVerdicts.projectId, projectId))
-    .orderBy(desc(schema.pickerVerdicts.decidedAt))
+    // Same tiebreaker as the counts above: the audit trail and the window it explains must not
+    // disagree about which verdicts are the newest.
+    .orderBy(desc(schema.pickerVerdicts.decidedAt), desc(schema.pickerVerdicts.id))
     .limit(limit);
   return rows.map((row) => ({
     beadId: row.beadId,

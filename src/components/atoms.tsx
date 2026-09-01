@@ -1,9 +1,9 @@
 import type { ReactNode } from "react";
-import { CircleSlashIcon, LockIcon, LockOpenIcon, MoonIcon, TimerResetIcon } from "lucide-react";
+import { CircleSlashIcon, LockIcon, LockOpenIcon, MoonIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { Stage } from "@/lib/types";
-import { formatCountdown, formatExactTime, formatRelativeTime } from "@/lib/time";
+import { formatExactTime, formatRelativeTime } from "@/lib/time";
 import { STAGE_ACCENT_DOT, STAGE_LABELS } from "@/components/board/board-utils";
 
 type ChipTone = "neutral" | "risk-high" | "risk-med" | "partial" | "blocked" | "pr" | "done";
@@ -132,23 +132,6 @@ export function SnoozedChip({ className }: { className?: string }) {
     <MetaChip className={className}>
       <MoonIcon className="size-2.5" aria-hidden="true" />
       <span title="Snoozed — kept out of the ready queue until un-snoozed">snoozed</span>
-    </MetaChip>
-  );
-}
-
-/**
- * "not now" chip — the operator vetoed this pick and anton is holding the target until the window
- * runs out (anton-jqvy). Distinct from `snoozed`, which is bd's own shared, unbounded defer: this
- * one expires by itself, so it names WHEN rather than asking to be undone.
- */
-export function NotNowChip({ untilMs, className }: { untilMs: number; className?: string }) {
-  const left = formatCountdown(new Date(untilMs).toISOString());
-  return (
-    <MetaChip className={className}>
-      <TimerResetIcon className="size-2.5" aria-hidden="true" />
-      <span title={`Not now — anton offers this again in ${left} (${formatExactTime(new Date(untilMs).toISOString())})`}>
-        not now · {left}
-      </span>
     </MetaChip>
   );
 }

@@ -21,10 +21,20 @@ import { createContext, useCallback, useContext, useMemo, useRef, useState } fro
  *
  * Outside a provider the lock is a no-op — a Backlog card renders exactly one of these controls, so
  * there is nothing to serialize.
+ *
+ * It also carries WHICH pick is being answered — the generation of the plan the operator is looking
+ * at (PR #212 review). The controls that write a verdict live at different depths (the vetoes sit on
+ * the lane's own row, `[Release]` inside the shared card), and both must name the same decision, so
+ * the generation belongs to the pick rather than to either button's props.
  */
 export type PickDecision = {
   /** `open` — answerable. `deciding` — a write is out. `settled` — this pick has its answer. */
   state: "open" | "deciding" | "settled";
+  /**
+   * The plan generation this pick was displayed from, when it came from a recorded plan. Undefined
+   * outside a provider: a Backlog card is not a pick, so its approve answers no decision.
+   */
+  planId?: string;
   /** Take the pick synchronously; `false` means another control already holds or settled it. */
   claim: () => boolean;
   /** The write landed — the pick is answered. */
@@ -42,7 +52,14 @@ const OPEN: PickDecision = {
 
 const PickDecisionContext = createContext<PickDecision>(OPEN);
 
-export function PickDecisionProvider({ children }: { children: React.ReactNode }) {
+export function PickDecisionProvider({
+  planId,
+  children,
+}: {
+  /** The generation the cards below were projected from; omitted when there is no plan to name. */
+  planId?: string;
+  children: React.ReactNode;
+}) {
   const held = useRef<PickDecision["state"]>("open");
   const [state, setState] = useState<PickDecision["state"]>("open");
 
@@ -60,8 +77,8 @@ export function PickDecisionProvider({ children }: { children: React.ReactNode }
   const abandon = useCallback(() => move("open"), [move]);
 
   const value = useMemo<PickDecision>(
-    () => ({ state, claim, settle, abandon }),
-    [state, claim, settle, abandon],
+    () => ({ state, claim, settle, abandon, ...(planId === undefined ? {} : { planId }) }),
+    [state, claim, settle, abandon, planId],
   );
   return <PickDecisionContext.Provider value={value}>{children}</PickDecisionContext.Provider>;
 }

@@ -135,7 +135,8 @@ export function UpNextLane({
  *
  * The row is also where the pick's ONE decision lives: `[Release]` renders inside the card and the
  * vetoes render above it, so nothing below could serialize them (PR #212 review). Scoped per row —
- * answering one pick never freezes the rest of the plan.
+ * answering one pick never freezes the rest of the plan. The provider carries the generation on
+ * screen with it, so the release inside the card names the same decision the vetoes above it do.
  */
 function UpNextRow({
   slug,
@@ -175,7 +176,7 @@ function UpNextRow({
   };
 
   return (
-    <PickDecisionProvider>
+    <PickDecisionProvider {...(planId === undefined ? {} : { planId })}>
       <div
         ref={setNodeRef}
         style={style}

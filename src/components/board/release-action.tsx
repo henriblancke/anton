@@ -61,7 +61,8 @@ export function ReleaseAction({
   const [failure, setFailure] = useState<string | undefined>(undefined);
   // Accepting the pick and declining it are one decision, and on a ranked card the veto beside this
   // button is the other half of it. The lock keeps them exclusive: a release that cannot claim the
-  // pick never starts a run the operator has already deferred (PR #212 review).
+  // pick never starts a run the operator has already deferred (PR #212 review). It also names the
+  // plan generation this card was drawn from — the decision this release answers.
   const decision = usePickDecision();
 
   async function release() {
@@ -73,8 +74,13 @@ export function ReleaseAction({
         method: "POST",
         headers: { "content-type": "application/json" },
         // `immediate` is what "release" promises — the operator asked for this run NOW, so it is
-        // never handed to the budget governor's pace-line.
-        body: JSON.stringify({ release: true, immediate: true }),
+        // never handed to the budget governor's pace-line. `planId` names the generation on screen,
+        // so the accept is recorded against the pick the operator actually saw.
+        body: JSON.stringify({
+          release: true,
+          immediate: true,
+          ...(decision.planId === undefined ? {} : { planId: decision.planId }),
+        }),
       });
       const body = (await res.json().catch(() => null)) as {
         error?: string;

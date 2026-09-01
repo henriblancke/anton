@@ -7,12 +7,12 @@ import {
   AbandonedChip,
   BlockedChip,
   MetaChip,
-  NotNowChip,
   PrLink,
   RiskChip,
   SnoozedChip,
 } from "@/components/atoms";
 import { ReviewScoreChip } from "@/components/review-score";
+import { NotNowChip } from "@/components/board/not-now-chip";
 import { TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { ContractChip } from "@/components/board/contract-mark";

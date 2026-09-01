@@ -57,13 +57,17 @@ async function liveStamp(): Promise<BoardStamp> {
 /** Record a plan that ranks `beadId` first, so a release has a pick to answer. Returns the plan's
  *  GENERATION id — what a recorded accept must name as the decision it answers, and deliberately not
  *  the reusable board digest. */
-async function planFor(beadId: string, stamp?: BoardStamp): Promise<string> {
+async function planFor(
+  beadId: string,
+  stamp?: BoardStamp,
+  rule = "the work policy armed on this machine",
+): Promise<string> {
   const fence = stamp ?? (await liveStamp());
   const project = await projectId();
   await saveBoardPickerPlan(getDb(), { now: () => Date.now() }, {
     projectId: project,
     stamp: fence,
-    entries: [{ beadId, rank: 1, rule: "the work policy armed on this machine" }],
+    entries: [{ beadId, rank: 1, rule }],
     exclusions: [],
   });
   return (await getBoardPickerPlan(getDb(), project))!.planId;
@@ -131,6 +135,34 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     ]);
     // The accept has no window to bound — only a decline defers.
     expect(rows[0]?.deferredUntilMs).toBeUndefined();
+  });
+
+  it("records the accept against the generation the operator named", async () => {
+    actAs("anton-test");
+    const epic = await runTarget("Named generation");
+    const planId = await planFor(epic);
+
+    expect((await approve(epic, { release: true, planId })).status).toBe(200);
+
+    expect(await verdictsFor(epic)).toEqual([
+      expect.objectContaining({ beadId: epic, verdict: "accepted", planId, rank: 1 }),
+    ]);
+  });
+
+  it("records nothing when a later pass replaced the generation the operator answered", async () => {
+    // The tab still shows generation A; the pass has since written B over it, carrying the same
+    // bead. Resolving the pick from B would credit the picker with an agreement to a decision that
+    // was never on screen — and could answer a pick another tab has already vetoed (PR #212 review).
+    actAs("anton-test");
+    const epic = await runTarget("Superseded generation");
+    const displayed = await planFor(epic);
+    const current = await planFor(epic, undefined, "a rule the next pass ranked it under");
+    expect(current).not.toBe(displayed);
+
+    expect((await approve(epic, { release: true, planId: displayed })).status).toBe(200);
+    // The run is the operator's to have either way — only the evidence is withheld.
+    expect(await executeEpicJobs(epic)).toHaveLength(1);
+    expect(await verdictsFor(epic)).toHaveLength(0);
   });
 
   it("counts one accept per pick, not per click — a re-released target enqueues no second run", async () => {

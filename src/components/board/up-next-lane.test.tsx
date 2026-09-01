@@ -369,6 +369,34 @@ describe("the budget line in the Up Next lane", () => {
 });
 
 /**
+ * `[Release]` from the lane (anton-d2h6 / R3.5). The button's own behaviour is
+ * `release-action.test.tsx`'s; what is pinned here is the wiring the operator depends on — the card
+ * inside the lane knows WHICH generation it was drawn from, exactly as the vetoes above it do.
+ */
+describe("releasing a pick from the lane", () => {
+  it("names the generation on screen, so the accept answers the pick that was shown", async () => {
+    const fetchMock = stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
+    const board = fixture(PLAN);
+    // The picker's mark is what draws `[Release]` in place of the plain Approve.
+    board.columns.backlog = board.columns.backlog.map((e) =>
+      e.id === "anton-pick2" ? { ...e, provenance: [{ kind: "policy" as const }] } : e,
+    );
+    render(<EpicBoard slug="tmp" initialBoard={board} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /release/i }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/tmp/epics/anton-pick2/approve",
+        expect.objectContaining({
+          body: JSON.stringify({ release: true, immediate: true, planId: PLAN_ID }),
+        }),
+      ),
+    );
+  });
+});
+
+/**
  * The two vetoes, reachable from the lane (anton-jqvy / R3.9). VetoActions' own behaviour is
  * `veto-actions.test.tsx`'s; what is pinned here is that an operator can actually get at it — the
  * gap that made the whole server half unreachable.
