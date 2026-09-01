@@ -11,7 +11,15 @@ import {
   type Stage,
   type StandaloneItem,
   type Ticket,
+  type UpNextEntry,
 } from "@/lib/types";
+
+/**
+ * The Up Next lane's heading (anton-t9m4 / R3.2). NOT "Ready": `bd ready` already means *unblocked*,
+ * and two meanings of ready on one screen is the confusion `.beads/PRIME.md` opens by warning about.
+ * Lives beside STAGE_LABELS but deliberately outside it — Up Next is not a stage.
+ */
+export const UP_NEXT_LABEL = "Up Next";
 
 export const STAGE_LABELS: Record<Stage, string> = {
   backlog: "Backlog",
@@ -429,6 +437,76 @@ export function groupBoardByEpic(
       return byTitle !== 0 ? byTitle : a.epic!.id.localeCompare(b.epic!.id);
     });
   return noEpic ? [...sorted, noEpic] : sorted;
+}
+
+// ── Up Next: this machine's plan, taken out of Backlog ────────────────────
+
+/** One card in the Up Next lane: the ranking's facts, plus whichever board item they describe. */
+export type UpNextCard =
+  | { entry: UpNextEntry; kind: "epic"; epic: Epic }
+  | { entry: UpNextEntry; kind: "standalone"; item: StandaloneItem };
+
+/** The lane and the board it was taken out of — `cards` empty means there is no lane to draw. */
+export interface UpNextSplit {
+  cards: UpNextCard[];
+  columns: Record<Stage, Epic[]>;
+  standalone: Record<Stage, StandaloneItem[]>;
+}
+
+/**
+ * Split the board into the Up Next lane and the Backlog it leaves behind (anton-t9m4 / R3.3).
+ *
+ * SUBTRACTION, not an overlay: a bead lives in exactly one lane, so a card the plan claims is
+ * removed from Backlog rather than drawn in both places. Done by id, against the backlog column
+ * only — Up Next is a projection over Backlog, never a stage, so a target that has since started
+ * stays in Implementing and simply drops out of the lane. That is also the staleness behaviour we
+ * want: the plan is history, the columns are what is true now.
+ *
+ * `entries` absent (no plan recorded, or the picker disarmed) yields an empty lane and the board
+ * untouched, which is what makes the lane's absence a single check for the caller.
+ */
+export function takeUpNext(
+  columns: Record<Stage, Epic[]>,
+  standalone: Record<Stage, StandaloneItem[]> | undefined,
+  entries: UpNextEntry[] | undefined,
+): UpNextSplit {
+  const chips = standalone ?? emptyStageMap<StandaloneItem>();
+  if (!entries?.length) return { cards: [], columns, standalone: chips };
+
+  const epicsById = new Map((columns.backlog ?? []).map((epic) => [epic.id, epic]));
+  const chipsById = new Map((chips.backlog ?? []).map((item) => [item.id, item]));
+
+  const cards: UpNextCard[] = [];
+  for (const entry of entries) {
+    const epic = epicsById.get(entry.beadId);
+    if (epic) {
+      cards.push({ entry, kind: "epic", epic });
+      continue;
+    }
+    const item = chipsById.get(entry.beadId);
+    if (item) cards.push({ entry, kind: "standalone", item });
+  }
+  if (cards.length === 0) return { cards: [], columns, standalone: chips };
+
+  const taken = new Set(cards.map((card) => card.entry.beadId));
+  return {
+    cards,
+    columns: { ...columns, backlog: (columns.backlog ?? []).filter((e) => !taken.has(e.id)) },
+    standalone: { ...chips, backlog: (chips.backlog ?? []).filter((i) => !taken.has(i.id)) },
+  };
+}
+
+/**
+ * The three ranking facts under a lane card's position — priority, work type, and how much open work
+ * finishing it frees. One string so the visible line and the group's accessible name can never say
+ * different things about the same pick.
+ *
+ * An unprioritized bead says so rather than borrowing a number: the ranking sorts it after every
+ * explicit priority (beads/rank.ts), and printing `P4` would claim a decision nobody made.
+ */
+export function upNextMetaLabel(entry: UpNextEntry): string {
+  const priority = entry.priority === undefined ? "no priority" : `P${entry.priority}`;
+  return `${priority} · ${TYPE_LABELS[entry.type]} · unblocks ${entry.unblocks}`;
 }
 
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic

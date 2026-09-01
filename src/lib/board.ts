@@ -19,6 +19,8 @@ import { boardProvenance, provenanceVersion } from "./board-provenance";
 import { getDb } from "./db";
 import { deferralVersion, latestPickerDeferrals } from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
+import { isScheduleEnabled } from "./schedules";
+import { upNextEntries, upNextVersion } from "./up-next";
 import {
   latestScanHealth,
   latestScanHealthVersion,
@@ -64,17 +66,19 @@ function boardVersion(
   scan: string,
   vetoes: string,
   provenance: string,
+  upNext: string,
   repoPath: string,
 ): string {
-  return `${snapshotVersion}:${hygiene}:${scan}:${vetoes}:${provenance}:${getSyncStatusToken(repoPath)}`;
+  return `${snapshotVersion}:${hygiene}:${scan}:${vetoes}:${provenance}:${upNext}:${getSyncStatusToken(repoPath)}`;
 }
 
 export async function getBoardVersion(project: Project): Promise<string> {
-  const [hygiene, scan, deferrals, plan] = await Promise.all([
+  const [hygiene, scan, deferrals, plan, pickerArmed] = await Promise.all([
     readHygieneVersion(project),
     readScanHealthVersion(project),
     readDeferrals(project),
     readPickerPlan(project),
+    readPickerArmed(project),
   ]);
   return boardVersion(
     issueSnapshotVersion(project.repoPath),
@@ -82,6 +86,7 @@ export async function getBoardVersion(project: Project): Promise<string> {
     scan,
     deferralVersion(deferrals),
     provenanceVersion(plan),
+    upNextVersion(pickerArmed),
     project.repoPath,
   );
 }
@@ -151,6 +156,22 @@ async function readPickerPlan(project: Project): Promise<BoardPickerPlan | undef
   }
 }
 
+/**
+ * Is the board-picker armed for this project? The Up Next lane is a projection of what the pass
+ * WOULD start next, so a disarmed picker has no lane: its last plan is history, and a ranking left
+ * on screen by a pass that stopped running is the one thing a shadow-mode lane must not be.
+ *
+ * Fail-soft to "armed" — losing the schedule read must not silently hide a lane that is running.
+ */
+async function readPickerArmed(project: Project): Promise<boolean> {
+  try {
+    return await isScheduleEnabled(project.id, "board-picker");
+  } catch (err) {
+    console.error(`[board] picker schedule read failed for ${project.slug}`, err);
+    return true;
+  }
+}
+
 /** The policy armed on this machine — what `◈ policy` anchors at. Fail-soft for the same reason. */
 async function readPickerPolicy(project: Project): Promise<Policy | undefined> {
   try {
@@ -190,15 +211,23 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // The bead read (bd) and the anton.db reads (hygiene, scan health, picker vetoes, the picker's
   // plan and policy) are independent — run them concurrently so the slowest sets the board's latency
   // instead of their sum.
-  const [{ beads: allBeads, version: snapshotVersion }, hygiene, scan, deferrals, plan, policy] =
-    await Promise.all([
-      readAllIssues(project.repoPath, opts),
-      readHygiene(project),
-      readScanHealth(project),
-      readDeferrals(project),
-      readPickerPlan(project),
-      readPickerPolicy(project),
-    ]);
+  const [
+    { beads: allBeads, version: snapshotVersion },
+    hygiene,
+    scan,
+    deferrals,
+    plan,
+    policy,
+    pickerArmed,
+  ] = await Promise.all([
+    readAllIssues(project.repoPath, opts),
+    readHygiene(project),
+    readScanHealth(project),
+    readDeferrals(project),
+    readPickerPlan(project),
+    readPickerPolicy(project),
+    readPickerArmed(project),
+  ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
   // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
@@ -322,6 +351,9 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
   const provenance = boardProvenance({ board: allBeads, plan, policy });
+  // The Up Next lane's input (anton-t9m4). Withheld whole while the picker is disarmed, so the lane
+  // is ABSENT rather than showing a ranking no pass is keeping fresh.
+  const upNext = upNextEntries(allBeads, pickerArmed ? plan : undefined);
   // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
   // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
   const marksFor = (stage: Stage, id: string): BeadProvenance[] | undefined =>
@@ -360,10 +392,12 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       scanHealthVersion(scan),
       deferralVersion(deferrals),
       provenanceVersion(plan),
+      upNextVersion(pickerArmed),
       project.repoPath,
     ),
     columns,
     standalone,
+    ...(upNext ? { upNext } : {}),
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),

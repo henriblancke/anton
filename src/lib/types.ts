@@ -318,6 +318,25 @@ export interface StandaloneItem {
   provenance?: BeadProvenance[];
 }
 
+/**
+ * One target in the board-picker's recorded plan, as the Up Next lane reads it (anton-t9m4 / R3.1).
+ *
+ * The plan is this machine's projection over Backlog, never a bead state — so an entry carries the
+ * ranking's own facts (where it stood, what it frees) rather than pointing at a stage. `priority`
+ * and `type` ride along because the lane heads BOTH card kinds with one meta row, and a standalone
+ * chip carries no priority of its own.
+ */
+export interface UpNextEntry {
+  beadId: string;
+  /** 1-based position in the ranked plan. */
+  rank: number;
+  /** bd priority (0=critical … 4=lowest); absent when the bead carries none. */
+  priority?: number;
+  type: IssueType;
+  /** How many still-waiting beads finishing this target transitively unblocks (beads/rank.ts). */
+  unblocks: number;
+}
+
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
  * SyncStatus there — kept as a separate declaration so client components import types without the
  * server-only bd module. */
@@ -349,6 +368,16 @@ export interface Board {
   columns: Record<Stage, Epic[]>;
   /** Standalone (parentless) tasks/bugs grouped by stage, rendered as chips at each column's foot. */
   standalone: Record<Stage, StandaloneItem[]>;
+  /**
+   * The board-picker's recorded plan, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole
+   * input. The lane resolves each entry against the BACKLOG column and takes those cards out of it,
+   * so a bead never renders twice.
+   *
+   * ABSENT, never empty, whenever there is no projection to show: the picker is disarmed for this
+   * project, or it has never run here. An empty lane titled "Up Next" would read as "anton has
+   * nothing to start" on a board where the pass simply isn't running.
+   */
+  upNext?: UpNextEntry[];
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
   /**

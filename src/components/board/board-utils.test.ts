@@ -14,9 +14,18 @@ import {
   groupBoardByEpic,
   moveEpicBetweenColumns,
   sortEpics,
+  takeUpNext,
   ticketProgress,
+  upNextMetaLabel,
 } from "@/components/board/board-utils";
-import { STAGES, type Epic, type Stage, type StandaloneItem, type Ticket } from "@/lib/types";
+import {
+  STAGES,
+  type Epic,
+  type Stage,
+  type StandaloneItem,
+  type Ticket,
+  type UpNextEntry,
+} from "@/lib/types";
 
 function makeTicket(id: string, over: Partial<Ticket> = {}): Ticket {
   return {
@@ -450,5 +459,125 @@ describe("board filters (anton-9pkk.3)", () => {
     expect(boardFiltersFromSearchParams(new URLSearchParams(href.split("?")[1]))).toEqual({
       epic: ONTOLOGY.id,
     });
+  });
+});
+
+/**
+ * The Up Next subtraction (anton-t9m4 / R3.3). A card lives in exactly one lane: the lane TAKES its
+ * cards out of Backlog rather than overlaying them, or the same bead renders twice in shadow mode.
+ */
+describe("takeUpNext", () => {
+  function chip(id: string, over: Partial<StandaloneItem> = {}): StandaloneItem {
+    return {
+      id,
+      title: id,
+      type: "bug",
+      status: "open",
+      stage: "backlog",
+      approved: false,
+      assignee: null,
+      createdAt: "",
+      createdBy: null,
+      blockedBy: [],
+      ready: true,
+      unread: false,
+      deferred: false,
+      abandoned: false,
+      ...over,
+    };
+  }
+
+  function entry(beadId: string, rank: number, over: Partial<UpNextEntry> = {}): UpNextEntry {
+    return { beadId, rank, priority: 2, type: "feature", unblocks: 0, ...over };
+  }
+
+  const columns = (over: Partial<Record<Stage, Epic[]>> = {}): Record<Stage, Epic[]> => ({
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+    ...over,
+  });
+
+  const chips = (over: Partial<Record<Stage, StandaloneItem[]>> = {}) => ({
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+    ...over,
+  });
+
+  it("takes its cards out of Backlog, in the plan's rank order", () => {
+    const board = columns({ backlog: [makeEpic("a"), makeEpic("b"), makeEpic("c")] });
+    const split = takeUpNext(board, chips(), [entry("c", 1), entry("a", 2)]);
+
+    expect(split.cards.map((card) => card.entry.beadId)).toEqual(["c", "a"]);
+    expect(split.columns.backlog.map((e) => e.id)).toEqual(["b"]);
+  });
+
+  it("leaves every other column untouched", () => {
+    const board = columns({
+      backlog: [makeEpic("a")],
+      implementing: [makeEpic("i", { stage: "implementing" })],
+      done: [makeEpic("d", { stage: "done" })],
+    });
+    const split = takeUpNext(board, chips(), [entry("a", 1)]);
+
+    expect(split.columns.implementing.map((e) => e.id)).toEqual(["i"]);
+    expect(split.columns.done.map((e) => e.id)).toEqual(["d"]);
+  });
+
+  it("takes standalone chips out of the backlog chips too", () => {
+    const split = takeUpNext(columns(), chips({ backlog: [chip("t1"), chip("t2")] }), [
+      entry("t2", 1, { type: "bug" }),
+    ]);
+
+    expect(split.cards).toEqual([
+      { entry: entry("t2", 1, { type: "bug" }), kind: "standalone", item: chip("t2") },
+    ]);
+    expect(split.standalone.backlog.map((i) => i.id)).toEqual(["t1"]);
+  });
+
+  it("ignores a pick that has already started — Up Next is a projection over Backlog only", () => {
+    const board = columns({
+      backlog: [makeEpic("a")],
+      implementing: [makeEpic("started", { stage: "implementing" })],
+    });
+    const split = takeUpNext(board, chips(), [entry("started", 1), entry("a", 2)]);
+
+    expect(split.cards.map((card) => card.entry.beadId)).toEqual(["a"]);
+    // The running card stays exactly where the board put it.
+    expect(split.columns.implementing.map((e) => e.id)).toEqual(["started"]);
+  });
+
+  it("yields no lane and an untouched board when nothing is recorded", () => {
+    const board = columns({ backlog: [makeEpic("a")] });
+    for (const entries of [undefined, []]) {
+      const split = takeUpNext(board, chips(), entries);
+      expect(split.cards).toEqual([]);
+      expect(split.columns).toBe(board);
+    }
+  });
+
+  it("yields no lane when every recorded pick has left the backlog", () => {
+    const board = columns({ backlog: [makeEpic("a")] });
+    const split = takeUpNext(board, chips(), [entry("gone", 1)]);
+
+    expect(split.cards).toEqual([]);
+    expect(split.columns.backlog.map((e) => e.id)).toEqual(["a"]);
+  });
+});
+
+describe("upNextMetaLabel", () => {
+  it("reads the ranking's own inputs — priority, work type, unblocking count", () => {
+    expect(
+      upNextMetaLabel({ beadId: "a", rank: 1, priority: 0, type: "feature", unblocks: 3 }),
+    ).toBe("P0 · Feature · unblocks 3");
+  });
+
+  it("says an unprioritized pick is unprioritized rather than borrowing a number", () => {
+    expect(upNextMetaLabel({ beadId: "a", rank: 2, type: "bug", unblocks: 0 })).toBe(
+      "no priority · Bug · unblocks 0",
+    );
   });
 });

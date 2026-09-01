@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { TriangleAlertIcon } from "lucide-react";
@@ -38,11 +38,13 @@ import {
   groupBoardByEpic,
   moveEpicBetweenColumns,
   sortEpics,
+  takeUpNext,
   type BoardSort,
 } from "@/components/board/board-utils";
 import { BoardFilters } from "@/components/board/board-filters";
 import { BoardGroupingToggle } from "@/components/board/board-grouping-toggle";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
+import { UpNextLane } from "@/components/board/up-next-lane";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import { SyncStatusBadge } from "@/components/board/sync-status-badge";
 import { EscalationStrip } from "@/components/board/escalation-strip";
@@ -53,8 +55,17 @@ import {
 import { HealthPill } from "@/components/board/health-pill";
 import { Button } from "@/components/ui/button";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
+import { cn } from "@/lib/utils";
 
 const BOARD_SORTS: BoardSort[] = ["default", "risk", "size"];
+
+/** Stand-in stage map for the render before a board has landed — nothing here mutates it. */
+const NO_COLUMNS: Record<Stage, Epic[]> = Object.freeze({
+  backlog: [],
+  implementing: [],
+  "in-review": [],
+  done: [],
+}) as Record<Stage, Epic[]>;
 
 const sortSelectClassName =
   "h-8 rounded-lg border border-border bg-card px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50";
@@ -258,6 +269,25 @@ export function EpicBoard({
     ) as Record<Stage, Epic[]>;
   }, [narrowed, sort]);
 
+  // The Up Next lane and the Backlog it was taken out of (anton-t9m4). Computed on the SORTED,
+  // narrowed board so the lane obeys the same filters as everything else, and subtracted rather than
+  // overlaid so no bead renders twice (R3.3). Only in the stage view: the lane is a column position
+  // between Backlog and Implementing, and the epic swimlanes group by product rather than by stage —
+  // so there the cards stay in Backlog, where they still appear exactly once.
+  const upNext = useMemo(
+    () =>
+      takeUpNext(
+        sortedColumns ?? NO_COLUMNS,
+        narrowed?.standalone,
+        grouping === "stage" ? board?.upNext : undefined,
+      ),
+    [sortedColumns, narrowed, grouping, board?.upNext],
+  );
+  // An empty lane is worse than none: with no plan recorded — or a picker the operator disarmed —
+  // "Up Next" with nothing under it reads as "anton has nothing to start" rather than "no pass is
+  // running here" (R3.4).
+  const hasUpNext = upNext.cards.length > 0;
+
   // The swimlanes are a regrouping of the very cards above — the sorted columns feed both views, so
   // a lane's cards carry the chosen sort and there is no second board to keep in step.
   const lanes = useMemo(
@@ -433,18 +463,35 @@ export function EpicBoard({
           )}
         </div>
       ) : (
-        <div className="grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2 xl:grid-cols-4">
+        <div
+          className={cn(
+            "grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2",
+            hasUpNext ? "xl:grid-cols-5" : "xl:grid-cols-4",
+          )}
+        >
           {STAGES.map((stage) => (
-            <BoardColumn
-              key={stage}
-              stage={stage}
-              epics={sortedColumns?.[stage] ?? []}
-              standalone={narrowed?.standalone[stage] ?? []}
-              slug={slug}
-              budgetAware={budgetAware}
-              onEpicDeleted={handleEpicDeleted}
-              onOpenTicket={setOpenTicketId}
-            />
+            <Fragment key={stage}>
+              <BoardColumn
+                stage={stage}
+                epics={upNext.columns[stage] ?? []}
+                standalone={upNext.standalone[stage] ?? []}
+                slug={slug}
+                budgetAware={budgetAware}
+                onEpicDeleted={handleEpicDeleted}
+                onOpenTicket={setOpenTicketId}
+              />
+              {/* Between Backlog and Implementing, never left of Backlog: flow direction is
+                  load-bearing, so a card must not move left as it advances (R3.1). */}
+              {stage === "backlog" && hasUpNext && (
+                <UpNextLane
+                  slug={slug}
+                  cards={upNext.cards}
+                  budgetAware={budgetAware}
+                  onEpicDeleted={handleEpicDeleted}
+                  onOpenTicket={setOpenTicketId}
+                />
+              )}
+            </Fragment>
           ))}
         </div>
       )}
