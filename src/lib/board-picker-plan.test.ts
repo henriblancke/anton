@@ -274,6 +274,41 @@ describe("staleness", () => {
       expect(isPlanStale(blocked, current, new Map())).toBe(false);
     });
   });
+
+  /**
+   * The same rule, for the window in which NO PASS RUNS (PR #212 review). The exclusion above is
+   * written by a later pass; with the picker disarmed or failing for the whole deferral window there
+   * is no such pass, so the vetoed target is still an ENTRY. Left to the exclusion rule alone, the
+   * generation would read current again the moment the hold lapsed and re-offer the pick under the
+   * very plan id whose decline stops `recordPickerAccept` recording the release — a start that
+   * silently teaches the track record nothing.
+   */
+  describe("declines against this generation", () => {
+    const current = stampBoard([bead()], OBSERVED + 1);
+    const vetoed = new Set(["anton-a"]);
+
+    it("holds still while the hold that veto placed is still running", () => {
+      const held = new Map([["anton-a", NOW + 86_400_000]]);
+
+      expect(isPlanStale(plan, current, held, vetoed)).toBe(false);
+    });
+
+    it("retires the generation once that hold runs out, with no pass in between", () => {
+      expect(isPlanStale(plan, current, new Map(), vetoed)).toBe(true);
+      expect(isPlanStale(plan, current, undefined, vetoed)).toBe(true);
+    });
+
+    it("ignores a decline against a target this plan does not pick", () => {
+      expect(isPlanStale(plan, current, new Map(), new Set(["anton-z"]))).toBe(false);
+    });
+
+    // The caller keys the set on THIS plan id, so an earlier generation's decline never reaches
+    // here — but the predicate must also stand on its own when no caller supplies one.
+    it("holds still when nothing declined it", () => {
+      expect(isPlanStale(plan, current, new Map(), new Set())).toBe(false);
+      expect(isPlanStale(plan, current)).toBe(false);
+    });
+  });
 });
 
 describe("plan storage", () => {

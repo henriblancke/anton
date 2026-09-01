@@ -14,7 +14,12 @@ import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
-import { activeDeferrals, recordPickerAccept, withdrawPickerAccept } from "@/lib/picker-veto";
+import {
+  activeDeferrals,
+  declinedPicks,
+  recordPickerAccept,
+  withdrawPickerAccept,
+} from "@/lib/picker-veto";
 import { getProjectSettings, resolvePickerPolicy } from "@/lib/projects";
 import { isScheduleEnabled } from "@/lib/schedules";
 import type { ApprovalRunOutcome, Project } from "@/lib/types";
@@ -152,8 +157,11 @@ async function reserveRelease(
       return skip("a later pass replaced the plan generation the operator answered");
     }
     if (deferrals.has(beadId)) return skip("the operator vetoed this pick");
-    if (isPlanStale(plan, stampBoard(board, Date.now(), policy), deferrals)) {
-      return skip("the board has moved past the plan that picked it");
+    // Keyed on the plan id the entry above came from, so this asks whether THIS generation has been
+    // vetoed — including the pick whose hold lapsed with no pass to rewrite the plan (isPlanStale).
+    const declined = await declinedPicks(db, projectId, plan.planId);
+    if (isPlanStale(plan, stampBoard(board, Date.now(), policy), deferrals, declined)) {
+      return skip("the plan that picked it is no longer the decision anton stands behind");
     }
     // The store settles a veto that landed while this request was in flight — the deferral read above
     // cannot see one still being written — so ask it what happened rather than assume the accept did.

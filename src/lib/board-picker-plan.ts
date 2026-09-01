@@ -204,14 +204,26 @@ export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy)
  * out of Up Next until the next scheduled pass rewrote the plan. A veto ARRIVING needs no such fence:
  * the lane subtracts live deferrals from the plan it reads (`upNextEntries`), which is a narrower and
  * faster answer than withholding the whole ranking.
+ *
+ * `declined` closes that same rule's gap when NO PASS RUNS (PR #212 review). The rule above reads the
+ * exclusion a later pass wrote, so it fires only if a pass got to rewrite the plan; with the picker
+ * disarmed or failing for the whole window, the vetoed target is still an ENTRY here and the plan
+ * reads current again the moment its hold lapses. It would then be re-offered under the very
+ * generation whose decline makes `recordPickerAccept` refuse the release's accept — a start with no
+ * evidence, skewing the track record earned autonomy reads. So a decline recorded against THIS
+ * generation retires it as soon as the hold it placed runs out, whether or not a pass observed the
+ * veto. While the hold is live nothing changes: the lane still subtracts that one card.
  */
 export function isPlanStale(
   plan: BoardPickerPlan,
   current: BoardStamp,
   deferrals?: ReadonlyMap<string, number>,
+  declined?: ReadonlySet<string>,
 ): boolean {
   if (plan.stamp.digest !== current.digest) return true;
-  return plan.exclusions.some((x) => x.reason === "deferred" && !deferrals?.has(x.beadId));
+  const lapsed = (beadId: string) => !deferrals?.has(beadId);
+  if (plan.exclusions.some((x) => x.reason === "deferred" && lapsed(x.beadId))) return true;
+  return plan.entries.some((e) => declined?.has(e.beadId) && lapsed(e.beadId));
 }
 
 /**

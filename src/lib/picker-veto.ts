@@ -403,6 +403,38 @@ export async function activeDeferrals(
 }
 
 /**
+ * The picks of ONE plan generation the operator has already answered no to — bead ids carrying a
+ * decline against `planId`, expired holds included (PR #212 review).
+ *
+ * Deliberately not filtered by the clock, unlike {@link activeDeferrals}: what this answers is "has
+ * this generation been declined", and a decline does not stop having happened when its window runs
+ * out. The expiry is only how long the pacing lasted. `isPlanStale` reads it together with the live
+ * holds to retire a generation whose veto no pass ever got to record as an exclusion.
+ *
+ * Keyed on the plan id, so a decline against an EARLIER generation says nothing about this one — the
+ * pass that re-offered the target after the window closed made a new decision, and it takes its own
+ * answer.
+ */
+export async function declinedPicks(
+  db: AntonDb,
+  projectId: string,
+  planId: string,
+): Promise<Set<string>> {
+  if (!planId) return new Set();
+  const rows = await db
+    .select({ beadId: schema.pickerVerdicts.beadId })
+    .from(schema.pickerVerdicts)
+    .where(
+      and(
+        eq(schema.pickerVerdicts.projectId, projectId),
+        eq(schema.pickerVerdicts.verdict, "declined"),
+        eq(schema.pickerVerdicts.planId, planId),
+      ),
+    );
+  return new Set(rows.map((row) => row.beadId));
+}
+
+/**
  * A freshness token over the deferrals in force — what a polling surface compares to decide whether
  * its copy still describes the board.
  *
@@ -429,6 +461,11 @@ export function latestPickerDeferrals(
   now: Date = new Date(),
 ): Promise<Map<string, number>> {
   return activeDeferrals(getDb(), projectId, now);
+}
+
+/** UI/board read path over the shared anton.db. */
+export function latestDeclinedPicks(projectId: string, planId: string): Promise<Set<string>> {
+  return declinedPicks(getDb(), projectId, planId);
 }
 
 /**

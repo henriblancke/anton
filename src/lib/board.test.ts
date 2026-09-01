@@ -52,12 +52,16 @@ vi.mock("./scan-health", async () => {
 // token (anton-jqvy): an unstubbed read reaches the real anton.db. `deferrals` is what this
 // project's operator has set aside, and every test but the veto ones runs with nothing deferred.
 let deferrals = new Map<string, number>();
+// The other half of that read: which of the recorded plan's picks already carry a decline against
+// THIS generation, holds expired included — what retires a generation no pass rewrote.
+let declined = new Set<string>();
 
 vi.mock("./picker-veto", async () => {
   const actual = await vi.importActual<typeof import("./picker-veto")>("./picker-veto");
   return {
     ...actual,
     latestPickerDeferrals: async () => deferrals,
+    latestDeclinedPicks: async () => declined,
   };
 });
 
@@ -103,6 +107,7 @@ beforeEach(() => {
   hygieneReport = undefined;
   scanHealth = undefined;
   deferrals = new Map();
+  declined = new Set();
   pickerPlan = undefined;
   pickerArmed = true;
   projectSettings = {};
@@ -1325,6 +1330,32 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     deferrals = new Map([["f-2", 1_770_000_100_000]]);
     expect((await getBoard(project)).upNext).toHaveLength(1);
 
+    resetIssueSnapshots();
+    deferrals = new Map();
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("withholds the lane once a veto's hold runs out with no pass to record it", async () => {
+    const board = [feature(), makeBead({ id: "f-2", title: "Next", issue_type: "feature" })];
+    listMock.mockResolvedValue(board);
+    // The picker was disarmed (or failing) for the whole window, so no pass ever rewrote the plan
+    // into one that excludes `f-1` as `deferred` — the decline against this generation is all there
+    // is. While the hold runs the lane just drops that card, as it does for any live veto.
+    pickerPlan = {
+      ...planOver(board, "f-1"),
+      entries: [
+        { beadId: "f-1", rank: 1, rule: "any claimable run target" },
+        { beadId: "f-2", rank: 2, rule: "any claimable run target" },
+      ],
+    };
+    declined = new Set(["f-1"]);
+    deferrals = new Map([["f-1", 1_770_000_100_000]]);
+    expect((await getBoard(project)).upNext).toEqual([
+      { beadId: "f-2", rank: 2, type: "feature", unblocks: 0, createdAt: "" },
+    ]);
+
+    // Once it lapses the generation is retired outright: re-offering `f-1` here would offer a start
+    // whose accept `recordPickerAccept` refuses, against the decline already standing on this plan.
     resetIssueSnapshots();
     deferrals = new Map();
     expect((await getBoard(project)).upNext).toBeUndefined();

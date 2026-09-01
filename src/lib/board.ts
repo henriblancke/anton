@@ -22,7 +22,7 @@ import {
 } from "./board-picker-plan";
 import { boardProvenance, provenanceVersion } from "./board-provenance";
 import { getDb } from "./db";
-import { deferralVersion, latestPickerDeferrals } from "./picker-veto";
+import { deferralVersion, latestDeclinedPicks, latestPickerDeferrals } from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
 import { isScheduleEnabled } from "./schedules";
 import { upNextEntries, upNextVersion } from "./up-next";
@@ -153,6 +153,20 @@ async function readDeferrals(project: Project): Promise<Map<string, number>> {
   } catch (err) {
     console.error(`[board] picker deferral read failed for ${project.slug}`, err);
     return new Map();
+  }
+}
+
+/**
+ * The picks of the recorded plan the operator has already vetoed — what retires a generation the
+ * picker never got to rewrite (`isPlanStale`). Degrades to "none declined" like the reads above: the
+ * worst a lost read costs is a plan that reads current for one more pass.
+ */
+async function readDeclinedPicks(project: Project, planId: string): Promise<Set<string>> {
+  try {
+    return await latestDeclinedPicks(project.id, planId);
+  } catch (err) {
+    console.error(`[board] picker decline read failed for ${project.slug}`, err);
+    return new Set();
   }
 }
 
@@ -371,15 +385,19 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // input to that decision — the beads and the armed policy, which stampBoard folds in together, plus
   // the deferrals, whose expiry no digest can see (isPlanStale). So an operator narrowing
   // `pickerPolicy` without touching a bead invalidates the plan, and so does a hold running out on a
-  // target the pass set aside.
+  // target the pass set aside — or on one it picked, when no pass ran to record the exclusion.
   //
   // Every live claim the board makes about the picker reads this one answer: the Up Next lane
   // (withheld whole rather than presented as a current ranking) and the `[Release]` derived from the
   // provenance badge. They must not disagree — a lane that vanished while its button stayed would go
   // on offering a start against a decision anton has already stopped standing behind.
+  //
+  // The declines are read here rather than beside the deferrals above because the question is about
+  // ONE generation — it needs the plan id the read above returns.
+  const declined = armedPlan ? await readDeclinedPicks(project, armedPlan.planId) : undefined;
   const planIsStale =
     armedPlan !== undefined &&
-    isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), policy), deferrals);
+    isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), policy), deferrals, declined);
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
   // A stale plan still badges — the rule a target WAS picked under does not stop being true — but

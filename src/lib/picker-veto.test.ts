@@ -11,6 +11,7 @@ import {
   PICKER_DEFER_WINDOW_MS,
   PICKER_RECORD_WINDOW,
   activeDeferrals,
+  declinedPicks,
   deferralVersion,
   listPickerVerdicts,
   pickerTrackRecord,
@@ -492,6 +493,60 @@ describe("recording an accept", () => {
       declined: 0,
       settled: 0,
     });
+  });
+});
+
+/**
+ * THE DECLINES ONE GENERATION CARRIES (PR #212 review). A plan whose pick was vetoed must retire even
+ * if no pass ever runs to rewrite it as an exclusion — otherwise the lapsing hold re-offers the pick
+ * under the generation whose decline makes its accept unrecordable. This is the read that fence uses.
+ */
+describe("the declines standing against a plan", () => {
+  it("names the vetoed picks of that generation, expired holds included", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      action: "not-now",
+      planId: "d1",
+    });
+    // Long past the window: the hold is gone, the decision is not — the record is what it answers.
+    const lapsed = at(NOW + PICKER_DEFER_WINDOW_MS + 1);
+    expect((await activeDeferrals(test.db, PROJECT, lapsed)).size).toBe(0);
+
+    expect(await declinedPicks(test.db, PROJECT, "d1")).toEqual(new Set(["anton-a"]));
+  });
+
+  it("says nothing about another generation, another project, or an accept", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      action: "never",
+      planId: "d1",
+    });
+    await recordPickerVeto(test.db, clock, {
+      projectId: OTHER,
+      beadId: "anton-c",
+      action: "not-now",
+      planId: "d2",
+    });
+    await recordPickerAccept(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-b",
+      planId: "d2",
+    });
+
+    // A later pass that re-offers the target made a NEW decision and takes its own answer.
+    expect(await declinedPicks(test.db, PROJECT, "d2")).toEqual(new Set());
+  });
+
+  it("ignores a plan-less veto — it answers no recorded pick to retire", async () => {
+    await recordPickerVeto(test.db, clock, {
+      projectId: PROJECT,
+      beadId: "anton-a",
+      action: "not-now",
+    });
+
+    expect(await declinedPicks(test.db, PROJECT, "d1")).toEqual(new Set());
   });
 });
 
