@@ -20,6 +20,7 @@ function headroom(over: Partial<BudgetHeadroom> = {}): BudgetHeadroom {
     weeklyPct: null,
     weeklyReason: "weekly-cap",
     weeklyInclusive: true,
+    reserveWaiver: null,
     ...over,
   };
 }
@@ -59,6 +60,39 @@ describe("budgetLine", () => {
   it("names the daytime reserve when that is the session-side hold", () => {
     const line = budgetLine(signal({ sessionPct: 10, sessionReason: "daytime-reserve" }), queue(3));
     expect(line).toEqual({ affordable: 1, reason: "daytime-reserve", seeded: false });
+  });
+
+  it("re-applies the daytime reserve where the projected burn ends its behind-pace waiver", () => {
+    // Behind pace inside the day window, the governor waives the reserve — but only while usage is
+    // behind. The queue's own burn catches it up, and from there the gate defers at the reserve
+    // (PR #212 review), so the waived hard floor must not be charged down the whole queue.
+    const line = budgetLine(
+      signal(
+        {
+          sessionPct: 55,
+          weeklyPct: 100,
+          reserveWaiver: { afterWeeklyPct: 35, sessionPct: 20 },
+        },
+        { sessionPct: 10, weeklyPct: 20 },
+      ),
+      queue(6),
+    );
+    // Two runs (40 weekly points) put usage back on pace; the third is held at the reserve, not four
+    // cards later at the hard floor.
+    expect(line).toEqual({ affordable: 2, reason: "daytime-reserve", seeded: false });
+  });
+
+  it("keeps the waived floor for a queue too small to catch the pace-line up", () => {
+    // The waiver is real while it lasts: a queue that never spends its way back onto the pace-line
+    // runs against the hard floor, and drawing the reserve there would bench work the governor runs.
+    const line = budgetLine(
+      signal(
+        { sessionPct: 55, weeklyPct: 100, reserveWaiver: { afterWeeklyPct: 90, sessionPct: 20 } },
+        { sessionPct: 20, weeklyPct: 5 },
+      ),
+      queue(5),
+    );
+    expect(line).toEqual({ affordable: 3, reason: "session-headroom", seeded: false });
   });
 
   it("places the line on the weekly side when the weekly budget binds first", () => {

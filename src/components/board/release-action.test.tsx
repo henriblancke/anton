@@ -170,7 +170,8 @@ describe("a release the approve route could not start", () => {
   it("refuses to report a run the response carries no job for", async () => {
     stubFetch({ epic: { id: "anton-a", approved: true } });
     const onReleased = vi.fn();
-    mount({ onReleased });
+    const onApprovedWithoutRun = vi.fn();
+    mount({ onReleased, onApprovedWithoutRun });
 
     release();
 
@@ -183,6 +184,9 @@ describe("a release the approve route could not start", () => {
     // …but the approval itself landed, so the surface is behind on the card either way.
     await waitFor(() => expect(refresh).toHaveBeenCalled());
     expect(screen.getByRole("button", { name: /release/i }).hasAttribute("disabled")).toBe(false);
+    // …and the surface is told to KEEP this control through that re-read: it hides the run on
+    // `approved`, and the copy above just sent the operator back to press it (PR #212 review).
+    expect(onApprovedWithoutRun).toHaveBeenCalled();
   });
 
   it("says so too when the 200 body cannot be read at all", async () => {
@@ -208,7 +212,8 @@ describe("a release a run on another machine already covers", () => {
   it("reports it as running, not as a release to retry", async () => {
     stubFetch({ run: "elsewhere" });
     const onReleased = vi.fn();
-    mount({ onReleased });
+    const onApprovedWithoutRun = vi.fn();
+    mount({ onReleased, onApprovedWithoutRun });
 
     release();
 
@@ -218,6 +223,8 @@ describe("a release a run on another machine already covers", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     // The target is running, so the card locks its affordances and the lane re-reads onto the run.
     expect(onReleased).toHaveBeenCalled();
+    // Nothing to retry, so the run affordance retires exactly as an ordinary approval retires it.
+    expect(onApprovedWithoutRun).not.toHaveBeenCalled();
     await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 });

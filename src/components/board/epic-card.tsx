@@ -106,6 +106,10 @@ function EpicCardBody({
   // immediately on our own click and reverts on failure.
   const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [approving, setApproving] = useState(false);
+  // Approved, but the enqueue threw — the target has no run and `showApprove`'s `!approved` gate
+  // would take the retry away the moment the board catches up (PR #212 review). Held here rather
+  // than inside `[Release]` because it is this gate, not the button, that hides it.
+  const [unrun, setUnrun] = useState(false);
   const approved = epic.approved || optimisticApproved;
   const word = typeWord(epic);
   // Approve/Queue are answers to the same pick the vetoes above a ranked card decline, so they take
@@ -162,7 +166,9 @@ function EpicCardBody({
   // fully blocked epic (nothing it would dispatch can run) must not be startable before its blocker
   // completes. A partially-gated one still is — mirrors the approve route, which gates on the same
   // verdict.
-  const showApprove = epic.stage === "backlog" && !approved && canStartRun(epic);
+  // `unrun` reopens it on an approved target: that approval started nothing, and approving again is
+  // what retries the enqueue.
+  const showApprove = epic.stage === "backlog" && (!approved || unrun) && canStartRun(epic);
   // A contract gap is the other reason a run can't start. It differs from a blocker in what it asks
   // of the founder — a blocker needs waiting, this needs a one-line edit — so the affordance stays in
   // place and names the missing section instead of disappearing (or 422ing on click).
@@ -330,7 +336,11 @@ function EpicCardBody({
                     beadId={epic.id}
                     title={epic.title}
                     disabled={approving}
-                    onReleased={() => setOptimisticApproved(true)}
+                    onReleased={() => {
+                      setUnrun(false);
+                      setOptimisticApproved(true);
+                    }}
+                    onApprovedWithoutRun={() => setUnrun(true)}
                   />
                 ) : (
                   <Button

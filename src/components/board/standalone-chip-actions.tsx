@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 import type { StandaloneItem } from "@/lib/types";
 // The predicate itself, not a chip-local copy: approve and the runner ask the same one.
 import { contractBlocks } from "@/lib/beads/contract";
@@ -28,7 +30,8 @@ export function canOfferRun(item: StandaloneItem, approved: boolean, deferred: b
  * The run affordance in its shapes: inert-and-explaining when the contract blocks the run, `[Release]`
  * when the board-picker chose this target, split into Queue/Approve when the project is budget-aware
  * (anton-y2ue), and a single "Approve & run" otherwise. Renders nothing when this chip may not offer
- * a run.
+ * a run — except after a release that approved the target without starting one, where the retry is
+ * the only way back to a run.
  *
  * A contract gap withholds the run the way an open blocker does, but asks for an edit rather than a
  * wait — so the affordance stays put and names the missing section instead of failing on click
@@ -45,8 +48,13 @@ export function ApproveRunAction({
   budgetAware: boolean;
   approval: StandaloneApproval;
 }) {
+  const [unrun, setUnrun] = useState(false);
   const { approved, deferred, running, locked, approveRun } = approval;
-  if (!canOfferRun(item, approved, deferred)) return null;
+  // A release whose approve landed with nothing enqueued leaves the target approved and idle, which
+  // is precisely what `canOfferRun` withholds the run for — so the retry the failure copy points at
+  // would vanish on the next poll (PR #212 review). Reopen the affordance until a run actually
+  // starts; approve re-enqueues for an already-approved target.
+  if (!canOfferRun(item, approved, deferred) && !unrun) return null;
 
   if (contractBlocks(item.contract)) {
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;
@@ -79,7 +87,11 @@ export function ApproveRunAction({
             beadId={item.id}
             title={item.title}
             disabled={running}
-            onReleased={approval.setApproved}
+            onReleased={() => {
+              setUnrun(false);
+              approval.setApproved();
+            }}
+            onApprovedWithoutRun={() => setUnrun(true)}
           />
         ) : (
           <Button

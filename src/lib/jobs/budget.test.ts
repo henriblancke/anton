@@ -498,6 +498,32 @@ describe("budgetHeadroom (the budget line's placement input, anton-vlom)", () =>
     expect(h).toMatchObject({ sessionPct: 55, sessionReason: "session-headroom" });
   });
 
+  it("says how much weekly burn the behind-pace waiver survives — it is not permanent", () => {
+    // A projection spends weekly budget as it walks the queue, and the reserve is waived only while
+    // usage stays behind pace: 35 more points (the 45-point line, less the 10 already spent) and the
+    // gate stops waiving it, from which point the reserve's own ceiling (60) is what binds.
+    const h = budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NOON);
+    expect(h?.reserveWaiver).toEqual({ afterWeeklyPct: 35, sessionPct: 20 });
+  });
+
+  it("carries no waiver where the reserve is not being waived at all", () => {
+    // Night (out of the day window), and on-pace daytime (the reserve holds outright): in neither
+    // case is there a waiver to expire, so a projection has nothing to re-apply.
+    expect(
+      budgetHeadroom(usageAt(NIGHT, { elapsed: 0.5, weeklyPct: 10, sessionPct: 40 }), POLICY, NIGHT)
+        ?.reserveWaiver,
+    ).toBeNull();
+    expect(
+      budgetHeadroom(usageAt(NOON, { elapsed: 0.5, weeklyPct: 50, sessionPct: 40 }), POLICY, NOON)
+        ?.reserveWaiver,
+    ).toBeNull();
+    // No weekly signal: no pace to be behind, so the reserve was never waived either.
+    expect(
+      budgetHeadroom(makeUsage({ sessionPct: 40, weeklyPct: 10, weeklyResetAt: null }), POLICY, NOON)
+        ?.reserveWaiver,
+    ).toBeNull();
+  });
+
   it("reports the weekly cap when the pace-line is above it", () => {
     // Late week: the pace-line has risen past the cap, so the cap is the only weekly hold left.
     const h = budgetHeadroom(usageAt(NIGHT, { elapsed: 0.99, weeklyPct: 88, sessionPct: 10 }), POLICY, NIGHT);

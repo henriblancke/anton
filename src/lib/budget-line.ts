@@ -102,18 +102,26 @@ export function budgetLine(
     // Each side is charged at the boundary the gate itself tests. Both session holds defer AT their
     // threshold; on the weekly side only the pace-line defers past it (`weeklyInclusive`), so a card
     // whose burn lands exactly on the pace ceiling is one the governor still starts.
-    const overSession = session >= headroom.sessionPct;
+    // The daytime reserve is waived only while weekly usage is behind pace, and the burn charged
+    // above catches it up — so past `afterWeeklyPct` the governor stops waiving it and the tighter
+    // reserve ceiling binds the rest of the queue (PR #212 review). Charging the hard floor all the
+    // way down would mark cards affordable that the governor defers at the reserve.
+    const waiver = headroom.reserveWaiver;
+    const reserveBack = waiver !== null && weekly >= waiver.afterWeeklyPct;
+    const sessionLimit = reserveBack ? waiver.sessionPct : headroom.sessionPct;
+    const sessionReason = reserveBack ? "daytime-reserve" : headroom.sessionReason;
+
+    const overSession = session >= sessionLimit;
     const overWeekly =
       headroom.weeklyPct !== null &&
       (headroom.weeklyInclusive ? weekly >= headroom.weeklyPct : weekly > headroom.weeklyPct);
     if (overSession || overWeekly) {
       // budgetGate's order is session-headroom → weekly-cap → weekly-on-track → daytime-reserve, so
       // only the hard floor beats a weekly hold when both are exhausted.
-      const sessionFirst =
-        overSession && (!overWeekly || headroom.sessionReason === "session-headroom");
+      const sessionFirst = overSession && (!overWeekly || sessionReason === "session-headroom");
       return {
         affordable: index,
-        reason: sessionFirst ? headroom.sessionReason : headroom.weeklyReason,
+        reason: sessionFirst ? sessionReason : headroom.weeklyReason,
         seeded,
       };
     }

@@ -207,6 +207,7 @@ function budgetSignal(sessionPct: number): BudgetSignal {
       weeklyPct: null,
       weeklyReason: "weekly-cap",
       weeklyInclusive: true,
+      reserveWaiver: null,
     },
     burn: { "execute-epic": { sessionPct: 20, weeklyPct: 3, seeded: false } },
   };

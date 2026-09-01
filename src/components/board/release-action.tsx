@@ -45,6 +45,7 @@ export function ReleaseAction({
   disabled = false,
   className,
   onReleased,
+  onApprovedWithoutRun,
 }: {
   slug: string;
   beadId: string;
@@ -55,6 +56,12 @@ export function ReleaseAction({
   className?: string;
   /** Fired once the run is enqueued, so the card can lock its own affordances before the next poll. */
   onReleased?: () => void;
+  /**
+   * The approve landed but nothing was enqueued. The surface must KEEP this control: its usual
+   * `!approved` gate is about to close on a target that is approved with no run, and re-approving is
+   * the retry the failure copy asks for (PR #212 review).
+   */
+  onApprovedWithoutRun?: () => void;
 }) {
   const router = useRouter();
   const [pending, setPending] = useState(false);
@@ -124,6 +131,12 @@ export function ReleaseAction({
         const message = "Approved, but no run started — release again to retry";
         setFailure(message);
         toast.error(message);
+        // …and the surface is told to KEEP offering it. The approve landed, so the refresh below
+        // adopts a board where this target is approved, and every gate that draws this control hides
+        // it on exactly that (PR #212 review) — leaving the operator an approved target with no run
+        // and no way to start one. Approve re-enqueues for an already-approved target, so the button
+        // the copy points at has to survive the refresh that follows.
+        onApprovedWithoutRun?.();
         // The approve landed, so this surface is behind on the card regardless of the enqueue.
         router.refresh();
         return;
