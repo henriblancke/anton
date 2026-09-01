@@ -408,6 +408,45 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(body).not.toHaveProperty("humanGates");
   });
 
+  it("reports the child gates the LOCKED board carries, not the ones the gate read", async () => {
+    // PR #214 review: the executor reloads the board and gates on `agent:human` as of the write, so
+    // a label that moves between the pre-lock gate read and the claim-locked read must move the
+    // report with it — otherwise the toast omits a stop the run will arm, or promises one for work
+    // an agent will simply do. Both directions ride the same window; the label flips between the
+    // route's two `bd list` reads (its only two — see the read-economy cases below).
+    actAs("anton-test");
+    const target = await beads.create(repo, { title: "Gates move mid-approval", type: "feature", acceptance: "- [ ] it works" });
+    const gains = await beads.create(repo, { title: "Sign the DPA", type: "task", acceptance: "- [ ] it works" });
+    const loses = await beads.create(repo, {
+      title: "Was human work",
+      type: "task",
+      acceptance: "- [ ] it works",
+      labels: ["agent:human"],
+    });
+    await beads.link(repo, gains, target, "parent-child");
+    await beads.link(repo, loses, target, "parent-child");
+
+    const realList = beads.list.bind(beads);
+    let flipped = false;
+    // The route takes exactly two board reads — the gate's, then the claim-locked one — so flipping
+    // immediately before the second puts the change squarely in the window under test.
+    const listSpy = vi.spyOn(beads, "list").mockImplementation(async (cwd, extra) => {
+      if (!flipped && listSpy.mock.calls.length === 2) {
+        flipped = true;
+        await beads.tag(repo, gains, ["agent:human"]);
+        await beads.untag(repo, loses, ["agent:human"]);
+      }
+      return realList(cwd, extra);
+    });
+    try {
+      const res = await approve(target);
+      expect(res.status).toBe(200);
+      expect((await res.json()).humanGates).toEqual([`${gains} → Sign the DPA`]);
+    } finally {
+      listSpy.mockRestore();
+    }
+  });
+
   it("says nothing about human work on a run that stops for nobody", async () => {
     const target = await beads.create(repo, { title: "All agent work", type: "feature", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Agent ticket", type: "task", acceptance: "- [ ] it works" });

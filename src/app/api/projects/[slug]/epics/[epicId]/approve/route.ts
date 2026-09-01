@@ -465,9 +465,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // What this run will cost the OPERATOR, on the same advisory channel (anton-qfso.2): every bead in
   // the dispatch set labelled `agent:human` is a point the run reaches and then holds, waiting for a
   // person. Never a refusal — human work is real, shaped, approved work — but it is the one cost the
-  // operator can only weigh before starting. Same `willEnqueue` gate and same set as the advisory
-  // above, so a take-over that starts no run promises no gates either.
-  const humanWork = willEnqueue ? humanGates(contractGated) : [];
+  // operator can only weigh before starting. Same `willEnqueue` gate as the advisory above, so a
+  // take-over that starts no run promises no gates either.
+  //
+  // Derived under the lock from the SAME locked board as `humanTarget`, not from the pre-lock
+  // `contractGated`: a child gaining or losing `agent:human` in that window changes which gates the
+  // run actually arms, and the executor reloads the board and gates off the label as of the write.
+  // Answering from the stale set would omit a stop the run will hold at, or promise a stop for work
+  // an agent will just do (PR #214 review).
+  let humanWork: string[] = [];
   // The one case where "anton runs the rest" is a lie (PR #214 review): when the TARGET itself
   // carries the label, execute-epic poisons it before dispatching a single child, so the run the
   // operator just triggered never starts. Reported separately from the gate lines because the two
@@ -570,9 +576,14 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     const refusal = notRunTargetReason(locked, lockedBoard);
     if (refusal) return { refused: refusal } as const;
 
-    // The human-target verdict, taken off the same locked read the approval writes against — see the
-    // declaration above for why the pre-lock read is not good enough.
+    // The human-work report, taken off the same locked read the approval writes against — see the
+    // declarations above for why the pre-lock read is not good enough. The child gates are re-derived
+    // through the same `runTickets`/`contractGatedBeads` pair the pre-lock gate used, so the lines
+    // describe the board the run is about to consume rather than the one that passed the gate.
     humanTarget = willEnqueue && beads.isHumanWork(locked);
+    humanWork = willEnqueue
+      ? humanGates(contractGatedBeads(locked, runTickets(lockedBoard, epicId)))
+      : [];
 
     // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
     // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the original
