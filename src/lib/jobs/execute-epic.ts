@@ -24,7 +24,7 @@ import {
   type Gate,
 } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
-import { ownerOf } from "../beads/claim";
+import { claimGuard, ownerOf } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { assignChildren, formatReservedChildren, releaseChildren } from "../beads/child-assign";
 import { contractGaps, formatContractGaps } from "../beads/contract";
@@ -1401,6 +1401,125 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       // and the held tail parks the run after the loop rather than riding into the PR unrun.
       const held = live.filter((t) => gated.has(t.id));
       const dispatchable = live.filter((t) => !gated.has(t.id));
+      // What a ticket that ran out of time takes down with it (anton-67xj). `skipCause` is the
+      // graph verdict — every ticket transitively behind a rolled-back one — recomputed as each
+      // timeout lands; `skipped` records the ones this loop ACTUALLY passed over, so a dependent
+      // whose commit was already on the branch still counts as delivered.
+      let skipCause = new Map<string, SkipCause>();
+      const skipped = new Map<string, SkipCause>();
+      // Tickets whose commit is on THIS branch — the ones a timeout cascade must stop at (PR #199
+      // review). A ticket closed on another machine whose commit this worktree already carries is
+      // delivered, so the tickets written against IT still have their mechanism and must still run,
+      // whatever rolled back further up the chain. Same rule merge finalization applies
+      // ({@link undeliveredAtMerge}); recorded as the loop goes, since only the loop knows what
+      // actually landed here.
+      const onBranch = new Set<string>();
+      // Hand a ticket this run will NOT dispatch back to the board, and say so on it. Shared by the
+      // dispatch loop below and by the held tail (4a), which reaches the same verdict for a ticket a
+      // cross-run blocker also holds — one writer, so the two paths can never leave a skipped ticket
+      // in different states. `doneOnBoard` is the caller's answer to "closed elsewhere, commit
+      // absent here"; only that case needs the reopen.
+      const recordSkipped = async (ticket: Bead, skipping: SkipCause, doneOnBoard: boolean) => {
+        skipped.set(ticket.id, skipping);
+        // Every board write below is decided on a read taken under this ticket's write lock
+        // (PR #199 review). `tickets` is the run's snapshot, and project concurrency lets the SAME
+        // operator own a second run: that run can reparent this ticket onto a target of its own
+        // and claim it there under the very actor string this run reserved it under, which an
+        // actor-only CAS matches. Marking a ticket that has left this run `not-delivered` sends
+        // the OTHER run's merge finalization off preserving work that shipped, and releasing it
+        // clears a live reservation. What tells the two runs apart is the rest of the bead — its
+        // parent and its status — so the writes land only while a fresh read still finds the
+        // ticket exactly where and as this run left it. The lock orders every claim write made in
+        // THIS process; the cross-process half stays open on bd's current primitives (anton-od4).
+        //
+        // A new ASSIGNEE is deliberately not one of those signals (PR #199 review). A reservation
+        // says who will run the ticket next, not that it left this run: it is still this target's
+        // child, still open, and still in no diff this PR carries — and the merge closes what it
+        // finds open, so withholding the marker there is the silent loss the marker exists to
+        // prevent. The reservation itself is what the CAS below protects.
+
+        const reservedFor = childCascade?.actor;
+        const moved = await claimGuard.withClaimLock(repo, ticket.id, async (swap) => {
+          // The guarded read is the evidence BOTH writes below are decided on, so it is retried
+          // like the writes are, and a run that still cannot take it stops (PR #199 review).
+          // Tagging on an unreadable bead is not the safe half of the trade: a second run that has
+          // already reparented and claimed this ticket would deliver it with `not-delivered` still
+          // attached — runTicket only clears the label off its OWN snapshot, taken before this late
+          // write — and merge finalization then preserves and rehomes work that shipped. Withholding
+          // the marker is not safe either; it is the silent loss the marker exists to prevent. So
+          // neither write is made on an unverified ticket: the run parks with the board named, and
+          // the resume re-reads it.
+          const live = await mustRead(repo, ticket.id);
+          if (!live) {
+            throw new PoisonEpic(
+              `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+                `not read the ticket back, so anton cannot tell whether it is still this run's to ` +
+                `mark — the run stopped rather than write \`${LABELS.notDelivered}\` onto a ticket ` +
+                `another run may already own. Check the beads DB, then resume the run`,
+            );
+          }
+          if (
+            beads.parentOf(live) !== beads.parentOf(ticket) ||
+            live.status !== ticket.status
+          )
+            return true;
+          // Closed on another machine but its commit never reached this branch, and now it will
+          // never be regenerated here — reopen it, or the board advertises work no PR contains.
+          // Required, not best-effort: merge finalization only preserves and rehomes children that
+          // are still OPEN, so a ticket left closed here is recorded as shipped by the very merge
+          // that proves it never was — the `not-delivered` marker below cannot rescue it.
+          if (doneOnBoard && ticket.status === "closed") {
+            if (!(await mustPersist(() => beads.reopen(repo, ticket.id)))) {
+              throw new PoisonEpic(
+                `${ticket.id} is closed on the board but its commit is on no branch here, and it ` +
+                  `was skipped because ${skipping.stopped} ran out of time — bd would not reopen ` +
+                  `it, so the merge of this run's pull request would file work no diff contains ` +
+                  `as shipped. Check the beads DB, then resume the run`,
+              );
+            }
+          }
+          // Mark it as work this run did NOT deliver, which is what stops merge finalization from
+          // closing it as shipped when the PR for the rest of the feature lands (anton-67xj). That
+          // marker is finalization's only input, so it is not best-effort: a run that cannot record
+          // it must not go on to open a PR whose merge would then file this ticket as shipped.
+          // Retry, then park for a human rather than proceed on an unwritten fact.
+          //
+          // Written BEFORE the reservation goes back (PR #199). The release is what makes this
+          // ticket claimable again on a shared board, and a second run that takes it in the gap
+          // would snapshot it without the marker — runTicket clears the label off its own snapshot,
+          // so it would never clear this one, and the ticket could deliver with `not-delivered`
+          // still attached, which sends merge finalization off preserving and rehoming work that
+          // actually shipped. While the reservation stands, `bd ready --unassigned` keeps the ticket
+          // out of every other worker's claimable set, so there is no such snapshot to take.
+          if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
+            throw new PoisonEpic(
+              `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+                `not record \`${LABELS.notDelivered}\` on it — the run stopped rather than open a ` +
+                `pull request whose merge would close this undelivered ticket as shipped. Check ` +
+                `the beads DB, then resume the run`,
+            );
+          }
+          // …then hand it back: the run's claim cascade reserved it, and a ticket left assigned to a
+          // run that never dispatched it is invisible to `bd ready --unassigned` on every machine.
+          //
+          // ONLY this run's own reservation, under the cascade's compare-and-swap (anton-67xj) —
+          // an operator who took this ticket over between the cascade and this skip is doing live
+          // work, and an unconditional unassign would advertise their ticket as claimable and
+          // invite a second run of it. `live` was read under this lock, so it IS the swap's own
+          // re-read: handed in rather than paid for twice.
+          if (reservedFor) await safe(() => swap(reservedFor, undefined, live));
+          return false;
+        });
+        await safe(() => beads.note(repo, ticket.id, skipNote(skipping, moved)));
+        console.warn(
+          `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +
+            `${skipping.waitingOn}, whose work was rolled back when ${skipping.stopped} ran out ` +
+            `of time` +
+            (moved
+              ? ` (the board has since moved it on, so anton left its labels and reservation alone)`
+              : ""),
+        );
+      };
       for (const ticket of dispatchable) {
         assertLeaseHeld(); // yield before starting a ticket if the shared lease has lapsed
         // A ticket marked done on the board — a closed epic child, or a standalone target moved to
@@ -1424,6 +1543,26 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             // leave a stale implementing label (making a reopened bead derive as in-progress).
             await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
           }
+          onBranch.add(ticket.id);
+          // Rebuild the cascade around it (PR #199 review). `skipCause` was computed at the
+          // timeout, before the loop knew this ticket's commit was already here: for a→b→c it
+          // still names both b and c, and c would be skipped over a mechanism that IS on the
+          // branch. Only matters when this ticket was itself in the cascade — otherwise the walk
+          // never reached it and the verdict is unchanged.
+          if (skipCause.has(ticket.id)) {
+            skipCause = skippedDependents(timedOut, tickets, all, onBranch);
+          }
+          continue;
+        }
+        // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The
+        // rollback took the mechanism it was written against off the branch, so its agent can only
+        // report the absence and exit with a zero diff — which the no-delivery gate then reads as a
+        // failed run, poisoning the tickets that DID deliver. Checked after the done-on-board skip
+        // above (work already on this branch is delivered, whatever timed out later) and before the
+        // re-gates below, which must not park a run over a ticket that is no longer going to run.
+        const skipping = skipCause.get(ticket.id);
+        if (skipping) {
+          await recordSkipped(ticket, skipping, doneOnBoard);
           continue;
         }
         // Done on the board but the commit is missing from this branch (cross-machine resume): the
@@ -1475,6 +1614,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
             closeOnDone: !standaloneRun,
             timeoutMs: ticketTimeoutMs,
           });
+          onBranch.add(ticket.id); // it committed, so nothing behind it is missing its mechanism
         } catch (e) {
           // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
           // already blocked its own bead and rolled its partial work back, so the feature can carry
@@ -1483,7 +1623,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // still halts the run, unchanged.
           if (!(e instanceof TicketTimeoutError)) throw e;
           timedOut.push({ id: e.ticketId, committed: e.committed });
+          if (e.committed) onBranch.add(e.ticketId); // the deadline hit the bookkeeping, not the code
           console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
+          // Recomputed over the whole ledger, which decides for itself what cascades: a timeout
+          // that landed AFTER its commit takes nothing down with it (anton-67xj). Walked over
+          // `tickets` rather than `live`: an abandoned ticket still sits on the `blocks` edges of
+          // the chain around it, so dropping it from the graph would cut the walk short and
+          // dispatch the tickets BEHIND it against work the rollback took off the branch.
+          skipCause = skippedDependents(timedOut, tickets, all, onBranch);
         }
         // A finished ticket is progress — reported here so the runner's no-progress timeout
         // measures a wedge rather than a long-but-healthy feature (anton-t1mo).
@@ -1501,14 +1648,36 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     same false success one ticket down. So park: the committed work stays on the branch, the
       //     held tickets stay open and unrun, and the resume that follows the blocker landing walks
       //     this same branch — skipping what already committed — and opens the single PR then.
-      if (held.length > 0) {
+      //     A held ticket that ALSO sits behind a rolled-back timeout is the one exception
+      //     (anton-67xj): the blocker is no longer the reason it can't run — the mechanism it was
+      //     written against was rolled off the branch, and the ticket that owned it is `blocked`,
+      //     which bd refuses to claim. So the resume this park promises could not dispatch it
+      //     either, and parking would strand the commits the run's independent tickets already made
+      //     behind a wait that decides nothing. Only tickets held for a reason a resume can clear
+      //     hold the run.
+      const stillHeld = held.filter((t) => !skipCause.has(t.id));
+      if (stillHeld.length > 0) {
         throw new BlockedTailError(
           blockedTailReason(epicBeadId, {
             blockers: freshReadiness.blockers,
+            // Every held ticket, including the timeout-skipped ones: the run parks either way, and
+            // the operator reading the park is owed the whole tail rather than half of it.
             held: held.map((t) => t.id),
-            ran: dispatchable.filter((t) => !rolledBack.has(t.id)).map((t) => t.id),
+            ran: dispatchable
+              .filter((t) => !rolledBack.has(t.id) && !skipped.has(t.id))
+              .map((t) => t.id),
           }),
         );
+      }
+      // The run proceeds, so the held tail is now work this run did not deliver and must say so on
+      // its own beads — otherwise the merge of the PR opening below closes it as shipped. Recorded
+      // only once the park above is ruled out, so a run that still parks leaves the board untouched.
+      // `doneOnBoard: false` — the epic graph puts closed children in neither the ready nor the held
+      // set, so a held ticket is open by construction and has no cross-machine close to undo.
+      // Every held ticket has a cause here: `stillHeld` is exactly the ones without one, and the
+      // park above throws whenever that set is non-empty.
+      for (const ticket of held) {
+        await recordSkipped(ticket, skipCause.get(ticket.id)!, false);
       }
 
       // 4b. The RUN phase of the walk (anton-lnkt): every formula step after the commit, in the
@@ -1521,7 +1690,9 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     is dropped for the same reason (anton-t1mo) — leaving it in would put it in the PR body
       //     as delivered and hand the reviewer a diff it isn't in. One stopped AFTER its commit
       //     stays: its code is in the diff, so dropping it would hide work the reviewer must read.
-      const delivered = live.filter((t) => !rolledBack.has(t.id));
+      //     A ticket SKIPPED behind a rolled-back one (anton-67xj) never ran at all, so it is out
+      //     for the same reason — the PR body must not claim work that has no diff.
+      const delivered = live.filter((t) => !rolledBack.has(t.id) && !skipped.has(t.id));
 
       // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is
       // only correct while SOMETHING landed — carrying on here would run the review gate over an
@@ -1531,7 +1702,11 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       if (timedOut.length > 0 && delivered.length === 0) {
         throw new PoisonEpic(
           `every ticket under ${epicBeadId} ran out of time ` +
-            `(${timedOut.map((t) => t.id).join(", ")}) — nothing was delivered. Re-scope them into ` +
+            `(${timedOut.map((t) => t.id).join(", ")})` +
+            (skipped.size > 0
+              ? ` or was skipped behind one that did (${[...skipped.keys()].join(", ")})`
+              : "") +
+            ` — nothing was delivered. Re-scope them into ` +
             `smaller tickets, or raise this project's ticketTimeoutMinutes, then resume the run`,
         );
       }
@@ -1736,13 +1911,23 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         : null;
       if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
 
+      // The tickets the timeout took down with it (anton-67xj) — the founder reads the TARGET at the
+      // merge gate, so the PR's missing half is named there too, not only on each skipped bead.
+      const skippedNotice = skipped.size
+        ? `${skipped.size} ticket(s) were never dispatched because the work they depend on was ` +
+          `rolled back — ` +
+          `${[...skipped].map(([id, c]) => `${id} (waiting on ${c.waitingOn})`).join(", ")}. ` +
+          `Each is open, unassigned and noted; run them once the tickets they wait on land.`
+        : null;
+      if (skippedNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${skippedNotice}`));
+
       // 5. Finalize run + clean up the worktree (the branch/PR carry the work now). The run IS done —
       //    the branch and its PR carry the work — so a stale-body salvage rides along as the row's
       //    error rather than failing a delivery that landed.
       await updateRun(db, clock, runId, {
         status: "done",
         endedAt: clock.now(),
-        error: [timeoutNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
+        error: [timeoutNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
       });
       // The branch and its PR carry the work now, so the checkout is residue; the branch survives
       // because the target is still open in review (anton-hrun.1). The claim comes off first: the
@@ -1796,6 +1981,28 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           );
         }
       }
+      // Reopen the timeouts this attempt absorbed (anton-67xj). runTicket leaves a rolled-back
+      // timeout `blocked` on purpose — the run walks on to its PR and the block is the founder's cue
+      // — but that only holds while the run REACHES that PR. Every stop below advertises a retry or
+      // a resume instead, and that attempt re-dispatches this ticket: `blocked` is a status bd
+      // refuses to claim, so runTicket's hard claim gate would kill the next attempt on a bead THIS
+      // one blocked, over a failure (a `not-delivered` write that wouldn't land, a held tail, a
+      // review the gate refused) that has nothing to do with it. Same restore the halting paths
+      // inside runTicket perform, for the same reason; the note it left is what carries the
+      // timeout's account to the operator, not the status.
+      //
+      // Only the ROLLED-BACK ones: a ticket stopped after its commit stays blocked for a human to
+      // read, and reopening it would have the next attempt re-dispatch an agent over work already
+      // on the branch. Not on an ABORT either — a kill or an abandon settles these beads itself
+      // (an abandon closes them), and reopening one there re-queues work a human just killed, the
+      // rule runTicket's own abort path follows.
+      //
+      // Retried, not best-effort (PR #199 review). Every path below advertises a resume or a retry,
+      // and this status is what that attempt's claim gate tests: swallowing a transient bd failure
+      // here leaves the ticket `blocked` with nothing said anywhere, so the resume the park promises
+      // dies on its first step for a reason nobody can see. A refusal that outlives the retries is
+      // logged with its repair, the escalation every other must-land write on this seam makes.
+      if (!ctx.signal.aborted) await reopenAbsorbedTimeouts(repo, epicBeadId, timedOut);
       // Resolved HERE — after the release awaits, immediately before the settle that would arm the
       // gate — so a kill landing mid-unwind still converts (anton-287p). Nothing above this line
       // branches on the distinction (the release runs the same for either error), so the late read
@@ -2097,6 +2304,29 @@ async function runTicket(args: {
   // Announce the stage + nudge a sync so the claim reaches teammates within a heartbeat
   // (fire-and-forget; the end-of-run sync is the backstop).
   await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("implementing")]));
+  // A previous run marked this ticket as undelivered (timed out, or skipped behind one that did).
+  // It is being run now, so that verdict is stale — and clearing it is as load-bearing as writing
+  // it was (anton-67xj). The failure is the mirror image: a marker that survives its own successful
+  // run makes merge finalization read delivered work as undelivered, hold this ticket out of the
+  // close, and file a follow-up epic for work the merged diff already contains. So it is retried,
+  // and a run that cannot clear it parks before it can open that PR.
+  if (beads.isNotDelivered(ticket)) {
+    if (!(await mustPersist(() => beads.untag(repo, ticket.id, [LABELS.notDelivered])))) {
+      // Put the ticket back the way the claim above found it before halting. The claim already
+      // moved it to `in_progress`, and the epic-level cleanup hands the assignee back but not the
+      // status — leaving `in_progress` with no owner, which `bd update --claim` refuses outright.
+      // The resume this park tells the operator to run would then never get past its claim gate.
+      // Same restore the retryable-failure path below performs, for the same reason.
+      await safe(() => beads.setStatus(repo, ticket.id, "open"));
+      await safe(() => beads.unassign(repo, ticket.id));
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+      throw new PoisonEpic(
+        `${ticket.id} carries \`${LABELS.notDelivered}\` from a previous run but bd would not ` +
+          `clear it — running this ticket and opening a pull request would make merge ` +
+          `finalization treat delivered work as undelivered. Check the beads DB, then resume the run`,
+      );
+    }
+  }
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
@@ -2336,6 +2566,14 @@ async function runTicket(args: {
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       await safe(() => beads.unassign(repo, ticket.id));
       await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+      // Rolled back ⇒ nothing from this ticket is on the branch, so it is in no PR: mark it, or
+      // merge finalization closes it as shipped when the rest of the feature lands (anton-67xj).
+      // A ticket stopped AFTER its commit is NOT marked — its work is in the diff a human merges.
+      // The marker is finalization's only input, so it is retried rather than best-effort; a run
+      // that still cannot record it must not reach its PR (escalated below, once the note is on the
+      // bead — the operator needs the timeout's own account either way).
+      const marked =
+        committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
       await safe(() =>
         beads.note(
           repo,
@@ -2353,6 +2591,15 @@ async function runTicket(args: {
             `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
         ),
       );
+      // Either halt below PARKS the run and tells the operator to resume it, so this ticket has to
+      // stay claimable (anton-67xj). The block above left it `blocked` — or `in_progress` and
+      // unowned, if that best-effort status write failed — and runTicket's hard claim gate refuses
+      // both, so the advertised resume would die on its own first step. Put it back at `open`, the
+      // same restore the stale-marker path performs; the note above is what carries the timeout's
+      // account to the operator, not the status. A timeout the run ABSORBS keeps `blocked` here: it
+      // carries on to a PR, and the block is the human's cue — and if that run later stops instead,
+      // its own stopping path reopens what it absorbed, for exactly the reason above.
+      if (leftovers || !marked) await safe(() => beads.setStatus(repo, ticket.id, "open"));
       // The rollback is what keeps the REST of the run honest, so its failure cannot be absorbed
       // the way the timeout itself is: the next ticket captures its baseline from this same tree
       // and would commit these leftovers under its own name. The bead note can't prevent that —
@@ -2364,6 +2611,18 @@ async function runTicket(args: {
             `partial work could NOT be rolled back — the run's worktree (${worktreePath}) still ` +
             `carries changes that the next ticket would commit as its own, so the run stopped ` +
             `here. Clear the worktree by hand, then resume the run`,
+        );
+      }
+      // Same reasoning one step further out: this ticket's work is on no branch, and without the
+      // marker the merge of the PR carrying the REST of the feature closes it as shipped. The note
+      // above can't prevent that — finalization reads labels, not prose — so halt instead of
+      // absorbing this timeout and walking on toward a PR that would swallow the ticket.
+      if (!marked) {
+        throw new PoisonEpic(
+          `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget and its ` +
+            `partial work was rolled back, but bd would not record \`${LABELS.notDelivered}\` on ` +
+            `it — the run stopped rather than carry on to a pull request whose merge would close ` +
+            `this undelivered ticket as shipped. Check the beads DB, then resume the run`,
         );
       }
       throw new TicketTimeoutError(ticket.id, timeoutMs, committed);
@@ -4174,23 +4433,229 @@ export function ticketSetDrift(selected: Bead[], confirmed: Bead[]): string | un
 }
 
 /**
- * Topologically order tickets so a ticket runs after the tickets it depends on (`blocks` edges
- * among the epic's own members). Falls back to input order on a cycle.
+ * The run's INTERNAL dependency graph — `blocks` edges among the run's own tickets only, as
+ * blocker id → the tickets that depend on it. Edges to beads outside the run are another gate's
+ * business (`runReadiness` holds those tickets before the loop ever sees them).
+ *
+ * Shared by the two questions a run asks of that graph: what order to dispatch in
+ * ({@link orderTickets}) and, once a ticket fails to deliver, what can no longer run
+ * ({@link skippedDependents}). One reader, so the skip can never disagree with the order.
  */
-export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
+function dependentEdges(tickets: Bead[], all: Bead[]): Map<string, string[]> {
   const ids = new Set(tickets.map((t) => t.id));
-  const indeg = new Map<string, number>();
-  const adj = new Map<string, string[]>();
-  for (const t of tickets) {
-    indeg.set(t.id, 0);
-    adj.set(t.id, []);
-  }
+  const adj = new Map<string, string[]>(tickets.map((t) => [t.id, []]));
   for (const e of beads.edgesOf(all)) {
     if (e.type !== "blocks") continue;
     // e.from depends on e.to → e.to must come first.
     if (!ids.has(e.from) || !ids.has(e.to)) continue;
     adj.get(e.to)!.push(e.from);
-    indeg.set(e.from, (indeg.get(e.from) ?? 0) + 1);
+  }
+  return adj;
+}
+
+/** Why a ticket was never dispatched: the ticket it directly waits on, and the stopped ticket at
+ * the head of that chain (the same id when the dependency is direct). */
+export interface SkipCause {
+  waitingOn: string;
+  stopped: string;
+}
+
+/** One entry in a run's timeout ledger: the ticket the budget stopped, and whether its work had
+ * already been committed when it did. */
+export interface TicketTimeoutOutcome {
+  id: string;
+  committed: boolean;
+}
+
+/**
+ * Whether a LIVE read of a ticket this run's budget stopped is still the run's to reopen
+ * (PR #199 review).
+ *
+ * A stopping run puts the timeouts it absorbed back at `open`, because the resume it advertises
+ * starts at runTicket's hard claim gate and that gate refuses the status the timeout left. But the
+ * ledger it works from is a snapshot taken when the timeout landed, and the run walked every
+ * independent ticket behind it before it stopped: in that window a resumed attempt elsewhere can
+ * have claimed the bead, and a human can have closed or abandoned it. Rewriting the status then
+ * downgrades live work or undoes a person's decision, so the reopen is decided on the board as it
+ * is now, against the state THIS run's timeout path leaves behind:
+ *
+ * - still carrying `not-delivered` — the marker runTicket clears the moment anyone re-runs the
+ *   ticket, so it surviving means nobody has;
+ * - unowned — the run gave its reservation back a few lines above, and an assignee that appeared
+ *   since is somebody else's claim;
+ * - `blocked`, or `in_progress` when the timeout's best-effort block write did not land — the two
+ *   statuses the claim gate refuses, and the only two this path exists to repair. `open` needs no
+ *   write; `closed` is a human's verdict.
+ */
+export function reopenableAfterStop(b: Bead): boolean {
+  return (
+    beads.isNotDelivered(b) &&
+    ownerOf(b) === undefined &&
+    (b.status === "blocked" || b.status === "in_progress")
+  );
+}
+
+/**
+ * The bd surface {@link reopenAbsorbedTimeouts} decides and writes through, declared structurally
+ * (like claim.ts's `AssigneeStore`) so tests can drive the sequence without a real board.
+ */
+export interface ReopenBoard {
+  show: (cwd: string, id: string) => Promise<Bead>;
+  setStatus: (cwd: string, id: string, status: string) => Promise<unknown>;
+}
+
+/**
+ * Put the ROLLED-BACK timeouts a stopping run absorbed back at `open`, each decided and written
+ * under that ticket's OWN write lock (PR #199 review).
+ *
+ * {@link reopenableAfterStop} is what makes the write safe, but a predicate read that nothing
+ * serializes only says the bead was ours a moment ago. Another run's claim gate
+ * ({@link beads.claimVerified}) and an operator's Claim both write on the per-bead chain in
+ * beads/claim-lock, so either could land between the read and this unconditional `open` and knock a
+ * freshly-claimed `in_progress` ticket back into `bd ready` while its agent runs. Holding the lock
+ * across both makes the two orders real: the claim wins and the locked re-read sees its owner, or it
+ * queues behind this and finds `open`. Ordering is process-local by construction (see claim-lock);
+ * the cross-machine half is anton-od4, which is why the predicate stays either way.
+ *
+ * Nothing inside may take that lock again, on pain of deadlock — `show`/`setStatus` are bare bd
+ * spawns, unlike claimVerified and the claim CAS.
+ *
+ * Never throws: this runs on the stopping path, where one refused bd write must not hide the run's
+ * own error. Every refusal is logged with the repair instead.
+ */
+export async function reopenAbsorbedTimeouts(
+  repo: string,
+  epicBeadId: string,
+  timedOut: readonly TicketTimeoutOutcome[],
+  board: ReopenBoard = beads,
+): Promise<void> {
+  for (const stalled of timedOut.filter((t) => !t.committed)) {
+    await withBeadWriteLock(repo, stalled.id, async () => {
+      // Decided on a read taken HERE, not on the ledger (PR #199 review).
+      const live = await board.show(repo, stalled.id).catch(() => undefined);
+      // A read that failed is not evidence the ticket is still ours, and a reopen written on that
+      // silence is the very overwrite this guard exists to prevent — so it takes the same escalation
+      // as a refused write: left as it stands, with the repair named.
+      if (!live) {
+        console.error(
+          `[execute-epic] ${epicBeadId}: could not re-read ${stalled.id} to reopen it, so its ` +
+            `status stands — if it is still \`blocked\`, runTicket's claim gate refuses it and ` +
+            `the resume this run advertises dies on it. Check it by hand: bd show ${stalled.id}`,
+        );
+        return;
+      }
+      if (!reopenableAfterStop(live)) {
+        console.warn(
+          `[execute-epic] ${epicBeadId}: left ${stalled.id} as it stands (status ` +
+            `${live.status}${ownerOf(live) ? `, held by ${ownerOf(live)}` : ""}) — it moved on ` +
+            `from the timeout this run recorded, so reopening it is not this run's call`,
+        );
+        return;
+      }
+      // The retries stay INSIDE the lock: a window reopened between attempts is the same window the
+      // lock exists to close, and a claim can only land in it if we let go.
+      if (!(await mustPersist(() => board.setStatus(repo, stalled.id, "open")))) {
+        console.error(
+          `[execute-epic] ${epicBeadId}: could not reopen ${stalled.id} — it stays \`blocked\`, ` +
+            `which runTicket's claim gate refuses, so the resume this run advertises would die ` +
+            `on it. Clear it by hand: bd update ${stalled.id} --status open`,
+        );
+      }
+    });
+  }
+}
+
+/**
+ * Every ticket that transitively depends on a ticket whose work was ROLLED BACK, and why
+ * (anton-67xj).
+ *
+ * A ticket whose budget ran out has its partial work rolled back, so the mechanism the tickets
+ * behind it were written against is not on the branch. Dispatching them anyway hands each agent a
+ * premise that does not exist — the same false-success shape a cross-run blocker is held for — and
+ * the zero diff that follows poisons the whole run, stranding the work its INDEPENDENT tickets
+ * already committed. So they are skipped instead, and the run narrows rather than dies.
+ *
+ * Only a rolled-back timeout cascades, which is why this reads the ledger rather than a list of
+ * ids: a ticket stopped AFTER its commit left its work on the branch — the deadline landed on the
+ * bookkeeping, not the code — so the tickets behind it still have what they were written against
+ * and still run.
+ *
+ * Breadth-first from the stopped set over the run's own `blocks` edges, so a chain a→b→c skips both
+ * b and c; a ticket already recorded is never revisited, which also makes a cycle terminate.
+ *
+ * `tickets` is the run's WHOLE set, ABANDONED members included (PR #199) — an abandoned ticket is a
+ * node the walk crosses, never a verdict it reports. Leaving it out of the graph would cut a→b→c at
+ * an abandoned `b` and dispatch `c` against a mechanism the rollback took off the branch; leaving it
+ * in the result would have the run skip-note a bead a human already closed.
+ *
+ * A ticket in `onBranch` STOPS the walk, the same rule merge finalization applies to a delivered
+ * dependent ({@link undeliveredAtMerge}). Its commit is on this branch — a resume finds work an
+ * earlier attempt closed and committed here, whatever rolled back further up the chain — so the
+ * tickets behind it have what they were written against and must still run. Passing through one
+ * would skip valid work and leave it out of the run's pull request for no reason.
+ */
+export function skippedDependents(
+  timedOut: readonly TicketTimeoutOutcome[],
+  tickets: Bead[],
+  all: Bead[],
+  onBranch: ReadonlySet<string> = new Set(),
+): Map<string, SkipCause> {
+  const ids = new Set(tickets.map((t) => t.id));
+  const adj = dependentEdges(tickets, all);
+  const stoppedSet = new Set(
+    timedOut.filter((t) => !t.committed && ids.has(t.id)).map((t) => t.id),
+  );
+  const cause = new Map<string, SkipCause>();
+  const queue = [...stoppedSet];
+  while (queue.length) {
+    const id = queue.shift()!;
+    const root = stoppedSet.has(id) ? id : cause.get(id)!.stopped;
+    for (const dependent of adj.get(id) ?? []) {
+      if (stoppedSet.has(dependent) || cause.has(dependent)) continue;
+      if (onBranch.has(dependent)) continue; // delivered here — it and its own dependents still run
+      cause.set(dependent, { waitingOn: id, stopped: root });
+      queue.push(dependent);
+    }
+  }
+  for (const t of tickets) if (beads.isAbandoned(t)) cause.delete(t.id);
+  return cause;
+}
+
+/**
+ * Why a skipped dependent did not run, for its own bead — the board has to say this, or the ticket
+ * reads as work anton simply forgot. Names the ticket it waits on AND the stopped one at the head
+ * of the chain, since for a transitive dependent those differ and only the second is actionable.
+ *
+ * `movedOn` is the skip that touched nothing else (PR #199 review): the board had reparented or
+ * re-statused this ticket out of the run before it could be marked, so the note must not promise
+ * the state anton deliberately did not write.
+ */
+export function skipNote(cause: SkipCause, movedOn = false): string {
+  const chain =
+    cause.waitingOn === cause.stopped
+      ? `${cause.stopped}, which ran out of time and had its work rolled back`
+      : `${cause.waitingOn}, which was itself skipped behind ${cause.stopped} — that ticket ran ` +
+        `out of time and had its work rolled back`;
+  return (
+    `anton: not dispatched — this ticket depends on ${chain}, so the work it builds on is not on ` +
+    `the run's branch and an agent could not have finished it. ` +
+    (movedOn
+      ? `The board moved this ticket on while the run was working, so anton left its status, ` +
+        `labels and assignee exactly as they are — whoever owns it now owns this work. `
+      : `Left open and unassigned; the run delivered the rest of the feature. `) +
+    `Re-scope ${cause.stopped} (or raise ticketTimeoutMinutes), run it, then run this ticket.`
+  );
+}
+
+/**
+ * Topologically order tickets so a ticket runs after the tickets it depends on (`blocks` edges
+ * among the epic's own members). Falls back to input order on a cycle.
+ */
+export function orderTickets(tickets: Bead[], all: Bead[]): Bead[] {
+  const adj = dependentEdges(tickets, all);
+  const indeg = new Map<string, number>(tickets.map((t) => [t.id, 0]));
+  for (const dependents of adj.values()) {
+    for (const d of dependents) indeg.set(d, (indeg.get(d) ?? 0) + 1);
   }
   const queue = tickets.filter((t) => (indeg.get(t.id) ?? 0) === 0).map((t) => t.id);
   const order: string[] = [];
@@ -4237,3 +4702,64 @@ async function safe(fn: () => Promise<unknown>): Promise<boolean> {
     return false; // best-effort
   }
 }
+
+/** Backoff between {@link mustPersist} attempts — long enough to outlast a contended Dolt write. */
+const PERSIST_RETRY_MS = 500;
+
+/**
+ * A bd write the run is NOT allowed to proceed without, retried before it is permitted to fail.
+ * Answers whether it landed, so the caller escalates instead of carrying on as if it had.
+ *
+ * `safe` is right for a label whose absence a reader can survive. It is wrong for the
+ * `not-delivered` marker (anton-67xj): that label is merge finalization's ONLY signal that a ticket
+ * is in no diff, so swallowing its failure lets the run open a PR whose merge closes never-written
+ * work as shipped — silently, and against the note on the bead telling the operator to re-run it.
+ *
+ * Every refusal is LOGGED rather than swallowed (PR #199 review): the callers escalate to a park
+ * whose message can only say "check the beads DB", so bd's own reason for refusing is what makes
+ * that park actionable — and it exists nowhere else once this has returned.
+ */
+async function mustPersist(fn: () => Promise<unknown>, attempts = 3): Promise<boolean> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await fn();
+      return true;
+    } catch (e) {
+      console.error(`[execute-epic] bd write failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+    }
+  }
+  return false;
+}
+
+/**
+ * A bd read a guarded write is decided on, retried on {@link PERSIST_RETRY_MS} exactly like the
+ * write itself. Answers `undefined` only once bd has refused it every time, so the caller escalates
+ * on a board that is genuinely unreachable rather than on one contended round trip.
+ *
+ * `beads.show(...).catch(() => undefined)` is right where "unreadable" is evidence of nothing and
+ * the caller simply does less. It is wrong ahead of a write whose correctness depends on WHOSE the
+ * bead still is (see {@link LABELS.notDelivered} in the skip path): there, a silent undefined turns
+ * a compare-and-swap into an unconditional write.
+ */
+async function mustRead(
+  repo: string,
+  id: string,
+  attempts = 3,
+): Promise<Bead | undefined> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await beads.show(repo, id);
+    } catch (e) {
+      console.error(`[execute-epic] bd read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+    }
+  }
+  return undefined;
+}
+
+const delayMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === "function") t.unref();
+  });
