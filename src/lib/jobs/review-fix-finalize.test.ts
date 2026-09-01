@@ -327,6 +327,44 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  it("does not delete a childless follow-up another operator filled mid-pass (PR #199 review)", async () => {
+    // The follow-up's own description asks to be approved, and this pass has been writing to a
+    // shared board since it was created: a ticket parented to it in that window is on no snapshot
+    // anton holds, because the epic did not exist when the board was read. `bd delete --force` does
+    // not cascade, so deleting it would leave that ticket parentless.
+    const boardNow: Bead[] = [];
+    listMock.mockImplementation(async () => [...boardNow]);
+    reparentMock.mockImplementation(async () => {
+      boardNow.push({ ...bead("t9"), parent: "epic-2" } as Bead);
+      throw new Error("bd update: DB locked");
+    });
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    expect(deleteMock).not.toHaveBeenCalled();
+    // It is a real home now, not the childless poison run the cleanup exists for, so nothing is
+    // left undone: the merged source closes.
+    expect(batchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the merged target open when childlessness cannot be re-read (PR #199 review)", async () => {
+    reparentMock.mockRejectedValue(new Error("bd update: DB locked"));
+    let reads = 0;
+    listMock.mockImplementation(async () => {
+      reads += 1;
+      if (reads > 2) throw new Error("bd list: DB locked"); // the read the delete is decided on
+      return [];
+    });
+
+    await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
+
+    // A board anton cannot read is not evidence the follow-up is empty, and the delete is the
+    // irreversible half: it stands, and the source stays open and `stage:in-review` to retry.
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(batchMock).not.toHaveBeenCalled();
+    expect(untagMock).not.toHaveBeenCalled();
+  });
+
   it("reuses the follow-up an interrupted sweep already created (PR #199)", async () => {
     // `beads.create` is a persistent write, and the sweep that made this one stopped before it
     // could move anything onto it. The target is still open, so finalization re-runs from the top —
@@ -1528,6 +1566,27 @@ describe("finalizeMergedEpic", () => {
     expect(reparentMock.mock.calls).toEqual([["/repo", "d0", "epic-1"]]);
     expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
     expect(noteFor("m1")).toContain("x1 still hangs off it");
+  });
+
+  it("pins an ancestor a DELIVERED ticket is reparented under after the detaches (PR #199 review)", async () => {
+    // d1 shipped in this merge, and pass 1c only inspects the ancestor its SNAPSHOT named — the
+    // merged target, which is not moving — so it is detached by nothing. Another operator hangs it
+    // off m1 while d0 is being detached, and a rider scan that walks only `takeable` and `excluded`
+    // never sees it: m1's move would carry a ticket this merge already shipped onto the follow-up,
+    // whose squash-merged branch shows none of its commits, and the next run would redo that work.
+    reparentMock.mockImplementation(async (_repo: string, id: string) => {
+      if (id === "d0") parents.set("d1", "m1");
+    });
+
+    await finalize(bead("epic-1"), [
+      bead("m1", "blocked", ["not-delivered"]),
+      under("m1", bead("d0")),
+      bead("d1", "closed"),
+    ]);
+
+    expect(reparentMock.mock.calls).toEqual([["/repo", "d0", "epic-1"]]);
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-2"); // nothing reached it
+    expect(noteFor("m1")).toContain("d1 still hangs off it");
   });
 
   it("re-reads a candidate before deciding it does not ride along (PR #199)", async () => {

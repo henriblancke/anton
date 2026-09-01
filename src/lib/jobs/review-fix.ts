@@ -1713,6 +1713,12 @@ async function applyRehome(
   // there is nothing to take the child off — and it now belongs to whoever claimed or reparented
   // it, so detaching their descendant would rewrite an edge inside somebody else's subtree.
   const preservedIds = new Set(preserved.map((b) => b.id));
+  /** The subtree's DELIVERED tickets: what this pass detaches, and what pass 2 re-checks for. */
+  const shippedTickets = subtree.filter(
+    (b) => b.id !== epic.id && !preservedIds.has(b.id),
+  );
+  /** The ones this pass took off their ancestor — anton's own write is the freshest edge there is. */
+  const detached = new Set<string>();
   /**
    * Whether detaching this child onto the merged target would STRAND it (PR #199). Delivery is the
    * sweep's verdict, and the closing batch is built from that same snapshot: a child it read as
@@ -1726,8 +1732,7 @@ async function applyRehome(
     if (owner !== undefined && owner !== runOwner) return true;
     return snapshot.status === "closed" && live.status !== "closed";
   };
-  for (const bead of subtree) {
-    if (preservedIds.has(bead.id)) continue;
+  for (const bead of shippedTickets) {
     const parentId = beads.parentOf(bead);
     if (
       !parentId ||
@@ -1759,8 +1764,10 @@ async function applyRehome(
       shipped &&
       !strandedByDetach(shipped, bead) &&
       (await safe(() => beads.reparent(repo, bead.id, epic.id)))
-    )
+    ) {
+      detached.add(bead.id);
       continue;
+    }
     await pinAncestors(bead);
   }
 
@@ -1798,6 +1805,20 @@ async function applyRehome(
     // ticket onto a target anton wrote. Scanning `takeable` alone never sees it. No takeover test —
     // the plan already refused this ticket, so any ride-along disqualifies the mover.
     for (const rider of excluded) {
+      const known = (await reread(rider.id)) ?? rider;
+      if ((await ridesOn(known, moverId, bySubtreeId, reread)) === "target")
+        return rider.id;
+    }
+    // A DELIVERED ticket rides along on that same edge too (PR #199 review), and it is in neither
+    // set above: pass 1c detaches the ones whose SNAPSHOT parent was a mover, so one another
+    // operator reparents beneath this mover afterwards was never inspected at all. Carrying it onto
+    // the follow-up is what pass 1c exists to prevent — a squash-merged branch shows none of its
+    // `<id>:` commits, so execute-epic reads the closed ticket as a cross-machine resume and reruns
+    // work the merge already shipped — and if it was reopened since, the reparent pulls live work
+    // into another run. No takeover test: a delivered ticket is not this rehome's to move either
+    // way, so any ride-along pins the mover, exactly as a failed detach does.
+    for (const rider of shippedTickets) {
+      if (detached.has(rider.id)) continue; // anton's own detach already took it off this edge
       const known = (await reread(rider.id)) ?? rider;
       if ((await ridesOn(known, moverId, bySubtreeId, reread)) === "target")
         return rider.id;
@@ -1880,9 +1901,10 @@ async function applyRehome(
       unfinished: unread ?? strandedRival,
     };
   // Nothing moved — the epic is a childless run target no one asked for. Take it back off the
-  // board, unless it is a REUSED follow-up an earlier sweep already moved tickets onto: deleting
-  // that one would take their only home with it. Nor one a CONCURRENT process created and is
-  // filling right now (`disposable`) — its children may not be on this pass's board read at all.
+  // board, unless something already hangs off it: a REUSED follow-up an earlier sweep moved tickets
+  // onto, or one another operator has filled since — deleting either would take those tickets' only
+  // home with it. Nor one a CONCURRENT process created and is filling right now (`disposable`) —
+  // its children may not be on any read this pass can take.
   //
   // Nor one that has since become somebody's RUN (PR #199 review). `beads.delete` is an
   // irreversible `bd delete --force`, and this pass has been reading and writing a shared board
@@ -1900,11 +1922,26 @@ async function applyRehome(
   // discoverable, the next sweep reuses this same follow-up (`REHOME_OF`) and retries the delete.
   const cleanup = async (): Promise<string | undefined> => {
     if (!disposable) return undefined;
-    if (reused && board.some((b) => beads.parentOf(b) === followUp))
-      return undefined;
     const live = await reread(followUp);
     if (!live) return followUp;
     if (!untouched(live)) return epic.id;
+    // CHILDLESSNESS is re-read here too (PR #199 review). `untouched` answers whether anybody has
+    // approved or claimed the follow-up; it says nothing about what now HANGS off it, and this
+    // pass has been reading and writing a shared board since — for one anton just created there is
+    // no snapshot that could answer it at all, since the epic did not exist when the board was
+    // read. `bd delete --force` does not cascade, so deleting a target another operator has since
+    // parented tickets to leaves those tickets parentless. Either read seeing a child is enough:
+    // the delete exists to clear a home nobody needed, and one with tickets under it is a home.
+    //
+    // A list that FAILS proves nothing either way, and the delete is the irreversible half — so the
+    // follow-up is left standing and the merged source held open, exactly as a delete that did not
+    // land leaves it, and the next sweep reuses this same follow-up and retries.
+    const now = await beads
+      .list(repo, ["--status", "all"])
+      .catch(() => undefined);
+    if (!now) return followUp;
+    if ([...board, ...now].some((b) => beads.parentOf(b) === followUp))
+      return undefined;
     return (await safe(() => beads.delete(repo, followUp)))
       ? undefined
       : followUp;
@@ -2047,7 +2084,8 @@ interface Rehomed {
    */
   nested: Map<string, string>;
   /**
-   * Ticket id → the preserved ticket hanging off it that anton is NOT moving. Reparenting would
+   * Ticket id → the ticket hanging off it that anton is NOT moving — one the plan left behind, or
+   * one this merge DELIVERED that could not be detached from it. Reparenting would
    * carry that descendant onto the follow-up on its own parent edge, so the ancestor stays under
    * the merged target instead, and its note names what pinned it rather than the generic remedy.
    */
