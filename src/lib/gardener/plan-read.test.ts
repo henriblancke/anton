@@ -221,9 +221,12 @@ describe("the read a proposal bead is applied through keeps the field", () => {
     });
   });
 
-  it("reads as one clause a message can carry", () => {
+  // Pinned with the separator: a reason phrased as its own sentence ("a retire has no default
+  // verb") runs straight into the field name without one, and this string is what an operator reads
+  // when a proposal refuses to apply.
+  it("reads as one clause a message can carry, with the field held apart from the reason", () => {
     expect(describePlanRejection(rejection(without(STALE, "retireAs")))).toMatch(
-      /^retireAs .*no default verb/,
+      /^retireAs: .*no default verb/,
     );
   });
 });

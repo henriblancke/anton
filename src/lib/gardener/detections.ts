@@ -865,9 +865,14 @@ export function proposalPlanOf(bead: { labels?: string[]; metadata?: Record<stri
   return "plan" in read ? read.plan : undefined;
 }
 
-/** The refusal as one clause, for a message that has to tell a human which field to go look at. */
+/**
+ * The refusal as one clause, for a message that has to tell a human which field to go look at. The
+ * colon is load-bearing: reasons come in two grammars — a predicate the field completes ("is not an
+ * object") and a standalone sentence that names the kind ("a retire has no default verb") — and only
+ * an explicit separator keeps the second kind from reading as prose that swallowed the field name.
+ */
 export const describePlanRejection = ({ field, reason }: PlanRejection): string =>
-  `${field} ${reason}`;
+  `${field}: ${reason}`;
 
 /**
  * The fingerprint this proposal's own plan hashes to TODAY, whatever label the bead carries — or
