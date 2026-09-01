@@ -25,6 +25,14 @@ import { doltSync, type SyncMode, type SyncOutcome } from "./sync-coalescer";
 export type { Bead, BeadComment, BeadDep } from "./types";
 import type { Bead } from "./types";
 
+/**
+ * The `agent:` VALUE that names no agent — the half {@link labelValueOf}(labels, "agent") returns,
+ * as distinct from the whole label {@link LABELS.agentHuman}. Exported because the routing
+ * chokepoints read the value, not the label: the active-agents allowlist compares agent ids, and
+ * `human` is not one anybody can enable.
+ */
+export const HUMAN_AGENT = "human";
+
 export const LABELS = {
   approved: "approved",
   stage: (s: "implementing" | "in-review") => `stage:${s}`,
@@ -69,6 +77,14 @@ export const LABELS = {
    * comments beside it.
    */
   reviewScore: (score: number) => `review-score:${score}`,
+  /**
+   * The one `agent:` value that names no agent (anton-mv70): a person executes this bead — it needs
+   * a credential, an account, a purchase, a signature, or a taste call. Every other `agent:<id>`
+   * resolves to a specialist prompt, so a human bead left unmarked would dispatch to the DEFAULT
+   * agent and burn a run failing at work no agent can do. Written by shaping (skills/bd/SKILL.md),
+   * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
+   */
+  agentHuman: `agent:${HUMAN_AGENT}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
@@ -1645,13 +1661,22 @@ export function buildClaimableReadyArgs(): string[] {
  *     the claimable set can never disagree with what anton will actually execute. That is what
  *     keeps container epics (their features each run on their own) and child tickets (executed as
  *     part of their target's run, never distributed) out of the set.
+ *   - not {@link beads.isHumanWork} — `agent:human` names the one specialist anton does not have,
+ *     so a claimed human target would dispatch to the DEFAULT agent and burn a run failing at work
+ *     no agent can do. It is approved work waiting for a person, not backlog: leaving it in the set
+ *     is the hazard, leaving it on the board is the point.
+ *
+ * The human exclusion belongs here rather than in {@link buildClaimableReadyArgs}: bd's own
+ * `--exclude-label` would move it into the argv every external worker copies, where it could drift
+ * from this rule; the board read this narrowing already holds answers it for free.
  */
 function isClaimable(b: Bead, board: Bead[]): boolean {
   return (
     b.status === "open" &&
     beads.isApproved(b) &&
     !ownerOf(b) &&
-    beads.isRunTarget(b, board)
+    beads.isRunTarget(b, board) &&
+    !beads.isHumanWork(b)
   );
 }
 
@@ -1729,6 +1754,9 @@ export function staleClaimReason(bead: Bead, board: Bead[]): string | undefined 
   if (!beads.isApproved(bead)) return "approval was withdrawn while the claim settled";
   if (!beads.isRunTarget(bead, board)) {
     return "the target is no longer a run target (a container epic or a child ticket)";
+  }
+  if (beads.isHumanWork(bead)) {
+    return `the target was labelled ${LABELS.agentHuman} while the claim settled — a person executes it, no agent can`;
   }
   return undefined;
 }
@@ -2665,6 +2693,18 @@ export const beads = {
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),
   isApproved: (b: Bead) => b.labels?.includes(LABELS.approved) ?? false,
+
+  /**
+   * Work a PERSON executes, not an agent (`agent:human`, see {@link LABELS.agentHuman}). Approved,
+   * shaped, real work — it just resolves to no specialist prompt, so anton must refuse it at every
+   * point where a bead turns into a dispatch rather than let it fall through to the default agent.
+   * Shared by {@link isClaimable} (it never enters the claimable set), execute-epic's run gate (a
+   * forced dispatch of a human TARGET is poisoned) and its per-ticket gate (a human TICKET inside an
+   * ordinary run is held behind a human gate at its own boundary), so the set anton picks from and
+   * the runner agree at every level of the tree.
+   */
+  isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
+
   isEpic: (b: Bead) => b.issue_type === "epic",
 
   /** The bead's parent id, from whichever field the bd read populated (`list` vs `show`). */

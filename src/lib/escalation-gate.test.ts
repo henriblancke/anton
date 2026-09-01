@@ -422,6 +422,13 @@ describe("answerGateWait — the dispatch rule that holds a resume", () => {
       /still blocked by anton-e9/,
     ],
     [
+      "a target a person now executes, which no agent can deliver",
+      board({
+        target: runTarget("anton-e1", { labels: [LABELS.approved, LABELS.agentHuman] }),
+      }),
+      /agent:human/,
+    ],
+    [
       "a target another machine is running right now",
       board({
         target: runTarget("anton-e1", {

@@ -5,8 +5,8 @@
  * gate-check: the decision is a pure function over ONE board snapshot, so it can be read and tested
  * without a runner, a clock, or a `bd` spawn around it.
  *
- * This is the STRUCTURAL half of `.beads/PRIME.md` §1 — a run target, `open`, unclaimed, unblocked,
- * and clearing the approve gate. The policy predicate (R2) narrows this set afterwards and the PRIME
+ * This is the STRUCTURAL half of `.beads/PRIME.md` §1 — a run target, `open`, unclaimed, not human
+ * work, unblocked, and clearing the approve gate. The policy predicate (R2) narrows this set afterwards and the PRIME
  * ranking (`beads/rank.ts`) orders what survives; neither belongs here. Nothing in this module calls
  * `bd ready`, whose answer is "what is unblocked", not "what may I take".
  *
@@ -25,7 +25,7 @@
  * That is the one place this set is wider than `beads.claimableTargets`, which serves workers that
  * only ever consume the label.
  */
-import { beads, ownerOf } from "../beads/bd";
+import { beads, LABELS, ownerOf } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import {
   formatApprovalGaps,
@@ -90,6 +90,17 @@ export function ineligibility(
   // The holder is the detail: "who has it" is the whole of what the operator needs.
   const holder = ownerOf(target);
   if (holder) return { beadId, reason: "claimed", detail: `held by ${holder}` };
+
+  // Work only a PERSON can do is never anton's to start (anton-mv70). `agent:human` resolves to the
+  // one specialist anton does not have, so a plan that ranked it would start a run execute-epic
+  // poison-parks on arrival, and the policy editor would count it as startable. Refused HERE rather
+  // than only in `beads.claimableTargets`, because the picker is the second writer of `approved`
+  // (R1.5) and never reads that set — the two paths must agree about what a run may take.
+  // Ahead of the approve gate on purpose: this bead's contract can be perfect and it still isn't
+  // agent work, and the reason an operator needs is "a person owns this", not a shaping gap.
+  if (beads.isHumanWork(target)) {
+    return { beadId, reason: "needs-human", detail: `labelled ${LABELS.agentHuman}` };
+  }
 
   // Approval's four promises, through the gate rather than re-derived — including the blocker
   // rollup, which is where the per-child readiness verdict lives (a partially-gated target is

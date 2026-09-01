@@ -24,15 +24,18 @@
  * Mocked at the bd seam, because the states under test are bd calls that fail: the end-to-end shapes
  * of the arm live in execute-epic.needs-human.integration.test.ts against real bd.
  */
-import { beforeEach, expect, it, vi } from "vitest";
-import type { Bead, Gate } from "../beads/bd";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LABELS, type Bead, type Gate } from "../beads/bd";
 import { parkedAskGateId, parkedAskGateIds } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
 const gateCreateMock = vi.fn();
 const gateResolveMock = vi.fn();
 const tagMock = vi.fn();
+const untagMock = vi.fn();
+const showMock = vi.fn();
 const pullMock = vi.fn();
+const closeMock = vi.fn();
 
 vi.mock("../beads/issues", async () => {
   const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
@@ -48,14 +51,23 @@ vi.mock("../beads/bd", async () => {
       gateCreate: (...args: unknown[]) => gateCreateMock(...args),
       gateResolve: (...args: unknown[]) => gateResolveMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
+      untag: (...args: unknown[]) => untagMock(...args),
+      show: (...args: unknown[]) => showMock(...args),
       pull: (...args: unknown[]) => pullMock(...args),
+      close: (...args: unknown[]) => closeMock(...args),
     },
   };
 });
 
 const {
   armHumanGate,
+  armHumanTicketGates,
+  preflightHumanTickets,
+  MAX_HUMAN_TICKET_PASSES,
+  humanGateReason,
+  humanTicketAsk,
   concludeCancelledArmedPark,
+  undoCancelledTicketGates,
   HUMAN_GATE_ARMED_LABEL,
   liveArmedAsk,
   NeedsHumanError,
@@ -98,7 +110,11 @@ beforeEach(() => {
   gateCreateMock.mockReset();
   gateResolveMock.mockReset().mockResolvedValue(undefined);
   tagMock.mockReset().mockResolvedValue(undefined);
+  untagMock.mockReset().mockResolvedValue(undefined);
+  // The re-read a failed retire makes before it restores the marker: the wait still stands.
+  showMock.mockReset().mockImplementation(async (_repo: string, id: string) => gate(id, REASON, []));
   pullMock.mockReset().mockResolvedValue(undefined);
+  closeMock.mockReset().mockResolvedValue(undefined);
 });
 
 it("pulls the shared board before it plans, so a gate another machine armed is visible", async () => {
@@ -1155,4 +1171,532 @@ it("keeps a STRANDED gate's verdict when the sync fails — the board already ag
 
   await expect(concludeCancelledArmedPark(c.args)).resolves.toEqual({ thrown: stranded });
   expect(c.effects).toEqual({ released: false, queued: 1 });
+});
+
+/**
+ * A kill that lands BETWEEN two ticket arms (PR #213 review). 0b-pre arms one human gate per human
+ * ticket, and `armHumanGate` unwinds only the gate it was arming when the signal flipped — the waits
+ * earlier iterations already returned survive it, blocking their tickets for a run nothing comes
+ * back for, each promising that resolving it resumes that run.
+ */
+describe("undoCancelledTicketGates — the arms a cancelled preflight pass already made", () => {
+  /** One armed ticket gate, produced by the real arm so its undo rights are the real ones. */
+  const armOne = async (gateId: string) => {
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue(gateId);
+    const gate = await armHumanGate(REPO, "f-1", ASKED);
+    gateResolveMock.mockClear();
+    return { ticketId: TICKET, gate };
+  };
+
+  const cancelled = () => {
+    const c = new AbortController();
+    c.abort();
+    return c.signal;
+  };
+
+  it("resolves them, and settles under the error the cancelled arm already threw", async () => {
+    const armed = await armOne("g-first");
+    const cause = new Error("refusing to arm t-2's human gate — the run was cancelled");
+
+    await expect(undoCancelledTicketGates([armed], cancelled(), cause)).resolves.toBe(cause);
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-first",
+      expect.stringContaining("cancelled"),
+    );
+  });
+
+  it("leaves them where they are when the pass failed for any other reason", async () => {
+    // A locked DB or a rejected create is a RESUMABLE failure: the run comes back, and 0b-pre reuses
+    // this very wait rather than arming a second one. Undoing here would take back a live ask.
+    const armed = await armOne("g-first");
+
+    const cause = new Error("database is locked");
+    await expect(
+      undoCancelledTicketGates([armed], new AbortController().signal, cause),
+    ).resolves.toBe(cause);
+    expect(gateResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("names every wait it could not take back — nothing else on the board points at them", async () => {
+    // Two ways an undo is unavailable: the resolve fails, and an arm that spent its undo retiring an
+    // older wait (taking the replacement back would leave the ticket bare). Both stay open and only
+    // this error carries their ids.
+    const armed = await armOne("g-first");
+    gateResolveMock.mockRejectedValue(new Error("database is locked"));
+
+    const thrown = (await undoCancelledTicketGates(
+      [armed, { ticketId: "t-2", gate: { gateId: "g-superseding", held: [] } }],
+      cancelled(),
+      new Error("the run was cancelled"),
+    )) as Error;
+
+    expect(thrown.message).toContain("the run was cancelled");
+    expect(thrown.message).toContain(`g-first (${TICKET})`);
+    expect(thrown.message).toContain("g-superseding (t-2)");
+  });
+});
+
+// ── the human tickets' half of preflight (anton-mv70, PR #213 review) ──
+
+describe("armHumanTicketGates — closing what a person answered, arming what they have not", () => {
+  /** A human ticket, optionally blocked by the given beads. */
+  const ticket = (id: string, title: string, ...blockedBy: string[]): Bead =>
+    ({
+      id,
+      title,
+      status: "open",
+      issue_type: "task",
+      labels: [LABELS.agentHuman],
+      dependencies: blockedBy.map((b) => ({ issue_id: id, depends_on_id: b, type: "blocks" })),
+    }) as Bead;
+
+  /** The gate a person ANSWERED for that ticket: anton's own, closed, carrying that exact ask. */
+  const answered = (id: string, t: Bead): Gate =>
+    ({
+      ...gate(id, humanGateReason(t.id, { ticketId: t.id, ask: humanTicketAsk(t) })),
+      status: "closed",
+    }) as Gate;
+
+  it("closes a ticket whose only remaining blocker this same pass just closed", async () => {
+    // Two answered human tickets in a row ("sign the contract, then wire the account"). The board
+    // was read BEFORE the pass, so the prerequisite still reads as open to the ticket that waits on
+    // it — held there, the run parks on a blocker the next board read shows closed, and no event
+    // remains that would ever resume it.
+    const first = ticket("t-sign", "Sign the order form", "g-sign");
+    const second = ticket("t-wire", "Wire the live key", "g-wire", "t-sign");
+    const board = [first, second, answered("g-sign", first), answered("g-wire", second)];
+
+    // Listed dependent-first, to prove the pass walks them in dependency order.
+    const held = await armHumanTicketGates(REPO, "f-1", board, [second, first], undefined);
+
+    expect(held.size).toBe(0);
+    expect(closeMock.mock.calls.map((c) => c[1])).toEqual(["t-sign", "t-wire"]);
+    expect(gateCreateMock).not.toHaveBeenCalled();
+  });
+
+  it("still holds a ticket whose ORDINARY prerequisite has not landed", async () => {
+    // The in-pass closes must not over-reach: work no one did is still a blocker, and the ticket is
+    // held (never re-asked) until the resume that follows it.
+    const human = ticket("t-sign", "Sign the DPA", "g-sign", "t-api");
+    const board = [
+      human,
+      { id: "t-api", title: "Ship the API", status: "open", issue_type: "task" } as Bead,
+      answered("g-sign", human),
+    ];
+
+    const held = await armHumanTicketGates(REPO, "f-1", board, [human], undefined);
+
+    expect([...held]).toEqual([["t-sign", ["t-api"]]]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("takes back every wait when the kill lands after the LAST arm, which no iteration observes", async () => {
+    // The loop exits normally here — the signal flipped between two board writes, not inside one —
+    // so nothing in `armHumanGate` unwinds. Left standing, the gate blocks its ticket for a run that
+    // is not coming back, promising a person that resolving it resumes that run.
+    const armIt = ticket("t-buy", "Buy the Business plan");
+    const doneAlready = ticket("t-sign", "Sign the order form", "g-sign");
+    const board = [armIt, doneAlready, answered("g-sign", doneAlready)];
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue("g-buy");
+    const controller = new AbortController();
+    closeMock.mockImplementation(async () => controller.abort()); // the kill lands AFTER the arm
+
+    await expect(
+      armHumanTicketGates(REPO, "f-1", board, [armIt, doneAlready], controller.signal),
+    ).rejects.toThrow(/cancelled after its human ticket gate\(s\) were armed/);
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-buy",
+      expect.stringContaining("cancelled"),
+    );
+  });
+
+  it("arms every unanswered ticket and reports nothing held while the run is live", async () => {
+    const one = ticket("t-buy", "Buy the Business plan");
+    const two = ticket("t-sign", "Sign the order form");
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValueOnce("g-buy").mockResolvedValueOnce("g-sign");
+
+    const held = await armHumanTicketGates(REPO, "f-1", [one, two], [one, two], undefined);
+
+    expect(held.size).toBe(0);
+    expect(gateCreateMock).toHaveBeenCalledTimes(2);
+    expect(gateResolveMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("preflightHumanTickets — classifying again after the arm's own board refresh", () => {
+  /** A ticket under f-1, human only while it carries the label. */
+  const child = (id: string, human: boolean, ...blockedBy: string[]): Bead =>
+    ({
+      id,
+      title: id,
+      status: "open",
+      issue_type: "task",
+      parent: "f-1",
+      labels: human ? [LABELS.agentHuman] : [],
+      dependencies: blockedBy.map((b) => ({ issue_id: id, depends_on_id: b, type: "blocks" })),
+    }) as Bead;
+
+  /** The gate a person ANSWERED for that ticket: anton's own, closed, carrying that exact ask. */
+  const answeredGate = (id: string, t: Bead): Gate =>
+    ({
+      ...gate(id, humanGateReason(t.id, { ticketId: t.id, ask: humanTicketAsk(t) })),
+      status: "closed",
+    }) as Gate;
+
+  /** The shared board every read sees — reassigned to model another machine writing to it. */
+  let board: Bead[] = [];
+
+  const preflight = (children: Bead[]) =>
+    preflightHumanTickets({
+      repo: REPO,
+      targetId: "f-1",
+      board,
+      target: target(),
+      children,
+      standaloneRun: false,
+      isResumeSkipped: (t: Bead) => t.status === "closed",
+      signal: undefined,
+    });
+
+  beforeEach(() => {
+    loadAllIssuesMock.mockImplementation(async () => board);
+    gateCreateMock.mockImplementation(async () => `g-${gateCreateMock.mock.calls.length}`);
+  });
+
+  it("arms a sibling another machine relabelled while the first arm was in flight", async () => {
+    // The relabel lands inside `armHumanGate`'s own pull, so the refresh below ADOPTS it — but
+    // readiness never asks about the label. Classified only once, this ticket stays dispatchable
+    // and the run reaches the dispatch loop's backstop naming a wait nobody ever armed.
+    const human = child("t-buy", true);
+    const ordinary = child("t-ship", false);
+    board = [target(), human, ordinary];
+    gateCreateMock.mockImplementationOnce(async () => {
+      board = [target(), human, child("t-ship", true)];
+      return "g-buy";
+    });
+
+    const out = await preflight([human, ordinary]);
+
+    expect(out.armed).toBe(true);
+    expect(gateCreateMock).toHaveBeenCalledTimes(2);
+    expect(out.tickets.map((t) => t.id)).toEqual(["t-buy", "t-ship"]);
+    expect(out.tickets.every((t) => t.labels?.includes(LABELS.agentHuman))).toBe(true);
+  });
+
+  it("arms an unchanged ticket exactly once — the confirming pass finds nothing new", async () => {
+    const human = child("t-buy", true);
+    board = [target(), human];
+
+    const out = await preflight([human]);
+
+    expect(gateCreateMock).toHaveBeenCalledTimes(1);
+    expect(out.answeredButBlocked.size).toBe(0);
+    expect(out.tickets.map((t) => t.id)).toEqual(["t-buy"]);
+  });
+
+  it("touches nothing at all when no ticket is a person's work", async () => {
+    board = [target(), child("t-ship", false)];
+
+    const out = await preflight([child("t-ship", false)]);
+
+    expect(out.armed).toBe(false);
+    expect(out.board).toBe(board);
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+    expect(gateCreateMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a hold an earlier pass reported when a later pass arms a newcomer", async () => {
+    // The held ticket is the run's verdict, not this pass's bookkeeping: dropped when the second
+    // pass overwrites the first's answer, the dispatch loop reaches it as open human work and parks
+    // on the backstop instead of holding it by the ordinary blocked-child rule.
+    const signed = child("t-sign", true, "g-sign", "t-api");
+    const buy = child("t-buy", true);
+    const ship = child("t-ship", false);
+    const api = child("t-api", false);
+    board = [target(), signed, buy, ship, api, answeredGate("g-sign", signed)];
+    gateCreateMock.mockImplementationOnce(async () => {
+      board = [target(), signed, buy, child("t-ship", true), api, answeredGate("g-sign", signed)];
+      return "g-buy";
+    });
+
+    const out = await preflight([signed, buy, ship, api]);
+
+    expect([...out.answeredButBlocked]).toEqual([["t-sign", ["t-api"]]]);
+    expect(gateCreateMock).toHaveBeenCalledTimes(2); // t-buy, then the relabelled t-ship
+  });
+
+  it("takes back an EARLIER pass's wait when the kill lands in a later one", async () => {
+    // Multi-pass arming must keep the invariant a single pass already had: a gate left standing for
+    // a cancelled run promises a person that resolving it resumes a run nothing is coming back for.
+    const human = child("t-buy", true);
+    board = [target(), human, child("t-ship", false)];
+    const controller = new AbortController();
+    gateCreateMock
+      .mockImplementationOnce(async () => {
+        board = [target(), human, child("t-ship", true)];
+        return "g-buy";
+      })
+      .mockImplementationOnce(async () => {
+        controller.abort(); // the kill lands inside the SECOND pass's arm
+        return "g-ship";
+      });
+
+    await expect(
+      preflightHumanTickets({
+        repo: REPO,
+        targetId: "f-1",
+        board,
+        target: target(),
+        children: [human, child("t-ship", false)],
+        standaloneRun: false,
+        isResumeSkipped: (t: Bead) => t.status === "closed",
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow();
+    expect(gateResolveMock.mock.calls.map((c) => c[1])).toContain("g-buy");
+  });
+
+  it("hands the run back rather than arming behind labels that keep moving", async () => {
+    // Each arm relabels another sibling `agent:human`, so no pass ever confirms a settled board. A
+    // plain Error, not a park: the next attempt re-gates from a board that has stopped moving,
+    // which no loop here can wait out. The ticket SET never changes — that is the drift check's
+    // question, and answering it here too would hide the one this bound exists for.
+    const ids = Array.from({ length: MAX_HUMAN_TICKET_PASSES + 1 }, (_, i) => `t-${i}`);
+    const humanThrough = (n: number) => [target(), ...ids.map((id, i) => child(id, i <= n))];
+    board = humanThrough(0);
+    gateCreateMock.mockImplementation(async () => {
+      const n = gateCreateMock.mock.calls.length;
+      board = humanThrough(n);
+      return `g-${n}`;
+    });
+
+    await expect(preflight(ids.map((id, i) => child(id, i === 0)))).rejects.toThrow(
+      new RegExp(`kept finding newly-labelled ${LABELS.agentHuman} tickets after ` +
+        `${MAX_HUMAN_TICKET_PASSES} arming passes`),
+    );
+    expect(gateCreateMock).toHaveBeenCalledTimes(MAX_HUMAN_TICKET_PASSES);
+  });
+
+  it("hands the run back when a child is ATTACHED while its human tickets are gated", async () => {
+    // The refresh below would otherwise replace the set step 1c confirmed under the run-lease, and
+    // the newcomer would ride into this run behind the approval, contract and agent-allowlist gates
+    // that already ran on the old set.
+    const human = child("t-buy", true);
+    const ship = child("t-ship", false);
+    board = [target(), human, ship];
+    gateCreateMock.mockImplementationOnce(async () => {
+      board = [target(), human, ship, child("t-new", false)];
+      return "g-buy";
+    });
+
+    await expect(preflight([human, ship])).rejects.toThrow(
+      /ticket set changed while its human tickets were gated \(attached t-new\)/,
+    );
+  });
+
+  it("closes a held ticket whose ordinary blocker landed while the arm was writing", async () => {
+    // The hold was judged against the PRE-arm board, and every arm pulls the shared board — so a
+    // prerequisite that closes in that window leaves the caller parking the run behind a bead that
+    // is already closed, with no blocker event left to resume it.
+    const signed = child("t-sign", true, "g-sign", "t-api");
+    const buy = child("t-buy", true);
+    const api = child("t-api", false);
+    board = [target(), signed, buy, api, answeredGate("g-sign", signed)];
+    gateCreateMock.mockImplementationOnce(async () => {
+      board = [
+        target(),
+        signed,
+        buy,
+        { ...api, status: "closed" } as Bead,
+        answeredGate("g-sign", signed),
+      ];
+      return "g-buy";
+    });
+
+    const out = await preflight([signed, buy, api]);
+
+    expect(out.answeredButBlocked.size).toBe(0);
+    expect(closeMock).toHaveBeenCalledWith(REPO, "t-sign", expect.stringContaining("g-sign"));
+  });
+
+  it("retires the wait it armed when an operator drops the label mid-arm", async () => {
+    // Nothing auto-resolves a human gate, so a ticket reclassified while its own arm was in flight
+    // stays blocked by an ask that no longer applies — and the run parks asking a person to do work
+    // the operator just handed back to an agent.
+    const buy = child("t-buy", true);
+    const sign = child("t-sign", true);
+    board = [target(), buy, sign];
+    gateCreateMock
+      .mockImplementationOnce(async () => "g-buy")
+      .mockImplementationOnce(async () => {
+        board = [target(), buy, child("t-sign", false)];
+        return "g-sign";
+      });
+
+    const out = await preflight([buy, sign]);
+
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-sign",
+      expect.stringContaining(`no longer labelled ${LABELS.agentHuman}`),
+    );
+    // Retired, not answered: the marker goes with the wait, so a later pass cannot read this close
+    // as a person having done work the operator just handed back to an agent (PR #213 review).
+    expect(untagMock).toHaveBeenCalledWith(REPO, "g-sign", [HUMAN_GATE_ARMED_LABEL]);
+    expect(gateCreateMock).toHaveBeenCalledTimes(2); // never re-armed on the pass that retired it
+    expect(out.answeredButBlocked.size).toBe(0);
+  });
+});
+
+
+// ── what a CLOSED human gate means: answered, or taken back (PR #213 review) ──
+
+/**
+ * A gate anton resolves itself — a cancelled arm, an ask the operator relabelled away, a wait a
+ * newer ask supersedes — must not read as a person's answer on the next run. Nothing on a closed
+ * gate records who ended it, so the armed label is the marker, and every retire strips it.
+ */
+describe("retiring anton's own human gate — a close it made is not an answer", () => {
+  const cancelled = () => {
+    const c = new AbortController();
+    c.abort();
+    return c.signal;
+  };
+
+  /** One armed ticket gate, produced by the real arm so its undo rights are the real ones. */
+  const armOne = async (gateId: string) => {
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue(gateId);
+    const armed = { ticketId: TICKET, gate: await armHumanGate(REPO, "f-1", ASKED) };
+    gateResolveMock.mockClear();
+    untagMock.mockClear();
+    return armed;
+  };
+
+  /** A human ticket held by its own gate. */
+  const humanTicket = (id: string, title: string, gateId: string): Bead =>
+    ({
+      id,
+      title,
+      status: "open",
+      issue_type: "task",
+      labels: [LABELS.agentHuman],
+      dependencies: [{ issue_id: id, depends_on_id: gateId, type: "blocks" }],
+    }) as Bead;
+
+  /** The gate that carried that ticket's ask, now closed — labelled as anton armed it or not. */
+  const closedGate = (id: string, t: Bead, labels: string[]): Gate =>
+    ({
+      ...gate(id, humanGateReason(t.id, { ticketId: t.id, ask: humanTicketAsk(t) }), labels),
+      status: "closed",
+    }) as Gate;
+
+  it("strips the armed label BEFORE it resolves, so no close it made can read as an answer", async () => {
+    const armed = await armOne("g-first");
+
+    await undoCancelledTicketGates([armed], cancelled(), new Error("the run was cancelled"));
+
+    expect(untagMock).toHaveBeenCalledWith(REPO, "g-first", [HUMAN_GATE_ARMED_LABEL]);
+    expect(untagMock.mock.invocationCallOrder[0]).toBeLessThan(
+      gateResolveMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("leaves the wait STANDING when the marker cannot be stripped", async () => {
+    // Resolving anyway would close the gate with the marker intact — a false answer no later run can
+    // tell from a real one. A still-open wait, named in the error, is the recoverable failure.
+    const armed = await armOne("g-first");
+    untagMock.mockRejectedValue(new Error("bd: database is locked"));
+
+    const thrown = (await undoCancelledTicketGates(
+      [armed],
+      cancelled(),
+      new Error("the run was cancelled"),
+    )) as Error;
+
+    expect(gateResolveMock).not.toHaveBeenCalled();
+    expect(thrown.message).toContain(`g-first (${TICKET})`);
+  });
+
+  it("puts the marker BACK when the resolve fails and the wait is still standing", async () => {
+    // The gate keeps its ask, and a ticket ask tells the person to do the work and resolve it. An
+    // unlabelled leftover would make that answer invisible: the next run re-asks for work already
+    // done. Restored, the answer reads as one (PR #213 review).
+    const armed = await armOne("g-first");
+    tagMock.mockClear();
+    gateResolveMock.mockRejectedValue(new Error("bd: database is locked"));
+
+    const thrown = (await undoCancelledTicketGates(
+      [armed],
+      cancelled(),
+      new Error("the run was cancelled"),
+    )) as Error;
+
+    expect(tagMock).toHaveBeenCalledWith(REPO, "g-first", [HUMAN_GATE_ARMED_LABEL]);
+    expect(untagMock.mock.invocationCallOrder[0]).toBeLessThan(
+      tagMock.mock.invocationCallOrder[0],
+    );
+    expect(thrown.message).toContain(`g-first (${TICKET})`);
+  });
+
+  it("leaves the marker OFF when the resolve actually landed and only its reporting failed", async () => {
+    // Relabelling a gate anton closed is exactly the false answer the untag-first order exists to
+    // prevent, so the restore is conditioned on the gate still being open.
+    const armed = await armOne("g-first");
+    tagMock.mockClear();
+    gateResolveMock.mockRejectedValue(new Error("bd: connection reset"));
+    showMock.mockImplementation(async (_repo: string, id: string) => ({
+      ...gate(id, REASON, []),
+      status: "closed",
+    }));
+
+    await undoCancelledTicketGates([armed], cancelled(), new Error("the run was cancelled"));
+
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("asks again for a ticket whose gate anton took back, rather than closing it", async () => {
+    // The failure this closes: cleanup resolved the gate but left the ticket human and its ask
+    // intact. Read as an answer, the next run closes a still-human ticket without executing it and
+    // without anyone doing the work. With the marker gone there is no answer, so the ask is re-armed
+    // — which is the state the board is actually in.
+    const buy = humanTicket("t-buy", "Buy the Business plan", "g-buy");
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue("g-buy-2");
+
+    const held = await armHumanTicketGates(
+      REPO,
+      "f-1",
+      [buy, closedGate("g-buy", buy, [])],
+      [buy],
+      undefined,
+    );
+
+    expect(held.size).toBe(0);
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(gateCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still closes a ticket whose gate a PERSON resolved — the marker survives their answer", async () => {
+    // The other half of the same contract: nothing untags a gate a human ran `bd gate resolve` on,
+    // so the answer still lands and the exchange the label exists for keeps working.
+    const buy = humanTicket("t-buy", "Buy the Business plan", "g-buy");
+
+    const held = await armHumanTicketGates(
+      REPO,
+      "f-1",
+      [buy, closedGate("g-buy", buy, [HUMAN_GATE_ARMED_LABEL])],
+      [buy],
+      undefined,
+    );
+
+    expect(held.size).toBe(0);
+    expect(closeMock).toHaveBeenCalledWith(REPO, "t-buy", expect.stringContaining("g-buy"));
+    expect(gateCreateMock).not.toHaveBeenCalled();
+  });
 });

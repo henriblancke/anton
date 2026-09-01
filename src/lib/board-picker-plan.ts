@@ -36,6 +36,8 @@ import type { AntonDb, Clock } from "./jobs/queue";
  *   • `abandoned`        — a won't-do. Usually closed with it, but a crashed cascade can leave the
  *                          label on an OPEN bead, which nothing may pick up.
  *   • `claimed`          — carries an assignee. A target a human took is never taken back.
+ *   • `needs-human`      — labelled `agent:human`: approved work waiting for a PERSON, which no
+ *                          agent can finish, so anton never starts it (anton-mv70).
  *   • `blocked`          — an unmet blocker on the `blocks` graph.
  *   • `approval-gap`     — fails one of the approve gate's four promises (`approval-gate.ts`).
  *   • `policy`           — structurally claimable, but the standing policy does not admit it.
@@ -45,6 +47,7 @@ export type PickerExclusionReason =
   | "not-open"
   | "abandoned"
   | "claimed"
+  | "needs-human"
   | "blocked"
   | "approval-gap"
   | "policy";

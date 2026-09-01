@@ -32,8 +32,20 @@ Narrow that pool to **run targets** against one full board read
 > A bead is a run target if it is a `feature`, **or** a parentless `task`/`bug`, **or** an `epic`
 > with no `feature` children.
 
-Keep only run targets that are `open`, carry `approved`, and have no assignee. Then rank — the order
-is total and deterministic, so two machines agree on what is next:
+Keep only run targets that are `open`, carry `approved`, have no assignee, and are **not labelled
+`agent:human`**.
+
+**Human work is excluded, and it is not a bug that it sits there.** `agent:human` marks a bead no
+agent can complete end to end — it needs a credential, an account, a purchase, a signature, or a
+taste call. Every other `agent:` value resolves to a specialist prompt; `human` resolves to none, so
+a human bead left in the set would dispatch to the DEFAULT agent and burn a run failing at work no
+agent can do. It is approved, real, and waiting for a person — not backlog, not unshaped.
+
+The exclusion belongs to this narrowing step, **not** to the pool query: bd's own `--exclude-label`
+flag would move it into the argv and drift from the one flag set every worker and anton share.
+Whatever holds the board already reads it for parentage, so the label costs nothing to check here.
+
+Then rank — the order is total and deterministic, so two machines agree on what is next:
 
 1. **priority**, P0 first (a bead with none sorts last);
 2. then **unblocking value** — how many open beads it transitively unblocks via `blocks` edges, most

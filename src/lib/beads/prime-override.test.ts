@@ -13,6 +13,10 @@ import { describe, expect, it } from "vitest";
 
 const read = (...parts: string[]): string => readFileSync(join(process.cwd(), ...parts), "utf8");
 
+/** Line wraps and blockquote markers are prose formatting, not protocol — drop them before matching
+ *  a sentence, so rewrapping a paragraph never breaks a rule assertion. */
+const flat = (doc: string): string => doc.replace(/\n>\s*/g, "\n").replace(/\s+/g, " ");
+
 const PRIME = read(".beads", "PRIME.md");
 const SKILL = read("skills", "bd", "SKILL.md");
 
@@ -33,6 +37,22 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
         // Must stay in step with buildClaimableReadyArgs (bd.ts): every flag is load-bearing.
         expect(doc).toMatch(/bd ready --label approved --unassigned --json --limit 0/);
         expect(doc).toMatch(/bd list --status all --json --limit 0/);
+      });
+
+      // anton-mv70: `agent:human` is the one agent value that resolves to no specialist prompt, so
+      // a set that still carried it would dispatch human work to the DEFAULT agent.
+      it("excludes agent:human from the claimable set, and says why", () => {
+        expect(flat(doc)).toMatch(/not labelled `agent:human`/);
+        expect(flat(doc)).toMatch(
+          /credential, an account, a purchase, a signature, or a taste call/,
+        );
+        expect(flat(doc)).toMatch(/`human` resolves to none/);
+      });
+
+      it("keeps that exclusion out of the pool query's flags", () => {
+        // isClaimable narrows; the argv stays byte-identical to buildClaimableReadyArgs. A doc that
+        // taught `bd ready --exclude-label` here would teach a pool no anton caller ever asks for.
+        expect(doc).not.toMatch(/bd ready[^\n]*--exclude-label/);
       });
 
       it("gives the rank order every consumer sorts by", () => {
@@ -95,6 +115,26 @@ describe("the pickup protocol is teachable without the anton runtime", () => {
     expect(PRIME).toMatch(
       /run target if it is a `feature`, \*\*or\*\* a parentless `task`\/`bug`, \*\*or\*\* an `epic`[\s>]+with no `feature` children/,
     );
+  });
+
+  // Shaping applies the label, so its test lives with the label table — the worker docs only need
+  // to know the set drops it.
+  it("SKILL.md's label table carries agent:human and the question that applies it", () => {
+    expect(SKILL).toMatch(/\|\s*`agent:`[^\n]*`human`/);
+    expect(flat(SKILL)).toMatch(
+      /Can an agent complete this end to end, or does it need a credential, an account, a purchase, a signature, or a taste call\?/,
+    );
+  });
+
+  // AGENTS.md is the third home of the same rule: a session that reads only it must not be taught a
+  // claimable set that still contains human work.
+  it("AGENTS.md's pickup section agrees on the exclusion", () => {
+    const agents = read("AGENTS.md");
+    expect(flat(agents)).toMatch(/drops anything labelled `agent:human`/);
+    expect(flat(agents)).toMatch(
+      /credential, an account, a purchase, a signature, or a taste call/,
+    );
+    expect(agents).not.toMatch(/bd ready[^\n]*--exclude-label/);
   });
 
   it("PRIME.md says how to recover what the override hides", () => {

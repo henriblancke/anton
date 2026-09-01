@@ -214,6 +214,13 @@ describe("isResumableTarget", () => {
     ).toBe(false);
   });
 
+  it("refuses a target a person executes — a resume could only park it at the run gate", () => {
+    // execute-epic poisons an `agent:human` target on sight, so dispatching one turns approved work
+    // waiting for a person into a parked job waiting for a human to clear it.
+    const human = bead("e-1", { issue_type: "epic", labels: [LABELS.approved, LABELS.agentHuman] });
+    expect(isResumableTarget(human, NOW)).toBe(false);
+  });
+
   it("refuses a target whose run-lease is still live — it is executing somewhere", () => {
     const live = bead("e-1", { labels: [LABELS.approved, LABELS.runLease(NOW + 60_000)] });
     expect(isResumableTarget(live, NOW)).toBe(false);
@@ -355,6 +362,14 @@ describe("plainGateResumes", () => {
     ];
     expect(plainGateResumes(board, NOW)).toEqual([]);
     expect(mergedGateTargets([{ ...board[0], metadata: { pr: "gh-7" } }, board[1]])).toHaveLength(1);
+  });
+
+  it("leaves a target relabelled agent:human alone — a person executes it, not a run", () => {
+    const board = [
+      parked("t-1", "g-1", { labels: [...approved, LABELS.agentHuman] }),
+      humanGate("g-1"),
+    ];
+    expect(plainGateResumes(board, NOW)).toEqual([]);
   });
 
   it("leaves an in-review target alone — its implementation is done", () => {

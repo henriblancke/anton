@@ -4,7 +4,7 @@
  * exercised end-to-end in execute-epic.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import type { Bead, BeadDep, Gate } from "../beads/bd";
+import { LABELS, type Bead, type BeadDep, type Gate } from "../beads/bd";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import {
   blockedTailReason,
@@ -16,9 +16,11 @@ import {
   RunAlreadyLiveError,
 } from "./errors";
 import {
+  adoptRefreshedTarget,
   askSettleError,
   claudeResumeDecision,
   continuationPrompt,
+  deliveredTickets,
   inactiveAgentTickets,
   mergeGatePlan,
   humanGatePlan,
@@ -153,6 +155,24 @@ describe("inactiveAgentTickets", () => {
       { id: "t-1", agent: "terraform" },
       { id: "t-2", agent: "typoo" },
     ]);
+  });
+
+  it("never reports agent:human — there is no toggle to enable, and its ticket is gated (anton-mv70)", () => {
+    // Failure path this closes: `agent:human` is in neither AGENT_OPTIONS nor `.claude/agents`, so
+    // under ANY persisted allowlist it read as "a disabled bundled agent" and poison-parked the
+    // WHOLE feature with "enable them in Settings → Agents" — pointing at a switch that cannot
+    // exist and killing the human ticket's independent siblings with it. A human ticket is held by
+    // its own gate instead (0b-pre), and its siblings still ship.
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:human"])], ["fastapi"])).toEqual([]);
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:human"])], [])).toEqual([]);
+    expect(inactiveAgentTickets([ticket("t-1", ["agent:human"])], [], ["my-custom"])).toEqual([]);
+    // …and it does not mask a genuinely disabled agent on a sibling.
+    expect(
+      inactiveAgentTickets(
+        [ticket("t-1", ["agent:human"]), ticket("t-2", ["agent:terraform"])],
+        ["fastapi"],
+      ),
+    ).toEqual([{ id: "t-2", agent: "terraform" }]);
   });
 
   it("reports every offending ticket, not just the first", () => {
@@ -440,6 +460,36 @@ describe("runTargetDrift — the target's own shape in that same window (anton-e
     const board = [bead("f-1", { issue_type: "feature" }), bead("t-1", { parent: "f-1" })];
     expect(runTargetDrift("f-1", board)).toBeUndefined();
     expect(runTargetDrift("t-1", board)).toBe("it now hangs under f-1, whose run owns it as a ticket");
+  });
+});
+
+describe("adoptRefreshedTarget — the target the human-ticket arm re-reads (PR #213 review)", () => {
+  const bead = (id: string, extra: Partial<Bead> = {}): Bead =>
+    ({ id, title: id, status: "open", issue_type: "feature", ...extra }) as Bead;
+
+  // The failure this closes: `armHumanGate` pulls the shared board before every arm, so a relabel
+  // another machine pushed becomes visible in the re-read that follows. That re-read rebuilt only
+  // the ticket set, so `target` stayed at its pre-arm snapshot — and since the top-of-handler
+  // backstop is the ONLY place that asks `agent:human`, the run went on to dispatch a person's work
+  // to the default agent.
+  it("refuses a target relabelled agent:human while the gates were being armed", () => {
+    const stale = bead("f-1");
+    const board = [bead("f-1", { labels: [LABELS.agentHuman] }), bead("t-1", { parent: "f-1" })];
+    expect(() => adoptRefreshedTarget(board, "f-1", stale)).toThrow(PoisonEpic);
+    expect(() => adoptRefreshedTarget(board, "f-1", stale)).toThrow(/is labelled agent:human/);
+  });
+
+  it("adopts the refreshed bead so later steps read the board's labels, not the pre-arm ones", () => {
+    const stale = bead("f-1", { labels: ["approved"] });
+    const fresh = bead("f-1", { labels: ["approved", "agent:fastapi"] });
+    expect(adoptRefreshedTarget([fresh, bead("t-1", { parent: "f-1" })], "f-1", stale)).toBe(fresh);
+  });
+
+  // Losing the bead is runTargetDrift's question, asked under the run-lease. Answering it here too
+  // would give an operator two different accounts of the same disappearance.
+  it("keeps the caller's target when the refreshed board no longer carries it", () => {
+    const stale = bead("f-1");
+    expect(adoptRefreshedTarget([bead("other")], "f-1", stale)).toBe(stale);
   });
 });
 
@@ -1101,6 +1151,40 @@ describe("isForeignRunOwner — what proves another machine owns the branch (ant
   it("refuses any other failure — a crash is not a foreign owner", () => {
     expect(isForeignRunOwner(new Error("boom"))).toBe(false);
     expect(isForeignRunOwner(undefined)).toBe(false);
+  });
+});
+
+describe("deliveredTickets — what the run's own steps speak for", () => {
+  const human = (id: string) => ticket(id, [LABELS.agentHuman]);
+  /** The branch, as `worktreeHasCommitFor` reads it. */
+  const branch = (...ids: string[]) => {
+    const asked: string[] = [];
+    const has = async (id: string) => {
+      asked.push(id);
+      return ids.includes(id);
+    };
+    return { has, asked };
+  };
+
+  it("drops a rolled-back ticket and a human one that left no commit", async () => {
+    const b = branch("t-1");
+    expect(
+      (await deliveredTickets([ticket("t-1"), ticket("t-2"), human("t-3")], new Set(["t-2"]), b.has))
+        .map((t) => t.id),
+    ).toEqual(["t-1"]);
+    // Only a human ticket is worth a git call — the label is what makes the branch the tie-breaker.
+    expect(b.asked).toEqual(["t-3"]);
+  });
+
+  it("keeps a human-labelled ticket whose commit IS on the branch (PR #213 review)", async () => {
+    // An agent committed and closed t-2 on an earlier attempt; someone labelled it `agent:human`
+    // before the parked run resumed. Its code is in the diff, so the review contract and the PR body
+    // must carry it — and, as the ONLY ticket, dropping it made the no-delivery park claim an empty
+    // branch that has commits on it.
+    const b = branch("t-2");
+    expect((await deliveredTickets([human("t-2")], new Set(), b.has)).map((t) => t.id)).toEqual([
+      "t-2",
+    ]);
   });
 });
 
