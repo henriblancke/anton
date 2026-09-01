@@ -271,7 +271,16 @@ describe("EpicBoard veto from the Up Next lane", () => {
 
   const planned = (version: string): Board => ({
     ...board(version, "backlog"),
-    upNext: [{ beadId: "anton-1", rank: 1, priority: 2, type: "feature", unblocks: 0 }],
+    upNext: [
+      {
+        beadId: "anton-1",
+        rank: 1,
+        priority: 2,
+        type: "feature",
+        unblocks: 0,
+        createdAt: "2026-08-01T00:00:00.000Z",
+      },
+    ],
   });
 
   /** Is the card drawn inside the lane (as opposed to back in a stage column)? */

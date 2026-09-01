@@ -241,6 +241,38 @@ describe("staleness", () => {
 
     expect(isPlanStale(armed, stampBoard(board, OBSERVED + 1))).toBe(true);
   });
+
+  /**
+   * The third decision input, and the only one no digest can carry: a deferral is anton's own state
+   * with a wall-clock expiry, so a hold running out re-admits a target while every hashed input sits
+   * still. Without this the re-eligible bead would stay out of Up Next — and unstartable there —
+   * until the next scheduled pass rewrote the plan.
+   */
+  describe("deferrals", () => {
+    const held = {
+      ...plan,
+      exclusions: [{ beadId: "anton-b", reason: "deferred" as const, detail: "you set this aside" }],
+    };
+    const current = stampBoard([bead()], OBSERVED + 1);
+
+    it("holds still while the hold the pass acted on is still held", () => {
+      expect(isPlanStale(held, current, new Map([["anton-b", NOW + 86_400_000]]))).toBe(false);
+    });
+
+    it("goes stale once a target it set aside is no longer deferred", () => {
+      expect(isPlanStale(held, current, new Map())).toBe(true);
+      expect(isPlanStale(held, current)).toBe(true);
+    });
+
+    it("ignores exclusions the operator never made — those are the board's own answer", () => {
+      const blocked = {
+        ...plan,
+        exclusions: [{ beadId: "anton-b", reason: "blocked" as const }],
+      };
+
+      expect(isPlanStale(blocked, current, new Map())).toBe(false);
+    });
+  });
 });
 
 describe("plan storage", () => {

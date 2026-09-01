@@ -1252,7 +1252,7 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     pickerPlan = planOver(board, "f-1");
 
     expect((await getBoard(project)).upNext).toEqual([
-      { beadId: "f-1", rank: 1, type: "feature", unblocks: 0 },
+      { beadId: "f-1", rank: 1, type: "feature", unblocks: 0, createdAt: "" },
     ]);
   });
 
@@ -1291,6 +1291,24 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     expect(served.upNext).toBeUndefined();
     expect("upNext" in served).toBe(false);
     expect(served.columns.backlog.map((e) => e.id)).toEqual(["f-1"]);
+  });
+
+  it("withholds the lane once a hold the pass acted on runs out", async () => {
+    const board = [feature(), makeBead({ id: "f-2", title: "Set aside", issue_type: "feature" })];
+    listMock.mockResolvedValue(board);
+    // A pass that ran while `f-2` was vetoed: the target is in the plan only as an exclusion, and no
+    // hashed input changes when its window closes. Without the deferral half of the fence the lane
+    // would keep presenting a ranking that cannot offer `f-2` until the next pass rewrote it.
+    pickerPlan = {
+      ...planOver(board, "f-1"),
+      exclusions: [{ beadId: "f-2", reason: "deferred", detail: "you set this aside" }],
+    };
+    deferrals = new Map([["f-2", 1_770_000_100_000]]);
+    expect((await getBoard(project)).upNext).toHaveLength(1);
+
+    resetIssueSnapshots();
+    deferrals = new Map();
+    expect((await getBoard(project)).upNext).toBeUndefined();
   });
 
   it("withholds the lane when the operator narrows the policy without touching a bead", async () => {

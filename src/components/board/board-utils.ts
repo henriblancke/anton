@@ -1,7 +1,9 @@
 /**
- * Pure display helpers for the epic board. Kept dependency-free so they're trivially testable
- * (see board-utils.test.ts) and reusable from both the board and card client components.
+ * Pure display helpers for the epic board. Kept dependency-free — bar the PRIME comparator, itself a
+ * pure leaf a lane drag must not restate — so they're trivially testable (see board-utils.test.ts)
+ * and reusable from both the board and card client components.
  */
+import { comparePrimeKeys, type PrimeKey } from "@/lib/beads/rank";
 import {
   STAGES,
   type BeadProvenance,
@@ -559,41 +561,85 @@ const LOWEST_PRIORITY = 4;
 
 const priorityOf = (entry: UpNextEntry): number => entry.priority ?? LOWEST_PRIORITY;
 
+/** The ranking's sort key for a lane entry, optionally at a priority the drag would write. */
+const rankKeyOf = (entry: UpNextEntry, priority = entry.priority): PrimeKey => ({
+  id: entry.beadId,
+  priority,
+  unblocks: entry.unblocks,
+  createdAt: entry.createdAt,
+});
+
 /**
- * The priority the dragged target must carry to hold the slot it was dropped into, or `null` when
- * the drop asks for nothing the priority channel can say.
+ * What a drop asks the priority channel for: a value to write, an order the plan already holds, or
+ * an order priority cannot state.
+ */
+export type ReorderVerdict =
+  | { kind: "write"; priority: number }
+  /** The plan already ranks the card where it was dropped — writing anything would invent a change. */
+  | { kind: "settled" }
+  /** No priority in the band would hold this order; the picker's own tiebreak decides it. */
+  | { kind: "unexpressible" };
+
+/**
+ * What the lane may do about a card dropped into another's slot.
  *
- * The rule is a clamp, not an assignment: the card's own priority is squeezed into the band its NEW
- * neighbours define — no better than the one above it, no worse than the one below. That is the
- * whole expressible content of a drag, because the ranking sorts on priority first and breaks ties
- * on unblocking value (beads/rank.ts). Dropping a P2 between a P0 and a P3 therefore writes nothing:
- * the card is already in the band it was dropped into, and inventing a write would claim the
- * operator changed a decision they didn't.
+ * The drag's whole expressible content is a priority inside the band its NEW neighbours define — no
+ * better than the one above it, no worse than the one below. Which value in that band is not a
+ * clamp, because a clamp can land on the very priority it had to cross: PRIME sorts on priority and
+ * then breaks ties on unblocking value, age and id (beads/rank.ts), none of which a drag can write.
+ * So each candidate is CHECKED against that comparator, nearest the card's current priority first,
+ * and the first that actually seats the card between its new neighbours is what gets written. A drop
+ * whose band holds no such value is refused rather than written — a lane that reported success while
+ * the next pass restored the old order would teach the operator it lies.
  *
- * `null` is also the answer for a reorder inside ONE band. The caller says so out loud rather than
- * failing silently — a drag that looks like it landed and wrote nothing is the one outcome that
- * would teach an operator the lane lies.
+ * A drop that does NOT cross a priority boundary writes nothing either way: the card is already in
+ * the band it landed in, so the position it was dropped at is the picker's own tiebreak, and
+ * inventing a priority change there would claim the operator made a decision they didn't.
  */
 export function reorderPriority(
   entries: readonly UpNextEntry[],
   beadId: string,
   overBeadId: string,
-): number | null {
+): ReorderVerdict {
   const from = entries.findIndex((e) => e.beadId === beadId);
   const to = entries.findIndex((e) => e.beadId === overBeadId);
-  if (from < 0 || to < 0 || from === to) return null;
+  if (from < 0 || to < 0 || from === to) return { kind: "settled" };
 
   // dnd-kit's convention: the moved card ends at the over card's index in the ORIGINAL order, so
   // the slot's neighbours are read off the list with the moved card already lifted out.
   const rest = entries.filter((_, index) => index !== from);
   const above = rest[to - 1];
   const below = rest[to];
+  const moved = entries[from];
   const lo = above ? priorityOf(above) : 0;
   const hi = below ? priorityOf(below) : LOWEST_PRIORITY;
 
-  const next = Math.min(Math.max(priorityOf(entries[from]), lo), hi);
-  // An unprioritized bead landing on P4 IS a change — explicit P4 outranks no priority at all.
-  return next === entries[from].priority ? null : next;
+  /** Would the ranking seat the card between these two neighbours at this priority? */
+  const holds = (priority: number): boolean => {
+    const key = rankKeyOf(moved, priority);
+    return (
+      (!above || comparePrimeKeys(rankKeyOf(above), key) < 0) &&
+      (!below || comparePrimeKeys(key, rankKeyOf(below)) < 0)
+    );
+  };
+
+  const clamped = Math.min(Math.max(priorityOf(moved), lo), hi);
+  // Unchanged priority means the drop stayed inside the card's own band. An unprioritized bead is
+  // never in that case: landing on P4 IS a change, since explicit P4 outranks no priority at all.
+  if (clamped === moved.priority) {
+    return holds(clamped) ? { kind: "settled" } : { kind: "unexpressible" };
+  }
+
+  const priority = bandCandidates(lo, hi, priorityOf(moved)).find(holds);
+  return priority === undefined ? { kind: "unexpressible" } : { kind: "write", priority };
+}
+
+/** The band's priorities, least disturbance first: the value closest to the card's current one, then
+ *  outwards, so a drag only reaches for a bigger change when the nearer one would not hold. */
+function bandCandidates(lo: number, hi: number, current: number): number[] {
+  const values: number[] = [];
+  for (let priority = lo; priority <= hi; priority++) values.push(priority);
+  return values.sort((a, b) => Math.abs(a - current) - Math.abs(b - current) || a - b);
 }
 
 /**

@@ -339,8 +339,11 @@ export function EpicBoard({
           i.id === beadId ? { ...i, notNowUntil: untilMs } : i,
         );
       }
-      const upNext = prev.upNext?.filter((entry) => entry.beadId !== beadId);
-      return { ...prev, columns, standalone, ...(upNext ? { upNext } : {}) };
+      // The lane is ABSENT, never empty (types.ts): vetoing its last card drops it rather than
+      // leaving an "Up Next" heading over nothing, which reads as "anton has nothing to start".
+      const { upNext: ranked, ...rest } = prev;
+      const upNext = ranked?.filter((entry) => entry.beadId !== beadId);
+      return { ...rest, columns, standalone, ...(upNext?.length ? { upNext } : {}) };
     });
   }
 
@@ -349,26 +352,33 @@ export function EpicBoard({
    * the same channel product-master writes on — so there is no override state to reconcile and the
    * correction reaches the next picker pass as ordinary board state.
    *
-   * A drop the priority channel cannot express (a reorder inside one band) writes nothing and says
-   * so. Silently accepting it would teach the operator the lane holds an order it does not.
+   * A drop the priority channel cannot express — a reorder inside one band, or a slot the picker's
+   * own tiebreak would take back — writes nothing and says so. Silently accepting it would teach the
+   * operator the lane holds an order it does not.
    */
   async function reorderUpNext(beadId: string, overBeadId: string) {
     if (!board) return;
     const card = upNext.cards.find((c) => c.entry.beadId === beadId);
     if (!card) return;
 
-    const priority = reorderPriority(
+    const verdict = reorderPriority(
       upNext.cards.map((c) => c.entry),
       beadId,
       overBeadId,
     );
-    if (priority === null) {
-      toast.message("Nothing to change", {
-        description:
-          "Order inside one priority band is the picker's own tiebreak — how much open work each target unblocks.",
-      });
+    if (verdict.kind !== "write") {
+      toast.message(
+        verdict.kind === "settled" ? "Nothing to change" : "That order can't be written",
+        {
+          description:
+            verdict.kind === "settled"
+              ? "The plan already ranks this target where you dropped it."
+              : "Priority is the only channel a drag has, and no priority holds that slot — inside one band the picker ranks by how much open work each target unblocks, then by age.",
+        },
+      );
       return;
     }
+    const { priority } = verdict;
 
     const title = card.kind === "epic" ? card.epic.title : card.item.title;
     const previous = board;

@@ -491,7 +491,15 @@ describe("takeUpNext", () => {
   }
 
   function entry(beadId: string, rank: number, over: Partial<UpNextEntry> = {}): UpNextEntry {
-    return { beadId, rank, priority: 2, type: "feature", unblocks: 0, ...over };
+    return {
+      beadId,
+      rank,
+      priority: 2,
+      type: "feature",
+      unblocks: 0,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      ...over,
+    };
   }
 
   const columns = (over: Partial<Record<Stage, Epic[]>> = {}): Record<Stage, Epic[]> => ({
@@ -574,12 +582,21 @@ describe("takeUpNext", () => {
 describe("upNextMetaLabel", () => {
   it("reads the ranking's own inputs — priority, work type, unblocking count", () => {
     expect(
-      upNextMetaLabel({ beadId: "a", rank: 1, priority: 0, type: "feature", unblocks: 3 }),
+      upNextMetaLabel({
+        beadId: "a",
+        rank: 1,
+        priority: 0,
+        type: "feature",
+        unblocks: 3,
+        createdAt: "2026-08-01T00:00:00.000Z",
+      }),
     ).toBe("P0 · Feature · unblocks 3");
   });
 
   it("says an unprioritized pick is unprioritized rather than borrowing a number", () => {
-    expect(upNextMetaLabel({ beadId: "a", rank: 2, type: "bug", unblocks: 0 })).toBe(
+    expect(
+      upNextMetaLabel({ beadId: "a", rank: 2, type: "bug", unblocks: 0, createdAt: "" }),
+    ).toBe(
       "no priority · Bug · unblocks 0",
     );
   });
@@ -587,49 +604,77 @@ describe("upNextMetaLabel", () => {
 
 /**
  * Dragging to reorder writes `priority` (anton-7bzg / R3.8). Priority is the ONLY channel — the same
- * one product-master writes on — so what these pin is the arithmetic that turns a drop position into
- * the one number the picker will re-rank from, and the drops that honestly write nothing.
+ * one product-master writes on — so what these pin is which drops that channel can state, which
+ * value states them, and the drops that honestly write nothing. A drop is only expressible if the
+ * PRIME comparator would seat the card between its new neighbours (beads/rank.ts): priority, then
+ * unblocking value, then age, then id. Writing a priority that merely TIES with the card it had to
+ * cross would report a move the next pass takes straight back.
  */
 describe("reorderPriority", () => {
-  const plan = (...priorities: (number | undefined)[]): UpNextEntry[] =>
-    priorities.map((priority, index) => ({
-      beadId: `b${index}`,
-      rank: index + 1,
-      ...(priority === undefined ? {} : { priority }),
-      type: "feature" as const,
-      unblocks: 0,
-    }));
+  type Card = { priority?: number; unblocks: number };
+
+  /** A plan as a pass would have left it: each card older than the one below it, so an equal-priority
+   *  tie falls to whichever already stood higher — exactly what the next pass would decide. */
+  const plan = (...cards: (number | undefined | Card)[]): UpNextEntry[] =>
+    cards.map((card, index) => {
+      const spec: Card = typeof card === "object" ? card : { priority: card, unblocks: 0 };
+      return {
+        beadId: `b${index}`,
+        rank: index + 1,
+        ...(spec.priority === undefined ? {} : { priority: spec.priority }),
+        type: "feature" as const,
+        unblocks: spec.unblocks,
+        createdAt: `2026-08-0${index + 1}T00:00:00.000Z`,
+      };
+    });
 
   it("promotes a card dragged to the top into the top card's band", () => {
-    expect(reorderPriority(plan(0, 2, 3), "b1", "b0")).toBe(0);
+    // The tie the promotion lands in is one this card wins: it frees more work than the P0 above it.
+    const entries = plan(0, { priority: 2, unblocks: 5 }, 3);
+
+    expect(reorderPriority(entries, "b1", "b0")).toEqual({ kind: "write", priority: 0 });
   });
 
-  it("demotes a card dragged to the bottom into the bottom card's band", () => {
-    expect(reorderPriority(plan(0, 2, 3), "b0", "b2")).toBe(3);
+  it("refuses a promotion the picker's own tiebreak would take straight back", () => {
+    // Same drag, but this card frees nothing the P0 above it doesn't: writing P0 would tie, and PRIME
+    // breaks that tie for the older card — so the lane would show a move the next pass undoes.
+    expect(reorderPriority(plan(0, 2, 3), "b1", "b0")).toEqual({ kind: "unexpressible" });
+  });
+
+  it("reaches past the tie when the band still holds a priority that seats the card", () => {
+    // Dragged to the bottom: P3 would only tie with the card above it (and lose on age), so the drop
+    // takes the next value the band allows rather than reporting a demotion that never happened.
+    expect(reorderPriority(plan(0, 2, 3), "b0", "b2")).toEqual({ kind: "write", priority: 4 });
   });
 
   it("clamps into the band the drop landed in, never past its new neighbours", () => {
     // P0 dropped between P1 and P3 takes P1 — enough to sit under it, no more.
-    expect(reorderPriority(plan(1, 3, 0), "b2", "b1")).toBe(1);
+    expect(reorderPriority(plan(1, 3, 0), "b2", "b1")).toEqual({ kind: "write", priority: 1 });
   });
 
   it("writes nothing when the card is already in the band it was dropped into", () => {
     // P2 dropped between P0 and P3 needs no change: the ranking already puts it there.
-    expect(reorderPriority(plan(0, 3, 2), "b2", "b1")).toBeNull();
+    expect(reorderPriority(plan(0, 3, 2), "b2", "b1")).toEqual({ kind: "settled" });
   });
 
-  it("writes nothing for a reorder inside one priority band", () => {
-    expect(reorderPriority(plan(2, 2, 2), "b2", "b0")).toBeNull();
+  it("refuses a reorder inside one priority band — that slot is the picker's tiebreak", () => {
+    expect(reorderPriority(plan(2, 2, 2), "b2", "b0")).toEqual({ kind: "unexpressible" });
   });
 
   it("gives an unprioritized card an explicit lowest priority — which outranks having none", () => {
-    expect(reorderPriority(plan(3, undefined), "b1", "b0")).toBe(3);
-    expect(reorderPriority(plan(4, undefined), "b1", "b0")).toBe(4);
+    expect(reorderPriority(plan(3, { unblocks: 1 }), "b1", "b0")).toEqual({
+      kind: "write",
+      priority: 3,
+    });
+    expect(reorderPriority(plan(4, { unblocks: 1 }), "b1", "b0")).toEqual({
+      kind: "write",
+      priority: 4,
+    });
   });
 
-  it("answers null for a drop on itself or on a card the plan does not carry", () => {
-    expect(reorderPriority(plan(0, 2), "b0", "b0")).toBeNull();
-    expect(reorderPriority(plan(0, 2), "b0", "gone")).toBeNull();
+  it("has nothing to settle for a drop on itself or on a card the plan does not carry", () => {
+    expect(reorderPriority(plan(0, 2), "b0", "b0")).toEqual({ kind: "settled" });
+    expect(reorderPriority(plan(0, 2), "b0", "gone")).toEqual({ kind: "settled" });
   });
 });
 
@@ -641,6 +686,7 @@ describe("reorderUpNextEntries", () => {
       priority: 2,
       type: "feature" as const,
       unblocks: 0,
+      createdAt: "2026-08-01T00:00:00.000Z",
     }));
 
   it("moves the target into the slot it was dropped on and renumbers every rank", () => {

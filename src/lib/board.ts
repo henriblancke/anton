@@ -363,16 +363,19 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // entry `◈ policy` — which is what `[Release]` is derived from (isPickerPick), so ordinary Backlog
   // cards would go on offering to record accepts against a pass that no longer runs.
   const armedPlan = pickerArmed ? plan : undefined;
-  // Does the recorded plan still describe the decision anton would make NOW? Asked ONCE, over both
-  // halves of that decision — the beads and the armed policy, which stampBoard folds in together, so
-  // an operator narrowing `pickerPolicy` without touching a bead invalidates the plan too.
+  // Does the recorded plan still describe the decision anton would make NOW? Asked ONCE, over every
+  // input to that decision — the beads and the armed policy, which stampBoard folds in together, plus
+  // the deferrals, whose expiry no digest can see (isPlanStale). So an operator narrowing
+  // `pickerPolicy` without touching a bead invalidates the plan, and so does a hold running out on a
+  // target the pass set aside.
   //
   // Every live claim the board makes about the picker reads this one answer: the Up Next lane
   // (withheld whole rather than presented as a current ranking) and the `[Release]` derived from the
   // provenance badge. They must not disagree — a lane that vanished while its button stayed would go
   // on offering a start against a decision anton has already stopped standing behind.
   const planIsStale =
-    armedPlan !== undefined && isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), policy));
+    armedPlan !== undefined &&
+    isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), policy), deferrals);
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
   // A stale plan still badges — the rule a target WAS picked under does not stop being true — but

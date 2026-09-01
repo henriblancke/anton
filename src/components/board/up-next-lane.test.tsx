@@ -112,7 +112,15 @@ function epic(id: string, over: Partial<Epic> = {}): Epic {
 }
 
 function entry(beadId: string, rank: number, over: Partial<UpNextEntry> = {}): UpNextEntry {
-  return { beadId, rank, priority: 2, type: "feature", unblocks: 0, ...over };
+  return {
+    beadId,
+    rank,
+    priority: 2,
+    type: "feature",
+    unblocks: 0,
+    createdAt: "2026-08-01T00:00:00.000Z",
+    ...over,
+  };
 }
 
 /** Two ranked backlog targets, one unranked one beside them, and one already implementing. */
@@ -417,9 +425,19 @@ describe("reordering the lane", () => {
       over: { id: overId, data: { current: { upNext: true, stage: "backlog" } } },
     } as unknown as DragEndEvent);
 
+  /**
+   * A plan whose lower card frees MORE work than the one above it. Crossing a priority boundary can
+   * only equalize priorities, and PRIME then breaks that tie on unblocking value — so this is a plan
+   * where the promotion is a move the next pass will keep, and the lane may report it.
+   */
+  const CROSSABLE = [
+    entry("anton-pick2", 1, { priority: 0, unblocks: 1 }),
+    entry("anton-pick1", 2, { priority: 2, unblocks: 3 }),
+  ];
+
   it("writes the dragged target's new priority through its own bead route", async () => {
     const fetchMock = stubFetch({ "/epics/anton-pick1": json({ detail: {} }) });
-    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+    render(<EpicBoard slug="tmp" initialBoard={fixture(CROSSABLE)} />);
 
     // P2 dragged above P0: to hold the top slot it must carry the top slot's priority.
     await drop("anton-pick1", "anton-pick2");
@@ -433,9 +451,23 @@ describe("reordering the lane", () => {
     expect(toastSuccess).toHaveBeenCalledWith('Set "Term merge" to P0 · critical');
   });
 
+  it("refuses a promotion the picker's own tiebreak would take straight back", async () => {
+    // The same drag against a plan where the top card frees more work: equalizing priorities would
+    // leave the ranking deciding on unblocking value, and it decides for the card already on top. A
+    // PATCH here would report a move the next pass silently reverses.
+    const fetchMock = stubFetch();
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await drop("anton-pick1", "anton-pick2");
+
+    await waitFor(() => expect(toastMessage).toHaveBeenCalled());
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/epics/anton-pick1"))).toBe(false);
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
   it("demotes a target dragged down to the band it landed in", async () => {
     const fetchMock = stubFetch({ "/epics/anton-pick2": json({ detail: {} }) });
-    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+    render(<EpicBoard slug="tmp" initialBoard={fixture(CROSSABLE)} />);
 
     await drop("anton-pick2", "anton-pick1");
 
@@ -449,7 +481,7 @@ describe("reordering the lane", () => {
 
   it("renumbers the lane on the drop, rather than leaving a plan reading 2, 1", async () => {
     stubFetch({ "/epics/anton-pick1": json({ detail: {} }) });
-    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+    render(<EpicBoard slug="tmp" initialBoard={fixture(CROSSABLE)} />);
 
     await drop("anton-pick1", "anton-pick2");
 
@@ -460,7 +492,7 @@ describe("reordering the lane", () => {
         "Prune closed beads",
       ]);
     });
-    expect(screen.getByRole("group", { name: "Rank 1 — P0 · Feature · unblocks 0" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Rank 1 — P0 · Feature · unblocks 3" })).toBeTruthy();
   });
 
   it("says so instead of writing when the drop is inside one priority band", async () => {
@@ -480,7 +512,7 @@ describe("reordering the lane", () => {
 
   it("rolls the lane back when the priority write fails", async () => {
     stubFetch({ "/epics/anton-pick1": json({ error: "anton.db is locked" }, 500) });
-    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+    render(<EpicBoard slug="tmp" initialBoard={fixture(CROSSABLE)} />);
 
     await drop("anton-pick1", "anton-pick2");
 

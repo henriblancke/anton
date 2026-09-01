@@ -345,6 +345,13 @@ export interface UpNextEntry {
   type: IssueType;
   /** How many still-waiting beads finishing this target transitively unblocks (beads/rank.ts). */
   unblocks: number;
+  /**
+   * The bead's `created_at`, the ranking's age tiebreak — "" when bd reported none, exactly as
+   * `RankedTarget.createdAt`. Carried so a drag inside the lane can ask whether the order it wants
+   * is one the priority channel can actually establish, rather than writing a priority the next
+   * pass's tiebreak quietly overrules.
+   */
+  createdAt: string;
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors

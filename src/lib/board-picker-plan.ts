@@ -191,9 +191,22 @@ export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy)
  * touched is still the current answer, and a plan computed a second ago against a board that has
  * since moved is not. The lane must show the second one as stale rather than present a ranking of
  * beads whose state it no longer describes.
+ *
+ * The operator's live vetoes are the third decision input, and the ONLY one the digest cannot carry:
+ * a deferral is anton's own state with a wall-clock expiry, not a bead field, so a hold running out
+ * re-admits a target while every hashed input sits still. A plan is therefore also stale once a
+ * target it set aside as `deferred` is no longer held — otherwise the newly eligible bead would stay
+ * out of Up Next until the next scheduled pass rewrote the plan. A veto ARRIVING needs no such fence:
+ * the lane subtracts live deferrals from the plan it reads (`upNextEntries`), which is a narrower and
+ * faster answer than withholding the whole ranking.
  */
-export function isPlanStale(plan: BoardPickerPlan, current: BoardStamp): boolean {
-  return plan.stamp.digest !== current.digest;
+export function isPlanStale(
+  plan: BoardPickerPlan,
+  current: BoardStamp,
+  deferrals?: ReadonlyMap<string, number>,
+): boolean {
+  if (plan.stamp.digest !== current.digest) return true;
+  return plan.exclusions.some((x) => x.reason === "deferred" && !deferrals?.has(x.beadId));
 }
 
 /**

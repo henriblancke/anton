@@ -12,13 +12,15 @@ import type { Bead } from "@/lib/beads/types";
 import type { BoardPickerPlan, PickerPlanEntry } from "@/lib/board-picker-plan";
 import { upNextEntries, upNextVersion } from "@/lib/up-next";
 
+const AGE = "2026-08-01T00:00:00.000Z";
+
 function bead(over: Partial<Bead> & { id: string }): Bead {
   return {
     title: over.title ?? `bead ${over.id}`,
     status: "open",
     issue_type: "feature",
     priority: 2,
-    created_at: "2026-08-01T00:00:00.000Z",
+    created_at: AGE,
     ...over,
   };
 }
@@ -43,7 +45,7 @@ describe("upNextEntries", () => {
     expect(upNextEntries([bead({ id: "anton-1" })], undefined)).toBeUndefined();
   });
 
-  it("carries rank, priority, type and unblocking count for each pick", () => {
+  it("carries rank, priority, type, unblocking count and age for each pick", () => {
     const board = [
       bead({ id: "anton-hub", issue_type: "feature", priority: 1 }),
       bead({ id: "anton-leaf", issue_type: "bug", priority: 3 }),
@@ -60,9 +62,11 @@ describe("upNextEntries", () => {
       ]),
     );
 
+    // `createdAt` rides along for the ranking's age tiebreak: a drag inside the lane has to know
+    // whether the order it asks for is one the priority channel can actually establish.
     expect(entries).toEqual([
-      { beadId: "anton-hub", rank: 1, priority: 1, type: "feature", unblocks: 2 },
-      { beadId: "anton-leaf", rank: 2, priority: 3, type: "bug", unblocks: 0 },
+      { beadId: "anton-hub", rank: 1, priority: 1, type: "feature", unblocks: 2, createdAt: AGE },
+      { beadId: "anton-leaf", rank: 2, priority: 3, type: "bug", unblocks: 0, createdAt: AGE },
     ]);
   });
 
@@ -90,6 +94,15 @@ describe("upNextEntries", () => {
     );
 
     expect(entries?.map((e) => e.beadId)).toEqual(["anton-1"]);
+  });
+
+  it("reports an undated pick as undated rather than dropping the age tiebreak", () => {
+    const entries = upNextEntries(
+      [bead({ id: "anton-1", created_at: undefined })],
+      plan([{ beadId: "anton-1", rank: 1, rule: "policy" }]),
+    );
+
+    expect(entries?.[0].createdAt).toBe("");
   });
 
   it("leaves an unprioritized pick without a priority rather than inventing one", () => {

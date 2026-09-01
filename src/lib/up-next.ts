@@ -4,7 +4,8 @@
  * The lane is NOT a stage. The other four columns map to bead state; this one is a ranking this
  * machine recorded over Backlog, so it cannot be derived from a bead's status and must not be
  * invented as one. This module is the join that makes it renderable: the recorded plan supplies the
- * order and the ids, the board snapshot supplies each target's type, priority and unblocking count.
+ * order and the ids, the board snapshot supplies each target's type, priority, age and unblocking
+ * count.
  *
  * `unblocks` is resolved HERE rather than on the client because it is a transitive walk over the
  * whole `blocks` graph (`beads/rank.ts`) — the same count the ranking itself sorted on, so the lane
@@ -54,6 +55,7 @@ export function upNextEntries(
           ...(bead.priority === undefined ? {} : { priority: bead.priority }),
           type: issueTypeOf(bead),
           unblocks: unblocks(entry.beadId),
+          createdAt: bead.created_at ?? "",
         } satisfies UpNextEntry,
       ];
     });
