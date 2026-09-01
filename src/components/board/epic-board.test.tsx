@@ -597,6 +597,46 @@ describe("EpicBoard reorder inside Up Next", () => {
     expect(boardReads.at(-1)).not.toContain("version=");
   });
 
+  it("refuses a second reorder while the first is still being written", async () => {
+    // Two reorders in flight cannot both be honoured: the rollback restores the pre-drag ORDER, so
+    // the first one's failure would erase a second drop that succeeded, and the lane would sit on an
+    // order neither write asked for until the next poll. The second drop is refused instead, and the
+    // first still rolls back to exactly the order the board started in.
+    let failPatch: (() => void) | undefined;
+    const patched = new Promise<Response>((resolve) => {
+      failPatch = () => resolve(new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
+    });
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/epics/anton-2")) return patched;
+      return new Response(null, { status: 304 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync", ["anton-1", "anton-2"])} />);
+
+    dragEndHandler?.({
+      active: { id: "anton-2", data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
+
+    // The operator drops the other card back while the first PATCH is still out.
+    dragEndHandler?.({
+      active: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: "anton-2", data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+    await waitFor(() => expect(toast.message).toHaveBeenCalled());
+    // Refused, not queued: no second PATCH, and the lane still shows the first drop.
+    const patches = fetchMock.mock.calls.filter((c) => String(c[0]).includes("/epics/"));
+    expect(patches).toHaveLength(1);
+    expect(laneOrder()).toEqual(["anton-2", "anton-1"]);
+
+    failPatch?.();
+
+    // The rollback has exactly one drag to undo, so the lane lands on the order it started in.
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-1", "anton-2"]));
+  });
+
   it("does not re-offer a target vetoed while the reorder was in flight when the write fails", async () => {
     // The rollback restores the pre-drag ORDER, and a veto that lands in the same window removes its
     // target from the lane. Writing the pre-drag lane back whole would undo that veto — re-offering

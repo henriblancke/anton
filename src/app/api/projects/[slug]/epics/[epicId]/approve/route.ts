@@ -15,7 +15,7 @@ import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/servi
 import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
 import { recordPickerAccept } from "@/lib/picker-veto";
-import type { Project } from "@/lib/types";
+import type { ApprovalRunOutcome, Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
@@ -519,21 +519,33 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // `{ steal: true }` with no `immediate` field, and a pure ownership transfer must preserve the
   // existing pacing choice — a defaulted `bypassBudget: true` would promote a covering paced job
   // (or enqueue a fresh bypass one) and silently override the operator's Queue decision.
+  //
+  // A missing `jobId` is NOT one outcome (PR #212): both enqueues withhold an id on purpose when a
+  // run already covers the epic — `enqueueExecuteEpic` when the shared board shows one live on
+  // another machine (anton-jz1), `enqueueExecuteEpicIfAbsent` when this instance already holds one.
+  // Reporting all three as "nothing started" tells the operator to retry a target that is running,
+  // so `run` names which it was and only a thrown enqueue reads as a failure.
   let jobId: string | undefined;
+  let run: ApprovalRunOutcome = "none";
   try {
     if (!takeOver) {
       jobId = await enqueueExecuteEpic(project.id, epicId, { bypassBudget: immediate });
+      run = jobId ? "started" : "elsewhere";
     } else if (willEnqueue) {
       jobId = await enqueueExecuteEpicIfAbsent(project.id, epicId, { bypassBudget: immediateExplicit });
+      run = jobId ? "started" : "covered";
     }
   } catch (err) {
+    run = "failed";
     console.error(`[approve] failed to enqueue execute-epic for ${epicId}`, err);
   }
 
   // A release is this approval plus its answer to the picker (anton-d2h6). Gated on a run actually
-  // having been enqueued: an accept for a run that never started would be evidence of nothing, and
-  // earned autonomy reads these counts to decide whether the picker may ever be armed.
-  if (release && jobId) await recordRelease(project.id, epicId);
+  // covering the target: an accept for a run that never started would be evidence of nothing, and
+  // earned autonomy reads these counts to decide whether the picker may ever be armed. A run live on
+  // another machine counts — the operator accepted the pick and the work is running, which is what
+  // the accept records; only a failed or suppressed enqueue leaves nothing to answer for.
+  if (release && (run === "started" || run === "elsewhere")) await recordRelease(project.id, epicId);
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local
   // state, so don't block the response on a `bd dolt pull/commit/push` a slow/unreachable remote
@@ -555,10 +567,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
   if (epic) {
     const updatedEpic = { ...epic, ...written };
-    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId, advisory });
+    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId, run, advisory });
   }
   if (standalone) {
-    return NextResponse.json({ item: { ...standalone, ...written }, jobId, advisory });
+    return NextResponse.json({ item: { ...standalone, ...written }, jobId, run, advisory });
   }
   return notFoundResponse("Run target not found");
 });

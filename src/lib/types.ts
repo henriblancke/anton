@@ -507,6 +507,23 @@ export interface MoveRequest {
   toStage: Stage;
 }
 
+/**
+ * What an approval did about the run it normally starts, answered alongside `jobId` (PR #212).
+ *
+ * A missing `jobId` means several different things, and only one of them is a problem: the enqueues
+ * withhold an id on purpose when a run already covers the target. A client that reads every missing
+ * id as a failure tells the operator to retry work that is already running.
+ *
+ * - `started`  — a run is enqueued on this machine; `jobId` names it.
+ * - `elsewhere`— the shared board shows a live run for this target on ANOTHER machine, so nothing was
+ *                enqueued here (anton-jz1). The work is covered; the board is what is behind.
+ * - `covered`  — a take-over found this instance already holds a job for the target, so it reused it
+ *                rather than shadowing it with a duplicate.
+ * - `none`     — this request was never going to start anything (a pure take-over of a blocked target).
+ * - `failed`   — the enqueue threw. The approval stands, so approving again retries it.
+ */
+export type ApprovalRunOutcome = "started" | "elsewhere" | "covered" | "none" | "failed";
+
 // ── Epic detail + dependency graph ──
 export type DepType = "parent-child" | "blocks" | "related" | "discovered-from";
 export interface DepEdge {

@@ -150,6 +150,12 @@ export function EpicBoard({
   // returns, and the reorder path has no authoritative board to re-adopt afterwards, so accepting
   // that poll reverts the lane on screen until the next beat. Suppress for the whole write instead.
   const writesInFlightRef = useRef(0);
+  // One lane reorder at a time (PR #212 review). Suppressing polls is not enough: a second drop
+  // applied optimistically while the first PATCH is out is erased by the first's rollback, and its
+  // own success reconciles nothing — the lane would show an order neither write asked for. The ref
+  // refuses the second drop synchronously; the state disables the lane's handles so it can't start.
+  const reorderingRef = useRef(false);
+  const [reordering, setReordering] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -402,6 +408,16 @@ export function EpicBoard({
    */
   async function reorderUpNext(beadId: string, overBeadId: string) {
     if (!board) return;
+    // Serialized, not interleaved: this rollback restores the pre-drag ORDER, so a second reorder
+    // applied while the first is out would be undone by the first's failure even though its own
+    // write succeeded. The lane withdraws itself after a successful reorder anyway, so refusing the
+    // second drop costs a beat — where accepting it costs the operator an order nobody asked for.
+    if (reorderingRef.current) {
+      toast.message("One reorder at a time", {
+        description: "The last drop is still being written. Try again once it settles.",
+      });
+      return;
+    }
     const card = upNext.cards.find((c) => c.entry.beadId === beadId);
     if (!card) return;
 
@@ -428,6 +444,8 @@ export function EpicBoard({
     // Only the lane moves, and it moves on the LATEST board: a poll can land during the PATCH, and
     // both writing and reverting a whole pre-drag snapshot would throw that poll's result away.
     const previousUpNext = board.upNext;
+    reorderingRef.current = true;
+    setReordering(true);
     writesInFlightRef.current += 1;
     setBoard((prev) => {
       if (!prev) return prev;
@@ -485,6 +503,8 @@ export function EpicBoard({
       // suppression lifts, so no poll slips between the two.
       writeSeqRef.current += 1;
       writesInFlightRef.current -= 1;
+      reorderingRef.current = false;
+      setReordering(false);
     }
   }
 
@@ -677,6 +697,7 @@ export function EpicBoard({
                   slug={slug}
                   cards={upNext.cards}
                   budgetAware={budgetAware}
+                  reordering={reordering}
                   onEpicDeleted={handleEpicDeleted}
                   onOpenTicket={setOpenTicketId}
                   onVetoed={handleVetoed}

@@ -122,6 +122,29 @@ describe("a release the approve route could not start", () => {
   });
 });
 
+describe("a release a run on another machine already covers", () => {
+  /**
+   * The enqueue withholds a job id ON PURPOSE when the shared board shows a live run elsewhere
+   * (anton-jz1) — nothing was started here because nothing needed to be. Reading that as a failed
+   * enqueue would push the operator to release again, into a second concurrent run.
+   */
+  it("reports it as running, not as a release to retry", async () => {
+    stubFetch({ run: "elsewhere" });
+    const onReleased = vi.fn();
+    mount({ onReleased });
+
+    release();
+
+    await waitFor(() => expect(success).toHaveBeenCalled());
+    expect(success.mock.calls[0]?.[0]).toContain("already running on another machine");
+    expect(error).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    // The target is running, so the card locks its affordances and the lane re-reads onto the run.
+    expect(onReleased).toHaveBeenCalled();
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+});
+
 describe("a release that loses the claim race", () => {
   it("fails loudly on the card and re-reads the lane", async () => {
     stubFetch(

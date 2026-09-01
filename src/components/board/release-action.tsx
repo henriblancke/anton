@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { toastAdvisoryGaps } from "@/components/board/contract-advisory";
+import type { ApprovalRunOutcome } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -21,10 +22,12 @@ import { cn } from "@/lib/utils";
  * the two would drift. The flag adds only what release means beyond approve: the target was anton's
  * pick, so the choice is recorded as an accept the arming decision can read.
  *
- * A 200 IS NOT A RUN, either: approve enqueues best-effort and reports the job id, so the button
- * believes the response's `jobId` rather than its status code — "running now" against an enqueue
- * that failed is a false success the operator would only discover by waiting for a card that never
- * moves.
+ * A 200 IS NOT A RUN, either: approve enqueues best-effort and reports what it did, so the button
+ * believes the response's `run` outcome rather than its status code — "running now" against an
+ * enqueue that failed is a false success the operator would only discover by waiting for a card that
+ * never moves. A MISSING JOB ID IS NOT A FAILURE, though: `elsewhere` means the shared board already
+ * shows a live run for this target on another machine, so nothing was enqueued here because nothing
+ * needed to be. Telling the operator to retry that is telling them to double-run it.
  *
  * A LOST CLAIM RACE is the failure this control is shaped around. Between the render and the click a
  * teammate can claim the target or its run can start, and approve answers 409 — so the refusal is
@@ -70,6 +73,7 @@ export function ReleaseAction({
       const body = (await res.json().catch(() => null)) as {
         error?: string;
         jobId?: string;
+        run?: ApprovalRunOutcome;
       } | null;
       if (!res.ok) {
         const message = body?.error ?? `Release failed (${res.status})`;
@@ -81,11 +85,23 @@ export function ReleaseAction({
         if (res.status === 409) router.refresh();
         return;
       }
+      // Already running on another machine (anton-jz1): approve deliberately enqueued nothing,
+      // because a live run there already covers this target. That is a lane that is stale, not a
+      // release that failed — so the approve stands, the accept is recorded, and this reconciles the
+      // board instead of pushing the operator to release again into a second concurrent run.
+      if (body?.run === "elsewhere") {
+        onReleased?.();
+        toast.success(`"${title}" is already running on another machine`, {
+          description: "Nothing new was started — the board is catching up.",
+        });
+        router.refresh();
+        return;
+      }
       // A 200 is not yet a run. Approve enqueues BEST-EFFORT — it will not fail an approval it has
       // already written over a runner hiccup — so it answers 200 with `jobId` omitted when the
-      // enqueue threw. `jobId` is the only proof a run exists, and "running now" without one leaves
-      // the operator watching a card that will never move (the route withholds the release accept on
-      // the same test). The approval stands, so releasing again enqueues afresh.
+      // enqueue threw. Absent both a job id and a covering run, "running now" leaves the operator
+      // watching a card that will never move (the route withholds the release accept on the same
+      // test). The approval stands, so releasing again enqueues afresh.
       if (!body?.jobId) {
         const message = "Approved, but no run started — release again to retry";
         setFailure(message);

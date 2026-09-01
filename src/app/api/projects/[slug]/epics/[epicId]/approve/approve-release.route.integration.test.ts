@@ -72,7 +72,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
 
     const res = await approve(epic, { release: true });
     expect(res.status).toBe(200);
-    expect((await res.json()).jobId).toBeTruthy();
+    const started = (await res.json()) as { jobId?: string; run?: string };
+    expect(started.jobId).toBeTruthy();
+    expect(started.run).toBe("started");
 
     // The approve route's own work, unchanged by the flag: labelled, claimed, and running.
     const bead = await beads.show(repo, epic);
@@ -128,6 +130,29 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     const rows = await listPickerVerdicts(getDb(), await projectId());
     expect(rows.filter((r) => r.beadId === epic)).toHaveLength(0);
     expect(record.declined).toBe(0);
+  });
+
+  it("says a run is live on another machine rather than reading as an enqueue failure", async () => {
+    // The claim gate passes (nobody holds the target), but the shared board carries a live run-lease
+    // from another machine, so the enqueue deliberately starts nothing — that run already covers the
+    // work (anton-jz1). Reporting the missing job id as a failed enqueue would tell the operator to
+    // release again, into a second concurrent run. `run` names which it was (PR #212).
+    actAs("anton-test");
+    const epic = await runTarget("Running elsewhere");
+    await planFor(epic);
+    await beads.publishRunLease(repo, epic, Date.now() + 15 * 60_000);
+
+    const res = await approve(epic, { release: true });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { jobId?: string; run?: string };
+    expect(body.run).toBe("elsewhere");
+    expect(body.jobId).toBeUndefined();
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+
+    // The accept still stands: the operator took the pick and the work IS running — what earned
+    // autonomy counts is the choice, not which machine happens to be executing it.
+    const rows = await listPickerVerdicts(getDb(), await projectId());
+    expect(rows.filter((r) => r.beadId === epic).map((r) => r.verdict)).toEqual(["accepted"]);
   });
 
   it("leaves an ordinary approve unrecorded — only a release answers the picker", async () => {

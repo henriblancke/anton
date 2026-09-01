@@ -32,6 +32,7 @@ export function UpNextLane({
   slug,
   cards,
   budgetAware = false,
+  reordering = false,
   onEpicDeleted,
   onOpenTicket,
   onVetoed,
@@ -41,6 +42,11 @@ export function UpNextLane({
   cards: UpNextCard[];
   /** Project budget-aware flag (anton-y2ue): forwarded to cards exactly as Backlog forwards it. */
   budgetAware?: boolean;
+  /**
+   * A reorder is being written. Reorders are serialized (epic-board), so the lane closes its handles
+   * for the round-trip rather than letting the operator start a drag the board will refuse.
+   */
+  reordering?: boolean;
   onEpicDeleted?: (epicId: string) => void;
   /** Open a standalone chip's detail dialog (hoisted to the board so one dialog serves all). */
   onOpenTicket?: (ticketId: string) => void;
@@ -93,6 +99,7 @@ export function UpNextLane({
                 slug={slug}
                 card={card}
                 budgetAware={budgetAware}
+                reordering={reordering}
                 onEpicDeleted={onEpicDeleted}
                 onOpenTicket={onOpenTicket}
                 onVetoed={onVetoed}
@@ -125,6 +132,7 @@ function UpNextRow({
   slug,
   card,
   budgetAware,
+  reordering,
   onEpicDeleted,
   onOpenTicket,
   onVetoed,
@@ -132,6 +140,7 @@ function UpNextRow({
   slug: string;
   card: UpNextCard;
   budgetAware: boolean;
+  reordering: boolean;
   onEpicDeleted?: (epicId: string) => void;
   onOpenTicket?: (ticketId: string) => void;
   onVetoed?: (beadId: string, untilMs: number) => void;
@@ -146,6 +155,7 @@ function UpNextRow({
       // `upNext` on BOTH ends is what tells the board's drop handler this was a reorder and not a
       // stage move; `stage` keeps a card draggable out of the lane into a column, as before.
       data: { upNext: true, ...(card.kind === "epic" ? { stage: card.epic.stage } : {}) },
+      disabled: reordering,
     });
 
   const style = {
@@ -174,10 +184,15 @@ function UpNextRow({
           type="button"
           {...attributes}
           {...listeners}
+          disabled={reordering}
           aria-label={`Reorder "${title}"`}
-          title="Drag to reorder — the new position is written as this target's priority"
+          title={
+            reordering
+              ? "Saving the last reorder — one at a time"
+              : "Drag to reorder — the new position is written as this target's priority"
+          }
           style={{ touchAction: "none" }}
-          className="flex size-5 shrink-0 cursor-grab items-center justify-center rounded-md text-subtle transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:cursor-grabbing"
+          className="flex size-5 shrink-0 cursor-grab items-center justify-center rounded-md text-subtle transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:cursor-grabbing disabled:cursor-progress disabled:opacity-40"
         >
           <GripVerticalIcon className="size-3.5" aria-hidden="true" />
         </button>
