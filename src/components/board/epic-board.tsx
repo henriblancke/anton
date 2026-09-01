@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { TriangleAlertIcon } from "lucide-react";
@@ -392,7 +392,7 @@ export function EpicBoard({
    * picker pass rewrites up to ten minutes from now — so without this the declined target would keep
    * its place in the ranking it was just refused a place in.
    */
-  function handleVetoed(beadId: string, untilMs: number) {
+  const handleVetoed = useCallback((beadId: string, untilMs: number) => {
     // A veto is a board write like any other: the deferral it records moves the board version, so a
     // poll that LEFT before it settled answers on the pre-veto board and would put the declined
     // target back in the lane with its controls live — long enough (up to a beat) for the operator
@@ -424,7 +424,7 @@ export function EpicBoard({
       const upNext = ranked?.filter((entry) => entry.beadId !== beadId);
       return { ...rest, columns, standalone, ...(upNext?.length ? { upNext } : {}) };
     });
-  }
+  }, []);
 
   /**
    * Reorder inside the Up Next lane (R3.8). The drop is persisted as the target's bead `priority` —
@@ -700,11 +700,13 @@ export function EpicBoard({
             </p>
           ) : (
             // The picks stay in their epic's Backlog slice here — no lane, so no row to carry the
-            // generation they were drawn from. The surface carries it instead, or `[Release]` would
-            // post an unnamed accept the server resolves against whatever plan is current by then
-            // (PR #212 review).
+            // generation they were drawn from, and none to carry the vetoes either. The surface
+            // supplies both: without the generation `[Release]` would post an unnamed accept the
+            // server resolves against whatever plan is current by then, and without the veto sink
+            // this layout would offer the operator no way to REFUSE a pick at all (PR #212 review).
             <PlanGenerationProvider
               {...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId })}
+              onVetoed={handleVetoed}
             >
               <div className="flex flex-col divide-y divide-border">
                 {lanes.map((lane) => (

@@ -562,7 +562,7 @@ describe("withdrawing an accept", () => {
     const outcome = await recordPickerAccept(test.db, clock, PICK);
     expect(outcome.recorded).toBe(true);
 
-    await withdrawPickerAccept(test.db, outcome.recorded ? outcome.id : "");
+    await withdrawPickerAccept(test.db, outcome.recorded ? outcome.id : "", clock);
 
     expect(await pickerTrackRecord(test.db, PROJECT)).toEqual({
       accepted: 0,
@@ -585,11 +585,59 @@ describe("withdrawing an accept", () => {
     });
     const dropped = await recordPickerAccept(test.db, clock, PICK);
 
-    await withdrawPickerAccept(test.db, dropped.recorded ? dropped.id : "");
+    await withdrawPickerAccept(test.db, dropped.recorded ? dropped.id : "", clock);
 
     expect(
       (await listPickerVerdicts(test.db, PROJECT)).map((r) => r.beadId),
     ).toEqual(["anton-b"]);
+    expect(kept.recorded).toBe(true);
+  });
+
+  it("replays the veto that lost only to the reservation — the operator refused a run that never started", async () => {
+    const reserved = await recordPickerAccept(test.db, clock, PICK);
+    // The other tab's veto, refused because the reservation made the pick look released.
+    expect(await recordPickerVeto(test.db, clock, { ...PICK, action: "never", rank: 1 })).toEqual({
+      recorded: false,
+      reason: "released",
+    });
+
+    const replayed = await withdrawPickerAccept(
+      test.db,
+      reserved.recorded ? reserved.id : "",
+      clock,
+    );
+
+    expect(replayed).toEqual({ beadId: "anton-a", untilMs: NOW + PICKER_DEFER_WINDOW_MS });
+    // The decline stands with everything the veto carried, and the target is held out of the plan.
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { beadId: "anton-a", verdict: "declined", action: "never", rank: 1, planId: "d1" },
+    ]);
+    expect([...(await activeDeferrals(test.db, PROJECT, at(NOW))).keys()]).toEqual(["anton-a"]);
+  });
+
+  it("replays it once — a withdrawal is not a decline the pick keeps re-earning", async () => {
+    const reserved = await recordPickerAccept(test.db, clock, PICK);
+    await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" });
+    const id = reserved.recorded ? reserved.id : "";
+
+    await withdrawPickerAccept(test.db, id, clock);
+    expect(await withdrawPickerAccept(test.db, id, clock)).toBeUndefined();
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 0, declined: 1 });
+  });
+
+  it("leaves a veto that lost to a KEPT accept lost — that run is under way", async () => {
+    const kept = await recordPickerAccept(test.db, clock, PICK);
+    await recordPickerVeto(test.db, clock, { ...PICK, action: "not-now" });
+
+    // A different reservation is withdrawn; the standing accept and the veto it beat are untouched.
+    const other = await recordPickerAccept(test.db, clock, { ...PICK, beadId: "anton-b" });
+    await withdrawPickerAccept(test.db, other.recorded ? other.id : "", clock);
+
+    expect(await listPickerVerdicts(test.db, PROJECT)).toMatchObject([
+      { beadId: "anton-a", verdict: "accepted" },
+    ]);
+    expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(0);
     expect(kept.recorded).toBe(true);
   });
 });

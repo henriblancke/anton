@@ -112,28 +112,29 @@ function msOf(value: unknown): number | undefined {
  * same target is a new decision and takes its own answer, which is why the id names the plan
  * GENERATION and never the reusable board digest (`planIdFor`). A plan-less verdict answers no
  * recorded pick and stays unconstrained, exactly as `picker_verdicts_accept_unique` leaves it.
+ *
+ * Answers with the ROW that got there first, not just a flag, so a veto that loses can be pinned to
+ * the accept it lost to (see {@link contestedVetoes}).
  */
 function pickAlreadyAnswered(
   tx: Pick<AntonDb, "select">,
   input: { projectId: string; beadId: string; planId?: string },
   verdict: PickerVerdict,
-): boolean {
-  if (!input.planId) return false;
-  return (
-    tx
-      .select({ id: schema.pickerVerdicts.id })
-      .from(schema.pickerVerdicts)
-      .where(
-        and(
-          eq(schema.pickerVerdicts.projectId, input.projectId),
-          eq(schema.pickerVerdicts.beadId, input.beadId),
-          eq(schema.pickerVerdicts.planId, input.planId),
-          eq(schema.pickerVerdicts.verdict, verdict),
-        ),
-      )
-      .limit(1)
-      .all().length > 0
-  );
+): string | undefined {
+  if (!input.planId) return undefined;
+  return tx
+    .select({ id: schema.pickerVerdicts.id })
+    .from(schema.pickerVerdicts)
+    .where(
+      and(
+        eq(schema.pickerVerdicts.projectId, input.projectId),
+        eq(schema.pickerVerdicts.beadId, input.beadId),
+        eq(schema.pickerVerdicts.planId, input.planId),
+        eq(schema.pickerVerdicts.verdict, verdict),
+      ),
+    )
+    .limit(1)
+    .all()[0]?.id;
 }
 
 /**
@@ -191,6 +192,79 @@ function standingDecline(
   );
 }
 
+/**
+ * File the decline: extend the standing one, or write a new row, and answer with the hold in force.
+ *
+ * Shared by the veto itself and by the REPLAY a withdrawn reservation performs
+ * ({@link withdrawPickerAccept}) — one place decides what a decline does, so a replayed veto lands
+ * exactly as the original would have.
+ */
+function writeDecline(
+  tx: Pick<AntonDb, "select" | "insert" | "update">,
+  input: RecordVetoInput,
+  nowMs: number,
+): PickerDeferral {
+  const standing = standingDecline(tx, input, new Date(nowMs));
+  const heldUntilMs = Math.max(
+    nowMs + PICKER_DEFER_WINDOW_MS,
+    standing ? (msOf(standing.deferredUntil) ?? 0) : 0,
+  );
+  if (standing) {
+    tx.update(schema.pickerVerdicts)
+      .set({
+        action: input.action,
+        rule: input.rule ?? standing.rule,
+        criterion: input.criterion ?? standing.criterion,
+        rank: input.rank ?? standing.rank,
+        deferredUntil: secDate(heldUntilMs),
+        decidedAt: secDate(nowMs),
+      })
+      .where(eq(schema.pickerVerdicts.id, standing.id))
+      .run();
+  } else {
+    tx.insert(schema.pickerVerdicts)
+      .values({
+        id: randomUUID(),
+        projectId: input.projectId,
+        beadId: input.beadId,
+        verdict: "declined",
+        action: input.action,
+        rule: input.rule ?? null,
+        criterion: input.criterion ?? null,
+        rank: input.rank ?? null,
+        planId: input.planId ?? null,
+        deferredUntil: secDate(heldUntilMs),
+        decidedAt: secDate(nowMs),
+      })
+      .run();
+  }
+  return { beadId: input.beadId, untilMs: secDate(heldUntilMs).getTime() };
+}
+
+/**
+ * Vetoes that lost to a RESERVATION, held against the accept row each lost to (PR #212 review).
+ *
+ * A release reserves its accept before it enqueues, so a veto racing it is refused: the pick is
+ * running. But the reservation is provisional — an enqueue that throws takes it back — and a veto
+ * dropped on the floor there would leave the operator with no run, no accept and no hold, on a pick
+ * they refused and were told was already under way. So the loser rides with the winner and is
+ * replayed by {@link withdrawPickerAccept} inside the very transaction that deletes it.
+ *
+ * In memory on purpose: a reservation lives for the length of one request in one process, and a
+ * process that dies mid-release leaves the accept standing with nobody to withdraw it either. An
+ * entry whose accept kept its run is never claimed, so entries are aged out on the next loss rather
+ * than by a timer nothing else needs.
+ */
+const CONTESTED_TTL_MS = 10 * 60 * 1000;
+const contestedVetoes = new Map<string, { input: RecordVetoInput; atMs: number }>();
+
+function holdContestedVeto(acceptId: string, input: RecordVetoInput, nowMs: number): void {
+  for (const [id, held] of contestedVetoes) {
+    if (nowMs - held.atMs > CONTESTED_TTL_MS) contestedVetoes.delete(id);
+  }
+  contestedVetoes.set(acceptId, { input, atMs: nowMs });
+}
+
 /** What a veto did: the hold it placed, or the release that answered this pick first. */
 export type PickerVetoOutcome =
   | { recorded: true; deferral: PickerDeferral }
@@ -207,10 +281,14 @@ export type PickerVetoOutcome =
  *
  * Refused outright when a release already accepted this pick (see {@link pickAlreadyAnswered}): the
  * run is under way, so there is nothing left to set aside, and the caller reports that rather than
- * filing a decline against a decision the operator already took the other side of. A REPEAT veto is
- * allowed — the same answer, not the opposite one — and EXTENDS the standing decline rather than
- * writing a second one (see {@link standingDecline}), keeping the later expiry and whatever
- * provenance either veto carried: a stale tab that no longer knows the rank must not erase it.
+ * filing a decline against a decision the operator already took the other side of. The refusal is
+ * not the end of it, though — the accept may still be a RESERVATION whose run never starts, so the
+ * loss is remembered against that row ({@link contestedVetoes}) and replayed if it is withdrawn.
+ *
+ * A REPEAT veto is allowed — the same answer, not the opposite one — and EXTENDS the standing
+ * decline rather than writing a second one (see {@link standingDecline}), keeping the later expiry
+ * and whatever provenance either veto carried: a stale tab that no longer knows the rank must not
+ * erase it.
  */
 export async function recordPickerVeto(
   db: AntonDb,
@@ -218,53 +296,14 @@ export async function recordPickerVeto(
   input: RecordVetoInput,
 ): Promise<PickerVetoOutcome> {
   const nowMs = clock.now();
-  const untilMs = nowMs + PICKER_DEFER_WINDOW_MS;
   return db.transaction(
     (tx) => {
-      if (pickAlreadyAnswered(tx, input, "accepted")) {
+      const accepted = pickAlreadyAnswered(tx, input, "accepted");
+      if (accepted) {
+        holdContestedVeto(accepted, input, nowMs);
         return { recorded: false, reason: "released" } as const;
       }
-      const standing = standingDecline(tx, input, new Date(nowMs));
-      const heldUntilMs = Math.max(
-        untilMs,
-        standing ? (msOf(standing.deferredUntil) ?? 0) : 0,
-      );
-      if (standing) {
-        tx.update(schema.pickerVerdicts)
-          .set({
-            action: input.action,
-            rule: input.rule ?? standing.rule,
-            criterion: input.criterion ?? standing.criterion,
-            rank: input.rank ?? standing.rank,
-            deferredUntil: secDate(heldUntilMs),
-            decidedAt: secDate(nowMs),
-          })
-          .where(eq(schema.pickerVerdicts.id, standing.id))
-          .run();
-      } else {
-        tx.insert(schema.pickerVerdicts)
-          .values({
-            id: randomUUID(),
-            projectId: input.projectId,
-            beadId: input.beadId,
-            verdict: "declined",
-            action: input.action,
-            rule: input.rule ?? null,
-            criterion: input.criterion ?? null,
-            rank: input.rank ?? null,
-            planId: input.planId ?? null,
-            deferredUntil: secDate(heldUntilMs),
-            decidedAt: secDate(nowMs),
-          })
-          .run();
-      }
-      return {
-        recorded: true,
-        deferral: {
-          beadId: input.beadId,
-          untilMs: secDate(heldUntilMs).getTime(),
-        },
-      } as const;
+      return { recorded: true, deferral: writeDecline(tx, input, nowMs) } as const;
     },
     { behavior: "immediate" },
   );
@@ -348,17 +387,33 @@ export async function recordPickerAccept(
  * The release RESERVES its answer before it enqueues, so a veto racing it cannot slip in between the
  * run starting and the decision being settled. The cost of reserving early is that the run may still
  * fail to start — and an accept for a run that never started is evidence of nothing. So the reserver
- * compensates: it deletes the row it wrote, by id, and only ever that one. A veto that lost the race
- * meanwhile stays lost, which is the honest outcome — it was answered, and the answer was withdrawn,
- * not overturned.
+ * compensates: it deletes the row it wrote, by id, and only ever that one.
+ *
+ * And a veto that lost ONLY to that reservation is replayed with it (PR #212 review). The refusal it
+ * got said the target was already running; once the run turns out not to exist, the operator is left
+ * with no run, no accept and no hold on a pick they refused — so the decline they were denied is
+ * filed here instead, in the same transaction, exactly as {@link recordPickerVeto} would have filed
+ * it. A veto that lost to an accept whose run DID start stays lost, which is the honest outcome.
+ *
+ * @returns the hold a replayed veto placed, or undefined when nothing was replayed.
  */
 export async function withdrawPickerAccept(
   db: AntonDb,
   id: string,
-): Promise<void> {
-  await db
-    .delete(schema.pickerVerdicts)
-    .where(eq(schema.pickerVerdicts.id, id));
+  clock: Clock,
+): Promise<PickerDeferral | undefined> {
+  return db.transaction(
+    (tx) => {
+      tx.delete(schema.pickerVerdicts).where(eq(schema.pickerVerdicts.id, id)).run();
+      // Claimed under the write lock, so a veto arriving between the delete and the replay is
+      // refused by neither: the accept is already gone, so it records its own decline.
+      const contested = contestedVetoes.get(id);
+      if (!contested) return undefined;
+      contestedVetoes.delete(id);
+      return writeDecline(tx, contested.input, clock.now());
+    },
+    { behavior: "immediate" },
+  );
 }
 
 /**

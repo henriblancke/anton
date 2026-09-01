@@ -654,10 +654,23 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // autonomy reads these counts to decide whether the picker may ever be armed. A run live on
   // another machine KEEPS it — the operator accepted the pick and the work is running, which is what
   // the accept records; only a failed or suppressed enqueue leaves nothing to answer for.
+  //
+  // Withdrawing also REPLAYS a veto that lost only to this reservation (PR #212 review): that
+  // operator was told the target was already running, and with no run there is nothing left for
+  // their decline to contradict — so the store files it rather than letting the failed release
+  // swallow it.
   if (acceptId && run !== "started" && run !== "elsewhere") {
-    await withdrawPickerAccept(getDb(), acceptId).catch((err: unknown) => {
-      console.error(`[approve] failed to withdraw the picker accept for ${epicId}`, err);
-    });
+    await withdrawPickerAccept(getDb(), acceptId, systemClock)
+      .then((replayed) => {
+        if (replayed) {
+          console.warn(
+            `[approve] ${epicId} started no run, so the veto that lost to its reservation was recorded after all`,
+          );
+        }
+      })
+      .catch((err: unknown) => {
+        console.error(`[approve] failed to withdraw the picker accept for ${epicId}`, err);
+      });
   }
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local

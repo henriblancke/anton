@@ -2,26 +2,13 @@
 
 import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { TYPE_RAIL } from "@/components/board/board-utils";
+import { TYPE_RAIL, isPickerPick } from "@/components/board/board-utils";
 import { ChipHeader, ChipMeta } from "@/components/board/standalone-chip-parts";
 import { ChipBacklogActions } from "@/components/board/standalone-chip-actions";
+import { PickDecisionProvider, useCardVeto } from "@/components/board/pick-decision";
 import { useStandaloneApproval } from "@/components/board/use-standalone-approval";
 
-/**
- * A standalone (parentless) task/bug — an epic-of-one — rendered as a compact typed chip, not a
- * fake epic card. Carries the shared type language (icon + hue + left rail + badge) and, in the
- * backlog, an "Approve & run" affordance that hits the same T2 approve route an epic uses (the
- * route validates the id is a real run target). A self-filed, still-unread bug shows a marker.
- *
- * The chip itself is only the shell: approval/snooze state lives in useStandaloneApproval, the rows
- * in standalone-chip-parts, and the backlog controls in standalone-chip-actions.
- */
-export function StandaloneChip({
-  slug,
-  item,
-  budgetAware = false,
-  onOpen,
-}: {
+type StandaloneChipProps = {
   slug: string;
   item: StandaloneItem;
   /**
@@ -31,6 +18,44 @@ export function StandaloneChip({
   budgetAware?: boolean;
   /** Open this ticket's detail dialog. When omitted the chip is non-interactive (view-only). */
   onOpen?: (ticketId: string) => void;
+};
+
+/**
+ * A standalone (parentless) task/bug — an epic-of-one — rendered as a compact typed chip, not a
+ * fake epic card. Carries the shared type language (icon + hue + left rail + badge) and, in the
+ * backlog, an "Approve & run" affordance that hits the same T2 approve route an epic uses (the
+ * route validates the id is a real run target). A self-filed, still-unread bug shows a marker.
+ *
+ * The chip itself is only the shell: approval/snooze state lives in useStandaloneApproval, the rows
+ * in standalone-chip-parts, and the backlog controls in standalone-chip-actions.
+ *
+ * A picked chip on a surface with no lane row to answer it (the epic swimlanes, PR #212 review)
+ * carries the pick's decision itself — the vetoes beside `[Release]`, under one lock — exactly as
+ * the card does. The provider wraps the chip rather than living inside it, so the chip's own
+ * approval hook takes the lock it created.
+ */
+export function StandaloneChip(props: StandaloneChipProps) {
+  const cardVeto = useCardVeto();
+  const { item } = props;
+  const answerable =
+    cardVeto !== undefined && isPickerPick(item.provenance) && item.notNowUntil === undefined;
+  if (!answerable) return <ChipBody {...props} />;
+  return (
+    <PickDecisionProvider>
+      <ChipBody {...props} cardVeto={cardVeto} />
+    </PickDecisionProvider>
+  );
+}
+
+function ChipBody({
+  slug,
+  item,
+  budgetAware = false,
+  onOpen,
+  cardVeto,
+}: StandaloneChipProps & {
+  /** Set when this chip owns its pick's vetoes; where the hold they place is reported. */
+  cardVeto?: (beadId: string, untilMs: number) => void;
 }) {
   const approval = useStandaloneApproval(slug, item);
   const hasOverlay = Boolean(onOpen);
@@ -64,6 +89,7 @@ export function StandaloneChip({
           budgetAware={budgetAware}
           approval={approval}
           hasOverlay={hasOverlay}
+          {...(cardVeto === undefined ? {} : { cardVeto })}
         />
       )}
     </div>

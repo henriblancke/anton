@@ -6,18 +6,18 @@
  * forked lane card would drift that markup and fail here.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { STAGES, type Board, type Epic, type StandaloneItem, type Stage } from "@/lib/types";
 
-vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() } }));
 
 // The board reads its Epic/Area narrowing from the URL; grouping is orthogonal to it, so this
 // suite runs on an unfiltered URL. The filter behaviour itself is covered in epic-filter.test.tsx.
 vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
   usePathname: () => "/projects/tmp",
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
 }));
 
 // dnd-kit can't resolve droppables under jsdom's zero-size rects; the board's drag behaviour is
@@ -140,6 +140,34 @@ function fixture(): Board {
   };
 }
 
+/** The generation the picks below were drawn from — what an answer to one must name. */
+const PLAN_ID = "plan-gen-1";
+
+/**
+ * The same fixture with the picker's mark on one card and one chip, and a recorded plan behind them.
+ * Grouping by epic leaves both picks in their epic's Backlog slice — no lane, and so no row to carry
+ * the decision (PR #212 review).
+ */
+function picked(): Board {
+  const board = fixture();
+  board.columns.backlog = board.columns.backlog.map((e) => ({
+    ...e,
+    provenance: [{ kind: "policy" as const }],
+  }));
+  board.standalone.backlog = board.standalone.backlog.map((i) => ({
+    ...i,
+    provenance: [{ kind: "policy" as const }],
+  }));
+  return {
+    ...board,
+    upNext: [
+      { beadId: "anton-1", rank: 1, priority: 2, type: "feature", unblocks: 0, createdAt: "2026-08-01T00:00:00.000Z" },
+      { beadId: "anton-t3x", rank: 2, priority: 2, type: "bug", unblocks: 0, createdAt: "2026-08-01T00:00:00.000Z" },
+    ],
+    upNextPlanId: PLAN_ID,
+  };
+}
+
 /** The EpicCard root for a card — the element wrapping its full-card deep link. */
 function cardMarkup(cardId: string): string {
   const link = document.querySelector(`a[href="/projects/tmp/epics/${cardId}"]`);
@@ -220,6 +248,77 @@ describe("board grouping (anton-9pkk.4)", () => {
     expect(noEpic.textContent).toContain("Prune closed beads");
     expect(noEpic.textContent).toContain("Board drag snaps back on drop");
     expect(noEpic.textContent).toContain("2 loose run targets");
+  });
+
+  it("answers a pick in full — Release AND both vetoes — where there is no Up Next row", () => {
+    render(<EpicBoard slug="tmp" initialBoard={picked()} />);
+    toggleTo("Epic");
+
+    // The lane is a column position, so grouping by epic leaves the picks in Backlog. Every way to
+    // answer one has to come with them, or this layout can start a pick but never refuse it.
+    // Both picks — the card and the chip — carry all three answers.
+    expect(screen.getAllByRole("button", { name: /release/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Never" })).toHaveLength(2);
+  });
+
+  it("names the generation on screen, so the decline answers the pick that was shown", async () => {
+    const until = Date.now() + 24 * 60 * 60 * 1000;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) =>
+      String(input).includes("/picker/veto")
+        ? new Response(JSON.stringify({ beadId: "anton-1", action: "not-now", deferredUntil: until }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(null, { status: 304 }),
+    );
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+    render(<EpicBoard slug="tmp" initialBoard={picked()} />);
+    toggleTo("Epic");
+
+    fireEvent.click(screen.getAllByRole("button", { name: /not now/i })[0]);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/projects/tmp/picker/veto",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ beadId: "anton-1", action: "not-now", planId: PLAN_ID }),
+        }),
+      ),
+    );
+    // The hold lands on the card here exactly as it does in the lane: the target reads as set aside
+    // on the click, and stops offering the answer it was just given.
+    await waitFor(() => expect(screen.getByText(/not now ·/i)).toBeTruthy());
+    expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(1);
+  });
+
+  it("keeps the two answers exclusive — a veto in flight closes the Release beside it", async () => {
+    // One decision per pick, the same lock the lane's row holds (PR #212 review): with the row gone
+    // the card owns it, or the swimlanes could release a target they are deferring.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async (input: RequestInfo | URL) =>
+          new Promise<Response>((resolve) => {
+            if (!String(input).includes("/picker/veto")) resolve(new Response(null, { status: 304 }));
+          }),
+      ) as unknown as typeof fetch,
+    );
+    render(<EpicBoard slug="tmp" initialBoard={picked()} />);
+    toggleTo("Epic");
+
+    fireEvent.click(screen.getAllByRole("button", { name: /not now/i })[0]);
+
+    // The vetoed pick's Release closes; the other pick's stays open — the lock is per pick, never
+    // per board.
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByRole("button", { name: /release/i })
+          .map((b) => b.hasAttribute("disabled")),
+      ).toEqual([true, false]),
+    );
   });
 
   it("remembers the grouping per project", () => {

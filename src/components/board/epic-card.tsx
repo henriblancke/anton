@@ -25,9 +25,14 @@ import { toastContractAdvisory } from "@/components/board/contract-advisory";
 import { ApproveBlocked, ContractChip } from "@/components/board/contract-mark";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 import { ProvenanceBadges } from "@/components/board/provenance-badge";
-import { usePickDecision } from "@/components/board/pick-decision";
+import {
+  PickDecisionProvider,
+  useCardVeto,
+  usePickDecision,
+} from "@/components/board/pick-decision";
 import { ReleaseAction } from "@/components/board/release-action";
 import { NotNowChip } from "@/components/board/not-now-chip";
+import { VetoActions } from "@/components/board/veto-actions";
 import {
   AbandonedChip,
   BlockedChip,
@@ -50,13 +55,28 @@ function prLabel(ref: string): string {
  * confirmations. A feature is the tier anton runs, so a card must never call itself an epic. */
 const typeWord = (epic: Epic): string => TYPE_LABELS[epic.type].toLowerCase();
 
-export function EpicCard({
-  slug,
-  epic,
-  overlay = false,
-  budgetAware = false,
-  onDeleted,
-}: {
+/**
+ * A card the picker chose, on a surface with no lane row to answer it (the epic swimlanes, PR #212
+ * review): the card carries the pick's decision itself — the two vetoes beside `[Release]`, under
+ * one lock, exactly as an Up Next row does. Everywhere else this is the plain card.
+ *
+ * The provider has to sit OUTSIDE the card, not inside it, or the card's own approve would read the
+ * surrounding context instead of the lock it just created.
+ */
+export function EpicCard(props: EpicCardProps) {
+  const cardVeto = useCardVeto();
+  const { epic } = props;
+  const answerable =
+    cardVeto !== undefined && isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
+  if (!answerable) return <EpicCardBody {...props} />;
+  return (
+    <PickDecisionProvider>
+      <EpicCardBody {...props} cardVeto={cardVeto} />
+    </PickDecisionProvider>
+  );
+}
+
+type EpicCardProps = {
   slug: string;
   epic: Epic;
   overlay?: boolean;
@@ -67,6 +87,18 @@ export function EpicCard({
   budgetAware?: boolean;
   /** Fired after this epic is deleted so the board can drop it from its columns. */
   onDeleted?: (epicId: string) => void;
+};
+
+function EpicCardBody({
+  slug,
+  epic,
+  overlay = false,
+  budgetAware = false,
+  onDeleted,
+  cardVeto,
+}: EpicCardProps & {
+  /** Set when this card owns its pick's vetoes; where the hold they place is reported. */
+  cardVeto?: (beadId: string, untilMs: number) => void;
 }) {
   // Optimistic override only — the source of truth is `epic.approved`, which a later board poll
   // refreshes. Deriving from the prop (rather than seeding local state once) keeps the controls in
@@ -312,6 +344,18 @@ export function EpicCard({
                 )}
               </span>
             ))}
+          {/* The two ways to disagree with the pick (R3.9), on the card because this surface has no
+              row to put them on. Same lock as the Release beside them: one answer per pick. */}
+          {cardVeto && picked && (
+            <VetoActions
+              slug={slug}
+              beadId={epic.id}
+              {...(decision.planId === undefined ? {} : { planId: decision.planId })}
+              title={epic.title}
+              className="pointer-events-auto"
+              onVetoed={(untilMs) => cardVeto(epic.id, untilMs)}
+            />
+          )}
           <ConfirmDeleteButton
             onConfirm={handleDelete}
             iconOnly

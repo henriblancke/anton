@@ -53,8 +53,16 @@ const OPEN: PickDecision = {
 
 const PickDecisionContext = createContext<PickDecision>(OPEN);
 
+/** What a surface that renders picks without a lane row of their own tells the cards below it. */
+type PlanSurface = {
+  planId?: string;
+  onVetoed?: (beadId: string, untilMs: number) => void;
+};
+
+const EMPTY_SURFACE: PlanSurface = {};
+
 /** The plan generation on screen, for surfaces that render picks without a per-pick provider. */
-const PlanGenerationContext = createContext<string | undefined>(undefined);
+const PlanSurfaceContext = createContext<PlanSurface>(EMPTY_SURFACE);
 
 /**
  * The generation the cards below were drawn from, where the picks are NOT rows of the lane (PR #212
@@ -66,17 +74,39 @@ const PlanGenerationContext = createContext<string | undefined>(undefined);
  * current, so a later pass that re-picked the bead would be credited with an agreement to a pick the
  * operator never saw.
  *
+ * `onVetoed` is the other half of that missing row: with no row to hang them on, the two ways to
+ * DISAGREE with a pick go on the card itself, and this is where the hold they place is reported so
+ * the surface can hold the target back before its next poll. Its presence is what puts them there —
+ * a surface whose rows carry their own vetoes (the lane) leaves it out, and the card renders none.
+ *
  * The GENERATION only, never the lock. The lock is per pick (see {@link PickDecisionProvider}); one
  * spanning a whole board would let answering one card freeze every other.
  */
 export function PlanGenerationProvider({
   planId,
+  onVetoed,
   children,
 }: {
   planId?: string;
+  onVetoed?: (beadId: string, untilMs: number) => void;
   children: React.ReactNode;
 }) {
-  return <PlanGenerationContext.Provider value={planId}>{children}</PlanGenerationContext.Provider>;
+  const surface = useMemo<PlanSurface>(
+    () => ({
+      ...(planId === undefined ? {} : { planId }),
+      ...(onVetoed === undefined ? {} : { onVetoed }),
+    }),
+    [planId, onVetoed],
+  );
+  return <PlanSurfaceContext.Provider value={surface}>{children}</PlanSurfaceContext.Provider>;
+}
+
+/**
+ * How a card reports a veto it renders itself, or undefined when the surface has rows that own the
+ * vetoes (the Up Next lane) — in which case the card draws none.
+ */
+export function useCardVeto(): PlanSurface["onVetoed"] {
+  return useContext(PlanSurfaceContext).onVetoed;
 }
 
 export function PickDecisionProvider({
@@ -114,7 +144,7 @@ export function usePickDecision(): PickDecision {
   const decision = useContext(PickDecisionContext);
   // A per-pick provider names its own generation; anything else falls back to the one the surface is
   // showing, so a control outside the lane still answers the decision it was drawn from.
-  const generation = useContext(PlanGenerationContext);
+  const generation = useContext(PlanSurfaceContext).planId;
   return useMemo(
     () =>
       decision.planId !== undefined || generation === undefined

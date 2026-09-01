@@ -374,14 +374,18 @@ describe("the budget line in the Up Next lane", () => {
  * inside the lane knows WHICH generation it was drawn from, exactly as the vetoes above it do.
  */
 describe("releasing a pick from the lane", () => {
-  it("names the generation on screen, so the accept answers the pick that was shown", async () => {
-    const fetchMock = stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
+  /** The fixture with the picker's mark on rank 1 — what draws `[Release]` in place of Approve. */
+  function markedBoard(): Board {
     const board = fixture(PLAN);
-    // The picker's mark is what draws `[Release]` in place of the plain Approve.
     board.columns.backlog = board.columns.backlog.map((e) =>
       e.id === "anton-pick2" ? { ...e, provenance: [{ kind: "policy" as const }] } : e,
     );
-    render(<EpicBoard slug="tmp" initialBoard={board} />);
+    return board;
+  }
+
+  it("names the generation on screen, so the accept answers the pick that was shown", async () => {
+    const fetchMock = stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard()} />);
 
     fireEvent.click(screen.getByRole("button", { name: /release/i }));
 
@@ -393,6 +397,43 @@ describe("releasing a pick from the lane", () => {
         }),
       ),
     );
+  });
+
+  it("hands the released target to Implementing, and the lane lets go of it (R3.1)", async () => {
+    // The promise the lane is built around: a released pick moves ON, it does not linger in the
+    // ranking it just left. `takeUpNext` subtracts a started pick, but only a board UPDATE makes the
+    // card actually move — which is the path a release triggers with `router.refresh()`.
+    stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
+    const { rerender } = render(<EpicBoard slug="tmp" initialBoard={markedBoard()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /release/i }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+
+    // What that refresh hands back: the run has started. The recorded plan STILL ranks the target —
+    // a pass runs every ten minutes, so the lane has to drop a started pick on the board state
+    // alone, not on the plan catching up.
+    const started = fixture(PLAN);
+    started.version = "2:sync";
+    started.columns.backlog = started.columns.backlog.filter((e) => e.id !== "anton-pick2");
+    started.columns.implementing = [
+      ...started.columns.implementing,
+      epic("anton-pick2", { title: "Prune closed beads", stage: "implementing", approved: true }),
+    ];
+    rerender(<EpicBoard slug="tmp" initialBoard={started} />);
+
+    await waitFor(() => expect(laneOf("anton-pick2")).toBe("Implementing"));
+    // In exactly one lane, as ever: it left Up Next rather than being drawn in both.
+    expect(cardCount("anton-pick2")).toBe(1);
+    const lane = screen.getByRole("region", { name: "Up Next" });
+    expect([...lane.querySelectorAll("h4")].map((h) => h.textContent)).toEqual(["Term merge"]);
+
+    // And once the next pass rewrites the plan without it, the lane goes with the last pick in it.
+    const rewritten = { ...started, version: "3:sync", upNext: undefined };
+    rerender(<EpicBoard slug="tmp" initialBoard={rewritten} />);
+
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull());
+    expect(laneOf("anton-pick2")).toBe("Implementing");
   });
 });
 

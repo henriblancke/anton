@@ -9,6 +9,8 @@ import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { ReleaseAction } from "@/components/board/release-action";
+import { VetoActions } from "@/components/board/veto-actions";
+import { usePickDecision } from "@/components/board/pick-decision";
 import { isPickerPick } from "@/components/board/board-utils";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
@@ -112,6 +114,7 @@ export function ChipBacklogActions({
   budgetAware,
   approval,
   hasOverlay,
+  cardVeto,
 }: {
   slug: string;
   item: StandaloneItem;
@@ -119,7 +122,14 @@ export function ChipBacklogActions({
   approval: StandaloneApproval;
   /** The chip's full-bleed open trigger sits behind this row; controls opt back into pointers. */
   hasOverlay: boolean;
+  /**
+   * Set when this chip owns its pick's vetoes — a surface with no lane row above it (PR #212
+   * review). Reports the hold they place so that surface can hold the target back.
+   */
+  cardVeto?: (beadId: string, untilMs: number) => void;
 }) {
+  const decision = usePickDecision();
+  const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
   return (
     <div className={cn("relative z-[1] flex flex-col gap-2", hasOverlay && "pointer-events-none")}>
       {/* Claim sits on its own line, above the action row. */}
@@ -130,9 +140,22 @@ export function ChipBacklogActions({
         readOnly={approval.approved}
         canTakeOver={item.stage === "backlog"}
       />
-      {/* Queue · Approve · Snooze share one line (anton-tc6y); snooze is pushed to the right. */}
-      <div className="flex items-center gap-1">
+      {/* Queue · Approve · Snooze share one line (anton-tc6y); snooze is pushed to the right. Wraps,
+          because a picked chip adds both vetoes to that line and a lane column is narrow. */}
+      <div className="flex flex-wrap items-center gap-1">
         <ApproveRunAction slug={slug} item={item} budgetAware={budgetAware} approval={approval} />
+        {/* The two ways to disagree with the pick (R3.9), on the chip because this surface has no
+            row to put them on. Same lock as the Release beside them: one answer per pick. */}
+        {cardVeto && picked && canOfferRun(item, approval.approved, approval.deferred) && (
+          <VetoActions
+            slug={slug}
+            beadId={item.id}
+            {...(decision.planId === undefined ? {} : { planId: decision.planId })}
+            title={item.title}
+            className="pointer-events-auto"
+            onVetoed={(untilMs) => cardVeto(item.id, untilMs)}
+          />
+        )}
         <SnoozeButton
           slug={slug}
           ticketId={item.id}
