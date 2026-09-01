@@ -807,6 +807,12 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               ` — refusing to execute`,
         );
       }
+      // The label the top-of-handler backstop judged moves in exactly the same window as the shape
+      // (PR #213 review). The pull above adopted a fresh target and nothing downstream re-reads
+      // `agent:human`, so a relabel landing here would carry a person's work into the dispatch loop
+      // and hand it to the default agent. Re-asked in the backstop's own words, and here rather than
+      // beside that backstop so a run whose PR is already live still settles idempotently above.
+      target = adoptRefreshedTarget(all, epicBeadId, target);
       let freshChildren = runTickets(all, epicBeadId);
       standaloneRun = !beads.groupsChildren(target, freshChildren);
       tickets = standaloneRun ? [target] : freshChildren;
@@ -1117,6 +1123,19 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
               `before its run-lease was visible`,
           );
         }
+        //     And the target's LABEL, on the freshest board this run ever reads (PR #213 review).
+        //     `agent:human` is asked in exactly two places — the top-of-handler backstop and this
+        //     adopt — so a relabel that lands in the lease window is refused here or nowhere.
+        //     Adopted, not merely checked: the two drift gates just proved this board describes the
+        //     same run, so its bead is the one every later label read should be answering.
+        //     Read out of the board rather than off `target`, which widens back to
+        //     `Bead | undefined` inside this closure; the drift gate above already proved it is here.
+        const confirmedTarget = confirmedBoard.find((b) => b.id === epicBeadId);
+        if (confirmedTarget) {
+          target = adoptRefreshedTarget(confirmedBoard, epicBeadId, confirmedTarget);
+          //   A standalone run's ticket IS its target, so the two never diverge.
+          if (standaloneRun) tickets = [target];
+        }
       });
 
       leaseTimer = setInterval(() => {
@@ -1202,56 +1221,15 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     them by the ordinary blocked-child rule rather than a second, parallel notion of "held".
       const humanTickets = tickets.filter((t) => !isResumeSkipped(t) && beads.isHumanWork(t));
       if (humanTickets.length > 0) {
-        // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet:
-        // held for this pass, closed by the resume that follows the blocker (see the loop below).
-        const answeredButBlocked = new Map<string, string[]>();
-        // Every wait THIS pass armed, so a kill landing BETWEEN two arms can take them back (PR #213
-        // review). `armHumanGate` undoes only the gate it was arming when the signal flipped; the
-        // ones earlier iterations armed are already returned, and each promises a person that
-        // resolving it resumes a run that is no longer coming back for it.
-        const armedHere: ArmedTicketGate[] = [];
-        try {
-          for (const t of humanTickets) {
-            // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
-            // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
-            const answered = answeredHumanGate(all, t);
-            if (answered) {
-              // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
-              // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
-              // cannot be closed until that work lands. Closing anyway throws a plain error the runner
-              // retries identically until the attempts are gone — a cryptic bd message and no sibling
-              // ever dispatched. Hold the ticket instead: the person's half is done and must not be
-              // asked for again (so no re-arm), the code it waits on is not, and the resume that
-              // follows that blocker closes it into this same branch.
-              const stillBlocked = openBlockersOf(all, t.id);
-              if (stillBlocked.length > 0) {
-                answeredButBlocked.set(t.id, stillBlocked);
-                console.log(
-                  `[execute-epic] ${epicBeadId}: holding ${t.id} — its human gate ${answered.id} is ` +
-                    `answered but it is still blocked by ${stillBlocked.join(", ")}`,
-                );
-                continue;
-              }
-              await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
-              console.log(
-                `[execute-epic] ${epicBeadId}: closed ${t.id} — a person answered its human gate ` +
-                  `${answered.id}`,
-              );
-              continue;
-            }
-            armedHere.push({
-              ticketId: t.id,
-              gate: await armHumanGate(
-                repo,
-                t.id,
-                { ticketId: t.id, ask: humanTicketAsk(t) },
-                ctx.signal,
-              ),
-            });
-          }
-        } catch (e) {
-          throw await undoCancelledTicketGates(armedHere, ctx.signal, e);
-        }
+        // What a person answered is closed here, what they have not is armed, and what their answer
+        // cannot yet release is reported back as held.
+        const answeredButBlocked = await armHumanTicketGates(
+          repo,
+          epicBeadId,
+          all,
+          humanTickets,
+          ctx.signal,
+        );
         // Re-read the board the gates and closes are ON — the TARGET, the ticket SET and the
         // verdict. A ticket closed just above is done work now, and the loop below reads its status
         // off these objects to skip it.
@@ -2772,9 +2750,14 @@ export function humanGateReason(targetId: string, { ticketId, ask }: HumanAsk): 
  *
  * A re-read that rebuilds only the ticket set leaves the target itself at a pre-refresh snapshot,
  * and every check downstream then judges labels the board has already moved on from. `agent:human`
- * is the label that cannot survive that: the backstop at the top of the handler is the ONLY place
- * that asks it, so a target relabelled while the run was starting would go on to dispatch a person's
- * work to the default agent. Refused here in the backstop's own words ({@link humanTargetPoison}).
+ * is the label that cannot survive that: outside the backstop at the top of the handler, this is the
+ * only place that asks it, so a target relabelled while the run was starting would go on to dispatch
+ * a person's work to the default agent. Refused here in the backstop's own words
+ * ({@link humanTargetPoison}).
+ *
+ * Called at EVERY refresh, not only the one the human-ticket arm makes (PR #213 review) — the pull
+ * in step 0 and the under-lock confirm in step 1c adopt boards of their own, and a relabel that
+ * lands in either window is caught here or nowhere.
  *
  * A target that has vanished from the refreshed board keeps the caller's object rather than throwing
  * — losing the bead is {@link runTargetDrift}'s question, asked under the run-lease, and answering it
@@ -2790,9 +2773,10 @@ export function adoptRefreshedTarget(board: Bead[], targetId: string, current: B
 /**
  * The refusal a run target labelled `agent:human` settles with (anton-mv70).
  *
- * Shared by the top-of-handler backstop and the post-arm re-read in step 0b-pre (PR #213 review), so
- * a label that only becomes visible once the run has started is refused in exactly the same words —
- * and neither site can drift into telling an operator something different about the same bead.
+ * Shared by the top-of-handler backstop and every board refresh that follows it ({@link
+ * adoptRefreshedTarget}), so a label that only becomes visible once the run has started is refused
+ * in exactly the same words — and no site can drift into telling an operator something different
+ * about the same bead.
  */
 function humanTargetPoison(targetId: string): PoisonEpic {
   return new PoisonEpic(
@@ -2815,7 +2799,7 @@ function humanTargetPoison(targetId: string): PoisonEpic {
  * Derived purely from the bead, so re-entering a run reproduces the same reason and reuses the same
  * wait instead of stacking a second one. One line, because it becomes an escalation row.
  */
-function humanTicketAsk(ticket: Bead): string {
+export function humanTicketAsk(ticket: Bead): string {
   const title = (ticket.title ?? "").replace(/\s+/g, " ").trim();
   return (
     `${title || ticket.id} — labelled ${LABELS.agentHuman}, so a person does this work, not an ` +
@@ -2890,12 +2874,99 @@ function answeredHumanGate(board: Bead[], ticket: Bead): Gate | undefined {
  * already closed would read as blocked forever and never be closed at all. An unknown dependency
  * counts as open, the same fail-safe the graph takes: bd holds the close either way.
  */
-function openBlockersOf(board: Bead[], beadId: string): string[] {
+function openBlockersOf(
+  board: Bead[],
+  beadId: string,
+  /** Beads closed since `board` was read — closed to bd, still open in this snapshot. */
+  closedSince: ReadonlySet<string> = new Set(),
+): string[] {
   const byId = new Map(board.map((b) => [b.id, b]));
   return (board.find((b) => b.id === beadId)?.dependencies ?? [])
     .filter((d) => d.type === "blocks")
     .map((d) => d.depends_on_id)
-    .filter((id) => byId.get(id)?.status !== "closed");
+    .filter((id) => !closedSince.has(id) && byId.get(id)?.status !== "closed");
+}
+
+/**
+ * The human tickets' half of preflight (anton-mv70): close what a person has already answered, arm a
+ * wait on what they have not, and report back the tickets an ordinary blocker still holds.
+ *
+ * Walked in DEPENDENCY order (PR #213 review). One human ticket can block another ("sign the
+ * contract, then wire the account"), and `board` is the read taken BEFORE this pass — so a
+ * prerequisite closed here still reads as open to the ticket waiting on it. Ordered, and with the
+ * closes this pass made carried alongside the board, the dependent is closed too instead of being
+ * held for a wait that is already over: a hold there parks the run on a blocker the very next board
+ * read shows closed, with no remaining event to resume it.
+ *
+ * Every wait armed here is taken back when a kill lands mid-pass — INCLUDING one that lands after
+ * the last arm returns, which no next iteration would ever observe (PR #213 review).
+ * {@link armHumanGate} unwinds only the gate it was arming when the signal flipped, so without this
+ * the earlier ones would stand for a run nothing is coming back for, each promising a person that
+ * resolving it resumes that run.
+ *
+ * Answers the tickets whose gate is ANSWERED but whose ordinary prerequisite has not landed, keyed
+ * to the blockers still holding them — the caller folds them into the run's verdict as gated.
+ */
+export async function armHumanTicketGates(
+  repo: string,
+  targetId: string,
+  /** The board these tickets were read from — the pre-pass snapshot. */
+  board: Bead[],
+  humanTickets: Bead[],
+  signal: AbortSignal | undefined,
+): Promise<Map<string, string[]>> {
+  // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet: held
+  // for this pass, closed by the resume that follows the blocker.
+  const answeredButBlocked = new Map<string, string[]>();
+  // Every wait THIS pass armed, so a kill landing between two arms — or after the last one — can
+  // take them back.
+  const armedHere: ArmedTicketGate[] = [];
+  // The tickets this pass has already closed: closed to bd, still open in `board`.
+  const closedHere = new Set<string>();
+  try {
+    for (const t of orderTickets(humanTickets, board)) {
+      // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
+      // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
+      const answered = answeredHumanGate(board, t);
+      if (answered) {
+        // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
+        // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
+        // cannot be closed until that work lands. Closing anyway throws a plain error the runner
+        // retries identically until the attempts are gone — a cryptic bd message and no sibling
+        // ever dispatched. Hold the ticket instead: the person's half is done and must not be
+        // asked for again (so no re-arm), the code it waits on is not, and the resume that
+        // follows that blocker closes it into this same branch.
+        const stillBlocked = openBlockersOf(board, t.id, closedHere);
+        if (stillBlocked.length > 0) {
+          answeredButBlocked.set(t.id, stillBlocked);
+          console.log(
+            `[execute-epic] ${targetId}: holding ${t.id} — its human gate ${answered.id} is ` +
+              `answered but it is still blocked by ${stillBlocked.join(", ")}`,
+          );
+          continue;
+        }
+        await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
+        closedHere.add(t.id);
+        console.log(
+          `[execute-epic] ${targetId}: closed ${t.id} — a person answered its human gate ` +
+            `${answered.id}`,
+        );
+        continue;
+      }
+      armedHere.push({
+        ticketId: t.id,
+        gate: await armHumanGate(repo, t.id, { ticketId: t.id, ask: humanTicketAsk(t) }, signal),
+      });
+    }
+    // A kill landing after the LAST arm returns has no next iteration to observe it: the loop exits
+    // normally and the undo below is never reached. Ask once more on the way out.
+    if (signal?.aborted && armedHere.length > 0) {
+      throw new Error(`${targetId}'s run was cancelled after its human ticket gate(s) were armed`);
+    }
+  } catch (e) {
+    throw await undoCancelledTicketGates(armedHere, signal, e);
+  }
+  return answeredButBlocked;
 }
 
 /**

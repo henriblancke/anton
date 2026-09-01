@@ -25,7 +25,7 @@
  * of the arm live in execute-epic.needs-human.integration.test.ts against real bd.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bead, Gate } from "../beads/bd";
+import { LABELS, type Bead, type Gate } from "../beads/bd";
 import { parkedAskGateId, parkedAskGateIds } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
@@ -33,6 +33,7 @@ const gateCreateMock = vi.fn();
 const gateResolveMock = vi.fn();
 const tagMock = vi.fn();
 const pullMock = vi.fn();
+const closeMock = vi.fn();
 
 vi.mock("../beads/issues", async () => {
   const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
@@ -49,12 +50,16 @@ vi.mock("../beads/bd", async () => {
       gateResolve: (...args: unknown[]) => gateResolveMock(...args),
       tag: (...args: unknown[]) => tagMock(...args),
       pull: (...args: unknown[]) => pullMock(...args),
+      close: (...args: unknown[]) => closeMock(...args),
     },
   };
 });
 
 const {
   armHumanGate,
+  armHumanTicketGates,
+  humanGateReason,
+  humanTicketAsk,
   concludeCancelledArmedPark,
   undoCancelledTicketGates,
   HUMAN_GATE_ARMED_LABEL,
@@ -100,6 +105,7 @@ beforeEach(() => {
   gateResolveMock.mockReset().mockResolvedValue(undefined);
   tagMock.mockReset().mockResolvedValue(undefined);
   pullMock.mockReset().mockResolvedValue(undefined);
+  closeMock.mockReset().mockResolvedValue(undefined);
 });
 
 it("pulls the shared board before it plans, so a gate another machine armed is visible", async () => {
@@ -1220,5 +1226,95 @@ describe("undoCancelledTicketGates — the arms a cancelled preflight pass alrea
     expect(thrown.message).toContain("the run was cancelled");
     expect(thrown.message).toContain(`g-first (${TICKET})`);
     expect(thrown.message).toContain("g-superseding (t-2)");
+  });
+});
+
+// ── the human tickets' half of preflight (anton-mv70, PR #213 review) ──
+
+describe("armHumanTicketGates — closing what a person answered, arming what they have not", () => {
+  /** A human ticket, optionally blocked by the given beads. */
+  const ticket = (id: string, title: string, ...blockedBy: string[]): Bead =>
+    ({
+      id,
+      title,
+      status: "open",
+      issue_type: "task",
+      labels: [LABELS.agentHuman],
+      dependencies: blockedBy.map((b) => ({ issue_id: id, depends_on_id: b, type: "blocks" })),
+    }) as Bead;
+
+  /** The gate a person ANSWERED for that ticket: anton's own, closed, carrying that exact ask. */
+  const answered = (id: string, t: Bead): Gate =>
+    ({
+      ...gate(id, humanGateReason(t.id, { ticketId: t.id, ask: humanTicketAsk(t) })),
+      status: "closed",
+    }) as Gate;
+
+  it("closes a ticket whose only remaining blocker this same pass just closed", async () => {
+    // Two answered human tickets in a row ("sign the contract, then wire the account"). The board
+    // was read BEFORE the pass, so the prerequisite still reads as open to the ticket that waits on
+    // it — held there, the run parks on a blocker the next board read shows closed, and no event
+    // remains that would ever resume it.
+    const first = ticket("t-sign", "Sign the order form", "g-sign");
+    const second = ticket("t-wire", "Wire the live key", "g-wire", "t-sign");
+    const board = [first, second, answered("g-sign", first), answered("g-wire", second)];
+
+    // Listed dependent-first, to prove the pass walks them in dependency order.
+    const held = await armHumanTicketGates(REPO, "f-1", board, [second, first], undefined);
+
+    expect(held.size).toBe(0);
+    expect(closeMock.mock.calls.map((c) => c[1])).toEqual(["t-sign", "t-wire"]);
+    expect(gateCreateMock).not.toHaveBeenCalled();
+  });
+
+  it("still holds a ticket whose ORDINARY prerequisite has not landed", async () => {
+    // The in-pass closes must not over-reach: work no one did is still a blocker, and the ticket is
+    // held (never re-asked) until the resume that follows it.
+    const human = ticket("t-sign", "Sign the DPA", "g-sign", "t-api");
+    const board = [
+      human,
+      { id: "t-api", title: "Ship the API", status: "open", issue_type: "task" } as Bead,
+      answered("g-sign", human),
+    ];
+
+    const held = await armHumanTicketGates(REPO, "f-1", board, [human], undefined);
+
+    expect([...held]).toEqual([["t-sign", ["t-api"]]]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("takes back every wait when the kill lands after the LAST arm, which no iteration observes", async () => {
+    // The loop exits normally here — the signal flipped between two board writes, not inside one —
+    // so nothing in `armHumanGate` unwinds. Left standing, the gate blocks its ticket for a run that
+    // is not coming back, promising a person that resolving it resumes that run.
+    const armIt = ticket("t-buy", "Buy the Business plan");
+    const doneAlready = ticket("t-sign", "Sign the order form", "g-sign");
+    const board = [armIt, doneAlready, answered("g-sign", doneAlready)];
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue("g-buy");
+    const controller = new AbortController();
+    closeMock.mockImplementation(async () => controller.abort()); // the kill lands AFTER the arm
+
+    await expect(
+      armHumanTicketGates(REPO, "f-1", board, [armIt, doneAlready], controller.signal),
+    ).rejects.toThrow(/cancelled after its human ticket gate\(s\) were armed/);
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-buy",
+      expect.stringContaining("cancelled"),
+    );
+  });
+
+  it("arms every unanswered ticket and reports nothing held while the run is live", async () => {
+    const one = ticket("t-buy", "Buy the Business plan");
+    const two = ticket("t-sign", "Sign the order form");
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValueOnce("g-buy").mockResolvedValueOnce("g-sign");
+
+    const held = await armHumanTicketGates(REPO, "f-1", [one, two], [one, two], undefined);
+
+    expect(held.size).toBe(0);
+    expect(gateCreateMock).toHaveBeenCalledTimes(2);
+    expect(gateResolveMock).not.toHaveBeenCalled();
   });
 });
