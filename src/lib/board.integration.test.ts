@@ -4,7 +4,7 @@
  * parent-child grouping. Skipped when `bd`/`git` aren't installed.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { describeBd, makeBdRepo, makeFileDb, type BdRepo, type FileDb } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, makeFileDb, tmpProject, type BdRepo, type FileDb } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { getBoard } from "./board";
 import type { Epic, Project } from "./types";
@@ -21,10 +21,7 @@ describeBd("board integration (real bd)", () => {
     fileDb = makeFileDb();
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "x", slug: "tmp", name: "tmp", repoPath: repo,
-      defaultBranch: "main", hasBeads: true, createdAt: 0,
-    };
+    project = tmpProject(repo);
   });
 
   afterAll(() => {

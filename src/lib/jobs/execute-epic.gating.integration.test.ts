@@ -13,7 +13,6 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
@@ -35,6 +34,7 @@ import {
   driveEpicRun,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
+import { insertProject } from "@/lib/testing/project";
 
 describeBd("execute-epic e2e — claims & gating (real handler · real bd/git · fake claude/gh)", () => {
   let sandbox: string;
@@ -774,13 +774,10 @@ process.exit(0);`),
     // dispatched. This project has no verify gates so the zero-diff commit path is what's exercised
     // (a failing test gate is a different, already-covered failure). The "changes → committed →
     // closed" path stays green via the suite's first test.
-    const noGateProjectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: noGateProjectId,
+    const noGateProjectId = insertProject(tdb.db, {
       slug: "sandbox-nogate",
       name: "sandbox-nogate",
       repoPath: repo,
-      defaultBranch: "main",
       settingsJson: JSON.stringify({}), // no testCommand → no verify gates
     });
 
@@ -937,13 +934,10 @@ process.exit(0);`),
     // at all is executing it.
     // The park comes from the zero-diff no-delivery gate, so the project gets no verify gates (a
     // failing test gate is a different, already-covered failure).
-    const cascadeProjectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: cascadeProjectId,
+    const cascadeProjectId = insertProject(tdb.db, {
       slug: "sandbox-cascade",
       name: "sandbox-cascade",
       repoPath: repo,
-      defaultBranch: "main",
       settingsJson: JSON.stringify({}),
     });
 

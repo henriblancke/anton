@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { cancelJob, leaseDue, systemClock } from "./queue";
+import { insertProject } from "@/lib/testing/project";
 
 let t: TestDb;
 beforeEach(() => {
@@ -105,10 +106,7 @@ describe("leaseDue exclude", () => {
   it("counts an excluded lease-lapsed in-flight job toward its project cap", async () => {
     // "busy": still dispatched in-process for project P, but its DB lease lapsed (missed heartbeat)
     // so it looks reclaimable. "queued": a second execute-epic queued for the SAME project.
-    t.db
-      .insert(schema.projects)
-      .values({ id: "P", slug: "P", name: "P", repoPath: "/tmp/P" })
-      .run();
+    insertProject(t.db, { id: "P", slug: "P", name: "P", repoPath: "/tmp/P" });
     const past = new Date(systemClock.now() - 100_000);
     t.db
       .insert(schema.jobs)

@@ -7,12 +7,10 @@
  * thread which will not load costs that bead its history and nothing more.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
 
 import type { Bead } from "../beads/bd";
-import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { fakeScope } from "./pass.fixture";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const showWithCommentsMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 
@@ -60,20 +58,13 @@ const roundsOf = (scores: number[]) =>
       "\n```",
   }));
 
-let t: TestDb;
+let t: TestProjectDb;
 let projectId: string;
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  t = makeTestDb();
-  projectId = randomUUID();
-  await t.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: REPO,
-    defaultBranch: "main",
-  });
+  t = makeProjectDb({ repoPath: REPO });
+  projectId = t.projectId;
   showWithCommentsMock.mockImplementation(async (_cwd, id) => bead(id, { comments: [] }));
 });
 

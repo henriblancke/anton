@@ -7,14 +7,13 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
 import { driveJob } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -35,7 +34,7 @@ describeBd("nightly-stringer e2e (real handler · real bd · fake stringer/claud
   let sandbox: string;
   let repo: string;
   let binDir: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let clock: FakeClock;
   let projectId: string;
   let restoreEnv: () => void;
@@ -123,16 +122,9 @@ process.stdin.on('end',()=>{
     process.env.ANTON_SCANS_ROOT = join(sandbox, "scans");
     process.env.ANTON_TEST_CLAUDE_ARGV = join(sandbox, "claude-argv.jsonl");
 
-    tdb = makeTestDb();
+    tdb = makeProjectDb({ repoPath: repo });
     clock = new FakeClock(1_700_000_000_000);
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    projectId = tdb.projectId;
   });
 
   afterAll(() => {

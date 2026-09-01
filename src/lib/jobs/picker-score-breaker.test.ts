@@ -15,6 +15,7 @@ import { activeDisarm, disarmAutopilot, reArmAutopilot } from "../autopilot-disa
 import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Clock } from "./queue";
 import { checkScoreSlide } from "./picker-score-breaker";
+import { insertProject } from "@/lib/testing/project";
 
 const PROJECT = "p1";
 const T0 = 1_800_000_000_000;
@@ -23,8 +24,8 @@ const MINUTE = 60_000;
 let t: TestDb;
 const clock: Clock = { now: () => T0 + 60 * MINUTE };
 
-async function project(settings: Record<string, unknown> = {}): Promise<void> {
-  await t.db.insert(schema.projects).values({
+function project(settings: Record<string, unknown> = {}): void {
+  insertProject(t.db, {
     id: PROJECT,
     slug: "p1",
     name: "P1",
@@ -68,7 +69,7 @@ afterEach(() => t.close());
 
 describe("checkScoreSlide", () => {
   it("latches the disarm with the series that triggered it", async () => {
-    await project();
+    project();
     await threeLowRuns();
 
     const outcome = await checkScoreSlide(t.db, clock, { projectId: PROJECT });
@@ -85,7 +86,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("does nothing while the runs are scoring at or above the floor", async () => {
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", atMinutes: 0, score: 4 });
     await run({ id: "r2", epic: "anton-b", atMinutes: 15, score: 9 });
     await run({ id: "r3", epic: "anton-c", atMinutes: 30, score: 8 });
@@ -97,7 +98,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("does not disarm on a run that left no score", async () => {
-    await project();
+    project();
     // The middle run never reached the review gate. Absence of evidence is not evidence.
     await run({ id: "r1", epic: "anton-a", atMinutes: 0, score: 6 });
     await run({ id: "r2", epic: "anton-b", atMinutes: 15 });
@@ -108,7 +109,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("does not lend an earlier attempt's score to an unreviewed rerun of the same target", async () => {
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", atMinutes: 0, score: 6 });
     await run({ id: "r2", epic: "anton-b", atMinutes: 15, score: 5 });
     await run({ id: "r3", epic: "anton-c", atMinutes: 30, score: 4 });
@@ -121,7 +122,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("does not disarm before the window has that many finished runs", async () => {
-    await project();
+    project();
     await run({ id: "r1", epic: "anton-a", atMinutes: 0, score: 3 });
     await run({ id: "r2", epic: "anton-b", atMinutes: 15, score: 2 });
 
@@ -129,7 +130,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("counts one score per target, however many attempts it took", async () => {
-    await project();
+    project();
     // Three run rows, one epic: a retry gets a fresh row, but the work being judged is one feature.
     // Counting each attempt would disarm the project off one bad review.
     await run({ id: "r1", epic: "anton-a", atMinutes: 0, status: "failed", score: 3 });
@@ -143,7 +144,7 @@ describe("checkScoreSlide", () => {
     // Two heavily retried targets can fill any fixed read on their own — twenty rows, two entries.
     // Stopping there would report the series as short and let a third low-scoring delivery, sitting
     // one row further back, go unread on every pass.
-    await project();
+    project();
     await run({ id: "r-c", epic: "anton-c", atMinutes: 0, score: 4 });
     for (let i = 0; i < 10; i++) {
       await run({ id: `r-b${i}`, epic: "anton-b", atMinutes: 1 + i, status: "failed", score: 5 });
@@ -168,7 +169,7 @@ describe("checkScoreSlide", () => {
   it("stops paging at the re-arm instead of walking the whole run history", async () => {
     // Every score this project has was already overruled. The read must reach the fence and stop —
     // paging on would cost the whole table, every ten minutes, to learn nothing.
-    await project();
+    project();
     await threeLowRuns();
     await checkScoreSlide(t.db, clock, { projectId: PROJECT });
     await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
@@ -187,7 +188,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("skips runs still in flight rather than reading them as gaps", async () => {
-    await project();
+    project();
     await threeLowRuns();
     await run({ id: "r4", epic: "anton-d", atMinutes: 45, status: "running" });
 
@@ -195,7 +196,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("is off when the operator zeroes the floor", async () => {
-    await project({ autopilotScoreFloor: 0 });
+    project({ autopilotScoreFloor: 0 });
     await threeLowRuns();
 
     expect(await checkScoreSlide(t.db, clock, { projectId: PROJECT })).toBeUndefined();
@@ -203,7 +204,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("honours an operator-set floor and window", async () => {
-    await project({ autopilotScoreFloor: 9, autopilotScoreWindow: 2 });
+    project({ autopilotScoreFloor: 9, autopilotScoreWindow: 2 });
     await run({ id: "r1", epic: "anton-a", atMinutes: 0, score: 8 });
     await run({ id: "r2", epic: "anton-b", atMinutes: 15, score: 8 });
 
@@ -219,7 +220,7 @@ describe("checkScoreSlide", () => {
     // The freeze landed and its strip row did not. Every breaker returns early once a latch exists,
     // so this pass is the only second chance the escalation write ever gets — and the latch outlives
     // the setting that raised it, so a disabled breaker must still finish the job.
-    await project({ autopilotScoreFloor: 0 });
+    project({ autopilotScoreFloor: 0 });
     await disarmAutopilot(t.db, clock, {
       projectId: PROJECT,
       reason: "score-regression",
@@ -236,7 +237,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("raises one escalation carrying the same series, and stamps it on the disarm", async () => {
-    await project();
+    project();
     await threeLowRuns();
 
     await checkScoreSlide(t.db, clock, { projectId: PROJECT });
@@ -254,7 +255,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("stays armed after a re-arm — those scores are the ones the operator overruled", async () => {
-    await project();
+    project();
     await threeLowRuns();
     expect((await checkScoreSlide(t.db, clock, { projectId: PROJECT }))?.latched).toBe(true);
     await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
@@ -269,7 +270,7 @@ describe("checkScoreSlide", () => {
     // The rerun settles AFTER the re-arm, so the floor lets its row in. Reading the target's old
     // score off the board would hand the breaker the very reviews the operator just overruled and
     // re-freeze the project on them — with nothing new reviewed at all.
-    await project();
+    project();
     await threeLowRuns();
     await checkScoreSlide(t.db, clock, { projectId: PROJECT });
     await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
@@ -283,7 +284,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("disarms again once NEW runs score below the floor after the re-arm", async () => {
-    await project();
+    project();
     await threeLowRuns();
     await checkScoreSlide(t.db, clock, { projectId: PROJECT });
     await reArmAutopilot(t.db, clock, { projectId: PROJECT, actor: "ops" });
@@ -299,7 +300,7 @@ describe("checkScoreSlide", () => {
   });
 
   it("abstains while the project is already disarmed", async () => {
-    await project();
+    project();
     await threeLowRuns();
     await disarmAutopilot(t.db, clock, {
       projectId: PROJECT,

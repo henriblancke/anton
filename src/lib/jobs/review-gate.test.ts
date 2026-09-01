@@ -11,12 +11,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asc } from "drizzle-orm";
 
-import { makeTestDb, type TestDb } from "../db/testing";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -33,6 +31,7 @@ import {
   type ReviewGateResult,
   type ReviewRound,
 } from "./review-gate";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 /** A one-commit `main` repo: the least a gate round needs to read its (absent) rules from. */
 function initRepo(path: string): void {
@@ -111,7 +110,7 @@ function fakeClaude(replies: ScriptedReply[]) {
 }
 
 let dir: string;
-let tdb: TestDb;
+let tdb: TestProjectDb;
 let projectId: string;
 let priorSessionsRoot: string | undefined;
 const clock = new TickingClock(1_700_000_000_000);
@@ -129,15 +128,8 @@ beforeEach(async () => {
   initRepo(dir);
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
-  tdb = makeTestDb();
-  projectId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: dir,
-    defaultBranch: "main",
-  });
+  tdb = makeProjectDb({ repoPath: dir });
+  projectId = tdb.projectId;
 });
 
 afterEach(() => {

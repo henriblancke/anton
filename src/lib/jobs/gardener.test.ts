@@ -13,13 +13,11 @@
  *     stays quiet on the remote.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import type {
   Bead,
   DuplicateGroup,
@@ -44,6 +42,7 @@ import { passRecordCounts, readPassRecords } from "../gardener/record";
 import { getHygieneReport, getHygieneReportForJob } from "../hygiene";
 import { driveJob, expectJobStatus, makeJobRunner } from "@/lib/testing/jobs";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
 const epicCloseMock = vi.fn<(cwd: string, opts?: { apply?: boolean }) => Promise<EpicCloseSweep>>();
@@ -133,7 +132,7 @@ const REPO = "/tmp/gardener-repo";
 let now = NOW;
 const clock: Clock = { now: () => now };
 
-let t: TestDb;
+let t: TestProjectDb;
 let projectId: string;
 const nudge = vi.fn();
 
@@ -181,15 +180,8 @@ beforeEach(async () => {
   sessionsDir = mkdtempSync(join(tmpdir(), "anton-gardener-"));
   priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
   process.env.ANTON_SESSIONS_ROOT = join(sessionsDir, "sessions");
-  t = makeTestDb();
-  projectId = randomUUID();
-  await t.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
-    repoPath: REPO,
-    defaultBranch: "main",
-  });
+  t = makeProjectDb({ repoPath: REPO });
+  projectId = t.projectId;
 
   calls.length = 0;
   planApplyMock.mockImplementation(realPlanApply);
