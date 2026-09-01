@@ -49,7 +49,9 @@ export interface BoardPoll {
  */
 export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPoll {
   const [board, setBoard] = useState<Board | null>(initialBoard);
-  const [error, setError] = useState<string | null>(null);
+  // The last failed read, recorded whether or not it is shown — `error` below decides that, off the
+  // rendered board. Deciding it here would mean reading `board` from a closure the read outlives.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const draggingRef = useRef(false);
   const versionRef = useRef(initialBoard?.version);
@@ -69,34 +71,31 @@ export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPol
         return;
       }
       loadingRef.current = true;
-      try {
+      let unconditional = force;
+      for (;;) {
         const writeSeq = writeSeqRef.current;
-        const next = await readBoard(slug, force ? undefined : versionRef.current);
-        if (
-          next &&
+        const read = await readBoard(slug, unconditional ? undefined : versionRef.current);
+        if (!read.ok) {
+          if (!signal?.aborted) setLoadError(read.message);
+        } else if (
+          read.board &&
           !signal?.aborted &&
           !draggingRef.current &&
           writesInFlightRef.current === 0 &&
           writeSeq === writeSeqRef.current
         ) {
-          versionRef.current = next.version;
-          setBoard(next);
-          setError(null);
+          versionRef.current = read.board.version;
+          setBoard(read.board);
+          setLoadError(null);
         }
-      } catch (err) {
-        // Only a board-less load surfaces an error UI; a failed poll keeps the last good board.
-        if (signal?.aborted) return;
-        setBoard((prev) => {
-          if (prev === null) setError(err instanceof Error ? err.message : "Failed to load board");
-          return prev;
-        });
-      } finally {
-        loadingRef.current = false;
-        if (queuedForceRef.current && !signal?.aborted) {
-          queuedForceRef.current = false;
-          await load(signal, true);
-        }
+        // A queued force is served by going round again rather than by re-entering `load`, whose
+        // guard this read still holds. A drag that started meanwhile leaves the flag up for the
+        // next poll to honour, exactly as a re-entry would have.
+        if (signal?.aborted || !queuedForceRef.current || draggingRef.current) break;
+        queuedForceRef.current = false;
+        unconditional = true;
       }
+      loadingRef.current = false;
     },
     [slug],
   );
@@ -133,6 +132,10 @@ export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPol
     versionRef.current = initialBoard.version;
     setBoard(initialBoard);
   }, [initialBoard]);
+
+  // A failed poll keeps the last good board rather than replacing it with an error UI, so a recorded
+  // failure only surfaces while there is nothing to show instead.
+  const error = board === null ? loadError : null;
 
   const refresh = useCallback(() => setAttempt((n) => n + 1), []);
   const reload = useCallback(() => load(undefined, true), [load]);
@@ -203,14 +206,25 @@ export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPol
 }
 
 /**
- * One board read. `undefined` means the server answered 304 — the snapshot the client already holds
- * is still current, so there is nothing to apply. Omitting the version forces a full read.
+ * The outcome of one read. `board: undefined` means the server answered 304 — the snapshot the
+ * client already holds is still current, so there is nothing to apply.
  */
-async function readBoard(slug: string, version: string | undefined): Promise<Board | undefined> {
+type BoardRead = { ok: true; board: Board | undefined } | { ok: false; message: string };
+
+/**
+ * One board read. Reports failure rather than throwing, so the poll settles every outcome on one
+ * straight path — no state written from a catch, and none written from a functional updater, which
+ * React may replay or discard. Omitting the version forces a full read.
+ */
+async function readBoard(slug: string, version: string | undefined): Promise<BoardRead> {
   const suffix = version === undefined ? "" : `?version=${encodeURIComponent(version)}`;
-  const res = await fetch(`/api/projects/${slug}/board${suffix}`);
-  if (res.status === 304) return undefined;
-  if (!res.ok) throw new Error(`Failed to load board (${res.status})`);
-  const data = (await res.json()) as { board: Board };
-  return data.board;
+  try {
+    const res = await fetch(`/api/projects/${slug}/board${suffix}`);
+    if (res.status === 304) return { ok: true, board: undefined };
+    if (!res.ok) return { ok: false, message: `Failed to load board (${res.status})` };
+    const data = (await res.json()) as { board: Board };
+    return { ok: true, board: data.board };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : "Failed to load board" };
+  }
 }

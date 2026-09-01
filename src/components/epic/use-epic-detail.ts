@@ -86,7 +86,12 @@ function useEpicSnapshot({ slug, epicId }: EpicTarget, attempt: number) {
  */
 function useReviewHistory({ slug, epicId }: EpicTarget, attempt: number) {
   const [review, setReview] = useState<ReviewReport | undefined>(undefined);
-  const [reviewError, setReviewError] = useState<string | null>(null);
+  // Stamped with the read it belongs to, so a failure expires the moment a new one goes out: the
+  // retry must render as loading, not as the error it is retrying, and `reviewLoading` is derived
+  // from this being null. Stamping rather than clearing keeps the effect free of a cascading
+  // setState.
+  const [failure, setFailure] = useState<{ read: string; message: string } | null>(null);
+  const read = `${slug}/${epicId}/${attempt}`;
 
   useEffect(() => {
     let cancelled = false;
@@ -97,19 +102,22 @@ function useReviewHistory({ slug, epicId }: EpicTarget, attempt: number) {
         const data = (await res.json()) as { report: ReviewReport };
         if (cancelled) return;
         setReview(data.report);
-        setReviewError(null);
+        setFailure(null);
       } catch (err) {
         // A history that can't be read never blocks the page: the score is a record of past runs,
         // and every action here operates on the beads, not on it.
-        if (!cancelled) setReviewError(errorMessage(err, "Couldn't load the self-review history"));
+        if (!cancelled) {
+          setFailure({ read, message: errorMessage(err, "Couldn't load the self-review history") });
+        }
       }
     }
     void load();
     return () => {
       cancelled = true;
     };
-  }, [slug, epicId, attempt]);
+  }, [slug, epicId, read]);
 
+  const reviewError = failure?.read === read ? failure.message : null;
   return { review, reviewError, reviewLoading: review === undefined && reviewError === null };
 }
 
