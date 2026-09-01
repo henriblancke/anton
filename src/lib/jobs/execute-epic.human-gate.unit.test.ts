@@ -24,7 +24,7 @@
  * Mocked at the bd seam, because the states under test are bd calls that fail: the end-to-end shapes
  * of the arm live in execute-epic.needs-human.integration.test.ts against real bd.
  */
-import { beforeEach, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead, Gate } from "../beads/bd";
 import { parkedAskGateId, parkedAskGateIds } from "./errors";
 
@@ -56,6 +56,7 @@ vi.mock("../beads/bd", async () => {
 const {
   armHumanGate,
   concludeCancelledArmedPark,
+  undoCancelledTicketGates,
   HUMAN_GATE_ARMED_LABEL,
   liveArmedAsk,
   NeedsHumanError,
@@ -1155,4 +1156,69 @@ it("keeps a STRANDED gate's verdict when the sync fails — the board already ag
 
   await expect(concludeCancelledArmedPark(c.args)).resolves.toEqual({ thrown: stranded });
   expect(c.effects).toEqual({ released: false, queued: 1 });
+});
+
+/**
+ * A kill that lands BETWEEN two ticket arms (PR #213 review). 0b-pre arms one human gate per human
+ * ticket, and `armHumanGate` unwinds only the gate it was arming when the signal flipped — the waits
+ * earlier iterations already returned survive it, blocking their tickets for a run nothing comes
+ * back for, each promising that resolving it resumes that run.
+ */
+describe("undoCancelledTicketGates — the arms a cancelled preflight pass already made", () => {
+  /** One armed ticket gate, produced by the real arm so its undo rights are the real ones. */
+  const armOne = async (gateId: string) => {
+    loadAllIssuesMock.mockResolvedValue([target()]);
+    gateCreateMock.mockResolvedValue(gateId);
+    const gate = await armHumanGate(REPO, "f-1", ASKED);
+    gateResolveMock.mockClear();
+    return { ticketId: TICKET, gate };
+  };
+
+  const cancelled = () => {
+    const c = new AbortController();
+    c.abort();
+    return c.signal;
+  };
+
+  it("resolves them, and settles under the error the cancelled arm already threw", async () => {
+    const armed = await armOne("g-first");
+    const cause = new Error("refusing to arm t-2's human gate — the run was cancelled");
+
+    await expect(undoCancelledTicketGates([armed], cancelled(), cause)).resolves.toBe(cause);
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-first",
+      expect.stringContaining("cancelled"),
+    );
+  });
+
+  it("leaves them where they are when the pass failed for any other reason", async () => {
+    // A locked DB or a rejected create is a RESUMABLE failure: the run comes back, and 0b-pre reuses
+    // this very wait rather than arming a second one. Undoing here would take back a live ask.
+    const armed = await armOne("g-first");
+
+    const cause = new Error("database is locked");
+    await expect(
+      undoCancelledTicketGates([armed], new AbortController().signal, cause),
+    ).resolves.toBe(cause);
+    expect(gateResolveMock).not.toHaveBeenCalled();
+  });
+
+  it("names every wait it could not take back — nothing else on the board points at them", async () => {
+    // Two ways an undo is unavailable: the resolve fails, and an arm that spent its undo retiring an
+    // older wait (taking the replacement back would leave the ticket bare). Both stay open and only
+    // this error carries their ids.
+    const armed = await armOne("g-first");
+    gateResolveMock.mockRejectedValue(new Error("database is locked"));
+
+    const thrown = (await undoCancelledTicketGates(
+      [armed, { ticketId: "t-2", gate: { gateId: "g-superseding", held: [] } }],
+      cancelled(),
+      new Error("the run was cancelled"),
+    )) as Error;
+
+    expect(thrown.message).toContain("the run was cancelled");
+    expect(thrown.message).toContain(`g-first (${TICKET})`);
+    expect(thrown.message).toContain("g-superseding (t-2)");
+  });
 });

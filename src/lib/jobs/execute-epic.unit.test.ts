@@ -4,7 +4,7 @@
  * exercised end-to-end in execute-epic.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import type { Bead, BeadDep, Gate } from "../beads/bd";
+import { LABELS, type Bead, type BeadDep, type Gate } from "../beads/bd";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import {
   blockedTailReason,
@@ -19,6 +19,7 @@ import {
   askSettleError,
   claudeResumeDecision,
   continuationPrompt,
+  deliveredTickets,
   inactiveAgentTickets,
   mergeGatePlan,
   humanGatePlan,
@@ -970,5 +971,39 @@ describe("isForeignRunOwner — what proves another machine owns the branch (ant
   it("refuses any other failure — a crash is not a foreign owner", () => {
     expect(isForeignRunOwner(new Error("boom"))).toBe(false);
     expect(isForeignRunOwner(undefined)).toBe(false);
+  });
+});
+
+describe("deliveredTickets — what the run's own steps speak for", () => {
+  const human = (id: string) => ticket(id, [LABELS.agentHuman]);
+  /** The branch, as `worktreeHasCommitFor` reads it. */
+  const branch = (...ids: string[]) => {
+    const asked: string[] = [];
+    const has = async (id: string) => {
+      asked.push(id);
+      return ids.includes(id);
+    };
+    return { has, asked };
+  };
+
+  it("drops a rolled-back ticket and a human one that left no commit", async () => {
+    const b = branch("t-1");
+    expect(
+      (await deliveredTickets([ticket("t-1"), ticket("t-2"), human("t-3")], new Set(["t-2"]), b.has))
+        .map((t) => t.id),
+    ).toEqual(["t-1"]);
+    // Only a human ticket is worth a git call — the label is what makes the branch the tie-breaker.
+    expect(b.asked).toEqual(["t-3"]);
+  });
+
+  it("keeps a human-labelled ticket whose commit IS on the branch (PR #213 review)", async () => {
+    // An agent committed and closed t-2 on an earlier attempt; someone labelled it `agent:human`
+    // before the parked run resumed. Its code is in the diff, so the review contract and the PR body
+    // must carry it — and, as the ONLY ticket, dropping it made the no-delivery park claim an empty
+    // branch that has commits on it.
+    const b = branch("t-2");
+    expect((await deliveredTickets([human("t-2")], new Set(), b.has)).map((t) => t.id)).toEqual([
+      "t-2",
+    ]);
   });
 });

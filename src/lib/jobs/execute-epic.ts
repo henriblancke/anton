@@ -868,35 +868,52 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // A ticket whose gate a person answered but whose ORDINARY prerequisite has not landed yet:
         // held for this pass, closed by the resume that follows the blocker (see the loop below).
         const answeredButBlocked = new Map<string, string[]>();
-        for (const t of humanTickets) {
-          // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
-          // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
-          const answered = answeredHumanGate(all, t);
-          if (answered) {
-            // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
-            // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
-            // cannot be closed until that work lands. Closing anyway throws a plain error the runner
-            // retries identically until the attempts are gone — a cryptic bd message and no sibling
-            // ever dispatched. Hold the ticket instead: the person's half is done and must not be
-            // asked for again (so no re-arm), the code it waits on is not, and the resume that
-            // follows that blocker closes it into this same branch.
-            const stillBlocked = openBlockersOf(all, t.id);
-            if (stillBlocked.length > 0) {
-              answeredButBlocked.set(t.id, stillBlocked);
+        // Every wait THIS pass armed, so a kill landing BETWEEN two arms can take them back (PR #213
+        // review). `armHumanGate` undoes only the gate it was arming when the signal flipped; the
+        // ones earlier iterations armed are already returned, and each promises a person that
+        // resolving it resumes a run that is no longer coming back for it.
+        const armedHere: ArmedTicketGate[] = [];
+        try {
+          for (const t of humanTickets) {
+            // A wait a person already ANSWERED closes the ticket instead of re-arming it — bd will not
+            // let them close a gate-blocked bead themselves, so this is anton's half of the exchange.
+            const answered = answeredHumanGate(all, t);
+            if (answered) {
+              // bd refuses `bd close` on a bead ANY open blocker holds, not just an open gate, so a
+              // human ticket that ALSO waits on ordinary work ("ship the API, then sign the DPA")
+              // cannot be closed until that work lands. Closing anyway throws a plain error the runner
+              // retries identically until the attempts are gone — a cryptic bd message and no sibling
+              // ever dispatched. Hold the ticket instead: the person's half is done and must not be
+              // asked for again (so no re-arm), the code it waits on is not, and the resume that
+              // follows that blocker closes it into this same branch.
+              const stillBlocked = openBlockersOf(all, t.id);
+              if (stillBlocked.length > 0) {
+                answeredButBlocked.set(t.id, stillBlocked);
+                console.log(
+                  `[execute-epic] ${epicBeadId}: holding ${t.id} — its human gate ${answered.id} is ` +
+                    `answered but it is still blocked by ${stillBlocked.join(", ")}`,
+                );
+                continue;
+              }
+              await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
               console.log(
-                `[execute-epic] ${epicBeadId}: holding ${t.id} — its human gate ${answered.id} is ` +
-                  `answered but it is still blocked by ${stillBlocked.join(", ")}`,
+                `[execute-epic] ${epicBeadId}: closed ${t.id} — a person answered its human gate ` +
+                  `${answered.id}`,
               );
               continue;
             }
-            await beads.close(repo, t.id, `human work done — gate ${answered.id} resolved`);
-            console.log(
-              `[execute-epic] ${epicBeadId}: closed ${t.id} — a person answered its human gate ` +
-                `${answered.id}`,
-            );
-            continue;
+            armedHere.push({
+              ticketId: t.id,
+              gate: await armHumanGate(
+                repo,
+                t.id,
+                { ticketId: t.id, ask: humanTicketAsk(t) },
+                ctx.signal,
+              ),
+            });
           }
-          await armHumanGate(repo, t.id, { ticketId: t.id, ask: humanTicketAsk(t) }, ctx.signal);
+        } catch (e) {
+          throw await undoCancelledTicketGates(armedHere, ctx.signal, e);
         }
         // Re-read the board the gates and closes are ON — the ticket SET as well as the verdict. A
         // ticket closed just above is done work now, and the loop below reads its status off these
@@ -1651,8 +1668,14 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
       //     branch — 0b-pre closed it on the way back in — so no commit here carries it. Leaving it
       //     would advertise a signature or a purchase in the PR body as delivered by a diff that
       //     cannot contain it, and hand the review gate a contract no code in the diff can satisfy,
-      //     parking the run at review after the person already did their part.
-      const delivered = live.filter((t) => !rolledBack.has(t.id) && !beads.isHumanWork(t));
+      //     parking the run at review after the person already did their part. The BRANCH decides
+      //     that, not the label (PR #213 review): a ticket an agent committed on an earlier attempt
+      //     and someone relabelled `agent:human` afterwards is still in this diff, and dropping it
+      //     would hide work the reviewer must read — and, when it is the only ticket, make the
+      //     no-delivery park below claim an empty branch that has commits on it.
+      const delivered = await deliveredTickets(live, rolledBack, (id) =>
+        worktreeHasCommitFor(worktree.path, id),
+      );
 
       // Nothing survived, so this run has nothing to show (anton-t1mo). Absorbing the timeouts is
       // only correct while SOMETHING landed — carrying on here would run the review gate over an
@@ -2753,6 +2776,31 @@ function humanTicketAsk(ticket: Bead): string {
 }
 
 /**
+ * What this run DELIVERED: the tickets whose work is actually on the branch, and the set every
+ * run-level step speaks for — the review contract and the PR body.
+ *
+ * A ticket its budget ROLLED BACK contributed no commit (anton-t1mo). A HUMAN ticket normally
+ * contributed none either (anton-mv70) — a person did that work outside this branch — but the
+ * label says who does the work, not what the diff contains: an agent ticket committed on an earlier
+ * attempt and relabelled `agent:human` before the parked run resumed is still in the diff (PR #213
+ * review). So the branch is asked, and only a human ticket with nothing on it is dropped; anything
+ * whose commit is present stays, because a reviewer must read every change the PR carries.
+ */
+export async function deliveredTickets(
+  live: Bead[],
+  rolledBack: Set<string>,
+  hasCommitFor: (ticketId: string) => Promise<boolean>,
+): Promise<Bead[]> {
+  const delivered: Bead[] = [];
+  for (const ticket of live) {
+    if (rolledBack.has(ticket.id)) continue;
+    if (beads.isHumanWork(ticket) && !(await hasCommitFor(ticket.id))) continue;
+    delivered.push(ticket);
+  }
+  return delivered;
+}
+
+/**
  * The gate a person ANSWERED for this ticket's ask: a human gate anton armed on the ticket, carrying
  * this exact reason, now closed (anton-mv70).
  *
@@ -3199,6 +3247,47 @@ export async function armHumanGate(
               ),
             ),
   };
+}
+
+/** A ticket's human wait as this preflight armed it — the ticket, and the arm's own undo rights. */
+export interface ArmedTicketGate {
+  ticketId: string;
+  gate: ArmedHumanGate;
+}
+
+/**
+ * Take back the ticket gates THIS preflight armed, when the pass that armed them is cut short by a
+ * kill (PR #213 review).
+ *
+ * {@link armHumanGate} unwinds only the gate it was arming when the signal flipped — the waits
+ * earlier iterations already returned survive it. Left standing they block their tickets for a run
+ * nothing comes back for, each carrying an ask whose gate promises that resolving it resumes that
+ * run. Undone where {@link ArmedHumanGate.undo} says that is still safe, and NAMED where it is not:
+ * a gate whose resolve failed, or one whose arm spent its undo retiring an older wait, stays open
+ * and nothing else on the board points at it, so its id rides out in the error the run settles with.
+ *
+ * Answers the error to throw — the cause unchanged when every wait was taken back, since then the
+ * cancelled pass left the board exactly as it found it.
+ */
+export async function undoCancelledTicketGates(
+  armed: ArmedTicketGate[],
+  signal: AbortSignal | undefined,
+  cause: unknown,
+): Promise<unknown> {
+  if (!signal?.aborted || armed.length === 0) return cause;
+  const stranded: string[] = [];
+  for (const { ticketId, gate } of armed) {
+    if (gate.undo && (await gate.undo())) continue;
+    stranded.push(`${gate.gateId} (${ticketId})`);
+  }
+  if (stranded.length === 0) return cause;
+  return new Error(
+    `${cause instanceof Error ? cause.message : String(cause)} The human gate(s) armed earlier in ` +
+      `this cancelled pass could not be taken back and still block their tickets: ` +
+      `${stranded.join(", ")} — resolve them by hand once the work is done, or resume the target, ` +
+      `which reuses them rather than arming a second wait.`,
+    { cause },
+  );
 }
 
 /**
