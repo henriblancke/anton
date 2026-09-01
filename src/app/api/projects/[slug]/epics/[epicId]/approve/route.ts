@@ -472,7 +472,13 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // carries the label, execute-epic poisons it before dispatching a single child, so the run the
   // operator just triggered never starts. Reported separately from the gate lines because the two
   // ask for different things — hold-and-resume versus do-it-yourself, no run pending.
-  const humanTarget = humanWork.length > 0 && beads.isHumanWork(target);
+  //
+  // Read off the TARGET's own label, never off the gate lines: `contractGatedBeads` empties on the
+  // two recovery shapes — a grouped target whose children are all closed, and a standalone target
+  // already in review — and both still hit the target-level poison when re-run. Conditioning this on
+  // a non-empty dispatch set would answer those with silence about the one thing that decides the
+  // outcome (PR #214 review).
+  const humanTarget = willEnqueue && beads.isHumanWork(target);
 
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
@@ -706,12 +712,18 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // `humanGates` rides the same channel and is OMITTED when the run stops for nobody, so the common
   // case adds nothing to the body and the client has nothing to say. `humanTarget` marks the shape
   // of that report: gates on a running target hold it, a human target starts no run at all.
+  //
+  // The gate lines are withheld when the enqueue THREW (PR #214 review): they describe a run that
+  // reaches each ticket and holds there, and with no run enqueued that is a promise about something
+  // that does not exist — contradicting the failure the same response reports. `elsewhere` and
+  // `covered` keep them: a run does cover the target, it is just not a new one. `humanTarget` is
+  // unaffected — "no agent-run starts" is true of a poisoned target however the enqueue went.
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
   const reported = {
     jobId,
     run,
     advisory,
-    ...(humanWork.length > 0 ? { humanGates: humanWork } : {}),
+    ...(humanWork.length > 0 && run !== "failed" ? { humanGates: humanWork } : {}),
     ...(humanTarget ? { humanTarget: true } : {}),
   };
   if (epic) {

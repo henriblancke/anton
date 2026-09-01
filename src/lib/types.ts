@@ -394,10 +394,17 @@ export interface OperatorQueueItem {
   /** ISO timestamp the ask was filed, from the raw bead's created_at. Drives the queue's order. */
   createdAt: string;
   /**
-   * The run this ticket stops when it reaches it. ABSENT on a run target, which is not held up by
-   * the work — it IS the work, and no agent will ever start it.
+   * The run this ticket rides on. ABSENT on a run target, which is not held up by the work — it IS
+   * the work, and no agent will ever start it.
    */
   runTarget?: { id: string; title: string };
+  /**
+   * Whether a run actually reaches this ticket and holds on it. Only meaningful alongside
+   * `runTarget`, and FALSE when that target is itself `agent:human`: execute-epic poisons such a
+   * target before it dispatches a single child, so no gate is ever armed under it and there is no
+   * held run to resume (PR #214 review).
+   */
+  holdsRun?: boolean;
 }
 
 export interface Board {

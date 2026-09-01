@@ -174,6 +174,16 @@ describe("human gates", () => {
     expect(description).not.toContain("anton runs the rest");
   });
 
+  it("says it with no gate lines at all — the target's own label is the whole fact", async () => {
+    // The route now reports `humanTarget` off the TARGET, not off the dispatch set, which empties on
+    // a re-run whose children are all closed or which is already in review. Requiring a gate line
+    // here would silence the notice on exactly those recoveries (PR #214 review).
+    await toastContractAdvisory(jsonRes({ humanTarget: true }));
+
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0][0]).toBe("This one is yours");
+  });
+
   it("still promises the rest of the run when only its tickets are human", async () => {
     await toastContractAdvisory(
       jsonRes({ humanGates: ["anton-1 → Buy the domain"], humanTarget: false }),

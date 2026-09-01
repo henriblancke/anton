@@ -71,6 +71,7 @@ describe("OperatorQueue", () => {
             id: "anton-f1.1",
             title: "Sign the contract",
             runTarget: { id: "anton-f1", title: "Ship billing" },
+            holdsRun: true,
           }),
         ]}
         onOpenTicket={onOpenTicket}
@@ -89,7 +90,13 @@ describe("OperatorQueue", () => {
     render(
       <OperatorQueue
         slug="anton"
-        items={[item({ id: "anton-f1.1", runTarget: { id: "anton-f1", title: "Ship billing" } })]}
+        items={[
+          item({
+            id: "anton-f1.1",
+            runTarget: { id: "anton-f1", title: "Ship billing" },
+            holdsRun: true,
+          }),
+        ]}
         onOpenTicket={() => {}}
       />,
     );
@@ -108,7 +115,11 @@ describe("OperatorQueue", () => {
       <OperatorQueue
         slug="anton"
         items={[
-          item({ id: "anton-f1.1", runTarget: { id: "anton-f1", title: "Ship billing" } }),
+          item({
+            id: "anton-f1.1",
+            runTarget: { id: "anton-f1", title: "Ship billing" },
+            holdsRun: true,
+          }),
           item({ id: "anton-t2", title: "Sign the contract" }),
         ]}
         onOpenTicket={() => {}}
@@ -119,6 +130,52 @@ describe("OperatorQueue", () => {
     expect(screen.getByRole("link", { name: "anton-f1" }).getAttribute("href")).toBe(
       "/projects/anton/epics/anton-f1",
     );
+  });
+
+  it("says a run is refused at the target, not held, when the target is a person's work too", () => {
+    // execute-epic poisons an `agent:human` target before dispatching any child, so no gate is ever
+    // armed on this ticket. Telling the operator to "Resolve & resume" would send them after an
+    // escalation row that does not exist (PR #214 review).
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[
+          item({
+            id: "anton-f1.1",
+            runTarget: { id: "anton-f1", title: "Buy the domain" },
+            holdsRun: false,
+          }),
+        ]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    const row = screen.getByRole("listitem").textContent ?? "";
+    expect(screen.getByText("no agent will start it")).toBeTruthy();
+    expect(row).not.toContain("Resolve & resume");
+    expect(row).toContain("which is yours as well");
+    // Still a parented ticket, so it still opens where its controls live.
+    expect(screen.getByRole("button", { name: "Buy the domain" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "anton-f1" })).toBeTruthy();
+  });
+
+  it("marks an ask someone has already picked up, and leaves an untouched one unchipped", () => {
+    // Without it an in-progress ask reads exactly like one nobody has opened — the queue's own
+    // reason for keeping `in_progress` rows is that the work is being done (PR #214 review).
+    render(
+      <OperatorQueue
+        slug="anton"
+        items={[
+          item({ id: "anton-t1", title: "Started", stage: "implementing" }),
+          item({ id: "anton-t2", title: "Untouched" }),
+        ]}
+        onOpenTicket={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("in progress")).toBeTruthy();
+    const untouched = screen.getAllByRole("listitem")[1].textContent ?? "";
+    expect(untouched).not.toContain("in progress");
   });
 
   it("renders the rows in the order it was handed, newest ask first", () => {

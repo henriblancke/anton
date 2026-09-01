@@ -66,6 +66,40 @@ describe("operatorQueue — the set", () => {
     const [item] = operatorQueue(board);
     expect(item.id).toBe("f1.1");
     expect(item.runTarget).toEqual({ id: "f1", title: "Ship billing" });
+    expect(item.holdsRun).toBe(true);
+  });
+
+  it("keeps a human GRANDCHILD of the run target — it ships in the same PR, so the run holds on it", () => {
+    // The approval-gate toast counts human work with `contractGatedBeads`, which reaches every
+    // descendant ticket; this list must reach exactly as far or a run that says "2 tickets need you"
+    // would show only one of them here (PR #214 review). Both derive depth from `boardCards.cardOf`,
+    // which walks the whole parent chain to the nearest card.
+    const board = [
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: [] }),
+      bead({ id: "f1.1.1", issue_type: "task", parent: "f1.1" }),
+    ];
+    const [item] = operatorQueue(board);
+    expect(item.id).toBe("f1.1.1");
+    // It rides the FEATURE — the card is the run, not the agent task in between.
+    expect(item.runTarget).toEqual({ id: "f1", title: "Ship billing" });
+    expect(item.holdsRun).toBe(true);
+  });
+
+  it("holds no run when the target is human work too — the run is refused before any gate arms", () => {
+    // execute-epic poisons an `agent:human` target before it dispatches a single child, so nothing
+    // under it is ever reached. Calling this ticket "holds a run" would send the operator looking
+    // for a "Waiting on you" escalation that was never armed (PR #214 review).
+    const board = [
+      bead({ id: "f1", title: "Buy the domain", issue_type: "feature" }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1" }),
+    ];
+    const [target, ticket] = operatorQueue(board);
+    expect(target.id).toBe("f1");
+    expect(target.holdsRun).toBeUndefined();
+    expect(ticket.id).toBe("f1.1");
+    expect(ticket.runTarget).toEqual({ id: "f1", title: "Buy the domain" });
+    expect(ticket.holdsRun).toBe(false);
   });
 
   it("drops a human ticket whose run target is not approved — the run cannot reach it", () => {

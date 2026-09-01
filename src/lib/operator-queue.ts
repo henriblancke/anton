@@ -43,11 +43,13 @@ function byNewestAsk(a: OperatorQueueItem, b: OperatorQueueItem): number {
 /**
  * The approved, open, human beads on this board, newest ask first.
  *
- * Two shapes qualify, and the row says which because they cost the operator different things:
+ * Three shapes qualify, and the row says which because they cost the operator different things:
  *   • a RUN TARGET labelled `agent:human` — anton refuses to run it at all, so nothing happens until
  *     a person does it;
  *   • a TICKET inside an ordinary run — the run reaches it, arms a human gate, and holds that ticket
- *     (and whatever depends on it) until the person answers.
+ *     (and whatever depends on it) until the person answers;
+ *   • a TICKET under a human run target — approved, but the run is refused at the target, so nothing
+ *     is held and this is simply more work no agent will start (`holdsRun: false`).
  *
  * Approval is read off whichever bead carries the human gate for this work: a ticket has no
  * `approved` label of its own — its run target's approval is what puts it in front of an agent — so
@@ -73,6 +75,12 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
     const gate = target ?? bead;
     if (!beads.isApproved(gate) || !isOpenWork(gate)) continue;
 
+    // A ticket only HOLDS a run if a run reaches it. When the target itself carries `agent:human`,
+    // execute-epic poisons it before dispatching anything under it (humanTargetPoison), so no gate
+    // is ever armed on this ticket — the row must not send the operator looking for an escalation
+    // that does not exist (PR #214 review).
+    const holdsRun = target ? !beads.isHumanWork(target) : false;
+
     const goal = parseGoal(bead);
     const risk = labelValue(bead.labels, "risk");
     const size = labelValue(bead.labels, "size");
@@ -84,7 +92,7 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
       ...(goal ? { goal } : {}),
       ...(risk ? { risk } : {}),
       ...(size ? { size } : {}),
-      ...(target ? { runTarget: { id: target.id, title: target.title } } : {}),
+      ...(target ? { runTarget: { id: target.id, title: target.title }, holdsRun } : {}),
     });
   }
 

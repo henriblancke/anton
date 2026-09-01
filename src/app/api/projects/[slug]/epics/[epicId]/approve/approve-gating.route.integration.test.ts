@@ -385,6 +385,29 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(body.humanTarget).toBe(true);
   });
 
+  it("marks a human target whose run would dispatch nothing — recovery still hits the poison", async () => {
+    // `contractGatedBeads` empties for a grouped target whose children are all closed, which is one
+    // of the Force-run recovery shapes the contract gate deliberately lets through. The target-level
+    // poison still fires on that re-run, so deriving this from the dispatch set would answer the
+    // recovery with silence about the only thing that decides its outcome (PR #214 review).
+    const target = await beads.create(repo, {
+      title: "Sign the contract",
+      type: "feature",
+      acceptance: "- [ ] it works",
+      labels: ["agent:human"],
+    });
+    const done = await beads.create(repo, { title: "Shipped ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, done, target, "parent-child");
+    await beads.close(repo, done);
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.humanTarget).toBe(true);
+    // No ticket is dispatched, so there is no gate line to name — and none is needed.
+    expect(body).not.toHaveProperty("humanGates");
+  });
+
   it("says nothing about human work on a run that stops for nobody", async () => {
     const target = await beads.create(repo, { title: "All agent work", type: "feature", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Agent ticket", type: "task", acceptance: "- [ ] it works" });

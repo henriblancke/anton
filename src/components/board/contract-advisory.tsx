@@ -67,9 +67,8 @@ export async function toastContractAdvisory(res: Response): Promise<void> {
 export function toastAdvisoryGaps(body: unknown): void {
   try {
     warnSpecGaps(gapsOf(body));
-    const gates = humanGatesOf(body);
-    if (humanTargetOf(body)) noteHumanTarget(gates);
-    else warnHumanGates(gates);
+    if (humanTargetOf(body)) noteHumanTarget();
+    else warnHumanGates(humanGatesOf(body));
   } catch (err) {
     console.error("[contract-advisory] failed to surface advisory gaps", err);
   }
@@ -124,12 +123,13 @@ function warnHumanGates(gates: string[]): void {
  * executor refuses a `agent:human` target before it dispatches anything under it, and promising a
  * partial run here would leave the operator waiting on a run that never starts.
  *
- * The gate lines are deliberately NOT listed. Any human children under this target are moot — no
- * dispatch reaches them — and naming them would read as work anton is about to hold, which is the
+ * The gate lines are deliberately NOT listed, and not required either: the route reports the target's
+ * own label, so a re-run of a target whose dispatch set is empty — every child closed, or already in
+ * review — still says this (PR #214 review). Any human children under it are moot besides, since no
+ * dispatch reaches them, and naming them would read as work anton is about to hold, which is the
  * exact claim this toast exists to withdraw.
  */
-function noteHumanTarget(gates: string[]): void {
-  if (gates.length === 0) return;
+function noteHumanTarget(): void {
   toast.info("This one is yours", {
     duration: 10_000,
     description: (
