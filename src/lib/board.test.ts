@@ -1224,6 +1224,23 @@ describe("provenance on the board (anton-cqxd)", () => {
     // The poll path compares against the same token, or the badge never reaches the tab.
     expect(await getBoardVersion(project)).toBe(picked);
   });
+
+  it("holds the refresh token still while the pass is switched off", async () => {
+    const board = [makeBead({ id: "t-1", title: "A loose task" })];
+    listMock.mockResolvedValue(board);
+    pickerArmed = false;
+    const quiet = await getBoardVersion(project);
+
+    // A disarmed board carries no provenance at all, so a plan row written before the pass was
+    // switched off cannot change what is served. A token that still moved on it would break the
+    // poll's 304 and spend a full board read to hand back byte-identical data.
+    resetIssueSnapshots();
+    pickerPlan = planFor(board, "t-1");
+    expect(await getBoardVersion(project)).toBe(quiet);
+    // And the two halves still agree: the poll's token is the one the served board carries.
+    const served = await getBoard(project);
+    expect(await getBoardVersion(project)).toBe(served.version);
+  });
 });
 
 /**

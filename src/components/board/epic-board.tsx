@@ -143,9 +143,13 @@ export function EpicBoard({
   // the route's non-blocking path with the retained pre-write board stamped with the version the
   // write already advanced to — believing that after the write restores both the stale board and a
   // token the next poll 304s on, silently undoing the drag. Comparing the sequence a poll left with
-  // against the current one discards exactly those; a poll landing while the write is still in
-  // flight is still believed, because the write settles after it and has the last word.
+  // against the current one discards exactly those.
   const writeSeqRef = useRef(0);
+  // Board writes currently in flight. The sequence above only catches polls that land AFTER a write
+  // settles; one that lands DURING it is just as stale — the drag is optimistic-only until the PATCH
+  // returns, and the reorder path has no authoritative board to re-adopt afterwards, so accepting
+  // that poll reverts the lane on screen until the next beat. Suppress for the whole write instead.
+  const writesInFlightRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -162,7 +166,12 @@ export function EpicBoard({
         if (res.status === 304) return;
         if (!res.ok) throw new Error(`Failed to load board (${res.status})`);
         const data = (await res.json()) as { board: Board };
-        if (!cancelled && !draggingRef.current && writeSeq === writeSeqRef.current) {
+        if (
+          !cancelled &&
+          !draggingRef.current &&
+          writesInFlightRef.current === 0 &&
+          writeSeq === writeSeqRef.current
+        ) {
           versionRef.current = data.board.version;
           setBoard(data.board);
           setError(null);
@@ -183,8 +192,11 @@ export function EpicBoard({
     }
 
     async function poll() {
-      // Skip work while the tab is hidden or a card is being dragged; keep the loop alive.
-      if (document.visibilityState === "visible" && !draggingRef.current) await load();
+      // Skip work while the tab is hidden, a card is being dragged, or a write is settling; keep
+      // the loop alive.
+      if (document.visibilityState === "visible" && !draggingRef.current && writesInFlightRef.current === 0) {
+        await load();
+      }
       if (!cancelled) timer = setTimeout(() => void poll(), BOARD_POLL_MS);
     }
 
@@ -204,6 +216,25 @@ export function EpicBoard({
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [slug, attempt, initialBoard]);
+
+  /**
+   * Adopt a REFRESHED server board. `board` is seeded from `initialBoard` once and client-owned
+   * after that, so a `router.refresh()` — how `[Release]` answers a lost claim race, and how the
+   * ticket dialog answers a save — re-renders the page for nothing: the stale card keeps offering a
+   * pick that already 409s until the next beat. The refreshed prop IS the authoritative read, so
+   * take it directly rather than spending a second fetch on the same answer.
+   *
+   * The mount value is skipped (it already seeded state), and an interaction in flight wins: its own
+   * settle has the last word on the board it is optimistically showing.
+   */
+  const seededBoardRef = useRef(initialBoard);
+  useEffect(() => {
+    if (initialBoard === null || initialBoard === seededBoardRef.current) return;
+    seededBoardRef.current = initialBoard;
+    if (draggingRef.current || writesInFlightRef.current > 0) return;
+    versionRef.current = initialBoard.version;
+    setBoard(initialBoard);
+  }, [initialBoard]);
 
   // A re-arm ends in router.refresh(), which re-renders the page and hands down a FRESH read. Drop
   // the polled answer whenever that happens, so the band clears on the click that cleared the latch
@@ -392,11 +423,16 @@ export function EpicBoard({
     // Only the lane moves, and it moves on the LATEST board: a poll can land during the PATCH, and
     // both writing and reverting a whole pre-drag snapshot would throw that poll's result away.
     const previousUpNext = board.upNext;
-    setBoard((prev) =>
-      prev
-        ? { ...prev, upNext: reorderUpNextEntries(prev.upNext ?? [], beadId, overBeadId, priority) }
-        : prev,
-    );
+    writesInFlightRef.current += 1;
+    setBoard((prev) => {
+      if (!prev) return prev;
+      const { upNext: ranked, ...rest } = prev;
+      const upNext = reorderUpNextEntries(ranked ?? [], beadId, overBeadId, priority);
+      // Absent, never empty (types.ts). A reorder that finds nothing to move — the lane emptied
+      // under us between the drag and this update — must drop the key rather than project an
+      // "Up Next" heading over nothing.
+      return { ...rest, ...(upNext.length ? { upNext } : {}) };
+    });
 
     // A standalone chip is a bead in its own right, so it patches through the ticket route; both
     // routes validate the priority server-side (parseEpicPatch / parseTicketPatch).
@@ -432,8 +468,10 @@ export function EpicBoard({
     } finally {
       // Every poll that left before this point asked on the pre-write version, so its answer is
       // about a board that no longer exists. Bump on failure too: a rejected PATCH is not proof the
-      // server wrote nothing.
+      // server wrote nothing. Order matters — the sequence takes over the moment the in-flight
+      // suppression lifts, so no poll slips between the two.
       writeSeqRef.current += 1;
+      writesInFlightRef.current -= 1;
     }
   }
 
@@ -462,6 +500,7 @@ export function EpicBoard({
     if (!epic) return;
 
     const previous = board;
+    writesInFlightRef.current += 1;
     setBoard({ ...board, columns: moveEpicBetweenColumns(board.columns, epicId, toStage) });
 
     try {
@@ -493,6 +532,7 @@ export function EpicBoard({
       // Same as the reorder path: a poll fetched against the pre-move version must not be believed
       // now that the move has settled.
       writeSeqRef.current += 1;
+      writesInFlightRef.current -= 1;
     }
   }
 

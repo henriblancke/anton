@@ -197,6 +197,36 @@ describe("EpicBoard drag-move (anton-4g35)", () => {
   });
 });
 
+describe("EpicBoard refreshed server board", () => {
+  it("adopts a board handed down by router.refresh() instead of holding the stale one", async () => {
+    // `[Release]` answers a lost claim race with router.refresh(), which re-renders the page and
+    // hands down a fresh server board. `board` is client-owned after mount, so without adopting the
+    // new prop the card keeps offering a pick that already 409s until the next 30s beat.
+    // Every board poll 304s: the refresh must land on its own, not on a fetch it happened to race.
+    const fetchMock = vi.fn(async (url: string) =>
+      url.includes("/board") ? new Response(null, { status: 304 }) : new Response(null, { status: 404 }),
+    );
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    const { rerender } = render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
+    expect(columnOf("anton-1")).toBe("backlog");
+
+    rerender(<EpicBoard slug="tmp" initialBoard={board("2:sync", "implementing")} />);
+    await waitFor(() => expect(columnOf("anton-1")).toBe("implementing"));
+
+    // And the refreshed version came with it, so the next poll asks on it rather than re-fetching
+    // the answer it already holds.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/board?version="))).toBe(true),
+    );
+    const pollUrls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(pollUrls.some((u) => u.includes("version=2%3Async") || u.includes("version=2:sync"))).toBe(
+      true,
+    );
+  });
+});
+
 describe("EpicBoard autopilot breaker (anton-5c8h)", () => {
   /** The band the board must be able to draw and retire on its own: the WIP hold, at its limit. */
   const hold = {
@@ -401,10 +431,12 @@ describe("EpicBoard reorder inside Up Next", () => {
     expect(columnOf("anton-2")).toBe("backlog");
   });
 
-  it("keeps what a poll delivered mid-write when the reorder fails", async () => {
-    // The optimistic update and its rollback both run on the LATEST board, not on a snapshot taken
-    // before the PATCH — a poll landing in that gap (the write is a server round-trip) must survive
-    // the rollback rather than be reverted along with the lane.
+  it("ignores a poll that lands while the reorder is still in flight", async () => {
+    // The write is a server round-trip, and the corrected order exists only optimistically until it
+    // returns: a poll landing in that gap answers on the PRE-write plan, so believing it reverts the
+    // lane on screen with nothing left to put it back until the next beat. Polls are suppressed for
+    // the whole write instead — and the failure path still rolls back onto the LATEST board, which
+    // the poll delivered once the write let it through.
     let failPatch: (() => void) | undefined;
     const patched = new Promise<Response>((resolve) => {
       failPatch = () => resolve(new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
@@ -430,13 +462,23 @@ describe("EpicBoard reorder inside Up Next", () => {
     await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
 
     // A poll lands while the PATCH is still in flight, bringing a card the drag knows nothing about.
+    // It is discarded whole: taking it would have taken its pre-write lane with it.
     fireEvent(document, new Event("visibilitychange"));
-    await waitFor(() => expect(columnOf("anton-3")).toBe("implementing"));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/board"))).toBe(true),
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(columnOf("anton-3")).toBeUndefined();
+    expect(laneOrder()).toEqual(["anton-2", "anton-1"]);
 
     failPatch?.();
 
     await waitFor(() => expect(laneOrder()).toEqual(["anton-1", "anton-2"]));
-    expect(columnOf("anton-3")).toBe("implementing");
+
+    // Rollback restored the lane only. The next poll — now unsuppressed — brings the rest of the
+    // board it was holding back.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(columnOf("anton-3")).toBe("implementing"));
   });
 
   it("discards a poll fetched on the pre-write version once the write has settled", async () => {

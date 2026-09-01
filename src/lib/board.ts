@@ -95,7 +95,11 @@ export async function getBoardVersion(project: Project): Promise<string> {
     hygiene,
     scan,
     deferralVersion(deferrals),
-    provenanceVersion(plan, policy),
+    // Gated on ARMED, exactly as the served board gates the marks themselves (`armedPlan` in
+    // getBoard): a disarmed picker's board carries no provenance, so letting a plan row written
+    // before the pass was switched off move the token would break a 304 and serve back data the
+    // client already holds. Arming flips are covered separately by upNextVersion.
+    provenanceVersion(pickerArmed ? plan : undefined, policy),
     upNextVersion(pickerArmed),
     project.repoPath,
   );
@@ -424,7 +428,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       hygieneVersion(hygiene),
       scanHealthVersion(scan),
       deferralVersion(deferrals),
-      provenanceVersion(plan, policy),
+      provenanceVersion(armedPlan, policy),
       upNextVersion(pickerArmed),
       project.repoPath,
     ),
