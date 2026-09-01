@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { toastAdvisoryGaps } from "@/components/board/contract-advisory";
+import { usePickDecision } from "@/components/board/pick-decision";
 import type { ApprovalRunOutcome } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -58,8 +59,13 @@ export function ReleaseAction({
   const router = useRouter();
   const [pending, setPending] = useState(false);
   const [failure, setFailure] = useState<string | undefined>(undefined);
+  // Accepting the pick and declining it are one decision, and on a ranked card the veto beside this
+  // button is the other half of it. The lock keeps them exclusive: a release that cannot claim the
+  // pick never starts a run the operator has already deferred (PR #212 review).
+  const decision = usePickDecision();
 
   async function release() {
+    if (!decision.claim()) return;
     setPending(true);
     setFailure(undefined);
     try {
@@ -76,6 +82,8 @@ export function ReleaseAction({
         run?: ApprovalRunOutcome;
       } | null;
       if (!res.ok) {
+        // Nothing was approved, so the pick is answerable again — by this button or by the veto.
+        decision.abandon();
         const message = body?.error ?? `Release failed (${res.status})`;
         setFailure(message);
         toast.error(message);
@@ -90,6 +98,7 @@ export function ReleaseAction({
       // release that failed — so the approve stands, the accept is recorded, and this reconciles the
       // board instead of pushing the operator to release again into a second concurrent run.
       if (body?.run === "elsewhere") {
+        decision.settle();
         onReleased?.();
         toast.success(`"${title}" is already running on another machine`, {
           description: "Nothing new was started — the board is catching up.",
@@ -103,6 +112,9 @@ export function ReleaseAction({
       // watching a card that will never move (the route withholds the release accept on the same
       // test). The approval stands, so releasing again enqueues afresh.
       if (!body?.jobId) {
+        // The approval stands but nothing runs, and the copy says to release again — so the pick
+        // stays claimable rather than settling on an answer that started no work.
+        decision.abandon();
         const message = "Approved, but no run started — release again to retry";
         setFailure(message);
         toast.error(message);
@@ -110,12 +122,14 @@ export function ReleaseAction({
         router.refresh();
         return;
       }
+      decision.settle();
       onReleased?.();
       toast.success(`Released "${title}" — running now`);
       // The run starts with whatever thin sections it has; say so once, here.
       toastAdvisoryGaps(body);
       router.refresh();
     } catch (err) {
+      decision.abandon();
       const message = err instanceof Error ? err.message : "Failed to release this target";
       setFailure(message);
       toast.error(message);
@@ -129,7 +143,7 @@ export function ReleaseAction({
       <Button
         type="button"
         size="xs"
-        disabled={pending || disabled}
+        disabled={pending || disabled || decision.state !== "open"}
         title="Start this target now — the same approve, claim and run every approval performs"
         onClick={() => void release()}
       >

@@ -23,9 +23,14 @@ let usage: ClaudeUsage | null = null;
 let usageReads = 0;
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
+const displayReads = vi.fn();
 vi.mock("@/lib/claude/usage", () => ({
-  getDisplayUsage: async () => {
+  getClaudeUsageCached: async () => {
     usageReads += 1;
+    return usage;
+  },
+  getDisplayUsage: async () => {
+    displayReads();
     return usage;
   },
 }));
@@ -56,6 +61,7 @@ describe("GET /picker/budget", () => {
     tdb = makeTestDb();
     usage = makeUsage();
     usageReads = 0;
+    displayReads.mockClear();
     await tdb.db
       .insert(schema.projects)
       .values({ id: "p1", slug: "tmp", name: "tmp", repoPath: "/tmp/p1" });
@@ -88,6 +94,14 @@ describe("GET /picker/budget", () => {
   it("answers 204 when usage is unreadable — the governor fails open and so does the line", async () => {
     usage = null;
     expect((await GET(req(), ctx("tmp"))).status).toBe(204);
+  });
+
+  // The nav pill's last-good fallback would keep drawing a line — and marking cards as waiting —
+  // through the very null read on which the governor fails open and starts them (PR #212 review).
+  it("reads the governor's strict signal, never the display fallback", async () => {
+    await GET(req(), ctx("tmp"));
+    expect(usageReads).toBe(1);
+    expect(displayReads).not.toHaveBeenCalled();
   });
 
   it("answers 204 for a project that is not budget-aware — no governor, no line", async () => {

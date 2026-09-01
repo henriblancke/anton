@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { RUN_JOB_TYPE, type BudgetSignal } from "@/lib/budget-line";
 import { getBurnAverage } from "@/lib/burn";
-import { getDisplayUsage } from "@/lib/claude/usage";
+import { getClaudeUsageCached } from "@/lib/claude/usage";
 import { getDb } from "@/lib/db";
 import { budgetHeadroom } from "@/lib/jobs/budget";
 import { getProjectSettings, resolveBudgetPolicy } from "@/lib/projects";
@@ -23,13 +23,18 @@ export const dynamic = "force-dynamic";
  * cannot justify). Either way the lane omits the line rather than guessing one — the governor admits
  * on a null read, and this surface must not contradict it. The enablement check runs first, before
  * any usage read, so an ungoverned project never spends the shared usage cache on this.
+ *
+ * The read is the governor's STRICT one ({@link getClaudeUsageCached}), not the nav pill's
+ * last-good-tolerant `getDisplayUsage`: a transient null after a high reading would leave the
+ * display fallback drawing a line — and marking cards as waiting — at the very moment the governor
+ * fails open and starts them. An unreadable meter must produce the documented 204 here.
  */
 export const GET = withProject<{ slug: string }>(async (_request, { project }) => {
   const db = getDb();
   const settings = await getProjectSettings(db, project.id);
   if (settings.budgetAware !== true) return new NextResponse(null, { status: 204 });
 
-  const usage = await getDisplayUsage();
+  const usage = await getClaudeUsageCached();
   const headroom = budgetHeadroom(usage, resolveBudgetPolicy(settings), Date.now());
   if (!headroom) return new NextResponse(null, { status: 204 });
 

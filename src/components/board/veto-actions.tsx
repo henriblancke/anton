@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { usePickDecision } from "@/components/board/pick-decision";
 import { criterionLabel, policyHref } from "@/lib/policy/href";
 import { formatCountdown } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -49,8 +50,12 @@ export function VetoActions({
 }) {
   const router = useRouter();
   const [pending, setPending] = useState<"not-now" | "never" | undefined>(undefined);
+  // A veto and a `[Release]` are two answers to one pick, and the card renders both. The lock is
+  // what makes them exclusive; a click that cannot take it is not a queued veto, it is no veto.
+  const decision = usePickDecision();
 
   async function veto(action: "not-now" | "never") {
+    if (!decision.claim()) return;
     setPending(action);
     try {
       const res = await fetch(`/api/projects/${slug}/picker/veto`, {
@@ -67,6 +72,7 @@ export function VetoActions({
       if (typeof until === "number") onVetoed?.(until);
 
       if (action === "not-now") {
+        decision.settle();
         toast.success("Set aside", {
           description: `anton offers "${title}" again in ${formatCountdown(new Date(until ?? Date.now()).toISOString())}.`,
         });
@@ -79,6 +85,7 @@ export function VetoActions({
       // The criterion is the SERVER's answer — it needs the board and the stored policy — and a
       // project whose policy narrows nothing has none, which opens the panel rather than a control.
       const criterion = body?.criterion ?? undefined;
+      decision.settle();
       toast.success("Declined — tighten the rule", {
         description: criterion
           ? `Opening the policy at ${criterionLabel(criterion)}.`
@@ -87,6 +94,8 @@ export function VetoActions({
       router.push(policyHref(slug, criterion));
       setPending(undefined);
     } catch (err) {
+      // Nothing was recorded, so the pick goes back on offer — including to `[Release]`.
+      decision.abandon();
       toast.error(err instanceof Error ? err.message : "Failed to record that");
       setPending(undefined);
     }
@@ -108,7 +117,7 @@ export function VetoActions({
         type="button"
         size="xs"
         variant="ghost"
-        disabled={pending !== undefined}
+        disabled={pending !== undefined || decision.state !== "open"}
         title="Set this one target aside — anton offers it again after a day, and nothing else changes"
         onClick={() => void veto("not-now")}
       >
@@ -119,7 +128,7 @@ export function VetoActions({
         type="button"
         size="xs"
         variant="ghost"
-        disabled={pending !== undefined}
+        disabled={pending !== undefined || decision.state !== "open"}
         title="Set it aside and open the policy at the rule that admitted it, so work like this stops being offered"
         onClick={() => void veto("never")}
       >

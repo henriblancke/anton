@@ -9,6 +9,7 @@ import type { UpNextCard } from "@/components/board/board-utils";
 import { UP_NEXT_LABEL, upNextMetaLabel } from "@/components/board/board-utils";
 import { BudgetDivider, BudgetWaiting, useBudgetSignal } from "@/components/board/budget-line";
 import { EpicCard } from "@/components/board/epic-card";
+import { PickDecisionProvider } from "@/components/board/pick-decision";
 import { StandaloneChip } from "@/components/board/standalone-chip";
 import { VetoActions } from "@/components/board/veto-actions";
 import { budgetLine } from "@/lib/budget-line";
@@ -127,6 +128,10 @@ export function UpNextLane({
  *
  * The drag handle lives here rather than on the card, so a target registers exactly one draggable —
  * dragging it sideways still moves its stage, dragging it within the lane reorders the plan.
+ *
+ * The row is also where the pick's ONE decision lives: `[Release]` renders inside the card and the
+ * vetoes render above it, so nothing below could serialize them (PR #212 review). Scoped per row —
+ * answering one pick never freezes the rest of the plan.
  */
 function UpNextRow({
   slug,
@@ -164,56 +169,58 @@ function UpNextRow({
   };
 
   return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className={cn("flex flex-col gap-1.5", isDragging && "opacity-40")}
-    >
-      <div className="flex items-center gap-2 px-0.5">
-        <UpNextMeta card={card} />
-        {/* The two ways to disagree with the pick, on the pick itself (R3.9). */}
-        <VetoActions
-          slug={slug}
-          beadId={beadId}
-          title={title}
-          {...(notNowUntil === undefined ? {} : { notNowUntil })}
-          className="shrink-0"
-          onVetoed={(untilMs) => onVetoed?.(beadId, untilMs)}
-        />
-        <button
-          ref={setActivatorNodeRef}
-          type="button"
-          {...attributes}
-          {...listeners}
-          disabled={reordering}
-          aria-label={`Reorder "${title}"`}
-          title={
-            reordering
-              ? "Saving the last reorder — one at a time"
-              : "Drag to reorder — the new position is written as this target's priority"
-          }
-          style={{ touchAction: "none" }}
-          className="flex size-5 shrink-0 cursor-grab items-center justify-center rounded-md text-subtle transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:cursor-grabbing disabled:cursor-progress disabled:opacity-40"
-        >
-          <GripVerticalIcon className="size-3.5" aria-hidden="true" />
-        </button>
+    <PickDecisionProvider>
+      <div
+        ref={setNodeRef}
+        style={style}
+        className={cn("flex flex-col gap-1.5", isDragging && "opacity-40")}
+      >
+        <div className="flex items-center gap-2 px-0.5">
+          <UpNextMeta card={card} />
+          {/* The two ways to disagree with the pick, on the pick itself (R3.9). */}
+          <VetoActions
+            slug={slug}
+            beadId={beadId}
+            title={title}
+            {...(notNowUntil === undefined ? {} : { notNowUntil })}
+            className="shrink-0"
+            onVetoed={(untilMs) => onVetoed?.(beadId, untilMs)}
+          />
+          <button
+            ref={setActivatorNodeRef}
+            type="button"
+            {...attributes}
+            {...listeners}
+            disabled={reordering}
+            aria-label={`Reorder "${title}"`}
+            title={
+              reordering
+                ? "Saving the last reorder — one at a time"
+                : "Drag to reorder — the new position is written as this target's priority"
+            }
+            style={{ touchAction: "none" }}
+            className="flex size-5 shrink-0 cursor-grab items-center justify-center rounded-md text-subtle transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:cursor-grabbing disabled:cursor-progress disabled:opacity-40"
+          >
+            <GripVerticalIcon className="size-3.5" aria-hidden="true" />
+          </button>
+        </div>
+        {card.kind === "epic" ? (
+          <EpicCard
+            slug={slug}
+            epic={card.epic}
+            budgetAware={budgetAware}
+            onDeleted={onEpicDeleted}
+          />
+        ) : (
+          <StandaloneChip
+            slug={slug}
+            item={card.item}
+            budgetAware={budgetAware}
+            onOpen={onOpenTicket}
+          />
+        )}
       </div>
-      {card.kind === "epic" ? (
-        <EpicCard
-          slug={slug}
-          epic={card.epic}
-          budgetAware={budgetAware}
-          onDeleted={onEpicDeleted}
-        />
-      ) : (
-        <StandaloneChip
-          slug={slug}
-          item={card.item}
-          budgetAware={budgetAware}
-          onOpen={onOpenTicket}
-        />
-      )}
-    </div>
+    </PickDecisionProvider>
   );
 }
 

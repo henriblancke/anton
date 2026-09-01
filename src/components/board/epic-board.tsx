@@ -156,13 +156,24 @@ export function EpicBoard({
   // refuses the second drop synchronously; the state disables the lane's handles so it can't start.
   const reorderingRef = useRef(false);
   const [reordering, setReordering] = useState(false);
+  // The live `load`, so a write that invalidates more than it can reconcile itself (a lane reorder,
+  // which retires the whole recorded plan server-side) can re-read the board on its own settle
+  // instead of leaving a stale surface up for a poll interval.
+  const loadRef = useRef<((force?: boolean) => Promise<void>) | undefined>(undefined);
+  const queuedForceRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     async function load(force = false) {
-      if (loadingRef.current) return;
+      if (loadingRef.current) {
+        // A forced read is never dropped on the floor: the poll already in flight left before the
+        // write and its answer will be discarded on `writeSeq`, so returning here would leave
+        // nobody to re-read. Run it once that one settles.
+        if (force) queuedForceRef.current = true;
+        return;
+      }
       loadingRef.current = true;
       try {
         const version = versionRef.current;
@@ -194,8 +205,13 @@ export function EpicBoard({
         }
       } finally {
         loadingRef.current = false;
+        if (queuedForceRef.current && !cancelled) {
+          queuedForceRef.current = false;
+          await load(true);
+        }
       }
     }
+    loadRef.current = load;
 
     async function poll() {
       // Skip work while the tab is hidden, a card is being dragged, or a write is settling; keep
@@ -218,6 +234,8 @@ export function EpicBoard({
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
+      queuedForceRef.current = false;
+      loadRef.current = undefined;
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
@@ -468,6 +486,7 @@ export function EpicBoard({
     // A standalone chip is a bead in its own right, so it patches through the ticket route; both
     // routes validate the priority server-side (parseEpicPatch / parseTicketPatch).
     const resource = card.kind === "epic" ? "epics" : "tickets";
+    let withdrew = false;
     try {
       const res = await fetch(`/api/projects/${slug}/${resource}/${beadId}`, {
         method: "PATCH",
@@ -485,9 +504,16 @@ export function EpicBoard({
       // detail rather than a board, so there is no authoritative version to adopt: drop the token
       // instead, and the next poll asks versionlessly and takes the blocking, post-write path.
       versionRef.current = undefined;
-      // A reprioritized bead is one the recorded plan no longer describes (isPlanStale), so that
-      // post-write board withholds the lane until the next pass re-ranks it. Say so, or the
-      // withdrawal reads as the drag having failed.
+      // A reprioritized bead is one the recorded plan no longer describes (isPlanStale), so the
+      // post-write board withholds the lane AND drops the live policy mark `[Release]` reads
+      // (isPickerPick). Both are re-read the moment this write settles (`withdrew` below) rather
+      // than at the next poll: for that whole beat the lane would otherwise go on offering Release
+      // against a plan the server has already invalidated, and that click starts an ordinary
+      // approval with none of the picker accept the button promises. Dropping the lane client-side
+      // is not enough — its cards would fall back into Backlog still carrying a live mark only the
+      // server can retire.
+      withdrew = true;
+      // Say what the withdrawal is, or it reads as the drag having failed.
       toast.success(`Set "${title}" to ${PRIORITY_LABELS[priority]}`, {
         description: "The lane re-ranks from it on the next board-picker pass.",
       });
@@ -514,6 +540,10 @@ export function EpicBoard({
       reorderingRef.current = false;
       setReordering(false);
     }
+
+    // After the sequence bump, never inside the write: a read issued before it would answer on the
+    // superseded `writeSeq` and be discarded by `load` — which is exactly the poll this replaces.
+    if (withdrew) await loadRef.current?.(true);
   }
 
   async function handleDragEnd(event: DragEndEvent) {

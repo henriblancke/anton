@@ -433,7 +433,7 @@ describe("EpicBoard reorder inside Up Next", () => {
     return button;
   };
 
-  it("keeps the corrected order instead of being served the pre-write plan on the next poll", async () => {
+  it("withdraws the stale lane on the write's own settle, not a poll later", async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes("/epics/anton-2")) {
         return new Response(JSON.stringify({ detail: {} }), { status: 200 });
@@ -465,21 +465,15 @@ describe("EpicBoard reorder inside Up Next", () => {
       over: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
     } as unknown as DragEndEvent);
 
-    await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
-
-    // Returning to the tab polls immediately (the interval is 30s).
-    fireEvent(document, new Event("visibilitychange"));
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/board"))).toBe(true),
-    );
-    await new Promise((r) => setTimeout(r, 0));
-
+    // No poll is waited on: the write reads the authoritative board itself. Until it does, the lane
+    // would still be offering [Release] against a plan the server has already invalidated — the
+    // click that starts an ordinary approval carrying none of the picker accept it promises.
+    await waitFor(() => expect(laneOrder()).toEqual([]));
     const boardReads = fetchMock.mock.calls
       .map((c) => String(c[0]))
       .filter((u) => u.includes("/board"));
+    expect(boardReads.length).toBe(1);
     expect(boardReads.every((u) => !u.includes("version="))).toBe(true);
-    // The lane withdrew itself — it never came back in the order the drag corrected away from.
-    expect(laneOrder()).toEqual([]);
     expect(columnOf("anton-2")).toBe("backlog");
   });
 
@@ -543,6 +537,10 @@ describe("EpicBoard reorder inside Up Next", () => {
     const pollHeld = new Promise<void>((resolve) => {
       landPoll = () => resolve();
     });
+    let landAuthoritative: (() => void) | undefined;
+    const authoritativeHeld = new Promise<void>((resolve) => {
+      landAuthoritative = () => resolve();
+    });
     let settlePatch: (() => void) | undefined;
     const patched = new Promise<Response>((resolve) => {
       settlePatch = () => resolve(new Response(JSON.stringify({ detail: {} }), { status: 200 }));
@@ -552,12 +550,13 @@ describe("EpicBoard reorder inside Up Next", () => {
       if (url.includes("/epics/anton-2")) return patched;
       if (url.includes("/board?version=")) {
         await pollHeld;
-        return new Response(
-          JSON.stringify({ board: planned("2:sync", ["anton-1", "anton-2"]) }),
-          { status: 200 },
-        );
+        const stale = planned("2:sync", ["anton-1", "anton-2"]);
+        // A card only the stale answer knows about, so adopting it would be visible.
+        stale.columns.implementing = [epic("anton-3", "implementing")];
+        return new Response(JSON.stringify({ board: stale }), { status: 200 });
       }
       if (url.includes("/board")) {
+        await authoritativeHeld;
         const authoritative = planned("2:sync", ["anton-1", "anton-2"]);
         delete authoritative.upNext;
         return new Response(JSON.stringify({ board: authoritative }), { status: 200 });
@@ -586,10 +585,12 @@ describe("EpicBoard reorder inside Up Next", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(laneOrder()).toEqual(["anton-2", "anton-1"]);
+    expect(columnOf("anton-3")).toBeUndefined();
 
-    // And it did not restore the token either: the next poll still asks versionlessly, so the
-    // withheld post-write lane is what finally replaces the optimistic one.
-    fireEvent(document, new Event("visibilitychange"));
+    // And the write's own re-read is not lost behind that poll: it is queued while the stale answer
+    // is in flight and asks versionlessly the moment it settles, which is what finally withdraws
+    // the lane — no waiting out a poll interval with [Release] on offer against a dead plan.
+    landAuthoritative?.();
     await waitFor(() => expect(laneOrder()).toEqual([]));
     const boardReads = fetchMock.mock.calls
       .map((c) => String(c[0]))
