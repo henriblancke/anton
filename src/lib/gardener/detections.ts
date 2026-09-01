@@ -436,7 +436,7 @@ type IdentityForm = "canonical" | "legacy";
  * exact state target-identity exists to remove. Emission only ever writes the canonical form, and
  * suppression folds a legacy proposal onto it (`canonicalFingerprintOf`), so no duplicate is filed.
  *
- * Which form matched decides how hard {@link parseGardenerPlan} presses on the subject checksum: a
+ * Which form matched decides how hard {@link readGardenerPlan} presses on the subject checksum: a
  * legacy fingerprint hashes the membership itself, so it needs no second record of it.
  */
 function identityForm(
@@ -573,15 +573,122 @@ const GARDENER_MOVES: readonly GardenerMove[] = [
 const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
 
 /**
- * Read a plan back off a bead's metadata, or `undefined` when what is there is not one. Validated
- * field by field rather than cast: this value decides which beads get MUTATED, so anything the
- * emitter did not write — a hand-edited metadata blob, a plan from a future anton that added a move
- * — must read as "no readable plan" and stop the apply, not fall through to a default branch.
+ * Why a wire plan was refused, naming the FIELD that failed. One reason per plan — the first rule
+ * that catches it — because the point is to tell a reader which field to look at, not to grade a
+ * metadata blob a human is free to edit.
+ */
+export interface PlanRejection {
+  field: PlanField;
+  reason: string;
+}
+
+/** What was on the bead: the plan, or why what is there is not one. */
+export type PlanRead = { plan: GardenerPlan } | { rejected: PlanRejection };
+
+/** The stand-in for the value AS A WHOLE — what a blob that is not plan-shaped at all is refused as. */
+const PLAN_ROOT = "(plan)";
+
+type PlanField = keyof GardenerPlan | typeof PLAN_ROOT;
+
+/**
+ * What one field must look like ON ITS OWN, before any rule that reads two fields together. Stated
+ * as a row per field rather than as a guard in a chain, so adding a field to {@link GardenerPlan} is
+ * a row here — and a missing row is a type error rather than a field nothing validates.
+ */
+interface FieldSpec {
+  /** Every plan carries it. Presence that DEPENDS on another field is a rule, not a spec. */
+  required?: boolean;
+  /** What a legal value is, in the words the rejection reports. */
+  shape: string;
+  ok: (value: unknown) => boolean;
+}
+
+/** A bead id, or any other string a plan carries that must not be empty. */
+const isId = (value: unknown): boolean => typeof value === "string" && value.length > 0;
+
+const PLAN_FIELDS = {
+  kind: {
+    required: true,
+    shape: "a kind some detector emits",
+    ok: (v) => isId(v) && GARDENER_DETECTION_KINDS.includes(v as GardenerDetectionKind),
+  },
+  move: {
+    required: true,
+    shape: "a move anton has an executor for",
+    ok: (v) => isId(v) && GARDENER_MOVES.includes(v as GardenerMove),
+  },
+  fingerprint: {
+    required: true,
+    shape: "a <namespace>:<kind>:<hash> label",
+    ok: (v) => typeof v === "string" && FINGERPRINT_LABEL.test(v),
+  },
+  subjects: {
+    required: true,
+    shape: "a non-empty list of bead ids",
+    ok: (v) => Array.isArray(v) && v.length > 0 && v.every(isId),
+  },
+  target: { shape: "a bead id", ok: isId },
+  retireAs: {
+    shape: `one of ${RETIRE_VERBS.join("/")}`,
+    ok: (v) => isId(v) && RETIRE_VERBS.includes(v as RetireVerb),
+  },
+  detail: { shape: "a non-empty parameter", ok: isId },
+  subjectChecksum: { shape: "a digest", ok: (v) => typeof v === "string" },
+} satisfies Record<keyof GardenerPlan, FieldSpec>;
+
+const PLAN_FIELD_NAMES = Object.keys(PLAN_FIELDS) as (keyof GardenerPlan)[];
+
+/**
+ * A rule that reads the plan as a WHOLE: presence that depends on the move, the kind→verb pairing,
+ * and the identities recomputed from the fields themselves. Ordered, and the first violation is the
+ * one reported — so each rule may assume the ones above it held.
+ */
+interface PlanRule {
+  field: keyof GardenerPlan;
+  violation: (plan: GardenerPlan, form: IdentityForm | undefined) => string | undefined;
+}
+
+const PLAN_RULES: readonly PlanRule[] = [
+  {
+    // A subject list is a SET, and emission writes it as one ({@link makeDetection}) — so a repeat is
+    // an edit, and for the kind whose identity is its target the fingerprint no longer catches it.
+    // Left standing, one bead listed twice counts twice towards MIN_CLUSTER_SIZE and a single bead
+    // already under the home settles as an applied cluster no detector would derive.
+    field: "subjects",
+    violation: (plan) =>
+      new Set(plan.subjects).size === plan.subjects.length ? undefined : "names a bead twice",
+  },
+  {
+    field: "move",
+    violation: (plan) =>
+      KINDS[plan.kind].move === plan.move
+        ? undefined
+        : `${plan.kind} is a ${KINDS[plan.kind].move}, not a ${plan.move}`,
+  },
+  { field: "retireAs", violation: retireViolation },
+  { field: "detail", violation: (plan) => detailViolation(plan.kind, plan.detail) },
+  {
+    field: "fingerprint",
+    violation: (_plan, form) =>
+      form ? undefined : "does not hash the kind, subjects, target and detail filed with it",
+  },
+  { field: "subjectChecksum", violation: checksumViolation },
+];
+
+/**
+ * Read a plan back off a bead's metadata, or say which field refused it. Validated against
+ * {@link PLAN_FIELDS} and {@link PLAN_RULES} rather than cast: this value decides which beads get
+ * MUTATED, so anything the emitter did not write — a hand-edited metadata blob, a plan from a future
+ * anton that added a move — must read as "no readable plan" and stop the apply, not fall through to
+ * a default branch.
+ *
+ * The reason is what the field spec buys over the guard chain it replaced: a refusal used to be a
+ * bare `undefined`, so a proposal that would not apply gave no account of WHICH field had rotted.
  *
  * `retireAs` is required exactly when the move is `retire` and forbidden otherwise, which is the
  * same invariant {@link GardenerDetection} documents; a retire with no verb has no safe default.
  *
- * Four checks bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
+ * Four rules bind the plan to the ONE claim its fingerprint stands for, so an approver cannot read
  * one ask and have another execute:
  *   • the fingerprint is RECOMPUTED from the parsed kind/subjects/target and must match the field
  *     carried alongside them — editing the subjects or the target of a proposal now invalidates it
@@ -589,99 +696,89 @@ const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
  *     identity, the target still is — see {@link ClaimIdentity});
  *   • the {@link subjectChecksum} is recomputed too, which is what re-binds the subject list for
  *     exactly that kind ({@link checksumViolation});
- *   • the move and retirement verb must be the ones {@link CANONICAL_MOVE} pairs with the kind,
- *     which is what covers the two fields the hash can't (a `stale` bead reads as a defer, so it
- *     must not execute a close);
+ *   • the move and retirement verb must be the ones {@link KINDS} pairs with the kind, which is what
+ *     covers the two fields the hash can't (a `stale` bead reads as a defer, so it must not execute
+ *     a close);
  *   • the subjects must be DISTINCT — a bead named twice is not two members of anything, and no
  *     hash of a sorted set catches it.
  */
-export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
+export function readGardenerPlan(value: unknown): PlanRead {
+  const raw = planObject(value);
+  if (!raw) return { rejected: { field: PLAN_ROOT, reason: "is not an object" } };
+  const read = readPlanFields(raw);
+  if ("rejected" in read) return read;
 
-  const kind = raw.kind;
-  const move = raw.move;
-  const fingerprint = raw.fingerprint;
-  if (typeof kind !== "string" || !GARDENER_DETECTION_KINDS.includes(kind as GardenerDetectionKind)) {
-    return undefined;
+  const { kind, subjects, target, detail, fingerprint } = read.plan;
+  const form = identityForm(kind, subjects, target, detail, fingerprint);
+  for (const rule of PLAN_RULES) {
+    const reason = rule.violation(read.plan, form);
+    if (reason) return { rejected: { field: rule.field, reason } };
   }
-  if (typeof move !== "string" || !GARDENER_MOVES.includes(move as GardenerMove)) return undefined;
-  if (typeof fingerprint !== "string" || !FINGERPRINT_LABEL.test(fingerprint)) return undefined;
-
-  const subjects = raw.subjects;
-  if (!Array.isArray(subjects) || subjects.length === 0) return undefined;
-  if (!subjects.every((s) => typeof s === "string" && s.length > 0)) return undefined;
-  // A subject list is a SET, and emission writes it as one ({@link makeDetection}) — so a repeat is
-  // an edit, and for the kind whose identity is its target the fingerprint no longer catches it. Left
-  // standing, one bead listed twice counts twice towards MIN_CLUSTER_SIZE and a single bead already
-  // under the home settles as an applied cluster no detector would derive.
-  if (new Set(subjects as string[]).size !== subjects.length) return undefined;
-
-  const target = raw.target;
-  if (target !== undefined && (typeof target !== "string" || !target)) return undefined;
-
-  const retireAs = raw.retireAs;
-  if (move === "retire") {
-    if (typeof retireAs !== "string" || !RETIRE_VERBS.includes(retireAs as RetireVerb)) {
-      return undefined;
-    }
-  } else if (retireAs !== undefined) {
-    return undefined;
-  }
-
-  const detail = raw.detail;
-  if (detail !== undefined && (typeof detail !== "string" || !detail)) return undefined;
-  // Required exactly where the kind declares a shape, forbidden elsewhere, and matching that shape:
-  // the same bar `makeDetection` holds the emitter to, re-applied to a metadata blob a human can
-  // edit. A `reprioritize` whose detail is not a priority has nothing to write.
-  if (detailViolation(kind as GardenerDetectionKind, detail as string | undefined)) return undefined;
-
-  // The move must be the one this kind means, and the identity must be the one these fields hash to.
-  const canonical = KINDS[kind as GardenerDetectionKind];
-  if (canonical.move !== move || canonical.retireAs !== (move === "retire" ? retireAs : undefined)) {
-    return undefined;
-  }
-  const form = identityForm(
-    kind as GardenerDetectionKind,
-    subjects as string[],
-    target as string | undefined,
-    detail as string | undefined,
-    fingerprint,
-  );
-  if (!form) return undefined;
-
-  const checksum = raw.subjectChecksum;
-  if (checksum !== undefined && typeof checksum !== "string") return undefined;
-  if (
-    checksumViolation(
-      kind as GardenerDetectionKind,
-      subjects as string[],
-      target as string | undefined,
-      detail as string | undefined,
-      checksum,
-      form,
-    )
-  ) {
-    return undefined;
-  }
-
-  return {
-    kind: kind as GardenerDetectionKind,
-    move: move as GardenerMove,
-    fingerprint,
-    subjects: subjects as string[],
-    ...(target ? { target: target as string } : {}),
-    ...(move === "retire" ? { retireAs: retireAs as RetireVerb } : {}),
-    ...(detail ? { detail: detail as string } : {}),
-    ...(checksum ? { subjectChecksum: checksum } : {}),
-  };
+  return read;
 }
 
 /**
- * Is this plan's subject guard wrong for what it carries? All-or-nothing, the same invariant
- * `detail` and `retireAs` hold: a kind whose fingerprint already hashes its membership must carry no
- * checksum, because a second record nothing reads is a plan whose identity says more than its
- * execution does.
+ * The plan a bead carries, or `undefined` when what is there is not one — the contract every caller
+ * that only decides whether to apply depends on. {@link readGardenerPlan} is the same read with the
+ * refusal's field kept.
+ */
+export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
+  const read = readGardenerPlan(value);
+  return "plan" in read ? read.plan : undefined;
+}
+
+/** The metadata blob as a plain object — an array or a scalar is not a plan, whatever it carries. */
+const planObject = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+/**
+ * The wire object as a plan CANDIDATE: every field it carries checked against its own spec, every
+ * field it omits left off. Unknown keys are dropped rather than refused — a plan is what the
+ * executors branch on, and an extra key is not something they could act on.
+ */
+function readPlanFields(raw: Record<string, unknown>): PlanRead {
+  const plan: Partial<GardenerPlan> = {};
+  for (const field of PLAN_FIELD_NAMES) {
+    const spec: FieldSpec = PLAN_FIELDS[field];
+    const value = raw[field];
+    if (value === undefined) {
+      if (spec.required) return { rejected: { field, reason: `is missing; expected ${spec.shape}` } };
+      continue;
+    }
+    if (!spec.ok(value)) return { rejected: { field, reason: `is not ${spec.shape}` } };
+    // The one cast in the read, and the spec above is what earns it: the field was just checked
+    // against the shape its own declaration names.
+    (plan as Record<string, unknown>)[field] = value;
+  }
+  return { plan: plan as GardenerPlan };
+}
+
+/**
+ * Why this plan's retirement verb is wrong, or undefined when it is right. Required exactly when the
+ * move is `retire`, forbidden otherwise, and it must be the verb {@link KINDS} pairs with the kind:
+ * `move` and `retireAs` are the two fields the fingerprint cannot cover, so this pairing is their
+ * whole guard — a bead whose prose says "defer" must never execute a close.
+ */
+function retireViolation(plan: GardenerPlan): string | undefined {
+  const expected = KINDS[plan.kind].retireAs;
+  if (plan.move !== "retire") {
+    return plan.retireAs === undefined
+      ? undefined
+      : `only a retire carries a verb, and ${plan.move} is not one`;
+  }
+  if (plan.retireAs === undefined) return `a retire has no default verb; expected ${expected}`;
+  return plan.retireAs === expected
+    ? undefined
+    : `${plan.kind} retires as ${expected}, not ${plan.retireAs}`;
+}
+
+/**
+ * Why this plan's subject guard is wrong for what it carries, or undefined when it is right.
+ * All-or-nothing, the same invariant `detail` and `retireAs` hold: a kind whose fingerprint already
+ * hashes its membership must carry no checksum, because a second record nothing reads is a plan
+ * whose identity says more than its execution does.
  *
  * Where the kind DOES declare one, the canonical form must carry it and it must match — that is the
  * whole guard, and the reason a cluster's membership cannot be edited into fresh grouping evidence.
@@ -689,18 +786,18 @@ export function parseGardenerPlan(value: unknown): GardenerPlan | undefined {
  * membership itself, so the list is already bound, and requiring a field the older emitter never
  * wrote would strand exactly the proposals {@link identityForm} exists to keep readable.
  */
-function checksumViolation(
-  kind: GardenerDetectionKind,
-  subjects: string[],
-  target: string | undefined,
-  detail: string | undefined,
-  checksum: string | undefined,
-  form: IdentityForm,
-): boolean {
-  const expected = subjectChecksum(kind, subjects, target, detail);
-  if (expected === undefined) return checksum !== undefined;
-  if (form === "legacy") return checksum !== undefined && checksum !== expected;
-  return checksum !== expected;
+function checksumViolation(plan: GardenerPlan, form: IdentityForm | undefined): string | undefined {
+  const expected = subjectChecksum(plan.kind, plan.subjects, plan.target, plan.detail);
+  const carried = plan.subjectChecksum;
+  if (expected === undefined) {
+    return carried === undefined
+      ? undefined
+      : `${plan.kind} binds its subjects by fingerprint and carries no guard`;
+  }
+  if (carried === undefined) {
+    return form === "legacy" ? undefined : `${plan.kind} must carry the subject guard it was filed with`;
+  }
+  return carried === expected ? undefined : "does not match the subject list it is filed with";
 }
 
 /**
