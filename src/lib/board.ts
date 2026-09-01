@@ -437,7 +437,9 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     // Length, not existence: a plan every entry drops out of (the bead left the snapshot, or every
     // pick is vetoed) projects an EMPTY lane, and `Board.upNext` promises absent-never-empty — an
     // "Up Next" heading over nothing reads as "anton has nothing to start".
-    ...(upNext?.length ? { upNext } : {}),
+    // The generation rides with the lane it projects: a card's veto names the decision it was drawn
+    // from, so a tab a later pass has overtaken records no pick rather than a stranger's.
+    ...(upNext?.length && currentPlan ? { upNext, upNextPlanId: currentPlan.planId } : {}),
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),

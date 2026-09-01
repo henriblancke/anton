@@ -395,6 +395,13 @@ export interface Board {
    * nothing to start" on a board where the pass simply isn't running.
    */
   upNext?: UpNextEntry[];
+  /**
+   * The GENERATION of the plan {@link upNext} was projected from — carried so a verdict can name the
+   * decision the operator actually looked at (PR #212 review). A veto posted from a tab a later pass
+   * has overtaken sends this id, and the server records no pick rather than one the operator was
+   * never shown. Absent exactly when the lane is.
+   */
+  upNextPlanId?: string;
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
   /**

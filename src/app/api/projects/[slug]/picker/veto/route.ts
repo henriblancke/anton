@@ -17,6 +17,11 @@ const bodySchema = z.object({
   beadId: z.string().trim().min(1).max(120),
   /** `not-now` sets the target aside; `never` does that AND sends the operator at the rule. */
   action: z.enum(["not-now", "never"]),
+  /**
+   * The plan GENERATION the operator was looking at when they answered — what names the pick this
+   * verdict is about. Optional: a caller that names none records a veto against no pick.
+   */
+  planId: z.string().trim().min(1).max(120).optional(),
 });
 
 /**
@@ -29,10 +34,18 @@ const bodySchema = z.object({
  * because it needs the board and the stored policy; the client only carries the answer into a URL.
  *
  * The plan is read for provenance, not for permission: a veto records the rank and the generation id
- * of the decision it answers, so the record names a PICK rather than only a bead. A target the
- * current plan does not carry is still vetoable — the pass may have re-ranked since the operator
- * looked — and records neither, plan id included: naming the latest generation would claim the
- * operator answered a decision that never offered this bead.
+ * of the decision it answers, so the record names a PICK rather than only a bead. Which decision
+ * that is comes from the CLIENT — the generation it had on screen — and is honoured only while the
+ * recorded plan is still that generation (PR #212 review). Inferring it from membership instead
+ * would misattribute every veto posted from a tab a later pass has overtaken: a bead can sit in both
+ * the plan the operator answered and the newer one, and the verdict would then carry a rank and a
+ * rule from a pick they were never shown — and, keyed on that generation, refuse the release of it
+ * (`recordPickerVeto`).
+ *
+ * A veto that cannot name its decision — an unnamed generation, a superseded one, or a plan that no
+ * longer carries the target — is still recorded and still defers: the pass may have re-ranked since
+ * the operator looked, and their answer is not theirs to lose. It simply records no pick, rank, rule
+ * and plan id dropped together, rather than one it cannot stand behind.
  *
  * A `never` on a project with no armed policy, or one whose policy narrows nothing this bead
  * satisfies, returns `criterion: null`. That is an answer, not a failure: the editor opens at the
@@ -51,11 +64,16 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
       { status: 400 },
     );
   }
-  const { beadId, action } = parsed.data;
+  const { beadId, action, planId } = parsed.data;
   const db = getDb();
 
   const plan = await getBoardPickerPlan(db, project.id).catch(() => undefined);
-  const entry = plan?.entries.find((e) => e.beadId === beadId);
+  const displayed = planId !== undefined && plan?.planId === planId ? plan : undefined;
+  const entry = displayed?.entries.find((e) => e.beadId === beadId);
+  const pick =
+    displayed && entry
+      ? { rank: entry.rank, planId: displayed.planId, ...(entry.rule ? { rule: entry.rule } : {}) }
+      : undefined;
 
   // Only `never` pays for a board read: `not-now` needs nothing but the veto, and making the cheap
   // veto wait on `bd` would be the one thing that stops an operator from using it.
@@ -66,8 +84,7 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
     projectId: project.id,
     beadId,
     action,
-    ...(entry?.rule ? { rule: entry.rule } : {}),
-    ...(entry ? { rank: entry.rank, ...(plan?.planId ? { planId: plan.planId } : {}) } : {}),
+    ...pick,
     ...(criterion ? { criterion } : {}),
   });
 

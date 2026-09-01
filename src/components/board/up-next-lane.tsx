@@ -32,6 +32,7 @@ import { cn } from "@/lib/utils";
 export function UpNextLane({
   slug,
   cards,
+  planId,
   budgetAware = false,
   reordering = false,
   onEpicDeleted,
@@ -41,6 +42,8 @@ export function UpNextLane({
   slug: string;
   /** Ranked plan cards, in rank order — never empty, since an empty lane is not rendered at all. */
   cards: UpNextCard[];
+  /** The plan generation these cards were projected from, carried into each card's veto. */
+  planId?: string;
   /** Project budget-aware flag (anton-y2ue): forwarded to cards exactly as Backlog forwards it. */
   budgetAware?: boolean;
   /**
@@ -99,6 +102,7 @@ export function UpNextLane({
               <UpNextRow
                 slug={slug}
                 card={card}
+                planId={planId}
                 budgetAware={budgetAware}
                 reordering={reordering}
                 onEpicDeleted={onEpicDeleted}
@@ -136,6 +140,7 @@ export function UpNextLane({
 function UpNextRow({
   slug,
   card,
+  planId,
   budgetAware,
   reordering,
   onEpicDeleted,
@@ -144,6 +149,7 @@ function UpNextRow({
 }: {
   slug: string;
   card: UpNextCard;
+  planId?: string;
   budgetAware: boolean;
   reordering: boolean;
   onEpicDeleted?: (epicId: string) => void;
@@ -181,6 +187,7 @@ function UpNextRow({
           <VetoActions
             slug={slug}
             beadId={beadId}
+            {...(planId === undefined ? {} : { planId })}
             title={title}
             {...(notNowUntil === undefined ? {} : { notNowUntil })}
             className="shrink-0"

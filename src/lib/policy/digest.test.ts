@@ -85,4 +85,27 @@ describe("policyDigest", () => {
   it("keeps an absent bound distinct from one asserted at zero", () => {
     expect(policyDigest({ maxParentDepth: 0 })).not.toBe(policyDigest({}));
   });
+
+  // Every value in a policy is a string off the operator's own board, so no separator this digest
+  // picks is unavailable to them — and two policies that admit different labels must never agree
+  // (PR #212 review).
+  it.each<[string, Policy, Policy]>([
+    [
+      "a value containing the value separator",
+      { labels: [{ namespace: "domain", values: ["a,b"] }] },
+      { labels: [{ namespace: "domain", values: ["a", "b"] }] },
+    ],
+    [
+      "a type containing the value separator",
+      { types: ["a,b"] },
+      { types: ["a", "b"] },
+    ],
+    [
+      "a namespace containing the field separators",
+      { labels: [{ namespace: "domain=eng/", values: [] }] },
+      { labels: [{ namespace: "domain", values: ["eng"] }] },
+    ],
+  ])("does not collide on %s", (_what, left, right) => {
+    expect(policyDigest(left)).not.toBe(policyDigest(right));
+  });
 });

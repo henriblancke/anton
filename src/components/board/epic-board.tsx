@@ -734,6 +734,7 @@ export function EpicBoard({
                 <UpNextLane
                   slug={slug}
                   cards={upNext.cards}
+                  {...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId })}
                   budgetAware={budgetAware}
                   reordering={reordering}
                   onEpicDeleted={handleEpicDeleted}

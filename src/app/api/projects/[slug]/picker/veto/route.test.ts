@@ -73,7 +73,8 @@ describe("POST /picker/veto", () => {
       exclusions: [],
     });
 
-    const res = await POST(req({ beadId: "anton-a", action: "not-now" }), ctx("tmp"));
+    const planId = (await getBoardPickerPlan(tdb.db, "p1"))!.planId;
+    const res = await POST(req({ beadId: "anton-a", action: "not-now", planId }), ctx("tmp"));
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.deferredUntil).toBeGreaterThan(Date.now());
@@ -87,7 +88,7 @@ describe("POST /picker/veto", () => {
       rank: 3,
       // The plan GENERATION it answers, never the board digest — that digest comes back the moment a
       // later pass re-admits this target, and the new pick must not inherit this decline.
-      planId: (await getBoardPickerPlan(tdb.db, "p1"))!.planId,
+      planId,
       rule: "the work policy armed on this machine",
     });
     expect(row.planId).not.toBe("cafebabecafebabe");
@@ -121,10 +122,78 @@ describe("POST /picker/veto", () => {
   it("vetoes a target the current plan no longer carries, recording neither rank nor plan id", async () => {
     // A stale tab answering a pick the latest generation has dropped. Stamping that generation's id
     // on the verdict would claim the operator answered a decision that never offered this bead.
-    const res = await POST(req({ beadId: "anton-zz", action: "not-now" }), ctx("tmp"));
+    await saveBoardPickerPlan(tdb.db, { now: () => NOW }, {
+      projectId: "p1",
+      stamp: { observedAtMs: NOW, digest: "cafebabecafebabe", beadCount: 1 },
+      entries: [{ beadId: "anton-a", rank: 1, rule: "the work policy armed on this machine" }],
+      exclusions: [],
+    });
+    const res = await POST(
+      req({
+        beadId: "anton-zz",
+        action: "not-now",
+        planId: (await getBoardPickerPlan(tdb.db, "p1"))!.planId,
+      }),
+      ctx("tmp"),
+    );
     expect(res.status).toBe(200);
     expect((await listPickerVerdicts(tdb.db, "p1"))[0]).toMatchObject({ beadId: "anton-zz" });
     expect((await listPickerVerdicts(tdb.db, "p1"))[0]?.rank).toBeUndefined();
+    expect((await listPickerVerdicts(tdb.db, "p1"))[0]?.planId).toBeUndefined();
+  });
+
+  it("records no pick when the operator answered a generation a later pass replaced", async () => {
+    // The bead is in BOTH plans, which is exactly the trap: inferring the pick from membership would
+    // stamp the newer generation's rank and rule on a decision the operator never saw — and, keyed
+    // on that generation, refuse the release of a pick they never declined.
+    const write = (rank: number) =>
+      saveBoardPickerPlan(tdb.db, { now: () => NOW }, {
+        projectId: "p1",
+        stamp: { observedAtMs: NOW, digest: "cafebabecafebabe", beadCount: 1 },
+        entries: [{ beadId: "anton-a", rank, rule: "the work policy armed on this machine" }],
+        exclusions: [],
+      });
+    await write(1);
+    const displayed = (await getBoardPickerPlan(tdb.db, "p1"))!.planId;
+    await write(7);
+    const current = (await getBoardPickerPlan(tdb.db, "p1"))!.planId;
+    expect(current).not.toBe(displayed);
+
+    const res = await POST(
+      req({ beadId: "anton-a", action: "not-now", planId: displayed }),
+      ctx("tmp"),
+    );
+
+    // The answer still lands — their veto is not theirs to lose — it just names no pick.
+    expect(res.status).toBe(200);
+    const [row] = await listPickerVerdicts(tdb.db, "p1");
+    expect(row).toMatchObject({ beadId: "anton-a", verdict: "declined" });
+    expect(row?.rank).toBeUndefined();
+    expect(row?.planId).toBeUndefined();
+    expect(row?.rule).toBeUndefined();
+    expect([...(await activeDeferrals(tdb.db, "p1", new Date())).keys()]).toEqual(["anton-a"]);
+
+    // And the current generation's pick is still releasable: the stale decline never claimed it.
+    expect(
+      await recordPickerAccept(tdb.db, { now: () => NOW }, {
+        projectId: "p1",
+        beadId: "anton-a",
+        planId: current,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("records no pick when the veto names no generation at all", async () => {
+    // A caller that cannot say which decision it answered has not witnessed one, and the latest plan
+    // is not evidence of what was on screen.
+    await saveBoardPickerPlan(tdb.db, { now: () => NOW }, {
+      projectId: "p1",
+      stamp: { observedAtMs: NOW, digest: "cafebabecafebabe", beadCount: 1 },
+      entries: [{ beadId: "anton-a", rank: 1, rule: "the work policy armed on this machine" }],
+      exclusions: [],
+    });
+
+    expect((await POST(req({ beadId: "anton-a", action: "not-now" }), ctx("tmp"))).status).toBe(200);
     expect((await listPickerVerdicts(tdb.db, "p1"))[0]?.planId).toBeUndefined();
   });
 
@@ -157,7 +226,10 @@ describe("POST /picker/veto", () => {
       planId: (await getBoardPickerPlan(tdb.db, "p1"))!.planId,
     });
 
-    const res = await POST(req({ beadId: "anton-a", action: "not-now" }), ctx("tmp"));
+    const res = await POST(
+      req({ beadId: "anton-a", action: "not-now", planId: (await getBoardPickerPlan(tdb.db, "p1"))!.planId }),
+      ctx("tmp"),
+    );
 
     expect(res.status).toBe(409);
     expect((await res.json()).error).toMatch(/already released/);

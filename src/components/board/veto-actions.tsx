@@ -33,6 +33,7 @@ import { cn } from "@/lib/utils";
 export function VetoActions({
   slug,
   beadId,
+  planId,
   title,
   notNowUntil,
   className,
@@ -40,6 +41,12 @@ export function VetoActions({
 }: {
   slug: string;
   beadId: string;
+  /**
+   * The plan generation this card was drawn from. Sent with the veto so the record names the pick
+   * the operator answered: by the time they click, a later pass may already have re-ranked this bead
+   * into a plan they never saw, and the server records no pick rather than that one.
+   */
+  planId?: string;
   /** The target's title, for the confirmation — the operator set a thing aside, not an id. */
   title: string;
   /** When the target's current hold expires (epoch ms), when one is already running. */
@@ -61,7 +68,7 @@ export function VetoActions({
       const res = await fetch(`/api/projects/${slug}/picker/veto`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ beadId, action }),
+        body: JSON.stringify({ beadId, action, ...(planId ? { planId } : {}) }),
       });
       const body = (await res.json().catch(() => null)) as
         | { error?: string; deferredUntil?: number; criterion?: string | null }

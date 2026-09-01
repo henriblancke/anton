@@ -124,6 +124,9 @@ function entry(beadId: string, rank: number, over: Partial<UpNextEntry> = {}): U
 }
 
 /** Two ranked backlog targets, one unranked one beside them, and one already implementing. */
+/** The generation the fixture's lane is drawn from — what a veto off it must name. */
+const PLAN_ID = "plan-gen-1";
+
 function fixture(upNext?: UpNextEntry[]): Board {
   const columns = Object.fromEntries(STAGES.map((s) => [s, [] as Epic[]])) as Record<Stage, Epic[]>;
   columns.backlog = [
@@ -141,7 +144,7 @@ function fixture(upNext?: UpNextEntry[]): Board {
       Stage,
       StandaloneItem[]
     >,
-    ...(upNext ? { upNext } : {}),
+    ...(upNext ? { upNext, upNextPlanId: PLAN_ID } : {}),
     sync: {
       state: "synced",
       lastSyncedAt: 1,
@@ -386,7 +389,13 @@ describe("vetoing a pick from the lane", () => {
         "/api/projects/tmp/picker/veto",
         expect.objectContaining({
           method: "POST",
-          body: JSON.stringify({ beadId: "anton-pick2", action: "not-now" }),
+          // The generation the card was drawn from rides along, so the record names the pick the
+          // operator answered rather than whatever the latest pass has since ranked.
+          body: JSON.stringify({
+            beadId: "anton-pick2",
+            action: "not-now",
+            planId: PLAN_ID,
+          }),
         }),
       ),
     );
