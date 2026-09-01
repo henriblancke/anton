@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
+import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { loadAllIssues, refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
@@ -324,6 +325,13 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       ]
     : [];
 
+  // What this run will cost the OPERATOR, on the same advisory channel (anton-qfso.2): every bead in
+  // the dispatch set labelled `agent:human` is a point the run reaches and then holds, waiting for a
+  // person. Never a refusal — human work is real, shaped, approved work — but it is the one cost the
+  // operator can only weigh before starting. Same `willEnqueue` gate and same set as the advisory
+  // above, so a take-over that starts no run promises no gates either.
+  const humanWork = willEnqueue ? humanGates(contractGated) : [];
+
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
@@ -507,13 +515,16 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // `advisory` carries the contract gaps that did NOT refuse the approval — the run is starting
   // despite them, so the operator hears about them once, here, rather than never. Empty when this
   // request enqueued nothing (a pure take-over of a blocked target): no run, nothing degraded.
+  // `humanGates` rides the same channel and is OMITTED when the run stops for nobody, so the common
+  // case adds nothing to the body and the client has nothing to say.
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
+  const reported = { jobId, advisory, ...(humanWork.length > 0 ? { humanGates: humanWork } : {}) };
   if (epic) {
     const updatedEpic = { ...epic, ...written };
-    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId, advisory });
+    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, ...reported });
   }
   if (standalone) {
-    return NextResponse.json({ item: { ...standalone, ...written }, jobId, advisory });
+    return NextResponse.json({ item: { ...standalone, ...written }, ...reported });
   }
   return notFoundResponse("Run target not found");
 });

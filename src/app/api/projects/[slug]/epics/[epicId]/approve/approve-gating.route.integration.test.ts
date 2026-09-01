@@ -342,6 +342,40 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(beads.isApproved(await beads.show(repo, epic))).toBe(true);
   });
 
+  it("names every human ticket the run will stop for, however deep it nests", async () => {
+    // anton-qfso.2: `agent:human` work is real, approved work the run reaches and then HOLDS for a
+    // person. It never refuses the approval — it is what the operator is signing up for, and the
+    // only moment they can weigh it is here, not three hours into the run.
+    const target = await beads.create(repo, { title: "Feature with human work", type: "feature", acceptance: "- [ ] it works" });
+    const agentWork = await beads.create(repo, { title: "Agent ticket", type: "task", acceptance: "- [ ] it works" });
+    const personWork = await beads.create(repo, {
+      title: "Buy the domain",
+      type: "task",
+      acceptance: "- [ ] the domain resolves",
+      labels: ["agent:human"],
+    });
+    await beads.link(repo, agentWork, target, "parent-child");
+    // A grandchild ships in the same PR, so its gate is this run's gate.
+    await beads.link(repo, personWork, agentWork, "parent-child");
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.humanGates).toEqual([`${personWork} → Buy the domain`]);
+    expect(beads.isApproved(await beads.show(repo, target))).toBe(true);
+  });
+
+  it("says nothing about human work on a run that stops for nobody", async () => {
+    const target = await beads.create(repo, { title: "All agent work", type: "feature", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Agent ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, target, "parent-child");
+
+    const res = await approve(target);
+    expect(res.status).toBe(200);
+    // Absent, not empty: an empty list is still a thing the client has to decide not to say.
+    expect(await res.json()).not.toHaveProperty("humanGates");
+  });
+
   it("approves a bead repaired since the board last read it — the gate reads fresh", async () => {
     // The contract gate rides the same forced fresh read as the blocker gate: a bead whose
     // Acceptance was written after the board snapshot warmed must approve, not 422 on stale text.
