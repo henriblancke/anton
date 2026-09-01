@@ -1431,6 +1431,13 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
         // parent and its status — so the writes land only while a fresh read still finds the
         // ticket exactly where and as this run left it. The lock orders every claim write made in
         // THIS process; the cross-process half stays open on bd's current primitives (anton-od4).
+        //
+        // A new ASSIGNEE is deliberately not one of those signals (PR #199 review). A reservation
+        // says who will run the ticket next, not that it left this run: it is still this target's
+        // child, still open, and still in no diff this PR carries — and the merge closes what it
+        // finds open, so withholding the marker there is the silent loss the marker exists to
+        // prevent. The reservation itself is what the CAS below protects.
+
         const reservedFor = childCascade?.actor;
         const moved = await claimGuard.withClaimLock(repo, ticket.id, async (swap) => {
           const live = await beads.show(repo, ticket.id).catch(() => undefined);

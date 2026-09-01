@@ -377,6 +377,26 @@ describe("finalizeMergedEpic", () => {
     expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
   });
 
+  it("creates a fresh follow-up when the leftover one is no longer open (PR #199 review)", async () => {
+    // A human deferred it — the lane's "not now". The picker skips every non-open target and the
+    // claim gate refuses one, so filling this epic and closing the merged source would park the
+    // remaining tickets somewhere no approval can start.
+    const deferred = {
+      ...bead("epic-7", "deferred"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [deferred],
+    );
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-2");
+  });
+
   it("does not reuse a leftover follow-up claimed since the sweep (PR #199)", async () => {
     // The snapshot only nominates it. A PR sits in review for days, and an operator who claimed
     // this epic in that window is running it — adding tickets to a live run's ticket set is the

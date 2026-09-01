@@ -1455,8 +1455,16 @@ async function applyRehome(
   // anton cannot re-read decides nothing either way — and creating a second follow-up on that
   // silence would strand this one — so finalization stops short of the close instead, and the next
   // sweep retries the whole rehome.
+  //
+  // `open` and nothing else, which is the same status test the picker applies to a run target
+  // (`picker-targets.ineligibility`) and the claim gate enforces (PR #199 review). A follow-up a
+  // human deferred, or that bd left `blocked`, is not a target anton can ever run: moving the
+  // remaining tickets onto it and closing their merged source would put that work somewhere no
+  // sweep re-selects and no approval can start, short of an undocumented status repair. That one is
+  // touched in the sense that matters — somebody's decision is on it — so it gets a fresh follow-up,
+  // exactly like an approved or claimed one.
   const untouched = (b: Bead): boolean =>
-    b.status !== "closed" &&
+    b.status === "open" &&
     ownerOf(b) === undefined &&
     !(b.labels ?? []).includes(LABELS.approved);
   const stampedBy = (b: Bead): boolean => b.metadata?.[REHOME_OF] === epic.id;
