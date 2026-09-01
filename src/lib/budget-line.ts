@@ -70,8 +70,10 @@ export interface BudgetLine {
  * `null` means exactly one thing to a caller — render no line — and it covers both honest cases: the
  * budget cannot be read (fail open), and the whole queue is affordable (nothing to mark).
  *
- * A card that exhausts BOTH sides at once reports the session hold, matching the gate's own
- * precedence: the session floor outranks the weekly plan.
+ * A card that exhausts BOTH sides at once reports whichever hold the gate would actually apply. Only
+ * the hard session floor outranks the weekly checks; the daytime reserve is tested AFTER them, so a
+ * card over both reports the weekly hold — telling the operator to wait for tonight when the real
+ * wait runs to weekly catch-up or reset would misstate the hold.
  */
 export function budgetLine(
   signal: BudgetSignal | null,
@@ -95,9 +97,13 @@ export function budgetLine(
     const overSession = session > headroom.sessionPct;
     const overWeekly = headroom.weeklyPct !== null && weekly > headroom.weeklyPct;
     if (overSession || overWeekly) {
+      // budgetGate's order is session-headroom → weekly-cap → weekly-on-track → daytime-reserve, so
+      // only the hard floor beats a weekly hold when both are exhausted.
+      const sessionFirst =
+        overSession && (!overWeekly || headroom.sessionReason === "session-headroom");
       return {
         affordable: index,
-        reason: overSession ? headroom.sessionReason : headroom.weeklyReason,
+        reason: sessionFirst ? headroom.sessionReason : headroom.weeklyReason,
         seeded,
       };
     }

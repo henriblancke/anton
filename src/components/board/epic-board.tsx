@@ -139,6 +139,13 @@ export function EpicBoard({
   const draggingRef = useRef(false);
   const versionRef = useRef(initialBoard?.version);
   const loadingRef = useRef(false);
+  // Bumped as each board write settles. A poll fetched against the PRE-write version is answered on
+  // the route's non-blocking path with the retained pre-write board stamped with the version the
+  // write already advanced to — believing that after the write restores both the stale board and a
+  // token the next poll 304s on, silently undoing the drag. Comparing the sequence a poll left with
+  // against the current one discards exactly those; a poll landing while the write is still in
+  // flight is still believed, because the write settles after it and has the last word.
+  const writeSeqRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -149,12 +156,13 @@ export function EpicBoard({
       loadingRef.current = true;
       try {
         const version = versionRef.current;
+        const writeSeq = writeSeqRef.current;
         const suffix = !force && version !== undefined ? `?version=${encodeURIComponent(version)}` : "";
         const res = await fetch(`/api/projects/${slug}/board${suffix}`);
         if (res.status === 304) return;
         if (!res.ok) throw new Error(`Failed to load board (${res.status})`);
         const data = (await res.json()) as { board: Board };
-        if (!cancelled && !draggingRef.current) {
+        if (!cancelled && !draggingRef.current && writeSeq === writeSeqRef.current) {
           versionRef.current = data.board.version;
           setBoard(data.board);
           setError(null);
@@ -421,6 +429,11 @@ export function EpicBoard({
         prev ? { ...prev, ...(previousUpNext?.length ? { upNext: previousUpNext } : {}) } : prev,
       );
       toast.error(err instanceof Error ? err.message : "Failed to reorder");
+    } finally {
+      // Every poll that left before this point asked on the pre-write version, so its answer is
+      // about a board that no longer exists. Bump on failure too: a rejected PATCH is not proof the
+      // server wrote nothing.
+      writeSeqRef.current += 1;
     }
   }
 
@@ -476,6 +489,10 @@ export function EpicBoard({
     } catch (err) {
       setBoard(previous);
       toast.error(err instanceof Error ? err.message : "Failed to move card");
+    } finally {
+      // Same as the reorder path: a poll fetched against the pre-move version must not be believed
+      // now that the move has settled.
+      writeSeqRef.current += 1;
     }
   }
 

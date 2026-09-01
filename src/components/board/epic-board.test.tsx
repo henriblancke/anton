@@ -438,4 +438,68 @@ describe("EpicBoard reorder inside Up Next", () => {
     await waitFor(() => expect(laneOrder()).toEqual(["anton-1", "anton-2"]));
     expect(columnOf("anton-3")).toBe("implementing");
   });
+
+  it("discards a poll fetched on the pre-write version once the write has settled", async () => {
+    // Dropping the token only helps polls issued AFTER the write. A poll already in flight when the
+    // drop fired still carries the pre-write version, so the board route answers it on the
+    // non-blocking path with the retained pre-write plan stamped with the version the write already
+    // advanced to. Believing it after the write restores BOTH the old order and a token every later
+    // poll 304s on — the drag undone until some other invalidation.
+    let landPoll: (() => void) | undefined;
+    const pollHeld = new Promise<void>((resolve) => {
+      landPoll = () => resolve();
+    });
+    let settlePatch: (() => void) | undefined;
+    const patched = new Promise<Response>((resolve) => {
+      settlePatch = () => resolve(new Response(JSON.stringify({ detail: {} }), { status: 200 }));
+    });
+
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/epics/anton-2")) return patched;
+      if (url.includes("/board?version=")) {
+        await pollHeld;
+        return new Response(
+          JSON.stringify({ board: planned("2:sync", ["anton-1", "anton-2"]) }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/board")) {
+        const authoritative = planned("2:sync", ["anton-1", "anton-2"]);
+        delete authoritative.upNext;
+        return new Response(JSON.stringify({ board: authoritative }), { status: 200 });
+      }
+      return new Response(null, { status: 304 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync", ["anton-1", "anton-2"])} />);
+
+    // A poll leaves on the pre-write token, then the drop fires while it is still out.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/board?version="))).toBe(true),
+    );
+    dragEndHandler?.({
+      active: { id: "anton-2", data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
+
+    // The write settles first; the stale answer only lands after it.
+    settlePatch?.();
+    await new Promise((r) => setTimeout(r, 0));
+    landPoll?.();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(laneOrder()).toEqual(["anton-2", "anton-1"]);
+
+    // And it did not restore the token either: the next poll still asks versionlessly, so the
+    // withheld post-write lane is what finally replaces the optimistic one.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(laneOrder()).toEqual([]));
+    const boardReads = fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((u) => u.includes("/board"));
+    expect(boardReads.at(-1)).not.toContain("version=");
+  });
 });

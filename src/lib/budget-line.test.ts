@@ -62,10 +62,21 @@ describe("budgetLine", () => {
     expect(line).toEqual({ affordable: 0, reason: "weekly-on-track", seeded: false });
   });
 
-  it("reports the session hold when both sides run out on the same card", () => {
-    // The gate's own precedence: the session floor outranks the weekly plan.
+  it("reports the session floor when both sides run out on the same card", () => {
+    // The gate's own precedence: the hard session floor is checked before the weekly holds.
     const line = budgetLine(signal({ sessionPct: 10, weeklyPct: 1 }), queue(2));
     expect(line?.reason).toBe("session-headroom");
+  });
+
+  it("yields to the weekly hold when the session side is only the daytime reserve", () => {
+    // budgetGate tests the reserve AFTER weekly cap/pacing, so a card over both is held by the
+    // weekly side. Naming the reserve would promise the wait ends tonight when it runs to the
+    // weekly catch-up or reset.
+    const line = budgetLine(
+      signal({ sessionPct: 10, sessionReason: "daytime-reserve", weeklyPct: 1 }),
+      queue(2),
+    );
+    expect(line).toEqual({ affordable: 0, reason: "weekly-cap", seeded: false });
   });
 
   it("puts the line above the whole queue when nothing is affordable now", () => {
