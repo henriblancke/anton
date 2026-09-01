@@ -1469,6 +1469,37 @@ async function applyRehome(
     !(b.labels ?? []).includes(LABELS.approved);
   const stampedBy = (b: Bead): boolean => b.metadata?.[REHOME_OF] === epic.id;
   const stampedForEpic = (b: Bead): boolean => stampedBy(b) && untouched(b);
+  /**
+   * Take the stamped follow-ups that LOST the election off the board — the same reconciliation
+   * whichever way this pass got its home, since a childless stamped epic nobody deletes outlives
+   * the merged source's close and no later sweep re-selects it.
+   *
+   * Only an UNTOUCHED, CHILDLESS loser, on a read taken here: one a human has since approved or a
+   * worker claimed is a run of its own, and one that already carries tickets is a real home —
+   * `bd delete --force` does not cascade, so removing it would strand its children parentless.
+   * `boards` are the parentage snapshots to believe; any of them seeing a child is enough. A loser
+   * anton cannot settle holds the merged source open ({@link strandedRival}) instead of being
+   * deleted on a guess.
+   */
+  const deleteLosers = async (
+    losers: Bead[],
+    boards: Bead[][],
+  ): Promise<void> => {
+    for (const loser of losers) {
+      const live = await reread(loser.id);
+      if (!live) {
+        strandedRival ??= loser.id;
+        continue;
+      }
+      if (
+        !untouched(live) ||
+        boards.some((b) => b.some((x) => beads.parentOf(x) === loser.id))
+      )
+        continue;
+      if (!(await safe(() => beads.delete(repo, loser.id))))
+        strandedRival ??= loser.id;
+    }
+  };
   // A snapshot that names NO candidate is not evidence that none exists (PR #199). Two jobs may
   // finalize the same merged target — `enqueueReviewFixIfAbsent` counts the project-wide sweep and
   // a gate-check's targeted fix as different work — and whichever runs second holds a board read
@@ -1481,11 +1512,32 @@ async function applyRehome(
     ? all
     : await beads.list(repo, ["--status", "all"]).catch(() => undefined);
   if (!board) return { ...none, unfinished: epic.id };
-  const candidate = board.find(stampedForEpic);
-  const liveCandidate = candidate ? await reread(candidate.id) : undefined;
-  if (candidate && !liveCandidate) return { ...none, unfinished: candidate.id };
-  const reused =
-    liveCandidate && untouched(liveCandidate) ? liveCandidate : undefined;
+  // EVERY stamped candidate, not the first one the board happens to list (PR #199 review). Two
+  // processes that each crashed between their create and its reconciliation leave two on the board,
+  // and a reuse that picks one arbitrarily never reaches the rival cleanup the create path runs —
+  // the merged source then closes over a childless run target no later sweep re-selects, asking the
+  // founder to approve a run with nothing in it. The election is the create path's rule exactly
+  // (`olderOf`), so a process arriving at either entry point converges on the same bead.
+  //
+  // A candidate anton cannot re-read decides nothing either way, and reusing a younger one while an
+  // older may still be out there would split the preserved tickets across both: finalization stops
+  // short of the close instead, and the next sweep retries the whole rehome.
+  const candidates: Bead[] = [];
+  for (const stamped of board.filter(stampedForEpic)) {
+    const live = await reread(stamped.id);
+    if (!live) return { ...none, unfinished: stamped.id };
+    if (untouched(live)) candidates.push(live);
+  }
+  const reused = candidates.length > 0 ? candidates.reduce(olderOf) : undefined;
+  const losers = candidates.filter((b) => b.id !== reused?.id);
+  if (losers.length > 0) {
+    // Childlessness is asked of the board as it is NOW: `board` may be this sweep's snapshot, and a
+    // rival's own process can have parented tickets to it since. A list that fails proves nothing
+    // against an irreversible delete, so the duplicates are left standing and the source held open.
+    const now = await beads.list(repo, ["--status", "all"]).catch(() => undefined);
+    if (now) await deleteLosers(losers, [board, now]);
+    else strandedRival ??= losers[0].id;
+  }
   const area = areaLabelOf(epic, all);
   let followUp: string;
   /**
@@ -1558,25 +1610,7 @@ async function applyRehome(
         // process's own loser leaves that childless stamped epic on the board for good: the merged
         // source closes below, so no later sweep re-selects it and reconciles. An empty run target
         // sitting there asks the founder to approve a run with nothing in it.
-        //
-        // Only an UNTOUCHED, CHILDLESS rival: one a human has since approved or a worker claimed is
-        // a run of its own, and one that already carries tickets is a real home — `bd delete` does
-        // not cascade here, so removing it would strand its children parentless. A rival anton
-        // cannot settle holds the source open instead of being deleted on a guess.
-        for (const rival of rivals) {
-          const live = await reread(rival.id);
-          if (!live) {
-            strandedRival ??= rival.id;
-            continue;
-          }
-          if (
-            !untouched(live) ||
-            afterCreate.some((b) => beads.parentOf(b) === rival.id)
-          )
-            continue;
-          if (!(await safe(() => beads.delete(repo, rival.id))))
-            strandedRival ??= rival.id;
-        }
+        await deleteLosers(rivals, [afterCreate]);
       } else {
         // Ours is the duplicate: take it off the board before anything can land on it, and move
         // onto the winner instead — the rival reaches that same bead, so the preserved tickets stay

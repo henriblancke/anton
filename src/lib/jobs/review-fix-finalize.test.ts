@@ -386,6 +386,63 @@ describe("finalizeMergedEpic", () => {
     expect(noteMock.mock.calls[0][2]).toContain("now lives under epic-7");
   });
 
+  it("reconciles the duplicate follow-ups two interrupted sweeps left behind (PR #199 review)", async () => {
+    // Reuse and the create path reach the same board state and must reconcile it the same way. Two
+    // processes that each crashed between their create and its cleanup leave two stamped epics, and
+    // reusing whichever one the board lists first leaves the other childless for good — the merged
+    // source closes below, so no later sweep re-selects it and settles it.
+    const older = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    const younger = {
+      ...bead("epic-8"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    createdAt.set("epic-7", "2026-01-01T00:00:00Z");
+    createdAt.set("epic-8", "2026-01-02T00:00:00Z");
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [younger, older], // listed youngest-first: the verdict is creation time, not board order
+    );
+
+    expect(createMock).not.toHaveBeenCalled();
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-7");
+    expect(deleteMock).toHaveBeenCalledWith("/repo", "epic-8");
+    expect(batchMock).toHaveBeenCalledTimes(1); // nothing left undone — the source closes
+  });
+
+  it("leaves a duplicate follow-up that already carries tickets standing (PR #199 review)", async () => {
+    // The losing duplicate is a real home, not the childless poison run the cleanup exists for:
+    // `bd delete --force` does not cascade, so deleting it would strand its ticket parentless.
+    const older = {
+      ...bead("epic-7"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    const younger = {
+      ...bead("epic-8"),
+      issue_type: "epic",
+      metadata: { rehomeOf: "epic-1" },
+    } as Bead;
+    createdAt.set("epic-7", "2026-01-01T00:00:00Z");
+    createdAt.set("epic-8", "2026-01-02T00:00:00Z");
+    listMock.mockResolvedValue([{ ...bead("t9"), parent: "epic-8" } as Bead]);
+
+    await finalize(
+      bead("epic-1"),
+      [bead("t2", "blocked", ["not-delivered"])],
+      [older, younger],
+    );
+
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "t2", "epic-7");
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+
   it("stamps the follow-up with the target it was created for", async () => {
     await finalize(bead("epic-1"), [bead("t2", "blocked", ["not-delivered"])]);
 

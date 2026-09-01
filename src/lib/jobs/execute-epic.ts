@@ -1440,16 +1440,27 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
 
         const reservedFor = childCascade?.actor;
         const moved = await claimGuard.withClaimLock(repo, ticket.id, async (swap) => {
-          const live = await beads.show(repo, ticket.id).catch(() => undefined);
-          // A read that FAILS is not evidence the ticket moved, and the two writes fail in
-          // opposite directions: the marker withheld from a ticket still ours lets the merge close
-          // undelivered work as shipped (silent loss), while a release nobody can justify clears a
-          // claim that may be somebody's live work. So an unreadable bead keeps the marker and
-          // skips only the release.
+          // The guarded read is the evidence BOTH writes below are decided on, so it is retried
+          // like the writes are, and a run that still cannot take it stops (PR #199 review).
+          // Tagging on an unreadable bead is not the safe half of the trade: a second run that has
+          // already reparented and claimed this ticket would deliver it with `not-delivered` still
+          // attached — runTicket only clears the label off its OWN snapshot, taken before this late
+          // write — and merge finalization then preserves and rehomes work that shipped. Withholding
+          // the marker is not safe either; it is the silent loss the marker exists to prevent. So
+          // neither write is made on an unverified ticket: the run parks with the board named, and
+          // the resume re-reads it.
+          const live = await mustRead(repo, ticket.id);
+          if (!live) {
+            throw new PoisonEpic(
+              `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+                `not read the ticket back, so anton cannot tell whether it is still this run's to ` +
+                `mark — the run stopped rather than write \`${LABELS.notDelivered}\` onto a ticket ` +
+                `another run may already own. Check the beads DB, then resume the run`,
+            );
+          }
           if (
-            live &&
-            (beads.parentOf(live) !== beads.parentOf(ticket) ||
-              live.status !== ticket.status)
+            beads.parentOf(live) !== beads.parentOf(ticket) ||
+            live.status !== ticket.status
           )
             return true;
           // Closed on another machine but its commit never reached this branch, and now it will
@@ -1496,8 +1507,7 @@ export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
           // work, and an unconditional unassign would advertise their ticket as claimable and
           // invite a second run of it. `live` was read under this lock, so it IS the swap's own
           // re-read: handed in rather than paid for twice.
-          if (reservedFor && live)
-            await safe(() => swap(reservedFor, undefined, live));
+          if (reservedFor) await safe(() => swap(reservedFor, undefined, live));
           return false;
         });
         await safe(() => beads.note(repo, ticket.id, skipNote(skipping, moved)));
@@ -4720,6 +4730,32 @@ async function mustPersist(fn: () => Promise<unknown>, attempts = 3): Promise<bo
     }
   }
   return false;
+}
+
+/**
+ * A bd read a guarded write is decided on, retried on {@link PERSIST_RETRY_MS} exactly like the
+ * write itself. Answers `undefined` only once bd has refused it every time, so the caller escalates
+ * on a board that is genuinely unreachable rather than on one contended round trip.
+ *
+ * `beads.show(...).catch(() => undefined)` is right where "unreadable" is evidence of nothing and
+ * the caller simply does less. It is wrong ahead of a write whose correctness depends on WHOSE the
+ * bead still is (see {@link LABELS.notDelivered} in the skip path): there, a silent undefined turns
+ * a compare-and-swap into an unconditional write.
+ */
+async function mustRead(
+  repo: string,
+  id: string,
+  attempts = 3,
+): Promise<Bead | undefined> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await beads.show(repo, id);
+    } catch (e) {
+      console.error(`[execute-epic] bd read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await delayMs(PERSIST_RETRY_MS);
+    }
+  }
+  return undefined;
 }
 
 const delayMs = (ms: number): Promise<void> =>

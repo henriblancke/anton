@@ -36,7 +36,7 @@
  */
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
@@ -1055,6 +1055,82 @@ const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.
         // …and it still says it delivered nothing, so the resumed run re-runs it rather than reading
         // it as work already on the branch.
         expect(stalled.labels ?? []).toContain("not-delivered");
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+        if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
+        else process.env[BD_BIN_ENV] = priorBdBin;
+        resetBdBinCache();
+        await patchSettings({ ticketTimeoutMinutes: undefined });
+        if (jobId)
+          await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
+      }
+    });
+
+    it("halts the run when a skipped ticket cannot be READ back (PR #199 review)", async () => {
+      // The guarded read is what tells "still this run's ticket" from "a second run reparented and
+      // claimed it", and both of the writes it guards are wrong on the other run's ticket: the
+      // marker rides along on work that ships (its snapshot predates this late write, so runTicket
+      // never clears it) and the release clears a live reservation. Tagging on an unreadable bead is
+      // not the conservative half of that trade — so neither write is made, and the run parks.
+      const epicId = await beads.create(repo, {
+        title: "ShowRefusedDependent",
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nShowRefusedDependent",
+      });
+      await beads.approve(repo, epicId);
+      const stalls = createTicket(repo, {
+        title: "ShowRefusedDependent stalls",
+        parent: epicId,
+      });
+      const dependent = createTicket(repo, {
+        title: "ShowRefusedDependent dependent",
+        parent: epicId,
+      });
+      await beads.link(repo, dependent, stalls, "blocks");
+
+      const invLog = join(sandbox, "show-refused-inv.jsonl");
+      const claude = hangingClaude("claude-hang-show-refused", invLog, "first");
+
+      // Armed by the STALLED ticket's own marker, so the refusal lands in the skip path rather than
+      // in the claim cascade that runs long before it — the read under test is the one taken while
+      // deciding what to write onto the dependent.
+      const realBd = resolveBdBin();
+      const armed = join(sandbox, "show-refused-armed");
+      const shim = writeBin(
+        binDir,
+        "bd-refuses-dependent-show",
+        `const {spawnSync}=require('child_process');const fs=require('fs');const a=process.argv.slice(2);
+const i=a.indexOf('--add-label');
+if(i>=0&&a[i+1]==='not-delivered')fs.writeFileSync(${JSON.stringify(armed)},'1');
+if(a[0]==='show'&&a[1]===${JSON.stringify(dependent)}&&fs.existsSync(${JSON.stringify(armed)})){process.stderr.write('Error: simulated bd read failure\\n');process.exit(1);}
+const r=spawnSync(${JSON.stringify(realBd)},a,{stdio:'inherit'});process.exit(r.status===null?1:r.status);`,
+      );
+
+      await patchSettings({ ticketTimeoutMinutes: 0.25 });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = claude;
+      const priorBdBin = process.env[BD_BIN_ENV];
+      process.env[BD_BIN_ENV] = shim;
+      resetBdBinCache();
+      let jobId: string | undefined;
+      try {
+        jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicId });
+
+        const job = await getJob(tdb.db, jobId);
+        expect(job?.status).toBe("parked");
+        expect(job?.lastError).toMatch(/would not read the ticket back/i);
+        rmSync(armed); // the assertions below read the same bead through the same shim
+
+        // Nothing was written onto the ticket anton could not verify — no marker, and no PR whose
+        // merge would have to make sense of one.
+        const skipped = await beads.show(repo, dependent);
+        expect(skipped.labels ?? []).not.toContain("not-delivered");
+        expect(beads.parentOf(skipped)).toBe(epicId);
+        const target = await beads.show(repo, epicId);
+        expect(beads.getPrRef(target) ?? null).toBeNull();
+        expect(target.labels ?? []).not.toContain("stage:in-review");
       } finally {
         process.env.ANTON_CLAUDE_BIN = successClaude;
         if (priorBdBin === undefined) delete process.env[BD_BIN_ENV];
