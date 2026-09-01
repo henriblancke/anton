@@ -321,6 +321,10 @@ export function EpicBoard({
    * A target the operator just set aside (anton-jqvy / R3.9). Stamped locally so the card reads as
    * deferred on the click that deferred it — the hold is server state, and the board's own poll is
    * up to 30s away, which is long enough for an operator to click `not now` twice.
+   *
+   * It also leaves Up Next on that click. The lane is driven by the recorded plan, which the next
+   * picker pass rewrites up to ten minutes from now — so without this the declined target would keep
+   * its place in the ranking it was just refused a place in.
    */
   function handleVetoed(beadId: string, untilMs: number) {
     setBoard((prev) => {
@@ -335,7 +339,8 @@ export function EpicBoard({
           i.id === beadId ? { ...i, notNowUntil: untilMs } : i,
         );
       }
-      return { ...prev, columns, standalone };
+      const upNext = prev.upNext?.filter((entry) => entry.beadId !== beadId);
+      return { ...prev, columns, standalone, ...(upNext ? { upNext } : {}) };
     });
   }
 

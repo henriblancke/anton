@@ -275,6 +275,15 @@ export const pickerVerdicts = sqliteTable(
     index("picker_verdicts_project_idx").on(table.projectId, table.decidedAt),
     // Serves the pass's and the board's "which targets are deferred right now" read.
     index("picker_verdicts_deferred_idx").on(table.projectId, table.deferredUntil),
+    // At most one ACCEPT per (project, bead, plan) — the DB backstop behind recordPickerAccept's
+    // conflict-ignoring insert. Two concurrent releases of one pick (a double-click, a retry) start
+    // a single run through the enqueue dedupe, so they must not leave two accepts inflating the
+    // track record earned autonomy reads. Partial on the accepted verdict because a DECLINE is
+    // legitimately repeatable — a second veto extends the window. A digest-less accept answers no
+    // recorded pick and stays unconstrained: SQLite treats NULLs as distinct.
+    uniqueIndex("picker_verdicts_accept_unique")
+      .on(table.projectId, table.beadId, table.planDigest)
+      .where(sql`${table.verdict} = 'accepted'`),
   ],
 );
 

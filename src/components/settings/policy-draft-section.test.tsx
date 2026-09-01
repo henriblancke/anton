@@ -1448,3 +1448,54 @@ describe("the bead a provenance badge opened the editor about", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The deep link's other half: the ringed criterion has to be ON SCREEN. The panel is taller than the
+ * viewport, so a highlight below the fold is a highlight nobody sees — and a scroll that repeated
+ * would drag the viewport back to the ring on every keystroke of the edit the operator came to make.
+ */
+describe("scrolling the deep-linked criterion into view", () => {
+  afterEach(() => {
+    window.history.replaceState(null, "", "/");
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  });
+
+  /** jsdom implements no layout and defines no scrollIntoView at all — which is why the panel calls
+   *  it optionally. Installed here so the call can be observed rather than performed. */
+  function stubScrollIntoView() {
+    const scroll = vi.fn();
+    (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView = scroll;
+    return scroll;
+  }
+
+  it("scrolls to the criterion the link names, and to nothing else", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings?criterion=types#policy");
+    const scroll = stubScrollIntoView();
+    renderPanel();
+
+    expect(scroll).toHaveBeenCalledTimes(1);
+    expect(scroll.mock.instances[0]).toBe(screen.getByRole("group", { name: "Issue type" }));
+  });
+
+  it("does not snap back to the ring while the operator edits the panel", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings?criterion=types#policy");
+    const scroll = stubScrollIntoView();
+    renderPanel({ candidates: CANDIDATES });
+    scroll.mockClear();
+
+    // Any edit re-renders every criterion. The scroll belongs to ARRIVING at the deep link, not to
+    // rendering it, so re-rendering must not move the viewport.
+    fireEvent.change(screen.getByLabelText("Minimum priority"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("switch", { name: "severity:minor" }));
+
+    expect(scroll).not.toHaveBeenCalled();
+  });
+
+  it("scrolls nothing when the link names no criterion", () => {
+    window.history.replaceState(null, "", "/projects/tmp/settings#policy");
+    const scroll = stubScrollIntoView();
+    renderPanel();
+
+    expect(scroll).not.toHaveBeenCalled();
+  });
+});

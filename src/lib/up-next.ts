@@ -22,14 +22,21 @@ import type { UpNextEntry } from "./types";
 /**
  * The lane's entries in rank order, or `undefined` when there is no lane to draw.
  *
- * `undefined` covers both honest absences at once — no plan recorded, and a picker the operator has
- * disarmed (the caller resolves that and withholds the plan) — because the lane's answer to both is
- * the same: show nothing. An entry whose bead has left the snapshot is dropped rather than rendered
- * from the plan alone; the plan is history, and the board is what is true now.
+ * `undefined` covers three honest absences at once — no plan recorded, a picker the operator has
+ * disarmed, and a plan the board has since moved past (the caller resolves those two and withholds
+ * the plan) — because the lane's answer to all of them is the same: show nothing. An entry whose
+ * bead has left the snapshot is dropped rather than rendered from the plan alone; the plan is
+ * history, and the board is what is true now.
+ *
+ * `deferred` is the live half of that same rule. A veto lands between passes, so the plan the lane
+ * reads still ranks the target the operator just set aside — and leaving it in Up Next would offer
+ * the very start they declined, for up to a full picker cadence. The next pass excludes it as
+ * `deferred` anyway; this makes the lane agree with that immediately.
  */
 export function upNextEntries(
   board: Bead[],
   plan: BoardPickerPlan | undefined,
+  deferred?: ReadonlyMap<string, number>,
 ): UpNextEntry[] | undefined {
   if (!plan) return undefined;
   const byId = new Map(board.map((bead) => [bead.id, bead]));
@@ -39,7 +46,7 @@ export function upNextEntries(
     .sort((a, b) => a.rank - b.rank)
     .flatMap((entry) => {
       const bead = byId.get(entry.beadId);
-      if (!bead) return [];
+      if (!bead || deferred?.has(entry.beadId)) return [];
       return [
         {
           beadId: entry.beadId,

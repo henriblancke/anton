@@ -101,6 +101,19 @@ describe("upNextEntries", () => {
     expect(entries?.[0]).not.toHaveProperty("priority");
   });
 
+  it("drops a pick the operator vetoed since the pass ran", () => {
+    const entries = upNextEntries(
+      [bead({ id: "anton-1" }), bead({ id: "anton-2" })],
+      plan([
+        { beadId: "anton-1", rank: 1, rule: "policy" },
+        { beadId: "anton-2", rank: 2, rule: "policy" },
+      ]),
+      new Map([["anton-1", 1_770_000_100_000]]),
+    );
+
+    expect(entries?.map((e) => e.beadId)).toEqual(["anton-2"]);
+  });
+
   it("records a plan that admitted nothing as an empty lane, not as no lane", () => {
     expect(upNextEntries([bead({ id: "anton-1" })], plan([]))).toEqual([]);
   });

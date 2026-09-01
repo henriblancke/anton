@@ -29,7 +29,12 @@ import type { BeadProvenance } from "./types";
 export interface BoardProvenanceInput {
   /** The full board read, unfiltered — what the policy projection and the proposals are read from. */
   board: Bead[];
-  /** The picker's latest recorded plan, or undefined on a project whose picker has never run. */
+  /**
+   * The picker's latest recorded plan, or undefined on a project whose picker has never run — and
+   * on one whose pass the operator has switched off, which the caller resolves: the badge is what
+   * `[Release]` is derived from (isPickerPick), so a plan left behind by a disabled schedule must
+   * not go on offering starts against a pass that no longer runs.
+   */
   plan?: BoardPickerPlan;
   /** The policy armed on this machine, or undefined when the project has armed none. */
   policy?: Policy;

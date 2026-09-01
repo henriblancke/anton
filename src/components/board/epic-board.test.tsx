@@ -259,3 +259,41 @@ describe("EpicBoard autopilot breaker (anton-5c8h)", () => {
     expect(screen.getByText("Autopilot is holding")).toBeTruthy();
   });
 });
+
+/**
+ * The lane is driven by the recorded plan, and the pass that rewrites it is up to ten minutes away
+ * (anton-t9m4 / anton-jqvy). So a veto has to leave the lane on the click that recorded it — a
+ * declined target keeping its place in the ranking is the lane still offering the start the operator
+ * just refused.
+ */
+describe("EpicBoard veto from the Up Next lane", () => {
+  const UNTIL = 1_800_086_400_000;
+
+  const planned = (version: string): Board => ({
+    ...board(version, "backlog"),
+    upNext: [{ beadId: "anton-1", rank: 1, priority: 2, type: "feature", unblocks: 0 }],
+  });
+
+  /** Is the card drawn inside the lane (as opposed to back in a stage column)? */
+  const inUpNext = (cardId: string) =>
+    document.querySelector(
+      `section[aria-label="Up Next"] a[href="/projects/tmp/epics/${cardId}"]`,
+    ) !== null;
+
+  it("returns a declined target to Backlog on the click, not on the next picker pass", async () => {
+    const fetchMock = vi.fn(async (url: string) =>
+      String(url).includes("/picker/veto")
+        ? new Response(JSON.stringify({ deferredUntil: UNTIL }), { status: 200 })
+        : new Response(null, { status: 304 }),
+    );
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync")} />);
+    expect(inUpNext("anton-1")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /not now/i }));
+
+    await waitFor(() => expect(inUpNext("anton-1")).toBe(false));
+    expect(columnOf("anton-1")).toBe("backlog");
+  });
+});

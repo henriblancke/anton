@@ -86,6 +86,23 @@ describe("recording a veto", () => {
     expect(held.get("anton-a")).toBe(later + PICKER_DEFER_WINDOW_MS);
   });
 
+  it("holds nothing on an ACCEPT, whatever timestamp it carries", async () => {
+    // Written raw: no code path puts an expiry on an accept today, and the point of the assertion is
+    // that one appearing later cannot silently hold a target out of the plan. The verdict is the
+    // intent; the expiry is only how long it lasts.
+    await test.db.insert(schema.pickerVerdicts).values({
+      id: "v-accepted",
+      projectId: PROJECT,
+      beadId: "anton-a",
+      verdict: "accepted",
+      action: "release",
+      deferredUntil: at(NOW + PICKER_DEFER_WINDOW_MS),
+      decidedAt: at(NOW),
+    });
+
+    expect((await activeDeferrals(test.db, PROJECT, at(NOW))).size).toBe(0);
+  });
+
   it("both actions defer — a veto that left the card in the next plan would be no veto", async () => {
     await recordPickerVeto(test.db, clock, { projectId: PROJECT, beadId: "anton-a", action: "not-now" });
     await recordPickerVeto(test.db, clock, { projectId: PROJECT, beadId: "anton-b", action: "never" });
@@ -188,6 +205,28 @@ describe("recording an accept", () => {
     await recordPickerAccept(test.db, clock, pick);
 
     expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 1, settled: 1 });
+  });
+
+  it("counts one accept when two releases of the same pick OVERLAP", async () => {
+    const pick = { projectId: PROJECT, beadId: "anton-a", rank: 1, planDigest: "d1" };
+    // A read-then-insert lets both requests pass the check before either writes. The unique index is
+    // what makes the second one a no-op instead of a second accept.
+    await Promise.all([
+      recordPickerAccept(test.db, clock, pick),
+      recordPickerAccept(test.db, clock, pick),
+    ]);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ accepted: 1, settled: 1 });
+  });
+
+  it("leaves a DECLINE against the same plan repeatable — a second veto extends the window", async () => {
+    const veto = { projectId: PROJECT, beadId: "anton-a", action: "not-now" as const, planDigest: "d1" };
+    await recordPickerVeto(test.db, clock, veto);
+    nowMs = NOW + 60_000;
+    const second = await recordPickerVeto(test.db, clock, veto);
+
+    expect(second.untilMs).toBe(nowMs + PICKER_DEFER_WINDOW_MS);
+    expect((await activeDeferrals(test.db, PROJECT, at(nowMs))).get("anton-a")).toBe(second.untilMs);
   });
 
   it("records again once a later plan re-picks it — a new decision is a new answer", async () => {

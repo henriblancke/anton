@@ -380,9 +380,11 @@ describe("vetoing a pick from the lane", () => {
         }),
       ),
     );
-    // The hold is stamped on the board immediately, so the card reads as set aside on the click
-    // that set it aside rather than a poll later.
-    await waitFor(() => expect(screen.getByText(/set aside · back in/i)).toBeTruthy());
+    // The hold is stamped on the board immediately, so the target leaves the lane on the click that
+    // set it aside rather than on the next picker pass ten minutes later — and lands back in
+    // Backlog reading as held, never silently missing.
+    await waitFor(() => expect(laneOf("anton-pick2")).toBe("Backlog"));
+    expect(screen.getByText(/not now ·/i)).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(1);
   });
 

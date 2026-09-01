@@ -72,6 +72,17 @@ vi.mock("./board-picker-plan", async () => {
   return { ...actual, latestBoardPickerPlan: async () => pickerPlan };
 });
 
+// Whether a board-picker pass still runs here (anton-t9m4): the lane is a projection of what that
+// pass would start next, and the badge is derived from a plan only while one is being kept. Stubbed
+// at the schedule seam so no test needs anton.db; armed is the default, as it is for a project the
+// operator has never switched off.
+let pickerArmed = true;
+
+vi.mock("./schedules", async () => {
+  const actual = await vi.importActual<typeof import("./schedules")>("./schedules");
+  return { ...actual, isScheduleEnabled: async () => pickerArmed };
+});
+
 vi.mock("./projects", async () => {
   const actual = await vi.importActual<typeof import("./projects")>("./projects");
   return { ...actual, getProjectSettings: async () => ({}) };
@@ -80,6 +91,7 @@ vi.mock("./projects", async () => {
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
 const { resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
+const { stampBoard } = await import("./board-picker-plan");
 
 beforeEach(() => {
   resetIssueSnapshots();
@@ -88,6 +100,7 @@ beforeEach(() => {
   scanHealth = undefined;
   deferrals = new Map();
   pickerPlan = undefined;
+  pickerArmed = true;
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1165,6 +1178,16 @@ describe("provenance on the board (anton-cqxd)", () => {
     ]);
   });
 
+  it("stops badging picks once the pass that would refresh them is switched off", async () => {
+    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    pickerPlan = planFor("t-1");
+    pickerArmed = false;
+
+    // The badge is what `[Release]` is derived from (isPickerPick), so a plan left behind by a
+    // disabled schedule would keep offering to record accepts against a pass that no longer runs.
+    expect((await getBoard(project)).standalone.backlog[0]?.provenance).toBeUndefined();
+  });
+
   it("never badges a done target — provenance is about whether to run it", async () => {
     listMock.mockResolvedValue([
       makeBead({ id: "f-1", title: "A shipped feature", issue_type: "feature", status: "closed" }),
@@ -1190,5 +1213,71 @@ describe("provenance on the board (anton-cqxd)", () => {
 
     // The poll path compares against the same token, or the badge never reaches the tab.
     expect(await getBoardVersion(project)).toBe(picked);
+  });
+});
+
+/**
+ * The Up Next lane's server half (anton-t9m4 / R3.1–R3.4). The lane claims this is the order anton
+ * would start work in NOW — a stricter promise than the badge beside it, which only records the rule
+ * a target WAS picked under. So it is withheld whole on every fact that makes the recorded ranking
+ * no longer that: a disarmed pass, a board the plan predates, and — per pick — a veto since.
+ */
+describe("the Up Next lane on the board (anton-t9m4)", () => {
+  const feature = () => makeBead({ id: "f-1", title: "A feature", issue_type: "feature" });
+
+  /** A plan recorded against exactly this board — what a pass that just ran would have written. */
+  function planOver(board: Bead[], beadId: string): import("./board-picker-plan").BoardPickerPlan {
+    return {
+      projectId: "p1",
+      generatedAt: 1_770_000_000,
+      stamp: stampBoard(board, 1_770_000_000_000),
+      entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+  }
+
+  it("projects the lane from a plan the board still matches", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+
+    expect((await getBoard(project)).upNext).toEqual([
+      { beadId: "f-1", rank: 1, type: "feature", unblocks: 0 },
+    ]);
+  });
+
+  it("withholds the lane when the board has moved past the plan", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    // The pass ranked a board this one no longer is — a target claimed, blocked or reprioritized
+    // since. Showing the old order would answer "what is next?" with a board that has gone.
+    pickerPlan = {
+      ...planOver(board, "f-1"),
+      stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
+    };
+
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("withholds the lane while the picker is disarmed", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    pickerArmed = false;
+
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("drops a pick the operator vetoed since the pass ran", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    deferrals = new Map([["f-1", 1_770_000_100_000]]);
+
+    // Out of the lane, but still on the board: a set-aside target returns to Backlog, it does not
+    // vanish.
+    const served = await getBoard(project);
+    expect(served.upNext).toEqual([]);
+    expect(served.columns.backlog.map((e) => e.id)).toEqual(["f-1"]);
   });
 });

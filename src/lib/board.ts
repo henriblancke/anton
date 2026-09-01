@@ -14,7 +14,12 @@ import {
   type HygieneReport,
 } from "./hygiene";
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
-import { latestBoardPickerPlan, type BoardPickerPlan } from "./board-picker-plan";
+import {
+  isPlanStale,
+  latestBoardPickerPlan,
+  stampBoard,
+  type BoardPickerPlan,
+} from "./board-picker-plan";
 import { boardProvenance, provenanceVersion } from "./board-provenance";
 import { getDb } from "./db";
 import { deferralVersion, latestPickerDeferrals } from "./picker-veto";
@@ -348,12 +353,22 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Chips read the same way in every column (unread-first, then newest), independent of epic order.
   for (const stage of STAGES) standalone[stage].sort(compareStandalone);
 
+  // The plan, only while a pass is actually keeping it: a project whose `board-picker` schedule was
+  // switched off keeps its last recorded plan in the db, and reading it here would badge every old
+  // entry `◈ policy` — which is what `[Release]` is derived from (isPickerPick), so ordinary Backlog
+  // cards would go on offering to record accepts against a pass that no longer runs.
+  const armedPlan = pickerArmed ? plan : undefined;
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
-  const provenance = boardProvenance({ board: allBeads, plan, policy });
-  // The Up Next lane's input (anton-t9m4). Withheld whole while the picker is disarmed, so the lane
-  // is ABSENT rather than showing a ranking no pass is keeping fresh.
-  const upNext = upNextEntries(allBeads, pickerArmed ? plan : undefined);
+  const provenance = boardProvenance({ board: allBeads, plan: armedPlan, policy });
+  // The Up Next lane's input (anton-t9m4). The lane holds a stricter standard than the badge beside
+  // it: a badge records the rule a target WAS picked under (history), while the lane claims this is
+  // the order anton would start work in NOW — so a plan whose board stamp no longer matches the
+  // snapshot is withheld whole rather than presented as a current ranking (isPlanStale). Deferrals
+  // are subtracted for the same reason: a target vetoed since the pass ran is not up next.
+  const currentPlan =
+    armedPlan && !isPlanStale(armedPlan, stampBoard(allBeads, Date.now())) ? armedPlan : undefined;
+  const upNext = upNextEntries(allBeads, currentPlan, deferrals);
   // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
   // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
   const marksFor = (stage: Stage, id: string): BeadProvenance[] | undefined =>

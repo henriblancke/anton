@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
@@ -1205,16 +1205,22 @@ function Criterion({
   onRemove?: () => void;
   children: React.ReactNode;
 }) {
+  const node = useRef<HTMLDivElement | null>(null);
+  // Only the deep-linked one scrolls, and only when it BECOMES the deep-linked one: the panel is
+  // taller than the viewport, so a highlight below the fold is a highlight nobody sees. In an effect
+  // keyed on that fact rather than in the ref callback — an inline ref is a new function every
+  // render, so React re-attaches it on each one and the panel would snap back to the ring every
+  // time the operator edited any criterion on it.
+  useEffect(() => {
+    if (highlighted) node.current?.scrollIntoView?.({ block: "center" });
+  }, [highlighted]);
+
   return (
     <div
       role="group"
       aria-label={label}
       {...(highlighted ? { "aria-current": "true" as const } : {})}
-      ref={(node) => {
-        // Only the deep-linked one scrolls, and only when it mounts: the panel is taller than the
-        // viewport, so a highlight below the fold is a highlight nobody sees.
-        if (highlighted) node?.scrollIntoView?.({ block: "center" });
-      }}
+      ref={node}
       className={cn(
         "flex flex-col gap-1.5 rounded-[10px] border bg-card px-3 py-2.5",
         highlighted ? "border-primary/60 ring-2 ring-primary/30" : "border-border",

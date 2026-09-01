@@ -138,40 +138,33 @@ export async function recordPickerVeto(
  * a retry after a slow response) starts no second run, so it must not leave a second accept inflating
  * the evidence a future arming decision reads. The pick is identified by the plan digest the decision
  * was recorded under; a release against no recorded plan has no pick to dedupe on and always records.
+ *
+ * The dedupe is the INSERT, not a read before it: two overlapping releases of one pick both pass a
+ * separate existence check and both write. So the conflict is resolved where it is atomic — against
+ * `picker_verdicts_accept_unique`, the partial index over accepted verdicts — and a digest-less
+ * accept, which that index leaves unconstrained (NULLs are distinct), still always records.
  */
 export async function recordPickerAccept(
   db: AntonDb,
   clock: Clock,
   input: RecordAcceptInput,
 ): Promise<void> {
-  if (input.planDigest) {
-    const existing = await db
-      .select({ id: schema.pickerVerdicts.id })
-      .from(schema.pickerVerdicts)
-      .where(
-        and(
-          eq(schema.pickerVerdicts.projectId, input.projectId),
-          eq(schema.pickerVerdicts.beadId, input.beadId),
-          eq(schema.pickerVerdicts.verdict, "accepted"),
-          eq(schema.pickerVerdicts.planDigest, input.planDigest),
-        ),
-      )
-      .limit(1);
-    if (existing.length > 0) return;
-  }
-  await db.insert(schema.pickerVerdicts).values({
-    id: randomUUID(),
-    projectId: input.projectId,
-    beadId: input.beadId,
-    verdict: "accepted",
-    action: "release",
-    rule: input.rule ?? null,
-    criterion: null,
-    rank: input.rank ?? null,
-    planDigest: input.planDigest ?? null,
-    deferredUntil: null,
-    decidedAt: secDate(clock.now()),
-  });
+  await db
+    .insert(schema.pickerVerdicts)
+    .values({
+      id: randomUUID(),
+      projectId: input.projectId,
+      beadId: input.beadId,
+      verdict: "accepted",
+      action: "release",
+      rule: input.rule ?? null,
+      criterion: null,
+      rank: input.rank ?? null,
+      planDigest: input.planDigest ?? null,
+      deferredUntil: null,
+      decidedAt: secDate(clock.now()),
+    })
+    .onConflictDoNothing();
 }
 
 /**
@@ -180,6 +173,11 @@ export async function recordPickerAccept(
  * Filtered by the clock rather than by a cleanup pass: an expired row is history, and history is the
  * track record's whole point. A bead vetoed twice keeps the LATER expiry — a second veto extends the
  * window, it never shortens one already running.
+ *
+ * Only DECLINES are read, stated rather than left to SQL's NULL semantics: an accept defers nothing
+ * today, so `deferred_until > now` already skips it — but a future write that put any timestamp on
+ * an accept would silently hold that target out of the plan. The verdict is the intent; the expiry
+ * is only how long it lasts.
  */
 export async function activeDeferrals(
   db: AntonDb,
@@ -195,6 +193,7 @@ export async function activeDeferrals(
     .where(
       and(
         eq(schema.pickerVerdicts.projectId, projectId),
+        eq(schema.pickerVerdicts.verdict, "declined"),
         gt(schema.pickerVerdicts.deferredUntil, now),
       ),
     );
