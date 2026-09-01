@@ -274,6 +274,16 @@ export interface BeadProvenance {
   ref?: string;
   /** What that writer decided, in its own words — the badge's tooltip, never its label. */
   detail?: string;
+  /**
+   * `policy` only: the plan this mark came from no longer describes the board and policy it was
+   * decided over, so it is a record of a past pick rather than a current one.
+   *
+   * The badge renders either way — "who picked this, and under which rule" is history, and history
+   * does not expire. What the flag gates is the LIVE affordance derived from the same mark: a stale
+   * pick keeps its plain `Approve` rather than `[Release]`, which claims this is the target anton
+   * would start next (`isPickerPick`, board-utils.ts).
+   */
+  stale?: boolean;
 }
 
 /**

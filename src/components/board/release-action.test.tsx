@@ -80,8 +80,45 @@ describe("releasing one pick", () => {
     fireEvent.click(button);
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    settle(new Response("{}", { status: 200 }));
+    settle(new Response(JSON.stringify({ jobId: "job-1" }), { status: 200 }));
     await waitFor(() => expect(success).toHaveBeenCalled());
+  });
+});
+
+describe("a release the approve route could not start", () => {
+  /**
+   * Approve enqueues best-effort: it answers 200 with `jobId` omitted rather than failing an
+   * approval it has already written. Nothing is running, so nothing may say so.
+   */
+  it("refuses to report a run the response carries no job for", async () => {
+    stubFetch({ epic: { id: "anton-a", approved: true } });
+    const onReleased = vi.fn();
+    mount({ onReleased });
+
+    release();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("no run started");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("no run started"));
+    // The card must not lock its affordances behind a run that does not exist…
+    expect(onReleased).not.toHaveBeenCalled();
+    expect(success).not.toHaveBeenCalled();
+    // …but the approval itself landed, so the surface is behind on the card either way.
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: /release/i }).hasAttribute("disabled")).toBe(false);
+  });
+
+  it("says so too when the 200 body cannot be read at all", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("<html>gateway</html>", { status: 200 })),
+    );
+    mount();
+
+    release();
+
+    expect((await screen.findByRole("alert")).textContent).toContain("no run started");
+    expect(success).not.toHaveBeenCalled();
   });
 });
 

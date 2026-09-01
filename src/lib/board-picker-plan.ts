@@ -23,6 +23,8 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
+import { policyDigest } from "./policy/digest";
+import type { Policy } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /**
@@ -74,8 +76,8 @@ export interface PickerExclusion {
 }
 
 /**
- * The board snapshot a plan was computed from, carried on the record so staleness is detectable
- * rather than assumed from the clock.
+ * The decision inputs a plan was computed from — the board snapshot AND the policy in force —
+ * carried on the record so staleness is detectable rather than assumed from the clock.
  */
 export interface BoardStamp {
   /**
@@ -83,7 +85,7 @@ export interface BoardStamp {
    * change to a bead counts as having happened "since we looked".
    */
   observedAtMs: number;
-  /** {@link stampBoard}'s digest over the snapshot. Two boards agree iff their digests do. */
+  /** {@link stampBoard}'s digest over those inputs. Two reads agree iff their digests do. */
   digest: string;
   /** How many beads the digest covers. */
   beadCount: number;
@@ -161,12 +163,19 @@ function digestLine(bead: Bead): string {
 }
 
 /**
- * Stamp a board snapshot. Order-independent — the lines are sorted before hashing — because two
- * reads of an unchanged board may return the beads in any order, and a stamp that disagreed with
- * itself over that would report every plan stale.
+ * Stamp the inputs one decision was made from. Order-independent — the lines are sorted before
+ * hashing — because two reads of an unchanged board may return the beads in any order, and a stamp
+ * that disagreed with itself over that would report every plan stale.
+ *
+ * The armed POLICY is hashed alongside the beads (anton-t9m4 review): admission is a function of
+ * both, so an operator who narrows `pickerPolicy` without touching a bead has invalidated the plan
+ * just as surely as a claim would have. A fence over the beads alone would keep offering a start the
+ * new policy refuses until the next pass ran. Absent means the project has armed none, which is its
+ * own state and digests differently from any policy.
  */
-export function stampBoard(board: Bead[], observedAtMs: number): BoardStamp {
+export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy): BoardStamp {
   const hash = createHash("sha256");
+  hash.update(`policy\t${policyDigest(policy)}\n`);
   for (const line of board.map(digestLine).sort()) hash.update(`${line}\n`);
   return {
     observedAtMs,

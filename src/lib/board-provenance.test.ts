@@ -89,6 +89,26 @@ describe("the picker's mark", () => {
   it("marks nothing when the picker has never run here", () => {
     expect(boardProvenance({ board: [bead({ id: "anton-1" })] }).size).toBe(0);
   });
+
+  /**
+   * The badge is history and survives the board moving past the plan — but `[Release]` is derived
+   * from this same mark, and that button claims the pick is LIVE. The caller's freshness verdict
+   * rides along so the two can be told apart.
+   */
+  it("flags a mark whose plan the board has moved past, rather than dropping it", () => {
+    const target = bead({ id: "anton-1" });
+    const entries = [{ beadId: "anton-1", rank: 1, rule: "any claimable run target" }];
+
+    const marks = boardProvenance({
+      board: [target],
+      plan: plan({ entries }),
+      planIsStale: true,
+    }).get("anton-1");
+
+    expect(marks).toEqual([
+      { kind: "policy", detail: "any claimable run target", stale: true },
+    ]);
+  });
 });
 
 describe("the product master's mark", () => {
@@ -191,6 +211,18 @@ describe("the freshness token", () => {
   });
 
   it("is a stable answer on a project whose picker has never run", () => {
-    expect(provenanceVersion()).toBe("none");
+    expect(provenanceVersion()).toBe(provenanceVersion());
+    expect(provenanceVersion()).toContain("none");
+  });
+
+  // A settings save moves no bead, no plan row and no schedule — but it turns every live pick into
+  // history (it is half the plan's freshness fence), so a token blind to it would 304 the operator
+  // back onto a lane anton has already withdrawn.
+  it("moves when the operator saves a different policy", () => {
+    const armed = provenanceVersion(plan(), { types: ["feature"] });
+
+    expect(provenanceVersion(plan(), { types: ["bug"] })).not.toBe(armed);
+    expect(provenanceVersion(plan())).not.toBe(armed);
+    expect(provenanceVersion(plan(), { types: ["feature"] })).toBe(armed);
   });
 });

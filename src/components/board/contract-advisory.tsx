@@ -28,7 +28,22 @@ function gapsOf(body: unknown): string[] {
  */
 export async function toastContractAdvisory(res: Response): Promise<void> {
   try {
-    const gaps = gapsOf(await res.json().catch(() => null));
+    toastAdvisoryGaps(await res.json().catch(() => null));
+  } catch (err) {
+    console.error("[contract-advisory] failed to read advisory gaps", err);
+  }
+}
+
+/**
+ * The same report, for a caller that has ALREADY read the body — a response body can only be
+ * consumed once, and a surface that inspects the 200 payload before deciding the run really started
+ * (`release-action.tsx`, which reads `jobId`) has nothing left to hand {@link toastContractAdvisory}.
+ *
+ * NEVER throws, for the same reason as above.
+ */
+export function toastAdvisoryGaps(body: unknown): void {
+  try {
+    const gaps = gapsOf(body);
     if (gaps.length === 0) return;
     toast.warning(gaps.length === 1 ? "1 spec gap" : `${gaps.length} spec gaps`, {
       // Long enough to read several bead ids and act on them; the run is already under way.

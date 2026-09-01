@@ -30,6 +30,7 @@ import {
   type PickerExclusion,
   type PickerPlanEntry,
 } from "../board-picker-plan";
+import type { Policy } from "../policy/types";
 import { eligibleTargets } from "./picker-targets";
 
 /**
@@ -102,6 +103,13 @@ export interface BoardPickerDecision {
 export function decideBoardPickerPlan(input: {
   board: Bead[];
   policy: PickerPolicy;
+  /**
+   * The AUTHORED policy behind {@link input.policy}, when the project has armed one — carried only
+   * so the recorded fence covers it ({@link stampBoard}). Separate from the predicate because they
+   * answer different questions: one admits a target, the other says WHICH revision of the operator's
+   * rules did, which is what makes a plan detectably out of date after a settings edit.
+   */
+  armedPolicy?: Policy;
   runtime: PickerRuntime;
 }): BoardPickerDecision {
   const { eligible, exclusions } = eligibleTargets(input.board);
@@ -146,7 +154,7 @@ export function decideBoardPickerPlan(input: {
   });
 
   return {
-    stamp: stampBoard(input.board, input.runtime.observedAtMs),
+    stamp: stampBoard(input.board, input.runtime.observedAtMs, input.armedPolicy),
     entries,
     exclusions: sortExclusions(refused),
   };

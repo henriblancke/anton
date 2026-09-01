@@ -209,6 +209,38 @@ describe("staleness", () => {
 
     expect(isPlanStale(shapedPlan, stampBoard(after, OBSERVED + 1))).toBe(true);
   });
+
+  /**
+   * The other half of the decision. An operator editing `pickerPolicy` changes who may be started
+   * without touching a bead, so a fence over the beads alone would keep calling the old plan current
+   * — and the lane would go on offering a start the new policy refuses until the next pass ran.
+   */
+  it("catches a policy saved after the plan was computed", () => {
+    const board = [bead()];
+    const unarmed = { ...plan, stamp: stampBoard(board, OBSERVED) };
+
+    expect(isPlanStale(unarmed, stampBoard(board, OBSERVED + 1, { types: ["bug"] }))).toBe(true);
+  });
+
+  it("holds still when the policy is re-saved unchanged", () => {
+    const board = [bead()];
+    const policy = { types: ["feature", "bug"], labels: [{ namespace: "domain", values: ["eng"] }] };
+    const armed = { ...plan, stamp: stampBoard(board, OBSERVED, policy) };
+
+    // Same criteria, authored in another order — the same policy, so the same fence.
+    const resaved = {
+      types: ["bug", "feature"],
+      labels: [{ namespace: "domain", values: ["eng"] }],
+    };
+    expect(isPlanStale(armed, stampBoard(board, OBSERVED + 1, resaved))).toBe(false);
+  });
+
+  it("catches an armed policy being cleared", () => {
+    const board = [bead()];
+    const armed = { ...plan, stamp: stampBoard(board, OBSERVED, { types: ["feature"] }) };
+
+    expect(isPlanStale(armed, stampBoard(board, OBSERVED + 1))).toBe(true);
+  });
 });
 
 describe("plan storage", () => {

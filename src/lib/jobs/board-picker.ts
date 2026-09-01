@@ -121,6 +121,9 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     const decision = decideBoardPickerPlan({
       board,
       policy: armed ? armedPickerPolicy(armed, board, new Date(observedAtMs)) : ADMIT_ALL_POLICY,
+      // Stamped into the plan's freshness fence, so a settings edit that admits or excludes a target
+      // invalidates this plan the moment it lands rather than a cadence later.
+      ...(armed ? { armedPolicy: armed } : {}),
       runtime: { observedAtMs, deferrals },
     });
 

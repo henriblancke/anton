@@ -23,6 +23,7 @@ import {
 } from "./gardener/detections";
 import { admittingCriterion } from "./policy/admitting";
 import { policyCandidates } from "./policy/candidates";
+import { policyDigest } from "./policy/digest";
 import type { Policy } from "./policy/types";
 import type { BeadProvenance } from "./types";
 
@@ -38,6 +39,15 @@ export interface BoardProvenanceInput {
   plan?: BoardPickerPlan;
   /** The policy armed on this machine, or undefined when the project has armed none. */
   policy?: Policy;
+  /**
+   * The recorded plan no longer describes the decision anton would make now — the board or the armed
+   * policy has moved since the pass ran ({@link isPlanStale}). The mark is still emitted, because it
+   * is history and history does not expire; it is flagged {@link BeadProvenance.stale} so the LIVE
+   * predicate beside it can tell the two apart (`isPickerPick` → `[Release]`).
+   *
+   * Defaults to "current": the only producer is the board build, which always answers explicitly.
+   */
+  planIsStale?: boolean;
 }
 
 /**
@@ -62,12 +72,14 @@ export function boardProvenance(input: BoardProvenanceInput): Map<string, BeadPr
  * A freshness token over the provenance a board would serve, so a polling surface sees new badges
  * instead of 304ing on a version that never moved.
  *
- * The PLAN is the only half that needs one: the pm half rides on the proposal beads themselves, so
- * the bead snapshot version already covers it, and the policy only moves where the `◈ policy` badge
- * ANCHORS — which is the settings page the operator is on while editing it.
+ * The pm half needs no part: it rides on the proposal beads themselves, so the bead snapshot version
+ * already covers it. The plan and the POLICY both do — the policy because it is half of the plan's
+ * freshness fence (`stampBoard`), so saving a narrower one turns every live pick into history
+ * without touching a bead or a plan row. A poll that 304'd on that would leave `[Release]` on offer
+ * against a rule the operator has already replaced.
  */
-export function provenanceVersion(plan?: BoardPickerPlan): string {
-  return plan ? `${plan.generatedAt}:${plan.stamp.digest}` : "none";
+export function provenanceVersion(plan?: BoardPickerPlan, policy?: Policy): string {
+  return `${plan ? `${plan.generatedAt}:${plan.stamp.digest}` : "none"}:${policyDigest(policy)}`;
 }
 
 /**
@@ -80,13 +92,17 @@ export function provenanceVersion(plan?: BoardPickerPlan): string {
  * says what admitted the bead even though there is no control to open.
  *
  * The plan is read as HISTORY, not as a live verdict: a stale plan still records the rule this
- * target was picked under, and whether the plan describes the board as it now reads is the lane's
- * question (`isPlanStale`), not the badge's.
+ * target was picked under, so the badge survives the board moving past it. But `[Release]` is
+ * derived from this same mark (`isPickerPick`), and offering a start against a decision the board
+ * or the policy has since invalidated would be a live claim dressed as a record — so the caller's
+ * freshness verdict rides along as {@link BeadProvenance.stale}, which the badge ignores and the
+ * button obeys.
  */
 function pickerProvenance({
   board,
   plan,
   policy,
+  planIsStale,
 }: BoardProvenanceInput): Map<string, BeadProvenance> {
   const out = new Map<string, BeadProvenance>();
   if (!plan?.entries.length) return out;
@@ -103,6 +119,7 @@ function pickerProvenance({
       kind: "policy",
       ...(criterion ? { ref: criterion } : {}),
       ...(entry.rule ? { detail: entry.rule } : {}),
+      ...(planIsStale ? { stale: true } : {}),
     });
   }
   return out;

@@ -262,9 +262,14 @@ export function canStartRun(epic: Pick<Epic, "childReadiness">): boolean {
  *
  * What it gates is shadow mode's affordance: while nothing starts unattended, a pick is offered with
  * `[Release]` rather than the plain `Approve` every other backlog card carries (R3.5).
+ *
+ * A STALE mark is not a pick. The badge outlives the plan it came from — it records the rule this
+ * target was picked under — but the button claims something stronger, that this is what anton would
+ * start next, and the board withdraws the Up Next lane on exactly that fact. Reading the flag here
+ * is what keeps the two agreeing: no lane, no release.
  */
 export function isPickerPick(provenance: BeadProvenance[] | undefined): boolean {
-  return provenance?.some((mark) => mark.kind === "policy") ?? false;
+  return provenance?.some((mark) => mark.kind === "policy" && !mark.stale) ?? false;
 }
 
 /**

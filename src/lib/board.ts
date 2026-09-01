@@ -78,11 +78,16 @@ function boardVersion(
 }
 
 export async function getBoardVersion(project: Project): Promise<string> {
-  const [hygiene, scan, deferrals, plan, pickerArmed] = await Promise.all([
+  // The policy joins the plan on the poll path (not just the build): it is half the plan's freshness
+  // fence, so saving a narrower one turns every live pick into history — the lane goes and
+  // `[Release]` with it — while the bead snapshot, the plan row and the schedule all sit still. A
+  // token blind to it would 304 the operator back onto the board they just invalidated.
+  const [hygiene, scan, deferrals, plan, policy, pickerArmed] = await Promise.all([
     readHygieneVersion(project),
     readScanHealthVersion(project),
     readDeferrals(project),
     readPickerPlan(project),
+    readPickerPolicy(project),
     readPickerArmed(project),
   ]);
   return boardVersion(
@@ -90,7 +95,7 @@ export async function getBoardVersion(project: Project): Promise<string> {
     hygiene,
     scan,
     deferralVersion(deferrals),
-    provenanceVersion(plan),
+    provenanceVersion(plan, policy),
     upNextVersion(pickerArmed),
     project.repoPath,
   );
@@ -358,16 +363,26 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // entry `◈ policy` — which is what `[Release]` is derived from (isPickerPick), so ordinary Backlog
   // cards would go on offering to record accepts against a pass that no longer runs.
   const armedPlan = pickerArmed ? plan : undefined;
+  // Does the recorded plan still describe the decision anton would make NOW? Asked ONCE, over both
+  // halves of that decision — the beads and the armed policy, which stampBoard folds in together, so
+  // an operator narrowing `pickerPolicy` without touching a bead invalidates the plan too.
+  //
+  // Every live claim the board makes about the picker reads this one answer: the Up Next lane
+  // (withheld whole rather than presented as a current ranking) and the `[Release]` derived from the
+  // provenance badge. They must not disagree — a lane that vanished while its button stayed would go
+  // on offering a start against a decision anton has already stopped standing behind.
+  const planIsStale =
+    armedPlan !== undefined && isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), policy));
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
-  const provenance = boardProvenance({ board: allBeads, plan: armedPlan, policy });
+  // A stale plan still badges — the rule a target WAS picked under does not stop being true — but
+  // the mark carries `stale`, so what survives staleness is the badge and not the button.
+  const provenance = boardProvenance({ board: allBeads, plan: armedPlan, policy, planIsStale });
   // The Up Next lane's input (anton-t9m4). The lane holds a stricter standard than the badge beside
   // it: a badge records the rule a target WAS picked under (history), while the lane claims this is
-  // the order anton would start work in NOW — so a plan whose board stamp no longer matches the
-  // snapshot is withheld whole rather than presented as a current ranking (isPlanStale). Deferrals
-  // are subtracted for the same reason: a target vetoed since the pass ran is not up next.
-  const currentPlan =
-    armedPlan && !isPlanStale(armedPlan, stampBoard(allBeads, Date.now())) ? armedPlan : undefined;
+  // the order anton would start work in NOW — so a stale plan is withheld whole. Deferrals are
+  // subtracted for the same reason: a target vetoed since the pass ran is not up next.
+  const currentPlan = planIsStale ? undefined : armedPlan;
   const upNext = upNextEntries(allBeads, currentPlan, deferrals);
   // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
   // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
@@ -406,13 +421,16 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       hygieneVersion(hygiene),
       scanHealthVersion(scan),
       deferralVersion(deferrals),
-      provenanceVersion(plan),
+      provenanceVersion(plan, policy),
       upNextVersion(pickerArmed),
       project.repoPath,
     ),
     columns,
     standalone,
-    ...(upNext ? { upNext } : {}),
+    // Length, not existence: a plan every entry drops out of (the bead left the snapshot, or every
+    // pick is vetoed) projects an EMPTY lane, and `Board.upNext` promises absent-never-empty — an
+    // "Up Next" heading over nothing reads as "anton has nothing to start".
+    ...(upNext?.length ? { upNext } : {}),
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),

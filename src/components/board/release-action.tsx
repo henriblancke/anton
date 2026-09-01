@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastAdvisoryGaps } from "@/components/board/contract-advisory";
 import { cn } from "@/lib/utils";
 
 /**
@@ -20,6 +20,11 @@ import { cn } from "@/lib/utils";
  * semantics; a second endpoint that "just starts it" would be a second answer to "may this run", and
  * the two would drift. The flag adds only what release means beyond approve: the target was anton's
  * pick, so the choice is recorded as an accept the arming decision can read.
+ *
+ * A 200 IS NOT A RUN, either: approve enqueues best-effort and reports the job id, so the button
+ * believes the response's `jobId` rather than its status code — "running now" against an enqueue
+ * that failed is a false success the operator would only discover by waiting for a card that never
+ * moves.
  *
  * A LOST CLAIM RACE is the failure this control is shaped around. Between the render and the click a
  * teammate can claim the target or its run can start, and approve answers 409 — so the refusal is
@@ -62,8 +67,11 @@ export function ReleaseAction({
         // never handed to the budget governor's pace-line.
         body: JSON.stringify({ release: true, immediate: true }),
       });
+      const body = (await res.json().catch(() => null)) as {
+        error?: string;
+        jobId?: string;
+      } | null;
       if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
         const message = body?.error ?? `Release failed (${res.status})`;
         setFailure(message);
         toast.error(message);
@@ -73,10 +81,23 @@ export function ReleaseAction({
         if (res.status === 409) router.refresh();
         return;
       }
+      // A 200 is not yet a run. Approve enqueues BEST-EFFORT — it will not fail an approval it has
+      // already written over a runner hiccup — so it answers 200 with `jobId` omitted when the
+      // enqueue threw. `jobId` is the only proof a run exists, and "running now" without one leaves
+      // the operator watching a card that will never move (the route withholds the release accept on
+      // the same test). The approval stands, so releasing again enqueues afresh.
+      if (!body?.jobId) {
+        const message = "Approved, but no run started — release again to retry";
+        setFailure(message);
+        toast.error(message);
+        // The approve landed, so this surface is behind on the card regardless of the enqueue.
+        router.refresh();
+        return;
+      }
       onReleased?.();
       toast.success(`Released "${title}" — running now`);
       // The run starts with whatever thin sections it has; say so once, here.
-      await toastContractAdvisory(res);
+      toastAdvisoryGaps(body);
       router.refresh();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to release this target";
@@ -101,7 +122,11 @@ export function ReleaseAction({
       {/* Inline, truncated, and never cleared by a poll: a release that did not start must not read
           as started. Mirrors the kill control's own refusal copy. */}
       {failure && (
-        <span role="alert" className="max-w-44 truncate font-mono text-[10px] text-risk-high">
+        <span
+          role="alert"
+          title={failure}
+          className="max-w-44 truncate font-mono text-[10px] text-risk-high"
+        >
           {failure}
         </span>
       )}

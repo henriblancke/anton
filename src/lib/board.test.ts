@@ -83,9 +83,13 @@ vi.mock("./schedules", async () => {
   return { ...actual, isScheduleEnabled: async () => pickerArmed };
 });
 
+// The policy armed on this machine (anton-t9m4 review): half of the plan's freshness fence, so a
+// test can move it without touching a bead. Unarmed by default, as a project that never set one.
+let projectSettings: { pickerPolicy?: import("./policy/types").Policy } = {};
+
 vi.mock("./projects", async () => {
   const actual = await vi.importActual<typeof import("./projects")>("./projects");
-  return { ...actual, getProjectSettings: async () => ({}) };
+  return { ...actual, getProjectSettings: async () => projectSettings };
 });
 
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
@@ -101,6 +105,7 @@ beforeEach(() => {
   deferrals = new Map();
   pickerPlan = undefined;
   pickerArmed = true;
+  projectSettings = {};
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1148,39 +1153,42 @@ describe("picker vetoes on the board (anton-jqvy)", () => {
  * that renders a card renders them — the lane is one reader of this data, never its owner.
  */
 describe("provenance on the board (anton-cqxd)", () => {
-  const planFor = (beadId: string): import("./board-picker-plan").BoardPickerPlan => ({
+  /** Stamped over the board it ranks — an unstale plan, as a pass that just ran would have left. */
+  const planFor = (board: Bead[], beadId: string): import("./board-picker-plan").BoardPickerPlan => ({
     projectId: "p1",
     generatedAt: 1_770_000_000,
-    stamp: { observedAtMs: 1_770_000_000_000, digest: "d1", beadCount: 1 },
+    stamp: stampBoard(board, 1_770_000_000_000),
     entries: [{ beadId, rank: 1, rule: "any claimable run target" }],
     exclusions: [],
   });
 
   it("marks the picker's pick on a card and on a chip alike", async () => {
-    listMock.mockResolvedValue([
+    const board = [
       makeBead({ id: "f-1", title: "A feature", issue_type: "feature" }),
       makeBead({ id: "t-1", title: "A loose task" }),
-    ]);
+    ];
+    listMock.mockResolvedValue(board);
     pickerPlan = {
-      ...planFor("f-1"),
+      ...planFor(board, "f-1"),
       entries: [
         { beadId: "f-1", rank: 1, rule: "any claimable run target" },
         { beadId: "t-1", rank: 2, rule: "any claimable run target" },
       ],
     };
 
-    const board = await getBoard(project);
-    expect(board.columns.backlog.find((e) => e.id === "f-1")?.provenance).toEqual([
+    const served = await getBoard(project);
+    expect(served.columns.backlog.find((e) => e.id === "f-1")?.provenance).toEqual([
       { kind: "policy", detail: "any claimable run target" },
     ]);
-    expect(board.standalone.backlog.find((i) => i.id === "t-1")?.provenance).toEqual([
+    expect(served.standalone.backlog.find((i) => i.id === "t-1")?.provenance).toEqual([
       { kind: "policy", detail: "any claimable run target" },
     ]);
   });
 
   it("stops badging picks once the pass that would refresh them is switched off", async () => {
-    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
-    pickerPlan = planFor("t-1");
+    const board = [makeBead({ id: "t-1", title: "A loose task" })];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planFor(board, "t-1");
     pickerArmed = false;
 
     // The badge is what `[Release]` is derived from (isPickerPick), so a plan left behind by a
@@ -1189,10 +1197,11 @@ describe("provenance on the board (anton-cqxd)", () => {
   });
 
   it("never badges a done target — provenance is about whether to run it", async () => {
-    listMock.mockResolvedValue([
+    const board = [
       makeBead({ id: "f-1", title: "A shipped feature", issue_type: "feature", status: "closed" }),
-    ]);
-    pickerPlan = planFor("f-1");
+    ];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planFor(board, "f-1");
 
     expect((await getBoard(project)).columns.done[0]?.provenance).toBeUndefined();
   });
@@ -1203,11 +1212,12 @@ describe("provenance on the board (anton-cqxd)", () => {
   });
 
   it("moves the refresh token when the picker records a new plan", async () => {
-    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "A loose task" })]);
+    const board = [makeBead({ id: "t-1", title: "A loose task" })];
+    listMock.mockResolvedValue(board);
     const clean = (await getBoard(project)).version;
 
     resetIssueSnapshots();
-    pickerPlan = planFor("t-1");
+    pickerPlan = planFor(board, "t-1");
     const picked = (await getBoard(project)).version;
     expect(picked).not.toBe(clean);
 
@@ -1275,9 +1285,79 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     deferrals = new Map([["f-1", 1_770_000_100_000]]);
 
     // Out of the lane, but still on the board: a set-aside target returns to Backlog, it does not
-    // vanish.
+    // vanish. And the lane is ABSENT rather than empty (Board.upNext) — an "Up Next" heading over
+    // nothing would read as "anton has nothing to start".
     const served = await getBoard(project);
-    expect(served.upNext).toEqual([]);
+    expect(served.upNext).toBeUndefined();
+    expect("upNext" in served).toBe(false);
     expect(served.columns.backlog.map((e) => e.id)).toEqual(["f-1"]);
+  });
+
+  it("withholds the lane when the operator narrows the policy without touching a bead", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    // Recorded by a pass that ran under NO policy — the fence covers both halves of that decision.
+    pickerPlan = planOver(board, "f-1");
+    expect((await getBoard(project)).upNext).toHaveLength(1);
+
+    resetIssueSnapshots();
+    // A settings save admits or excludes targets while every bead digest stays byte-identical. The
+    // plan now ranks under a rule the operator has replaced, so it is not what anton would start.
+    projectSettings = { pickerPolicy: { types: ["bug"] } };
+    expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("moves the refresh token on a policy save, so the poll cannot 304 past the withdrawal", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    const armed = await getBoardVersion(project);
+
+    projectSettings = { pickerPolicy: { types: ["bug"] } };
+    expect(await getBoardVersion(project)).not.toBe(armed);
+  });
+});
+
+/**
+ * `[Release]` is derived from the `◈ policy` badge (isPickerPick), and the badge outlives the plan it
+ * came from — it records the rule a target WAS picked under. The button claims something stronger:
+ * that this is what anton would start NOW. So the mark carries the freshness verdict the lane is
+ * withheld on, and the two can never disagree.
+ */
+describe("a pick the board has moved past (anton-t9m4)", () => {
+  const feature = () => makeBead({ id: "f-1", title: "A feature", issue_type: "feature" });
+
+  it("keeps the badge but flags it stale once the board no longer matches the plan", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = {
+      projectId: "p1",
+      generatedAt: 1_770_000_000,
+      stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
+      entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+
+    const served = await getBoard(project);
+    expect(served.upNext).toBeUndefined();
+    expect(served.columns.backlog[0]?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target", stale: true },
+    ]);
+  });
+
+  it("leaves the mark unflagged while the plan still describes the board", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = {
+      projectId: "p1",
+      generatedAt: 1_770_000_000,
+      stamp: stampBoard(board, 1_770_000_000_000),
+      entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+
+    expect((await getBoard(project)).columns.backlog[0]?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target" },
+    ]);
   });
 });

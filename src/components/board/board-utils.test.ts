@@ -12,6 +12,7 @@ import {
   compareBacklogEpics,
   filterBoard,
   groupBoardByEpic,
+  isPickerPick,
   moveEpicBetweenColumns,
   reorderPriority,
   reorderUpNextEntries,
@@ -661,5 +662,24 @@ describe("reorderUpNextEntries", () => {
   it("leaves the plan alone when either end is not in it", () => {
     const entries = plan("a", "b");
     expect(reorderUpNextEntries(entries, "a", "gone", 0)).toEqual(entries);
+  });
+});
+
+/**
+ * `[Release]` is offered on this predicate, and the Up Next lane is withheld on the same freshness
+ * verdict — so a mark the board flagged stale must read as history here, not as a live pick.
+ */
+describe("isPickerPick", () => {
+  it("reads a fresh policy mark as the picker's current pick", () => {
+    expect(isPickerPick([{ kind: "policy", ref: "types" }])).toBe(true);
+  });
+
+  it("refuses a mark whose plan the board has moved past", () => {
+    expect(isPickerPick([{ kind: "policy", ref: "types", stale: true }])).toBe(false);
+  });
+
+  it("ignores the other writers, stale or not", () => {
+    expect(isPickerPick([{ kind: "pm", ref: "anton-1" }])).toBe(false);
+    expect(isPickerPick(undefined)).toBe(false);
   });
 });
