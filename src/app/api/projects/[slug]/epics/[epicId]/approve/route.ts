@@ -9,12 +9,14 @@ import { nudgeSync } from "@/lib/beads/sync-nudge";
 import { conflictBody, ownerOf, stealRefused, withClaimLock } from "@/lib/beads/claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
-import { getBoardPickerPlan } from "@/lib/board-picker-plan";
+import { getBoardPickerPlan, isPlanStale, stampBoard } from "@/lib/board-picker-plan";
 import { getDb } from "@/lib/db";
 import { enqueueExecuteEpic, enqueueExecuteEpicIfAbsent } from "@/lib/jobs/service";
 import { systemClock } from "@/lib/jobs/queue";
 import { resolveOperator } from "@/lib/operator";
-import { recordPickerAccept } from "@/lib/picker-veto";
+import { activeDeferrals, recordPickerAccept } from "@/lib/picker-veto";
+import { getProjectSettings, resolvePickerPolicy } from "@/lib/projects";
+import { isScheduleEnabled } from "@/lib/schedules";
 import type { ApprovalRunOutcome, Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
 import { STAGES } from "@/lib/types";
@@ -42,6 +44,8 @@ export const dynamic = "force-dynamic";
  * this route does — a release is exactly this approval, with the same contract gate, structure gate,
  * blocker check, auto-claim and enqueue — and only adds what release MEANS that approve does not: the
  * target was anton's pick and the operator agreed with it, so the choice is recorded as an accept.
+ * The flag ASKS for that record; whether the target really was a live pick is re-derived server-side
+ * (see {@link recordRelease}), because a client cannot be the witness to its own evidence.
  */
 async function readApprovalBody(
   request: Request,
@@ -65,24 +69,50 @@ async function readApprovalBody(
  *
  * The pick is resolved from the recorded plan HERE, exactly as the veto route resolves its own
  * provenance server-side: the rank and the board digest name the decision being accepted, and a
- * client-supplied one could name any. A target the current plan no longer carries still records — the
- * pass may have re-ranked since the operator looked — and simply records no rank.
+ * client-supplied one could name any.
+ *
+ * And the pick must still BE one (PR #212 review). The flag is a client's claim that this target was
+ * anton's pick, so a stale lane, a retried request, or any direct caller can set it on a target the
+ * picker never offered — and an accept counts as evidence in `pickerTrackRecord`, which earned
+ * autonomy reads to decide whether the picker may ever be armed. Recording an unvalidated flag would
+ * let the record claim the operator agreed with a decision they were never shown. So the server
+ * re-derives the very predicate the `[Release]` button is drawn from (`board.ts` → `isPickerPick`):
+ * the picker is armed, the plan carries this target as an entry, the board and policy have not moved
+ * past that plan, and the operator has not since vetoed it. Anything else releases exactly as an
+ * approve does and records nothing — the run is the operator's to have, the evidence is not.
+ *
+ * Judged against `board` — the pre-write snapshot this request already read — not a fresh one: the
+ * approval's own label and claim would otherwise invalidate the very plan they are answering.
  *
  * Best-effort, like the enqueue it follows: the approval has landed and the run has started, so a
  * write to anton.db that falls over must not fail a release the operator already got. The accept is
- * evidence about the picker, never a gate on the run.
+ * evidence about the picker, never a gate on the run — which is also why every failure here fails
+ * CLOSED, recording nothing rather than an accept it could not stand behind.
  */
-async function recordRelease(projectId: string, beadId: string): Promise<void> {
+async function recordRelease(projectId: string, beadId: string, board: Bead[]): Promise<void> {
   try {
     const db = getDb();
-    const plan = await getBoardPickerPlan(db, projectId);
+    const [plan, armed, policy, deferrals] = await Promise.all([
+      getBoardPickerPlan(db, projectId),
+      isScheduleEnabled(projectId, "board-picker"),
+      getProjectSettings(db, projectId).then(resolvePickerPolicy),
+      activeDeferrals(db, projectId, new Date()),
+    ]);
+    const skip = (why: string) =>
+      void console.warn(`[approve] release of ${beadId} recorded no accept: ${why}`);
     const entry = plan?.entries.find((e) => e.beadId === beadId);
+    if (!armed) return skip("the picker is disarmed");
+    if (!plan || !entry) return skip("no recorded plan picks this target");
+    if (deferrals.has(beadId)) return skip("the operator vetoed this pick");
+    if (isPlanStale(plan, stampBoard(board, Date.now(), policy), deferrals)) {
+      return skip("the board has moved past the plan that picked it");
+    }
     await recordPickerAccept(db, systemClock, {
       projectId,
       beadId,
-      ...(entry?.rule ? { rule: entry.rule } : {}),
-      ...(entry ? { rank: entry.rank } : {}),
-      ...(plan?.stamp.digest ? { planDigest: plan.stamp.digest } : {}),
+      ...(entry.rule ? { rule: entry.rule } : {}),
+      rank: entry.rank,
+      ...(plan.stamp.digest ? { planDigest: plan.stamp.digest } : {}),
     });
   } catch (err) {
     console.error(`[approve] failed to record the picker accept for ${beadId}`, err);
@@ -544,8 +574,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // covering the target: an accept for a run that never started would be evidence of nothing, and
   // earned autonomy reads these counts to decide whether the picker may ever be armed. A run live on
   // another machine counts — the operator accepted the pick and the work is running, which is what
-  // the accept records; only a failed or suppressed enqueue leaves nothing to answer for.
-  if (release && (run === "started" || run === "elsewhere")) await recordRelease(project.id, epicId);
+  // the accept records; only a failed or suppressed enqueue leaves nothing to answer for. Whether
+  // the target was a PICK at all is re-derived server-side, off this same pre-write snapshot.
+  if (release && (run === "started" || run === "elsewhere")) {
+    await recordRelease(project.id, epicId, allBeads);
+  }
 
   // Fire-and-forget: the approve write already landed locally and the run enqueues off that local
   // state, so don't block the response on a `bd dolt pull/commit/push` a slow/unreachable remote
