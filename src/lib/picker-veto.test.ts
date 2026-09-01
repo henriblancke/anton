@@ -231,6 +231,50 @@ describe("recording an accept", () => {
     expect((await activeDeferrals(test.db, PROJECT, at(nowMs))).get("anton-a")).toBe(untilMs);
   });
 
+  it("counts a repeated veto of one pick ONCE — two tabs are one answer, not two declines", async () => {
+    // The window still extends (above); what must not double is the EVIDENCE. `pickerTrackRecord`
+    // counts rows, so a retry that filed a second decline would inflate the negative half of the
+    // record and push other decisions out of its rolling window.
+    const veto = { projectId: PROJECT, beadId: "anton-a", action: "not-now" as const, planId: "d1" };
+    await recordPickerVeto(test.db, clock, veto);
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, veto);
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ declined: 1, settled: 1 });
+    expect((await listPickerVerdicts(test.db, PROJECT)).length).toBe(1);
+  });
+
+  it("keeps the provenance a repeat veto no longer carries, and takes the criterion it adds", async () => {
+    // A stale tab that has lost the rank must not erase the rank the first veto recorded, and a
+    // `Never` following a `not-now` still has to leave the criterion the operator was sent at.
+    const pick = { projectId: PROJECT, beadId: "anton-a", planId: "d1" };
+    await recordPickerVeto(test.db, clock, {
+      ...pick,
+      action: "not-now",
+      rule: "the work policy armed on this machine",
+      rank: 2,
+    });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...pick, action: "never", criterion: "labels:domain" });
+
+    expect((await listPickerVerdicts(test.db, PROJECT))[0]).toMatchObject({
+      action: "never",
+      rule: "the work policy armed on this machine",
+      criterion: "labels:domain",
+      rank: 2,
+      planId: "d1",
+    });
+  });
+
+  it("files its own decline against a LATER plan that re-picks the target", async () => {
+    const veto = { projectId: PROJECT, beadId: "anton-a", action: "not-now" as const };
+    await recordPickerVeto(test.db, clock, { ...veto, planId: "d1" });
+    nowMs = NOW + 60_000;
+    await recordPickerVeto(test.db, clock, { ...veto, planId: "d2" });
+
+    expect(await pickerTrackRecord(test.db, PROJECT)).toMatchObject({ declined: 2, settled: 2 });
+  });
+
   it("records again once a later plan re-picks it — a new decision is a new answer", async () => {
     await recordPickerAccept(test.db, clock, { projectId: PROJECT, beadId: "anton-a", planId: "d1" });
     nowMs = NOW + 60_000;

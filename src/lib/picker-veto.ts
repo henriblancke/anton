@@ -136,6 +136,44 @@ function pickAlreadyAnswered(
   );
 }
 
+/**
+ * The decline already standing against this pick, when there is one (PR #212 review).
+ *
+ * A pick gets one DECLINE row, not one per click: two tabs vetoing the same card, or a client
+ * retrying after it lost the response, are the same answer restated. Counting them twice would
+ * inflate the negative half of the record `pickerTrackRecord` reads and push other decisions out of
+ * its rolling window — so the repeat extends the standing decline instead of filing a new one.
+ *
+ * Keyed on the PICK, like {@link pickAlreadyAnswered}: a plan-less veto answers no recorded decision
+ * and has nothing to extend, and a later plan that re-picks the target is a new decision with its
+ * own answer.
+ */
+function standingDecline(
+  tx: Pick<AntonDb, "select">,
+  input: { projectId: string; beadId: string; planId?: string },
+) {
+  if (!input.planId) return undefined;
+  return tx
+    .select({
+      id: schema.pickerVerdicts.id,
+      rule: schema.pickerVerdicts.rule,
+      criterion: schema.pickerVerdicts.criterion,
+      rank: schema.pickerVerdicts.rank,
+      deferredUntil: schema.pickerVerdicts.deferredUntil,
+    })
+    .from(schema.pickerVerdicts)
+    .where(
+      and(
+        eq(schema.pickerVerdicts.projectId, input.projectId),
+        eq(schema.pickerVerdicts.beadId, input.beadId),
+        eq(schema.pickerVerdicts.planId, input.planId),
+        eq(schema.pickerVerdicts.verdict, "declined"),
+      ),
+    )
+    .limit(1)
+    .all()[0];
+}
+
 /** What a veto did: the hold it placed, or the release that answered this pick first. */
 export type PickerVetoOutcome =
   | { recorded: true; deferral: PickerDeferral }
@@ -152,8 +190,10 @@ export type PickerVetoOutcome =
  *
  * Refused outright when a release already accepted this pick (see {@link pickAlreadyAnswered}): the
  * run is under way, so there is nothing left to set aside, and the caller reports that rather than
- * filing a decline against a decision the operator already took the other side of. A REPEAT decline
- * is untouched — a second veto extends the window, and that is the same answer, not the opposite one.
+ * filing a decline against a decision the operator already took the other side of. A REPEAT veto is
+ * allowed — the same answer, not the opposite one — and EXTENDS the standing decline rather than
+ * writing a second one (see {@link standingDecline}), keeping the later expiry and whatever
+ * provenance either veto carried: a stale tab that no longer knows the rank must not erase it.
  */
 export async function recordPickerVeto(
   db: AntonDb,
@@ -167,24 +207,40 @@ export async function recordPickerVeto(
       if (pickAlreadyAnswered(tx, input, "accepted")) {
         return { recorded: false, reason: "released" } as const;
       }
-      tx.insert(schema.pickerVerdicts)
-        .values({
-          id: randomUUID(),
-          projectId: input.projectId,
-          beadId: input.beadId,
-          verdict: "declined",
-          action: input.action,
-          rule: input.rule ?? null,
-          criterion: input.criterion ?? null,
-          rank: input.rank ?? null,
-          planId: input.planId ?? null,
-          deferredUntil: secDate(untilMs),
-          decidedAt: secDate(nowMs),
-        })
-        .run();
+      const standing = standingDecline(tx, input);
+      const heldUntilMs = Math.max(untilMs, standing ? (msOf(standing.deferredUntil) ?? 0) : 0);
+      if (standing) {
+        tx.update(schema.pickerVerdicts)
+          .set({
+            action: input.action,
+            rule: input.rule ?? standing.rule,
+            criterion: input.criterion ?? standing.criterion,
+            rank: input.rank ?? standing.rank,
+            deferredUntil: secDate(heldUntilMs),
+            decidedAt: secDate(nowMs),
+          })
+          .where(eq(schema.pickerVerdicts.id, standing.id))
+          .run();
+      } else {
+        tx.insert(schema.pickerVerdicts)
+          .values({
+            id: randomUUID(),
+            projectId: input.projectId,
+            beadId: input.beadId,
+            verdict: "declined",
+            action: input.action,
+            rule: input.rule ?? null,
+            criterion: input.criterion ?? null,
+            rank: input.rank ?? null,
+            planId: input.planId ?? null,
+            deferredUntil: secDate(heldUntilMs),
+            decidedAt: secDate(nowMs),
+          })
+          .run();
+      }
       return {
         recorded: true,
-        deferral: { beadId: input.beadId, untilMs: secDate(untilMs).getTime() },
+        deferral: { beadId: input.beadId, untilMs: secDate(heldUntilMs).getTime() },
       } as const;
     },
     { behavior: "immediate" },

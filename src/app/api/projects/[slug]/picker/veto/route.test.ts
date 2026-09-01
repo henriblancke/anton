@@ -118,11 +118,14 @@ describe("POST /picker/veto", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it("vetoes a target the current plan no longer carries, recording no rank", async () => {
+  it("vetoes a target the current plan no longer carries, recording neither rank nor plan id", async () => {
+    // A stale tab answering a pick the latest generation has dropped. Stamping that generation's id
+    // on the verdict would claim the operator answered a decision that never offered this bead.
     const res = await POST(req({ beadId: "anton-zz", action: "not-now" }), ctx("tmp"));
     expect(res.status).toBe(200);
     expect((await listPickerVerdicts(tdb.db, "p1"))[0]).toMatchObject({ beadId: "anton-zz" });
     expect((await listPickerVerdicts(tdb.db, "p1"))[0]?.rank).toBeUndefined();
+    expect((await listPickerVerdicts(tdb.db, "p1"))[0]?.planId).toBeUndefined();
   });
 
   it("still records the decline when the board read for the criterion falls over", async () => {

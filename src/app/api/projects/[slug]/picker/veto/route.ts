@@ -31,7 +31,8 @@ const bodySchema = z.object({
  * The plan is read for provenance, not for permission: a veto records the rank and the generation id
  * of the decision it answers, so the record names a PICK rather than only a bead. A target the
  * current plan does not carry is still vetoable — the pass may have re-ranked since the operator
- * looked — and simply records no rank.
+ * looked — and records neither, plan id included: naming the latest generation would claim the
+ * operator answered a decision that never offered this bead.
  *
  * A `never` on a project with no armed policy, or one whose policy narrows nothing this bead
  * satisfies, returns `criterion: null`. That is an answer, not a failure: the editor opens at the
@@ -66,8 +67,7 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
     beadId,
     action,
     ...(entry?.rule ? { rule: entry.rule } : {}),
-    ...(entry ? { rank: entry.rank } : {}),
-    ...(plan?.planId ? { planId: plan.planId } : {}),
+    ...(entry ? { rank: entry.rank, ...(plan?.planId ? { planId: plan.planId } : {}) } : {}),
     ...(criterion ? { criterion } : {}),
   });
 

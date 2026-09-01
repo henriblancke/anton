@@ -245,10 +245,12 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
  * track record — the same evidence base earned autonomy reads for the gardener's kinds
  * (`gardener/track-record.ts`), for a surface that has no board fingerprint to count off.
  *
- * Append-only, and a decline carries its own expiry rather than a flag somebody has to clear: a
- * veto defers the target for a bounded window ({@link PICKER_DEFER_WINDOW_MS}), so the next pass
- * skips it and the pass after the window lets it back in. That bound is what keeps this from being
- * the per-bead blocklist the design refuses — nothing here can silence a target permanently.
+ * One row per (verdict, pick) — a repeat veto extends its standing decline rather than filing a
+ * second one, so the counts stay a record of DECISIONS and not of clicks. A decline carries its own
+ * expiry rather than a flag somebody has to clear: a veto defers the target for a bounded window
+ * ({@link PICKER_DEFER_WINDOW_MS}), so the next pass skips it and the pass after the window lets it
+ * back in. That bound is what keeps this from being the per-bead blocklist the design refuses —
+ * nothing here can silence a target permanently.
  *
  * Machine-local, like the plan and the policy it answers: a veto is one operator's pacing decision
  * on one machine, not shared board state.
@@ -292,9 +294,10 @@ export const pickerVerdicts = sqliteTable(
     // At most one ACCEPT per (project, bead, plan) — the DB backstop behind recordPickerAccept's
     // conflict-ignoring insert. Two concurrent releases of one pick (a double-click, a retry) start
     // a single run through the enqueue dedupe, so they must not leave two accepts inflating the
-    // track record earned autonomy reads. Partial on the accepted verdict because a DECLINE is
-    // legitimately repeatable — a second veto extends the window. A plan-less accept answers no
-    // recorded pick and stays unconstrained: SQLite treats NULLs as distinct.
+    // track record earned autonomy reads. Partial on the accepted verdict because the DECLINE side
+    // is deduped by `recordPickerVeto` itself, under the same write lock: a second veto updates the
+    // standing row's expiry, so there is no conflicting insert for an index to catch. A plan-less
+    // accept answers no recorded pick and stays unconstrained: SQLite treats NULLs as distinct.
     uniqueIndex("picker_verdicts_accept_unique")
       .on(table.projectId, table.beadId, table.planId)
       .where(sql`${table.verdict} = 'accepted'`),
