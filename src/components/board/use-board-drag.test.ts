@@ -56,6 +56,12 @@ describe("dropTarget", () => {
     expect(dropTarget(board(), drop("anton-gone", "backlog", "done"))).toBeNull();
   });
 
+  it("declines a drop onto a lane card — an Up Next row is not a stage named after a bead", () => {
+    // The Up Next lane's cards are droppables of their own, so `over` is only a column when it says
+    // it is. Reading a bead id as a stage would POST a move to a stage that does not exist.
+    expect(dropTarget(board(), drop("anton-1", "backlog", "anton-2"))).toBeNull();
+  });
+
   it("declines a drag that carries no source stage", () => {
     expect(dropTarget(board(), drop("anton-1", undefined, "done"))).toBeNull();
   });

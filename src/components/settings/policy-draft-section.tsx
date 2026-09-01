@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import {
@@ -80,6 +80,49 @@ const PRIORITIES = [0, 1, 2, 3, 4];
 const MAX_LISTED = 40;
 
 /**
+ * The location, as an external system this component may only READ (anton-jqvy, anton-cqxd).
+ *
+ * Module-level so the subscription is stable across renders, and shaped this way — rather than as a
+ * `useSearchParams` read — because the deep link must render nothing on the server and its effect on
+ * the client without a hydration mismatch, and without dragging the whole settings page behind a
+ * Suspense boundary.
+ */
+function subscribeToLocation(onChange: () => void): () => void {
+  window.addEventListener("popstate", onChange);
+  window.addEventListener("hashchange", onChange);
+  return () => {
+    window.removeEventListener("popstate", onChange);
+    window.removeEventListener("hashchange", onChange);
+  };
+}
+
+/** One search param off the current URL, or undefined on the server and when it is absent. */
+function useUrlParam(name: string): string | undefined {
+  const raw = useSyncExternalStore(
+    subscribeToLocation,
+    () => new URLSearchParams(window.location.search).get(name),
+    () => null,
+  );
+  return raw ?? undefined;
+}
+
+/**
+ * What a deep link asked this editor to open at: a criterion to land on, and the bead that link was
+ * about.
+ *
+ * Two callers, arriving for opposite reasons and landing in the same place. `Never` on a pick
+ * (anton-jqvy) sends the operator at the criterion that admitted it, to TIGHTEN it. A card's
+ * `◈ policy` badge (anton-cqxd) sends them at the same criterion to CHECK it, and names the bead so
+ * the panel can open its evaluation instead of a list of forty.
+ *
+ * Advisory only. It highlights, opens and scrolls; it never edits, disables or preselects anything,
+ * because the operator writes the rule.
+ */
+function usePolicyDeepLink(): { criterion?: string; bead?: string } {
+  return { criterion: useUrlParam("criterion"), bead: useUrlParam("bead") };
+}
+
+/**
  * The work policy panel (anton-c7iv, anton-qsr1) — and, before anything is armed, the FIRST-ARM
  * PROPOSAL.
  *
@@ -149,6 +192,7 @@ export function PolicyDraftSection({
   boardUnavailable?: boolean;
 }) {
   const router = useRouter();
+  const { criterion: highlighted, bead: focusBead } = usePolicyDeepLink();
   const armed = stored !== undefined;
   const [policy, setPolicy] = useState<Policy>(stored ?? draft.policy);
   const [saving, setSaving] = useState(false);
@@ -476,7 +520,7 @@ export function PolicyDraftSection({
         onDragEnd={onDragEnd}
       >
         <div className="flex max-w-2xl flex-col gap-3">
-          <Criterion label="Issue type" why={why("types")}>
+          <Criterion label="Issue type" why={why("types")} highlighted={highlighted === "types"}>
             <div className="flex flex-wrap gap-1.5">
               {typeVocabulary.map((type) => (
                 <Chip
@@ -512,7 +556,7 @@ export function PolicyDraftSection({
             )}
           </Criterion>
 
-          <Criterion label="Priority" why={why("priority")}>
+          <Criterion label="Priority" why={why("priority")} highlighted={highlighted === "priority"}>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
               <label className="flex items-center gap-2">
                 at least
@@ -538,7 +582,7 @@ export function PolicyDraftSection({
             )}
           </Criterion>
 
-          <Criterion label="Parentage" why={why("parentage")}>
+          <Criterion label="Parentage" why={why("parentage")} highlighted={highlighted === "parentage"}>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
               <label className="flex items-center gap-2">
                 at least
@@ -565,7 +609,7 @@ export function PolicyDraftSection({
             </p>
           </Criterion>
 
-          <Criterion label="Age" why={why("age")}>
+          <Criterion label="Age" why={why("age")} highlighted={highlighted === "age"}>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-subtle">
               <label className="flex items-center gap-2">
                 filed at least
@@ -610,6 +654,7 @@ export function PolicyDraftSection({
               }
               scaleLike={scaleLike.has(group.namespace)}
               why={why(`labels:${group.namespace}`)}
+              highlighted={highlighted === `labels:${group.namespace}`}
               onToggleValue={(value) => toggleValue(group.namespace, value)}
               onRanked={(ranked) => setRanked(group.namespace, ranked)}
               onCompare={(compare) => setCompare(group.namespace, compare)}
@@ -617,7 +662,7 @@ export function PolicyDraftSection({
             />
           ))}
 
-          <Criterion label="Blockers" why={why("blockers")}>
+          <Criterion label="Blockers" why={why("blockers")} highlighted={highlighted === "blockers"}>
             <div className="flex items-center gap-2">
               <Toggle
                 checked={policy.requireUnblocked ?? false}
@@ -640,6 +685,7 @@ export function PolicyDraftSection({
           excluded={excluded}
           total={candidates.length}
           notStartable={notStartable}
+          focusBead={focusBead}
         />
       )}
 
@@ -753,11 +799,18 @@ function MatchPanel({
   excluded,
   total,
   notStartable,
+  focusBead,
 }: {
   matched: PolicyCandidate[];
   excluded: { candidate: PolicyCandidate; failed: { label: string; reason: string }[] }[];
   total: number;
   notStartable: number;
+  /**
+   * The bead a `◈ policy` badge arrived from (anton-cqxd). Its list opens and its row is marked, so
+   * the badge's promise — "the rule that matched, WITH this bead's evaluated criteria" — is kept
+   * without the operator hunting a list capped at {@link MAX_LISTED}.
+   */
+  focusBead?: string;
 }) {
   if (total === 0) {
     return (
@@ -789,17 +842,26 @@ function MatchPanel({
       )}
 
       {matched.length > 0 && (
-        <details>
+        <details open={matched.some((c) => c.id === focusBead)}>
           <summary className="cursor-pointer text-[11.5px] text-subtle hover:text-foreground">
             See them ({matched.length})
           </summary>
           <ul className="mt-1.5 flex flex-col gap-1">
-            {matched.slice(0, MAX_LISTED).map((c) => (
-              <li key={c.id} className="flex gap-2 text-[11.5px]">
-                <span className="shrink-0 font-mono text-[10.5px] text-subtle">{c.id}</span>
-                <span className="truncate text-foreground">{c.title}</span>
-              </li>
-            ))}
+            {focusFirst(matched, (c) => c.id, focusBead)
+              .slice(0, MAX_LISTED)
+              .map((c) => (
+                <li
+                  key={c.id}
+                  {...(c.id === focusBead ? { "aria-current": "true" as const } : {})}
+                  className={cn(
+                    "flex gap-2 rounded-sm text-[11.5px]",
+                    c.id === focusBead && "bg-primary/10 px-1 ring-1 ring-primary/30",
+                  )}
+                >
+                  <span className="shrink-0 font-mono text-[10.5px] text-subtle">{c.id}</span>
+                  <span className="truncate text-foreground">{c.title}</span>
+                </li>
+              ))}
             {matched.length > MAX_LISTED && (
               <li className="text-[11px] text-subtle">
                 …and {matched.length - MAX_LISTED} more
@@ -810,15 +872,23 @@ function MatchPanel({
       )}
 
       {excluded.length > 0 && (
-        <details>
+        <details open={excluded.some((e) => e.candidate.id === focusBead)}>
           <summary className="cursor-pointer text-[11.5px] text-subtle hover:text-foreground">
             Why not the rest? ({excluded.length})
           </summary>
           <ul className="mt-1.5 flex flex-col gap-1">
-            {excluded.slice(0, MAX_LISTED).map(({ candidate, failed }) => (
+            {focusFirst(excluded, (e) => e.candidate.id, focusBead)
+              .slice(0, MAX_LISTED)
+              .map(({ candidate, failed }) => (
               <li key={candidate.id}>
-                <details>
-                  <summary className="flex cursor-pointer gap-2 text-[11.5px] hover:text-foreground">
+                <details open={candidate.id === focusBead}>
+                  <summary
+                    {...(candidate.id === focusBead ? { "aria-current": "true" as const } : {})}
+                    className={cn(
+                      "flex cursor-pointer gap-2 rounded-sm text-[11.5px] hover:text-foreground",
+                      candidate.id === focusBead && "bg-primary/10 px-1 ring-1 ring-primary/30",
+                    )}
+                  >
                     <span className="shrink-0 font-mono text-[10.5px] text-subtle">
                       {candidate.id}
                     </span>
@@ -847,6 +917,18 @@ function MatchPanel({
 }
 
 /**
+ * The deep-linked bead first, everything else in its existing order. Both lists are capped at
+ * {@link MAX_LISTED}, so a badge that opened the panel on a bead sitting at position 200 would
+ * otherwise land on a list that does not contain it — the one case where the link silently fails.
+ */
+function focusFirst<T>(items: T[], idOf: (item: T) => string, focusBead?: string): T[] {
+  if (!focusBead) return items;
+  const index = items.findIndex((item) => idOf(item) === focusBead);
+  if (index <= 0) return items;
+  return [items[index], ...items.slice(0, index), ...items.slice(index + 1)];
+}
+
+/**
  * One discovered namespace, generated from the board's own labels — membership by default, and a
  * hand-ranked order only when the operator asks for one (R2.3). anton never infers the order,
  * because a namespace a repo invented has none to infer.
@@ -857,6 +939,7 @@ function NamespaceCriterion({
   locked,
   scaleLike,
   why,
+  highlighted = false,
   onToggleValue,
   onRanked,
   onCompare,
@@ -874,6 +957,8 @@ function NamespaceCriterion({
   /** Discovery read these values as a scale — a hint beside the control, never a gate on it. */
   scaleLike: boolean;
   why?: PolicyRationale;
+  /** A deep link sent the operator at THIS criterion — to tighten or to check it (usePolicyDeepLink). */
+  highlighted?: boolean;
   onToggleValue: (value: string) => void;
   onRanked: (ranked: boolean) => void;
   onCompare: (compare: PolicyRankComparison | undefined) => void;
@@ -894,6 +979,7 @@ function NamespaceCriterion({
     <Criterion
       label={`${group.namespace}:`}
       why={why}
+      highlighted={highlighted}
       onRemove={selected.length ? onClear : undefined}
     >
       <div className="flex flex-wrap gap-1.5">
@@ -1104,22 +1190,49 @@ function normalize(policy: Policy): Policy {
 function Criterion({
   label,
   why,
+  highlighted = false,
   onRemove,
   children,
 }: {
   label: string;
   why?: PolicyRationale;
+  /**
+   * A `Never` veto opened the editor at this criterion (anton-jqvy). Marked `aria-current` as well
+   * as ringed, so the operator who arrived by keyboard lands on the same control the ring points at
+   * — a highlight only sighted users can follow is a deep link that only half works.
+   */
+  highlighted?: boolean;
   onRemove?: () => void;
   children: React.ReactNode;
 }) {
+  const node = useRef<HTMLDivElement | null>(null);
+  // Only the deep-linked one scrolls, and only when it BECOMES the deep-linked one: the panel is
+  // taller than the viewport, so a highlight below the fold is a highlight nobody sees. In an effect
+  // keyed on that fact rather than in the ref callback — an inline ref is a new function every
+  // render, so React re-attaches it on each one and the panel would snap back to the ring every
+  // time the operator edited any criterion on it.
+  useEffect(() => {
+    if (highlighted) node.current?.scrollIntoView?.({ block: "center" });
+  }, [highlighted]);
+
   return (
     <div
       role="group"
       aria-label={label}
-      className="flex flex-col gap-1.5 rounded-[10px] border border-border bg-card px-3 py-2.5"
+      {...(highlighted ? { "aria-current": "true" as const } : {})}
+      ref={node}
+      className={cn(
+        "flex flex-col gap-1.5 rounded-[10px] border bg-card px-3 py-2.5",
+        highlighted ? "border-primary/60 ring-2 ring-primary/30" : "border-border",
+      )}
     >
       <div className="flex items-baseline justify-between gap-2">
         <span className="font-mono text-[11px] font-medium text-foreground">{label}</span>
+        {highlighted && (
+          <span className="text-[10.5px] text-subtle">
+            this admitted the bead you came from
+          </span>
+        )}
         {onRemove && (
           <Button size="xs" variant="ghost" onClick={onRemove}>
             Remove

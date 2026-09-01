@@ -19,10 +19,14 @@ export function ctx(slug: string, epicId: string): { params: Promise<{ slug: str
   return paramsCtx({ slug, epicId });
 }
 
-/** The approve route's optional body: take over a teammate's claim, and/or ask to run now. */
+/** The approve route's optional body: take over a teammate's claim, ask to run now, and/or release
+ *  the picker's pick (which records an accept alongside the ordinary approval). */
 export interface ApproveBody {
   steal?: boolean;
   immediate?: boolean;
+  release?: boolean;
+  /** The plan generation a release names — the pick the operator was looking at. */
+  planId?: string;
 }
 
 /**

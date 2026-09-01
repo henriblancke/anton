@@ -1,22 +1,27 @@
 "use client";
 
+import { useState } from "react";
 import { toast } from "sonner";
 
 import type { Epic } from "@/lib/types";
 // The predicate itself, not a card-local copy: approve and the runner ask the same one.
 import { contractBlocks } from "@/lib/beads/contract";
 import { ConfirmDeleteButton } from "@/components/ui/confirm-delete-button";
-import { canStartRun, typeWord } from "@/components/board/board-utils";
+import { canStartRun, isPickerPick, typeWord } from "@/components/board/board-utils";
 import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
+import { usePickDecision } from "@/components/board/pick-decision";
+import { VetoActions } from "@/components/board/veto-actions";
 import type { ApproveRun } from "@/components/board/use-approve-run";
 import type { EpicCardProps } from "@/components/board/epic-card";
 
 /**
- * The run affordance in its three shapes: inert-and-explaining when the contract blocks the run,
- * the Queue/Approve split when the project is budget-aware, and a single Approve otherwise.
- * Renders nothing once the card may not offer a run.
+ * The run affordance in its shapes: inert-and-explaining when the contract blocks the run,
+ * `[Release]` when the board-picker chose this target, the Queue/Approve split when the project is
+ * budget-aware, and a single Approve otherwise. Renders nothing once the card may not offer a run —
+ * except after a release that approved the target without starting one, where re-approving is the
+ * only way back to a run.
  *
  * Gates on readiness, not just stage: approving enqueues execute-epic immediately, so a fully
  * blocked epic (nothing it would dispatch can run) must not be startable before its blocker
@@ -26,15 +31,24 @@ import type { EpicCardProps } from "@/components/board/epic-card";
  * stays in place and names the missing section instead of disappearing (or 422ing on click).
  */
 function ApproveEpicAction({
+  slug,
   epic,
   budgetAware,
   approval,
+  picked,
 }: {
+  slug: string;
   epic: Epic;
   budgetAware: boolean;
   approval: ApproveRun;
+  /** The picker chose this target and the operator has not set it aside. */
+  picked: boolean;
 }) {
-  if (approval.approved || !canStartRun(epic)) return null;
+  // Approved, but the enqueue threw — the target has no run, and the `approved` gate below would
+  // take the retry away the moment the board catches up (PR #212 review). Held here rather than
+  // inside `[Release]` because it is this gate, not the button, that hides it.
+  const [unrun, setUnrun] = useState(false);
+  if ((approval.approved && !unrun) || !canStartRun(epic)) return null;
 
   if (contractBlocks(epic.contract)) {
     return <ApproveBlocked violations={epic.contract?.blocking ?? []} />;
@@ -46,6 +60,20 @@ function ApproveEpicAction({
       approval={approval}
       label="Approve"
       busyLabel="Approving…"
+      {...(picked
+        ? {
+            release: {
+              slug,
+              beadId: epic.id,
+              title: epic.title,
+              onReleased: () => {
+                setUnrun(false);
+                approval.setApproved();
+              },
+              onApprovedWithoutRun: () => setUnrun(true),
+            },
+          }
+        : {})}
     />
   );
 }
@@ -57,8 +85,17 @@ export function EpicBacklogActions({
   budgetAware = false,
   approval,
   onDeleted,
-}: EpicCardProps & { approval: ApproveRun }) {
+  cardVeto,
+}: EpicCardProps & {
+  approval: ApproveRun;
+  /** Set when this card owns its pick's vetoes; where the hold they place is reported. */
+  cardVeto?: (beadId: string, untilMs: number) => void;
+}) {
   const word = typeWord(epic.type);
+  const decision = usePickDecision();
+  // A target the operator set aside keeps its plain Approve: [Release] on a card that reads
+  // "set aside · back in 4h" would offer the very start the veto just declined.
+  const picked = isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -81,7 +118,25 @@ export function EpicBacklogActions({
       canTakeOver={epic.stage === "backlog"}
       className="mt-0.5"
     >
-      <ApproveEpicAction epic={epic} budgetAware={budgetAware} approval={approval} />
+      <ApproveEpicAction
+        slug={slug}
+        epic={epic}
+        budgetAware={budgetAware}
+        approval={approval}
+        picked={picked}
+      />
+      {/* The two ways to disagree with the pick (R3.9), on the card because this surface has no row
+          to put them on. Same lock as the Release beside them: one answer per pick. */}
+      {cardVeto && picked && (
+        <VetoActions
+          slug={slug}
+          beadId={epic.id}
+          {...(decision.planId === undefined ? {} : { planId: decision.planId })}
+          title={epic.title}
+          className="pointer-events-auto"
+          onVetoed={(untilMs) => cardVeto(epic.id, untilMs)}
+        />
+      )}
       <ConfirmDeleteButton
         onConfirm={handleDelete}
         iconOnly

@@ -12,12 +12,24 @@ import {
   compareBacklogEpics,
   filterBoard,
   groupBoardByEpic,
+  isPickerPick,
   moveEpicBetweenColumns,
   removeEpicFromColumns,
+  reorderPriority,
+  reorderUpNextEntries,
   sortEpics,
+  takeUpNext,
   ticketProgress,
+  upNextMetaLabel,
 } from "@/components/board/board-utils";
-import { STAGES, type Epic, type Stage, type StandaloneItem, type Ticket } from "@/lib/types";
+import {
+  STAGES,
+  type Epic,
+  type Stage,
+  type StandaloneItem,
+  type Ticket,
+  type UpNextEntry,
+} from "@/lib/types";
 
 function makeTicket(id: string, over: Partial<Ticket> = {}): Ticket {
   return {
@@ -475,5 +487,270 @@ describe("board filters (anton-9pkk.3)", () => {
     expect(boardFiltersFromSearchParams(new URLSearchParams(href.split("?")[1]))).toEqual({
       epic: ONTOLOGY.id,
     });
+  });
+});
+
+/**
+ * The Up Next subtraction (anton-t9m4 / R3.3). A card lives in exactly one lane: the lane TAKES its
+ * cards out of Backlog rather than overlaying them, or the same bead renders twice in shadow mode.
+ */
+describe("takeUpNext", () => {
+  function chip(id: string, over: Partial<StandaloneItem> = {}): StandaloneItem {
+    return {
+      id,
+      title: id,
+      type: "bug",
+      status: "open",
+      stage: "backlog",
+      approved: false,
+      assignee: null,
+      createdAt: "",
+      createdBy: null,
+      blockedBy: [],
+      ready: true,
+      unread: false,
+      deferred: false,
+      abandoned: false,
+      ...over,
+    };
+  }
+
+  function entry(beadId: string, rank: number, over: Partial<UpNextEntry> = {}): UpNextEntry {
+    return {
+      beadId,
+      rank,
+      priority: 2,
+      type: "feature",
+      unblocks: 0,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      ...over,
+    };
+  }
+
+  const columns = (over: Partial<Record<Stage, Epic[]>> = {}): Record<Stage, Epic[]> => ({
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+    ...over,
+  });
+
+  const chips = (over: Partial<Record<Stage, StandaloneItem[]>> = {}) => ({
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+    ...over,
+  });
+
+  it("takes its cards out of Backlog, in the plan's rank order", () => {
+    const board = columns({ backlog: [makeEpic("a"), makeEpic("b"), makeEpic("c")] });
+    const split = takeUpNext(board, chips(), [entry("c", 1), entry("a", 2)]);
+
+    expect(split.cards.map((card) => card.entry.beadId)).toEqual(["c", "a"]);
+    expect(split.columns.backlog.map((e) => e.id)).toEqual(["b"]);
+  });
+
+  it("leaves every other column untouched", () => {
+    const board = columns({
+      backlog: [makeEpic("a")],
+      implementing: [makeEpic("i", { stage: "implementing" })],
+      done: [makeEpic("d", { stage: "done" })],
+    });
+    const split = takeUpNext(board, chips(), [entry("a", 1)]);
+
+    expect(split.columns.implementing.map((e) => e.id)).toEqual(["i"]);
+    expect(split.columns.done.map((e) => e.id)).toEqual(["d"]);
+  });
+
+  it("takes standalone chips out of the backlog chips too", () => {
+    const split = takeUpNext(columns(), chips({ backlog: [chip("t1"), chip("t2")] }), [
+      entry("t2", 1, { type: "bug" }),
+    ]);
+
+    expect(split.cards).toEqual([
+      { entry: entry("t2", 1, { type: "bug" }), kind: "standalone", item: chip("t2") },
+    ]);
+    expect(split.standalone.backlog.map((i) => i.id)).toEqual(["t1"]);
+  });
+
+  it("ignores a pick that has already started — Up Next is a projection over Backlog only", () => {
+    const board = columns({
+      backlog: [makeEpic("a")],
+      implementing: [makeEpic("started", { stage: "implementing" })],
+    });
+    const split = takeUpNext(board, chips(), [entry("started", 1), entry("a", 2)]);
+
+    expect(split.cards.map((card) => card.entry.beadId)).toEqual(["a"]);
+    // The running card stays exactly where the board put it.
+    expect(split.columns.implementing.map((e) => e.id)).toEqual(["started"]);
+  });
+
+  it("yields no lane and an untouched board when nothing is recorded", () => {
+    const board = columns({ backlog: [makeEpic("a")] });
+    for (const entries of [undefined, []]) {
+      const split = takeUpNext(board, chips(), entries);
+      expect(split.cards).toEqual([]);
+      expect(split.columns).toBe(board);
+    }
+  });
+
+  it("yields no lane when every recorded pick has left the backlog", () => {
+    const board = columns({ backlog: [makeEpic("a")] });
+    const split = takeUpNext(board, chips(), [entry("gone", 1)]);
+
+    expect(split.cards).toEqual([]);
+    expect(split.columns.backlog.map((e) => e.id)).toEqual(["a"]);
+  });
+});
+
+describe("upNextMetaLabel", () => {
+  it("reads the ranking's own inputs — priority, work type, unblocking count", () => {
+    expect(
+      upNextMetaLabel({
+        beadId: "a",
+        rank: 1,
+        priority: 0,
+        type: "feature",
+        unblocks: 3,
+        createdAt: "2026-08-01T00:00:00.000Z",
+      }),
+    ).toBe("P0 · Feature · unblocks 3");
+  });
+
+  it("says an unprioritized pick is unprioritized rather than borrowing a number", () => {
+    expect(
+      upNextMetaLabel({ beadId: "a", rank: 2, type: "bug", unblocks: 0, createdAt: "" }),
+    ).toBe(
+      "no priority · Bug · unblocks 0",
+    );
+  });
+});
+
+/**
+ * Dragging to reorder writes `priority` (anton-7bzg / R3.8). Priority is the ONLY channel — the same
+ * one product-master writes on — so what these pin is which drops that channel can state, which
+ * value states them, and the drops that honestly write nothing. A drop is only expressible if the
+ * PRIME comparator would seat the card between its new neighbours (beads/rank.ts): priority, then
+ * unblocking value, then age, then id. Writing a priority that merely TIES with the card it had to
+ * cross would report a move the next pass takes straight back.
+ */
+describe("reorderPriority", () => {
+  type Card = { priority?: number; unblocks: number };
+
+  /** A plan as a pass would have left it: each card older than the one below it, so an equal-priority
+   *  tie falls to whichever already stood higher — exactly what the next pass would decide. */
+  const plan = (...cards: (number | undefined | Card)[]): UpNextEntry[] =>
+    cards.map((card, index) => {
+      const spec: Card = typeof card === "object" ? card : { priority: card, unblocks: 0 };
+      return {
+        beadId: `b${index}`,
+        rank: index + 1,
+        ...(spec.priority === undefined ? {} : { priority: spec.priority }),
+        type: "feature" as const,
+        unblocks: spec.unblocks,
+        createdAt: `2026-08-0${index + 1}T00:00:00.000Z`,
+      };
+    });
+
+  it("promotes a card dragged to the top into the top card's band", () => {
+    // The tie the promotion lands in is one this card wins: it frees more work than the P0 above it.
+    const entries = plan(0, { priority: 2, unblocks: 5 }, 3);
+
+    expect(reorderPriority(entries, "b1", "b0")).toEqual({ kind: "write", priority: 0 });
+  });
+
+  it("refuses a promotion the picker's own tiebreak would take straight back", () => {
+    // Same drag, but this card frees nothing the P0 above it doesn't: writing P0 would tie, and PRIME
+    // breaks that tie for the older card — so the lane would show a move the next pass undoes.
+    expect(reorderPriority(plan(0, 2, 3), "b1", "b0")).toEqual({ kind: "unexpressible" });
+  });
+
+  it("reaches past the tie when the band still holds a priority that seats the card", () => {
+    // Dragged to the bottom: P3 would only tie with the card above it (and lose on age), so the drop
+    // takes the next value the band allows rather than reporting a demotion that never happened.
+    expect(reorderPriority(plan(0, 2, 3), "b0", "b2")).toEqual({ kind: "write", priority: 4 });
+  });
+
+  it("clamps into the band the drop landed in, never past its new neighbours", () => {
+    // P0 dropped between P1 and P3 takes P1 — enough to sit under it, no more.
+    expect(reorderPriority(plan(1, 3, 0), "b2", "b1")).toEqual({ kind: "write", priority: 1 });
+  });
+
+  it("writes nothing when the card is already in the band it was dropped into", () => {
+    // P2 dropped between P0 and P3 needs no change: the ranking already puts it there.
+    expect(reorderPriority(plan(0, 3, 2), "b2", "b1")).toEqual({ kind: "settled" });
+  });
+
+  it("refuses a reorder inside one priority band — that slot is the picker's tiebreak", () => {
+    expect(reorderPriority(plan(2, 2, 2), "b2", "b0")).toEqual({ kind: "unexpressible" });
+  });
+
+  it("gives an unprioritized card an explicit lowest priority — which outranks having none", () => {
+    expect(reorderPriority(plan(3, { unblocks: 1 }), "b1", "b0")).toEqual({
+      kind: "write",
+      priority: 3,
+    });
+    expect(reorderPriority(plan(4, { unblocks: 1 }), "b1", "b0")).toEqual({
+      kind: "write",
+      priority: 4,
+    });
+  });
+
+  it("has nothing to settle for a drop on itself or on a card the plan does not carry", () => {
+    expect(reorderPriority(plan(0, 2), "b0", "b0")).toEqual({ kind: "settled" });
+    expect(reorderPriority(plan(0, 2), "b0", "gone")).toEqual({ kind: "settled" });
+  });
+});
+
+describe("reorderUpNextEntries", () => {
+  const plan = (...ids: string[]): UpNextEntry[] =>
+    ids.map((beadId, index) => ({
+      beadId,
+      rank: index + 1,
+      priority: 2,
+      type: "feature" as const,
+      unblocks: 0,
+      createdAt: "2026-08-01T00:00:00.000Z",
+    }));
+
+  it("moves the target into the slot it was dropped on and renumbers every rank", () => {
+    const next = reorderUpNextEntries(plan("a", "b", "c"), "c", "a", 0);
+
+    expect(next.map((e) => e.beadId)).toEqual(["c", "a", "b"]);
+    expect(next.map((e) => e.rank)).toEqual([1, 2, 3]);
+    expect(next[0].priority).toBe(0);
+  });
+
+  it("moves a target down to the dropped-on slot", () => {
+    expect(reorderUpNextEntries(plan("a", "b", "c"), "a", "c", 3).map((e) => e.beadId)).toEqual([
+      "b",
+      "c",
+      "a",
+    ]);
+  });
+
+  it("leaves the plan alone when either end is not in it", () => {
+    const entries = plan("a", "b");
+    expect(reorderUpNextEntries(entries, "a", "gone", 0)).toEqual(entries);
+  });
+});
+
+/**
+ * `[Release]` is offered on this predicate, and the Up Next lane is withheld on the same freshness
+ * verdict — so a mark the board flagged stale must read as history here, not as a live pick.
+ */
+describe("isPickerPick", () => {
+  it("reads a fresh policy mark as the picker's current pick", () => {
+    expect(isPickerPick([{ kind: "policy", ref: "types" }])).toBe(true);
+  });
+
+  it("refuses a mark whose plan the board has moved past", () => {
+    expect(isPickerPick([{ kind: "policy", ref: "types", stale: true }])).toBe(false);
+  });
+
+  it("ignores the other writers, stale or not", () => {
+    expect(isPickerPick([{ kind: "pm", ref: "anton-1" }])).toBe(false);
+    expect(isPickerPick(undefined)).toBe(false);
   });
 });

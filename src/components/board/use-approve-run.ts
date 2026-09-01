@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { usePickDecision } from "@/components/board/pick-decision";
 import { readAppliedSummary } from "@/components/board/proposal-applied";
 
 /**
@@ -37,8 +38,12 @@ export interface ApproveRun {
   approved: boolean;
   /** An approve is in flight; the affordance disables rather than double-firing. */
   running: boolean;
+  /** This target's pick is being answered — or has been — by another control on the same surface. */
+  locked: boolean;
   /** `immediate`: true → run now (bypass budget pacing), false → queue for optimal usage. */
   approveRun: (immediate?: boolean) => Promise<void>;
+  /** Lock the affordance for an approval another control drove (the picker's `[Release]`). */
+  setApproved: () => void;
 }
 
 /**
@@ -63,8 +68,14 @@ export function useApproveRun({
 }): ApproveRun {
   const [optimisticApproved, setOptimisticApproved] = useState(false);
   const [running, setRunning] = useState(false);
+  // Approve and Queue answer the same pick the vetoes beside them decline, so they take the lock
+  // `[Release]` takes (PR #212 review) — Queue especially, since it records no accept and so leaves
+  // nothing downstream to settle the race: without this it can queue a run on the very target the
+  // operator is deferring. Off a picked surface there is no provider and the lock is a no-op.
+  const decision = usePickDecision();
 
   async function approveRun(immediate = true) {
+    if (!decision.claim()) return;
     setRunning(true);
     setOptimisticApproved(true);
     try {
@@ -77,11 +88,14 @@ export function useApproveRun({
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Approve failed (${res.status})`);
       }
+      decision.settle();
       const applied = await readAppliedSummary(res);
       toast.success(approveOutcomeMessage({ applied, immediate, title: target.title }));
       // The run starts with whatever thin sections it has; say so once, here.
       await toastContractAdvisory(res);
     } catch (err) {
+      // Nothing was approved, so the pick goes back on offer — including to the vetoes.
+      decision.abandon();
       setOptimisticApproved(false);
       toast.error(err instanceof Error ? err.message : failureMessage);
     } finally {
@@ -89,5 +103,11 @@ export function useApproveRun({
     }
   }
 
-  return { approved: target.approved || optimisticApproved, running, approveRun };
+  return {
+    approved: target.approved || optimisticApproved,
+    running,
+    locked: decision.state !== "open",
+    approveRun,
+    setApproved: () => setOptimisticApproved(true),
+  };
 }

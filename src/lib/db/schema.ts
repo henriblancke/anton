@@ -201,6 +201,17 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
     .references(() => projects.id),
   /** The picker job that produced this plan, so an entry traces back to its job row. */
   jobId: text("job_id"),
+  /**
+   * Identity of this GENERATION of the plan — what a verdict names when it answers one of its picks
+   * (`picker_verdicts.plan_id`).
+   *
+   * Distinct from `board_digest`, and that distinction is the point: the digest describes the INPUTS
+   * (board + policy) and is legitimately reusable, so a pass that re-admits a target once its veto
+   * expires stamps the very digest the decline was filed against. Keyed on that, the new pick would
+   * inherit the old answer. Minted fresh whenever the pass decides anything different, and carried
+   * over when it re-decides the same plan.
+   */
+  planId: text("plan_id").notNull().default(""),
   generatedAt: ts("generated_at").notNull().default(now),
   /**
    * Digest of the board snapshot the plan was ranked against. A surface compares it with a digest of
@@ -225,6 +236,73 @@ export const boardPickerPlans = sqliteTable("board_picker_plans", {
   /** Denormalized so a lane badge / refresh token needn't parse the blob. */
   targetCount: integer("target_count").notNull().default(0),
 });
+
+/**
+ * What the operator ANSWERED the picker (anton-jqvy) — one row per verdict on one of its picks.
+ *
+ * The counterpart to the plan above: that row is what anton decided, this table is what a human said
+ * back. `✕ not now` and `Never` both record a DECLINE (release records the accept), so the pair is a
+ * track record — the same evidence base earned autonomy reads for the gardener's kinds
+ * (`gardener/track-record.ts`), for a surface that has no board fingerprint to count off.
+ *
+ * One row per (verdict, pick) — a repeat veto extends its standing decline rather than filing a
+ * second one, so the counts stay a record of DECISIONS and not of clicks. A decline carries its own
+ * expiry rather than a flag somebody has to clear: a veto defers the target for a bounded window
+ * ({@link PICKER_DEFER_WINDOW_MS}), so the next pass skips it and the pass after the window lets it
+ * back in. That bound is what keeps this from being the per-bead blocklist the design refuses —
+ * nothing here can silence a target permanently.
+ *
+ * Machine-local, like the plan and the policy it answers: a veto is one operator's pacing decision
+ * on one machine, not shared board state.
+ */
+export const pickerVerdicts = sqliteTable(
+  "picker_verdicts",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The target the verdict is about. Not an FK — beads live on the board, not in anton.db. */
+    beadId: text("bead_id").notNull(),
+    /** `accepted` | `declined` — the two halves of the record earned autonomy counts. */
+    verdict: text("verdict").notNull(),
+    /** `PickerVerdictAction`: which affordance produced it (`not-now`, `never`, `release`). */
+    action: text("action").notNull(),
+    /** The admitting rule the plan recorded, frozen at the moment of the verdict. */
+    rule: text("rule"),
+    /**
+     * The `PolicyCriterionKey` a `Never` opened the policy editor at, when the armed policy had one
+     * to name. Null for a `not-now`, and for a project whose policy narrows nothing.
+     */
+    criterion: text("criterion"),
+    /** The rank the target held in the plan being answered — the pick, not just the bead. */
+    rank: integer("rank"),
+    /**
+     * The answered plan's generation id (`board_picker_plans.plan_id`), so a verdict names the
+     * DECISION and not only its subject. Null when no recorded plan carried the target.
+     */
+    planId: text("plan_id"),
+    /** When this target becomes pickable again. Null on an accept — only a decline defers. */
+    deferredUntil: ts("deferred_until"),
+    decidedAt: ts("decided_at").notNull().default(now),
+  },
+  (table) => [
+    // Serves the track-record read ("this project's last N verdicts, newest first").
+    index("picker_verdicts_project_idx").on(table.projectId, table.decidedAt),
+    // Serves the pass's and the board's "which targets are deferred right now" read.
+    index("picker_verdicts_deferred_idx").on(table.projectId, table.deferredUntil),
+    // At most one ACCEPT per (project, bead, plan) — the DB backstop behind recordPickerAccept's
+    // conflict-ignoring insert. Two concurrent releases of one pick (a double-click, a retry) start
+    // a single run through the enqueue dedupe, so they must not leave two accepts inflating the
+    // track record earned autonomy reads. Partial on the accepted verdict because the DECLINE side
+    // is deduped by `recordPickerVeto` itself, under the same write lock: a second veto updates the
+    // standing row's expiry, so there is no conflicting insert for an index to catch. A plan-less
+    // accept answers no recorded pick and stays unconstrained: SQLite treats NULLs as distinct.
+    uniqueIndex("picker_verdicts_accept_unique")
+      .on(table.projectId, table.beadId, table.planId)
+      .where(sql`${table.verdict} = 'accepted'`),
+  ],
+);
 
 /**
  * The autopilot's DISARM latch, per project (anton-5c8h / R4.6). A disarm is the half of the brake

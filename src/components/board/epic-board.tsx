@@ -19,6 +19,7 @@ import { useBoardBreaker } from "@/components/board/use-board-breaker";
 import { useBoardDrag } from "@/components/board/use-board-drag";
 import { useBoardPoll } from "@/components/board/use-board-poll";
 import { useBoardView } from "@/components/board/use-board-view";
+import { useUpNextReorder } from "@/components/board/use-up-next-reorder";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import type { BoardSort } from "@/components/board/board-utils";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
@@ -67,7 +68,8 @@ export function EpicBoard({
   const state = useBoardPoll(slug, initialBoard);
   const polledBreaker = useBoardBreaker(slug, breaker);
   const view = useBoardView(state.board, sort, grouping);
-  const drag = useBoardDrag(slug, state);
+  const reorder = useUpNextReorder(slug, state, view.upNext);
+  const drag = useBoardDrag(slug, state, reorder);
 
   if (state.error) return <BoardLoadError message={state.error} onRetry={state.refresh} />;
   if (!state.board) return <BoardSkeleton />;
@@ -104,8 +106,10 @@ export function EpicBoard({
         slug={slug}
         view={view}
         budgetAware={budgetAware}
+        reordering={reorder.reordering}
         onEpicDeleted={state.removeEpic}
         onOpenTicket={setOpenTicketId}
+        onVetoed={state.vetoBead}
       />
       <BoardDragOverlay slug={slug} epic={drag.activeEpic} />
       <TicketDialog

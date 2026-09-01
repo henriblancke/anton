@@ -1,9 +1,9 @@
 import type { Epic } from "@/lib/types";
 
 /**
- * The one `Epic` row every board suite builds its cards from. Each suite used to inline the same
- * 17-field literal, so a new required field meant editing all of them and a card test could quietly
- * drift from the shape `toEpic` actually produces.
+ * The one `Epic` row every board suite builds its cards from — a ready, unapproved backlog feature.
+ * Each suite used to inline the same 17-field literal, so a new required field meant editing all of
+ * them and a card test could quietly drift from the shape `toEpic` actually produces.
  *
  * Test-support only (see `.stringer.yaml`): a suite overrides just the fields its case is about.
  */

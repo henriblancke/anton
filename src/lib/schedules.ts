@@ -363,3 +363,22 @@ export async function ensureSchedule(
   if (existing[0]) return existing[0].id;
   return createSchedule(db, clock, input);
 }
+
+/**
+ * Is one of a project's schedules armed? UI read path over the shared anton.db.
+ *
+ * A type with no row reads as ENABLED: absence means the seed has never run for this project, which
+ * is not the operator switching the automation off, and a surface that treated it as a disable would
+ * hide itself on an installation that simply predates the type.
+ */
+export async function isScheduleEnabled(
+  projectId: string,
+  type: ScheduledJobType,
+): Promise<boolean> {
+  const rows = await getDb()
+    .select({ enabled: schema.schedules.enabled })
+    .from(schema.schedules)
+    .where(and(eq(schema.schedules.projectId, projectId), eq(schema.schedules.type, type)))
+    .limit(1);
+  return rows[0]?.enabled ?? true;
+}

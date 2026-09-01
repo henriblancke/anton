@@ -1,16 +1,27 @@
 /**
- * Pure display helpers for the epic board. Kept dependency-free so they're trivially testable
- * (see board-utils.test.ts) and reusable from both the board and card client components.
+ * Pure display helpers for the epic board. Kept dependency-free — bar the PRIME comparator, itself a
+ * pure leaf a lane drag must not restate — so they're trivially testable (see board-utils.test.ts)
+ * and reusable from both the board and card client components.
  */
+import { comparePrimeKeys, type PrimeKey } from "@/lib/beads/rank";
 import {
   STAGES,
+  type BeadProvenance,
   type Epic,
   type EpicCrumb,
   type IssueType,
   type Stage,
   type StandaloneItem,
   type Ticket,
+  type UpNextEntry,
 } from "@/lib/types";
+
+/**
+ * The Up Next lane's heading (anton-t9m4 / R3.2). NOT "Ready": `bd ready` already means *unblocked*,
+ * and two meanings of ready on one screen is the confusion `.beads/PRIME.md` opens by warning about.
+ * Lives beside STAGE_LABELS but deliberately outside it — Up Next is not a stage.
+ */
+export const UP_NEXT_LABEL = "Up Next";
 
 export const STAGE_LABELS: Record<Stage, string> = {
   backlog: "Backlog",
@@ -250,6 +261,26 @@ export function canStartRun(epic: Pick<Epic, "childReadiness">): boolean {
 }
 
 /**
+ * Is this card one of the board-picker's current picks — the targets the Up Next projection holds?
+ *
+ * Read off the provenance the board already attaches (`◈ policy`, board-provenance.ts), which is set
+ * for exactly the beads in the recorded plan. A second signal on the card would be a second answer to
+ * "did the picker choose this", and the badge and the `[Release]` button beside it must never
+ * disagree about that.
+ *
+ * What it gates is shadow mode's affordance: while nothing starts unattended, a pick is offered with
+ * `[Release]` rather than the plain `Approve` every other backlog card carries (R3.5).
+ *
+ * A STALE mark is not a pick. The badge outlives the plan it came from — it records the rule this
+ * target was picked under — but the button claims something stronger, that this is what anton would
+ * start next, and the board withdraws the Up Next lane on exactly that fact. Reading the flag here
+ * is what keeps the two agreeing: no lane, no release.
+ */
+export function isPickerPick(provenance: BeadProvenance[] | undefined): boolean {
+  return provenance?.some((mark) => mark.kind === "policy" && !mark.stale) ?? false;
+}
+
+/**
  * The N-of-M behind a partially-gated card: how many of the tickets this run would dispatch can
  * start now, of how many in total. Counted off the rollup's own child sets so the badge can never
  * disagree with the verdict it labels.
@@ -435,6 +466,76 @@ export function removeEpicFromColumns(
   return next;
 }
 
+// ── Up Next: this machine's plan, taken out of Backlog ────────────────────
+
+/** One card in the Up Next lane: the ranking's facts, plus whichever board item they describe. */
+export type UpNextCard =
+  | { entry: UpNextEntry; kind: "epic"; epic: Epic }
+  | { entry: UpNextEntry; kind: "standalone"; item: StandaloneItem };
+
+/** The lane and the board it was taken out of — `cards` empty means there is no lane to draw. */
+export interface UpNextSplit {
+  cards: UpNextCard[];
+  columns: Record<Stage, Epic[]>;
+  standalone: Record<Stage, StandaloneItem[]>;
+}
+
+/**
+ * Split the board into the Up Next lane and the Backlog it leaves behind (anton-t9m4 / R3.3).
+ *
+ * SUBTRACTION, not an overlay: a bead lives in exactly one lane, so a card the plan claims is
+ * removed from Backlog rather than drawn in both places. Done by id, against the backlog column
+ * only — Up Next is a projection over Backlog, never a stage, so a target that has since started
+ * stays in Implementing and simply drops out of the lane. That is also the staleness behaviour we
+ * want: the plan is history, the columns are what is true now.
+ *
+ * `entries` absent (no plan recorded, or the picker disarmed) yields an empty lane and the board
+ * untouched, which is what makes the lane's absence a single check for the caller.
+ */
+export function takeUpNext(
+  columns: Record<Stage, Epic[]>,
+  standalone: Record<Stage, StandaloneItem[]> | undefined,
+  entries: UpNextEntry[] | undefined,
+): UpNextSplit {
+  const chips = standalone ?? emptyStageMap<StandaloneItem>();
+  if (!entries?.length) return { cards: [], columns, standalone: chips };
+
+  const epicsById = new Map((columns.backlog ?? []).map((epic) => [epic.id, epic]));
+  const chipsById = new Map((chips.backlog ?? []).map((item) => [item.id, item]));
+
+  const cards: UpNextCard[] = [];
+  for (const entry of entries) {
+    const epic = epicsById.get(entry.beadId);
+    if (epic) {
+      cards.push({ entry, kind: "epic", epic });
+      continue;
+    }
+    const item = chipsById.get(entry.beadId);
+    if (item) cards.push({ entry, kind: "standalone", item });
+  }
+  if (cards.length === 0) return { cards: [], columns, standalone: chips };
+
+  const taken = new Set(cards.map((card) => card.entry.beadId));
+  return {
+    cards,
+    columns: { ...columns, backlog: (columns.backlog ?? []).filter((e) => !taken.has(e.id)) },
+    standalone: { ...chips, backlog: (chips.backlog ?? []).filter((i) => !taken.has(i.id)) },
+  };
+}
+
+/**
+ * The three ranking facts under a lane card's position — priority, work type, and how much open work
+ * finishing it frees. One string so the visible line and the group's accessible name can never say
+ * different things about the same pick.
+ *
+ * An unprioritized bead says so rather than borrowing a number: the ranking sorts it after every
+ * explicit priority (beads/rank.ts), and printing `P4` would claim a decision nobody made.
+ */
+export function upNextMetaLabel(entry: UpNextEntry): string {
+  const priority = entry.priority === undefined ? "no priority" : `P${entry.priority}`;
+  return `${priority} · ${TYPE_LABELS[entry.type]} · unblocks ${entry.unblocks}`;
+}
+
 /** Moves an epic (by id) to another stage column, immutably. Used for optimistic
  * drag-and-drop updates before the move API call resolves. No-op if the epic isn't found.
  * A move that lands in the backlog is re-sorted (compareBacklogEpics) so the prepended card
@@ -465,4 +566,124 @@ export function moveEpicBetweenColumns(
   const inserted = [{ ...moved, stage: toStage }, ...next[toStage]];
   next[toStage] = toStage === "backlog" ? inserted.sort(compareBacklogEpics) : inserted;
   return next;
+}
+
+// ── Up Next: dragging to reorder writes priority (anton-7bzg / R3.8) ──────
+//
+// A drag inside the lane steers the picker through the SAME channel product-master writes on — the
+// target's bead `priority` — so there is no override concept to reconcile and the correction
+// propagates as ordinary board state (docs/plans/2026-08-18-002-feat-autopilot-design.md
+// §Architecture). Both helpers are pure so the arithmetic is pinned in board-utils.test.ts rather
+// than inferred from a rendered lane.
+
+/** bd's lowest explicit priority — what an unprioritized bead is charged as, since it ranks last. */
+const LOWEST_PRIORITY = 4;
+
+const priorityOf = (entry: UpNextEntry): number => entry.priority ?? LOWEST_PRIORITY;
+
+/** The ranking's sort key for a lane entry, optionally at a priority the drag would write. */
+const rankKeyOf = (entry: UpNextEntry, priority = entry.priority): PrimeKey => ({
+  id: entry.beadId,
+  priority,
+  unblocks: entry.unblocks,
+  createdAt: entry.createdAt,
+});
+
+/**
+ * What a drop asks the priority channel for: a value to write, an order the plan already holds, or
+ * an order priority cannot state.
+ */
+export type ReorderVerdict =
+  | { kind: "write"; priority: number }
+  /** The plan already ranks the card where it was dropped — writing anything would invent a change. */
+  | { kind: "settled" }
+  /** No priority in the band would hold this order; the picker's own tiebreak decides it. */
+  | { kind: "unexpressible" };
+
+/**
+ * What the lane may do about a card dropped into another's slot.
+ *
+ * The drag's whole expressible content is a priority inside the band its NEW neighbours define — no
+ * better than the one above it, no worse than the one below. Which value in that band is not a
+ * clamp, because a clamp can land on the very priority it had to cross: PRIME sorts on priority and
+ * then breaks ties on unblocking value, age and id (beads/rank.ts), none of which a drag can write.
+ * So each candidate is CHECKED against that comparator, nearest the card's current priority first,
+ * and the first that actually seats the card between its new neighbours is what gets written. A drop
+ * whose band holds no such value is refused rather than written — a lane that reported success while
+ * the next pass restored the old order would teach the operator it lies.
+ *
+ * A drop that does NOT cross a priority boundary writes nothing either way: the card is already in
+ * the band it landed in, so the position it was dropped at is the picker's own tiebreak, and
+ * inventing a priority change there would claim the operator made a decision they didn't.
+ */
+export function reorderPriority(
+  entries: readonly UpNextEntry[],
+  beadId: string,
+  overBeadId: string,
+): ReorderVerdict {
+  const from = entries.findIndex((e) => e.beadId === beadId);
+  const to = entries.findIndex((e) => e.beadId === overBeadId);
+  if (from < 0 || to < 0 || from === to) return { kind: "settled" };
+
+  // dnd-kit's convention: the moved card ends at the over card's index in the ORIGINAL order, so
+  // the slot's neighbours are read off the list with the moved card already lifted out.
+  const rest = entries.filter((_, index) => index !== from);
+  const above = rest[to - 1];
+  const below = rest[to];
+  const moved = entries[from];
+  const lo = above ? priorityOf(above) : 0;
+  const hi = below ? priorityOf(below) : LOWEST_PRIORITY;
+
+  /** Would the ranking seat the card between these two neighbours at this priority? */
+  const holds = (priority: number): boolean => {
+    const key = rankKeyOf(moved, priority);
+    return (
+      (!above || comparePrimeKeys(rankKeyOf(above), key) < 0) &&
+      (!below || comparePrimeKeys(key, rankKeyOf(below)) < 0)
+    );
+  };
+
+  const clamped = Math.min(Math.max(priorityOf(moved), lo), hi);
+  // Unchanged priority means the drop stayed inside the card's own band. An unprioritized bead is
+  // never in that case: landing on P4 IS a change, since explicit P4 outranks no priority at all.
+  if (clamped === moved.priority) {
+    return holds(clamped) ? { kind: "settled" } : { kind: "unexpressible" };
+  }
+
+  const priority = bandCandidates(lo, hi, priorityOf(moved)).find(holds);
+  return priority === undefined ? { kind: "unexpressible" } : { kind: "write", priority };
+}
+
+/** The band's priorities, least disturbance first: the value closest to the card's current one, then
+ *  outwards, so a drag only reaches for a bigger change when the nearer one would not hold. */
+function bandCandidates(lo: number, hi: number, current: number): number[] {
+  const values: number[] = [];
+  for (let priority = lo; priority <= hi; priority++) values.push(priority);
+  return values.sort((a, b) => Math.abs(a - current) - Math.abs(b - current) || a - b);
+}
+
+/**
+ * The recorded plan with one target moved to another card's slot, carrying its new priority and with
+ * every rank renumbered from 1.
+ *
+ * Optimistic only: the plan is the picker's, and its next pass re-ranks from the priority just
+ * written. Renumbering matters because the lane prints the rank beside each card — leaving the old
+ * numbers would show a plan reading 2, 1, 3 down the column.
+ */
+export function reorderUpNextEntries(
+  entries: readonly UpNextEntry[],
+  beadId: string,
+  overBeadId: string,
+  priority: number,
+): UpNextEntry[] {
+  const from = entries.findIndex((e) => e.beadId === beadId);
+  const to = entries.findIndex((e) => e.beadId === overBeadId);
+  if (from < 0 || to < 0 || from === to) return [...entries];
+
+  const rest = entries.filter((_, index) => index !== from);
+  const moved: UpNextEntry = { ...entries[from], priority };
+  return [...rest.slice(0, to), moved, ...rest.slice(to)].map((entry, index) => ({
+    ...entry,
+    rank: index + 1,
+  }));
 }

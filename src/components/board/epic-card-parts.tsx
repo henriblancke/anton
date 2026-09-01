@@ -24,6 +24,8 @@ import {
 } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { ContractChip } from "@/components/board/contract-mark";
+import { ProvenanceBadges } from "@/components/board/provenance-badge";
+import { NotNowChip } from "@/components/board/not-now-chip";
 import { EpicBadge, NoEpicBadge } from "@/components/board/epic-badge";
 
 /**
@@ -229,16 +231,23 @@ export function CardProgress({ epic }: { epic: Epic }) {
 }
 
 /** Badge row: what this run is, who runs it, and how it has been judged so far. */
-export function CardMetaRow({ epic }: { epic: Epic }) {
+export function CardMetaRow({ slug, epic }: { slug: string; epic: Epic }) {
   return (
     <div className="flex flex-wrap gap-1.5">
       <TypeBadge type={epic.type} />
+      {/* Who put this card here, and why — the same grammar on every card that renders, not only in
+          Up Next (anton-cqxd). A done card carries none: the board attaches provenance only while
+          the answer still bears on whether the target should run. */}
+      <ProvenanceBadges slug={slug} beadId={epic.id} provenance={epic.provenance} />
       {epic.agent && <MetaChip dotClass={agentDotClass(epic.agent)}>{epic.agent}</MetaChip>}
       {epic.risk && <RiskChip risk={epic.risk} />}
       {epic.size && <MetaChip>size:{epic.size}</MetaChip>}
       {/* Renders only once a review has actually scored this target (anton-tprv). */}
       <ReviewScoreChip score={epic.reviewScore} />
       <ContractChip contract={epic.contract} />
+      {/* A pick the operator set aside is SHOWN set aside — the veto's whole point is that
+          disagreeing does not make the card disappear (anton-jqvy). */}
+      {epic.notNowUntil !== undefined && <NotNowChip untilMs={epic.notNowUntil} />}
     </div>
   );
 }

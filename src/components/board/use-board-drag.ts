@@ -15,6 +15,7 @@ import {
 import { STAGES, type Board, type Epic, type MoveRequest, type Stage } from "@/lib/types";
 import { STAGE_LABELS, moveEpicBetweenColumns } from "@/components/board/board-utils";
 import type { BoardPoll } from "@/components/board/use-board-poll";
+import type { UpNextReorder } from "@/components/board/use-up-next-reorder";
 
 /** Everything `DndContext` and its overlay need from the board's drag layer. */
 export interface BoardDrag {
@@ -33,9 +34,12 @@ export interface BoardDrag {
  * Drag-to-move: the optimistic column change, the POST that commits it, and the rollback when that
  * fails. Kept beside the board's state rather than inside its markup — a drop is a write, and the
  * only thing the view needs back from it is which card to draw in the overlay.
+ *
+ * A drop with both ends inside the Up Next lane is a REORDER, not a move — the lane is a ranking, so
+ * it changes the target's priority rather than its stage — and is handed to `reorder`.
  */
-export function useBoardDrag(slug: string, state: BoardPoll): BoardDrag {
-  const { board, setBoard, draggingRef, versionRef } = state;
+export function useBoardDrag(slug: string, state: BoardPoll, reorder: UpNextReorder): BoardDrag {
+  const { board, setBoard, draggingRef, versionRef, startWrite, endWrite } = state;
   const [activeId, setActiveId] = useState<string | null>(null);
 
   const sensors = useSensors(
@@ -53,11 +57,17 @@ export function useBoardDrag(slug: string, state: BoardPoll): BoardDrag {
   async function onDragEnd(event: DragEndEvent) {
     settle();
     if (!board) return;
+    const { active, over } = event;
+    if (over && active.data.current?.upNext && over.data.current?.upNext) {
+      await reorder.reorder(String(active.id), String(over.id));
+      return;
+    }
     const target = dropTarget(board, event);
     if (!target) return;
 
     const { epic, toStage } = target;
     const previous = board;
+    startWrite();
     setBoard({ ...board, columns: moveEpicBetweenColumns(board.columns, epic.id, toStage) });
 
     try {
@@ -75,6 +85,9 @@ export function useBoardDrag(slug: string, state: BoardPoll): BoardDrag {
     } catch (err) {
       setBoard(previous);
       toast.error(err instanceof Error ? err.message : "Failed to move card");
+    } finally {
+      // A poll fetched against the pre-move version must not be believed now the move has settled.
+      endWrite();
     }
   }
 
@@ -110,6 +123,9 @@ export function dropTarget(board: Board, event: DragEndEvent): { epic: Epic; toS
   const { active, over } = event;
   if (!over) return null;
   const toStage = over.id as Stage;
+  // The lane's cards are droppables too, so `over` is only a column when it says it is — a card
+  // dropped on a lane card from outside must not be read as a move to a stage named after a bead.
+  if (!STAGES.includes(toStage)) return null;
   const fromStage = active.data.current?.stage as Stage | undefined;
   if (!fromStage || fromStage === toStage) return null;
   const epic = board.columns[fromStage]?.find((candidate) => candidate.id === String(active.id));
