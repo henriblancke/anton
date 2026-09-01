@@ -32,6 +32,7 @@ import { cn } from "@/lib/utils";
 export function UpNextLane({
   slug,
   cards,
+  plan,
   planId,
   budgetAware = false,
   reordering = false,
@@ -42,6 +43,11 @@ export function UpNextLane({
   slug: string;
   /** Ranked plan cards, in rank order — never empty, since an empty lane is not rendered at all. */
   cards: UpNextCard[];
+  /**
+   * Every pick in the ranking, in rank order, by bead id — including the ones the board's filters
+   * are hiding. `cards` is a narrowed view of this; the budget line is placed on the whole plan.
+   */
+  plan: readonly string[];
   /** The plan generation these cards were projected from, carried into each card's veto. */
   planId?: string;
   /** Project budget-aware flag (anton-y2ue): forwarded to cards exactly as Backlog forwards it. */
@@ -61,7 +67,18 @@ export function UpNextLane({
   // headroom, so a null reading — unreadable usage, or a project that is not budget-aware — draws no
   // line at all, matching the gate's fail-open rule rather than guessing a position.
   const signal = useBudgetSignal(slug);
-  const line = useMemo(() => budgetLine(signal, cards.map(() => ({}))), [signal, cards]);
+  // Placed on the WHOLE ranking, not on what the filters left. A hidden pick still spends the
+  // budget, so charging only the visible cards from zero would mark a target affordable that anton
+  // would hold — the plan is what the governor pays for, the lane is just the part on screen.
+  const line = useMemo(() => budgetLine(signal, plan.map(() => ({}))), [signal, plan]);
+  // What crosses back to the cards is only the waiting state the full plan gives each of them.
+  const waiting = useMemo(() => (line ? new Set(plan.slice(line.affordable)) : null), [line, plan]);
+  // The divider goes above the first VISIBLE card the plan leaves waiting — which is the top of the
+  // lane when the filters hid everything the budget affords, and nowhere when they hid the rest.
+  const dividerAt = useMemo(
+    () => (waiting ? cards.findIndex((card) => waiting.has(card.entry.beadId)) : -1),
+    [waiting, cards],
+  );
   const ids = useMemo(() => cards.map((card) => card.entry.beadId), [cards]);
 
   return (
@@ -112,8 +129,8 @@ export function UpNextLane({
             );
             return (
               <Fragment key={card.entry.beadId}>
-                {line && index === line.affordable && <BudgetDivider line={line} />}
-                {line && index >= line.affordable ? (
+                {line && index === dividerAt && <BudgetDivider line={line} />}
+                {line && waiting?.has(card.entry.beadId) ? (
                   <BudgetWaiting reason={line.reason}>{row}</BudgetWaiting>
                 ) : (
                   row

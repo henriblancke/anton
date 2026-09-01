@@ -352,6 +352,18 @@ export function EpicBoard({
       ),
     [sortedColumns, narrowed, grouping, board?.upNext],
   );
+  // The same ranking, UNFILTERED — what the lane places its budget line on. `upNext.cards` is only
+  // what the narrowing left, and a hidden pick still spends the quota: charging the visible cards
+  // from zero would show a target as affordable that the whole plan puts below the line.
+  const upNextPlan = useMemo(
+    () =>
+      grouping === "stage" && board
+        ? takeUpNext(board.columns, board.standalone, board.upNext).cards.map(
+            (card) => card.entry.beadId,
+          )
+        : [],
+    [grouping, board],
+  );
   // An empty lane is worse than none: with no plan recorded — or a picker the operator disarmed —
   // "Up Next" with nothing under it reads as "anton has nothing to start" rather than "no pass is
   // running here" (R3.4).
@@ -747,6 +759,7 @@ export function EpicBoard({
                 <UpNextLane
                   slug={slug}
                   cards={upNext.cards}
+                  plan={upNextPlan}
                   {...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId })}
                   budgetAware={budgetAware}
                   reordering={reordering}

@@ -33,8 +33,10 @@ vi.mock("sonner", () => ({
 }));
 
 const refresh = vi.fn();
+/** The board's Epic/Area narrowing lives in the URL; a test sets this to run the lane narrowed. */
+let searchQuery = "";
 vi.mock("next/navigation", () => ({
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => new URLSearchParams(searchQuery),
   usePathname: () => "/projects/tmp",
   useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh }),
 }));
@@ -212,6 +214,7 @@ function budgetSignal(sessionPct: number): BudgetSignal {
 
 beforeEach(() => {
   window.localStorage.clear();
+  searchQuery = "";
   stubFetch();
 });
 
@@ -351,6 +354,18 @@ describe("the budget line in the Up Next lane", () => {
     );
     expect(screen.queryByRole("separator")).toBeNull();
     expect(laneRows()).toEqual(["card:anton-pick2", "card:anton-pick1"]);
+  });
+
+  it("charges the picks a filter is hiding, so the line stays where the plan puts it", async () => {
+    // 20% headroom at 20% a run affords rank 1 and no more. Narrowed to rank 2 alone, the lane must
+    // still draw it below the line: the hidden pick above spends that headroom whether or not the
+    // filter draws it, and charging only what is on screen would promise a run anton would hold.
+    searchQuery = "epic=anton-pick1";
+    stubFetch({ "/picker/budget": json(budgetSignal(20)) });
+    render(<EpicBoard slug="tmp" initialBoard={fixture(PLAN)} />);
+
+    await waitFor(() => expect(screen.getByRole("separator")).toBeTruthy());
+    expect(laneRows()).toEqual(["divider", "waiting:anton-pick1"]);
   });
 
   it("draws no line when the whole plan is affordable", async () => {
