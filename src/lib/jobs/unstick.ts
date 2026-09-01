@@ -552,6 +552,24 @@ export interface UnstickSummary {
   settled: number;
 }
 
+/** What one pass is run over: a project's repo, plus the runner handles it reports progress through. */
+export interface UnstickPassOpts {
+  projectId: string;
+  repoPath: string;
+  heartbeat?: () => Promise<void>;
+  /** The job's abort signal, so a cancelled/timed-out pass kills its in-flight `gh` child too. */
+  signal?: AbortSignal;
+}
+
+/** {@link UnstickPassOpts} with the optional handles resolved, as every phase below reads them. */
+interface PassInputs {
+  projectId: string;
+  repoPath: string;
+  readPrActivity: NonNullable<UnstickDeps["readPrActivity"]>;
+  heartbeat: () => Promise<void>;
+  signal?: AbortSignal;
+}
+
 /**
  * Run one unstick pass over the project's latest run-health report. Exported separately from the
  * handler so it can be driven directly with an injected clock/db.
@@ -561,68 +579,168 @@ export interface UnstickSummary {
  */
 export async function unstickPass(
   deps: { db: AntonDb; clock: Clock; readPrActivity?: UnstickDeps["readPrActivity"] },
-  opts: {
-    projectId: string;
-    repoPath: string;
-    heartbeat?: () => Promise<void>;
-    /** The job's abort signal, so a cancelled/timed-out pass kills its in-flight `gh` child too. */
-    signal?: AbortSignal;
-  },
+  opts: UnstickPassOpts,
 ): Promise<UnstickSummary> {
   const { db, clock } = deps;
-  const readPrActivity = deps.readPrActivity ?? getPrActivity;
   const { projectId, repoPath } = opts;
-  const heartbeat = opts.heartbeat ?? (async () => {});
   const summary: UnstickSummary = { findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 };
 
   const report = await getRunHealthReport(db, projectId);
   const findings = report?.findings ?? [];
   summary.findings = findings.length;
 
-  // An open escalation OUTLIVES the report that raised it: once the stall ends the sweep simply
-  // stops reporting the finding, so the loop below — which only ever visits findings in the CURRENT
-  // report — never sees it again, and the row keeps claiming a stall that is over. Reconciling those
-  // is why an empty report is not yet an idle pass: it is precisely the report an ended stall
-  // produces. No report at all means the run-health sweep has never run here (it ships off by
-  // default), and with no open row either there is nothing to act on: not an error, just an idle
-  // pass.
-  //
-  // Candidates are the rows the current report no longer carries. A row still reported is either a
-  // genuine stall or one the loop below re-raises anyway, so retiring it here would churn it
-  // settle-raise every pass.
-  const openRows = await listOpenEscalations(db, projectId);
-  const reportedKeys = new Set(findings.map((f) => f.key));
-  const orphanRows = openRows.filter((row) => !reportedKeys.has(row.findingKey));
-  // A gate wait is the one kind reconciled whether or not the report still carries it: the gate list
-  // answers "is anybody still waiting" outright, and the panel offers no Dismiss on a `needs-human`
-  // row, so nothing else can retire one.
-  const gateWaits = openRows.filter((row) => row.kind === "needs-human");
-  // The special case one kind over: an `exhausted-job` row raised for a job parked on a human gate —
-  // one that refused to start behind someone else's gate, or one that ARMED its own for an ask —
-  // back before the sweep deduped the two halves of that one wait (`withoutGateBlockedJobs`).
-  // Suppression retires the FINDING, never the row it already raised, and the job itself is still
-  // legitimately parked — so only the gate id in the park message can tell this row is a duplicate
-  // of the gate's own wait.
-  const blockedJobWaits = orphanRows.filter(
-    (row) =>
-      row.kind === "exhausted-job" &&
-      (poisonBlockerIds(row.reason) !== undefined || parkedAskGateId(row.reason) !== undefined),
-  );
-  // The general retirement, one live re-check per kind (see {@link settleEndedStalls}). Gate-blocked
-  // rows stay in this set on purpose rather than being carved out: the gate path above retires one
-  // only while a gate still owns its whole wait, so this is the fallback for the job itself ending
-  // (resumed, vanished, or blocked by an ordinary prerequisite too) — without it those rows would
-  // have no re-check at all. Rows the gate path just settled are dropped below, not re-read.
-  const endedStalls = orphanRows.filter((row) => row.kind !== "needs-human");
-  if (findings.length === 0 && gateWaits.length === 0 && endedStalls.length === 0) {
+  // No report at all means the run-health sweep has never run here (it ships off by default), and
+  // with nothing open to reconcile there is nothing to act on: not an error, just an idle pass.
+  const pending = partitionOpenEscalations(await listOpenEscalations(db, projectId), findings);
+  if (findings.length === 0 && pending.gateWaits.length === 0 && pending.endedStalls.length === 0) {
     return summary;
   }
 
-  // Pull BEFORE reading the board, exactly as the runner's `liveRunCheck` does: the local Dolt
-  // working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
-  // moments ago is invisible without this — and a resume judged against that stale snapshot would
-  // re-run work someone else currently owns. A pull failure doesn't fail the pass (the escalation
-  // half needs no shared state); it marks the board untrusted so the lease-gated resumes stand down.
+  const inputs: PassInputs = {
+    projectId,
+    repoPath,
+    readPrActivity: deps.readPrActivity ?? getPrActivity,
+    heartbeat: opts.heartbeat ?? (async () => {}),
+    signal: opts.signal,
+  };
+  const state = await buildPassState(db, clock, inputs, findings);
+
+  // Retirement runs BEFORE the finding loop, and in this order: the gate list answers every gate
+  // wait at once, and a row the gate path retires needs no second live re-read to reach the same
+  // verdict.
+  summary.settled = await reconcileGateWaits(db, clock, repoPath, findings, pending, state);
+  summary.settled += await reconcileOrphanStalls(db, clock, repoPath, pending, state.live);
+  await recheckLiveFindings(db, findings, state);
+
+  const actor: FindingActor = {
+    db,
+    clock,
+    projectId,
+    repoPath,
+    ctx: state.ctx,
+    heartbeat: inputs.heartbeat,
+  };
+  const acted = await actOnFindings(findings, actor, inputs.signal);
+  summary.resumed = acted.resumed;
+  summary.escalated = acted.escalated;
+  summary.held = acted.held;
+  return summary;
+}
+
+/**
+ * Carry out every finding's verdict and tally what each one moved, then push the bd notes written
+ * along the way — so the board-native record of an escalation reaches teammates rather than living
+ * only in this machine's Dolt working set.
+ *
+ * A mid-loop abort is safe by construction: both verbs are idempotent, so everything already done
+ * stands and the next pass picks up exactly where this one left off. The push is logged, never
+ * thrown — a sync failure must not fail a pass whose resumes and escalations already landed locally.
+ */
+async function actOnFindings(
+  findings: RunHealthFinding[],
+  actor: FindingActor,
+  signal?: AbortSignal,
+): Promise<Pick<UnstickSummary, "resumed" | "escalated" | "held">> {
+  const tally = { resumed: 0, escalated: 0, held: 0 };
+  let wroteBeads = false;
+  for (const finding of findings) {
+    // Stop acting the moment the job is cancelled or times out.
+    signal?.throwIfAborted();
+    const { action, wroteBead } = await actOnFinding(finding, actor);
+    tally[action] += 1;
+    wroteBeads = wroteBead || wroteBeads;
+  }
+  if (wroteBeads) {
+    await beads
+      .sync(actor.repoPath)
+      .catch((e) => console.error(`[unstick] beads dolt sync failed for ${actor.projectId}`, e));
+  }
+  return tally;
+}
+
+/** The open escalation rows one pass reconciles, split by which live re-check can retire each. */
+export interface PendingEscalations {
+  /**
+   * Every open gate wait, reported or not: the gate list answers "is anybody still waiting"
+   * outright, and the panel offers no Dismiss on a `needs-human` row, so nothing else can retire one.
+   */
+  gateWaits: EscalationRow[];
+  /**
+   * Orphaned `exhausted-job` rows that are a human gate's wait wearing a second face — a job that
+   * refused to start behind someone else's gate, or one that ARMED its own for an ask, raised back
+   * before the sweep deduped the two halves of that one wait (`withoutGateBlockedJobs`).
+   * Suppression retires the FINDING, never the row it already raised, and the job itself is still
+   * legitimately parked — so only the gate id in the park message can tell this row is a duplicate.
+   */
+  blockedJobWaits: EscalationRow[];
+  /**
+   * Every other orphan, retired only on its own kind's live evidence (see {@link settleEndedStalls}).
+   * Gate-blocked rows stay in this set on purpose rather than being carved out: the gate path
+   * retires one only while a gate still owns its whole wait, so this is the fallback for the job
+   * itself ending — without it those rows would have no re-check at all.
+   */
+  endedStalls: EscalationRow[];
+}
+
+/**
+ * Split the project's open escalations into the sets one pass reconciles.
+ *
+ * An open escalation OUTLIVES the report that raised it: once the stall ends the sweep simply stops
+ * reporting the finding, so the finding loop — which only ever visits findings in the CURRENT
+ * report — never sees it again, and the row keeps claiming a stall that is over. That is why an
+ * empty report is not yet an idle pass: it is precisely the report an ended stall produces.
+ *
+ * ORPHANS ONLY, for everything but a gate wait. A row the current report still carries is either a
+ * genuine stall or one the finding loop re-raises anyway, so retiring it here would churn it
+ * settle-raise every pass. Absence makes a row a CANDIDATE; only its kind's live evidence retires it.
+ */
+export function partitionOpenEscalations(
+  openRows: EscalationRow[],
+  findings: RunHealthFinding[],
+): PendingEscalations {
+  const reportedKeys = new Set(findings.map((f) => f.key));
+  const orphanRows = openRows.filter((row) => !reportedKeys.has(row.findingKey));
+  return {
+    gateWaits: openRows.filter((row) => row.kind === "needs-human"),
+    blockedJobWaits: orphanRows.filter(
+      (row) =>
+        row.kind === "exhausted-job" &&
+        (poisonBlockerIds(row.reason) !== undefined || parkedAskGateId(row.reason) !== undefined),
+    ),
+    endedStalls: orphanRows.filter((row) => row.kind !== "needs-human"),
+  };
+}
+
+/**
+ * The live state one pass judges against: the classifier's context, the shared re-check bar, and the
+ * memo the async re-checks write through so the classifier itself stays pure.
+ */
+interface PassState {
+  ctx: UnstickContext;
+  live: LiveRecheck;
+  /** Per-finding re-check verdicts, read back through {@link UnstickContext.stillStuck}. */
+  stillStuck: Map<string, boolean>;
+}
+
+/**
+ * Read every live handle the pass judges against, once.
+ *
+ * The board read is preceded by a PULL, exactly as the runner's `liveRunCheck` does: the local Dolt
+ * working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
+ * moments ago is invisible without it — and a resume judged against that stale snapshot would re-run
+ * work someone else currently owns. A pull failure doesn't fail the pass (the escalation half needs
+ * no shared state); it marks the board untrusted so the lease-gated resumes stand down.
+ *
+ * Thresholds come from the project's own settings so every re-check applies the SAME bar the sweep
+ * did — a re-check on a different bar is a second, undeclared policy.
+ */
+async function buildPassState(
+  db: AntonDb,
+  clock: Clock,
+  inputs: PassInputs,
+  findings: RunHealthFinding[],
+): Promise<PassState> {
+  const { projectId, repoPath } = inputs;
   let boardFresh = true;
   await beads.pull(repoPath).catch((e) => {
     boardFresh = false;
@@ -632,8 +750,6 @@ export async function unstickPass(
     );
   });
 
-  // The thresholds come from the project's own settings so every re-check below applies the SAME bar
-  // the sweep did — a re-check on a different bar is a second, undeclared policy.
   const [board, activeEpicKeys, parkedRunRows, settings] = await Promise.all([
     beads.list(repoPath, ["--status", "all"]),
     activeExecuteEpicKeys(db),
@@ -641,11 +757,8 @@ export async function unstickPass(
     getProjectSettings(db, projectId),
   ]);
   const thresholds = resolveRunHealthThresholds(settings);
+  const latestJobs = await primeLatestJobs(db, projectId, findings, parkedRunRows);
 
-  // One job read per epic at most, memoized: several findings can point at the same epic. The row
-  // answers both job-side questions — when the quota window reopens, and whether it was cancelled.
-  const latestJobs = new Map<string, JobRow | undefined>();
-  // Per-finding re-check verdicts for the two kinds with no live handle in the context below.
   const stillStuck = new Map<string, boolean>();
   const ctx: UnstickContext = {
     projectId,
@@ -661,97 +774,125 @@ export async function unstickPass(
     // report's word stands.
     stillStuck: (finding) => stillStuck.get(finding.key) ?? true,
   };
+  return {
+    ctx,
+    stillStuck,
+    // The re-checks the classifier and the retirement share, spelled once: a row can never be
+    // retired on a different bar than the one its finding was raised on.
+    live: {
+      ctx,
+      repoPath,
+      readPrActivity: inputs.readPrActivity,
+      stalePrThresholdMs: thresholds.stalePrHours * 3_600_000,
+      maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
+      heartbeat: inputs.heartbeat,
+      signal: inputs.signal,
+    },
+  };
+}
 
-  // Prime the memo before classifying: the job-backed lookups are synchronous so the classifier
-  // stays pure, which means the async job reads have to happen up front. An epic the memo never
-  // learned about reads as "not cancelled", so every path that consults `epicCancelled` must prime.
-  const primeLatestJob = async (epicBeadId: string) => {
+/**
+ * The latest execute-epic job per epic, at most one read each: several findings can point at the
+ * same epic, and the row answers both job-side questions — when the quota window reopens, and
+ * whether an operator cancelled it.
+ *
+ * Primed up front because the context's job-backed lookups are synchronous, which is what keeps the
+ * classifier pure. An epic the memo never learned about reads as "not cancelled", so every path that
+ * consults `epicCancelled` must be primed here: every parked run whatever its reason, and every dead
+ * lease, where the bead IS the epic.
+ */
+async function primeLatestJobs(
+  db: AntonDb,
+  projectId: string,
+  findings: RunHealthFinding[],
+  parkedRunRows: RunRow[],
+): Promise<Map<string, JobRow | undefined>> {
+  const latestJobs = new Map<string, JobRow | undefined>();
+  const prime = async (epicBeadId: string) => {
     if (latestJobs.has(epicBeadId)) return;
     latestJobs.set(epicBeadId, await latestExecuteEpicJob(db, projectId, epicBeadId));
   };
-  // Every parked run, not just the quota parks: the cancellation guard now applies to a park of any
-  // reason, and an epic the memo never learned about reads as "not cancelled".
   for (const run of parkedRunRows) {
-    await primeLatestJob(run.epicBeadId);
+    await prime(run.epicBeadId);
   }
-  // A dead lease reads the same row for its cancellation guard; there the bead IS the epic.
   for (const finding of findings) {
-    if (finding.kind === "dead-lease" && finding.beadId) await primeLatestJob(finding.beadId);
+    if (finding.kind === "dead-lease" && finding.beadId) await prime(finding.beadId);
   }
+  return latestJobs;
+}
 
-  // Same reason again, but ONE read for every gate finding: `gate list` answers all of them at once,
-  // and gate beads are absent from the ordinary board read above (see the sweep's own two reads).
-  // The same read answers both halves of a gate wait's lifecycle — whether to raise one, and whether
-  // an already-raised one is still waiting on anybody.
+/**
+ * Let ONE gate-list read answer both halves of a gate wait's lifecycle: whether each `needs-human`
+ * finding is still waiting on somebody (recorded for the classifier), and whether an already-raised
+ * wait has since been answered (retired here). Gate beads are absent from the ordinary board read,
+ * so this is a read of its own — one per pass, not one per finding. Returns how many waits it
+ * retired.
+ */
+async function reconcileGateWaits(
+  db: AntonDb,
+  clock: Clock,
+  repoPath: string,
+  findings: RunHealthFinding[],
+  pending: PendingEscalations,
+  state: PassState,
+): Promise<number> {
   const gateFindings = findings.filter((f) => f.kind === "needs-human");
-  if (gateFindings.length > 0 || gateWaits.length > 0) {
-    const openGates = await readOpenGates(repoPath);
-    for (const finding of gateFindings) {
-      stillStuck.set(finding.key, gateStillOpen(finding.gateId, openGates, board, ctx.nowMs));
-    }
-    summary.settled = await settleEndedGateWaits(db, clock, gateWaits, {
-      openGates,
-      board,
-      nowMs: ctx.nowMs,
-    });
-    await heartbeat();
+  if (gateFindings.length === 0 && pending.gateWaits.length === 0) return 0;
+  const openGates = await readOpenGates(repoPath);
+  const { nowMs } = state.ctx;
+  const board = [...state.ctx.board.values()];
+  for (const finding of gateFindings) {
+    state.stillStuck.set(finding.key, gateStillOpen(finding.gateId, openGates, board, nowMs));
   }
+  const settled = await settleEndedGateWaits(db, clock, pending.gateWaits, {
+    openGates,
+    board,
+    nowMs,
+  });
+  await state.live.heartbeat();
+  return settled;
+}
 
-  let gateBlockedSettled: ReadonlySet<string> = new Set();
-  if (blockedJobWaits.length > 0) {
-    gateBlockedSettled = await settleGateBlockedJobWaits(db, clock, repoPath, blockedJobWaits);
-    summary.settled += gateBlockedSettled.size;
-    await heartbeat();
+/**
+ * Retire the orphaned rows whose stall is over, and report how many. The gate-blocked duplicates go
+ * first — one full-gate-list read decides all of them — and what they retire is dropped from the
+ * general per-kind re-check rather than being re-read to the same verdict.
+ */
+async function reconcileOrphanStalls(
+  db: AntonDb,
+  clock: Clock,
+  repoPath: string,
+  pending: PendingEscalations,
+  live: LiveRecheck,
+): Promise<number> {
+  let gateBlocked: ReadonlySet<string> = new Set();
+  if (pending.blockedJobWaits.length > 0) {
+    gateBlocked = await settleGateBlockedJobWaits(db, clock, repoPath, pending.blockedJobWaits);
+    await live.heartbeat();
   }
+  const unsettled = pending.endedStalls.filter((row) => !gateBlocked.has(row.id));
+  if (unsettled.length === 0) return gateBlocked.size;
+  return gateBlocked.size + (await settleEndedStalls(db, clock, unsettled, live));
+}
 
-  // The re-checks the classifier and the retirement share, spelled once: a row can never be retired
-  // on a different bar than the one its finding was raised on.
-  const live: LiveRecheck = {
-    ctx,
-    repoPath,
-    readPrActivity,
-    stalePrThresholdMs: thresholds.stalePrHours * 3_600_000,
-    maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
-    heartbeat,
-    signal: opts.signal,
-  };
-
-  // A row the gate path already retired needs no second live re-read to reach the same verdict.
-  const unsettledStalls = endedStalls.filter((row) => !gateBlockedSettled.has(row.id));
-  if (unsettledStalls.length > 0) {
-    summary.settled += await settleEndedStalls(db, clock, unsettledStalls, live);
-  }
-
-  // Same reason, one gh/job read per stale-pr / exhausted-job finding.
+/**
+ * Record the live re-checks the classifier cannot make itself — one `gh` read per `stale-pr`, one
+ * job read per `exhausted-job`. They happen here, up front, so the judgment stays synchronous and
+ * pure (see {@link UnstickContext.stillStuck}).
+ */
+async function recheckLiveFindings(
+  db: AntonDb,
+  findings: RunHealthFinding[],
+  state: PassState,
+): Promise<void> {
   for (const finding of findings) {
     if (finding.kind === "stale-pr") {
-      stillStuck.set(finding.key, await stalePrStillStuck(finding, live));
-      await heartbeat();
+      state.stillStuck.set(finding.key, await stalePrStillStuck(finding, state.live));
+      await state.live.heartbeat();
     } else if (finding.kind === "exhausted-job") {
-      stillStuck.set(finding.key, await exhaustedJobStillStuck(db, finding, live));
+      state.stillStuck.set(finding.key, await exhaustedJobStillStuck(db, finding, state.live));
     }
   }
-
-  const actor: FindingActor = { db, clock, projectId, repoPath, ctx, heartbeat };
-  let wroteBeads = false;
-  for (const finding of findings) {
-    // Stop acting the moment the job is cancelled or times out. Everything already done stands —
-    // both verbs are idempotent, so the next pass picks up exactly where this one left off.
-    opts.signal?.throwIfAborted();
-    const { action, wroteBead } = await actOnFinding(finding, actor);
-    summary[action] += 1;
-    wroteBeads = wroteBead || wroteBeads;
-  }
-
-  // Every note above is a beads write; push it so the board-native record reaches teammates rather
-  // than living only in this machine's Dolt working set. Logged, never thrown: a push failure must
-  // not fail a pass whose resumes and escalations already landed locally.
-  if (wroteBeads) {
-    await beads
-      .sync(repoPath)
-      .catch((e) => console.error(`[unstick] beads dolt sync failed for ${projectId}`, e));
-  }
-  return summary;
 }
 
 /** Everything acting on one finding needs, gathered once so the per-finding step stays small. */
