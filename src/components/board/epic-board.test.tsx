@@ -14,6 +14,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { DragEndEvent } from "@dnd-kit/core";
+import { toast } from "sonner";
 
 import { STAGES, type Board, type Epic, type Stage } from "@/lib/types";
 import { STAGE_LABELS } from "@/components/board/board-utils";
@@ -29,7 +30,7 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), message: v
 vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
   usePathname: () => "/projects/tmp",
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
 }));
 
 // Capture the board's onDragEnd so a test can fire a synthetic drop; stub the rest of the dnd-kit
@@ -335,6 +336,45 @@ describe("EpicBoard veto from the Up Next lane", () => {
     await waitFor(() => expect(inUpNext("anton-1")).toBe(false));
     expect(columnOf("anton-1")).toBe("backlog");
   });
+
+  it("keeps a declined target out of the lane when a poll fetched before the veto lands after it", async () => {
+    // The deferral a veto records moves the board version, so it is a board write like any other —
+    // but the poll already out asked on the PRE-veto board. Believing its answer puts the declined
+    // pick back in the lane with its controls live, and the operator declines the same one twice.
+    let landPoll: (() => void) | undefined;
+    const pollHeld = new Promise<void>((resolve) => {
+      landPoll = () => resolve();
+    });
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes("/picker/veto")) {
+        return new Response(JSON.stringify({ deferredUntil: UNTIL }), { status: 200 });
+      }
+      if (String(url).includes("/board")) {
+        await pollHeld;
+        return new Response(JSON.stringify({ board: planned("2:sync") }), { status: 200 });
+      }
+      return new Response(null, { status: 304 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync")} />);
+
+    // A poll leaves on the pre-veto board (returning to the tab reads immediately), then the
+    // operator declines the pick while it is still out.
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/board"))).toBe(true),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /not now/i }));
+    await waitFor(() => expect(inUpNext("anton-1")).toBe(false));
+
+    landPoll?.();
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(inUpNext("anton-1")).toBe(false);
+    expect(columnOf("anton-1")).toBe("backlog");
+  });
 });
 
 /**
@@ -380,6 +420,18 @@ describe("EpicBoard reorder inside Up Next", () => {
     ].map((button) =>
       (button.getAttribute("aria-label") ?? "").replace(/^Reorder "|"$/g, ""),
     );
+
+  /** The `not now` control on one lane row — every row renders one, so scope by its drag handle. */
+  const vetoButton = (title: string) => {
+    const row = document
+      .querySelector(`section[aria-label="Up Next"] button[aria-label='Reorder "${title}"']`)
+      ?.parentElement;
+    const button = [...(row?.querySelectorAll("button") ?? [])].find((b) =>
+      (b.textContent ?? "").toLowerCase().includes("not now"),
+    );
+    if (!button) throw new Error(`No veto control for ${title}`);
+    return button;
+  };
 
   it("keeps the corrected order instead of being served the pre-write plan on the next poll", async () => {
     const fetchMock = vi.fn(async (url: string) => {
@@ -543,5 +595,42 @@ describe("EpicBoard reorder inside Up Next", () => {
       .map((c) => String(c[0]))
       .filter((u) => u.includes("/board"));
     expect(boardReads.at(-1)).not.toContain("version=");
+  });
+
+  it("does not re-offer a target vetoed while the reorder was in flight when the write fails", async () => {
+    // The rollback restores the pre-drag ORDER, and a veto that lands in the same window removes its
+    // target from the lane. Writing the pre-drag lane back whole would undo that veto — re-offering
+    // the pick the operator just declined until the next beat.
+    let failPatch: (() => void) | undefined;
+    const patched = new Promise<Response>((resolve) => {
+      failPatch = () => resolve(new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
+    });
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/epics/anton-2")) return patched;
+      if (url.includes("/picker/veto")) {
+        return new Response(JSON.stringify({ deferredUntil: 1_800_086_400_000 }), { status: 200 });
+      }
+      return new Response(null, { status: 304 });
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<EpicBoard slug="tmp" initialBoard={planned("1:sync", ["anton-1", "anton-2"])} />);
+
+    dragEndHandler?.({
+      active: { id: "anton-2", data: { current: { upNext: true, stage: "backlog" } } },
+      over: { id: "anton-1", data: { current: { upNext: true, stage: "backlog" } } },
+    } as unknown as DragEndEvent);
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-2", "anton-1"]));
+
+    // The operator declines the other target while the PATCH is still out.
+    fireEvent.click(vetoButton("anton-1"));
+    await waitFor(() => expect(laneOrder()).toEqual(["anton-2"]));
+
+    vi.mocked(toast.error).mockClear();
+    failPatch?.();
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+
+    expect(laneOrder()).toEqual(["anton-2"]);
+    expect(columnOf("anton-1")).toBe("backlog");
   });
 });

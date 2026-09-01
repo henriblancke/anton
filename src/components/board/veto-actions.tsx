@@ -82,6 +82,7 @@ export function VetoActions({
           : "No criterion admits this yet — the policy admits every claimable target.",
       });
       router.push(policyHref(slug, criterion));
+      setPending(undefined);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to record that");
       setPending(undefined);

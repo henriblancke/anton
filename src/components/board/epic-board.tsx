@@ -366,6 +366,11 @@ export function EpicBoard({
    * its place in the ranking it was just refused a place in.
    */
   function handleVetoed(beadId: string, untilMs: number) {
+    // A veto is a board write like any other: the deferral it records moves the board version, so a
+    // poll that LEFT before it settled answers on the pre-veto board and would put the declined
+    // target back in the lane with its controls live — long enough (up to a beat) for the operator
+    // to decline the same pick twice. Bumping the sequence here discards exactly those.
+    writeSeqRef.current += 1;
     setBoard((prev) => {
       if (!prev) return prev;
       const columns = { ...prev.columns };
@@ -461,9 +466,17 @@ export function EpicBoard({
         description: "The lane re-ranks from it on the next board-picker pass.",
       });
     } catch (err) {
-      setBoard((prev) =>
-        prev ? { ...prev, ...(previousUpNext?.length ? { upNext: previousUpNext } : {}) } : prev,
-      );
+      setBoard((prev) => {
+        if (!prev) return prev;
+        const { upNext: ranked, ...rest } = prev;
+        // Restore the pre-drag ORDER, not the pre-drag lane. A veto can land between the drop and
+        // this rollback and it drops its target from the lane; writing `previousUpNext` back whole
+        // would re-offer the pick the operator just declined until the next poll. Keep only what
+        // the current lane still ranks, so both updates stand.
+        const stillRanked = new Set((ranked ?? []).map((entry) => entry.beadId));
+        const restored = (previousUpNext ?? []).filter((entry) => stillRanked.has(entry.beadId));
+        return { ...rest, ...(restored.length ? { upNext: restored } : {}) };
+      });
       toast.error(err instanceof Error ? err.message : "Failed to reorder");
     } finally {
       // Every poll that left before this point asked on the pre-write version, so its answer is
