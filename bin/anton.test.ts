@@ -17,6 +17,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileS
 
 import {
   agentsFromArgs,
+  cmdStop,
   daemonExited,
   ensureFreshBuild,
   nextArgs,
@@ -24,6 +25,7 @@ import {
   resolveAntonDb,
   resolvePort,
   runningPid,
+  stoppedFor,
   unverifiableDaemon,
   unstampedServers,
   writePidFile,
@@ -500,6 +502,32 @@ describe("the daemon pidfile", () => {
       expect(daemonExited(path)).toBe(true);
 
       expect(daemonExited(join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);
+    });
+  });
+
+  /**
+   * `anton stop` reporting success is what `update` and `uninstall` go on to destroy a runtime over
+   * (PR #217 review). Only the unverifiable branches are exercised here: both return before any
+   * signal is sent, so the suite never SIGTERMs its own process to assert them.
+   */
+  describe("stopping a daemon that cannot be verified either way", () => {
+    it("fails rather than reporting a stop it never attempted", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(await cmdStop(path, () => null)).toBe(1);
+      expect(existsSync(path)).toBe(true); // kept, so the next stop can still name the daemon
+    });
+
+    it("reports nothing running only where the pidfile names nobody", async () => {
+      expect(await cmdStop(join(await dirs.make("anton-state-"), "absent.pid"))).toBe(0);
+    });
+
+    it("blocks the lifecycle commands that would destroy the runtime under it", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(await stoppedFor("update", path, () => null)).toBe(false);
+
+      expect(await stoppedFor("uninstall", join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);
     });
   });
 });

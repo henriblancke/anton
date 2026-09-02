@@ -228,11 +228,11 @@ function unverifiableDaemon(pidFile = PID_FILE, startedAtNow = processStartedAt)
 }
 
 /** Say why a lifecycle command refused to act, and what makes it safe to retry. */
-function reportUnverifiableDaemon(pid, action) {
+function reportUnverifiableDaemon(pid, action, pidFile = PID_FILE) {
   console.log(c.yellow(`cannot ${action}: a daemon may still be running (pid ${pid}).`));
-  console.log(c.dim(`  ${PID_FILE} names it, but its birth time could not be reread, so anton cannot tell`));
-  console.log(c.dim("  a live server from a reused pid — and acting would strand it. Re-run once the process"));
-  console.log(c.dim(`  table is readable, or stop that process yourself and delete ${PID_FILE}.`));
+  console.log(c.dim(`  ${pidFile} names it, but its birth time could not be reread, so anton cannot tell`));
+  console.log(c.dim("  a live server from a reused pid — acting would strand the one, or signal the other."));
+  console.log(c.dim(`  Re-run once the process table is readable, or stop that process yourself and delete ${pidFile}.`));
 }
 
 /** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
@@ -826,33 +826,66 @@ async function startDaemon(args) {
 /**
  * Stop the running daemon (SIGTERM, then SIGKILL if it lingers).
  *
- * Every step waits on `daemonExited` rather than on `runningPid` going quiet, and the pidfile is
- * deleted only once that proves the daemon dead (PR #217 review): a birth-time read that fails
- * mid-wait makes a live daemon unnameable, and treating that as its exit would drop the SIGKILL and
- * then remove the one record of the process still holding the port. Keeping the file leaves it for
- * the next `anton stop` to find; the operator is told rather than shown a green tick over a server
- * that never stopped.
+ * The opening read consumes the tri-state verdict rather than `runningPid`'s pid alone (PR #217
+ * review): a daemon whose birth time cannot be reread answers null there, and reporting that as
+ * "not running" with rc 0 is a stop that never sent a signal — the lifecycle commands downstream
+ * then take that success as proof the port is free. An unverifiable daemon is a retryable failure.
+ *
+ * Every step after it waits on `daemonExited` rather than on `runningPid` going quiet, and the
+ * pidfile is deleted only once that proves the daemon dead (PR #217 review): a birth-time read that
+ * fails mid-wait makes a live daemon unnameable, and treating that as its exit would drop the
+ * SIGKILL and then remove the one record of the process still holding the port. Keeping the file
+ * leaves it for the next `anton stop` to find; the operator is told rather than shown a green tick
+ * over a server that never stopped.
+ *
+ * Both seams are injectable so the unverifiable branch can be exercised over a fixture — it returns
+ * before any signal — matching the other pidfile readers here.
  */
-async function cmdStop() {
-  const pid = runningPid();
+async function cmdStop(pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid, stale, unverifiable } = pidFileVerdict(pidFile, startedAtNow);
+  if (stale) {
+    try { unlinkSync(pidFile); } catch {}
+  }
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "stop", pidFile);
+    return 1;
+  }
   if (!pid) {
     console.log(c.dim("anton is not running."));
     return 0;
   }
   try { process.kill(pid, "SIGTERM"); } catch {}
-  for (let i = 0; i < 20 && !daemonExited(); i++) await sleep(150); // up to ~3s grace
-  if (!daemonExited()) {
+  const exited = () => daemonExited(pidFile, startedAtNow);
+  for (let i = 0; i < 20 && !exited(); i++) await sleep(150); // up to ~3s grace
+  if (!exited()) {
     try { process.kill(pid, "SIGKILL"); } catch {}
-    for (let i = 0; i < 10 && !daemonExited(); i++) await sleep(100); // let the kill land
+    for (let i = 0; i < 10 && !exited(); i++) await sleep(100); // let the kill land
   }
-  if (!daemonExited()) {
-    console.log(c.yellow(`could not confirm anton stopped (pid ${pid})`) + c.dim(` — keeping ${PID_FILE}`));
+  if (!exited()) {
+    console.log(c.yellow(`could not confirm anton stopped (pid ${pid})`) + c.dim(` — keeping ${pidFile}`));
     console.log(c.dim("  Its birth time could not be reread, so the pid may not be anton's. Re-run `anton stop`."));
     return 1;
   }
-  try { unlinkSync(PID_FILE); } catch {}
+  try { unlinkSync(pidFile); } catch {}
   console.log(c.green("✓ anton stopped") + c.dim(` (pid ${pid})`));
   return 0;
+}
+
+/**
+ * Stop the daemon ahead of a step that destroys what it is running on, and say whether that step may
+ * proceed (PR #217 review).
+ *
+ * `update` and `uninstall` used to discard `cmdStop`'s result: a stop that could NOT confirm the
+ * daemon dead returns 1 and deliberately keeps the pidfile, and running on past that swaps the
+ * runtime out from under a live server, or deletes it (with `--purge`, its state too). The
+ * pre-flight `unverifiableDaemon` check both commands make cannot cover this — the failure happens
+ * later, in stop's own polling loop.
+ */
+async function stoppedFor(action, pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  if ((await cmdStop(pidFile, startedAtNow)) === 0) return true;
+  console.log(c.red(`cannot ${action}: anton could not be confirmed stopped.`));
+  console.log(c.dim("  Nothing was changed. Re-run once `anton stop` succeeds."));
+  return false;
 }
 
 /** Print install/runtime/state paths and whether the daemon is running. */
@@ -994,7 +1027,10 @@ async function cmdUpdate() {
     return 1;
   }
   const wasRunning = !!runningPid();
-  if (wasRunning) await cmdStop();
+  if (wasRunning && !(await stoppedFor("update"))) {
+    rmSync(tmp, { recursive: true, force: true });
+    return 1;
+  }
 
   const runtime = join(INSTALL_ROOT, "runtime");
   const backup = join(INSTALL_ROOT, "runtime.old");
@@ -1024,7 +1060,7 @@ async function cmdUninstall(args = []) {
     reportUnverifiableDaemon(unverifiable, "uninstall");
     return 1;
   }
-  if (runningPid()) await cmdStop();
+  if (runningPid() && !(await stoppedFor("uninstall"))) return 1;
   rmSync(INSTALL_ROOT, { recursive: true, force: true });
   try { unlinkSync(BIN_LINK); } catch {}
   if (args.includes("--purge")) {
@@ -2222,6 +2258,8 @@ export {
   runningPid,
   daemonExited,
   unverifiableDaemon,
+  cmdStop,
+  stoppedFor,
   writePidFile,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
