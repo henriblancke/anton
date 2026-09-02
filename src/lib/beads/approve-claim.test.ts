@@ -32,6 +32,19 @@ function read(): Bead {
   return board.get(ID)!;
 }
 
+/**
+ * An untag that hands the target to another worker as it runs — the take-over the ownership check
+ * before it cannot see, because it lands inside that one await.
+ */
+function stealDuringUntag(): void {
+  vi.spyOn(beads, "untag").mockImplementation(async (_cwd, id, labels) => {
+    const b = board.get(id)!;
+    b.labels = (b.labels ?? []).filter((l) => !labels.includes(l));
+    b.assignee = "other-box";
+    return "";
+  });
+}
+
 beforeEach(() => {
   board.clear();
   repo = `/tmp/approve-claim-${(n += 1)}`;
@@ -51,6 +64,11 @@ beforeEach(() => {
   vi.spyOn(beads, "untag").mockImplementation(async (_cwd, id, labels) => {
     const b = board.get(id)!;
     b.labels = (b.labels ?? []).filter((l) => !labels.includes(l));
+    return "";
+  });
+  vi.spyOn(beads, "approve").mockImplementation(async (_cwd, id) => {
+    const b = board.get(id)!;
+    b.labels = [...new Set([...(b.labels ?? []), LABELS.approved])];
     return "";
   });
 });
@@ -233,6 +251,75 @@ describe("unwindApproveClaim", () => {
 
     expect(read().labels).toContain(LABELS.approved);
     expect(read().assignee).toBe("anton-box");
+  });
+
+  it("puts the approval back when a take-over landed INSIDE the untag", async () => {
+    // The ownership check is on the near side of that await (PR #218 review): on a shared-server
+    // board an explicit take-over can win the assignee while the untag runs, and the label then
+    // comes off the SUCCESSOR's freshly claimed target. The release loses to them and says so, which
+    // is the second proof — so their approval goes back on rather than the unwind reading as clean
+    // and their run starting unapproved.
+    put({ labels: [LABELS.approved], assignee: "anton-box" });
+    stealDuringUntag();
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: true,
+      }),
+    ).resolves.toBe("transferred");
+
+    expect(read().labels).toContain(LABELS.approved);
+    expect(read().assignee).toBe("other-box");
+  });
+
+  it("reports the stripped approval when it cannot be put back", async () => {
+    // Same take-over, and the restore itself falls over: the holder is left with a claimed target
+    // and no approval, which nothing on the board explains and no later pass repairs. Named so a
+    // person re-approves it, rather than swallowed as a clean unwind.
+    put({ labels: [LABELS.approved], assignee: "anton-box" });
+    stealDuringUntag();
+    vi.spyOn(beads, "approve").mockRejectedValue(new Error("bd is down"));
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: true,
+      }),
+    ).resolves.toBe("stripped");
+
+    expect(read().labels).not.toContain(LABELS.approved);
+    expect(read().assignee).toBe("other-box");
+  });
+
+  it("reads the ownership proof for itself when there was no claim to release", async () => {
+    // A no-op swap took no reservation, so there is no release to prove ownership with — but the
+    // same successor can still land during the untag (PR #218 review). The proof is read instead,
+    // and the approval goes back the same way.
+    put({ labels: [LABELS.approved], assignee: "anton-box" });
+    stealDuringUntag();
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: "anton-box",
+        wroteLabel: true,
+        wroteClaim: false,
+      }),
+    ).resolves.toBe("transferred");
+
+    expect(read().labels).toContain(LABELS.approved);
+    expect(read().assignee).toBe("other-box");
   });
 
   it("holds the bead lock across the whole unwind, so a retry cannot land between its legs", async () => {

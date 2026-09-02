@@ -245,13 +245,17 @@ async function jobs(): Promise<{ id: string; payloadJson: string; status: string
 }
 
 /** A settled-but-recoverable run left on `t1` by an earlier attempt — what a parked epic looks like. */
-async function settledJob(status: "parked" | "failed"): Promise<string> {
+async function settledJob(status: "parked" | "failed", bypassBudget?: boolean): Promise<string> {
   const id = `job-${status}`;
   await t.db.insert(schema.jobs).values({
     id,
     type: "execute-epic",
     projectId: "p1",
-    payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "t1" }),
+    payloadJson: JSON.stringify({
+      projectId: "p1",
+      epicBeadId: "t1",
+      ...(bypassBudget ? { bypassBudget: true } : {}),
+    }),
     status,
     runAt: new Date(NOW),
     updatedAt: new Date(NOW),
@@ -1397,6 +1401,24 @@ describe("applyPickerPlan", () => {
     expect(read("t1").assignee).toBe("anton-box");
     expect(read("t1").labels).toContain(LABELS.approved);
     expect(notes).toHaveLength(1);
+  });
+
+  it("resumes an operator's run-now job PACED, not on its bypass", async () => {
+    // The job it revives may have been enqueued by an immediate "Approve & run" (PR #218 review).
+    // Riding that flag into an unattended start would skip the budget and value gates the governor
+    // holds every policy start to — a person's run-now decision spent on a run nobody asked for.
+    put(bead("t1"));
+    const parked = await settledJob("parked", true);
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ started: { beadId: "t1", jobId: parked } });
+    const [job] = await jobs();
+    expect(job).toMatchObject({ id: parked, status: "queued" });
+    expect(JSON.parse(job!.payloadJson) as Record<string, unknown>).toEqual({
+      projectId: "p1",
+      epicBeadId: "t1",
+    });
   });
 
   it("takes its writes back when no run could be started at all", async () => {

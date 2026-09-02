@@ -157,8 +157,13 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
  * this request wrote is still standing, which a caller whose plan was stamped before it has to know.
  * A claim that was released rather than handed on is not this: with no successor the approval covers
  * nothing, so it comes off like any other failed sequence.
+ *
+ * `stripped` is the transfer this unwind noticed too LATE (PR #218 review): the successor took the
+ * target while the untag was in flight, so the approval came off THEIR reservation and could not be
+ * put back. Their run stands down for want of a label nobody can see is missing, which is why this
+ * needs a human — one who re-approves rather than clears anything.
  */
-export type UnwindLeftover = "approval" | "claim" | "transferred";
+export type UnwindLeftover = "approval" | "claim" | "transferred" | "stripped";
 
 export interface UnwindApproveClaimInput {
   repoPath: string;
@@ -225,6 +230,13 @@ export interface UnwindApproveClaimInput {
  * goes through the LOCKED CAS rather than `setAssigneeIfOwner`, which would wait on the lock this
  * body already holds and deadlock.
  *
+ * The untag's own ownership check is on the NEAR side of an await, so it is proven a SECOND time
+ * afterwards (PR #218 review) — by the release CAS, which re-reads the assignee under this lock, or
+ * by a read of its own when there is no reservation to release. A successor that landed inside the
+ * untag holds a target this unwind just unapproved, so the approval goes back on for them; only one
+ * that will not go back on is reported, as `stripped`. Without that second proof the release simply
+ * loses to the successor and the unwind reads as clean, which is how an unapproved run gets started.
+ *
  * A swap lost to a THIRD PARTY is not a failure: someone else holds the reservation now, which is a
  * safe final state and none of ours to repair. A swap lost while the target still reads as `owner`
  * is the opposite (PR #218 review) — the release did not take, so the reservation is still ours,
@@ -242,6 +254,23 @@ export async function unwindApproveClaim(
         console.error(`[approve-claim] could not re-read ${beadId} ${when}`, e);
         return undefined;
       });
+
+    // Put an approval back on a target that turned out to be somebody else's (PR #218 review).
+    // `beads.approve` is ambiguous on failure like every other bd write, but both its outcomes send
+    // a person to the same remedy — re-approve a run standing down for want of a label — and
+    // re-approving one that did land is a no-op, so the error is taken at face value here.
+    const restoreApproval = (successor: string): Promise<UnwindLeftover> =>
+      beads
+        .approve(repoPath, beadId)
+        .then<UnwindLeftover>(() => "transferred")
+        .catch((e) => {
+          console.error(`[approve-claim] could not restore ${beadId}'s approval for ${successor}`, e);
+          return "stripped";
+        });
+
+    // Whether the approval actually came OFF — what makes the ownership proofs below something to
+    // act on rather than a curiosity.
+    let stripped = false;
 
     // One read, two questions: is the reservation still ours to reverse, and did the label actually
     // land. Read only when there is a label to take off — with none, the release below is a CAS that
@@ -279,6 +308,7 @@ export async function unwindApproveClaim(
           const after = await reread("after failing to unapprove it");
           if (!after || beads.isApproved(after)) return "approval";
         }
+        stripped = true;
       }
     }
 
@@ -288,6 +318,30 @@ export async function unwindApproveClaim(
         return undefined;
       });
       if (!released || (!released.ok && released.owner === input.owner)) return "claim";
+      // The release doubles as the ownership proof the untag could not carry (PR #218 review): the
+      // check above sits on the NEAR side of an await, so a take-over landing while the untag runs
+      // strips the label off the SUCCESSOR's freshly claimed target. This CAS re-reads the assignee
+      // under the same lock, and one that lost to a NAMED holder says exactly that happened — so
+      // their approval goes back on, rather than the unwind reporting a clean sweep over a run left
+      // unapproved. A release that lost to nobody is the cleared-assignee case, where the approval
+      // is correctly off.
+      if (stripped && !released.ok && released.owner !== undefined) {
+        return restoreApproval(released.owner);
+      }
+      return undefined;
+    }
+
+    // No reservation to release, so that proof has to be read for its own sake (PR #218 review): a
+    // no-op swap took nothing this unwind has to hand back, but a successor can still land during
+    // the untag and lose the approval to it.
+    if (stripped) {
+      const after = await reread("after unapproving it");
+      // The label is already off and the board cannot say whose target it is. Reported rather than
+      // answered as a clean unwind, because the state it would otherwise hide is another worker's
+      // run with no approval behind it — visible to nobody, and fixed by the same re-approval.
+      if (!after) return "stripped";
+      const holder = ownerOf(after);
+      if (holder !== undefined && holder !== input.owner) return restoreApproval(holder);
     }
 
     return undefined;

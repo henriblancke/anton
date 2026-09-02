@@ -230,6 +230,30 @@ function promoteToBypass(
     .run();
 }
 
+/**
+ * Strip the "run now" flag from a SETTLED execute-epic job, so resuming it is paced like any other
+ * policy start (PR #218 review).
+ *
+ * A parked or failed job can carry `bypassBudget` from the operator's immediate "Approve & run" that
+ * first created it, and the picker resumes whatever job covers its target rather than enqueueing a
+ * fresh one. Left on, a person's run-now decision would ride into an UNATTENDED start and skip the
+ * budget and value gates the governor holds a policy start to — the pacing that makes an armed
+ * picker safe to leave running.
+ *
+ * Guarded to the resumable statuses, so it can only touch a job that is settled: nothing sets the
+ * flag on a parked/failed row ({@link promoteToBypass} is `queued`-only), and a row an operator
+ * revived first is left alone — as is its resume, which refuses the same statuses. `json_remove`
+ * rather than a rewritten payload so nothing else the row carries is dropped on the way through.
+ * `updatedAt` is deliberately untouched: this is a payload edit, not a lifecycle move, and the
+ * resume that follows stamps it.
+ */
+export async function clearBypassBudget(db: AntonDb, jobId: string): Promise<void> {
+  await db
+    .update(schema.jobs)
+    .set({ payloadJson: sql`json_remove(${schema.jobs.payloadJson}, '$.bypassBudget')` })
+    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...RESUMABLE_STATUSES])));
+}
+
 /** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {

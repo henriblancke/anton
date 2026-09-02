@@ -702,7 +702,14 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
             leftover === "transferred"
             ? `${epicId} could not be approved by this request — it was claimed by another worker ` +
               `while it was in flight, and its approval now stands for them. ${swap.approveFailed}`
-            : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
+            : // The same take-over, caught only after the approval had come off theirs (PR #218
+              // review). Nothing of this request's is left standing — what needs a hand is the label
+              // it took off the worker who now holds the target, whose run waits on it.
+              leftover === "stripped"
+              ? `${epicId} could not be approved by this request — it was claimed by another ` +
+                `worker while it was in flight, and the approval this request took back could not ` +
+                `be put back for them; re-approve it by hand. ${swap.approveFailed}`
+              : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
     // Same reason as the claim-failure branch above: the unwind is itself a board write, and what it
     // could not take back is a partial write standing. Neither reaches another machine until it is
     // published (PR #218 review).

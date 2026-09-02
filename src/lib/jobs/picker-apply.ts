@@ -59,6 +59,7 @@ import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
 import { inReviewTargets } from "./run-health";
 import {
   activeExecuteEpicId,
+  clearBypassBudget,
   enqueueExecuteEpicIfAbsent,
   resumableExecuteEpicId,
   resumeJob,
@@ -645,6 +646,15 @@ async function unwindStart(
   if (leftover === "transferred") {
     return { note: `${beadId} is claimed by another worker — its approval stands`, wroteBoard: true };
   }
+  // The same take-over, caught too late to put the approval back (PR #218 review): the holder's
+  // target is unapproved, so their run stands down until a person re-approves it. Nothing of this
+  // pass's is left to clear — what needs a human is the label it took off somebody else.
+  if (leftover === "stripped") {
+    return {
+      note: `${beadId} was taken over while this pass unwound and lost its approval — re-approve it by hand`,
+      wroteBoard: true,
+    };
+  }
   return { wroteBoard: false };
 }
 
@@ -684,6 +694,11 @@ async function resumeSettledRun(
 ): Promise<string | undefined> {
   const resumable = await resumableExecuteEpicId(db, projectId, epicBeadId);
   if (!resumable) return undefined;
+  // The job being revived may have been created by an operator's immediate "Approve & run", and its
+  // `bypassBudget` payload would carry that person's run-now decision into THIS unattended start
+  // (PR #218 review). A policy start is paced by the governor exactly as a queued one is — the same
+  // reason this pass's own enqueue asks for no bypass — so the flag comes off before the resume.
+  await clearBypassBudget(db, resumable);
   return (await resume(resumable)) ? resumable : undefined;
 }
 
