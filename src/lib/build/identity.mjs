@@ -300,14 +300,14 @@ function trackedPaths(listed, ...modes) {
  * compiles the raw bytes on disk. `--no-ext-diff` and `--no-textconv` do not reach it: those
  * disable diff-time conversions, and this one happens before the diff.
  *
- * Only paths a CONFIGURED driver actually converts count. `filter=x` with no `filter.x.clean`
- * command leaves the bytes alone, so the diff already covers them — and re-reading every tracked
- * file in a repo that merely declares the attribute would hash the whole tree for nothing. Regular
- * files only, for the same reason: git runs no filter over a symlink or a gitlink, both of which
- * the digest already covers on their own terms.
+ * Only paths a CONFIGURED driver actually converts count. `filter=x` with neither a `filter.x.clean`
+ * command nor a `filter.x.process` one leaves the bytes alone, so the diff already covers them — and
+ * re-reading every tracked file in a repo that merely declares the attribute would hash the whole
+ * tree for nothing. Regular files only, for the same reason: git runs no filter over a symlink or a
+ * gitlink, both of which the digest already covers on their own terms.
  */
 function filteredTrackedPaths(appRoot, paths) {
-  const drivers = cleanFilterDrivers(appRoot);
+  const drivers = convertingFilterDrivers(appRoot);
   if (drivers === null) return null;
   if (!drivers.size || !paths.length) return [];
   const attrs = git(appRoot, ["check-attr", "--stdin", "-z", "filter"], paths.join("\0"));
@@ -320,16 +320,22 @@ function filteredTrackedPaths(appRoot, paths) {
 }
 
 /**
- * The filter drivers this repo has a `clean` command configured for — the only ones that convert
- * anything. Read from the merged config, because the command can just as well come from the user's
- * global file as from the checkout's own.
+ * The filter drivers this repo has configured a conversion for — the only ones that change anything
+ * on the way into the diff. Read from the merged config, because the command can just as well come
+ * from the user's global file as from the checkout's own.
+ *
+ * A long-running `filter.<driver>.process` counts alongside `filter.<driver>.clean`: git asks the
+ * process filter for its `clean` capability and diffs that canonicalized output, so a lossy
+ * process-only driver — the shape git-lfs and its kind ship — hides a rewritten file exactly as a
+ * `clean` command does, and matching only `.clean` would omit those paths from the digest and let
+ * `buildMatchesCheckout` accept a stale artifact (PR #217 review).
  */
-function cleanFilterDrivers(appRoot) {
+function convertingFilterDrivers(appRoot) {
   const listed = git(appRoot, ["config", "--list", "-z"]);
   if (listed === null) return null;
   const drivers = new Set();
   for (const record of listed.split("\0")) {
-    const driver = /^filter\.(.+)\.clean$/.exec(record.split("\n", 1)[0]);
+    const driver = /^filter\.(.+)\.(?:clean|process)$/.exec(record.split("\n", 1)[0]);
     if (driver) drivers.add(driver[1]);
   }
   return drivers;

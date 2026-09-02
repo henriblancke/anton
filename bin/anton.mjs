@@ -2208,12 +2208,16 @@ const MAX_BUILD_ATTEMPTS = 3;
  * out or overran its buffer is the check failing open, and stamping through it is the same false
  * "current" by another route.
  *
+ * The rebuild passes `--webpack` because that is what `package.json`'s `build` script — the one CI
+ * and the release bundle compile with — uses; Next 16 defaults bare `next build` to Turbopack, so
+ * omitting it would leave the server running an artifact no gate ever built (PR #217 review).
+ *
  * `build` and `readIdentity` are injected so the loop is testable without spawning a real compile.
  */
 function ensureFreshBuild({
   appRoot,
   isBundle,
-  build = () => runLocal("next", ["build"]),
+  build = () => runLocal("next", ["build", "--webpack"]),
   readIdentity = readBuildIdentity,
 }) {
   let compiledFrom = isBundle ? null : readIdentity(appRoot);

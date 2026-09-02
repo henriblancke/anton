@@ -81,6 +81,65 @@ function submodule(dir: string, path: string): string {
   return origin;
 }
 
+/**
+ * A git long-running filter process (protocol v2, pkt-line over stdio) that answers every `clean`
+ * with the same constant — the lossy shape that makes `git diff HEAD` blind to a rewritten file.
+ * Written into the checkout under test and named by `filter.<driver>.process`.
+ */
+const PROCESS_FILTER = `import { readSync, writeSync } from "node:fs";
+
+let buf = Buffer.alloc(0);
+function need(n) {
+  while (buf.length < n) {
+    const chunk = Buffer.alloc(65536);
+    const read = readSync(0, chunk, 0, chunk.length, null);
+    if (!read) process.exit(0);
+    buf = Buffer.concat([buf, chunk.subarray(0, read)]);
+  }
+}
+function readPacket() {
+  need(4);
+  const len = parseInt(buf.subarray(0, 4).toString(), 16);
+  if (len === 0) { buf = buf.subarray(4); return null; }
+  need(len);
+  const payload = buf.subarray(4, len);
+  buf = buf.subarray(len);
+  return payload;
+}
+function readUntilFlush() {
+  const out = [];
+  for (let p = readPacket(); p !== null; p = readPacket()) out.push(Buffer.from(p));
+  return out;
+}
+function write(text) {
+  const payload = Buffer.from(text);
+  const head = Buffer.from((payload.length + 4).toString(16).padStart(4, "0"));
+  writeSync(1, Buffer.concat([head, payload]));
+}
+function flush() { writeSync(1, Buffer.from("0000")); }
+
+readUntilFlush();
+write("git-filter-server\\n");
+write("version=2\\n");
+flush();
+readUntilFlush();
+write("capability=clean\\n");
+write("capability=smudge\\n");
+flush();
+
+for (;;) {
+  const head = readUntilFlush();
+  if (!head.length) process.exit(0);
+  readUntilFlush();
+  const command = head.map(String).find((line) => line.startsWith("command="))?.slice(8).trim();
+  write("status=success\\n");
+  flush();
+  if (command === "clean") write("constant\\n");
+  flush();
+  flush();
+}
+`;
+
 describe("compareBuild", () => {
   it("says nothing when the running build is the build on disk", () => {
     expect(compareBuild(RUNNING, { ...RUNNING }).state).toBe("current");
@@ -278,6 +337,30 @@ describe("readBuildIdentity", () => {
     expect(first).toMatch(/^[0-9a-f]{12}$/);
 
     writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
+  // A long-running `filter.<driver>.process` is the OTHER way to configure a conversion — git asks
+  // the process for its `clean` capability and diffs THAT output, so a lossy process-only driver
+  // (git-lfs's shape) hides a rewritten file exactly as a `clean` command does. Discovering only
+  // `.clean` drivers left those paths out of the raw-content inputs, and a stale `.next` then passed
+  // as this checkout (PR #217 review).
+  it("digests a tracked edit a process-only filter driver would canonicalize away", () => {
+    const dir = gitCheckout();
+    const filter = join(dir, "filter.mjs");
+    writeFileSync(filter, PROCESS_FILTER);
+    writeFileSync(join(dir, ".gitattributes"), "*.ts filter=proc\n");
+    spawnSync("git", ["-C", dir, "config", "filter.proc.process", `${process.execPath} ${filter}`]);
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    // src.ts was committed before the attribute existed, so only a renormalize runs the driver over it.
+    spawnSync("git", ["-C", dir, "add", "--renormalize", "."]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "process filter"]);
+    // The driver hides the edit from the diff, so only the raw-content read can tell these apart.
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(spawnSync("git", ["-C", dir, "diff", "HEAD"]).stdout.toString()).toBe("");
+
     expect(readBuildIdentity(dir).worktree).not.toBe(first);
   });
 
