@@ -676,9 +676,9 @@ function hashContents(hash, path) {
 const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
 
 /**
- * The env files `next build` loads in production — the mode `anton start` compiles in. Their
- * CONTENTS are already a build input (`ignoredEnvFiles`, or the diff where they are tracked); what
- * is read from them here is which variables of the build ENVIRONMENT their values pull in.
+ * The env files `next build` loads in production — the mode `anton start` compiles in. Each one
+ * reaches the artifact twice: as the bytes Next inlines from, and as the names of build-ENVIRONMENT
+ * variables its values expand.
  */
 const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
 
@@ -690,6 +690,17 @@ const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production
  * backslash expands nothing there either, however many backslashes precede it (PR #217 review).
  */
 const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+
+/** The env files present at `appRoot`, as `[file, contents]` pairs — read once for both their routes. */
+function readEnvFiles(appRoot) {
+  const files = [];
+  for (const file of BUILD_ENV_FILES) {
+    try {
+      files.push([file, readFileSync(join(appRoot, file), "utf8")]);
+    } catch {}
+  }
+  return files;
+}
 
 /**
  * The build-environment variables the loaded env files EXPAND — the second route a value Next
@@ -705,43 +716,42 @@ const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
  * names this environment actually SETS — a rebuild too many costs one build, while a missed one
  * serves a value the checkout no longer holds.
  */
-function expandedEnvNames(appRoot) {
+function expandedEnvNames(files) {
   const names = new Set();
-  for (const file of BUILD_ENV_FILES) {
-    let text;
-    try {
-      text = readFileSync(join(appRoot, file), "utf8");
-    } catch {
-      continue;
-    }
+  for (const [, text] of files) {
     for (const [, name] of text.matchAll(ENV_EXPANSION)) names.add(name);
   }
   return names;
 }
 
 /**
- * A digest of the build-time environment values Next compiles in — null when none are set.
+ * A digest of everything Next compiles in from the build's environment: the env FILES it loads and
+ * the inlined values of the process environment it loads them into — null when there is neither.
  *
- * `ignoredEnvFiles` closes this hole on the FILE side only, and a `.env` file is not the only place
- * Next reads an inlined value from: `NEXT_PUBLIC_API_URL=x anton start` puts it straight in the
- * build's environment, and Next inlines it just the same. Without it in the identity, re-running
- * with a different value finds a stamp that still matches the checkout, reuses the `.next` compiled
- * from the OLD value, and every drift surface calls that server current (PR #217 review).
+ * Both halves, because either alone leaves a hole. `NEXT_PUBLIC_API_URL=x anton start` puts a value
+ * straight in the build's environment where no file holds it; and the files' own bytes are digested
+ * elsewhere only where there is a git to digest them with — `readWorktreeDigest` (through
+ * `ignoredEnvFiles`) never runs on a source install with no `.git`, the extracted-tarball shape. So
+ * a tarball editing `.env.local` from `NEXT_PUBLIC_URL=old` to `=new` left both identities identical,
+ * and `anton start` reused the `.next` holding the old inlined value (PR #217 review).
  *
- * The scope is the prefix plus whatever the env files expand into one, deliberately: those are the
- * variables that reach the artifact, and they are stable per shell. Digesting the environment
+ * The environment half stays scoped to the prefix plus whatever the files expand into one: those are
+ * the variables that reach the artifact, and they are stable per shell. Digesting the environment
  * wholesale would fold in `PWD`, `TERM` and every per-invocation variable, and rebuild on each one.
  *
- * `\0` frames name from value because neither can contain one, so no pair of variables can digest
- * into the same bytes as another.
+ * A `\0`-framed tag leads each entry because no path, name or value can contain one — so no pair of
+ * files or variables can digest into the same bytes as another, and a file cannot digest as a
+ * variable that happens to spell its name.
  */
 function readEnvDigest(env, appRoot) {
+  const files = readEnvFiles(appRoot);
   const inlined = new Set(Object.keys(env).filter((name) => name.startsWith(INLINED_ENV_PREFIX)));
-  for (const name of expandedEnvNames(appRoot)) inlined.add(name);
+  for (const name of expandedEnvNames(files)) inlined.add(name);
   const names = [...inlined].filter((name) => env[name] !== undefined).sort();
-  if (!names.length) return null;
+  if (!names.length && !files.length) return null;
   const digest = createHash("sha256");
-  for (const name of names) digest.update(name).update("\0").update(env[name]).update("\0");
+  for (const [file, text] of files) digest.update("\0file\0").update(file).update("\0").update(text);
+  for (const name of names) digest.update("\0var\0").update(name).update("\0").update(env[name]);
   return digest.digest("hex").slice(0, 12);
 }
 
@@ -750,10 +760,10 @@ function readEnvDigest(env, appRoot) {
  *
  * The worktree digest is read only where a revision was: `readRevision`'s toplevel check is what
  * proves `appRoot` is its own checkout, and without it a bundle unpacked in a git-tracked $HOME
- * would wear that repo's uncommitted dotfile edits. The env digest carries no such condition — it
- * is a read of this process's own environment, which is exactly the environment `anton start` hands
- * the `next build` it spawns (`runLocal` inherits it), widened by the variables the checkout's env
- * files expand out of it.
+ * would wear that repo's uncommitted dotfile edits. The env digest carries no such condition, and
+ * must not: it reads the env files directly plus this process's own environment — exactly the
+ * environment `anton start` hands the `next build` it spawns (`runLocal` inherits it) — so it is the
+ * only thing that sees an inlined value move on an install git cannot describe at all.
  *
  * @param {string} appRoot
  * @param {Record<string, string|undefined>} [env] the environment a build from this process compiles with
@@ -1062,7 +1072,8 @@ export function recordAlive(record, startedAt = processStartedAt) {
  *
  * The env digest is not compared at all, though both sides carry one. A verdict is read from
  * OUTSIDE the running server — `anton doctor` in whatever shell the operator is standing in — and
- * that shell's `NEXT_PUBLIC_*` values are not a fact about the code on disk. Comparing them would
+ * that shell's `NEXT_PUBLIC_*` values are not a fact about the code on disk (the env FILES it also
+ * digests are, but the two are one field and the shell half decides it). Comparing them would
  * report drift whenever doctor runs in a different shell from the one that started the server, and
  * print two identical build strings as the evidence. Freshness is where the env belongs, and
  * `sameCheckout` reads it there: `anton start` compares the stamp against its OWN environment,
@@ -1113,9 +1124,9 @@ export function compareBuild(running, onDisk) {
  * always was.
  *
  * The env digest is compared here and NOWHERE else, because freshness is the only question it
- * answers. A stamp carrying none (written before the field existed) against a process with no
- * `NEXT_PUBLIC_*` set is two absences that agree — the common case, so the field costs no install a
- * rebuild on the upgrade that introduced it — while a stamp with none against an environment that
+ * answers. A stamp carrying none (written before the field existed) against an install with no env
+ * file and no `NEXT_PUBLIC_*` set is two absences that agree — the common case, so the field costs
+ * such an install no rebuild on the upgrade that introduced it — while a stamp with none against an environment that
  * now sets one is a build that cannot be shown to hold that value, and is compiled again.
  *
  * @param {BuildIdentity} a

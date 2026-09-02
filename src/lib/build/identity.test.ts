@@ -737,6 +737,27 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(app(), { PATH: "/usr/bin" }).env).toBe(null);
   });
 
+  // The FILE side of the digest, and the only side an install with no `.git` has: `readWorktreeDigest`
+  // never runs there, so nothing else in the identity ever reads these bytes (PR #217 review).
+  it("digests the env files themselves, on an install no git can describe", () => {
+    const dir = app();
+    writeFileSync(join(dir, ".env.local"), "NEXT_PUBLIC_URL=old\n");
+    const first = readBuildIdentity(dir, { PATH: "/usr/bin" }).env;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    writeFileSync(join(dir, ".env.local"), "NEXT_PUBLIC_URL=new\n");
+    expect(readBuildIdentity(dir, { PATH: "/usr/bin" }).env).not.toBe(first);
+  });
+
+  // Same bytes under a different name is a different build: Next loads `.env.local` over `.env`, and
+  // moving a value between them changes which one wins.
+  it("frames each env file from its contents", () => {
+    const one = app();
+    writeFileSync(join(one, ".env"), "NEXT_PUBLIC_URL=x\n");
+    const other = app();
+    writeFileSync(join(other, ".env.local"), "NEXT_PUBLIC_URL=x\n");
+    expect(readBuildIdentity(one, {}).env).not.toBe(readBuildIdentity(other, {}).env);
+  });
+
   it("digests an inlined value by content, so changing it is a different build", () => {
     const dir = app();
     const first = readBuildIdentity(dir, { NEXT_PUBLIC_API_URL: "https://one" }).env;
@@ -774,12 +795,14 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { API_HOST: "https://two" }).env).not.toBe(first);
   });
 
-  // A reference to something the build environment does not set expands to nothing, and the file's
-  // own bytes are already a build input — so it is not a value this digest has to carry.
+  // A reference to something the build environment does not set expands to nothing, so it adds
+  // nothing past the file's own bytes — which the digest already carries either way.
   it("names an expanded variable only where the environment sets one", () => {
     const dir = app();
     writeFileSync(join(dir, ".env"), "NEXT_PUBLIC_API_URL=${API_HOST}\n");
-    expect(readBuildIdentity(dir, { PATH: "/usr/bin" }).env).toBe(null);
+    const unset = readBuildIdentity(dir, { PATH: "/usr/bin" }).env;
+    expect(readBuildIdentity(dir, { PATH: "/usr/other" }).env).toBe(unset);
+    expect(readBuildIdentity(dir, { API_HOST: "https://one" }).env).not.toBe(unset);
   });
 
   // Order is the shell's, not the build's: the same two values exported the other way round is the
@@ -1138,6 +1161,17 @@ describe("buildMatchesCheckout", () => {
   it("accepts a checkout with no git at all on its version alone", () => {
     const onDisk = { version: "0.4.0", revision: null, worktree: null };
     expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(true);
+  });
+
+  // The same install once it holds an `.env.local`: version alone stops being its whole identity,
+  // because no worktree digest is ever read there to see those bytes move (PR #217 review).
+  it("rejects a git-less install whose env file changed under the build", () => {
+    const app = checkout({ version: "0.4.0", revision: null });
+    writeFileSync(join(app, ".env.local"), "NEXT_PUBLIC_URL=old\n");
+    writeFileSync(buildStampPath(app), JSON.stringify(readBuildIdentity(app, {})));
+    expect(buildMatchesCheckout(app, readBuildIdentity(app, {}))).toBe(true);
+    writeFileSync(join(app, ".env.local"), "NEXT_PUBLIC_URL=new\n");
+    expect(buildMatchesCheckout(app, readBuildIdentity(app, {}))).toBe(false);
   });
 
   // `NEXT_PUBLIC_API_URL=old anton start`, then `NEXT_PUBLIC_API_URL=new anton start`: the checkout
