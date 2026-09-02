@@ -685,6 +685,24 @@ describe("the build-time environment in an identity", () => {
     expect(a).not.toBe(b);
   });
 
+  // Next resolves `$API_HOST` from the BUILD's environment before inlining the public value, so the
+  // env file that names it holds the same bytes while what it compiles in moves (PR #217 review).
+  it("digests a variable an env file expands into an inlined value", () => {
+    const dir = app();
+    writeFileSync(join(dir, ".env.local"), "NEXT_PUBLIC_API_URL=$API_HOST\n");
+    const first = readBuildIdentity(dir, { API_HOST: "https://one" }).env;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    expect(readBuildIdentity(dir, { API_HOST: "https://two" }).env).not.toBe(first);
+  });
+
+  // A reference to something the build environment does not set expands to nothing, and the file's
+  // own bytes are already a build input — so it is not a value this digest has to carry.
+  it("names an expanded variable only where the environment sets one", () => {
+    const dir = app();
+    writeFileSync(join(dir, ".env"), "NEXT_PUBLIC_API_URL=${API_HOST}\n");
+    expect(readBuildIdentity(dir, { PATH: "/usr/bin" }).env).toBe(null);
+  });
+
   // Order is the shell's, not the build's: the same two values exported the other way round is the
   // same artifact, and rebuilding on it would be churn nobody can explain.
   it("does not depend on the order the shell exported them in", () => {

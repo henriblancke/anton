@@ -75,12 +75,17 @@ export function projectHealthFromBoard(
 /**
  * UI read path. Goes through {@link getBoard} rather than reading hygiene/scan-health directly, so a
  * failed anton.db read degrades to "never patrolled"/"never scanned" the same way the board itself
- * does (getBoard logs and returns undefined) instead of taking this page down with it. The board read
- * and the escalation read are independent, so they run concurrently.
+ * does (getBoard logs and returns undefined) instead of taking this page down with it. The three
+ * reads are independent, so they run concurrently.
  */
 export async function getProjectHealth(project: Project): Promise<ProjectHealth> {
-  const [board, escalations] = await Promise.all([getBoard(project), openEscalations(project.id)]);
-  // Read live rather than from a stored report: which build is running is a fact about this instant,
-  // and a patrol row written by a since-restarted process would report drift that no longer exists.
-  return projectHealthFromBoard(board, escalations.length, serverBuildDrifts());
+  // Read the running builds live rather than from a stored report: which build is running is a fact
+  // about this instant, and a patrol row written by a since-restarted process would report drift
+  // that no longer exists. It needs neither of the other two, so all three run concurrently.
+  const [board, escalations, staleServers] = await Promise.all([
+    getBoard(project),
+    openEscalations(project.id),
+    serverBuildDrifts(),
+  ]);
+  return projectHealthFromBoard(board, escalations.length, staleServers);
 }

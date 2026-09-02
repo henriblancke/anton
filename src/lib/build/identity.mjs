@@ -589,6 +589,44 @@ function hashContents(hash, path) {
 const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
 
 /**
+ * The env files `next build` loads in production — the mode `anton start` compiles in. Their
+ * CONTENTS are already a build input (`ignoredEnvFiles`, or the diff where they are tracked); what
+ * is read from them here is which variables of the build ENVIRONMENT their values pull in.
+ */
+const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
+
+/** One expansion in an env-file value: `$NAME` or `${NAME}`, unless the `$` is escaped. */
+const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+
+/**
+ * The build-environment variables the loaded env files EXPAND — the second route a value Next
+ * inlines takes into the artifact (PR #217 review).
+ *
+ * `NEXT_PUBLIC_API_URL=$API_HOST` in `.env.local` compiles the value of `API_HOST` into the bundle,
+ * and neither digest moves when that value does: the file's bytes are unchanged, and `API_HOST`
+ * wears no `NEXT_PUBLIC_` prefix. `anton start` accepts the previous stamp and serves the old URL.
+ *
+ * Every reference is named, not only those in public assignments: dotenv expands transitively
+ * (`NEXT_PUBLIC_URL=$API_HOST` over `API_HOST=$REGION_HOST`), and a `$` inside single quotes expands
+ * nothing at all. Both are over-inclusive by the width of one name, and the caller folds in only
+ * names this environment actually SETS — a rebuild too many costs one build, while a missed one
+ * serves a value the checkout no longer holds.
+ */
+function expandedEnvNames(appRoot) {
+  const names = new Set();
+  for (const file of BUILD_ENV_FILES) {
+    let text;
+    try {
+      text = readFileSync(join(appRoot, file), "utf8");
+    } catch {
+      continue;
+    }
+    for (const [, name] of text.matchAll(ENV_EXPANSION)) names.add(name);
+  }
+  return names;
+}
+
+/**
  * A digest of the build-time environment values Next compiles in — null when none are set.
  *
  * `ignoredEnvFiles` closes this hole on the FILE side only, and a `.env` file is not the only place
@@ -597,17 +635,17 @@ const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
  * with a different value finds a stamp that still matches the checkout, reuses the `.next` compiled
  * from the OLD value, and every drift surface calls that server current (PR #217 review).
  *
- * The prefix is the whole scope, deliberately: it is the one class of variable Next documents as
- * compiled into the artifact, and it is stable per shell. Digesting the environment wholesale would
- * fold in `PWD`, `TERM` and every per-invocation variable, and rebuild on each one.
+ * The scope is the prefix plus whatever the env files expand into one, deliberately: those are the
+ * variables that reach the artifact, and they are stable per shell. Digesting the environment
+ * wholesale would fold in `PWD`, `TERM` and every per-invocation variable, and rebuild on each one.
  *
  * `\0` frames name from value because neither can contain one, so no pair of variables can digest
  * into the same bytes as another.
  */
-function readEnvDigest(env) {
-  const names = Object.keys(env)
-    .filter((name) => name.startsWith(INLINED_ENV_PREFIX) && env[name] !== undefined)
-    .sort();
+function readEnvDigest(env, appRoot) {
+  const inlined = new Set(Object.keys(env).filter((name) => name.startsWith(INLINED_ENV_PREFIX)));
+  for (const name of expandedEnvNames(appRoot)) inlined.add(name);
+  const names = [...inlined].filter((name) => env[name] !== undefined).sort();
   if (!names.length) return null;
   const digest = createHash("sha256");
   for (const name of names) digest.update(name).update("\0").update(env[name]).update("\0");
@@ -621,7 +659,8 @@ function readEnvDigest(env) {
  * proves `appRoot` is its own checkout, and without it a bundle unpacked in a git-tracked $HOME
  * would wear that repo's uncommitted dotfile edits. The env digest carries no such condition — it
  * is a read of this process's own environment, which is exactly the environment `anton start` hands
- * the `next build` it spawns (`runLocal` inherits it).
+ * the `next build` it spawns (`runLocal` inherits it), widened by the variables the checkout's env
+ * files expand out of it.
  *
  * @param {string} appRoot
  * @param {Record<string, string|undefined>} [env] the environment a build from this process compiles with
@@ -633,7 +672,7 @@ export function readBuildIdentity(appRoot, env = process.env) {
     version: readVersion(appRoot),
     revision,
     worktree: revision && revision !== REVISION_UNREADABLE ? readWorktreeDigest(appRoot) : null,
-    env: readEnvDigest(env),
+    env: readEnvDigest(env, appRoot),
   };
 }
 

@@ -26,6 +26,7 @@ import {
   readBuildRecord,
   writeBuildRecord,
 } from "./identity.mjs";
+import { antonPidFile, livePid, unstampedServers } from "./servers.mjs";
 
 export type BuildDriftState = "outdated" | "modified" | "unstamped";
 
@@ -41,9 +42,10 @@ export interface BuildIdentity {
    */
   worktree?: string | null;
   /**
-   * A digest of the `NEXT_PUBLIC_*` values a build compiles in — null when none are set. Recorded
-   * so a stamp names the environment it was built with; only the freshness check (`sameCheckout`)
-   * compares it, never the drift verdict, whose reader stands in a different shell.
+   * A digest of the values a build compiles in — the `NEXT_PUBLIC_*` ones, plus whatever the
+   * checkout's env files expand into them — null when none are set. Recorded so a stamp names the
+   * environment it was built with; only the freshness check (`sameCheckout`) compares it, never the
+   * drift verdict, whose reader stands in a different shell.
    */
   env?: string | null;
 }
@@ -68,9 +70,9 @@ export interface ServerDrift {
   /** True for the process answering the request — the only one whose in-memory identity can stand in. */
   self: boolean;
   /**
-   * Whether this process executes the scheduled jobs. Undefined when its record predates the field,
-   * where a reader must claim neither: attributing a nightly to a UI-only server is the mistake
-   * this field exists to prevent.
+   * Whether this process executes the scheduled jobs. Undefined when nothing says — a record
+   * predating the field, or a server too old to have written one at all — where a reader must claim
+   * neither: attributing a nightly to a UI-only server is the mistake this field exists to prevent.
    */
   runner: boolean | undefined;
   drift: BuildDrift;
@@ -295,7 +297,9 @@ export function serverBuildDrift(): BuildDrift | null {
 
 /**
  * Held for the same window as the on-disk read, and for the same reason: this runs on every health
- * render, and proving a record's process alive costs a `ps` per record on a platform without procfs.
+ * render, and what it stands on is not free — a `ps` per record on a platform without procfs to
+ * prove it alive, plus one enumeration of the machine's listening sockets and a fetch per candidate
+ * to find the servers no record names.
  */
 let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
 
@@ -315,18 +319,18 @@ let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
  * only the process asking can be assumed to still be up.
  *
  * `bootedFrom` covers this process when the state dir could not be written, the same fallback the
- * per-process read has — the difference being that nothing can stand in for a NEIGHBOUR whose record
- * is missing. That server is `anton doctor`'s to name; it has the pidfile and the port.
+ * per-process read has. A NEIGHBOUR whose record is missing has no such stand-in, so it is found the
+ * only way it can be — as a live process of this checkout ({@link unstampedNeighbours}).
  */
-export function serverBuildDrifts(): ServerDrift[] {
+export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   const now = Date.now();
   if (driftsCache && now - driftsCache.at < ON_DISK_TTL_MS) return driftsCache.drifts;
-  const drifts = readServerDrifts();
-  driftsCache = { at: now, drifts };
+  const drifts = await readServerDrifts();
+  driftsCache = { at: Date.now(), drifts };
   return drifts;
 }
 
-function readServerDrifts(): ServerDrift[] {
+async function readServerDrifts(): Promise<ServerDrift[]> {
   const db = dbPath();
   const root = appRoot();
   const records: BuildRecord[] =
@@ -340,13 +344,52 @@ function readServerDrifts(): ServerDrift[] {
     const drift = driftOf(bootedFrom, null);
     if (drift) drifts.push({ pid: process.pid, self: true, runner: bootedRunner, drift });
   }
+  for (const pid of await unstampedNeighbours(root, records)) {
+    drifts.push({ pid, self: false, runner: undefined, drift: unstampedDrift() });
+  }
   return drifts;
+}
+
+/**
+ * The servers of this install that no record above accounts for — the pre-stamp ones (PR #217
+ * review).
+ *
+ * The records answer for the processes that WROTE one, and the upgrade this module exists for is
+ * precisely the case where one did not: a server predating build stamps stays up running the
+ * nightlies while the operator, having pulled, starts a current one on the next free port. Reading
+ * records alone, this page calls that install clean and the stale runner goes on shipping old
+ * verdicts — the silence, one process over. `anton doctor` already looks beside its records, and the
+ * two must not answer differently about the same machine, so both stand on `unstampedServers`.
+ *
+ * THIS process is never a candidate, whatever the records say. The search proves a listener is
+ * anton's by fetching its page, and a server fetching its own page from inside a render of that page
+ * would recurse; the process asking is also the one case a record can never be needed for, since
+ * `bootedFrom` already stands in for it.
+ */
+async function unstampedNeighbours(root: string | null, records: BuildRecord[]): Promise<number[]> {
+  if (!root) return [];
+  const accounted = new Set<number>([process.pid, ...records.map((record) => record.pid)]);
+  return unstampedServers({
+    isBundle: isBundleInstall(root),
+    appRoot: root,
+    livePids: accounted,
+    pid: () => livePid(antonPidFile()),
+  });
 }
 
 function driftOf(running: BuildIdentity, bootedAt: number | null): BuildDrift | null {
   const verdict = compareBuild(running, onDiskIdentity());
   if (verdict.state === "current") return null;
   return { ...verdict, bootedAt } as BuildDrift;
+}
+
+/**
+ * The verdict for a server that recorded nothing: running, and unable to say what it is running.
+ * Never "current" — an identity with no version is what `compareBuild` reads as unstamped — and it
+ * carries no boot time, because the only thing that would have written one is the record it lacks.
+ */
+function unstampedDrift(): BuildDrift {
+  return { ...compareBuild(null, onDiskIdentity()), bootedAt: null } as BuildDrift;
 }
 
 /** Whether a record claims its process runs the jobs — undefined when it predates the field. */

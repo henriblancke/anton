@@ -9,6 +9,16 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+/**
+ * The search for servers no record accounts for enumerates the whole machine and fetches the page of
+ * every listener of this checkout — including whatever `anton dev` the developer running these tests
+ * has up. Stubbed by default, so a case says what it found rather than what the box happens to hold.
+ */
+vi.mock("./servers.mjs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./servers.mjs")>()),
+  unstampedServers: vi.fn(async (): Promise<number[]> => []),
+}));
+
 let dir: string;
 const realDb = process.env.ANTON_DB;
 
@@ -314,6 +324,13 @@ describe("serverBuildDrifts", () => {
     writeFileSync(join(dir, `server-build.${pid}.json`), JSON.stringify({ ...mine, pid, startedAt: null, ...over }));
   }
 
+  /** What the search beside the records finds — the servers too old to have written one. */
+  async function searchFinds(pids: number[]) {
+    const { unstampedServers } = await import("./servers.mjs");
+    vi.mocked(unstampedServers).mockResolvedValue(pids);
+    return vi.mocked(unstampedServers);
+  }
+
   // The silence the reviewer found: the page renders in the UI-only process, which is current, while
   // the runner beside it grinds through nightlies on a build that shipped days ago.
   it("reports a stale runner beside a current process serving the page", async () => {
@@ -321,7 +338,7 @@ describe("serverBuildDrifts", () => {
     recordServerBuild({ runner: false });
     neighbour(process.ppid, { version: "0.0.1", runner: true });
 
-    const drifts = serverBuildDrifts();
+    const drifts = await serverBuildDrifts();
     expect(drifts).toHaveLength(1);
     expect(drifts[0]).toMatchObject({ pid: process.ppid, self: false, runner: true });
     expect(drifts[0].drift.state).toBe("outdated");
@@ -336,7 +353,7 @@ describe("serverBuildDrifts", () => {
     const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
     writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
 
-    const drifts = serverBuildDrifts();
+    const drifts = await serverBuildDrifts();
     expect(drifts).toHaveLength(1);
     expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: false });
   });
@@ -350,7 +367,7 @@ describe("serverBuildDrifts", () => {
     delete mine.runner;
     writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
 
-    expect(serverBuildDrifts()[0]?.runner).toBeUndefined();
+    expect((await serverBuildDrifts())[0]?.runner).toBeUndefined();
   });
 
   it("says nothing when every running server is the build on disk", async () => {
@@ -358,7 +375,7 @@ describe("serverBuildDrifts", () => {
     recordServerBuild({ runner: true });
     neighbour(process.ppid);
 
-    expect(serverBuildDrifts()).toEqual([]);
+    expect(await serverBuildDrifts()).toEqual([]);
   });
 
   // Nothing deletes a record at exit, so a stopped server's leftover would banner the health page
@@ -368,7 +385,7 @@ describe("serverBuildDrifts", () => {
     recordServerBuild({ runner: true });
     neighbour(999_999, { version: "0.0.1", pid: 999_999 });
 
-    expect(serverBuildDrifts()).toEqual([]);
+    expect(await serverBuildDrifts()).toEqual([]);
   });
 
   // `ANTON_DB` deliberately points two checkouts at one database, and a neighbour's build says
@@ -378,7 +395,7 @@ describe("serverBuildDrifts", () => {
     recordServerBuild({ runner: true });
     neighbour(process.ppid, { version: "0.0.1", appRoot: join(dir, "elsewhere") });
 
-    expect(serverBuildDrifts()).toEqual([]);
+    expect(await serverBuildDrifts()).toEqual([]);
   });
 
   // The state dir anton could not write to: no record exists for anyone, so the identity this
@@ -394,20 +411,47 @@ describe("serverBuildDrifts", () => {
     const { recordServerBuild, serverBuildDrifts } = await import("./drift");
 
     recordServerBuild({ runner: true });
-    expect(serverBuildDrifts()).toEqual([]);
+    expect(await serverBuildDrifts()).toEqual([]);
 
     onDisk = { version: "0.4.1", revision: null };
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + 60_000); // past the TTL on both the on-disk read and this one
 
-    const drifts = serverBuildDrifts();
+    const drifts = await serverBuildDrifts();
     expect(drifts).toHaveLength(1);
     expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: true });
     expect(drifts[0].drift.state).toBe("outdated");
   });
 
+  // The upgrade this whole module exists for: a server predating build stamps still up beside the
+  // current one, with no record to its name. Reading records alone, this page calls the install
+  // clean while that process goes on running the nightlies from code that shipped days ago.
+  it("reports a server of this checkout that no record accounts for", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: false });
+    await searchFinds([424_242]);
+
+    const drifts = await serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0]).toMatchObject({ pid: 424_242, self: false, runner: undefined });
+    expect(drifts[0].drift.state).toBe("unstamped");
+    expect(drifts[0].drift.running).toBeNull();
+  });
+
+  // The search proves a listener is anton's by fetching its page, so handing it this process would
+  // have the server fetch its own page from inside a render of that page.
+  it("searches only past the processes already accounted for, this one included", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    neighbour(process.ppid);
+    const search = await searchFinds([]);
+
+    await serverBuildDrifts();
+    expect(search.mock.calls[0]?.[0]?.livePids).toEqual(new Set([process.pid, process.ppid]));
+  });
+
   it("says nothing in a process that never booted a server", async () => {
     const { serverBuildDrifts } = await freshModule();
-    expect(serverBuildDrifts()).toEqual([]);
+    expect(await serverBuildDrifts()).toEqual([]);
   });
 });
