@@ -11,7 +11,7 @@
  * — whose writable state lives outside the replaceable runtime dir — records beside the database
  * `anton setup` created rather than inside a directory the next update deletes.
  */
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
   buildRecordPath,
@@ -185,6 +185,26 @@ function onDiskIdentity(): BuildIdentity {
 }
 
 /**
+ * Forget what this module last read off disk, because the caller just moved the code there
+ * (PR #217 review).
+ *
+ * The TTL above is a rate limit for readers that cannot know when a deploy lands. A caller that
+ * fast-forwarded the checkout ITSELF does know, and comparing against a read taken before its own
+ * pull is the silence this module exists to end, one layer up: the nightly pass refreshes anton's
+ * checkout and then asks whether the server is running that code — inside 15s of boot, on the exact
+ * pass whose answer changed, the cached read still says yes.
+ *
+ * Naming a path other than this install's checkout changes nothing: the projects anton scans are
+ * usually somebody else's repo, and their commits say nothing about the build this server runs.
+ */
+export function checkoutMoved(repoPath: string): void {
+  const root = appRoot();
+  if (!root || resolve(repoPath) !== resolve(root)) return;
+  onDiskCache = null;
+  driftsCache = null;
+}
+
+/**
  * Record what this process is running. Called once from the instrumentation hook, BEFORE the runner
  * starts: a UI-only server (`ANTON_RUNNER=off`) is just as capable of being stale, and a record
  * written only on the runner path would leave that one silently unstamped.
@@ -320,6 +340,14 @@ export function serverBuildDrift(): BuildDrift | null {
 let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
 
 /**
+ * The read currently running, shared with every caller that arrives while it does (PR #217 review).
+ * The cache alone only spares the SECOND render: concurrent ones all miss together, and each then
+ * fires the whole neighbour search independently — one enumeration of the machine's sockets and a
+ * fetch per candidate port, multiplied by the requests in flight.
+ */
+let inflightDrifts: Promise<ServerDrift[]> | null = null;
+
+/**
  * Every server of this install that is running something other than the code on disk — empty when
  * they all match, which is the ordinary case.
  *
@@ -343,9 +371,17 @@ let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
 export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   const now = Date.now();
   if (driftsCache && now - driftsCache.at < ON_DISK_TTL_MS) return driftsCache.drifts;
-  const drifts = await readServerDrifts();
-  driftsCache = { at: Date.now(), drifts };
-  return drifts;
+  // Dropped in `finally`, so a read that threw is retried by the next caller rather than replayed
+  // to every one of them for the rest of the TTL.
+  inflightDrifts ??= readServerDrifts()
+    .then((drifts) => {
+      driftsCache = { at: Date.now(), drifts };
+      return drifts;
+    })
+    .finally(() => {
+      inflightDrifts = null;
+    });
+  return inflightDrifts;
 }
 
 async function readServerDrifts(): Promise<ServerDrift[]> {

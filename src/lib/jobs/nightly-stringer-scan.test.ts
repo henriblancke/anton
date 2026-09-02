@@ -38,11 +38,16 @@ vi.mock("../git/refresh", () => ({
 // otherwise. Real drift needs a real stale server, which no unit test can boot.
 const build = vi.hoisted(() => ({
   drift: null as { state: string; running: unknown; onDisk: unknown; bootedAt: number | null } | null,
+  /** The checkouts the pass told drift had moved, in the order it said so. */
+  moved: [] as string[],
 }));
 
+// The verdict is gated on the invalidation, so a pass that asked BEFORE fast-forwarding reads as the
+// silence it is: drift caches the code on disk, and the cached copy predates the pull.
 vi.mock("../build/drift", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../build/drift")>()),
-  serverBuildDrift: () => build.drift,
+  checkoutMoved: (repoPath: string) => build.moved.push(repoPath),
+  serverBuildDrift: () => (build.moved.length > 0 ? build.drift : null),
 }));
 
 const scanned = vi.hoisted(() => ({ restoreBaseline: async (): Promise<string | undefined> => undefined }));
@@ -76,6 +81,7 @@ beforeEach(() => {
   logPath = join(dir, "session.log");
   failLogWrite = undefined;
   build.drift = null;
+  build.moved = [];
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 
@@ -171,6 +177,23 @@ it("names a stale server on the session, beside the line recording what it invok
   expect(log).toContain("[stringer] scan --delta /repo @ abc1234");
   expect(log).toContain("[stringer] WARNING: the running anton server is 0.4.0 (aaaaaaa)");
   expect(log).toContain("Restart the server");
+});
+
+// The stamp the verdict stands on is the one this pass just fast-forwarded to (PR #217 review): a
+// schedule firing within drift's 15s cache of boot would otherwise compare this server against the
+// commit the checkout held before the pull and call itself current.
+it("asks about the tree the fast-forward left, not the one the pass started on", async () => {
+  build.drift = {
+    state: "outdated",
+    running: { version: "0.4.0", revision: "a".repeat(40) },
+    onDisk: { version: "0.4.1", revision: "b".repeat(40) },
+    bootedAt: null,
+  };
+
+  await runScan();
+
+  expect(build.moved).toEqual([project.repoPath]);
+  expect(readFileSync(logPath, "utf8")).toContain("Restart the server");
 });
 
 it("says nothing when the pass runs under the build on disk", async () => {

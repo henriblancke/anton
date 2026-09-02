@@ -9,7 +9,7 @@
  */
 import { join } from "node:path";
 import { appendSessionLog } from "../sessions";
-import { describeBuildDrift, serverBuildDrift } from "../build/drift";
+import { checkoutMoved, describeBuildDrift, serverBuildDrift } from "../build/drift";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
 import { describeDuplicationFilter } from "../scan-duplication";
@@ -145,8 +145,13 @@ async function reportScanDiagnostics(
  * row filed a signal two landed filters already dropped, and the only tell was a log line the
  * running build was too old to write. The claim belongs on the log because that is where the run is
  * reconstructed afterwards; the scan proceeds either way.
+ *
+ * The verdict has to stand on the tree the fast-forward just left, not on a read taken before it
+ * (PR #217 review): drift caches the code on disk for 15s, and a schedule firing that soon after
+ * boot would compare this server against the commit it started on and call itself current.
  */
 async function reportStaleServer(project: Project, logPath: string): Promise<void> {
+  checkoutMoved(project.repoPath);
   const drift = serverBuildDrift();
   if (!drift) return;
   const detail = describeBuildDrift(drift);

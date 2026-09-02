@@ -321,6 +321,32 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(drift?.onDisk.version).toBe("0.4.1");
     expect(drift?.bootedAt).toBeNull();
   });
+
+  // The TTL is a rate limit for readers that cannot know when the code moved. The nightly pass DOES
+  // — it fast-forwards this checkout itself — and inside 15s of boot the cached read would have it
+  // compare the server against the commit it started on and call itself current (PR #217 review).
+  it("re-reads the code on disk when a caller says this checkout just moved", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { checkoutMoved, recordServerBuild, serverBuildDrift } = await import("./drift");
+
+    recordServerBuild({ runner: true });
+    onDisk = { version: "0.4.1", revision: null };
+    expect(serverBuildDrift()).toBeNull(); // the read taken at boot still stands
+
+    // Another project's checkout advancing says nothing about the build this server runs.
+    checkoutMoved(join(dir, "elsewhere"));
+    expect(serverBuildDrift()).toBeNull();
+
+    checkoutMoved(`${app}/`);
+
+    expect(serverBuildDrift()?.state).toBe("outdated");
+  });
 });
 
 /**
@@ -338,7 +364,8 @@ describe("serverBuildDrifts", () => {
   /** What the search beside the records finds — the servers too old to have written one. */
   async function searchFinds(pids: number[]) {
     const { unstampedServers } = await import("./servers.mjs");
-    vi.mocked(unstampedServers).mockResolvedValue(pids);
+    // The mock outlives a module reset, so a case counting searches must start from zero.
+    vi.mocked(unstampedServers).mockClear().mockResolvedValue(pids);
     return vi.mocked(unstampedServers);
   }
 
@@ -488,6 +515,33 @@ describe("serverBuildDrifts", () => {
 
     await serverBuildDrifts();
     expect(search.mock.calls[0]?.[0]?.livePids).toEqual(new Set([process.pid, process.ppid]));
+  });
+
+  // The cache only spares the SECOND render. Concurrent ones miss together, and the search each one
+  // would fire enumerates the machine's sockets and fetches a page per candidate port.
+  it("collapses concurrent misses into one search", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    const search = await searchFinds([]);
+
+    const [first, second] = await Promise.all([serverBuildDrifts(), serverBuildDrifts()]);
+
+    expect(search).toHaveBeenCalledOnce();
+    expect(first).toBe(second);
+  });
+
+  // A failed read must not be replayed to every later caller for the rest of the TTL — the next one
+  // retries it.
+  it("retries after a search that threw rather than caching the failure", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    const search = await searchFinds([]);
+    search.mockRejectedValueOnce(new Error("lsof: command not found"));
+
+    await expect(serverBuildDrifts()).rejects.toThrow("lsof");
+
+    expect(await serverBuildDrifts()).toEqual([]);
+    expect(search).toHaveBeenCalledTimes(2);
   });
 
   it("says nothing in a process that never booted a server", async () => {
