@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { TestDb } from "../db/testing";
 import * as schema from "../db/schema";
-import { getBoardPickerPlan } from "../board-picker-plan";
+import { getBoardPickerPlan, isPlanStale, stampBoard } from "../board-picker-plan";
 import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
@@ -17,6 +17,7 @@ import { listOpenEscalations } from "../escalations";
 import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
+import { loadAllIssues } from "../beads/issues";
 import { PoisonError } from "./errors";
 import type { Clock } from "./queue";
 import type { JobContext } from "./runner";
@@ -487,6 +488,59 @@ describe("makeBoardPickerHandler", () => {
     });
     // A start outranks "ranked N": it is the one outcome of this pass that moved something.
     expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 2)" });
+  });
+
+  it("restamps the plan against the board its own start rewrote", async () => {
+    // R3.5's apply lane is a LIVE PREVIEW: the start writes `approved` and the assignee, both inputs
+    // to the plan's freshness fence, so the row saved before it reads stale the instant it lands —
+    // and a stale plan withholds Up Next whole (PR #218 review). The pass therefore re-decides over
+    // the post-write board, which drops the started target and leaves the survivors current.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+    arm(t, "apply");
+    applyPickerPlan.mockImplementationOnce(async () => {
+      board.current = [
+        bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
+        bead("t2", { priority: 2 }),
+      ];
+      return {
+        started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
+      };
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(plan?.exclusions).toContainEqual(
+      expect.objectContaining({ beadId: "t1", reason: "claimed" }),
+    );
+    // The whole point: the recorded plan describes the board as it now reads, so the lane survives.
+    expect(isPlanStale(plan!, stampBoard(board.current, clock.now(), { types: ["task"] }))).toBe(
+      false,
+    );
+  });
+
+  it("keeps the start when the restamp fails, rather than retrying the pass", async () => {
+    // The run is already enqueued: a throw here would retry the pass, and the retry — reading a
+    // board whose top pick is now claimed — would start the NEXT target.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    applyPickerPlan.mockResolvedValueOnce({
+      started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The pass's own read stands; the RESTAMP's re-read is the one that falls over.
+    vi.mocked(loadAllIssues)
+      .mockImplementationOnce(async () => board.current)
+      .mockImplementationOnce(async () => {
+        throw new Error("bd is gone");
+      });
+
+    const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 1)" });
+    expect(warn.mock.calls.some((args) => String(args[0]).includes("restamped"))).toBe(true);
+    warn.mockRestore();
   });
 
   it("still only ranks at shadow — the level below apply starts nothing", async () => {

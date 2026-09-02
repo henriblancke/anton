@@ -19,10 +19,15 @@ import { resolveOperator } from "@/lib/operator";
 import {
   activeDeferrals,
   declinedPicks,
+  pickerTrackRecord,
   recordPickerAccept,
   withdrawPickerAccept,
 } from "@/lib/picker-veto";
-import { getProjectSettings, resolvePickerPolicy } from "@/lib/projects";
+import {
+  getProjectSettings,
+  resolvePickerAutonomy,
+  resolvePickerPolicy,
+} from "@/lib/projects";
 import { isScheduleEnabled } from "@/lib/schedules";
 import type { ApprovalRunOutcome, Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
@@ -106,8 +111,9 @@ async function readApprovalBody(request: Request): Promise<{
  * autonomy reads to decide whether the picker may ever be armed. Recording an unvalidated flag would
  * let the record claim the operator agreed with a decision they were never shown. So the server
  * re-derives the very predicate the `[Release]` button is drawn from (`board.ts` → `isPickerPick`):
- * the picker is armed, the plan carries this target as an entry, the board and policy have not moved
- * past that plan, and the operator has not since vetoed it. Anything else releases exactly as an
+ * the picker is armed AND at a level that offers its picks, the plan carries this target as an
+ * entry, the board and policy have not moved past that plan, and the operator has not since vetoed
+ * it. Anything else releases exactly as an
  * approve does and records nothing — the run is the operator's to have, the evidence is not.
  *
  * Judged against `board` — the pre-write snapshot this request already read — not a fresh one: the
@@ -142,18 +148,26 @@ async function reserveRelease(
 ): Promise<string | undefined> {
   try {
     const db = getDb();
-    const [plan, armed, policy, deferrals] = await Promise.all([
+    const [plan, armed, settings, record, deferrals] = await Promise.all([
       getBoardPickerPlan(db, projectId),
       isScheduleEnabled(projectId, "board-picker"),
-      getProjectSettings(db, projectId).then(resolvePickerPolicy),
+      getProjectSettings(db, projectId),
+      pickerTrackRecord(db, projectId),
       activeDeferrals(db, projectId, new Date()),
     ]);
+    const policy = resolvePickerPolicy(settings);
     const skip = (why: string) => {
       console.warn(`[approve] release of ${beadId} recorded no accept: ${why}`);
       return undefined;
     };
     const entry = plan?.entries.find((e) => e.beadId === beadId);
     if (!armed) return skip("the picker is disarmed");
+    // The level, beside the schedule, because the board gates the button on both (PR #218 review):
+    // `propose` ranks and offers nothing (R3.5), so a flag arriving from a tab opened before the
+    // level changed answers a pick this project never put in front of anyone.
+    if (resolvePickerAutonomy(settings, record) === "propose") {
+      return skip("the picker is at propose — it offers no picks to answer");
+    }
     if (!plan || !entry) return skip("no recorded plan picks this target");
     if (displayedPlanId !== undefined && plan.planId !== displayedPlanId) {
       return skip("a later pass replaced the plan generation the operator answered");

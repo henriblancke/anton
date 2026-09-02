@@ -25,8 +25,9 @@
  *     paces a policy start exactly as it paces a queued one.
  *   • It never invents a claim protocol. The bead write-lock and the assignee CAS are the ones the
  *     approve route uses; on an embedded board the mirror they judge is refreshed first (see
- *     {@link refreshFor}), the reservation is then published and read back before anything is
- *     enqueued (see {@link settleClaim}), and the pass stands down whenever either leg fails.
+ *     {@link refreshFor}), and on every board with a second writer the reservation is settled and
+ *     read back before anything is enqueued (see {@link settleClaim}) — the pass stands down
+ *     whenever either leg fails.
  */
 import { beads, CLAIM_SETTLE_MS, type SyncOutcome } from "../beads/bd";
 import { isServerMode } from "../beads/board-mode";
@@ -168,15 +169,23 @@ type SettleVerdict = { held: true } | { lost: string } | { unverified: string } 
  * irreversible half of a start (a second machine's run is not something a later pass can take back),
  * so the proof has to come before it, not after.
  *
- * Skipped where there is nothing to settle against: a shared-server board is authoritative the
- * moment it commits, and a not-wired embedded board has no second machine to race.
+ * A shared-server board drops the SYNC legs and keeps the settle (PR #218 review). There is nothing
+ * to publish — the write landed on the one database the moment bd committed it — but that is not the
+ * same as being arbitrated: unlike `beads.claimVerified`, which rides bd's atomic `bd update
+ * --claim`, this pass reserves through a read-then-`assign` CAS (a policy claim must not flip the
+ * status), and two processes can both read the target free and both write, with the LAST write
+ * standing. Waiting the propagation window and re-reading is what turns that last-write-wins into a
+ * decided race: after both writes have landed, both processes read the same single assignee, and
+ * only its owner starts anything. Skipped only on a not-wired embedded board, which has no second
+ * machine to race.
  *
  * The assignee is machine-scoped, not per-instance (see `lib/operator.ts`: it is the same identity
  * the run ownership gate and review-fix's PR filter compare against), so two machines resolving to
  * one operator string cannot be told apart HERE — that residual cross-process window is the one
- * `beads/claim.ts` documents and anton-od4 tracks. It is not the last guard: the irreversible half,
- * the run itself, arbitrates on a per-run lease token in `execute-epic.ts`, so a double enqueue
- * still ends with exactly one run and the other parked.
+ * `beads/claim.ts` documents and anton-od4 tracks, and it is what a write landing AFTER the loser's
+ * settle read leaves open. It is not the last guard: the irreversible half, the run itself,
+ * arbitrates on a per-run lease token in `execute-epic.ts`, so a double enqueue still ends with
+ * exactly one run and the other parked.
  */
 async function settleClaim(
   repoPath: string,
@@ -184,19 +193,23 @@ async function settleClaim(
   owner: string,
   deps: ClaimSettleDeps = {},
 ): Promise<SettleVerdict> {
-  if (isServerMode(repoPath)) return { held: true };
+  // On a shared server the board IS the remote: every leg below that reconciles a local mirror is
+  // not just unnecessary but unrunnable (`bd dolt pull/push` would run on the server itself).
+  const shared = isServerMode(repoPath);
   const push = deps.push ?? beads.push;
   const pull = deps.pull ?? beads.pull;
   const readBoard = deps.board ?? loadAllIssues;
   const sleep = deps.sleep ?? sleepMs;
 
-  let outcome: SyncOutcome;
-  try {
-    outcome = await push(repoPath);
-  } catch (e) {
-    return { unverified: `the claim could not be published before starting (${errorText(e)})` };
+  if (!shared) {
+    let outcome: SyncOutcome;
+    try {
+      outcome = await push(repoPath);
+    } catch (e) {
+      return { unverified: `the claim could not be published before starting (${errorText(e)})` };
+    }
+    if (outcome !== "synced") return { held: true };
   }
-  if (outcome !== "synced") return { held: true };
 
   await sleep(deps.settleMs ?? CLAIM_SETTLE_MS);
   // The whole board, not just the bead: winning the assignee proves the race was won, not that the
@@ -204,7 +217,7 @@ async function settleClaim(
   // its children and its blockers.
   let board: Bead[];
   try {
-    await pull(repoPath);
+    if (!shared) await pull(repoPath);
     board = await readBoard(repoPath);
   } catch (e) {
     return { unverified: `the claim could not be read back before starting (${errorText(e)})` };

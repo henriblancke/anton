@@ -21,7 +21,8 @@ import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { beads, ownerOf } from "../beads/bd";
 import * as schema from "../db/schema";
-import { getBoardPickerPlan } from "../board-picker-plan";
+import { getBoardPickerPlan, isPlanStale, stampBoard } from "../board-picker-plan";
+import { loadAllIssues } from "../beads/issues";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { makeBoardPickerHandler } from "./board-picker";
 import { systemClock } from "./queue";
@@ -122,9 +123,17 @@ describeBd("board-picker apply e2e (real handler · real bd)", () => {
 
     // ONE start, and it is the top of the ranking the same pass recorded.
     expect(await startedEpics()).toEqual([first]);
-    expect(effect).toMatchObject({ changed: true });
+    expect(effect).toMatchObject({ changed: true, note: `started ${first} (rank 1 of 3)` });
+    // The plan the pass leaves behind describes the board AFTER the start (PR #218 review): the
+    // started target drops out as `claimed` and the survivors stay live, so Up Next keeps offering
+    // the picks below it instead of being withheld as stale until the next pass.
     const plan = await getBoardPickerPlan(t.db, "p1");
-    expect(plan?.entries[0]?.beadId).toBe(first);
+    expect(plan?.entries.map((e) => e.beadId)).toEqual([second, third]);
+    expect(plan?.exclusions).toContainEqual(
+      expect.objectContaining({ beadId: first, reason: "claimed" }),
+    );
+    const after = await loadAllIssues(repo, { strictGates: true });
+    expect(isPlanStale(plan!, stampBoard(after, Date.now(), { types: ["task"] }))).toBe(false);
 
     // The label and the claim landed together on that one bead.
     const started = await beads.show(repo, first);
@@ -133,7 +142,7 @@ describeBd("board-picker apply e2e (real handler · real bd)", () => {
 
     // R1.7: the note names the rule and the rank, and bd attributes it to nobody watching.
     expect(String(started.notes ?? "")).toContain("started by POLICY — rank 1 of 3");
-    expect(String(started.notes ?? "")).toContain(plan!.entries[0].rule);
+    expect(String(started.notes ?? "")).toContain(plan!.entries[0]!.rule);
 
     // And nothing else moved: the ranked-but-not-started targets are untouched backlog.
     for (const id of [second, third]) {

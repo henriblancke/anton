@@ -269,12 +269,39 @@ describe("applyPickerPlan", () => {
     expect(await jobs()).toHaveLength(0);
   });
 
-  it("does not pull on a shared-server board — there is no mirror to refresh", async () => {
+  it("settles a shared-server claim without the sync legs that board cannot run", async () => {
+    // There is no mirror to refresh and nothing to publish — `bd dolt pull/push` would run ON the
+    // server — but the reservation is still a read-then-assign CAS two processes can both write, so
+    // the settle window and the read-back stay.
+    pinBoardMode(REPO, { mode: "server", host: "db.test", port: 3306, database: "beads" });
+    put(bead("t1"));
+    const push = vi.fn(async () => "synced" as const);
+
+    const outcome = await apply("t1", 1, { push, sleep: async () => {} });
+
+    expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+    expect(pulls).toBe(0);
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("enqueues nothing when a shared-server claim loses the last write", async () => {
+    // The cross-process race the local CAS cannot order (beads/claim.ts): two pickers both read the
+    // target free and both assign, last write standing. Re-reading after the window is what decides
+    // it — the loser sees the winner's assignee and starts nothing.
     pinBoardMode(REPO, { mode: "server", host: "db.test", port: 3306, database: "beads" });
     put(bead("t1"));
 
-    expect(await apply("t1")).toMatchObject({ started: { beadId: "t1" } });
-    expect(pulls).toBe(0);
+    const outcome = await apply("t1", 1, {
+      sleep: async () => {
+        board.current.get("t1")!.assignee = "other-box";
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      skipped: { beadId: "t1", reason: "other-box claimed it first" },
+    });
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
   });
 
   it("enqueues exactly one run across two overlapping passes, and notes one start", async () => {
