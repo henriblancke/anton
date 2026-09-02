@@ -14,7 +14,14 @@ import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 
-import { agentsFromArgs, ensureFreshBuild, nextArgs, procfsListeningPids, resolvePort, serverIsUp } from "./anton.mjs";
+import {
+  agentsFromArgs,
+  ensureFreshBuild,
+  nextArgs,
+  procfsListeningEndpoints,
+  resolvePort,
+  unstampedServers,
+} from "./anton.mjs";
 
 import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
@@ -324,25 +331,36 @@ describe("anton doctor — skill drift", () => {
 });
 
 /**
- * Whose server the liveness evidence belongs to (anton-pzfb). Both signals are shared across
- * installs — the pidfile sits in the global state dir, and any anton can hold the port — so each
- * mode may read only its own. The end-to-end cases below all run from this source checkout, which
- * is why bundle mode is asserted on the unit here.
+ * Whose server the liveness evidence belongs to (anton-pzfb), and which servers a live record is
+ * allowed to speak for (PR #217). Both signals are shared across installs — the pidfile sits in the
+ * global state dir, and any anton can hold a port — so each mode may read only its own, and a
+ * stamped record answers for its own process alone. The end-to-end cases below all run from this
+ * source checkout, which is why bundle mode is asserted on the unit here.
  */
-describe("anton doctor — liveness evidence is scoped to the install", () => {
+describe("anton doctor — servers no record accounts for", () => {
   const answers = () => Promise.resolve(true);
   const silent = () => Promise.resolve(false);
+  const listening = (...pids: number[]) => () => pids.map((pid, i) => ({ pid, port: 4000 + i }));
 
   it("trusts only the daemon pidfile in bundle mode", async () => {
-    expect(await serverIsUp({ isBundle: true, port: "3000", pid: () => 42, answering: silent })).toBe(true);
+    expect(await unstampedServers({ isBundle: true, pid: () => 42, servers: listening(7), answering: answers })).toEqual([42]);
     // A separate source checkout serving anton's page is not this bundle's stopped daemon.
-    expect(await serverIsUp({ isBundle: true, port: "3000", pid: () => null, answering: answers })).toBe(false);
+    expect(await unstampedServers({ isBundle: true, pid: () => null, servers: listening(7), answering: answers })).toEqual([]);
   });
 
-  it("trusts only the port in source mode", async () => {
-    expect(await serverIsUp({ isBundle: false, port: "3000", pid: () => null, answering: answers })).toBe(true);
+  it("trusts only this checkout's listeners in source mode", async () => {
+    expect(await unstampedServers({ isBundle: false, pid: () => 42, servers: listening(7), answering: answers })).toEqual([7]);
     // `anton dev` writes no pidfile, so the one on disk is the installed bundle's.
-    expect(await serverIsUp({ isBundle: false, port: "3000", pid: () => 42, answering: silent })).toBe(false);
+    expect(await unstampedServers({ isBundle: false, pid: () => 42, servers: listening(7), answering: silent })).toEqual([]);
+  });
+
+  // A record proves what ONE process is running. A second, older server — the pre-stamp one an
+  // upgrade leaves behind on another port — is exactly what nothing else can see.
+  it("keeps the servers a live record already speaks for out of the answer", async () => {
+    const livePids = new Set([7]);
+    expect(await unstampedServers({ isBundle: false, livePids, servers: listening(7), answering: answers })).toEqual([]);
+    expect(await unstampedServers({ isBundle: false, livePids, servers: listening(7, 9), answering: answers })).toEqual([9]);
+    expect(await unstampedServers({ isBundle: true, livePids: new Set([42]), pid: () => 42, answering: answers })).toEqual([]);
   });
 });
 
@@ -351,7 +369,7 @@ describe("anton doctor — liveness evidence is scoped to the install", () => {
  * lsof nor declares it a prereq, and most distros ship without it — an enumerator that is merely
  * absent would answer "nothing is listening" about every live source server on those boxes.
  */
-describe("listeningPids — procfs", () => {
+describe("listeningEndpoints — procfs", () => {
   const dirs = tempDirs();
 
   afterEach(dirs.cleanup);
@@ -373,28 +391,45 @@ describe("listeningPids — procfs", () => {
     return root;
   };
 
-  it("resolves the pid holding the listening socket", async () => {
-    const root = await fakeProc(table(row("0BB8", "99001")), [[4242, "99001"]]);
-    expect(procfsListeningPids("3000", root)).toEqual([4242]);
-  });
-
-  it("says nothing is listening when no LISTEN socket is bound to the port", async () => {
-    // Same port, but established — and a listener on a different port.
-    const root = await fakeProc(table(row("0BB8", "99001", "01"), row("0FA0", "99002")), [
+  it("resolves the pid and port of each listening socket", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001"), row("0FA0", "99002")), [
       [4242, "99001"],
       [4243, "99002"],
     ]);
-    expect(procfsListeningPids("3000", root)).toEqual([]);
+    expect(procfsListeningEndpoints(root)).toEqual([
+      { pid: 4242, port: 3000 },
+      { pid: 4243, port: 4000 },
+    ]);
+  });
+
+  it("says nothing is listening when no socket is in LISTEN", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001", "01")), [[4242, "99001"]]);
+    expect(procfsListeningEndpoints(root)).toEqual([]);
   });
 
   it("cannot say when there is no procfs to read", async () => {
-    expect(procfsListeningPids("3000", await dirs.make("anton-noproc-"))).toBeNull();
+    expect(procfsListeningEndpoints(await dirs.make("anton-noproc-"))).toBeNull();
   });
 
-  it("cannot say when the listening socket belongs to a process anton can't read", async () => {
+  // "Found, owned by someone else" is not "not listening": the socket is real, so the port is not
+  // free — it just belongs to a process anton cannot attribute, which is no evidence about it.
+  it("names the port but no pid when the socket belongs to a process anton can't read", async () => {
     // Another user's server: the socket is in the table, but no readable fd links back to it.
     const root = await fakeProc(table(row("0BB8", "99001")));
-    expect(procfsListeningPids("3000", root)).toBeNull();
+    expect(procfsListeningEndpoints(root)).toEqual([{ pid: null, port: 3000 }]);
+  });
+
+  // One server holds a socket per address family, and both have to resolve back to it — stopping at
+  // the first match would leave whatever it holds beyond that one unattributed.
+  it("attributes every socket a process holds, not just the first", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001"), row("0FA0", "99002")));
+    mkdirSync(join(root, "4242", "fd"), { recursive: true });
+    symlinkSync("socket:[99001]", join(root, "4242", "fd", "3"));
+    symlinkSync("socket:[99002]", join(root, "4242", "fd", "4"));
+    expect(procfsListeningEndpoints(root)).toEqual([
+      { pid: 4242, port: 3000 },
+      { pid: 4242, port: 4000 },
+    ]);
   });
 });
 
@@ -453,12 +488,14 @@ describe("anton doctor — stale server build", () => {
   /**
    * Point doctor's state dir at a temp dir and leave `record` there as the running server's stamp.
    *
-   * The port is pinned per case because doctor now probes it: left to default, a suite run on the
-   * developer's own machine would find THEIR anton on 3000 and flip every "nothing is running" case.
+   * No port is pinned, because doctor no longer probes one: it enumerates the servers listening
+   * from this checkout (PR #217). A case that must find nothing running therefore serves nothing,
+   * and one that must find a server serves it from this process — whose cwd IS the checkout doctor
+   * is diagnosing, so an `anton dev` of your own in THIS worktree would join the answer.
    */
   async function runDoctorWith(
     record: { pid: number } | ({ pid: number } | null)[] | null,
-    { daemonPid, port = 1, recordedPort }: { daemonPid?: number; port?: number; recordedPort?: number } = {},
+    { daemonPid }: { daemonPid?: number } = {},
   ) {
     const records = (Array.isArray(record) ? record : [record]).filter((one) => one !== null);
     const home = await dirs.make("anton-home-");
@@ -467,17 +504,10 @@ describe("anton doctor — stale server build", () => {
     // claims as one thing — a name that disagrees with the contents names no process at all.
     for (const one of records) writeFileSync(join(state, `server-build.${one.pid}.json`), JSON.stringify(one));
     if (daemonPid) writeFileSync(join(state, "anton.pid"), String(daemonPid));
-    // `recordedPort` stands in for a `dev`/`start` that ran earlier on a nondefault port and left
-    // its note beside anton.db; doctor is then invoked with no flag at all, which is the case.
-    if (recordedPort) writeFileSync(join(state, "server-port"), `${recordedPort}\n`);
-    const args = recordedPort ? [CLI, "doctor"] : [CLI, "doctor", "--port", String(port)];
-    // Spawned ASYNCHRONOUSLY on purpose: doctor probes the port, and `spawnSync` would block this
-    // process's event loop — the very loop the stub server above answers from.
-    // PORT is dropped, not inherited: it outranks the recorded note the way `--port` does, so a
-    // developer's own `PORT=3000` would send the probe at whatever they have running instead.
+    // Spawned ASYNCHRONOUSLY on purpose: doctor asks the servers it finds for anton's page, and
+    // `spawnSync` would block this process's event loop — the very loop the stubs above answer from.
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state };
-    delete env.PORT;
-    const child = spawn(process.execPath, args, { cwd: await dirs.make("anton-cwd-"), env });
+    const child = spawn(process.execPath, [CLI, "doctor"], { cwd: await dirs.make("anton-cwd-"), env });
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => (stdout += chunk));
@@ -519,38 +549,32 @@ describe("anton doctor — stale server build", () => {
   });
 
   // A source checkout's `anton dev` / `anton start` writes no pidfile, so on the first upgrade past
-  // this change — an old server, no record, no daemon — the port is the only evidence anton has.
-  // Without it doctor calls that exact case "nothing running" and the stale server stays silent.
-  it("reports a source-mode server answering the port but leaving no record", async () => {
-    const r = await runDoctorWith(null, { port: await serve("<html><head><title>anton</title></head>") });
+  // this change — an old server, no record, no daemon — the listener is the only evidence anton
+  // has. Without it doctor calls that exact case "nothing running" and the stale server stays
+  // silent. The port is whatever the stub took, which is the point: nothing on disk names it.
+  it("reports a source-mode server that is up but left no record", async () => {
+    await serve("<html><head><title>anton</title></head>");
+    const r = await runDoctorWith(null);
     expect(r.stdout).toContain("recorded no build identity");
     expect(r.stdout).toContain("Restart it to run the build on disk");
   });
 
-  // doctor is its own invocation: nothing on its command line remembers `anton dev --port 4000`,
-  // so without the note `dev`/`start` leaves it probes 3000 and calls a live stale server "nothing
-  // running" — in exactly the pre-stamp upgrade this probe exists for.
-  it("probes the port dev/start recorded, not 3000, when the invocation names none", async () => {
-    const recordedPort = await serve("<html><head><title>anton</title></head>");
-    const r = await runDoctorWith(null, { recordedPort });
-    expect(r.stdout).toContain("recorded no build identity");
-    expect(r.stdout).toContain("Restart it to run the build on disk");
-  });
-
-  // Any dev server can hold the port. Claiming a stranger's is anton would send the operator to
+  // Any dev server can hold a port. Claiming a stranger's is anton would send the operator to
   // restart a server that was never up.
   it("does not claim another app on the port is a stale anton", async () => {
-    const r = await runDoctorWith(null, { port: await serve("<html><head><title>grafana</title></head>") });
+    await serve("<html><head><title>grafana</title></head>");
+    const r = await runDoctorWith(null);
     expect(r.stdout).toContain("no running server recorded");
     expect(r.stdout).not.toContain("Restart it");
   });
 
-  // Any anton can hold the port, and the page it serves is the same page — so the response alone
+  // Any anton can hold a port, and the page it serves is the same page — so the response alone
   // attributes a neighbouring install's server (a bundle, a second worktree) to this checkout, and
   // hands the operator restart instructions for an install they are not in.
-  it("does not claim another anton install's server on the port", async () => {
+  it("does not claim another anton install's server", async () => {
     const elsewhere = await dirs.make("anton-elsewhere-");
-    const r = await runDoctorWith(null, { port: await serveFrom("<html><head><title>anton</title></head>", elsewhere) });
+    await serveFrom("<html><head><title>anton</title></head>", elsewhere);
+    const r = await runDoctorWith(null);
     expect(r.stdout).toContain("no running server recorded");
     expect(r.stdout).not.toContain("Restart it");
   });
@@ -565,10 +589,40 @@ describe("anton doctor — stale server build", () => {
   // would both vouch for a build nothing is serving AND stand in for the liveness check — so the
   // one server that IS up, too old to have left a record of its own, stays invisible.
   it("does not let a stopped server's leftover record answer for a server that is running", async () => {
-    const port = await serve("<html><head><title>anton</title></head>");
-    const r = await runDoctorWith(running({ pid: process.pid, startedAt: "a process that has exited" }), { port });
+    await serve("<html><head><title>anton</title></head>");
+    const r = await runDoctorWith(running({ pid: process.pid, startedAt: "a process that has exited" }));
     expect(r.stdout).toContain("recorded no build identity");
     expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // A live record proves what ONE process is running and nothing about a second, older one. The
+  // upgrade this check exists for leaves a pre-stamp server up while the operator, having pulled,
+  // starts a current one on the next free port — and that stale process keeps running the nightly
+  // jobs. Behind the records it has no line at all; beside them it has its own.
+  it("names a running server no live record accounts for, beside the ones that do", async () => {
+    await serve("<html><head><title>anton</title></head>");
+    // The parent of this test process stands in for the recorded server; this one, which holds the
+    // listening socket, is the server nothing recorded.
+    const r = await runDoctorWith([{ ...running(current()), pid: process.ppid }]);
+    expect(r.stdout).toContain(`pid ${process.ppid} running the build on disk`);
+    expect(r.stdout).toContain(`pid ${process.pid} is running but recorded no build identity`);
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // `ANTON_DB` deliberately points two checkouts at one database — a runner and an
+  // `ANTON_RUNNER=off` UI, or two worktrees — so a record beside it is not necessarily this
+  // checkout's. Compared against this one it prints a stale-or-current verdict about a repo the
+  // operator is not standing in.
+  it("does not compare a neighbouring install's record against this checkout", async () => {
+    const elsewhere = await dirs.make("anton-elsewhere-");
+    const r = await runDoctorWith(running({ version: "0.0.1", appRoot: elsewhere }));
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("0.0.1");
+  });
+
+  it("still answers for a record that names this checkout as the install it booted from", async () => {
+    const r = await runDoctorWith(running({ version: "0.0.1", appRoot: REPO_ROOT }));
+    expect(r.stdout).toContain("is running 0.0.1");
   });
 
   // Two servers from one install — a UI-only `ANTON_RUNNER=off` one beside the runner. Each is its

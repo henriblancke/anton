@@ -317,15 +317,44 @@ function writeStampFile(path, value) {
  * `startedAt` is the pid's birth stamp, written so a LATER reader can tell this process from an
  * unrelated one the OS handed the same pid after it exited (see `recordAlive`).
  *
+ * `appRoot` is the install the process booted FROM, written so a reader can tell whose server a
+ * record describes (see `recordFromInstall`) — the directory is not implied by where the record
+ * sits, since `ANTON_DB` can point two checkouts at one database.
+ *
  * @param {string} path
  * @param {BuildIdentity} identity
+ * @param {{pid?: number, bootedAt?: number, startedAt?: string|null, appRoot?: string|null}} [stamp]
  */
 export function writeBuildRecord(
   path,
   identity,
-  { pid = process.pid, bootedAt = Date.now(), startedAt = processStartedAt(pid) } = {},
+  { pid = process.pid, bootedAt = Date.now(), startedAt = processStartedAt(pid), appRoot = null } = {},
 ) {
-  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt });
+  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt, appRoot });
+}
+
+/**
+ * Was this record written by a server of the install at `appRoot`?
+ *
+ * Records live beside anton.db, and that database is not per-checkout: `ANTON_DB` deliberately
+ * points a runner and an `ANTON_RUNNER=off` UI — or two worktrees — at one file. Without this every
+ * reader compares a NEIGHBOUR's running build against its own code on disk and prints a stale or
+ * current verdict about a checkout the operator is not standing in (PR #217).
+ *
+ * A record carrying no `appRoot` (one written before this field existed) still answers for whoever
+ * reads it: an absence is not evidence, the same rule `compareBuild` follows field by field.
+ *
+ * Paths are compared resolved, then literally. `anton update` deletes the runtime dir a server
+ * booted from, so requiring a resolvable path would drop precisely the record whose install moved
+ * under it — the drift this module exists to report.
+ *
+ * @param {{[key: string]: unknown}|null|undefined} record
+ * @param {string} appRoot
+ */
+export function recordFromInstall(record, appRoot) {
+  const declared = record?.appRoot;
+  if (!declared || typeof declared !== "string") return true;
+  return declared === appRoot || sameDirectory(declared, appRoot);
 }
 
 /** The record a running server left, or null when there is none (or it is unreadable/malformed). */
@@ -345,6 +374,10 @@ export function readBuildRecord(path) {
  *
  * A record whose filename and `pid` field disagree is skipped rather than trusted: the name is what
  * makes a record this process's own, so one that does not match its contents names nothing.
+ *
+ * Records of OTHER installs sharing this database are returned too — `recordFromInstall` is that
+ * judgement, and it belongs to the caller: a reader must drop them, while the prune below must see
+ * every dead record beside the database, whoever left it.
  */
 export function listBuildRecords(dbPath) {
   const dir = dirname(dbPath);

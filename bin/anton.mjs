@@ -69,6 +69,7 @@ import {
   listBuildRecords,
   readBuildIdentity,
   recordAlive,
+  recordFromInstall,
   sameCheckout,
   sameDirectory,
   writeBuildStamp,
@@ -168,29 +169,33 @@ async function waitForReady(port, timeoutMs = 30000) {
 }
 
 /**
- * The pids listening on `port`: `[]` when nothing is, null when this machine cannot say.
+ * Every TCP socket LISTENING on this machine, as `{ pid, port }` — `[]` when nothing is, null when
+ * this machine cannot say. A socket anton can see but cannot attribute carries a null `pid`: that
+ * is "found, owned by someone else", not "not listening".
+ *
+ * Enumerated whole rather than one port at a time (PR #217): the server doctor most needs to find
+ * is the one nothing recorded, and nothing on disk names the port it took — Next moves to the next
+ * free port when 3000 is held, which is exactly how a stale server and a current one end up running
+ * side by side.
  *
  * Each platform is answered by something it always has, because anton installs no enumerator and
  * declares none as a prereq: Linux reads procfs directly (most distros ship no lsof, and one that
  * is merely absent would answer "nothing is listening" on every such box), macOS — which has no
  * procfs — uses the lsof in its base system.
  */
-function listeningPids(port) {
-  return osPlatform() === "linux" ? procfsListeningPids(port) : lsofListeningPids(port);
+function listeningEndpoints() {
+  return osPlatform() === "linux" ? procfsListeningEndpoints() : lsofListeningEndpoints();
 }
 
 /** `/proc/net/tcp` connection state for LISTEN. */
 const TCP_LISTEN = "0A";
 
 /**
- * listeningPids via procfs: the LISTEN sockets bound to `port` in /proc/net/tcp{,6}, resolved to
- * their owning pids through /proc/<pid>/fd. `procRoot` is injectable so the parse is testable.
+ * listeningEndpoints via procfs: the LISTEN sockets in /proc/net/tcp{,6}, resolved to their owning
+ * pids through /proc/<pid>/fd. `procRoot` is injectable so the parse is testable.
  */
-function procfsListeningPids(port, procRoot = "/proc") {
-  const wanted = parseInt(port, 10);
-  if (!Number.isInteger(wanted) || wanted <= 0) return null;
-  const suffix = `:${wanted.toString(16).toUpperCase().padStart(4, "0")}`;
-  const inodes = new Set();
+function procfsListeningEndpoints(procRoot = "/proc") {
+  const ports = new Map(); // socket inode -> the port it listens on
   let tables = 0;
   for (const table of ["net/tcp", "net/tcp6"]) {
     let text;
@@ -202,26 +207,26 @@ function procfsListeningPids(port, procRoot = "/proc") {
     tables++;
     for (const line of text.split("\n").slice(1)) {
       const f = line.trim().split(/\s+/);
-      if (f.length < 10 || f[3] !== TCP_LISTEN || !f[1].endsWith(suffix)) continue;
-      inodes.add(f[9]);
+      if (f.length < 10 || f[3] !== TCP_LISTEN) continue;
+      const port = parseInt(f[1].slice(f[1].lastIndexOf(":") + 1), 16);
+      if (Number.isInteger(port) && port > 0) ports.set(f[9], port);
     }
   }
   if (!tables) return null; // no procfs (a container without it) — no evidence, not "nothing".
-  if (!inodes.size) return [];
-  const pids = socketOwners(inodes, procRoot);
-  // A socket anton found but cannot attribute belongs to another user: still no evidence.
-  return pids.length ? pids : null;
+  if (!ports.size) return [];
+  const owners = socketOwners(new Set(ports.keys()), procRoot);
+  return [...ports].map(([inode, port]) => ({ pid: owners.get(inode) ?? null, port }));
 }
 
-/** The pids holding any of `inodes` as an open socket. Processes anton can't read are skipped. */
+/** Which pid holds each of `inodes` as an open socket. Processes anton can't read are skipped. */
 function socketOwners(inodes, procRoot) {
-  const targets = new Set([...inodes].map((i) => `socket:[${i}]`));
-  const pids = [];
+  const targets = new Map([...inodes].map((inode) => [`socket:[${inode}]`, inode]));
+  const owners = new Map();
   let entries;
   try {
     entries = readdirSync(procRoot);
   } catch {
-    return pids;
+    return owners;
   }
   for (const entry of entries) {
     const pid = parseInt(entry, 10);
@@ -239,81 +244,108 @@ function socketOwners(inodes, procRoot) {
       } catch {
         continue;
       }
-      if (targets.has(link)) {
-        pids.push(pid);
-        break;
-      }
+      // Every match is kept, not just the first: one server holds a socket per address family and
+      // may hold several ports, and stopping at one would leave the rest unattributed.
+      const inode = targets.get(link);
+      if (inode !== undefined) owners.set(inode, pid);
     }
   }
-  return pids;
+  return owners;
 }
 
 /**
- * listeningPids via lsof. Its exit status separates the two answers that must not be confused —
+ * listeningEndpoints via lsof. Its exit status separates the two answers that must not be confused —
  * 1 with no output is "nothing is listening", while a missing binary or an error is "no evidence".
  */
-function lsofListeningPids(port) {
-  const r = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
+function lsofListeningEndpoints() {
+  const r = spawnSync("lsof", ["-nP", "-w", "-iTCP", "-sTCP:LISTEN", "-Fpn"], {
     encoding: "utf8",
     timeout: 5000,
   });
   if (r.error) return null;
   const out = (r.stdout ?? "").trim();
   if (r.status !== 0) return out ? null : [];
-  return out
-    .split("\n")
-    .map((n) => parseInt(n, 10))
-    .filter((n) => Number.isInteger(n) && n > 0);
-}
-
-/** A running process's working directory, or null when it cannot be read. */
-function processCwd(pid) {
-  try {
-    return realpathSync(`/proc/${pid}/cwd`); // Linux publishes it; macOS has no /proc.
-  } catch {}
-  const r = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
-    encoding: "utf8",
-    timeout: 5000,
+  return lsofRows(out).flatMap(({ pid, name }) => {
+    // `*:3000`, `127.0.0.1:3000`, `[::1]:3000` — the port is what follows the last colon.
+    const port = parseInt(name.slice(name.lastIndexOf(":") + 1), 10);
+    return Number.isInteger(port) && port > 0 ? [{ pid, port }] : [];
   });
-  if (r.error || r.status !== 0) return null;
-  const line = (r.stdout ?? "").split("\n").find((l) => l.startsWith("n"));
-  return line ? line.slice(1) : null;
 }
 
 /**
- * Is the process holding `port` running from THIS checkout?
- *
- * The port is shared by every anton on the box, so answering that from the response alone attributes
- * a neighbouring install's server to this one — a bundle, or a second worktree, serving anton's page
- * on this checkout's port would be reported as this checkout's unstamped server, with restart
- * instructions for the wrong install. `dev` and `start` both spawn the server with `cwd: APP_ROOT`
- * (`runLocal`), so the listener's working directory is the install-specific evidence that closes it.
- *
- * Evidence anton cannot gather is not evidence against: a machine without lsof answers no, which
- * costs the pre-stamp probe and claims nothing — the same trade the pidfile scoping makes, since a
- * liveness claim about the wrong install is worse than a missing one.
+ * `lsof -Fpn` output as `{ pid, name }` rows: a `p<pid>` line opens a process set, and every `n`
+ * line under it names a file of that process.
  */
-function servedFromCheckout(port, appRoot) {
-  const pids = listeningPids(port);
-  if (!pids?.length) return false;
-  return pids.some((pid) => {
-    const cwd = processCwd(pid);
+function lsofRows(out) {
+  const rows = [];
+  let pid = null;
+  for (const line of out.split("\n")) {
+    if (line.startsWith("p")) {
+      const parsed = parseInt(line.slice(1), 10);
+      pid = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+    } else if (line.startsWith("n") && pid !== null) {
+      rows.push({ pid, name: line.slice(1) });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Each pid's working directory as `Map<pid, path>` — absent for one anton cannot read.
+ *
+ * Read in one pass because the caller asks about every listener on the machine at once and the
+ * fallback is a spawn: `lsof -p 1,2,3` costs what `lsof -p 1` does, while one spawn per listener
+ * would put dozens of them on doctor's path.
+ */
+function processCwds(pids) {
+  const found = new Map();
+  const missing = [];
+  for (const pid of pids) {
+    try {
+      found.set(pid, realpathSync(`/proc/${pid}/cwd`)); // Linux publishes it; macOS has no /proc.
+    } catch {
+      missing.push(pid);
+    }
+  }
+  if (!missing.length) return found;
+  const r = spawnSync("lsof", ["-a", "-w", "-p", missing.join(","), "-d", "cwd", "-Fpn"], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  if (r.error || r.status !== 0) return found;
+  for (const { pid, name } of lsofRows((r.stdout ?? "").trim())) found.set(pid, name);
+  return found;
+}
+
+/**
+ * The servers listening from THIS checkout: `{ pid, port }` per socket, `[]` when none can be shown
+ * to be.
+ *
+ * The port is shared by every anton on the box, so a response alone attributes a neighbouring
+ * install's server to this one — a bundle, or a second worktree, serving anton's page would be
+ * reported as this checkout's, with restart instructions for the wrong install. `dev` and `start`
+ * both spawn the server with `cwd: APP_ROOT` (`runLocal`), so the listener's working directory is
+ * the install-specific evidence that closes it.
+ *
+ * Evidence anton cannot gather is not evidence against: a machine that can enumerate nothing yields
+ * no servers and claims nothing — the same trade the pidfile scoping makes, since a liveness claim
+ * about the wrong install is worse than a missing one.
+ */
+function checkoutServers(appRoot = APP_ROOT) {
+  const endpoints = (listeningEndpoints() ?? []).filter(({ pid }) => pid !== null);
+  if (!endpoints.length) return [];
+  const cwds = processCwds([...new Set(endpoints.map(({ pid }) => pid))]);
+  return endpoints.filter(({ pid }) => {
+    const cwd = cwds.get(pid);
     return !!cwd && sameDirectory(cwd, appRoot);
   });
 }
 
 /**
- * Is an anton server answering on `port`, from this checkout? The liveness probe for a SOURCE
- * checkout (anton-pzfb): `anton dev` and source `anton start` run in a terminal and write no
- * pidfile, so a server too old to have left a build record is otherwise invisible — and that first
- * upgrade past this change is exactly the stale server doctor exists to name.
- *
- * Both halves are required, because each rules out a different stranger: the title is what tells
- * anton's page from any other dev server on the port, and the listener's working directory is what
- * tells THIS install's server from another anton's (`servedFromCheckout`).
+ * Is anton's own page answering on `port`? The other half of naming a server, beside where it runs
+ * from: the title is what tells anton's page from any other dev server holding a port.
  */
-async function antonAnswering(port, appRoot = APP_ROOT) {
-  if (!servedFromCheckout(port, appRoot)) return false;
+async function answersAsAnton(port) {
   try {
     const r = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
     if (!r.ok) return false;
@@ -331,16 +363,12 @@ function serverPortPath(dbPath) {
 }
 
 /**
- * Remember the port `dev`/`start` is launching on, so a LATER `anton doctor` probes the right
- * endpoint (anton-pzfb).
+ * Remember the port `dev`/`start` is launching on, so a LATER invocation (`anton status`) can name
+ * the URL this install's server is actually on rather than assume 3000.
  *
- * doctor is its own invocation and carries no memory of `anton dev --port 4000`: without this it
- * probes 3000, finds nothing, and says "no running server recorded" about a live stale server —
- * precisely the pre-stamp case that probe exists for. Beside anton.db, because that is the one
- * directory this install resolves identically in both modes; the global state dir is shared with
- * every other anton on the box, and a port read from there would name someone else's server.
- *
- * Best-effort, and a stale note costs nothing: the probe still has to find anton's own page there.
+ * Beside anton.db, because that is the one directory this install resolves identically in both
+ * modes; the global state dir is shared with every other anton on the box, and a port read from
+ * there would name someone else's server. Best-effort, and a stale note costs nothing.
  */
 function recordServerPort(dbPath, port) {
   try {
@@ -1312,24 +1340,46 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
 }
 
 /**
- * Is a server up for THE INSTALL BEING DIAGNOSED? Only asked when no LIVE build record exists, which
- * is the one case where liveness itself is the evidence (identity.mjs `buildDrift`) — a record whose
- * process is gone answers nothing, so the probe has to run behind it rather than be skipped by it.
+ * The servers of THIS install that no live build record accounts for — the unstamped ones.
+ *
+ * A record proves what ONE process is running and says nothing about a second, older one, so the
+ * search runs BESIDE the records rather than behind them (PR #217). The case that needs it is the
+ * upgrade this whole check exists for: a pre-stamp server still up while the operator, having
+ * pulled, starts a current one — Next takes the next free port when 3000 is held — and the old
+ * process goes on running the nightly jobs from code that shipped days ago. Gated on "some record
+ * is live", that process is invisible; here it is one more line. Only the pids the records already
+ * speak for are dropped.
  *
  * Each mode reads only its OWN evidence, because both signals are shared across installs and
  * crossing them names the wrong process. The pidfile lives under the global state dir and is
  * written by exactly one thing — the bundle's daemonized `anton start` — so a source checkout that
  * consulted it would report the installed bundle's daemon as its own unstamped server and hand the
- * operator source-mode restart instructions for a process `anton stop` owns. The port is the mirror
- * image: any anton can hold it, so a bundle that probed it would attribute a source checkout's
- * server to a bundle that is stopped.
+ * operator source-mode restart instructions for a process `anton stop` owns. A bundle reading the
+ * listeners is the mirror image: its own daemon is already the pidfile's answer, and anything else
+ * holding a port is someone else's server.
  *
  * The cost is bundle `--foreground`, which writes no pidfile: an unstamped one reads as stopped.
  * A liveness claim about the wrong install is worse than a missing one — restarting the wrong
  * server kills a run and leaves the stale one up.
  */
-async function serverIsUp({ isBundle = IS_BUNDLE, port = "3000", pid = runningPid, answering = antonAnswering } = {}) {
-  return isBundle ? !!pid() : await answering(port);
+async function unstampedServers({
+  isBundle = IS_BUNDLE,
+  appRoot = APP_ROOT,
+  livePids = new Set(),
+  pid = runningPid,
+  servers = checkoutServers,
+  answering = answersAsAnton,
+} = {}) {
+  if (isBundle) {
+    const daemon = pid();
+    return daemon && !livePids.has(daemon) ? [daemon] : [];
+  }
+  const found = [];
+  for (const { pid: listener, port } of servers(appRoot)) {
+    if (livePids.has(listener) || found.includes(listener)) continue;
+    if (await answering(port)) found.push(listener);
+  }
+  return found;
 }
 
 /**
@@ -1340,45 +1390,53 @@ async function serverIsUp({ isBundle = IS_BUNDLE, port = "3000", pid = runningPi
  * names the action and leaves it to the operator. The restart itself differs by install — a bundle
  * has a daemon to stop and start, a source checkout has whatever terminal `anton dev` is in.
  */
-async function reportServerBuild(dbPath, args = []) {
-  // Every record still backed by a running process. One install can hold several — a UI-only server
-  // beside the runner, or two ports mid-hand-over — and each is its own answer, so each gets a line.
-  const live = listBuildRecords(dbPath).filter(({ record }) => recordAlive(record));
+async function reportServerBuild(dbPath) {
+  // Every record still backed by a running process, and left by THIS install: one install can hold
+  // several servers — a UI-only one beside the runner, or two ports mid-hand-over — and each is its
+  // own answer, while a neighbouring checkout sharing this database (`ANTON_DB`) is not this
+  // checkout's answer at all.
+  const live = listBuildRecords(dbPath).filter(
+    ({ record }) => recordFromInstall(record, APP_ROOT) && recordAlive(record),
+  );
+  // The servers no record above can see: one too old to have written one, which is the state that
+  // hid a stale process for three nights.
+  const unstamped = await unstampedServers({ livePids: new Set(live.map(({ record }) => record.pid)) });
   // One read of the code on disk for all of them: they are compared against the same checkout, and
   // `readBuildIdentity` spawns git.
-  const onDisk = live.length ? readBuildIdentity(APP_ROOT) : undefined;
-  // Liveness is only worth probing when no live record answers it. A record that IS live carries
-  // its own pid and birth stamp, so it cannot be a leftover standing in for the check.
-  const serverRunning = live.length ? false : await serverIsUp({ port: serverPort(args, dbPath) });
-  const seen = live.length
-    ? live.map(({ record }) => ({
-        record,
-        // Already proved live above; re-checking would spawn `ps` again per record.
-        drift: buildDrift({ appRoot: APP_ROOT, record, onDisk, isAlive: () => true }),
-      }))
-    : [{ record: null, drift: buildDrift({ appRoot: APP_ROOT, record: null, serverRunning }) }];
+  const onDisk = live.length || unstamped.length ? readBuildIdentity(APP_ROOT) : undefined;
+  const seen = [
+    ...live.map(({ record }) => ({
+      pid: record.pid,
+      record,
+      // Already proved live above; re-checking would spawn `ps` again per record.
+      drift: buildDrift({ appRoot: APP_ROOT, record, onDisk, isAlive: () => true }),
+    })),
+    ...unstamped.map((pid) => ({
+      pid,
+      record: null,
+      drift: buildDrift({ appRoot: APP_ROOT, record: null, serverRunning: true, onDisk }),
+    })),
+  ];
+  if (!seen.length) {
+    // Not "stopped": this install's own liveness evidence came back empty too, so all anton can
+    // honestly claim here is that nothing recorded a boot against it.
+    console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
+    return;
+  }
   // Which process a line is about only needs saying when there is more than one to confuse it with.
-  const which = (record) => (seen.length > 1 && record ? `pid ${record.pid} ` : "");
-  for (const { record, drift } of seen) {
+  const which = (pid) => (seen.length > 1 ? `pid ${pid} ` : "");
+  for (const { pid, record, drift } of seen) {
     if (!drift) {
-      // No drift means one of two things, and they are different claims — a matching build is a
-      // check that PASSED, while a stopped server is a check with nothing to run against.
-      if (record) {
-        console.log(
-          `  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`${which(record)}running the build on disk (${describeBuildIdentity(record)})`)}`,
-        );
-      } else {
-        // Not "stopped": this install's own liveness evidence came back empty too, so all anton can
-        // honestly claim here is that nothing recorded a boot against it.
-        console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
-      }
+      console.log(
+        `  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`${which(pid)}running the build on disk (${describeBuildIdentity(record)})`)}`,
+      );
       continue;
     }
     const why =
       drift.state === "unstamped"
         ? "is running but recorded no build identity — what it is serving cannot be established"
         : `is running ${describeBuildIdentity(drift.running)} but the ${drift.state === "outdated" ? "runtime" : "checkout"} on disk is ${describeBuildIdentity(drift.onDisk)}`;
-    console.log(`  ${c.yellow("!")} ${"server".padEnd(9)} ${c.yellow(`${which(record)}${why}`)}`);
+    console.log(`  ${c.yellow("!")} ${"server".padEnd(9)} ${c.yellow(`${which(pid)}${why}`)}`);
   }
   if (!seen.some(({ drift }) => drift)) return;
   console.log(
@@ -1388,7 +1446,7 @@ async function reportServerBuild(dbPath, args = []) {
   );
 }
 
-async function cmdDoctor(args = []) {
+async function cmdDoctor() {
   const ok = checkPrereqs();
   const stale = staleSkills();
   if (stale.length === 0) {
@@ -1424,7 +1482,7 @@ async function cmdDoctor(args = []) {
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
-  await reportServerBuild(dbPath, args);
+  await reportServerBuild(dbPath);
   // Last, because it is the only check that leaves the machine: a board on a shared server that
   // nothing here can reach is as fatal as a missing tool, and doctor is where an operator looks first.
   // Gated on the tool check: probing a board with no usable bd would report an "unreachable server"
@@ -2175,7 +2233,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
   ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim(SERVER_MODE_FLAGS)}
-  ${c.bold("doctor")}   check prereqs + anton.db + stale skills + a stale running server (non-destructive)  ${c.dim("[--port <n>]")}
+  ${c.bold("doctor")}   check prereqs + anton.db + stale skills + a stale running server (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
@@ -2187,7 +2245,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("--help")}   show this help
 
 ${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
-${c.dim("      doctor probes whichever port dev/start last used; pass --port <n> to point it elsewhere.")}
+${c.dim("      doctor takes no port — it finds every server running from this install, on any port.")}
 The runner + scheduler start automatically with the server (set ANTON_RUNNER=off to disable).
 `;
 
@@ -2200,7 +2258,7 @@ function main(argv) {
     case "init":
       return cmdInit(rest);
     case "doctor":
-      return cmdDoctor(rest);
+      return cmdDoctor();
     case "board-check":
       return cmdBoardCheck(rest);
     case "server-mode":
@@ -2255,8 +2313,8 @@ export {
   provisionAgentsSkills,
   installSkillDir,
   staleSkills,
-  serverIsUp,
-  procfsListeningPids,
+  unstampedServers,
+  procfsListeningEndpoints,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

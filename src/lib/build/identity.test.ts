@@ -28,6 +28,7 @@ import {
   readBuildIdentity,
   readBuildRecord,
   recordAlive,
+  recordFromInstall,
   sameCheckout,
   writeBuildRecord,
   writeBuildStamp,
@@ -390,7 +391,7 @@ describe("the record a running server leaves", () => {
     const dir = tempDir();
     const path = buildRecordPath(join(dir, "anton.db"));
     expect(path).toBe(join(dir, `server-build.${process.pid}.json`));
-    const stamp = { pid: 4242, bootedAt: 1_700_000_000_000, startedAt: "when-4242-began" };
+    const stamp = { pid: 4242, bootedAt: 1_700_000_000_000, startedAt: "when-4242-began", appRoot: "/opt/anton" };
     expect(writeBuildRecord(buildRecordPath(join(dir, "anton.db"), 4242), RUNNING, stamp)).toBe(true);
     expect(readBuildRecord(join(dir, "server-build.4242.json"))).toEqual({ ...RUNNING, ...stamp });
   });
@@ -445,6 +446,31 @@ describe("the record a running server leaves", () => {
   it("keeps the launcher's port note out of the checkout too", () => {
     const ignored = spawnSync("git", ["check-ignore", "-q", "server-port"], { cwd: process.cwd() });
     expect(ignored.status).toBe(0);
+  });
+
+  // `ANTON_DB` can point two checkouts at one database, so the directory a record sits in does not
+  // say whose server wrote it. Without the install on the record, every reader compares a
+  // neighbour's running build against its own code and calls it stale or current (PR #217).
+  it("names the install its server booted from, so a neighbour's record is not read as this one's", () => {
+    const dir = tempDir();
+    writeBuildRecord(buildRecordPath(join(dir, "anton.db"), 4242), RUNNING, { pid: 4242, appRoot: dir });
+
+    const [{ record }] = listBuildRecords(join(dir, "anton.db"));
+    expect(recordFromInstall(record, dir)).toBe(true);
+    expect(recordFromInstall(record, join(dir, "elsewhere"))).toBe(false);
+  });
+
+  // An absence is not evidence — the same rule the comparison itself follows field by field — so a
+  // record written before this field existed still answers for whoever reads it.
+  it("reads a record with no install as this one's", () => {
+    expect(recordFromInstall(RUNNING, "/anywhere")).toBe(true);
+    expect(recordFromInstall(null, "/anywhere")).toBe(true);
+  });
+
+  // `anton update` deletes the runtime dir a server booted from, which is exactly the drift worth
+  // reporting: requiring a resolvable path would drop the one record that matters most.
+  it("still matches an install whose directory is already gone", () => {
+    expect(recordFromInstall({ ...RUNNING, appRoot: "/gone/anton/runtime" }, "/gone/anton/runtime")).toBe(true);
   });
 
   it("creates the state dir on the way, so a first boot needs no setup step", () => {

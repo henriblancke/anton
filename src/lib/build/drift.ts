@@ -146,12 +146,16 @@ function onDiskIdentity(): BuildIdentity {
  * It is named for this pid, so a second server booting from the same install cannot overwrite what
  * this one is judged against — and the boot that wrote it is also where the records of servers that
  * have since exited get dropped, since nothing deletes one at exit.
+ *
+ * The install this process booted from is recorded with it: the database these records sit beside
+ * may be shared with another checkout (`ANTON_DB`), and a reader that cannot tell whose server a
+ * record describes compares a neighbour's build against its own code.
  */
 export function recordServerBuild(): void {
   bootedFrom = bootIdentity();
   const db = dbPath();
   if (!db) return;
-  writeBuildRecord(buildRecordPath(db), bootedFrom);
+  writeBuildRecord(buildRecordPath(db), bootedFrom, { appRoot: appRoot() });
   pruneBuildRecords(db);
 }
 
