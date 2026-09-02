@@ -260,6 +260,40 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  // A linked DIRECTORY is a single path to git — `ls-files --others` reports the link and never
+  // descends — while Next compiles every import under it. Hashing the link text alone would leave
+  // an edit behind it invisible, and `anton start` would reuse the `.next` compiled from the old
+  // source while calling that server current.
+  it("follows a symlinked source directory to the files the build compiles", () => {
+    const dir = gitCheckout();
+    const shared = join(tempDir(), "shared");
+    mkdirSync(shared);
+    writeFileSync(join(shared, "lib.ts"), "export const n = 1;\n");
+    symlinkSync(shared, join(dir, "linked"));
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(shared, "lib.ts"), "export const n = 2;\n");
+    const edited = readBuildIdentity(dir).worktree;
+    expect(edited).not.toBe(first);
+
+    // A file ADDED under the link is a build input the tracked diff cannot see either.
+    writeFileSync(join(shared, "extra.ts"), "export const m = 3;\n");
+    expect(readBuildIdentity(dir).worktree).not.toBe(edited);
+  });
+
+  // Following links makes cycles reachable: a directory linking back to its own ancestor would
+  // recurse forever, and the read has to still resolve to a digest.
+  it("terminates on a linked directory that points back into itself", () => {
+    const dir = gitCheckout();
+    const shared = join(tempDir(), "shared");
+    mkdirSync(shared);
+    writeFileSync(join(shared, "lib.ts"), "export const n = 1;\n");
+    symlinkSync(shared, join(shared, "self"));
+    symlinkSync(shared, join(dir, "linked"));
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   // .gitignore is what keeps `.next` and node_modules — which every build rewrites — out of the
   // digest; without it a build would invalidate itself the moment it finished.
   it("ignores what git ignores", () => {

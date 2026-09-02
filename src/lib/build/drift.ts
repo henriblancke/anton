@@ -174,6 +174,13 @@ export function recordServerBuild(): void {
  * worktree digest: a development checkout is dirty by definition, so recording the digest would put
  * a permanent "restart the server" banner in front of the one person who least needs it. Dropping
  * it leaves the version/commit comparison, which is what a dev server can actually miss.
+ *
+ * That leaves one gap open deliberately (PR #217 review): the job runner is started once from the
+ * instrumentation hook and deliberately survives hot reloads (lib/jobs/service), so a scheduled job
+ * under `anton dev` can keep executing pre-edit code while this reports the server current. A digest
+ * that moves on every save would banner the entire session and be ignored long before the one
+ * moment it mattered — a dev runner running old code is fixed by the restart the developer is
+ * already doing, not by a warning they have learned to dismiss.
  */
 function bootIdentity(): BuildIdentity {
   const identity = onDiskIdentity();

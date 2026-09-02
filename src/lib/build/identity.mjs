@@ -218,34 +218,86 @@ function ignoredEnvFiles(appRoot) {
 }
 
 /**
- * One file's contents as a fixed-width digest. A file that cannot be read (it vanished between the
- * listing and the read, or it is a directory symlink) still counted as present under its path, so
- * the marker keeps the digest defined rather than collapsing the whole worktree read to null.
+ * Ceiling on the entries one listed path can pull in through a directory symlink. Nothing bounds
+ * what a link points AT — `shared -> ~/work` would walk a whole home directory on every read, and
+ * unlike the checkout itself that tree carries no .gitignore anton can honour. Past the cap the
+ * walk stops at a marker: an incomplete read of a tree that large is the honest trade against
+ * re-hashing it every fifteen seconds, and a linked SOURCE directory (the shape Next actually
+ * compiles through) fits inside it many times over.
+ */
+const MAX_LINKED_ENTRIES = 4096;
+
+/**
+ * One listed build input as a fixed-width digest — its contents, or a whole tree's when the input
+ * is a link to one. An input that cannot be read (it vanished between the listing and the read) is
+ * still counted as present under its path, so the marker keeps the digest defined rather than
+ * collapsing the whole worktree read to null.
  *
  * A symlink is BOTH its target path and what stands at the end of it: `.env.local` pointing at a
  * shared secrets file is the common shape here, and Next inlines what that file holds at build
  * time — so hashing the link alone would call the build current after the secrets behind it moved.
- * The link text stays in the digest because repointing it is a change too; only a link that leads
- * nowhere readable (dangling, or a directory) stops there.
+ * The link text stays in the digest because repointing it is a change too.
+ *
+ * A link to a DIRECTORY is followed for the same reason (PR #217 review). `git ls-files --others`
+ * reports it as one path and never descends, so hashing the link text alone leaves every file under
+ * it invisible: Next compiles imports through a linked source directory, and an edit under an
+ * unchanged target would leave the digest identical — `anton start` would then reuse the old `.next`
+ * and every drift surface would call that server current.
  */
 function hashFile(path) {
+  return hashEntry(path, { left: MAX_LINKED_ENTRIES, seen: new Set() });
+}
+
+/** One entry — file, directory, or link to either — under a walk budget shared with its children. */
+function hashEntry(path, budget) {
   const hash = createHash("sha256");
   try {
-    if (lstatSync(path).isSymbolicLink()) {
+    let entry = lstatSync(path);
+    if (entry.isSymbolicLink()) {
       hash.update(readlinkSync(path)).update("\0");
-      if (!statSync(path).isFile()) return hash.digest();
+      entry = statSync(path);
     }
-    const fd = openSync(path, "r");
-    try {
-      const buf = Buffer.allocUnsafe(READ_CHUNK);
-      for (let n = 0; (n = readSync(fd, buf, 0, READ_CHUNK, null)) > 0; ) hash.update(buf.subarray(0, n));
-    } finally {
-      closeSync(fd);
-    }
+    if (entry.isDirectory()) hashTree(hash, path, budget);
+    else if (entry.isFile()) hashContents(hash, path);
   } catch {
     return hash.update("\0unreadable").digest();
   }
   return hash.digest();
+}
+
+/**
+ * Every entry under `dir`, in a fixed order so the digest is a function of the tree and not of
+ * readdir's.
+ *
+ * Cycles are what a followed link makes possible — a directory linking back to its own ancestor
+ * would recurse forever — so each directory is entered once per walk, keyed by its resolved path.
+ */
+function hashTree(hash, dir, budget) {
+  const resolved = realpathSync(dir);
+  if (budget.seen.has(resolved)) {
+    hash.update("\0cycle");
+    return;
+  }
+  budget.seen.add(resolved);
+  for (const name of readdirSync(dir).sort()) {
+    if (budget.left <= 0) {
+      hash.update("\0truncated");
+      return;
+    }
+    budget.left -= 1;
+    hash.update(name).update("\0").update(hashEntry(join(dir, name), budget));
+  }
+}
+
+/** One file's bytes, folded in as bounded chunks so an oversized input costs time and not memory. */
+function hashContents(hash, path) {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.allocUnsafe(READ_CHUNK);
+    for (let n = 0; (n = readSync(fd, buf, 0, READ_CHUNK, null)) > 0; ) hash.update(buf.subarray(0, n));
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The prefix Next inlines from the BUILD's environment into the bundle it compiles. */
