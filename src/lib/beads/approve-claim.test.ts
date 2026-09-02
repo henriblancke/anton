@@ -187,6 +187,54 @@ describe("unwindApproveClaim", () => {
     expect(beads.untag).not.toHaveBeenCalled();
   });
 
+  it("releases the claim when a failed untag had already taken the label off", async () => {
+    // `bd update --remove-label` is ambiguous on failure the same way the approve is (PR #218
+    // review): it can commit and then time out. Believing the error would report an approval that is
+    // already gone and skip the release, leaving a target that is unapproved but still ours —
+    // invisible to every later pass, and not what the leftover sends an operator to fix.
+    put({ labels: [LABELS.approved], assignee: "anton-box" });
+    vi.spyOn(beads, "untag").mockImplementation(async (_cwd, id, labels) => {
+      const b = board.get(id)!;
+      b.labels = (b.labels ?? []).filter((l) => !labels.includes(l));
+      throw new Error("timed out waiting for bd");
+    });
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(read().labels).not.toContain(LABELS.approved);
+    expect(read().assignee).toBeUndefined();
+  });
+
+  it("reports the approval when a failed untag left the label standing", async () => {
+    // The other half of that re-read: the label really is still there, so the claim stays with it —
+    // releasing it would publish the approved, unassigned target this ordering exists never to make.
+    put({ labels: [LABELS.approved], assignee: "anton-box" });
+    vi.spyOn(beads, "untag").mockRejectedValue(new Error("bd is down"));
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: true,
+      }),
+    ).resolves.toBe("approval");
+
+    expect(read().labels).toContain(LABELS.approved);
+    expect(read().assignee).toBe("anton-box");
+  });
+
   it("holds the bead lock across the whole unwind, so a retry cannot land between its legs", async () => {
     // Unlocked, the untag and the release are separately ordered: a concurrent approval of the same
     // target could take the reservation between them and have this release hand it straight back,

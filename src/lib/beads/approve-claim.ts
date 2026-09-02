@@ -192,6 +192,13 @@ export interface UnwindApproveClaimInput {
  * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
  * this exists to prevent.
  *
+ * `--remove-label` is ambiguous in exactly the same way, so a FAILED untag is judged by re-reading
+ * the label rather than by the error (PR #218 review). One that committed and then timed out leaves
+ * the label gone, and gating the release on the error alone strands the mirror image of the case
+ * above — unapproved but still assigned to us, which every later pass reads as taken and which the
+ * leftover's own remedy ("unapprove it by hand") does not name, leaving nothing a person can do
+ * about the assignee. A label that is genuinely still there keeps its claim, as before.
+ *
  * That same re-read decides whether the writes are still OURS at all (PR #218 review). The untag is
  * the one unconditional write here — the release is a CAS and refuses a target somebody else holds —
  * and the lock orders this process only, so on a shared-server board a competing picker can win the
@@ -230,14 +237,17 @@ export async function unwindApproveClaim(
   const { repoPath, beadId } = input;
 
   return withClaimLock(repoPath, beadId, async (cas) => {
+    const reread = async (when: string): Promise<Bead | undefined> =>
+      beads.show(repoPath, beadId).catch((e) => {
+        console.error(`[approve-claim] could not re-read ${beadId} ${when}`, e);
+        return undefined;
+      });
+
     // One read, two questions: is the reservation still ours to reverse, and did the label actually
     // land. Read only when there is a label to take off — with none, the release below is a CAS that
     // asks the ownership question itself.
     if (input.wroteLabel) {
-      const current = await beads.show(repoPath, beadId).catch((e) => {
-        console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
-        return undefined;
-      });
+      const current = await reread("before unapproving it");
       // A board that cannot be read answers NEITHER question, and the untag below is the one
       // unconditional write here (PR #218 review) — so the unwind stops rather than guessing at
       // ownership it could not verify. Untagging on the assumption the reservation is still ours
@@ -261,7 +271,14 @@ export async function unwindApproveClaim(
             console.error(`[approve-claim] could not unapprove ${beadId}`, e);
             return false;
           });
-        if (!unapproved) return "approval";
+        // The untag is ambiguous on failure exactly as the approve was (PR #218 review): it can
+        // commit and then time out, and an error taken at face value here reports an approval
+        // nobody has to clear while skipping the release that would free the claim. So the label is
+        // re-read; only one still standing — or a board that cannot say — keeps its claim.
+        if (!unapproved) {
+          const after = await reread("after failing to unapprove it");
+          if (!after || beads.isApproved(after)) return "approval";
+        }
       }
     }
 

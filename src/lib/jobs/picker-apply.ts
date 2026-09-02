@@ -1033,6 +1033,15 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // await: the disarm latch — which a breaker can raise on a run settling into a failing streak —
   // beside the board's own eligibility rule and the operator's policy, re-asked exactly as the settle
   // asked them (PR #218 review). See {@link pickerDisarmed} and {@link stillStartable}.
+  //
+  // The reservation is NOT re-proven on their far side, and deliberately so (PR #218 review). Every
+  // read behind these three is anton.db through better-sqlite3 — synchronous, in-process, no socket
+  // and no subprocess — so the window they open before the insert is a microtask, not the seconds a
+  // `bd list` or a `gh pr view` costs. Re-proving ownership there means another board read, and the
+  // board read is itself the long await: whatever followed it would sit behind a window ORDERS of
+  // magnitude wider than the one it closed, and the enqueue can never be reached with no window at
+  // all. So the last board read stays as close to the insert as a read can be: nothing between them
+  // leaves this process.
   const [frozen, moved] = await Promise.all([
     disarmed(),
     stillStartable(finalBoard, target, stance, "while the review queue was confirmed"),
