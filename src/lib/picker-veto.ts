@@ -559,6 +559,14 @@ export async function pickerTrackRecord(
   return { accepted, declined: rows.length - accepted, settled: rows.length };
 }
 
+/**
+ * UI read path over the shared anton.db — the counts the earned-autonomy floor reads
+ * ({@link earnedPickerAutonomy}), so the settings surface and the pass weigh the same numbers.
+ */
+export function latestPickerTrackRecord(projectId: string): Promise<PickerTrackRecord> {
+  return pickerTrackRecord(getDb(), projectId);
+}
+
 /** UI read path over the shared anton.db — the decision log's half of the verdict record. */
 export function latestPickerVerdicts(
   projectId: string,

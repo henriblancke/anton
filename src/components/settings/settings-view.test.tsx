@@ -67,12 +67,26 @@ const FALLBACK_DRAFT: Parameters<typeof SettingsView>[0]["policyDraft"] = {
   rationale: [],
 };
 
+type PickerEarned = Parameters<typeof SettingsView>[0]["pickerEarned"];
+
+/**
+ * The picker's own accept/veto record (anton-vkp9). The default is the project every operator
+ * starts on — no pick answered either way, so `apply` is locked and has to say what on.
+ */
+const NO_PICKER_RECORD: PickerEarned = {
+  accepted: 0,
+  settled: 0,
+  eligible: false,
+  reason: "no answered picks yet — apply unlocks at 20 answered with 90% released",
+};
+
 function renderView(
   settings: Parameters<typeof SettingsView>[0]["settings"] = {},
   agents: Parameters<typeof SettingsView>[0]["agents"] = [],
   schedules: Parameters<typeof SettingsView>[0]["schedules"] = [],
   earned: Earned = NO_RECORD,
   labelVocabulary: Parameters<typeof SettingsView>[0]["labelVocabulary"] = [],
+  pickerEarned: PickerEarned = NO_PICKER_RECORD,
 ) {
   return render(
     <SettingsView
@@ -91,6 +105,7 @@ function renderView(
       policyNotStartable={0}
       boardUnavailable={false}
       earned={earned}
+      pickerEarned={pickerEarned}
     />,
   );
 }
@@ -2124,5 +2139,68 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     renderView({}, [], coupledSchedules({ pm: { enabled: false } }));
     arm();
     expect(offer()).toBeNull();
+  });
+});
+
+describe("SettingsView picker autonomy (anton-vkp9)", () => {
+  showing("policy");
+
+  const ARMED = { pickerPolicy: { types: ["task"] } };
+
+  it("explains what apply is short of in counts rather than only disabling the control", () => {
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], {
+      accepted: 12,
+      settled: 15,
+      eligible: false,
+      reason: "12/15 released — apply unlocks at 20 answered with 90% released",
+    });
+
+    expect(
+      screen.getByText(/12\/15 released — apply unlocks at 20 answered with 90% released/),
+    ).toBeTruthy();
+    expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(true);
+    // The levels that MAKE the record are never gated — that is where the counts come from.
+    expect((screen.getByLabelText("picker · shadow") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("names the record on the way up too, once it clears the bar", () => {
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], {
+      accepted: 19,
+      settled: 20,
+      eligible: true,
+    });
+
+    expect(screen.getByText(/19\/20 released — clears the bar/)).toBeTruthy();
+    expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("still counts the record on a project with no policy, and names the missing policy too", () => {
+    // Two floors, two different next steps: hiding the counts behind "accept a policy first" would
+    // leave an operator unable to see the second gate coming.
+    renderView({}, [], [], NO_RECORD, [], NO_PICKER_RECORD);
+
+    expect(screen.getByText(/no answered picks yet/)).toBeTruthy();
+    expect(screen.getByText(/apply also needs a work policy/)).toBeTruthy();
+    expect((screen.getByLabelText("picker · apply") as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("shows a stored apply the record no longer supports as running at shadow", () => {
+    renderView({ ...ARMED, pickerAutonomy: "apply" }, [], [], NO_RECORD, [], NO_PICKER_RECORD);
+
+    expect((screen.getByLabelText("picker · shadow") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("picker · apply") as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText(/anton is running this picker at/)).toBeTruthy();
+  });
+
+  it("PATCHes the level as soon as it is chosen", async () => {
+    const fetchMock = stubFetch();
+    renderView({ ...ARMED }, [], [], NO_RECORD, [], { accepted: 20, settled: 20, eligible: true });
+
+    fireEvent.click(screen.getByLabelText("picker · apply"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe("/api/projects/tmp/settings");
+    expect(JSON.parse(String(init?.body))).toEqual({ pickerAutonomy: "apply" });
   });
 });

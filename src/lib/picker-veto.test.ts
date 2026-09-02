@@ -19,6 +19,7 @@ import {
   recordPickerVeto,
   withdrawPickerAccept,
 } from "./picker-veto";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "./gardener/autonomy";
 import type { Clock } from "./jobs/queue";
 
 const NOW = 1_800_000_000_000;
@@ -244,6 +245,17 @@ describe("the decline record", () => {
       declined: 1,
       settled: 2,
     });
+  });
+});
+
+describe("the window the earned floor reads (anton-vkp9)", () => {
+  it("is at least as wide as the bar apply has to clear", () => {
+    // The counts and the bar are set in two modules, and a window NARROWER than `minSettled` would
+    // make `apply` unreachable by construction — a floor nobody could ever climb, with nothing on
+    // screen to say why. Asserted rather than commented, because the two numbers move separately.
+    expect(PICKER_RECORD_WINDOW).toBeGreaterThanOrEqual(
+      EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER].minSettled,
+    );
   });
 });
 

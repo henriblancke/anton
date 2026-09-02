@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "./gardener/autonomy";
 
 let workDir: string;
 let dbFile: string;
@@ -434,21 +435,54 @@ describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
   });
 });
 
-describe("resolvePickerAutonomy (anton-qlci)", () => {
+describe("resolvePickerAutonomy (anton-qlci, anton-vkp9)", () => {
+  const BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+  /** A record that has earned `apply`: a full window of picks, every one of them released. */
+  const EARNED = { settled: BAR.minSettled, accepted: BAR.minSettled };
+  /** What every project starts on — no pick answered either way. */
+  const NO_RECORD = { settled: 0, accepted: 0 };
+
   it("defaults to propose unarmed and shadow armed — apply is never a default", () => {
-    expect(resolvePickerAutonomy({})).toBe("propose");
-    expect(resolvePickerAutonomy({ pickerPolicy: { types: ["bug"] } })).toBe("shadow");
+    expect(resolvePickerAutonomy({}, EARNED)).toBe("propose");
+    expect(resolvePickerAutonomy({ pickerPolicy: { types: ["bug"] } }, EARNED)).toBe("shadow");
   });
 
-  it("honours a stored level on an armed project", () => {
+  it("honours a stored level on an armed project whose record supports it", () => {
     const armed = { pickerPolicy: { types: ["bug"] } };
-    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" })).toBe("propose");
-    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "apply" })).toBe("apply");
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" }, EARNED)).toBe("propose");
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "apply" }, EARNED)).toBe("apply");
   });
 
   it("floors apply to shadow when no policy is armed", () => {
     // The structural default admits every claimable run target, so apply there is autopilot with no
     // approval in it — an operator who clears their policy lands back in shadow rather than wide open.
-    expect(resolvePickerAutonomy({ pickerAutonomy: "apply" })).toBe("shadow");
+    expect(resolvePickerAutonomy({ pickerAutonomy: "apply" }, EARNED)).toBe("shadow");
+  });
+
+  it("floors apply to shadow until the record has earned it, whatever the setting says", () => {
+    // The second gate (anton-vkp9): an armed policy says what anton MAY start, and only the
+    // operator's own releases say whether its picks have been worth starting.
+    const armed = { pickerPolicy: { types: ["bug"] }, pickerAutonomy: "apply" as const };
+    expect(resolvePickerAutonomy(armed, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy(armed, { settled: BAR.minSettled - 1, accepted: BAR.minSettled - 1 })).toBe(
+      "shadow",
+    );
+    expect(resolvePickerAutonomy(armed, EARNED)).toBe("apply");
+  });
+
+  it("returns an armed picker to shadow once its record degrades", () => {
+    // Re-asked every pass and never latched, so a project that stops clearing the bar stops starting
+    // work on its own — and lands in shadow, the one level where the record can be earned back.
+    const armed = { pickerPolicy: { types: ["bug"] }, pickerAutonomy: "apply" as const };
+    expect(resolvePickerAutonomy(armed, EARNED)).toBe("apply");
+    expect(
+      resolvePickerAutonomy(armed, { settled: BAR.minSettled, accepted: BAR.minSettled - 3 }),
+    ).toBe("shadow");
+  });
+
+  it("never floors the levels below apply — shadow is where the record is made", () => {
+    const armed = { pickerPolicy: { types: ["bug"] } };
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "shadow" }, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" }, NO_RECORD)).toBe("propose");
   });
 });

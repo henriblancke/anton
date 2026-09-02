@@ -11,6 +11,7 @@ import type { TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
 import { PICKER_DEFER_WINDOW_MS, recordPickerVeto } from "../picker-veto";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { activeDisarm, listDisarms, reArmAutopilot } from "../autopilot-disarm";
 import { listOpenEscalations } from "../escalations";
 import { LABELS } from "../beads/bd";
@@ -103,12 +104,45 @@ function fakeCtx(over: Partial<JobContext> = {}): JobContext {
   };
 }
 
-/** Arm the project: a policy plus the autonomy level that lets a pass act on it. */
-function arm(t: TestDb, autonomy: string, policy: unknown = { types: ["task"] }): void {
+/**
+ * Arm the project: a policy, the autonomy level that lets a pass act on it, and — at `apply` — the
+ * accept/veto record that level has to be EARNED on (anton-vkp9). All three are what "armed" means
+ * to the pass, so a test about the brakes does not have to restate the gate it is not testing.
+ */
+function arm(
+  t: TestDb,
+  autonomy: string,
+  { policy = { types: ["task"] } as unknown, record = true }: { policy?: unknown; record?: boolean } = {},
+): void {
   t.db
     .update(schema.projects)
     .set({ settingsJson: JSON.stringify({ pickerPolicy: policy, pickerAutonomy: autonomy }) })
     .run();
+  if (record) answerPicks(t, PICKER_BAR.minSettled, PICKER_BAR.minSettled);
+}
+
+/** The bar the picker's own record clears — read off the shared ladder, never restated here. */
+const PICKER_BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+
+/**
+ * `settled` answered picks, `accepted` of them released — the operator's record, written where the
+ * release route and the veto route write it.
+ */
+function answerPicks(t: TestDb, settled: number, accepted: number): void {
+  for (let i = 0; i < settled; i++) {
+    t.db
+      .insert(schema.pickerVerdicts)
+      .values({
+        id: `v${i}`,
+        projectId: "p1",
+        beadId: `answered-${i}`,
+        verdict: i < accepted ? "accepted" : "declined",
+        action: i < accepted ? "release" : "not-now",
+        planId: `plan-${i}`,
+        decidedAt: new Date(NOW - (settled - i) * 60_000),
+      })
+      .run();
+  }
 }
 
 let t: TestDb;
@@ -442,6 +476,56 @@ describe("makeBoardPickerHandler", () => {
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
 
     expect(applyPickerPlan).not.toHaveBeenCalled();
+  });
+
+  it("refuses to apply until this project's own picks have earned it (anton-vkp9)", async () => {
+    // The second gate. A policy says what anton MAY start; nothing but the operator's own releases
+    // says whether its picks have been worth starting — so an armed `apply` with no record ranks and
+    // starts nothing, and the pass says what it is short of rather than ignoring the setting quietly.
+    board.current = [bead("t1")];
+    arm(t, "apply", { record: false });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+    expect(info.mock.calls.map((args) => String(args[0])).join("\n")).toContain(
+      "apply not earned — no answered picks yet",
+    );
+    // Still a ranking: the floor freezes STARTING, not deciding.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+    info.mockRestore();
+  });
+
+  it("returns an armed picker to shadow once its record degrades", async () => {
+    // Re-asked on every pass over a rolling window, so vetoes the operator files after arming push
+    // the record back below the bar and the next pass starts nothing — no latch, nothing to clear.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+
+    const veto = (i: number) =>
+      recordPickerVeto(t.db, clock, {
+        projectId: "p1",
+        beadId: `late-${i}`,
+        action: "not-now",
+        planId: `late-plan-${i}`,
+      });
+
+    // One veto still clears the bar — the floor is a threshold, not a hair trigger, and a pass that
+    // stopped here would prove nothing about the one below.
+    await veto(1);
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(2);
+
+    // Two more displace releases out of the rolling window, and the record no longer supports apply.
+    await veto(2);
+    await veto(3);
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(2);
   });
 
   it("starts nothing while the project is disarmed, on this pass and every later one", async () => {

@@ -16,8 +16,10 @@ import { FORMULA_NAME_PATTERN, configureBeadsForRepo } from "./beads/config.mjs"
 import { DEFAULT_BUDGET_POLICY, type BudgetPolicy } from "./jobs/budget";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
 import {
+  earnedPickerAutonomy,
   PROPOSAL_AUTONOMY_LEVELS,
   resolveProposalAutonomyPolicy,
+  type PickerRecordCounts,
   type ProposalAutonomyOverrides,
   type ProposalAutonomyPolicy,
 } from "./gardener/autonomy";
@@ -369,10 +371,11 @@ export interface ProjectSettings {
   pickerPolicy?: Policy;
   /**
    * How far the picker may go with the plan it decides (R3.5) — the level {@link
-   * resolvePickerAutonomy} floors before anything acts on it. Absent means the operator has never
-   * chosen one, which is NOT the same as `propose`: an armed project defaults to `shadow`, where
-   * the picker offers its picks and the operator's releases and vetoes become the record `apply` is
-   * earned on. Validated with {@link pickerAutonomySchema} at the API boundary.
+   * resolvePickerAutonomy} floors, structurally and by the earned record, before anything acts on
+   * it. Absent means the operator has never chosen one, which is NOT the same as `propose`: an
+   * armed project defaults to `shadow`, where the picker offers its picks and the operator's
+   * releases and vetoes become the record `apply` is earned on. Validated with
+   * {@link pickerAutonomySchema} at the API boundary.
    */
   pickerAutonomy?: PickerAutonomy;
 }
@@ -787,22 +790,38 @@ export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefin
 export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
 
 /**
- * How far the picker may go on this project, with the one structural floor applied here so no caller
- * has to remember it: `apply` requires an ARMED POLICY.
+ * How far the picker may go on this project — the stored level with BOTH floors applied here, so no
+ * caller has to remember either.
  *
- * Without one the pass falls back to the structural default, which admits every claimable run target
- * — and a pass that wrote `approved` off THAT would be autopilot with no approval in it, the one
- * thing the design refuses (see `picker-decision.ts`'s ADMIT_ALL_POLICY). An operator who set `apply`
- * and then cleared their policy lands on `shadow`: still offered its picks, starting none of them.
+ * The STRUCTURAL floor: `apply` requires an ARMED POLICY. Without one the pass falls back to the
+ * structural default, which admits every claimable run target — and a pass that wrote `approved` off
+ * THAT would be autopilot with no approval in it, the one thing the design refuses (see
+ * `picker-decision.ts`'s ADMIT_ALL_POLICY).
  *
- * The EARNED floor — a level a project's own record does not yet support — sits above this one and is
- * the arming gate's (anton-vkp9), not this function's.
+ * The EARNED floor (anton-vkp9): `apply` also has to be earned, by this project's own record of
+ * releases and vetoes, against the same bars the gardener's kinds clear
+ * ({@link earnedPickerAutonomy}). A policy is what anton MAY start; the record is whether its picks
+ * have been worth starting, and only the operator's answers say so.
+ *
+ * Both land on `shadow` rather than on `propose`, and that is deliberate: `shadow` is the lane where
+ * picks are offered and answered, so it is where the record is MADE. Demoting to `propose` would
+ * empty the lane and leave the project with no way to earn back the level it just lost — a floor
+ * that locks the door and pockets the key. (The gardener demotes to `propose` for the opposite
+ * reason: its `shadow` writes records nobody asked for.)
+ *
+ * Re-asked on every pass, never latched, which is what makes the earned floor bite after arming too:
+ * a record that degrades returns the picker to `shadow` on the next tick.
  */
-export function resolvePickerAutonomy(settings: ProjectSettings): PickerAutonomy {
+export function resolvePickerAutonomy(
+  settings: ProjectSettings,
+  record: PickerRecordCounts,
+): PickerAutonomy {
   const armed = !!settings.pickerPolicy;
   const stored = settings.pickerAutonomy;
   if (!stored) return armed ? "shadow" : "propose";
-  return stored === "apply" && !armed ? "shadow" : stored;
+  if (stored !== "apply") return stored;
+  if (!armed) return "shadow";
+  return earnedPickerAutonomy(record).eligible ? "apply" : "shadow";
 }
 
 /**

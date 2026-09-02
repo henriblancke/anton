@@ -8,7 +8,8 @@
  * enqueued by the approve route on an explicit click. At `apply` the pass also STARTS its top pick,
  * through `./picker-apply`, which writes `approved` + the auto-claim under the bead's claim lock and
  * enqueues the run. That step is the one thing the brakes below exist to refuse: a disarmed project
- * and a held one still get their ranking, and start nothing.
+ * and a held one still get their ranking, and start nothing — and so does one whose own accept/veto
+ * record has not EARNED `apply` (anton-vkp9), whatever the setting says.
  *
  * Mechanical by design — a board read, a pure decision, one row. No Claude session on the tick
  * (docs/plans/2026-08-18-002-feat-autopilot-design.md, D3: "an LLM cannot be a hash function"), which
@@ -28,7 +29,8 @@ import { describeFailureStreak } from "../autopilot-failure-streak";
 import { describeScoreSlide } from "../autopilot-score-slide";
 import { describeWipHold } from "../autopilot-wip";
 import { saveBoardPickerPlan } from "../board-picker-plan";
-import { activeDeferrals } from "../picker-veto";
+import { activeDeferrals, pickerTrackRecord } from "../picker-veto";
+import { earnedPickerAutonomy } from "../gardener/autonomy";
 import {
   getProjectById,
   getProjectSettings,
@@ -129,7 +131,21 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     const armed = resolvePickerPolicy(settings);
     // How far this pass may go with what it decides. Resolved here, before the decision, so the one
     // fact that turns a ranking into a start is read from the same settings snapshot the policy is.
-    const autonomy = resolvePickerAutonomy(settings);
+    //
+    // The record is the second half of that resolution (anton-vkp9): `apply` is floored by what this
+    // project's own releases and vetoes have EARNED, not by the setting alone. Re-read every pass —
+    // the window rolls, so a record that degrades after arming returns the picker to `shadow` on the
+    // next tick rather than the next time somebody looks at settings.
+    const record = await pickerTrackRecord(db, projectId);
+    const autonomy = resolvePickerAutonomy(settings, record);
+    // Said out loud, because a setting the pass silently ignores is the unexplained state this whole
+    // floor exists to avoid: the operator asked for `apply` and is getting `shadow`, and the counts
+    // are the only thing that tells them why, and what would lift it.
+    if (settings.pickerAutonomy === "apply" && autonomy !== "apply" && settings.pickerPolicy) {
+      console.info(
+        `[board-picker] ${projectId}: apply not earned — ${earnedPickerAutonomy(record).reason}`,
+      );
+    }
     // What the operator vetoed and has not un-vetoed by waiting (anton-jqvy). Judged against the
     // OBSERVATION instant, like the age criterion beside it, so one pass answers "is this still
     // deferred?" the same way for every target it ranks.

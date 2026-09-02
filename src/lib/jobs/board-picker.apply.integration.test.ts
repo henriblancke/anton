@@ -22,6 +22,7 @@ import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { beads, ownerOf } from "../beads/bd";
 import * as schema from "../db/schema";
 import { getBoardPickerPlan } from "../board-picker-plan";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { makeBoardPickerHandler } from "./board-picker";
 import { systemClock } from "./queue";
 import type { JobContext } from "./runner";
@@ -64,8 +65,9 @@ beforeEach(() => {
   bdRepo = makeBdRepo();
   repo = bdRepo.repo;
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: repo });
-  // Armed, and armed to APPLY: a policy over the board's own vocabulary plus the level that lets
-  // the pass act on it. Without both, the pass ranks and stops.
+  // Armed, and armed to APPLY: a policy over the board's own vocabulary, the level that lets the
+  // pass act on it, and the accept/veto record that level is earned on (anton-vkp9). Without all
+  // three, the pass ranks and stops.
   t.db
     .update(schema.projects)
     .set({
@@ -73,7 +75,27 @@ beforeEach(() => {
     })
     .where(eq(schema.projects.id, "p1"))
     .run();
+  earnApply();
 });
+
+/** A full window of released picks — this project's operator has answered, and kept saying yes. */
+function earnApply(): void {
+  const bar = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+  for (let i = 0; i < bar.minSettled; i++) {
+    t.db
+      .insert(schema.pickerVerdicts)
+      .values({
+        id: `v${i}`,
+        projectId: "p1",
+        beadId: `answered-${i}`,
+        verdict: "accepted",
+        action: "release",
+        planId: `plan-${i}`,
+        decidedAt: new Date(Date.now() - (bar.minSettled - i) * 60_000),
+      })
+      .run();
+  }
+}
 
 afterEach(() => {
   t.close();
