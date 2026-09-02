@@ -5,7 +5,8 @@
  * what a human approval writes, through the same code: `approved` plus the auto-claim, as one
  * operation under the bead's claim-write lock (`beads/approve-claim.ts`, shared with the approve
  * route), then an enqueue through `enqueueExecuteEpicIfAbsent` — the idempotent path unstick and
- * gate-check already use, so two overlapping passes leave exactly one run.
+ * gate-check already use, so two overlapping passes leave exactly one run — or, where that path
+ * finds a run already parked on the target, the same resume unstick would give it.
  *
  * ONE target per pass, the top of the ranking. The plan is a view of the board, never a queue of
  * events (gate-check.ts's rule, which this inherits): "listed" must not read as "start it", so the
@@ -37,7 +38,14 @@ import type { PickerPlanEntry } from "../board-picker-plan";
 import { resolveOperator } from "../operator";
 import { recordPickerStart } from "../picker-starts";
 import { ineligibility } from "./picker-targets";
-import { enqueueExecuteEpicIfAbsent, type AntonDb, type Clock } from "./queue";
+import {
+  activeExecuteEpicId,
+  enqueueExecuteEpicIfAbsent,
+  resumableExecuteEpicId,
+  resumeJob,
+  type AntonDb,
+  type Clock,
+} from "./queue";
 
 /**
  * The actor every unattended board write is attributed to (R1.7), matching `gardener/apply.ts`:
@@ -203,26 +211,73 @@ async function settleClaim(
  * releasing the claim while it stood would publish the target to any worker looking for approved,
  * unclaimed work.
  *
- * `wroteLabel` is false when the target was ALREADY approved before this pass touched it (a human
+ * Each leg GATES the next rather than being best-effort on its own (PR #218 review): a release that
+ * follows a failed unapproval produces approved-and-unclaimed — the exact shape another worker
+ * starts — so a label that would not come off keeps its claim, and the target waits for a person
+ * instead of being handed to the run this pass just decided not to make.
+ *
+ * `wrote.label` is false when the target was ALREADY approved before this pass touched it (a human
  * approved it and never started it), and removing it there would erase somebody else's decision.
- * Best-effort: it is a repair, and one that fails leaves exactly the state we were already reporting.
+ *
+ * Returns what it could NOT take back, so the skip reason names the state it left rather than
+ * reporting a clean stand-down over a half-written target.
  */
 async function unwindStart(
   repoPath: string,
   beadId: string,
-  owner: string | undefined,
+  owner: string,
   wrote: { label: boolean; claim: boolean },
-): Promise<void> {
+): Promise<string | undefined> {
   if (wrote.label) {
-    await beads
+    const unapproved = await beads
       .untag(repoPath, beadId, [LABELS.approved])
-      .catch((e) => console.error(`[picker-apply] could not unapprove ${beadId}`, e));
+      .then(() => true)
+      .catch((e) => {
+        console.error(`[picker-apply] could not unapprove ${beadId}`, e);
+        return false;
+      });
+    if (!unapproved) return `${beadId} is left approved and claimed by anton — unapprove it by hand`;
   }
   if (wrote.claim) {
-    await setAssigneeIfOwner(repoPath, beadId, owner, undefined).catch((e) =>
-      console.error(`[picker-apply] could not release the claim on ${beadId}`, e),
-    );
+    // A LOST swap is not a failure here: someone else holds the reservation now, which is a safe
+    // final state and none of ours to repair. Only an unreachable board leaves the claim standing.
+    const released = await setAssigneeIfOwner(repoPath, beadId, owner, undefined).catch((e) => {
+      console.error(`[picker-apply] could not release the claim on ${beadId}`, e);
+      return undefined;
+    });
+    if (!released) return `${beadId} is left claimed by anton — clear its assignee by hand`;
   }
+  return undefined;
+}
+
+/** A skip reason plus whatever {@link unwindStart} could not take back — one line, both facts. */
+function withLeftover(reason: string, leftover: string | undefined): string {
+  return leftover ? `${reason}; ${leftover}` : reason;
+}
+
+/**
+ * Resume the epic's settled-but-recoverable run, and answer with the job that is now running.
+ *
+ * `enqueueExecuteEpicIfAbsent` counts a `parked`/`failed` job as COVERING the epic, so it withholds
+ * an id for one — but nothing redispatches a parked job on its own. Left there, the approval and the
+ * claim this pass just wrote would hide the target from every later pass with no run behind them
+ * (PR #218 review). Reached exactly where the unstick pass reaches for the same verb, and for the
+ * same reason: a parked run is revived by resuming THAT job, so it reuses its open run and worktree
+ * rather than starting a duplicate beside it.
+ *
+ * Undefined when there is nothing to resume, or when the resume lost its own CAS — an operator's
+ * cancel, or a fresh job that took the epic's active slot first. The caller decides what that means
+ * for its writes.
+ */
+async function resumeSettledRun(
+  db: AntonDb,
+  clock: Clock,
+  projectId: string,
+  epicBeadId: string,
+): Promise<string | undefined> {
+  const resumable = await resumableExecuteEpicId(db, projectId, epicBeadId);
+  if (!resumable) return undefined;
+  return (await resumeJob(db, clock, resumable)) ? resumable : undefined;
 }
 
 /**
@@ -244,9 +299,17 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   const publish = () => nudgeSync({ id: projectId, repoPath }, "picker-apply");
 
   // This machine's identity, exactly as the approve route resolves it: the assignee a run's ownership
-  // gate reads. Undefined only when no identity resolves at all, where the CAS is a verified no-op —
-  // the target is approved and left unclaimed, which is what the approve route does there too.
+  // gate reads. Without one the pass REFUSES to start anything (PR #218 review): the assignee is the
+  // whole cross-machine guard, and an undefined one makes the CAS an unassigned→unassigned no-op that
+  // settles nothing — two pickers would both approve and both enqueue the same target. A human
+  // approving by hand is present to see that; an unattended start has only the claim as its proof.
   const operator = await resolveOperator();
+  if (!operator) {
+    const reason =
+      "this machine has no claim identity to start work under — set ANTON_OPERATOR (or a global " +
+      "git user.name)";
+    return { skipped: { beadId: top.beadId, reason } };
+  }
 
   // Set by the guard, off the board read the write is made against: whether the label is OURS to
   // take back if the enqueue then fails (see unwindStart).
@@ -288,13 +351,13 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // never re-picks. So the claim comes straight back off, and the target is startable again next
   // cadence.
   if ("approveFailed" in swap) {
-    await unwindStart(repoPath, top.beadId, operator, {
+    const leftover = await unwindStart(repoPath, top.beadId, operator, {
       label: wroteLabel,
       claim: swap.swap.wrote,
     });
     publish();
     const reason = `the target could not be approved (${swap.approveFailed})`;
-    return { skipped: { beadId: top.beadId, reason } };
+    return { skipped: { beadId: top.beadId, reason: withLeftover(reason, leftover) } };
   }
   // Lost the claim race. Abandoned cleanly and NOT retried: the winner holds the target, nothing was
   // written here (the label is contingent on this swap), and the next pass re-decides from a board
@@ -308,7 +371,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // ordered this process, and a run started on a claim that loses the merge is a second machine
   // working the same target. Only a swap that actually WROTE is settled — a no-op swap took no
   // reservation of its own to prove.
-  if (operator && swap.wrote) {
+  if (swap.wrote) {
     const settled = await settleClaim(repoPath, top.beadId, operator, input.settle);
     if ("lost" in settled) {
       publish();
@@ -317,28 +380,47 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     if ("unverified" in settled) {
       // Fail closed, like the pre-CAS refresh: a claim we cannot prove must not license a run, and
       // the writes come off so the next pass re-decides against a target that is free again.
-      await unwindStart(repoPath, top.beadId, operator, { label: wroteLabel, claim: swap.wrote });
+      const leftover = await unwindStart(repoPath, top.beadId, operator, {
+        label: wroteLabel,
+        claim: swap.wrote,
+      });
       publish();
-      return { skipped: { beadId: top.beadId, reason: settled.unverified } };
+      return { skipped: { beadId: top.beadId, reason: withLeftover(settled.unverified, leftover) } };
     }
   }
 
-  // The idempotent enqueue: a run already covering this epic locally withholds an id rather than
-  // spawning a second, which is what makes two overlapping passes one run. No `bypassBudget` — a
-  // policy start is paced by the governor exactly as a queued one is.
+  // The idempotent enqueue, then the resume it cannot do: a run already covering this epic locally
+  // withholds an id rather than spawning a second, which is what makes two overlapping passes one
+  // run. No `bypassBudget` — a policy start is paced by the governor exactly as a queued one is.
   let jobId: string | undefined;
   try {
     jobId = enqueueExecuteEpicIfAbsent(db, clock, projectId, top.beadId);
+    jobId ??= await resumeSettledRun(db, clock, projectId, top.beadId);
   } catch (e) {
-    console.error(`[picker-apply] could not enqueue a run for ${top.beadId}`, e);
-    await unwindStart(repoPath, top.beadId, operator, { label: wroteLabel, claim: swap.wrote });
+    console.error(`[picker-apply] could not start a run for ${top.beadId}`, e);
+    const leftover = await unwindStart(repoPath, top.beadId, operator, {
+      label: wroteLabel,
+      claim: swap.wrote,
+    });
     publish();
-    return { skipped: { beadId: top.beadId, reason: "the run could not be enqueued" } };
+    const reason = withLeftover("the run could not be enqueued", leftover);
+    return { skipped: { beadId: top.beadId, reason } };
   }
   if (!jobId) {
-    // A run already covers the epic here — an overlapping pass, or a resumable job from a previous
-    // one. The approval and the claim stand (they are what that run needs); no second note is
-    // written, because no second start happened — but the writes still have to be published.
+    // Nothing of this pass's making runs. An ACTIVE job genuinely covers the target — an overlapping
+    // pass, or a run already in flight — and the approval and the claim are what that run needs, so
+    // they stand and only the note is skipped: no second start happened. With no active job the
+    // writes cover nothing, and left standing they hide the target from every later pass (its own
+    // guard reads a claimed bead as taken), so they come back off (PR #218 review).
+    if (!activeExecuteEpicId(db, projectId, top.beadId)) {
+      const leftover = await unwindStart(repoPath, top.beadId, operator, {
+        label: wroteLabel,
+        claim: swap.wrote,
+      });
+      publish();
+      const reason = withLeftover("no run could be started for this target", leftover);
+      return { skipped: { beadId: top.beadId, reason } };
+    }
     publish();
     return { skipped: { beadId: top.beadId, reason: "a run already covers this target" } };
   }

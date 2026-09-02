@@ -30,7 +30,9 @@ const board = vi.hoisted(() => ({ current: new Map<string, Record<string, unknow
 vi.mock("../beads/issues", () => ({
   loadAllIssues: vi.fn(async () => [...board.current.values()]),
 }));
-vi.mock("../operator", () => ({ resolveOperator: async () => "anton-box" }));
+/** This machine's claim identity — mutable, because a machine that has none must start nothing. */
+const operator = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../operator", () => ({ resolveOperator: async () => operator.current }));
 // The publish half is the approve route's, already proven there; here it would reach the real
 // anton.db singleton for its durable backstop job.
 vi.mock("../beads/sync-nudge", () => ({ nudgeSync: vi.fn() }));
@@ -100,6 +102,7 @@ function stubBd(): void {
 let t: TestDb;
 beforeEach(() => {
   board.current = new Map();
+  operator.current = "anton-box";
   notes.length = 0;
   pullFails = false;
   pulls = 0;
@@ -135,10 +138,32 @@ function wired(over: ClaimSettleDeps = {}): ClaimSettleDeps {
 }
 
 /** Every execute-epic job this project holds, whatever its status. */
-async function jobs(): Promise<{ id: string; payloadJson: string }[]> {
+async function jobs(): Promise<{ id: string; payloadJson: string; status: string }[]> {
   return t.db
-    .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson })
+    .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson, status: schema.jobs.status })
     .from(schema.jobs);
+}
+
+/** A settled-but-recoverable run left on `t1` by an earlier attempt — what a parked epic looks like. */
+async function settledJob(status: "parked" | "failed"): Promise<string> {
+  const id = `job-${status}`;
+  await t.db.insert(schema.jobs).values({
+    id,
+    type: "execute-epic",
+    projectId: "p1",
+    payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: "t1" }),
+    status,
+    runAt: new Date(NOW),
+    updatedAt: new Date(NOW),
+  });
+  return id;
+}
+
+/** Make every job CAS lose — the concurrent settle `resumeJob`'s guarded UPDATE exists to catch. */
+function jobWritesLoseTheirRace(): void {
+  vi.spyOn(t.db, "update").mockReturnValue({
+    set: () => ({ where: () => ({ returning: async () => [] }) }),
+  } as unknown as ReturnType<TestDb["db"]["update"]>);
 }
 
 describe("applyPickerPlan", () => {
@@ -447,5 +472,86 @@ describe("applyPickerPlan", () => {
 
     expect(outcome).toMatchObject({ skipped: { beadId: "ghost" } });
     expect(await jobs()).toHaveLength(0);
+  });
+
+  it("starts nothing when this machine has no claim identity", async () => {
+    // The assignee IS the cross-machine guard: with nobody to claim as, the CAS is a no-op that
+    // proves nothing, and two pickers would both approve and both enqueue the same target.
+    operator.current = undefined;
+    put(bead("t1"));
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "no claim identity",
+    );
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(read("t1").assignee).toBeUndefined();
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
+  });
+
+  it("resumes a parked run rather than claiming a target nothing will run", async () => {
+    // The operator fixed what parked the run and released its stale reservation. A parked job
+    // COVERS the epic, so the enqueue withholds an id — and nothing redispatches it on its own.
+    put(bead("t1"));
+    const parked = await settledJob("parked");
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ started: { beadId: "t1", jobId: parked } });
+    expect(await jobs()).toEqual([
+      expect.objectContaining({ id: parked, status: "queued" }),
+    ]);
+    expect(read("t1").assignee).toBe("anton-box");
+    expect(read("t1").labels).toContain(LABELS.approved);
+    expect(notes).toHaveLength(1);
+  });
+
+  it("takes its writes back when no run could be started at all", async () => {
+    // The unwind's whole point, from the enqueue's blind side: a covering job that could not be
+    // resumed leaves an approved, self-claimed target with nothing behind it — which every later
+    // pass reads as work already under way and never re-picks.
+    put(bead("t1"));
+    await settledJob("failed");
+    jobWritesLoseTheirRace();
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({
+      skipped: { beadId: "t1", reason: "no run could be started for this target" },
+    });
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(notes).toEqual([]);
+    expect(nudgeSync).toHaveBeenCalled();
+  });
+
+  it("keeps the claim standing when the approval it wrote will not come off", async () => {
+    // Ordered, not best-effort: releasing on top of a failed unapproval publishes exactly the shape
+    // any worker starts — approved and unclaimed — so the target waits for a person instead.
+    put(bead("t1"));
+    vi.spyOn(beads, "untag").mockRejectedValue(new Error("bd update timed out"));
+    const broken = {
+      ...t.db,
+      transaction: () => {
+        throw new Error("anton.db is gone");
+      },
+    };
+
+    const outcome = await applyPickerPlan({
+      db: broken as unknown as TestDb["db"],
+      clock,
+      projectId: "p1",
+      repoPath: REPO,
+      entries: [{ beadId: "t1", rank: 1, rule: "the work policy armed on this machine" }],
+    });
+
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "left approved and claimed",
+    );
+    expect(read("t1").labels).toContain(LABELS.approved);
+    expect(read("t1").assignee).toBe("anton-box");
   });
 });
