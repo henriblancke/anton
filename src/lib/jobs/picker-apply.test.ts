@@ -973,6 +973,59 @@ describe("applyPickerPlan", () => {
       expect(read("t1").labels ?? []).toContain(LABELS.approved);
     });
 
+    it("enqueues nothing when the reservation changes hands while the SECOND confirmation runs", async () => {
+      // The window the re-ask itself opens (PR #218 review). That second call can block for exactly
+      // as long as the first — a `gh pr view` per waiting PR — so the board it was handed is stale by
+      // the time it clears, and a pass judging ownership off it would enqueue a run against another
+      // machine's reservation. The gates below it therefore judge a read taken on its far side.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) board.current.get("t1")!.assignee = "other-box";
+          return undefined;
+        },
+      });
+
+      expect(asked).toBe(2);
+      expect(outcome).toMatchObject({
+        skipped: { beadId: "t1", reason: "other-box claimed it first", wroteBoard: true },
+      });
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      // Not ours to unwind, exactly as after a lost merge: the approval belongs to the holder now.
+      expect(read("t1").assignee).toBe("other-box");
+      expect(read("t1").labels ?? []).toContain(LABELS.approved);
+    });
+
+    it("takes its writes back when the target stops being startable while the SECOND confirmation runs", async () => {
+      // The board-derived half of that same window: blocked, closed, or labelled `agent:human` while
+      // the re-ask confirmed its PRs. Only the read on its far side can see it.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) {
+            const b = board.current.get("t1")!;
+            b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
+          }
+          return undefined;
+        },
+      });
+
+      expect(asked).toBe(2);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("stopped being startable");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
     it("enqueues nothing when its claim is cleared while the queue is checked", async () => {
       // The other half of the same loss: a human clearing the assignee leaves the target unowned,
       // which the cleared-claim projection below cannot tell from a target this pass still holds.

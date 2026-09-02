@@ -541,7 +541,7 @@ async function unwindStart(
   beadId: string,
   owner: string,
   wrote: { label: boolean; claim: boolean },
-): Promise<string | undefined> {
+): Promise<UnwindState> {
   const leftover = await unwindApproveClaim({
     repoPath,
     beadId,
@@ -551,15 +551,35 @@ async function unwindStart(
     wroteClaim: wrote.claim,
   });
   if (leftover === "approval") {
-    return `${beadId} is left approved and claimed by anton — unapprove it by hand`;
+    return {
+      note: `${beadId} is left approved and claimed by anton — unapprove it by hand`,
+      wroteBoard: true,
+    };
   }
-  if (leftover === "claim") return `${beadId} is left claimed by anton — clear its assignee by hand`;
-  return undefined;
+  if (leftover === "claim") {
+    return { note: `${beadId} is left claimed by anton — clear its assignee by hand`, wroteBoard: true };
+  }
+  // The reservation passed to another worker mid-compensation, so the approval this pass wrote is
+  // that holder's now and stays put (PR #218 review). Nobody has to clear anything — but the board
+  // still carries the write, so the caller's plan reads stale exactly as it does after a start.
+  if (leftover === "transferred") {
+    return { note: `${beadId} is claimed by another worker — its approval stands`, wroteBoard: true };
+  }
+  return { wroteBoard: false };
 }
 
-/** A skip reason plus whatever {@link unwindStart} could not take back — one line, both facts. */
-function withLeftover(reason: string, leftover: string | undefined): string {
-  return leftover ? `${reason}; ${leftover}` : reason;
+/**
+ * What an unwind left behind: the line an operator needs, and whether the board still carries this
+ * pass's writes (the caller's cue that its saved plan reads stale — see {@link PickerSkip}).
+ */
+interface UnwindState {
+  note?: string;
+  wroteBoard: boolean;
+}
+
+/** A skip reason plus whatever {@link unwindStart} left on the board — one line, both facts. */
+function withLeftover(reason: string, note: string | undefined): string {
+  return note ? `${reason}; ${note}` : reason;
 }
 
 /**
@@ -721,7 +741,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // never re-picks. So the claim comes straight back off, and the target is startable again next
   // cadence.
   if ("approveFailed" in swap) {
-    const leftover = await unwindStart(repoPath, top.beadId, operator, {
+    const left = await unwindStart(repoPath, top.beadId, operator, {
       label: wroteLabel,
       claim: swap.swap.wrote,
     });
@@ -730,8 +750,8 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     return {
       skipped: {
         beadId: top.beadId,
-        reason: withLeftover(reason, leftover),
-        wroteBoard: leftover !== undefined,
+        reason: withLeftover(reason, left.note),
+        wroteBoard: left.wroteBoard,
       },
     };
   }
@@ -748,7 +768,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // still carries this pass's writes, which is what tells the caller its saved plan reads stale
   // (PR #218 review). One closure, so that answer cannot drift between them.
   const standDown = async (reason: string): Promise<PickerApplyOutcome> => {
-    const leftover = await unwindStart(repoPath, top.beadId, operator, {
+    const left = await unwindStart(repoPath, top.beadId, operator, {
       label: wroteLabel,
       claim: swap.wrote,
     });
@@ -756,8 +776,8 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     return {
       skipped: {
         beadId: top.beadId,
-        reason: withLeftover(reason, leftover),
-        wroteBoard: leftover !== undefined,
+        reason: withLeftover(reason, left.note),
+        wroteBoard: left.wroteBoard,
       },
     };
   };
@@ -807,43 +827,64 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // client can relabel the target out of the policy, block it, label it `agent:human`, close it or
   // withdraw the approval while those PRs are confirmed, and answering from the snapshot the
   // confirmation started with would enqueue work that is no longer claimable or no longer admitted.
-  // FAILS CLOSED like every other read here, and it is deliberately the LAST board read before the
-  // enqueue: everything below judges THIS snapshot, so nothing can age behind another round trip
-  // except the flow brake's own re-ask, which is board-only wherever the queue has bandwidth.
-  let gateBoard: Bead[];
-  try {
-    gateBoard = await loadAllIssues(repoPath);
-  } catch (e) {
-    return standDown(`the board could not be read before starting (${errorText(e)})`);
-  }
-  const target = gateBoard.find((b) => b.id === top.beadId);
-  if (!target) return standDown("the target left the board before its run was enqueued");
+  // FAILS CLOSED like every other read here.
+  const readGateBoard = async (): Promise<Bead[] | string> => {
+    try {
+      return await loadAllIssues(repoPath);
+    } catch (e) {
+      return `the board could not be read before starting (${errorText(e)})`;
+    }
+  };
+  const gateBoard = await readGateBoard();
+  if (typeof gateBoard === "string") return standDown(gateBoard);
 
-  // The RESERVATION itself, re-asserted on this read (PR #218 review). Everything below judges the
-  // target with the claim cleared (see {@link asUnclaimed}), so an ownership change that landed
-  // while the review queue was confirmed — a merge this machine lost, or a human clearing the
-  // assignee — is read here and would otherwise be discarded, and the pass would enqueue a second
-  // run against someone else's reservation. Taken back exactly as the settle takes a lost claim
-  // back: the approval STANDS, because a withdrawal now would strip it out from under the holder
-  // whose decision it has become.
-  const holder = ownerOf(target);
-  if (holder !== operator) {
+  // A reservation this pass no longer holds, wherever it is read (PR #218 review). Every gate below
+  // judges the target with the claim cleared (see {@link asUnclaimed}), so an ownership change — a
+  // merge this machine lost, or a human clearing the assignee — would otherwise be discarded and the
+  // pass would enqueue a second run against someone else's reservation. Taken back exactly as the
+  // settle takes a lost claim back: the approval STANDS, because a withdrawal now would strip it out
+  // from under the holder whose decision it has become.
+  const lostClaim = (holder: string | undefined): PickerApplyOutcome => {
     publish();
     const reason = holder
       ? `${holder} claimed it first`
       : "the claim was released while the review queue was confirmed";
     return { skipped: { beadId: top.beadId, reason, wroteBoard: wroteLabel } };
-  }
+  };
+
+  const claimed = gateBoard.find((b) => b.id === top.beadId);
+  if (!claimed) return standDown("the target left the board before its run was enqueued");
+  // Asked before the confirmation as well as after it: a target this pass has already lost is not
+  // worth minutes of `gh` reads to decide about.
+  const gateHolder = ownerOf(claimed);
+  if (gateHolder !== operator) return lostClaim(gateHolder);
 
   // The flow brake once more, now against THIS read (PR #218 review): a run reaching
   // `stage:in-review` while the first call confirmed its PRs fills the very slot that call cleared
   // the pass into, and only a verdict taken on the far side of that confirmation can see it. Free
   // wherever the board still shows bandwidth — under the limit the hold spawns no `gh` at all (see
-  // {@link checkWipLimit}) — so on every path but a queue that has REACHED the limit on this read
-  // nothing below ages behind it. Asked before the settings brakes for the same reason the first
-  // call is: they are the correctness half, and they get the last word.
+  // {@link checkWipLimit}). Asked before the settings brakes for the same reason the first call is:
+  // they are the correctness half, and they get the last word.
   const stillHolding = await held(gateBoard);
   if (stillHolding) return standDown(stillHolding);
+
+  // And the board ONE more time, on the far side of that second confirmation (PR #218 review). It
+  // can block for exactly as long as the first — a `gh pr view` per waiting PR — and a verdict it
+  // CLEARS is precisely the case where PRs moved, so the board very likely moved with them: judging
+  // the reservation, the eligibility rule or the policy off the snapshot the confirmation began with
+  // would reopen the window the read above exists to close. This is the LAST board read before the
+  // enqueue, and no blocking await sits between it and the insert — only the flow brake's own
+  // verdict ages past it, by the local reads below rather than by another confirmation.
+  //
+  // Paid on every apply rather than only on the confirming one, because the brake reports a hold,
+  // not whether it had to spawn `gh` to decide: one `bd list` against a start that cannot be taken
+  // back.
+  const finalBoard = await readGateBoard();
+  if (typeof finalBoard === "string") return standDown(finalBoard);
+  const target = finalBoard.find((b) => b.id === top.beadId);
+  if (!target) return standDown("the target left the board before its run was enqueued");
+  const holder = ownerOf(target);
+  if (holder !== operator) return lostClaim(holder);
 
   // The last three questions, together on that one fresh read so none of them ages behind another's
   // await: the disarm latch — which a breaker can raise on a run settling into a failing streak —
@@ -851,7 +892,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // asked them (PR #218 review). See {@link pickerDisarmed} and {@link stillStartable}.
   const [frozen, moved] = await Promise.all([
     disarmed(),
-    stillStartable(gateBoard, target, stance, "while the review queue was confirmed"),
+    stillStartable(finalBoard, target, stance, "while the review queue was confirmed"),
   ]);
   if (frozen) return standDown(frozen);
   if (moved) return standDown(moved);

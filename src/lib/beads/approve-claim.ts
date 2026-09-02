@@ -30,7 +30,7 @@
  * is for.
  */
 import { beads, LABELS, type Bead } from "./bd";
-import { withClaimLock, type LockedSwap, type SwapResult } from "./claim";
+import { ownerOf, withClaimLock, type LockedSwap, type SwapResult } from "./claim";
 import { loadAllIssues } from "./issues";
 
 /**
@@ -146,10 +146,15 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
 }
 
 /**
- * What an unwind could NOT take back. The caller words it: the same leftover names a different state
+ * What an unwind LEFT on the board. The caller words it: the same value names a different state
  * depending on who was holding the reservation (the picker's own claim, an approver's hand-back).
+ *
+ * `approval` and `claim` are writes it could not take back — both need a human. `transferred` is the
+ * opposite (PR #218 review): the reservation passed to another worker while this request held it, so
+ * the writes stopped being ours to reverse. Nobody has to clear anything, but the approval this
+ * request wrote is still standing, which a caller whose plan was stamped before it has to know.
  */
-export type UnwindLeftover = "approval" | "claim";
+export type UnwindLeftover = "approval" | "claim" | "transferred";
 
 export interface UnwindApproveClaimInput {
   repoPath: string;
@@ -183,6 +188,16 @@ export interface UnwindApproveClaimInput {
  * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
  * this exists to prevent. An unreadable board is treated as approved, so the unwind fails closed.
  *
+ * That same re-read decides whether the writes are still OURS at all (PR #218 review). The untag is
+ * the one unconditional write here — the release is a CAS and refuses a target somebody else holds —
+ * and the lock orders this process only, so on a shared-server board a competing picker can win the
+ * assignee race between the ambiguous `beads.approve` and this compensation. Stripping the label
+ * then erases the approval the WINNER is now running on, which stands their run down or poison-parks
+ * it. So an owner that is no longer `owner` ends the unwind as `transferred`: their reservation,
+ * their approval, and nothing of ours left to reverse — the same call the picker's settle makes when
+ * its claim loses the board merge. An unreadable board still fails closed toward unwinding, because
+ * a stranded claim nobody can see is the worse of the two.
+ *
  * The WHOLE unwind runs under the bead's claim-write lock, not just its release (PR #218 review).
  * Unlocked, the re-read, the untag and the release are three separately-ordered writes, and a retry
  * approving the same target between them lands inside the compensation: this unwind then strips the
@@ -204,15 +219,20 @@ export async function unwindApproveClaim(
   const { repoPath, beadId } = input;
 
   return withClaimLock(repoPath, beadId, async (cas) => {
-    const approved =
-      input.wroteLabel &&
-      (await beads
-        .show(repoPath, beadId)
-        .then((b) => beads.isApproved(b))
-        .catch((e) => {
+    // One read, two questions: is the reservation still ours to reverse, and did the label actually
+    // land. Read only when there is a label to take off — with none, the release below is a CAS that
+    // asks the ownership question itself.
+    const current = input.wroteLabel
+      ? await beads.show(repoPath, beadId).catch((e) => {
           console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
-          return true;
-        }));
+          return undefined;
+        })
+      : undefined;
+    if (current && ownerOf(current) !== input.owner) return "transferred";
+
+    // No read at all (an unreadable board) fails closed to "approved", like every other unanswerable
+    // question here: leaving the label on a target this request also claimed strands it for good.
+    const approved = input.wroteLabel && (current ? beads.isApproved(current) : true);
     if (approved) {
       const unapproved = await beads
         .untag(repoPath, beadId, [LABELS.approved])

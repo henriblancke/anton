@@ -694,7 +694,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
           ? `${epicId} could not be approved, and the claim this request took could not be handed ` +
             `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
             swap.approveFailed
-          : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
+          : // The reservation changed hands while this request's writes were being taken back, so
+            // they stopped being ours to reverse (PR #218 review): whoever holds the target now owns
+            // the approval standing on it, and stripping it would strand THEIR run. Nothing for the
+            // operator to clear — but the target did move, so the response says so rather than
+            // claiming nothing changed.
+            leftover === "transferred"
+            ? `${epicId} could not be approved by this request — it was claimed by another worker ` +
+              `while it was in flight, and its approval now stands for them. ${swap.approveFailed}`
+            : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
     // Same reason as the claim-failure branch above: the unwind is itself a board write, and what it
     // could not take back is a partial write standing. Neither reaches another machine until it is
     // published (PR #218 review).

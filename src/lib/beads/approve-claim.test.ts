@@ -118,6 +118,51 @@ describe("unwindApproveClaim", () => {
     expect(read().assignee).toBe("other-box");
   });
 
+  it("leaves both writes alone when the reservation changed hands mid-compensation", async () => {
+    // The untag is the one UNCONDITIONAL write here, and the lock orders this process only: on a
+    // shared-server board a competing picker can win the assignee race between the ambiguous
+    // `beads.approve` and this compensation. Stripping the label then erases the approval the WINNER
+    // is running on, so the whole unwind stands down instead (PR #218 review).
+    put({ labels: [LABELS.approved], assignee: "other-box" });
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: true,
+      }),
+    ).resolves.toBe("transferred");
+
+    expect(read().labels).toContain(LABELS.approved);
+    expect(read().assignee).toBe("other-box");
+    expect(beads.untag).not.toHaveBeenCalled();
+  });
+
+  it("still takes its writes back when the bead cannot be re-read", async () => {
+    // An unreadable board answers neither question, and the two failures are not symmetric: a
+    // stranded approval nobody can see hides the target from every later pass, while an untag that
+    // was not ours to make needs the same human either way. So it fails closed toward unwinding,
+    // exactly as the label ambiguity above it does.
+    put({ labels: [LABELS.approved], assignee: "anton-box" });
+    vi.spyOn(beads, "show").mockRejectedValue(new Error("bd is down"));
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: false,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(read().labels).not.toContain(LABELS.approved);
+  });
+
   it("holds the bead lock across the whole unwind, so a retry cannot land between its legs", async () => {
     // Unlocked, the untag and the release are separately ordered: a concurrent approval of the same
     // target could take the reservation between them and have this release hand it straight back,
