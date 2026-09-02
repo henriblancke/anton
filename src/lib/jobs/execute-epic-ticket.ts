@@ -475,58 +475,15 @@ async function settleTicketTimeout(args: {
       logPath,
       `[ticket-timeout] ${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m budget\n`,
     ).catch(() => {});
-    // NEVER roll back a ticket that already committed. The baseline is the commit this ticket
-    // STARTED from, so a reset onto it would delete that commit — and a ticket whose commit
-    // landed has delivered real, gate-passed work; only its bookkeeping was cut short. The
-    // rollback exists for the uncommitted case, which is the only one that can leak into the
-    // next ticket's commit.
-    const rolledBack =
-      !committed && baseline
-        ? await safe(() => restoreWorktreeState(worktreePath, baseline))
-        : false;
-    // A rollback that failed — or was impossible, because the baseline itself was unreadable —
-    // may have left this ticket's files in the worktree the NEXT ticket commits from. Re-read the
-    // tree rather than assume: only changes actually left behind are dangerous, and a tree that
-    // can't be read at all counts as dangerous.
-    const leftovers =
-      !committed && !rolledBack && (await leftChangesBehind(worktreePath, baseline));
-    await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
-    await safe(() => beads.unassign(repo, ticket.id));
-    await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
-    // Rolled back ⇒ nothing from this ticket is on the branch, so it is in no PR: mark it, or
-    // merge finalization closes it as shipped when the rest of the feature lands (anton-67xj).
-    // A ticket stopped AFTER its commit is NOT marked — its work is in the diff a human merges.
-    // The marker is finalization's only input, so it is retried rather than best-effort; a run
-    // that still cannot record it must not reach its PR (escalated below, once the note is on the
-    // bead — the operator needs the timeout's own account either way).
-    const marked =
-      committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
-    await safe(() =>
-      beads.note(
-        repo,
-        ticket.id,
-        `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its ` +
-          `budget, so the run blocked it and carried on with the rest of the feature. ` +
-          (committed
-            ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
-              `and close the ticket by hand if it is complete. `
-            : leftovers
-              ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
-                `(${worktreePath}), so the run stopped rather than let another ticket commit it — ` +
-                `clear the worktree by hand before resuming. `
-              : `Its partial work was rolled back (nothing from it is on the branch). `) +
-          `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
-      ),
-    );
-    // Either halt below PARKS the run and tells the operator to resume it, so this ticket has to
-    // stay claimable (anton-67xj). The block above left it `blocked` — or `in_progress` and
-    // unowned, if that best-effort status write failed — and runTicket's hard claim gate refuses
-    // both, so the advertised resume would die on its own first step. Put it back at `open`, the
-    // same restore the stale-marker path performs; the note above is what carries the timeout's
-    // account to the operator, not the status. A timeout the run ABSORBS keeps `blocked` here: it
-    // carries on to a PR, and the block is the human's cue — and if that run later stops instead,
-    // its own stopping path reopens what it absorbed, for exactly the reason above.
-    if (leftovers || !marked) await safe(() => beads.setStatus(repo, ticket.id, "open"));
+    const leftovers = await rollbackTimedOutTicket(worktreePath, baseline, committed);
+    const marked = await blockTimedOutTicket({
+      repo,
+      ticket,
+      worktreePath,
+      timeoutMs,
+      committed,
+      leftovers,
+    });
     // The rollback is what keeps the REST of the run honest, so its failure cannot be absorbed
     // the way the timeout itself is: the next ticket captures its baseline from this same tree
     // and would commit these leftovers under its own name. The bead note can't prevent that —
@@ -541,8 +498,8 @@ async function settleTicketTimeout(args: {
       );
     }
     // Same reasoning one step further out: this ticket's work is on no branch, and without the
-    // marker the merge of the PR carrying the REST of the feature closes it as shipped. The note
-    // above can't prevent that — finalization reads labels, not prose — so halt instead of
+    // marker the merge of the PR carrying the REST of the feature closes it as shipped. The bead
+    // note can't prevent that — finalization reads labels, not prose — so halt instead of
     // absorbing this timeout and walking on toward a PR that would swallow the ticket.
     if (!marked) {
       throw new PoisonEpic(
@@ -554,6 +511,82 @@ async function settleTicketTimeout(args: {
     }
     throw new TicketTimeoutError(ticket.id, timeoutMs, committed);
   }
+}
+
+/**
+ * Undo what a timed-out ticket left in the tree, and report whether any of it is STILL there — the
+ * only condition under which the NEXT ticket's commit would sweep it up as its own.
+ */
+async function rollbackTimedOutTicket(
+  worktreePath: string,
+  baseline: WorktreeState | null,
+  committed: boolean,
+): Promise<boolean> {
+  // NEVER roll back a ticket that already committed. The baseline is the commit this ticket
+  // STARTED from, so a reset onto it would delete that commit — and a ticket whose commit landed
+  // has delivered real, gate-passed work; only its bookkeeping was cut short. The rollback exists
+  // for the uncommitted case, which is the only one that can leak into the next ticket's commit.
+  const rolledBack =
+    !committed && baseline ? await safe(() => restoreWorktreeState(worktreePath, baseline)) : false;
+  // A rollback that failed — or was impossible, because the baseline itself was unreadable — may
+  // have left this ticket's files in the worktree the NEXT ticket commits from. Re-read the tree
+  // rather than assume: only changes actually left behind are dangerous, and a tree that can't be
+  // read at all counts as dangerous.
+  return !committed && !rolledBack && (await leftChangesBehind(worktreePath, baseline));
+}
+
+/**
+ * Write a timed-out ticket's board state: blocked and released, with the operator's account of what
+ * happened to its work. Returns whether the undelivered marker landed — the one write here the run
+ * cannot proceed without.
+ */
+async function blockTimedOutTicket(args: {
+  repo: string;
+  ticket: Bead;
+  worktreePath: string;
+  timeoutMs: number;
+  committed: boolean;
+  leftovers: boolean;
+}): Promise<boolean> {
+  const { repo, ticket, worktreePath, timeoutMs, committed, leftovers } = args;
+  await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
+  await safe(() => beads.unassign(repo, ticket.id));
+  await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+  // Rolled back ⇒ nothing from this ticket is on the branch, so it is in no PR: mark it, or merge
+  // finalization closes it as shipped when the rest of the feature lands (anton-67xj). A ticket
+  // stopped AFTER its commit is NOT marked — its work is in the diff a human merges. The marker is
+  // finalization's only input, so it is retried rather than best-effort; a run that still cannot
+  // record it must not reach its PR (the caller escalates, once the note below is on the bead — the
+  // operator needs the timeout's own account either way).
+  const marked =
+    committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
+  await safe(() =>
+    beads.note(
+      repo,
+      ticket.id,
+      `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its ` +
+        `budget, so the run blocked it and carried on with the rest of the feature. ` +
+        (committed
+          ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
+            `and close the ticket by hand if it is complete. `
+          : leftovers
+            ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
+              `(${worktreePath}), so the run stopped rather than let another ticket commit it — ` +
+              `clear the worktree by hand before resuming. `
+            : `Its partial work was rolled back (nothing from it is on the branch). `) +
+        `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
+    ),
+  );
+  // Either halt the caller makes PARKS the run and tells the operator to resume it, so this ticket
+  // has to stay claimable (anton-67xj). The block above left it `blocked` — or `in_progress` and
+  // unowned, if that best-effort status write failed — and runTicket's hard claim gate refuses
+  // both, so the advertised resume would die on its own first step. Put it back at `open`, the same
+  // restore the stale-marker path performs; the note above is what carries the timeout's account to
+  // the operator, not the status. A timeout the run ABSORBS keeps `blocked` here: it carries on to
+  // a PR, and the block is the human's cue — and if that run later stops instead, its own stopping
+  // path reopens what it absorbed, for exactly the reason above.
+  if (leftovers || !marked) await safe(() => beads.setStatus(repo, ticket.id, "open"));
+  return marked;
 }
 
 /**
