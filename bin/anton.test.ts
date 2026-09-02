@@ -457,12 +457,15 @@ describe("anton doctor — stale server build", () => {
    * developer's own machine would find THEIR anton on 3000 and flip every "nothing is running" case.
    */
   async function runDoctorWith(
-    record: object | null,
+    record: { pid: number } | ({ pid: number } | null)[] | null,
     { daemonPid, port = 1, recordedPort }: { daemonPid?: number; port?: number; recordedPort?: number } = {},
   ) {
+    const records = (Array.isArray(record) ? record : [record]).filter((one) => one !== null);
     const home = await dirs.make("anton-home-");
     const state = await dirs.make("anton-state-");
-    if (record) writeFileSync(join(state, "server-build.json"), JSON.stringify(record));
+    // Records are named for the process that wrote them, so doctor reads the record and the pid it
+    // claims as one thing — a name that disagrees with the contents names no process at all.
+    for (const one of records) writeFileSync(join(state, `server-build.${one.pid}.json`), JSON.stringify(one));
     if (daemonPid) writeFileSync(join(state, "anton.pid"), String(daemonPid));
     // `recordedPort` stands in for a `dev`/`start` that ran earlier on a nondefault port and left
     // its note beside anton.db; doctor is then invoked with no flag at all, which is the case.
@@ -486,6 +489,12 @@ describe("anton doctor — stale server build", () => {
   // The vitest process itself stands in for the running server: its pid is alive, which is the only
   // thing that makes a record a claim about NOW rather than a leftover.
   const running = (over: object) => ({ version: "0.4.0", revision: null, pid: process.pid, bootedAt: Date.now(), ...over });
+
+  /** The identity of the code doctor will read on disk — what a server has to match to be current. */
+  const current = () => ({
+    version: JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version,
+    revision: spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(),
+  });
 
   it("names the running build, the one on disk, and the restart that clears it", async () => {
     const r = await runDoctorWith(running({ version: "0.0.1" }));
@@ -547,11 +556,32 @@ describe("anton doctor — stale server build", () => {
   });
 
   it("stays silent for a server started from the current checkout", async () => {
-    const onDisk = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version;
-    const head = spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
-    const r = await runDoctorWith(running({ version: onDisk, revision: head }));
+    const r = await runDoctorWith(running(current()));
     expect(r.stdout).toContain("running the build on disk");
     expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // A record outlives the server that wrote it, and the pid it names gets reused. Read as live it
+  // would both vouch for a build nothing is serving AND stand in for the liveness check — so the
+  // one server that IS up, too old to have left a record of its own, stays invisible.
+  it("does not let a stopped server's leftover record answer for a server that is running", async () => {
+    const port = await serve("<html><head><title>anton</title></head>");
+    const r = await runDoctorWith(running({ pid: process.pid, startedAt: "a process that has exited" }), { port });
+    expect(r.stdout).toContain("recorded no build identity");
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // Two servers from one install — a UI-only `ANTON_RUNNER=off` one beside the runner. Each is its
+  // own answer: under a shared record the newer one spoke for both and the stale one went unnamed.
+  it("answers for every running server, not just the last one to boot", async () => {
+    const r = await runDoctorWith([
+      running({ version: "0.0.1", bootedAt: 1 }),
+      // The parent of this test process: a second pid that is genuinely alive.
+      { ...running(current()), pid: process.ppid, bootedAt: 2 },
+    ]);
+    expect(r.stdout).toContain(`pid ${process.pid} is running 0.0.1`);
+    expect(r.stdout).toContain(`pid ${process.ppid} running the build on disk`);
+    expect(r.stdout).toContain("Restart it to run the build on disk");
   });
 });
 

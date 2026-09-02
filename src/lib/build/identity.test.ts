@@ -14,16 +14,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  BUILD_RECORD_FILE,
   buildDrift,
   buildMatchesCheckout,
+  buildRecordFile,
   buildRecordPath,
   buildStampPath,
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
+  listBuildRecords,
+  processStartedAt,
+  pruneBuildRecords,
   readBuildIdentity,
   readBuildRecord,
+  recordAlive,
   sameCheckout,
   writeBuildRecord,
   writeBuildStamp,
@@ -306,18 +310,57 @@ describe("sameCheckout", () => {
 });
 
 describe("the record a running server leaves", () => {
-  it("round-trips through the path anton.db decides", () => {
+  it("round-trips through the path anton.db decides, named for the process that wrote it", () => {
     const dir = tempDir();
     const path = buildRecordPath(join(dir, "anton.db"));
-    expect(path).toBe(join(dir, "server-build.json"));
-    expect(writeBuildRecord(path, RUNNING, { pid: 4242, bootedAt: 1_700_000_000_000 })).toBe(true);
-    expect(readBuildRecord(path)).toEqual({ ...RUNNING, pid: 4242, bootedAt: 1_700_000_000_000 });
+    expect(path).toBe(join(dir, `server-build.${process.pid}.json`));
+    const stamp = { pid: 4242, bootedAt: 1_700_000_000_000, startedAt: "when-4242-began" };
+    expect(writeBuildRecord(buildRecordPath(join(dir, "anton.db"), 4242), RUNNING, stamp)).toBe(true);
+    expect(readBuildRecord(join(dir, "server-build.4242.json"))).toEqual({ ...RUNNING, ...stamp });
+  });
+
+  // The failure a shared filename causes: two servers from one install (a UI-only `ANTON_RUNNER=off`
+  // one beside the runner) would have the LAST to boot speak for both, and a server that booted
+  // after a pull would suppress the older one's stale verdict by matching the code on disk itself.
+  it("keeps one record per process, so a second server cannot overwrite the first's identity", () => {
+    const dir = tempDir();
+    const db = join(dir, "anton.db");
+    writeBuildRecord(buildRecordPath(db, 4242), { ...RUNNING, version: "0.3.9" }, { pid: 4242, bootedAt: 1 });
+    writeBuildRecord(buildRecordPath(db, 4243), RUNNING, { pid: 4243, bootedAt: 2 });
+
+    expect(readBuildRecord(buildRecordPath(db, 4242))).toMatchObject({ version: "0.3.9" });
+    expect(listBuildRecords(db).map(({ record }) => record.pid)).toEqual([4242, 4243]);
+  });
+
+  // Nothing deletes a record when a server exits — a crash could not — so without this every boot
+  // would leave one more file beside anton.db forever.
+  it("drops the records of processes that are gone, and only those", () => {
+    const dir = tempDir();
+    const db = join(dir, "anton.db");
+    writeBuildRecord(buildRecordPath(db, 4242), RUNNING, { pid: 4242, bootedAt: 1 });
+    writeBuildRecord(buildRecordPath(db), RUNNING);
+    writeFileSync(join(dir, "server-build.notapid.json"), "{}");
+
+    pruneBuildRecords(db, (record) => record.pid === process.pid);
+
+    expect(listBuildRecords(db).map(({ record }) => record.pid)).toEqual([process.pid]);
+    // Only records are pruned: an unrelated file that merely starts with the prefix is not one.
+    expect(readBuildRecord(join(dir, "server-build.notapid.json"))).toEqual({});
+  });
+
+  // A record's pid is what makes it that process's own, so a file whose name and contents disagree
+  // (hand-edited, or copied between state dirs) is attributable to nothing and speaks for nobody.
+  it("ignores a record whose filename and pid disagree", () => {
+    const dir = tempDir();
+    const db = join(dir, "anton.db");
+    writeFileSync(buildRecordPath(db, 4242), JSON.stringify({ ...RUNNING, pid: 4243, bootedAt: 1 }));
+    expect(listBuildRecords(db)).toEqual([]);
   });
 
   // A source checkout resolves the record to the repo root, so an unignored name would leave a pid
   // and a boot timestamp staged by the next routine `git add -A`.
   it("carries a name this repo ignores, so a boot never dirties the checkout", () => {
-    const ignored = spawnSync("git", ["check-ignore", "-q", BUILD_RECORD_FILE], { cwd: process.cwd() });
+    const ignored = spawnSync("git", ["check-ignore", "-q", buildRecordFile(process.pid)], { cwd: process.cwd() });
     expect(ignored.status).toBe(0);
   });
 
@@ -339,6 +382,26 @@ describe("the record a running server leaves", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "blocked"), "");
     expect(writeBuildRecord(join(dir, "blocked", "rec.json"), RUNNING)).toBe(false);
+  });
+
+  // A pid is not an identity: the OS reuses the number, and a record outlives the server that wrote
+  // it. Without the birth stamp `anton doctor` vouches for — or demands a restart of — a process
+  // that stopped hours ago and whose pid now belongs to something unrelated.
+  it("holds a record to the process that wrote it, not to the number it was given", () => {
+    const startedAt = processStartedAt(process.pid);
+    expect(startedAt).toEqual(expect.any(String));
+    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt })).toBe(true);
+    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: "a different process" })).toBe(false);
+  });
+
+  // Two absences, and neither is evidence: a machine that cannot read a birth time at all must not
+  // start calling every live server stopped, and a record written before one could be read is
+  // exactly as trustworthy as it was.
+  it("falls back to the pid alone when no birth time can be established", () => {
+    expect(recordAlive({ ...RUNNING, pid: process.pid })).toBe(true);
+    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: "unreadable" }, () => null)).toBe(true);
+    expect(recordAlive({ ...RUNNING, pid: 999999, startedAt: null })).toBe(false);
+    expect(recordAlive(null)).toBe(false);
   });
 
   it("treats an unreadable or absent record as no record", () => {
@@ -454,6 +517,17 @@ describe("buildDrift", () => {
   it("goes quiet once the process that wrote the record is gone", () => {
     const paths = install({ version: "0.4.0" }, { version: "0.3.9", revision: null, pid: 999999, bootedAt: 1 });
     expect(buildDrift({ ...paths, isAlive: dead })).toBeNull();
+  });
+
+  // The leftover a restart does not clear: the server exited, the OS handed its number to something
+  // else, and the default liveness test is what has to notice — a stale record must not be able to
+  // stand in for a running server.
+  it("goes quiet when the pid is alive but belongs to a different process now", () => {
+    const paths = install(
+      { version: "0.4.0" },
+      { version: "0.3.9", revision: null, pid: process.pid, bootedAt: 1, startedAt: "some other process" },
+    );
+    expect(buildDrift(paths)).toBeNull();
   });
 
   it("says nothing about a missing record on an install with no server up", () => {

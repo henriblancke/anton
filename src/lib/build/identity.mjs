@@ -37,9 +37,11 @@ import {
   openSync,
   readFileSync,
   readSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -69,12 +71,32 @@ const READ_CHUNK = 64 * 1024;
  * @property {string|null} [worktree]
  */
 
-/** The record's filename. It lives beside anton.db, the one directory both the server and the CLI resolve identically. */
-export const BUILD_RECORD_FILE = "server-build.json";
+/**
+ * One record per PROCESS — `server-build.<pid>.json`, beside anton.db, the one directory both the
+ * server and the CLI resolve identically.
+ *
+ * Keyed by pid because a single install can be running more than one server: the production one
+ * plus a UI-only `ANTON_RUNNER=off` server, or two ports across a hand-over. Under one shared
+ * filename whichever booted LAST would speak for all of them — a server booting after a pull would
+ * overwrite an older server's record, and every surface reading it would then compare the NEW
+ * identity against the code on disk, find them equal, and call the older process current. That is
+ * exactly the silence this module exists to end.
+ *
+ * So each process owns a record nothing else can overwrite: `buildRecordPath()` with no pid names
+ * this process's own, and `listBuildRecords` is how an outside reader (`anton doctor`) sees them all.
+ */
+export const BUILD_RECORD_PREFIX = "server-build";
 
-/** Where the running server records what it booted from, given the anton.db path that install uses. */
-export function buildRecordPath(dbPath) {
-  return join(dirname(dbPath), BUILD_RECORD_FILE);
+/** The record filename one pid writes. */
+export function buildRecordFile(pid) {
+  return `${BUILD_RECORD_PREFIX}.${pid}.json`;
+}
+
+const BUILD_RECORD_NAME = new RegExp(`^${BUILD_RECORD_PREFIX}\\.(\\d+)\\.json$`);
+
+/** Where a running server records what it booted from — this process's record unless a pid is named. */
+export function buildRecordPath(dbPath, pid = process.pid) {
+  return join(dirname(dbPath), buildRecordFile(pid));
 }
 
 /** The installed bundle's version, else the checkout's package.json version, else null. */
@@ -257,11 +279,18 @@ function writeStampFile(path, value) {
 /**
  * Record what this process booted from. Best-effort: a state dir anton can't write is not fatal.
  *
+ * `startedAt` is the pid's birth stamp, written so a LATER reader can tell this process from an
+ * unrelated one the OS handed the same pid after it exited (see `recordAlive`).
+ *
  * @param {string} path
  * @param {BuildIdentity} identity
  */
-export function writeBuildRecord(path, identity, { pid = process.pid, bootedAt = Date.now() } = {}) {
-  return writeStampFile(path, { ...identity, pid, bootedAt });
+export function writeBuildRecord(
+  path,
+  identity,
+  { pid = process.pid, bootedAt = Date.now(), startedAt = processStartedAt(pid) } = {},
+) {
+  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt });
 }
 
 /** The record a running server left, or null when there is none (or it is unreadable/malformed). */
@@ -271,6 +300,49 @@ export function readBuildRecord(path) {
     return record && typeof record === "object" ? record : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Every well-formed record beside `dbPath`, oldest boot first — what an OUTSIDE reader sees when an
+ * install is running more than one server. Each carries the path it was read from, so a caller that
+ * finds one dead can drop it.
+ *
+ * A record whose filename and `pid` field disagree is skipped rather than trusted: the name is what
+ * makes a record this process's own, so one that does not match its contents names nothing.
+ */
+export function listBuildRecords(dbPath) {
+  const dir = dirname(dbPath);
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    const match = BUILD_RECORD_NAME.exec(name);
+    if (!match) continue;
+    const path = join(dir, name);
+    const record = readBuildRecord(path);
+    if (record && record.pid === Number(match[1])) out.push({ path, record });
+  }
+  return out.sort((a, b) => (a.record.bootedAt ?? 0) - (b.record.bootedAt ?? 0));
+}
+
+/**
+ * Delete the records of servers that are no longer running. Called at boot, so a machine that
+ * restarts its server all day does not accumulate one file per boot forever — and never at read
+ * time, where deleting the evidence a concurrent reader is mid-way through would be a race.
+ *
+ * Best-effort by construction: a record anton cannot delete is one every reader already ignores.
+ */
+export function pruneBuildRecords(dbPath, isAlive = recordAlive) {
+  for (const { path, record } of listBuildRecords(dbPath)) {
+    if (isAlive(record)) continue;
+    try {
+      unlinkSync(path);
+    } catch {}
   }
 }
 
@@ -328,7 +400,7 @@ function provesSameCheckout(stamp, onDisk) {
 }
 
 /** Does this pid name a live process? Signal 0 is the existence check every pidfile reader uses. */
-export function pidAlive(pid) {
+function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -336,6 +408,52 @@ export function pidAlive(pid) {
   } catch {
     return false;
   }
+}
+
+/**
+ * When the process holding `pid` was born, as an opaque stamp — null when this machine cannot say.
+ *
+ * A pid is not an identity: the OS reuses the number, and a record left by a server that exited
+ * days ago names whatever took it. The birth time is what separates the two, and it is stable for
+ * the life of a process, so comparing the stamp a record carries with the one the pid wears NOW
+ * turns "some process exists" into "that process is still running".
+ *
+ * procfs first (no spawn, and the field is the kernel's own value in clock ticks since boot), then
+ * `ps -o lstart=`, which macOS and procps both support. Neither is required: a platform that
+ * answers with neither degrades to the bare pid check, which is where this started.
+ */
+export function processStartedAt(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    // Field 22 of /proc/<pid>/stat, counted past the comm field — which is parenthesised and may
+    // itself contain spaces, so the split has to start after its closing paren.
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const started = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+    if (/^\d+$/.test(started ?? "")) return started;
+  } catch {}
+  const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 });
+  const out = r.status === 0 && !r.error ? (r.stdout ?? "").trim() : "";
+  return out || null;
+}
+
+/**
+ * Is the process that wrote this record still the one running? The liveness test every reader here
+ * uses, in place of the bare pid check.
+ *
+ * A record outlives the server that wrote it — nothing deletes it at exit, and a crash could not —
+ * so "the pid is alive" alone reports a stopped server as running the moment the OS reuses its
+ * number, which on a busy machine is hours. Doctor would then either vouch for a build nothing is
+ * serving or demand a restart of a server that is already down, and in bundle mode the leftover
+ * would also stand in for the daemon pidfile and stop the real liveness check from ever running.
+ *
+ * A record with no birth stamp (one this machine could not read at boot) still counts as alive on
+ * the pid alone: an absence is not evidence, and the pid check is exactly as good as it ever was.
+ */
+export function recordAlive(record, startedAt = processStartedAt) {
+  if (!record || !pidAlive(record.pid)) return false;
+  if (!record.startedAt) return true;
+  const now = startedAt(record.pid);
+  return now === null || now === record.startedAt;
 }
 
 /**
@@ -413,8 +531,9 @@ export function sameCheckout(a, b) {
  * fresh install) or "something is running that can't say what it is" (the first upgrade past this
  * change, and precisely the state that hid the stale process for three nights).
  *
- * A record whose pid is dead is a stopped server's leftover: silent, which is what makes a restart
- * the only action needed to clear any verdict here.
+ * A record whose process is gone is a stopped server's leftover: silent, which is what makes a
+ * restart the only action needed to clear any verdict here. Gone means `recordAlive` — the pid
+ * alone would keep vouching for the record after the OS handed that number to something else.
  *
  * `record` and `onDisk` let a caller that already holds either one pass it in rather than pay for a
  * second read — `readBuildIdentity` spawns git, and a request-path caller reads both once. Both are
@@ -424,14 +543,14 @@ export function buildDrift({
   appRoot,
   recordPath,
   serverRunning = false,
-  isAlive = pidAlive,
+  isAlive = recordAlive,
   record = /** @type {any} */ (undefined),
   onDisk = /** @type {any} */ (undefined),
 }) {
   const identity = () => onDisk ?? readBuildIdentity(appRoot);
   const found = record === undefined ? readBuildRecord(recordPath) : record;
   if (!found) return serverRunning ? { ...compareBuild(null, identity()), bootedAt: null } : null;
-  if (!isAlive(found.pid)) return null;
+  if (!isAlive(found)) return null;
   const verdict = compareBuild(found, identity());
   if (verdict.state === "current") return null;
   return { ...verdict, bootedAt: typeof found.bootedAt === "number" ? found.bootedAt : null };

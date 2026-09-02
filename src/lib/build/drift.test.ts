@@ -12,6 +12,9 @@ import { join } from "node:path";
 let dir: string;
 const realDb = process.env.ANTON_DB;
 
+/** This process's own record — the one file `serverBuildDrift` is judged against. */
+const recordPath = () => join(dir, `server-build.${process.pid}.json`);
+
 /** A fresh module instance per case — `bootedFrom` is module state, and boot is what's under test. */
 function freshModule() {
   vi.resetModules();
@@ -42,7 +45,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   it("records beside anton.db, naming this process so a later reader can tell it is still up", async () => {
     const { recordServerBuild } = await freshModule();
     recordServerBuild();
-    const record = JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8"));
+    const record = JSON.parse(readFileSync(recordPath(), "utf8"));
     expect(record.pid).toBe(process.pid);
     expect(record.version).toMatch(/^\d+\.\d+\.\d+/);
     expect(record.bootedAt).toBeGreaterThan(0);
@@ -52,7 +55,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   // checkout is dirty by definition, so recording the digest there would pin a permanent "restart
   // the server" banner on the one person who least needs it. A production server has no recovery.
   it("records uncommitted work only for a production server", async () => {
-    const record = () => JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8"));
+    const record = () => JSON.parse(readFileSync(recordPath(), "utf8"));
     const dev = await freshModule();
     dev.recordServerBuild();
     expect(record().worktree).toBeNull();
@@ -82,7 +85,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
     recordServerBuild();
 
-    expect(JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8")).version).toBe("0.3.9");
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBe("0.3.9");
     const drift = serverBuildDrift();
     expect(drift?.state).toBe("outdated");
     expect(drift?.running?.version).toBe("0.3.9");
@@ -101,7 +104,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
     recordServerBuild();
 
-    expect(JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8")).version).toBe("0.4.0");
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBe("0.4.0");
     expect(serverBuildDrift()).toBeNull();
   });
 
@@ -109,7 +112,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   it("reports the drift once the code on disk is no longer what this process booted from", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
     recordServerBuild();
-    const path = join(dir, "server-build.json");
+    const path = recordPath();
     const record = JSON.parse(readFileSync(path, "utf8"));
     writeFileSync(path, JSON.stringify({ ...record, version: "0.0.1" }));
 
@@ -123,7 +126,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   it("clears on the next boot with nothing else done", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
     recordServerBuild();
-    const path = join(dir, "server-build.json");
+    const path = recordPath();
     writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), version: "0.0.1" }));
     expect(serverBuildDrift()).not.toBeNull();
 
@@ -140,7 +143,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   it("keeps reporting after the runtime dir it booted from is deleted", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
     recordServerBuild();
-    const path = join(dir, "server-build.json");
+    const path = recordPath();
     writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), version: "0.0.1" }));
 
     vi.spyOn(process, "cwd").mockImplementation(() => {
@@ -167,7 +170,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
 
     const { recordServerBuild, serverBuildDrift } = await freshModule();
     recordServerBuild();
-    const path = join(dir, "server-build.json");
+    const path = recordPath();
     const record = JSON.parse(readFileSync(path, "utf8"));
     expect(record.version).toMatch(/^\d+\.\d+\.\d+/); // it read the checkout, not an empty identity
     writeFileSync(path, JSON.stringify({ ...record, version: "0.0.1" }));
@@ -175,6 +178,52 @@ describe("recordServerBuild / serverBuildDrift", () => {
     const drift = serverBuildDrift();
     expect(drift?.state).toBe("outdated");
     expect(drift?.onDisk.version).toBe(record.version);
+  });
+
+  // Two servers, one install — a UI-only `ANTON_RUNNER=off` server beside the runner, or two ports
+  // across a hand-over. Under one shared record the LAST to boot spoke for both: a server started
+  // after a pull matched the code on disk and silently cleared the older process's stale verdict.
+  it("is not silenced by a second server that booted from the current checkout", async () => {
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+    // The neighbour: booted later, running exactly what is on disk — which under a shared filename
+    // is the record every reader would have found.
+    writeFileSync(
+      join(dir, `server-build.${process.pid + 1}.json`),
+      JSON.stringify({ ...mine, pid: process.pid + 1, bootedAt: mine.bootedAt + 1 }),
+    );
+
+    const drift = serverBuildDrift();
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.running?.version).toBe("0.0.1");
+  });
+
+  // The mirror image, and the one that would put a false banner on the health page: a NEIGHBOUR is
+  // stale, this process is not, and only the process being asked about is the one described.
+  it("does not report a neighbouring server's drift as its own", async () => {
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(
+      join(dir, `server-build.${process.pid + 1}.json`),
+      JSON.stringify({ ...mine, pid: process.pid + 1, version: "0.0.1" }),
+    );
+
+    expect(serverBuildDrift()).toBeNull();
+  });
+
+  // Nothing deletes a record at exit, so without a sweep every boot leaves one more file beside
+  // anton.db — in a source checkout, at the repo root.
+  it("clears the records of servers that are no longer running when it boots", async () => {
+    writeFileSync(join(dir, "server-build.999999.json"), JSON.stringify({ version: "0.0.1", pid: 999999, bootedAt: 1 }));
+    const { recordServerBuild } = await freshModule();
+
+    recordServerBuild();
+
+    expect(existsSync(join(dir, "server-build.999999.json"))).toBe(false);
+    expect(existsSync(recordPath())).toBe(true);
   });
 
   it("says nothing in a process that never booted a server", async () => {
@@ -196,7 +245,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     const { recordServerBuild, serverBuildDrift } = await import("./drift");
 
     recordServerBuild();
-    expect(existsSync(join(dir, "blocked", "server-build.json"))).toBe(false);
+    expect(existsSync(join(dir, "blocked", `server-build.${process.pid}.json`))).toBe(false);
     expect(serverBuildDrift()).toBeNull();
 
     onDisk = { version: "0.4.1", revision: null };

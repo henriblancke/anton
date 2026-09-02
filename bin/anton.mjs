@@ -65,11 +65,10 @@ import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import {
   buildDrift,
   buildMatchesCheckout,
-  buildRecordPath,
   describeBuildIdentity,
-  pidAlive,
+  listBuildRecords,
   readBuildIdentity,
-  readBuildRecord,
+  recordAlive,
   sameCheckout,
   sameDirectory,
   writeBuildStamp,
@@ -1313,8 +1312,9 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
 }
 
 /**
- * Is a server up for THE INSTALL BEING DIAGNOSED? Only asked when no build record exists, which is
- * the one case where liveness itself is the evidence (identity.mjs `buildDrift`).
+ * Is a server up for THE INSTALL BEING DIAGNOSED? Only asked when no LIVE build record exists, which
+ * is the one case where liveness itself is the evidence (identity.mjs `buildDrift`) — a record whose
+ * process is gone answers nothing, so the probe has to run behind it rather than be skipped by it.
  *
  * Each mode reads only its OWN evidence, because both signals are shared across installs and
  * crossing them names the wrong process. The pidfile lives under the global state dir and is
@@ -1341,31 +1341,46 @@ async function serverIsUp({ isBundle = IS_BUNDLE, port = "3000", pid = runningPi
  * has a daemon to stop and start, a source checkout has whatever terminal `anton dev` is in.
  */
 async function reportServerBuild(dbPath, args = []) {
-  const recordPath = buildRecordPath(dbPath);
-  const record = readBuildRecord(recordPath);
-  // One read, one verdict: re-reading the record inside buildDrift would let a restart between the
-  // two reads produce a verdict and a liveness check that describe different processes. A record
-  // carries its own pid, so liveness is only worth establishing (and probing for) without one.
-  const serverRunning = record ? false : await serverIsUp({ port: serverPort(args, dbPath) });
-  const drift = buildDrift({ appRoot: APP_ROOT, recordPath, record, serverRunning });
-  if (!drift) {
-    // No drift means one of two things, and they are different claims — a matching build is a
-    // check that PASSED, while a stopped server is a check with nothing to run against.
-    const running = record && pidAlive(record.pid);
-    if (running) {
-      console.log(`  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`running the build on disk (${describeBuildIdentity(record)})`)}`);
-    } else {
-      // Not "stopped": this install's own liveness evidence came back empty too, so all anton can
-      // honestly claim here is that nothing recorded a boot against it.
-      console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
+  // Every record still backed by a running process. One install can hold several — a UI-only server
+  // beside the runner, or two ports mid-hand-over — and each is its own answer, so each gets a line.
+  const live = listBuildRecords(dbPath).filter(({ record }) => recordAlive(record));
+  // One read of the code on disk for all of them: they are compared against the same checkout, and
+  // `readBuildIdentity` spawns git.
+  const onDisk = live.length ? readBuildIdentity(APP_ROOT) : undefined;
+  // Liveness is only worth probing when no live record answers it. A record that IS live carries
+  // its own pid and birth stamp, so it cannot be a leftover standing in for the check.
+  const serverRunning = live.length ? false : await serverIsUp({ port: serverPort(args, dbPath) });
+  const seen = live.length
+    ? live.map(({ record }) => ({
+        record,
+        // Already proved live above; re-checking would spawn `ps` again per record.
+        drift: buildDrift({ appRoot: APP_ROOT, record, onDisk, isAlive: () => true }),
+      }))
+    : [{ record: null, drift: buildDrift({ appRoot: APP_ROOT, record: null, serverRunning }) }];
+  // Which process a line is about only needs saying when there is more than one to confuse it with.
+  const which = (record) => (seen.length > 1 && record ? `pid ${record.pid} ` : "");
+  for (const { record, drift } of seen) {
+    if (!drift) {
+      // No drift means one of two things, and they are different claims — a matching build is a
+      // check that PASSED, while a stopped server is a check with nothing to run against.
+      if (record) {
+        console.log(
+          `  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`${which(record)}running the build on disk (${describeBuildIdentity(record)})`)}`,
+        );
+      } else {
+        // Not "stopped": this install's own liveness evidence came back empty too, so all anton can
+        // honestly claim here is that nothing recorded a boot against it.
+        console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
+      }
+      continue;
     }
-    return;
+    const why =
+      drift.state === "unstamped"
+        ? "is running but recorded no build identity — what it is serving cannot be established"
+        : `is running ${describeBuildIdentity(drift.running)} but the ${drift.state === "outdated" ? "runtime" : "checkout"} on disk is ${describeBuildIdentity(drift.onDisk)}`;
+    console.log(`  ${c.yellow("!")} ${"server".padEnd(9)} ${c.yellow(`${which(record)}${why}`)}`);
   }
-  const why =
-    drift.state === "unstamped"
-      ? "is running but recorded no build identity — what it is serving cannot be established"
-      : `is running ${describeBuildIdentity(drift.running)} but the ${drift.state === "outdated" ? "runtime" : "checkout"} on disk is ${describeBuildIdentity(drift.onDisk)}`;
-  console.log(`  ${c.yellow("!")} ${"server".padEnd(9)} ${c.yellow(why)}`);
+  if (!seen.some(({ drift }) => drift)) return;
   console.log(
     c.dim("    Restart it to run the build on disk — ") +
       c.dim(IS_BUNDLE ? "`anton stop && anton start`." : "stop the server and re-run `anton dev` / `anton start`.") +

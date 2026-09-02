@@ -14,12 +14,12 @@
 import { join } from "node:path";
 
 import {
-  buildDrift,
   buildRecordPath,
   buildStampPath,
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
+  pruneBuildRecords,
   readBuildIdentity,
   readBuildRecord,
   writeBuildRecord,
@@ -136,11 +136,17 @@ function onDiskIdentity(): BuildIdentity {
  *
  * The file is what makes the verdict readable from OUTSIDE the process (`anton doctor` is a separate,
  * short-lived one); the in-memory copy is what keeps it readable inside when the file write fails.
+ *
+ * It is named for this pid, so a second server booting from the same install cannot overwrite what
+ * this one is judged against — and the boot that wrote it is also where the records of servers that
+ * have since exited get dropped, since nothing deletes one at exit.
  */
 export function recordServerBuild(): void {
   bootedFrom = bootIdentity();
   const db = dbPath();
-  if (db) writeBuildRecord(buildRecordPath(db), bootedFrom);
+  if (!db) return;
+  writeBuildRecord(buildRecordPath(db), bootedFrom);
+  pruneBuildRecords(db);
 }
 
 /**
@@ -182,33 +188,33 @@ function artifactIdentity(): BuildIdentity | null {
 }
 
 /**
- * The drift verdict for the process serving this install, or null when it matches the code on disk.
+ * The drift verdict for THIS process, or null when what it booted from matches the code on disk.
  *
- * The record on disk is the primary read even in-process: Next.js bundles the instrumentation hook
- * separately from the request graph, so the module instance that stamped `bootedFrom` at boot is not
- * necessarily this one, and the file is the one thing both can see. `bootedFrom` answers only the
- * case the file cannot — a state dir anton could not write to.
+ * The identity compared is always this process's own, never another server's. `buildRecordPath`
+ * keys on `process.pid`, so a second server on the same install — a UI-only `ANTON_RUNNER=off` one
+ * beside the runner, or a hand-over across two ports — writes its own record and cannot overwrite
+ * the one this verdict stands on. Nothing here checks liveness either: the process asking is the
+ * process being described.
+ *
+ * The record is read from disk rather than taken from `bootedFrom` because Next.js bundles the
+ * instrumentation hook separately from the request graph, so the module instance that stamped
+ * `bootedFrom` at boot is not necessarily this one — the file is the one thing both copies see.
+ * `bootedFrom` answers only the case the file cannot: a state dir anton could not write to.
  *
  * Silent when neither exists. In-process that means nothing here ever booted a server (a test, a
  * script), and inventing an "unstamped" verdict there would put a false warning on the health page
  * of every install. Saying so about a server that IS running but left no record is `anton doctor`'s
- * job — it has the pidfile to prove one is up.
+ * job — it has the pidfile and the port to prove one is up.
  */
 export function serverBuildDrift(): BuildDrift | null {
   const db = dbPath();
-  const recordPath = db ? buildRecordPath(db) : null;
-  const record = recordPath ? readBuildRecord(recordPath) : null;
-  if (!record && bootedFrom) {
-    const verdict = compareBuild(bootedFrom, onDiskIdentity());
-    return verdict.state === "current" ? null : ({ ...verdict, bootedAt: null } as BuildDrift);
-  }
-  if (!recordPath) return null;
-  return buildDrift({
-    appRoot: appRoot(),
-    recordPath,
-    record,
-    onDisk: onDiskIdentity(),
-  }) as BuildDrift | null;
+  const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
+  const running = record ?? bootedFrom;
+  if (!running) return null;
+  const verdict = compareBuild(running, onDiskIdentity());
+  if (verdict.state === "current") return null;
+  const bootedAt = record && typeof record.bootedAt === "number" ? record.bootedAt : null;
+  return { ...verdict, bootedAt } as BuildDrift;
 }
 
 export { describeBuildDrift, describeBuildIdentity };
