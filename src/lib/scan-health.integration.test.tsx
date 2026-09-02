@@ -234,6 +234,7 @@ process.stdin.on('end',()=>{
             trajectory: undefined,
             stoppedCount: 0,
             staleServers: [],
+            pickerLog: [],
           }}
         />
       </>,

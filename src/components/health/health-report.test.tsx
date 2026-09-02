@@ -21,6 +21,7 @@ function health(over: Partial<ProjectHealth> = {}): ProjectHealth {
     trajectory: undefined,
     stoppedCount: 0,
     staleServers: [],
+    pickerLog: [],
     ...over,
   };
 }

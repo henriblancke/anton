@@ -19,6 +19,7 @@ import {
   recordPickerVeto,
   withdrawPickerAccept,
 } from "./picker-veto";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "./gardener/autonomy";
 import type { Clock } from "./jobs/queue";
 
 const NOW = 1_800_000_000_000;
@@ -224,6 +225,41 @@ describe("the decline record", () => {
     );
   });
 
+  it("keeps a decline the newer accepts would have pushed out of the window", async () => {
+    // The decision log asks for declines only, and the narrowing has to happen in the QUERY (PR #218
+    // review): a project that released a full window of picks since its last veto would otherwise
+    // fetch nothing but accepts and filter them all away, showing an EMPTY log over a board that has
+    // a refusal to explain.
+    await test.db.insert(schema.pickerVerdicts).values([
+      {
+        id: "v-00",
+        projectId: PROJECT,
+        beadId: "anton-vetoed",
+        verdict: "declined",
+        action: "never",
+        decidedAt: at(NOW),
+      },
+      ...Array.from({ length: PICKER_RECORD_WINDOW }, (_, i) => ({
+        id: `v-${String(i + 1).padStart(2, "0")}`,
+        projectId: PROJECT,
+        beadId: `anton-${i + 1}`,
+        verdict: "accepted",
+        action: "release",
+        decidedAt: at(NOW + (i + 1) * 1000),
+      })),
+    ]);
+
+    expect(
+      (await listPickerVerdicts(test.db, PROJECT, PICKER_RECORD_WINDOW, "declined")).map(
+        (r) => r.beadId,
+      ),
+    ).toEqual(["anton-vetoed"]);
+    // Unfiltered, the same window is all accepts — which is what the log used to be handed.
+    expect(
+      (await listPickerVerdicts(test.db, PROJECT)).every((r) => r.verdict === "accepted"),
+    ).toBe(true);
+  });
+
   it("counts an accept beside the declines, so the record has two sides", async () => {
     await test.db.insert(schema.pickerVerdicts).values({
       id: "v-accept",
@@ -244,6 +280,17 @@ describe("the decline record", () => {
       declined: 1,
       settled: 2,
     });
+  });
+});
+
+describe("the window the earned floor reads (anton-vkp9)", () => {
+  it("is at least as wide as the bar apply has to clear", () => {
+    // The counts and the bar are set in two modules, and a window NARROWER than `minSettled` would
+    // make `apply` unreachable by construction — a floor nobody could ever climb, with nothing on
+    // screen to say why. Asserted rather than commented, because the two numbers move separately.
+    expect(PICKER_RECORD_WINDOW).toBeGreaterThanOrEqual(
+      EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER].minSettled,
+    );
   });
 });
 

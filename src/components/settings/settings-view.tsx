@@ -16,6 +16,10 @@ import { DangerSection } from "@/components/settings/sections/danger-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
 import { GeneralSection } from "@/components/settings/sections/general-section";
+import {
+  PickerAutonomySection,
+  type EarnedPicker,
+} from "@/components/settings/sections/picker-autonomy-section";
 import { PromptSection } from "@/components/settings/sections/prompt-section";
 import { ProposalsSection } from "@/components/settings/sections/proposals-section";
 import { ReviewFixSection } from "@/components/settings/sections/review-fix-section";
@@ -51,6 +55,7 @@ export function SettingsView({
   policyNotStartable,
   boardUnavailable,
   earned,
+  pickerEarned,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -97,6 +102,12 @@ export function SettingsView({
    * detection kind. Computed on the server off the board this project actually has.
    */
   earned: Record<string, EarnedKind>;
+  /**
+   * What this project's own releases and vetoes have earned the PICKER (anton-vkp9). Computed on the
+   * server off the verdict record the pass reads, so the control and the pass can never disagree
+   * about whether `apply` is available.
+   */
+  pickerEarned: EarnedPicker;
 }) {
   // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
   // lands where it says it will, a reload returns to the same place, and a link points at a section
@@ -149,17 +160,27 @@ export function SettingsView({
     ),
     proposals: <ProposalsSection form={form} earned={earned} projectSlug={project.slug} />,
     policy: (
-      <PolicyDraftSection
-        project={project}
-        draft={policyDraft}
-        stored={settings.pickerPolicy}
-        issueTypes={issueTypes}
-        labelVocabulary={labelVocabulary}
-        rankingCandidates={rankingCandidates}
-        candidates={policyCandidates}
-        notStartable={policyNotStartable}
-        boardUnavailable={boardUnavailable}
-      />
+      <div className="flex flex-col gap-9">
+        <PolicyDraftSection
+          project={project}
+          draft={policyDraft}
+          stored={settings.pickerPolicy}
+          issueTypes={issueTypes}
+          labelVocabulary={labelVocabulary}
+          rankingCandidates={rankingCandidates}
+          candidates={policyCandidates}
+          notStartable={policyNotStartable}
+          boardUnavailable={boardUnavailable}
+        />
+        {/* The policy is what anton MAY start; this is whether it starts it. Two halves of one
+            question, so they sit in one panel rather than in two places an operator has to connect. */}
+        <PickerAutonomySection
+          slug={project.slug}
+          armed={settings.pickerPolicy !== undefined}
+          stored={settings.pickerAutonomy}
+          earned={pickerEarned}
+        />
+      </div>
     ),
     danger: <DangerSection project={project} />,
   };

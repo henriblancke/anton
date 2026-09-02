@@ -12,7 +12,7 @@ import { LABELS } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import type { PrActivity } from "../git/pr";
 import { describeWipHold } from "../autopilot-wip";
-import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
+import { checkWipLimit, confirmWipQueue, type ReadPrActivity } from "./picker-wip-hold";
 import { insertProject } from "@/lib/testing/project";
 
 const PROJECT = "p1";
@@ -267,5 +267,53 @@ describe("checkWipLimit", () => {
     expect(
       await ask([inReview("anton-a", 11), inReview("anton-b", 12), inReview("anton-c", 13)]),
     ).toBeDefined();
+  });
+});
+
+describe("confirmWipQueue", () => {
+  it("names the slots it retired, which the board goes on showing", async () => {
+    // What a clearing verdict RESTS on, and the only part of it no later board read can re-check
+    // (PR #218 review): #13 is closed, so it stopped counting — but nothing takes it off the board,
+    // and reopening it refills the slot with the bead and PR ref unchanged.
+    project();
+
+    const verdict = await confirmWipQueue(t.db, {
+      projectId: PROJECT,
+      repoPath: REPO,
+      board: [inReview("anton-a", 11), inReview("anton-b", 12), inReview("anton-c", 13)],
+      readPrActivity: reader({ 13: "CLOSED" }),
+    });
+
+    expect(verdict.hold).toBeUndefined();
+    expect(verdict.retired).toEqual([{ beadId: "anton-c", prNumber: 13 }]);
+  });
+
+  it("retires nothing when it read no PR at all", async () => {
+    // Under the limit the verdict is the board's own, so there is nothing for a caller to reconcile
+    // and no extra confirmation to pay for.
+    project();
+
+    const verdict = await confirmWipQueue(t.db, {
+      projectId: PROJECT,
+      repoPath: REPO,
+      board: [inReview("anton-a", 11), inReview("anton-b", 12)],
+      readPrActivity: reader(),
+    });
+
+    expect(verdict).toEqual({ retired: [] });
+  });
+
+  it("retires nothing off a full queue, since every candidate it read still counts", async () => {
+    project();
+
+    const verdict = await confirmWipQueue(t.db, {
+      projectId: PROJECT,
+      repoPath: REPO,
+      board: [inReview("anton-a", 11), inReview("anton-b", 12), inReview("anton-c", 13)],
+      readPrActivity: reader(),
+    });
+
+    expect(verdict.hold).toBeDefined();
+    expect(verdict.retired).toEqual([]);
   });
 });

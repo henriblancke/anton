@@ -20,6 +20,9 @@ import { rankAttention, type AttentionItem } from "./attention";
 import { getBoard } from "./board";
 import { serverBuildDrifts, type ServerDrift } from "./build/drift";
 import { openEscalations } from "./escalations";
+import { PICKER_LOG_LIMIT, pickerLogEntries, type PickerLogEntry } from "./picker-log";
+import { latestPickerStarts, type PickerStartRow } from "./picker-starts";
+import { latestPickerDeclines, type PickerVerdictRow } from "./picker-veto";
 import type { Board, HygieneReport, Project, ReviewTrajectory, ScanHealth } from "./types";
 
 export interface ProjectHealth {
@@ -36,6 +39,12 @@ export interface ProjectHealth {
   trajectory: ReviewTrajectory | undefined;
   /** Open, stopped escalations — answered on the board, named here only as a count. */
   stoppedCount: number;
+  /**
+   * What the picker started unattended and what the operator vetoed, newest first (R3.10). Empty
+   * for a project whose picker has never started anything and whose picks nobody has refused —
+   * which the applied section reports by saying nothing, not by drawing an empty log.
+   */
+  pickerLog: PickerLogEntry[];
   /**
    * Every server of this install running something other than the code on disk (anton-pzfb), empty
    * when they all match. Not a property of this project at all — these are the processes every
@@ -56,6 +65,7 @@ export function projectHealthFromBoard(
   board: Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">,
   stoppedCount: number,
   staleServers: ServerDrift[] = [],
+  picker: { starts: PickerStartRow[]; verdicts: PickerVerdictRow[] } = { starts: [], verdicts: [] },
 ): ProjectHealth {
   const { items, housekeeping } = rankAttention({
     hygiene: board.hygiene,
@@ -68,6 +78,7 @@ export function projectHealthFromBoard(
     scanHealth: board.scanHealth,
     trajectory: board.reviewTrajectory,
     stoppedCount,
+    pickerLog: pickerLogEntries(picker),
     staleServers,
   };
 }
@@ -75,17 +86,22 @@ export function projectHealthFromBoard(
 /**
  * UI read path. Goes through {@link getBoard} rather than reading hygiene/scan-health directly, so a
  * failed anton.db read degrades to "never patrolled"/"never scanned" the same way the board itself
- * does (getBoard logs and returns undefined) instead of taking this page down with it. The three
- * reads are independent, so they run concurrently.
+ * does (getBoard logs and returns undefined) instead of taking this page down with it. The board
+ * read, the escalation read, the build-drift read and the picker's two records are independent, so
+ * they run concurrently.
  */
 export async function getProjectHealth(project: Project): Promise<ProjectHealth> {
   // Read the running builds live rather than from a stored report: which build is running is a fact
   // about this instant, and a patrol row written by a since-restarted process would report drift
-  // that no longer exists. It needs neither of the other two, so all three run concurrently.
-  const [board, escalations, staleServers] = await Promise.all([
+  // that no longer exists.
+  const [board, escalations, staleServers, starts, verdicts] = await Promise.all([
     getBoard(project),
     openEscalations(project.id),
     serverBuildDrifts(),
+    latestPickerStarts(project.id),
+    // Declines only, and no more of them than the log can show: the merge below keeps the newest
+    // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
+    latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
   ]);
-  return projectHealthFromBoard(board, escalations.length, staleServers);
+  return projectHealthFromBoard(board, escalations.length, staleServers, { starts, verdicts });
 }

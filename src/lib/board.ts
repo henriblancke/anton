@@ -23,7 +23,12 @@ import {
 } from "./board-picker-plan";
 import { boardProvenance, provenanceVersion } from "./board-provenance";
 import { getDb } from "./db";
-import { deferralVersion, latestDeclinedPicks, latestPickerDeferrals } from "./picker-veto";
+import {
+  deferralVersion,
+  latestDeclinedPicks,
+  latestPickerDeferrals,
+  pickerTrackRecord,
+} from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
 import { isScheduleEnabled } from "./schedules";
 import { upNextEntries, upNextVersion } from "./up-next";
@@ -36,7 +41,7 @@ import {
 } from "./scan-health";
 import { attachPrUrl, githubBaseUrl } from "./git/remote";
 import type { Policy } from "./policy/types";
-import { getProjectSettings, resolvePickerPolicy } from "./projects";
+import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "./projects";
 import {
   boardCards,
   isRunTicket,
@@ -83,25 +88,26 @@ export async function getBoardVersion(project: Project): Promise<string> {
   // fence, so saving a narrower one turns every live pick into history — the lane goes and
   // `[Release]` with it — while the bead snapshot, the plan row and the schedule all sit still. A
   // token blind to it would 304 the operator back onto the board they just invalidated.
-  const [hygiene, scan, deferrals, plan, policy, pickerArmed] = await Promise.all([
+  const [hygiene, scan, deferrals, plan, picker] = await Promise.all([
     readHygieneVersion(project),
     readScanHealthVersion(project),
     readDeferrals(project),
     readPickerPlan(project),
-    readPickerPolicy(project),
-    readPickerArmed(project),
+    readPickerStance(project),
   ]);
   return boardVersion(
     issueSnapshotVersion(project.repoPath),
     hygiene,
     scan,
     deferralVersion(deferrals),
-    // Gated on ARMED, exactly as the served board gates the marks themselves (`armedPlan` in
-    // getBoard): a disarmed picker's board carries no provenance, so letting a plan row written
-    // before the pass was switched off move the token would break a 304 and serve back data the
-    // client already holds. Arming flips are covered separately by upNextVersion.
-    provenanceVersion(pickerArmed ? plan : undefined, policy),
-    upNextVersion(pickerArmed),
+    // Gated on OFFERING, exactly as the served board gates the marks themselves (`armedPlan` in
+    // getBoard): a picker that is switched off — or running below the level that offers its picks —
+    // carries no provenance, so letting a plan row written before that move the token would break a
+    // 304 and serve back data the client already holds. The stance itself is covered separately by
+    // upNextVersion, which is what makes a level change land on the next poll: moving between
+    // `propose` and `shadow` touches neither a bead, nor the plan row, nor the policy.
+    provenanceVersion(picker.offers ? plan : undefined, picker.policy),
+    upNextVersion(picker.offers),
     project.repoPath,
   );
 }
@@ -186,28 +192,55 @@ async function readPickerPlan(project: Project): Promise<BoardPickerPlan | undef
 }
 
 /**
- * Is the board-picker armed for this project? The Up Next lane is a projection of what the pass
- * WOULD start next, so a disarmed picker has no lane: its last plan is history, and a ranking left
- * on screen by a pass that stopped running is the one thing a shadow-mode lane must not be.
+ * What the picker is doing on this project, as the board projects it: the policy `◈ policy` anchors
+ * at, and whether the pass is OFFERING its picks at all.
  *
- * Fail-soft to "armed" — losing the schedule read must not silently hide a lane that is running.
+ * Two facts make one answer because the board asks one question. The schedule is the first half — a
+ * ranking left on screen by a pass that stopped running is the one thing a shadow-mode lane must not
+ * be. The resolved AUTONOMY is the second (PR #218 review): `propose` promises "ranks what could run
+ * next · nothing is offered" in settings, and it is also where every unarmed project sits by default,
+ * so a lane drawn from it would offer ranked cards, `[Release]` and vetoes — and RECORD those answers
+ * into the track record `apply` is earned on — against a level that promised none of it. Only
+ * `shadow` (offer and answer) and `apply` (offer and start) put picks on the board.
+ *
+ * Fail-soft to "offering" on each half independently — losing a read must not silently hide a lane
+ * that is running, and the plan's own freshness fence still governs what it may claim.
  */
-async function readPickerArmed(project: Project): Promise<boolean> {
-  try {
-    return await isScheduleEnabled(project.id, "board-picker");
-  } catch (err) {
-    console.error(`[board] picker schedule read failed for ${project.slug}`, err);
-    return true;
-  }
+interface PickerStance {
+  /** The policy armed on this machine, or undefined when the project has armed none. */
+  policy?: Policy;
+  /** The pass is running AND its level puts picks in front of the operator. */
+  offers: boolean;
 }
 
-/** The policy armed on this machine — what `◈ policy` anchors at. Fail-soft for the same reason. */
-async function readPickerPolicy(project: Project): Promise<Policy | undefined> {
+async function readPickerStance(project: Project): Promise<PickerStance> {
+  const [scheduled, level] = await Promise.all([
+    isScheduleEnabled(project.id, "board-picker").catch((err) => {
+      console.error(`[board] picker schedule read failed for ${project.slug}`, err);
+      return true;
+    }),
+    readPickerLevel(project),
+  ]);
+  return { ...level, offers: scheduled && level.offers };
+}
+
+/** The settings half of {@link readPickerStance} — the armed policy and the resolved autonomy. */
+async function readPickerLevel(project: Project): Promise<PickerStance> {
   try {
-    return resolvePickerPolicy(await getProjectSettings(getDb(), project.id));
+    const db = getDb();
+    // Two independent reads, so one round trip rather than two on every board view.
+    const [settings, record] = await Promise.all([
+      getProjectSettings(db, project.id),
+      pickerTrackRecord(db, project.id),
+    ]);
+    // The EARNED floor rides along (`resolvePickerAutonomy`): a project demoted off `apply` lands on
+    // `shadow`, which still offers — the lane is where the record that lifts it back is made.
+    const autonomy = resolvePickerAutonomy(settings, record);
+    const armed = resolvePickerPolicy(settings);
+    return { ...(armed ? { policy: armed } : {}), offers: autonomy !== "propose" };
   } catch (err) {
-    console.error(`[board] picker policy read failed for ${project.slug}`, err);
-    return undefined;
+    console.error(`[board] picker settings read failed for ${project.slug}`, err);
+    return { offers: true };
   }
 }
 
@@ -246,16 +279,14 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     scan,
     deferrals,
     plan,
-    policy,
-    pickerArmed,
+    picker,
   ] = await Promise.all([
     readAllIssues(project.repoPath, opts),
     readHygiene(project),
     readScanHealth(project),
     readDeferrals(project),
     readPickerPlan(project),
-    readPickerPolicy(project),
-    readPickerArmed(project),
+    readPickerStance(project),
   ]);
 
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
@@ -382,11 +413,13 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Chips read the same way in every column (unread-first, then newest), independent of epic order.
   for (const stage of STAGES) standalone[stage].sort(compareStandalone);
 
-  // The plan, only while a pass is actually keeping it: a project whose `board-picker` schedule was
-  // switched off keeps its last recorded plan in the db, and reading it here would badge every old
-  // entry `◈ policy` — which is what `[Release]` is derived from (isPickerPick), so ordinary Backlog
-  // cards would go on offering to record accepts against a pass that no longer runs.
-  const armedPlan = pickerArmed ? plan : undefined;
+  // The plan, only while a pass is actually keeping it AND offering it (`readPickerStance`): a
+  // project whose `board-picker` schedule was switched off — or whose level is `propose`, which
+  // promises a ranking and nothing else — keeps its last recorded plan in the db, and reading it here
+  // would badge every old entry `◈ policy`. That badge is what `[Release]` is derived from
+  // (isPickerPick), so ordinary Backlog cards would go on offering to record accepts against a pass
+  // that no longer runs, or a level that never asked.
+  const armedPlan = picker.offers ? plan : undefined;
   // Does the recorded plan still describe the decision anton would make NOW? Asked ONCE, over every
   // input to that decision — the beads and the armed policy, which stampBoard folds in together, plus
   // the deferrals, whose expiry no digest can see (isPlanStale). So an operator narrowing
@@ -403,12 +436,17 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   const declined = armedPlan ? await readDeclinedPicks(project, armedPlan.planId) : undefined;
   const planIsStale =
     armedPlan !== undefined &&
-    isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), policy), deferrals, declined);
+    isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), picker.policy), deferrals, declined);
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
   // A stale plan still badges — the rule a target WAS picked under does not stop being true — but
   // the mark carries `stale`, so what survives staleness is the badge and not the button.
-  const provenance = boardProvenance({ board: allBeads, plan: armedPlan, policy, planIsStale });
+  const provenance = boardProvenance({
+    board: allBeads,
+    plan: armedPlan,
+    policy: picker.policy,
+    planIsStale,
+  });
   // The Up Next lane's input (anton-t9m4). The lane holds a stricter standard than the badge beside
   // it: a badge records the rule a target WAS picked under (history), while the lane claims this is
   // the order anton would start work in NOW — so a stale plan is withheld whole. Deferrals are
@@ -452,8 +490,8 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       hygieneVersion(hygiene),
       scanHealthVersion(scan),
       deferralVersion(deferrals),
-      provenanceVersion(armedPlan, policy),
-      upNextVersion(pickerArmed),
+      provenanceVersion(armedPlan, picker.policy),
+      upNextVersion(picker.offers),
       project.repoPath,
     ),
     columns,

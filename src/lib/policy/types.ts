@@ -207,3 +207,22 @@ export const POLICY_CONTROL_NAMESPACES: ReadonlySet<string> = new Set([
   "review-score",
   "source",
 ]);
+
+/**
+ * How far the board-picker may go with the plan it just decided (R3.5), ordered by how much of the
+ * start it is trusted to make — the same ladder, and the same word order, the gardener's per-kind
+ * autonomy uses (`gardener/autonomy.ts`), because an operator reading both should not have to learn
+ * two vocabularies for one idea.
+ *
+ *   • `propose` — the pass ranks and records, and the lane is empty. Nothing is offered.
+ *   • `shadow`  — the ranking is offered as picks the operator releases or vetoes by hand. Every
+ *                 release and veto is evidence, which is what `apply` is later earned on.
+ *   • `apply`   — the pass writes `approved`, claims the target and starts the run itself.
+ *
+ * Machine-local like the policy it accompanies, and never a default: `apply` is only ever reachable
+ * on a project that has armed a policy, because the structural default admits everything and a pass
+ * that started work off THAT is autopilot without the approval.
+ */
+export const PICKER_AUTONOMY_LEVELS = ["propose", "shadow", "apply"] as const;
+
+export type PickerAutonomy = (typeof PICKER_AUTONOMY_LEVELS)[number];

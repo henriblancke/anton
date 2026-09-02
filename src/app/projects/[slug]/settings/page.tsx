@@ -6,9 +6,14 @@ import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { discoverVocabulary } from "@/lib/policy/vocabulary";
 import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
 import { policyCandidates } from "@/lib/policy/candidates";
-import { earnedAutonomyOfKind, emptyTrackRecord } from "@/lib/gardener/autonomy";
+import {
+  earnedAutonomyOfKind,
+  earnedPickerAutonomy,
+  emptyTrackRecord,
+} from "@/lib/gardener/autonomy";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import { proposalTrackRecord } from "@/lib/gardener/track-record";
+import { latestPickerTrackRecord } from "@/lib/picker-veto";
 import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
@@ -97,6 +102,24 @@ export default async function ProjectSettingsPage({
     }),
   );
 
+  // And what this project's own picks have earned the PICKER (anton-vkp9) — the same floor, over the
+  // operator's releases and vetoes instead of over a kind's proposals. Read from anton.db rather than
+  // the board, and handed down as plain counts for the same reason: the control must reach the pass's
+  // verdict from the pass's numbers, and a store that will not answer locks `apply` rather than
+  // opening it.
+  const pickerRecord = await latestPickerTrackRecord(project.id).catch(() => ({
+    accepted: 0,
+    declined: 0,
+    settled: 0,
+  }));
+  const picker = earnedPickerAutonomy(pickerRecord);
+  const pickerEarned = {
+    accepted: picker.accepted,
+    settled: picker.settled,
+    eligible: picker.eligible,
+    ...(picker.reason ? { reason: picker.reason } : {}),
+  };
+
   return (
     <SettingsView
       project={project}
@@ -114,6 +137,7 @@ export default async function ProjectSettingsPage({
       policyNotStartable={notStartable}
       boardUnavailable={!board.ok}
       earned={earned}
+      pickerEarned={pickerEarned}
     />
   );
 }

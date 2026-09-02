@@ -305,6 +305,43 @@ export const pickerVerdicts = sqliteTable(
 );
 
 /**
+ * What the picker STARTED with nobody watching (anton-vfvg / R1.5) — one row per unattended start.
+ *
+ * The mirror of `picker_verdicts` above: that table is what a human said back, this one is what anton
+ * did on its own authority. Both feed the Health page's decision log, which is the operator's
+ * standing answer to "what happened while I was not looking" — a start recorded only in a bead note
+ * and a job log would make them open a run to find out.
+ *
+ * A LOG, not a projection of live state: the plan is one replaced row per project, so a start it
+ * decided is gone the moment the next pass runs. The record has to outlive the decision that made it.
+ *
+ * Bounded to {@link PICKER_START_RETENTION} rows per project, pruned on write like the scan
+ * summaries: the log answers "recently", and an unbounded table would grow a row every cadence
+ * forever for a page that shows the newest handful.
+ */
+export const pickerStarts = sqliteTable(
+  "picker_starts",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The target that was started. Not an FK — beads live on the board, not in anton.db. */
+    beadId: text("bead_id").notNull(),
+    /** Where it stood in the plan that started it, and how many targets that plan ranked. */
+    rank: integer("rank").notNull(),
+    ranked: integer("ranked").notNull(),
+    /** The admitting rule, frozen at the moment of the start — the same words the bead note carries. */
+    rule: text("rule").notNull(),
+    /** The run this start enqueued, so the log can point at the job that answers "what happened". */
+    jobId: text("job_id"),
+    startedAt: ts("started_at").notNull().default(now),
+  },
+  // Serves the log read ("this project's last N starts, newest first") and the prune behind it.
+  (table) => [index("picker_starts_project_idx").on(table.projectId, table.startedAt)],
+);
+
+/**
  * The autopilot's DISARM latch, per project (anton-5c8h / R4.6). A disarm is the half of the brake
  * that does not clear itself: a score regression or a run of failures freezes the picker until a
  * human looks at the evidence and re-arms it, and this row is both the freeze and the audit trail of

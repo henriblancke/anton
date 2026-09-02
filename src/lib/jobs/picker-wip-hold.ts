@@ -107,45 +107,77 @@ async function confirmSlots(
   input: WipHoldInput,
   candidates: readonly { bead: Bead; prNumber: number }[],
   limit: number,
-): Promise<{ slots: ReviewSlot[]; truncated: boolean }> {
+): Promise<{ slots: ReviewSlot[]; retired: ReviewSlot[]; truncated: boolean }> {
   const slots: ReviewSlot[] = [];
+  const retired: ReviewSlot[] = [];
   let confirmed = 0;
   for (let i = 0; i < candidates.length && slots.length < limit; i += PR_READ_CONCURRENCY) {
     const batch = await Promise.all(
       candidates
         .slice(i, i + PR_READ_CONCURRENCY)
-        .map(async ({ bead, prNumber }): Promise<ReviewSlot | undefined> =>
-          (await occupiesQueue(read, input, prNumber)) ? { beadId: bead.id, prNumber } : undefined,
-        ),
+        .map(async ({ bead, prNumber }) => ({
+          slot: { beadId: bead.id, prNumber },
+          occupied: await occupiesQueue(read, input, prNumber),
+        })),
     );
     confirmed = Math.min(i + PR_READ_CONCURRENCY, candidates.length);
-    slots.push(...batch.filter((slot) => slot !== undefined));
+    for (const { slot, occupied } of batch) (occupied ? slots : retired).push(slot);
   }
-  return { slots, truncated: confirmed < candidates.length };
+  return { slots, retired, truncated: confirmed < candidates.length };
+}
+
+/** What one confirmation found: the hold it produced, and the slots it took OFF the board's count. */
+export interface WipQueueVerdict {
+  /** The hold, or absent while there is still review bandwidth. */
+  hold?: WipHold;
+  /**
+   * In-review targets the board still lists whose PR this confirmation found merged or CLOSED, so
+   * they did not count (PR #218 review).
+   *
+   * The one input to a CLEARING verdict that no later board read can re-check. A merged PR retires
+   * its bead, but a closed one is deliberately left on the board ref and stage and all — so
+   * reopening it refills a review slot without moving a single bead, and a caller reconciling its
+   * verdict against a fresh board would see no drift at all. Carried out so that caller can
+   * reconcile these the only way they can be: against another confirmation.
+   */
+  retired: ReviewSlot[];
+}
+
+/**
+ * The project's WIP hold and what the confirmation retired to reach it.
+ *
+ * Nothing is written and nothing is latched: re-asking on the next pass re-derives the answer from
+ * whatever the board and GitHub say then, which is what makes the release automatic.
+ */
+export async function confirmWipQueue(
+  db: AntonDb,
+  input: WipHoldInput,
+): Promise<WipQueueVerdict> {
+  const config = resolveWipLimit(await getProjectSettings(db, input.projectId));
+  if (!config) return { retired: [] };
+
+  const candidates = inReviewTargets(input.board);
+  // Under the limit even before any PR is confirmed merged: confirming can only SHRINK the count,
+  // so there is no hold to find and no reason to spawn `gh` at all — and nothing is retired, because
+  // nothing was read.
+  if (candidates.length < config.limit) return { retired: [] };
+
+  const read = input.readPrActivity ?? getPrActivity;
+  const { slots, retired, truncated } = await confirmSlots(read, input, candidates, config.limit);
+  const hold = detectWipHold(slots, config, truncated);
+  return { ...(hold ? { hold } : {}), retired };
 }
 
 /**
  * The project's WIP hold, or `undefined` when there is still review bandwidth (and when the
- * operator has turned the hold off with a limit of 0).
- *
- * Nothing is written and nothing is latched: re-asking on the next pass re-derives the answer from
- * whatever the board and GitHub say then, which is what makes the release automatic.
+ * operator has turned the hold off with a limit of 0) — {@link confirmWipQueue} for callers that
+ * only need the verdict.
  */
 export async function checkWipLimit(
   db: AntonDb,
   input: WipHoldInput,
 ): Promise<WipHold | undefined> {
-  const config = resolveWipLimit(await getProjectSettings(db, input.projectId));
-  if (!config) return undefined;
-
-  const candidates = inReviewTargets(input.board);
-  // Under the limit even before any PR is confirmed merged: confirming can only SHRINK the count,
-  // so there is no hold to find and no reason to spawn `gh` at all.
-  if (candidates.length < config.limit) return undefined;
-
-  const read = input.readPrActivity ?? getPrActivity;
-  const { slots, truncated } = await confirmSlots(read, input, candidates, config.limit);
-  return detectWipHold(slots, config, truncated);
+  return (await confirmWipQueue(db, input)).hold;
 }
 
 /**

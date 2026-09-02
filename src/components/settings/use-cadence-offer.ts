@@ -17,16 +17,17 @@ import type {
  * ranking recomputed every few minutes. That is the only reason the offer exists — and the only
  * automation it is offered for, because no other pair of schedules has that relationship.
  *
- * The offer states the picker's effect TODAY — it records a plan, it starts nothing (see
- * `src/lib/jobs/board-picker.ts`). Overstating that would buy a daily claude session on a promise
- * the build does not keep; when the arming feature lands and the plan is executed, the reason gets
- * stronger, not different.
+ * The offer states the picker's effect TODAY — it ranks off these priorities, and on a project
+ * armed to `apply` it approves, claims and starts its top pick unattended (see
+ * `src/lib/jobs/picker-apply.ts`). It must keep saying only what the build does: a reason that
+ * outruns the code buys a daily claude session on a promise anton does not keep.
  */
 const AUTOPILOT_ARMING_AUTOMATION = "board-picker";
 const CADENCE_COUPLED_AUTOMATION = "product-master";
 const CADENCE_OFFER_REASON =
-  "board-picker now ranks what could run next off these priorities and records that plan — it " +
-  "starts nothing yet. A week-old priority makes a week-old ranking. Run it daily?";
+  "board-picker now ranks what could run next off these priorities — and where you armed apply, it " +
+  "approves, claims and starts its top pick. A week-old priority makes a week-old ranking. " +
+  "Run it daily?";
 
 /** The offer as the automation panel drives it: the pending question, and every way it is answered. */
 export interface CadenceOfferControl {

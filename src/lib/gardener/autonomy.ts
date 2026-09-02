@@ -17,6 +17,12 @@
  * policy. Shadow mode answers "would this apply CLEANLY?"; nothing but the record answers "is this
  * proposal RIGHT?".
  *
+ * That second floor is not the gardener's alone. The board-picker faces the identical trap — a plan
+ * that ranks a target proves the executor, never the judgment — so it reads the SAME bars through
+ * {@link earnedPickerAutonomy} (anton-vkp9), over the operator's releases and vetoes instead of over
+ * a kind's proposals. One trust ladder, two records; a second one would be a second thing to keep
+ * honest.
+ *
  * Pure values, in the same sense detections.ts is: nothing here reads a board, a settings store, or a
  * bead. That purity is what lets both floors be PROVEN properties instead of comments.
  */
@@ -210,6 +216,67 @@ export interface EarnedAutonomy {
 }
 
 /**
+ * How a record's counts are SAID. The only thing that differs between the two records this floor
+ * reads: a gardener kind's proposals are APPLIED or declined, the picker's picks are RELEASED or
+ * vetoed, and an operator should meet each in the words of the surface they answered it on.
+ */
+interface RecordWords {
+  /** What a decided item is called in the plural — "settled proposals", "answered picks". */
+  decided: string;
+  /** The word for a decided item in the bar itself — "settled", "answered". */
+  bar: string;
+  /** The accepting verb — "applied", "released". */
+  accepted: string;
+}
+
+const PROPOSAL_WORDS: RecordWords = {
+  decided: "settled proposals",
+  bar: "settled",
+  accepted: "applied",
+};
+
+const PICKER_WORDS: RecordWords = {
+  decided: "answered picks",
+  bar: "answered",
+  accepted: "released",
+};
+
+/**
+ * Does this record clear this bar, and — when it does not — what the counts are, in the record's own
+ * words.
+ *
+ * The ONE place either record is weighed. The gardener's kinds and the picker (anton-vkp9) reach
+ * `apply` through this function and the {@link EARNED_AUTONOMY_BARS} table above it, so there is one
+ * trust ladder to reason about and no second one to keep in step with it.
+ *
+ * A reason always carries the counts, never a bare "locked": the evidence for the nine bad
+ * re-parents was printed every time and read by nobody, so a floor that refuses without saying what
+ * it refused ON is the same failure with a lock on it.
+ */
+function clearsBar(
+  bar: EarnedAutonomyBar,
+  counts: { settled: number; accepted: number },
+  words: RecordWords,
+): { eligible: boolean; reason?: string } {
+  const { settled, accepted } = counts;
+  const so_far = `${accepted}/${settled} ${words.accepted}`;
+  const unlocks = `apply unlocks at ${bar.minSettled} ${words.bar} with ${bar.minAppliedPct}% ${words.accepted}`;
+
+  if (settled < bar.minSettled) {
+    const has = settled === 0 ? `no ${words.decided} yet` : so_far;
+    return { eligible: false, reason: `${has} — ${unlocks}` };
+  }
+  // Compared by cross multiplication, not on the rounded percentage (PR #218 review): 26/29 is
+  // 89.66% and rounds to 90, which would arm `apply` on a record that never met the bar. Rounding
+  // stays where it belongs — the sentence the operator reads.
+  if (accepted * 100 < bar.minAppliedPct * settled) {
+    const pct = Math.round((accepted / settled) * 100);
+    return { eligible: false, reason: `${so_far} (${pct}%) — ${unlocks}` };
+  }
+  return { eligible: true };
+}
+
+/**
  * Has this kind's own record earned the right to be armed?
  *
  * Pure over (move, record), like everything else here. The counts arrive already windowed by the
@@ -224,26 +291,7 @@ export function earnedAutonomy(
   const tier = autonomyTierOf(plan);
   const bar = EARNED_AUTONOMY_BARS[tier];
   const { settled, applied } = record[kind] ?? { settled: 0, applied: 0 };
-  const counts = `${applied}/${settled} applied`;
-
-  const unlocks = `apply unlocks at ${bar.minSettled} settled with ${bar.minAppliedPct}% applied`;
-
-  if (settled < bar.minSettled) {
-    const soFar = settled === 0 ? "no settled proposals yet" : counts;
-    return { tier, bar, settled, applied, eligible: false, reason: `${soFar} — ${unlocks}` };
-  }
-  const pct = Math.round((applied / settled) * 100);
-  if (pct < bar.minAppliedPct) {
-    return {
-      tier,
-      bar,
-      settled,
-      applied,
-      eligible: false,
-      reason: `${counts} (${pct}%) — ${unlocks}`,
-    };
-  }
-  return { tier, bar, settled, applied, eligible: true };
+  return { tier, bar, settled, applied, ...clearsBar(bar, { settled, accepted: applied }, PROPOSAL_WORDS) };
 }
 
 /**
@@ -256,6 +304,72 @@ export function earnedAutonomyOfKind(
   record: ProposalTrackRecord,
 ): EarnedAutonomy {
   return earnedAutonomy(kind, KINDS[kind], record);
+}
+
+// ── the same floor, over the picker's record (anton-vkp9) ──
+
+/**
+ * What the picker's start COSTS, and therefore which bar it clears.
+ *
+ * DERIVED from the table above rather than restated: at `apply` the picker writes `approved`, claims
+ * the target and enqueues the run — the `approve` move, which {@link autonomyTierOf} already prices
+ * at `history` because what follows the label is a run that spends tokens and opens a PR, and
+ * withdrawing the approval afterwards does not un-run it. Reading it off the move is what keeps the
+ * picker on ONE trust ladder with the gardener's kinds: a re-priced `approve` re-prices this too.
+ */
+export const PICKER_AUTONOMY_TIER: AutonomyTier = autonomyTierOf({ move: "approve" });
+
+/**
+ * The picker's record as the floor reads it: how many of its picks the operator ANSWERED, and how
+ * many of those they released.
+ *
+ * Structural, not imported, for the reason nothing else here reads a store either — the counts are
+ * derived from the verdict table by the caller (`picker-veto.ts` `pickerTrackRecord`) exactly as the
+ * gardener's are derived from the board, and this module stays pure enough for the floor to be a
+ * proven property.
+ */
+export interface PickerRecordCounts {
+  /** Picks answered either way — a release or a veto. Below the bar there is no record, not a bad one. */
+  settled: number;
+  /** How many of those were RELEASED. A veto is the other half, and it is evidence too. */
+  accepted: number;
+}
+
+/** Whether the picker's record clears its bar, and — when it does not — what to tell the operator. */
+export interface EarnedPickerAutonomy {
+  tier: AutonomyTier;
+  bar: EarnedAutonomyBar;
+  settled: number;
+  accepted: number;
+  /** May this project's picker be armed at `apply` at all? */
+  eligible: boolean;
+  /** Why `apply` is unavailable, with the counts — never a bare "locked". Absent exactly when eligible. */
+  reason?: string;
+}
+
+/**
+ * Has this project's picker earned the right to start work unattended?
+ *
+ * The gardener's floor, asked of the picker's own accept/decline record (anton-vkp9). Shadow mode is
+ * the same trap on this side of the house: a plan that ranks a target says the picker could start
+ * it, never that starting it was RIGHT — and the only thing that answers the second question is what
+ * the operator did when they were offered the pick.
+ *
+ * Pure over the counts, like {@link earnedAutonomy}, so the settings surface and the pass reach the
+ * identical verdict from the identical numbers. The window the counts arrive over is the caller's
+ * (`PICKER_RECORD_WINDOW`), and it ROLLS — which is what makes this floor bite AFTER arming too: a
+ * project whose recent answers stop supporting `apply` stops clearing this bar on the very next pass.
+ */
+export function earnedPickerAutonomy(record: PickerRecordCounts): EarnedPickerAutonomy {
+  const bar = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+  const { settled, accepted } = record;
+  return {
+    tier: PICKER_AUTONOMY_TIER,
+    bar,
+    settled,
+    accepted,
+    ...clearsBar(bar, { settled, accepted }, PICKER_WORDS),
+  };
 }
 
 /**
