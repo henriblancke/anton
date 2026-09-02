@@ -216,6 +216,7 @@ export function checkoutMoved(repoPath: string): void {
   if (resolve(repoPath) !== resolve(root) && !sameDirectory(repoPath, root)) return;
   onDiskCache = null;
   driftsCache = null;
+  driftsGeneration += 1;
 }
 
 /**
@@ -369,6 +370,14 @@ let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
 let inflightDrifts: Promise<ServerDrift[]> | null = null;
 
 /**
+ * Bumped by every invalidation, so a read that STARTED before one cannot store its result after it
+ * (PR #217 review). `checkoutMoved` clears the cache, but a read already in flight resolves later
+ * and would write the pre-move verdict straight back — leaving the health page calling a
+ * now-stale server current for the rest of the TTL, on the exact pass whose answer changed.
+ */
+let driftsGeneration = 0;
+
+/**
  * Every server of this install that is running something other than the code on disk — empty when
  * they all match, which is the ordinary case.
  *
@@ -392,11 +401,12 @@ let inflightDrifts: Promise<ServerDrift[]> | null = null;
 export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   const now = Date.now();
   if (driftsCache && now - driftsCache.at < ON_DISK_TTL_MS) return driftsCache.drifts;
+  const generation = driftsGeneration;
   // Dropped in `finally`, so a read that threw is retried by the next caller rather than replayed
   // to every one of them for the rest of the TTL.
   inflightDrifts ??= readServerDrifts()
     .then((drifts) => {
-      driftsCache = { at: Date.now(), drifts };
+      if (driftsGeneration === generation) driftsCache = { at: Date.now(), drifts };
       return drifts;
     })
     .finally(() => {

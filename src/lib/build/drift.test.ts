@@ -584,6 +584,35 @@ describe("serverBuildDrifts", () => {
     expect(first).toBe(second);
   });
 
+  // `checkoutMoved` clears the cache, but a read already in flight resolves AFTER it and would write
+  // the pre-move verdict straight back — the health page then calls a now-stale server current for
+  // the rest of the TTL, on the exact pass whose answer changed (PR #217 review).
+  it("does not let a read started before the checkout moved repopulate the cache", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { checkoutMoved, recordServerBuild, serverBuildDrifts } = await import("./drift");
+    recordServerBuild({ runner: true });
+
+    let release: (pids: number[]) => void = () => {};
+    const search = await searchFinds([]);
+    search.mockReturnValueOnce(new Promise<number[]>((resolve) => (release = resolve)));
+    const inflight = serverBuildDrifts();
+
+    onDisk = { version: "0.4.1", revision: null };
+    checkoutMoved(app);
+    release([]);
+    expect(await inflight).toEqual([]); // answered as it was taken, from the read before the pull
+
+    const drifts = await serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0].drift.state).toBe("outdated");
+  });
+
   // A failed read must not be replayed to every later caller for the rest of the TTL — the next one
   // retries it.
   it("retries after a search that threw rather than caching the failure", async () => {
