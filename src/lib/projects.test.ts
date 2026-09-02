@@ -23,6 +23,7 @@ let getProjectSettingsBySlug: typeof import("./projects").getProjectSettingsBySl
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
 let resolveValueLabels: typeof import("./projects").resolveValueLabels;
 let valueLabelsSchema: typeof import("./projects").valueLabelsSchema;
+let resolvePickerAutonomy: typeof import("./projects").resolvePickerAutonomy;
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-projects-test-"));
@@ -55,6 +56,7 @@ beforeAll(async () => {
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
   resolveValueLabels = mod.resolveValueLabels;
   valueLabelsSchema = mod.valueLabelsSchema;
+  resolvePickerAutonomy = mod.resolvePickerAutonomy;
 });
 
 afterAll(() => {
@@ -429,5 +431,24 @@ describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
     const created = await addProject({ name: "Budget On", repoPath: makeRepoDir("budget-on") });
     await updateProjectSettings(created.slug, { budgetAware: true });
     expect(await isBudgetAwareEnabledAnywhere()).toBe(true);
+  });
+});
+
+describe("resolvePickerAutonomy (anton-qlci)", () => {
+  it("defaults to propose unarmed and shadow armed — apply is never a default", () => {
+    expect(resolvePickerAutonomy({})).toBe("propose");
+    expect(resolvePickerAutonomy({ pickerPolicy: { types: ["bug"] } })).toBe("shadow");
+  });
+
+  it("honours a stored level on an armed project", () => {
+    const armed = { pickerPolicy: { types: ["bug"] } };
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" })).toBe("propose");
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "apply" })).toBe("apply");
+  });
+
+  it("floors apply to shadow when no policy is armed", () => {
+    // The structural default admits every claimable run target, so apply there is autopilot with no
+    // approval in it — an operator who clears their policy lands back in shadow rather than wide open.
+    expect(resolvePickerAutonomy({ pickerAutonomy: "apply" })).toBe("shadow");
   });
 });

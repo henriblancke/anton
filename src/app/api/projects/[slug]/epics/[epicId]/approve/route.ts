@@ -2,12 +2,13 @@ import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
 import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
-import { loadAllIssues, refreshAllIssues } from "@/lib/beads/issues";
+import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, stealRefused, withClaimLock } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
+import { approveAndClaim } from "@/lib/beads/approve-claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
 import { getBoardPickerPlan, isPlanStale, stampBoard } from "@/lib/board-picker-plan";
@@ -193,6 +194,13 @@ async function reserveRelease(
  * tells the operator that approving it again settles it.
  */
 const APPLY_STATUS = { unusable: 422, refused: 409, failed: 500, unsettled: 500 } as const;
+
+/**
+ * What the under-lock guard can refuse an approval for — the two verdicts that can only be taken
+ * against the board as of the write: the target is not (or is no longer) a run target, or a steal's
+ * victim started their run while this approval was in flight.
+ */
+type ApproveRefusal = { notRunTarget: string } | { moved: string };
 
 /**
  * Why this bead is not something approval may enqueue, or undefined when it is a run target. Reuses
@@ -553,69 +561,67 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // With no operator identity (no ANTON_OPERATOR, no git user.name) there's no one to assign, so
   // the swap is owner→owner: a verified no-op that still takes the lock and still serializes the
   // label against concurrent claims.
-  const swap = await withClaimLock(project.repoPath, epicId, async (cas) => {
-    // One raw board read under the lock, serving every re-check below. `loadAllIssues`, not the
-    // snapshot-backed `refreshAllIssues`: a refresh whose generation is bumped mid-flight (any other
-    // bd write to this repo) discards what it read and answers with the RETAINED board instead
-    // (lib/beads/snapshot.ts) — last-good data is right for a view and wrong for a gate that is
-    // about to write. This one goes straight to bd and is judged as read.
-    const lockedBoard = await loadAllIssues(project.repoPath);
-    const locked = lockedBoard.find((b) => b.id === epicId);
-    if (!locked) return { vanished: true } as const;
+  //
+  // The sequence itself lives in `beads/approve-claim.ts` — shared with the board-picker's apply
+  // step, which is the second writer of this label and must not rebuild the ordering above. What
+  // stays here is what is this route's: which re-checks the locked board has to survive.
+  const swap = await approveAndClaim<ApproveRefusal>({
+    repoPath: project.repoPath,
+    beadId: epicId,
+    expectedOwner: owner,
+    nextOwner: operator ?? owner,
+    guard: (locked, lockedBoard) => {
+      // Re-take the run-target verdict HERE, under the lock. The pre-lock gate answered from a read
+      // taken before every gate below it ran, and the Add-work commit (lib/backlog.ts
+      // `createDraftFeature`) attaches a feature child while holding THIS SAME per-bead lock. Without
+      // this the two orders are asymmetric: the feature landing first turns a standalone run target
+      // into a container behind the pre-lock gate's back, and we would label it `approved` and
+      // enqueue a run that execute-epic's own `isRunTarget` gate only poison-parks — a false green,
+      // the exact failure the pre-lock gate exists to prevent. Under the lock the shape cannot move
+      // between this verdict and the `approved` write, so the two writes are genuinely ordered:
+      // either the feature lands first and this refuses, or approval lands first and
+      // `createDraftFeature`'s own re-check refuses the draft.
+      const refusal = notRunTargetReason(locked, lockedBoard);
+      if (refusal) return { notRunTarget: refusal };
 
-    // Re-take the run-target verdict HERE, under the lock. The pre-lock gate answered from a read
-    // taken before every gate below it ran, and the Add-work commit (lib/backlog.ts
-    // `createDraftFeature`) attaches a feature child while holding THIS SAME per-bead lock. Without
-    // this the two orders are asymmetric: the feature landing first turns a standalone run target
-    // into a container behind the pre-lock gate's back, and we would label it `approved` and enqueue
-    // a run that execute-epic's own `isRunTarget` gate only poison-parks — a false green, the exact
-    // failure the pre-lock gate exists to prevent. Under the lock the shape cannot move between this
-    // verdict and the `beads.approve` below, so the two writes are genuinely ordered: either the
-    // feature lands first and this refuses, or approval lands first and `createDraftFeature`'s own
-    // re-check refuses the draft.
-    const refusal = notRunTargetReason(locked, lockedBoard);
-    if (refusal) return { refused: refusal } as const;
+      // The human-work report, taken off the same locked read the approval writes against — see the
+      // declarations above for why the pre-lock read is not good enough. The child gates are
+      // re-derived through the same `runTickets`/`contractGatedBeads` pair the pre-lock gate used, so
+      // the lines describe the board the run is about to consume rather than the one that passed it.
+      humanTarget = willEnqueue && beads.isHumanWork(locked);
+      humanWork = willEnqueue
+        ? humanGates(contractGatedBeads(locked, runTickets(lockedBoard, epicId)))
+        : [];
 
-    // The human-work report, taken off the same locked read the approval writes against — see the
-    // declarations above for why the pre-lock read is not good enough. The child gates are re-derived
-    // through the same `runTickets`/`contractGatedBeads` pair the pre-lock gate used, so the lines
-    // describe the board the run is about to consume rather than the one that passed the gate.
-    humanTarget = willEnqueue && beads.isHumanWork(locked);
-    humanWork = willEnqueue
-      ? humanGates(contractGatedBeads(locked, runTickets(lockedBoard, epicId)))
-      : [];
-
-    // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
-    // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the original
-    // owner's runner starts in the window before this CAS: it moves the bead to
-    // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
-    // (which matches on assignee alone) would still succeed and reassign a *live* run to the
-    // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
-    // stage inside the lock makes a run that started in that window lose the swap instead. A
-    // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
-    // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
-    if (owner && owner !== operator) {
-      const lockedStage = deriveStage(locked);
-      if (lockedStage !== "backlog") return { moved: lockedStage } as const;
-    }
-    // Hand this read to the CAS: it needs the assignee as of this lock, which is exactly what
-    // `locked` holds — re-reading it would be a `bd show` of a bead nothing can move.
-    const result = await cas(owner, operator ?? owner, locked);
-    if (result.ok) await beads.approve(project.repoPath, epicId);
-    return result;
+      // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
+      // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the
+      // original owner's runner starts in the window before this CAS: it moves the bead to
+      // in_progress/stage:implementing but leaves the assignee as the old owner, so `cas(owner, …)`
+      // (which matches on assignee alone) would still succeed and reassign a *live* run to the
+      // approver — the exact implementing/in-review takeover the pre-lock gate rejects. Reading the
+      // stage inside the lock makes a run that started in that window lose the swap instead. A
+      // self-owned re-approve (owner === operator, e.g. Force run on an implementing epic) is
+      // deliberately excluded: it's the operator asking to re-run their own target, not a takeover.
+      if (owner && owner !== operator) {
+        const lockedStage = deriveStage(locked);
+        if (lockedStage !== "backlog") return { moved: lockedStage };
+      }
+      return undefined;
+    },
   });
   if ("vanished" in swap) {
     return notFoundResponse(`Ticket ${epicId} not found on the board`);
   }
   if ("refused" in swap) {
-    return NextResponse.json({ error: swap.refused }, { status: 422 });
-  }
-  if ("moved" in swap) {
-    return stealRefused(
-      `${epicId} is claimed by ${owner} and is already ${swap.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
-      owner,
-      swap.moved,
-    );
+    const refusal = swap.refused;
+    if ("moved" in refusal) {
+      return stealRefused(
+        `${epicId} is claimed by ${owner} and is already ${refusal.moved} — its run started while this approval was in flight, so it can't be taken over; wait for it to finish or have ${owner} release it`,
+        owner,
+        refusal.moved,
+      );
+    }
+    return NextResponse.json({ error: refusal.notRunTarget }, { status: 422 });
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 

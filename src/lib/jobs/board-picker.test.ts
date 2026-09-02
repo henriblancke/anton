@@ -20,6 +20,7 @@ import { PoisonError } from "./errors";
 import type { Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeBoardPickerHandler } from "./board-picker";
+import type { PickerApplyInput, PickerApplyOutcome } from "./picker-apply";
 import { makeProjectDb } from "@/lib/testing/project";
 
 const board = vi.hoisted(() => ({ current: [] as Bead[], calls: [] as unknown[][] }));
@@ -29,6 +30,17 @@ vi.mock("../beads/issues", () => ({
     return board.current;
   }),
 }));
+
+/**
+ * The apply step is mocked, not driven: what this suite pins is the GATING — which passes reach a
+ * start at all — while what a start writes is picker-apply.test.ts's (and the e2e's).
+ */
+const applyPickerPlan = vi.hoisted(() =>
+  vi.fn<(input: PickerApplyInput) => Promise<PickerApplyOutcome>>(async () => ({
+    skipped: { reason: "stubbed" },
+  })),
+);
+vi.mock("./picker-apply", () => ({ applyPickerPlan }));
 
 const NOW = 1_800_000_000_000;
 const clock: Clock = { now: () => NOW };
@@ -91,10 +103,19 @@ function fakeCtx(over: Partial<JobContext> = {}): JobContext {
   };
 }
 
+/** Arm the project: a policy plus the autonomy level that lets a pass act on it. */
+function arm(t: TestDb, autonomy: string, policy: unknown = { types: ["task"] }): void {
+  t.db
+    .update(schema.projects)
+    .set({ settingsJson: JSON.stringify({ pickerPolicy: policy, pickerAutonomy: autonomy }) })
+    .run();
+}
+
 let t: TestDb;
 beforeEach(() => {
   board.current = [];
   board.calls = [];
+  applyPickerPlan.mockClear();
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: "/tmp/p1" });
 });
 afterEach(() => t.close());
@@ -370,6 +391,101 @@ describe("makeBoardPickerHandler", () => {
     // No second hold line, and nothing an operator had to clear to get there.
     expect(holdLines(info)).toHaveLength(1);
     expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toContain("t1");
+    info.mockRestore();
+  });
+
+
+  it("starts its top pick once the project is armed to apply", async () => {
+    // R1.5 wiring: the pass hands the plan it just recorded to the apply step — the ranking is not
+    // re-derived there, so the start and the lane can never name different targets.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+    arm(t, "apply");
+    applyPickerPlan.mockResolvedValueOnce({
+      started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
+    });
+
+    const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
+    expect(applyPickerPlan.mock.calls[0][0]).toMatchObject({
+      projectId: "p1",
+      repoPath: "/tmp/p1",
+      entries: [
+        { beadId: "t1", rank: 1 },
+        { beadId: "t2", rank: 2 },
+      ],
+    });
+    // A start outranks "ranked N": it is the one outcome of this pass that moved something.
+    expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 2)" });
+  });
+
+  it("still only ranks at shadow — the level below apply starts nothing", async () => {
+    board.current = [bead("t1")];
+    arm(t, "shadow");
+
+    expect(await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx())).toEqual({
+      changed: true,
+      note: "ranked 1 target(s)",
+    });
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+  });
+
+  it("refuses to apply on a project that has armed no policy", async () => {
+    // The structural default admits everything, so a pass that wrote `approved` off it would be
+    // autopilot with no approval in it. The level floors to shadow rather than starting anything.
+    board.current = [bead("t1")];
+    t.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerAutonomy: "apply" }) })
+      .run();
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+  });
+
+  it("starts nothing while the project is disarmed, on this pass and every later one", async () => {
+    // The latch is what the apply step refuses on (R4.4) — and it must keep refusing: the breaker
+    // itself answers `undefined` once a disarm stands, so a pass reading only its verdict would
+    // treat the second tick as armed again.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    threeFailedRuns(t);
+    const pass = makeBoardPickerHandler({ db: t.db, clock });
+
+    await pass(fakeCtx());
+    await pass(fakeCtx());
+
+    expect(await activeDisarm(t.db, "p1")).toBeDefined();
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+    // The ranking is still recorded — a disarm freezes starting, not deciding.
+    expect((await getBoardPickerPlan(t.db, "p1"))?.entries.map((e) => e.beadId)).toEqual(["t1"]);
+  });
+
+  it("starts nothing while the WIP hold is on, and starts again once it releases", async () => {
+    const IN_REVIEW = LABELS.stage("in-review");
+    const prs = [11, 12, 13];
+    board.current = [
+      bead("t1"),
+      ...prs.map((n) => bead(`anton-${n}`, { labels: [IN_REVIEW], metadata: { pr: `gh-${n}` } })),
+    ];
+    arm(t, "apply");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    let merged = false;
+    const pass = makeBoardPickerHandler({
+      db: t.db,
+      clock,
+      readPrActivity: async (_repo, number) =>
+        prActivity(number, merged && number === 12 ? "MERGED" : "OPEN"),
+    });
+
+    await pass(fakeCtx());
+    expect(applyPickerPlan).not.toHaveBeenCalled();
+
+    // Nothing was latched and nothing needed clearing: the next merge releases the hold by itself.
+    merged = true;
+    await pass(fakeCtx());
+    expect(applyPickerPlan).toHaveBeenCalledTimes(1);
     info.mockRestore();
   });
 

@@ -35,6 +35,8 @@ import {
   POLICY_PRIORITY_MAX,
   POLICY_TEXT_MAX,
   POLICY_TYPES_MAX,
+  PICKER_AUTONOMY_LEVELS,
+  type PickerAutonomy,
   type Policy,
 } from "./policy/types";
 import type { FailureBreakerConfig } from "./autopilot-failure-streak";
@@ -365,6 +367,14 @@ export interface ProjectSettings {
    * writes it but an explicit accept. Validated with {@link pickerPolicySchema} at the API boundary.
    */
   pickerPolicy?: Policy;
+  /**
+   * How far the picker may go with the plan it decides (R3.5) — the level {@link
+   * resolvePickerAutonomy} floors before anything acts on it. Absent means the operator has never
+   * chosen one, which is NOT the same as `propose`: an armed project defaults to `shadow`, where
+   * the picker offers its picks and the operator's releases and vetoes become the record `apply` is
+   * earned on. Validated with {@link pickerAutonomySchema} at the API boundary.
+   */
+  pickerAutonomy?: PickerAutonomy;
 }
 
 /** A resolved verify gate (anton-3oh8): a stable label (for logs/errors) + the shell command. */
@@ -771,6 +781,28 @@ export const pickerPolicySchema = z
 /** The armed policy, or undefined when this project has never been armed (the first-arm case). */
 export function resolvePickerPolicy(settings: ProjectSettings): Policy | undefined {
   return settings.pickerPolicy;
+}
+
+/** The stored autonomy level. Strict, because an unrecognised level must not resolve to `apply`. */
+export const pickerAutonomySchema = z.enum(PICKER_AUTONOMY_LEVELS);
+
+/**
+ * How far the picker may go on this project, with the one structural floor applied here so no caller
+ * has to remember it: `apply` requires an ARMED POLICY.
+ *
+ * Without one the pass falls back to the structural default, which admits every claimable run target
+ * — and a pass that wrote `approved` off THAT would be autopilot with no approval in it, the one
+ * thing the design refuses (see `picker-decision.ts`'s ADMIT_ALL_POLICY). An operator who set `apply`
+ * and then cleared their policy lands on `shadow`: still offered its picks, starting none of them.
+ *
+ * The EARNED floor — a level a project's own record does not yet support — sits above this one and is
+ * the arming gate's (anton-vkp9), not this function's.
+ */
+export function resolvePickerAutonomy(settings: ProjectSettings): PickerAutonomy {
+  const armed = !!settings.pickerPolicy;
+  const stored = settings.pickerAutonomy;
+  if (!stored) return armed ? "shadow" : "propose";
+  return stored === "apply" && !armed ? "shadow" : stored;
 }
 
 /**
