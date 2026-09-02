@@ -172,20 +172,26 @@ function readRevision(appRoot) {
 }
 
 /**
+ * Is `dir` a checkout in its own right? The `.git` entry answers the same question
+ * `readRevision`'s toplevel check does, without needing a git that may just have failed. A linked
+ * worktree's and a submodule's `.git` is a FILE rather than a directory, hence lstat over any
+ * directory test.
+ */
+function isCheckout(dir) {
+  try {
+    lstatSync(join(dir, ".git"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * What a failed revision read MEANS: `REVISION_UNREADABLE` where `appRoot` holds a `.git` of its
  * own, else null.
- *
- * The `.git` entry answers the same question `readRevision`'s toplevel check does — is this
- * directory a checkout in its own right — without needing the git that just failed. A worktree's
- * `.git` is a file rather than a directory, hence lstat over any directory test.
  */
 function unreadableOrAbsent(appRoot) {
-  try {
-    lstatSync(join(appRoot, ".git"));
-    return REVISION_UNREADABLE;
-  } catch {
-    return null;
-  }
+  return isCheckout(appRoot) ? REVISION_UNREADABLE : null;
 }
 
 /** The commit a read can actually name — an unreadable one is no evidence, not a different sha. */
@@ -229,29 +235,84 @@ function git(appRoot, args) {
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
- * that class back in, and the diff hides another, so `uncoveredTrackedLinks` names that one back.
- * Both read git, and a read git could not answer collapses the digest exactly as the two above do:
- * a digest missing an input vouches for a build compiled from something else (PR #217 review).
+ * that class back in; the diff hides another, so `uncoveredTrackedLinks` names that one back; and it
+ * flattens a third to a single line, so `submoduleDigests` reads those worktrees itself. All three
+ * read git, and a read git could not answer collapses the digest exactly as the two above do: a
+ * digest missing an input vouches for a build compiled from something else (PR #217 review).
+ *
+ * `--ignore-submodules=none` because that flattened line is the only record of a submodule moving to
+ * a different commit, and either repository's config (`diff.ignoreSubmodules`,
+ * `submodule.<name>.ignore`) can otherwise suppress it.
  */
 function readWorktreeDigest(appRoot) {
   const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (listed === null) return null;
-  const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"]);
+  const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "HEAD"]);
   if (diff === null) return null;
-  const links = uncoveredTrackedLinks(appRoot);
+  const tracked = git(appRoot, ["ls-files", "-s", "-z"]);
+  if (tracked === null) return null;
+  const links = uncoveredTrackedLinks(appRoot, trackedPaths(tracked, SYMLINK_MODE));
   if (links === null) return null;
   const envFiles = ignoredEnvFiles(appRoot);
   if (envFiles === null) return null;
+  const submodules = submoduleDigests(appRoot, trackedPaths(tracked, GITLINK_MODE));
+  if (submodules === null) return null;
   const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links];
   const files = [...new Set(inputs)].sort();
-  if (!files.length && !diff) return WORKTREE_CLEAN;
+  if (!files.length && !diff && !submodules.length) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
   for (const path of files) {
     const entry = hashFile(join(appRoot, path));
     if (entry === null) return null;
     digest.update(path).update("\0").update(entry);
   }
+  for (const [path, worktree] of submodules) digest.update(path).update("\0").update(worktree).update("\0");
   return digest.digest("hex").slice(0, 12);
+}
+
+/** git's mode for a symlink, and for a submodule — the two `ls-files -s` reports and no read shows. */
+const SYMLINK_MODE = "120000 ";
+const GITLINK_MODE = "160000 ";
+
+/** The paths `ls-files -s` reported at `mode`, in the order git listed them (sorted by path). */
+function trackedPaths(listed, mode) {
+  return listed
+    .split("\0")
+    .filter((entry) => entry.startsWith(mode))
+    .map((entry) => entry.slice(entry.indexOf("\t") + 1));
+}
+
+/**
+ * What each DIRTY submodule worktree holds that its own HEAD does not, as `[path, digest]` pairs —
+ * the build inputs the parent's diff flattens to one line. A clean one contributes nothing, so a
+ * checkout whose submodules are all committed still reads `WORKTREE_CLEAN`.
+ *
+ * A submodule is a gitlink: `git diff HEAD` in the parent compares the COMMIT it points at and
+ * summarizes everything uncommitted inside it as the suffix `-dirty` (PR #217 review). So a source
+ * checkout that compiles through a submodule — the vendored-package shape — reports the identical
+ * line however often a file in there is rewritten, and `buildMatchesCheckout` reuses a `.next`
+ * compiled from the previous contents while every drift surface calls the server current: the same
+ * edit-twice blindness the untracked listing and the tracked-link walk close elsewhere.
+ *
+ * Each worktree is read the way this checkout is, recursively, rather than through
+ * `--submodule=diff`: the recursion covers what the parent's inline diff would (tracked edits) plus
+ * what it would still only NAME — untracked files, ignored `.env` files, links leading out — and it
+ * reaches a submodule nested inside a submodule on the same terms. The parent's own diff already
+ * carries the commit each one points at, so nothing is hashed twice.
+ *
+ * An uninitialized submodule is skipped: with nothing checked out there is no content to digest, and
+ * `git -C` inside that empty directory would walk up and answer for the PARENT repository instead.
+ */
+function submoduleDigests(appRoot, paths) {
+  const digests = [];
+  for (const path of paths) {
+    const root = join(appRoot, path);
+    if (!isCheckout(root)) continue;
+    const worktree = readWorktreeDigest(root);
+    if (worktree === null) return null;
+    if (worktree !== WORKTREE_CLEAN) digests.push([path, worktree]);
+  }
+  return digests;
 }
 
 /**
@@ -276,23 +337,18 @@ function readWorktreeDigest(appRoot) {
  * rebuild rather than vouching for a partial read. A link resolving nowhere counts as uncovered,
  * which keeps its text in the digest.
  *
- * `ls-files -s` is the only listing that reports MODE, and mode 120000 is git's symlink. A read git
- * could not answer collapses the digest rather than returning a partial input set, for the reason
- * the walk cap does: a digest missing an input vouches for a build compiled from something else.
+ * `links` comes from `ls-files -s`, the only listing that reports MODE, which the caller reads once
+ * for both the symlinks here and the gitlinks `submoduleDigests` needs. A read git could not answer
+ * collapses the digest rather than returning a partial input set, for the reason the walk cap does:
+ * a digest missing an input vouches for a build compiled from something else.
  */
-function uncoveredTrackedLinks(appRoot) {
-  const listed = git(appRoot, ["ls-files", "-s", "-z"]);
-  if (listed === null) return null;
+function uncoveredTrackedLinks(appRoot, links) {
   let root;
   try {
     root = realpathSync(appRoot);
   } catch {
     return null;
   }
-  const links = listed
-    .split("\0")
-    .filter((entry) => entry.startsWith("120000 "))
-    .map((entry) => entry.slice(entry.indexOf("\t") + 1));
   const uncovered = [];
   for (const path of links) {
     const inside = resolvedInside(root, join(appRoot, path));

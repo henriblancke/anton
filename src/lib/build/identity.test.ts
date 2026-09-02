@@ -66,6 +66,20 @@ function gitCheckout(version = "0.4.0"): string {
   return dir;
 }
 
+/** A committed submodule under `dir` — the vendored-source shape a build compiles through. */
+function submodule(dir: string, path: string): string {
+  const origin = tempDir();
+  writeFileSync(join(origin, "lib.ts"), SOURCE);
+  spawnSync("git", ["init", "-q", origin]);
+  spawnSync("git", ["-C", origin, "add", "-A"]);
+  spawnSync("git", ["-C", origin, ...AUTHOR, "commit", "-qm", "vendored"]);
+  // A local clone over the file transport is what `protocol.file.allow` gates.
+  const allow = ["-c", "protocol.file.allow=always"];
+  spawnSync("git", ["-C", dir, ...AUTHOR, ...allow, "submodule", "add", "-q", origin, path]);
+  spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "vendor"]);
+  return origin;
+}
+
 describe("compareBuild", () => {
   it("says nothing when the running build is the build on disk", () => {
     expect(compareBuild(RUNNING, { ...RUNNING }).state).toBe("current");
@@ -353,6 +367,51 @@ describe("readBuildIdentity", () => {
     // Same bytes behind the same link is the same build, so the digest stays a function of them.
     writeFileSync(join(dir, "generated", "shared.ts"), SOURCE);
     expect(readBuildIdentity(dir).worktree).toBe(first);
+  });
+
+  // A submodule is a gitlink: `git diff HEAD` compares the COMMIT it points at and flattens
+  // everything uncommitted inside it to the suffix `-dirty`, so a checkout compiling through a
+  // vendored submodule reports the identical line however often a file in there is rewritten — and
+  // `anton start` reuses a `.next` compiled from the previous contents while calling it current.
+  it("digests the uncommitted contents of a submodule worktree", () => {
+    const dir = gitCheckout();
+    submodule(dir, "vendor");
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    writeFileSync(join(dir, "vendor", "lib.ts"), SOURCE.replace("1", "2"));
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    // The edit the `-dirty` suffix cannot tell from the one before it.
+    writeFileSync(join(dir, "vendor", "lib.ts"), SOURCE.replace("1", "3"));
+    const second = readBuildIdentity(dir).worktree;
+    expect(second).not.toBe(first);
+
+    // Untracked inside the submodule: the parent's `ls-files --others` stops at the boundary.
+    writeFileSync(join(dir, "vendor", "extra.ts"), "export const m = 3;\n");
+    expect(readBuildIdentity(dir).worktree).not.toBe(second);
+
+    // And back — undoing work inside a submodule clears the verdict as undoing it here does.
+    rmSync(join(dir, "vendor", "extra.ts"));
+    writeFileSync(join(dir, "vendor", "lib.ts"), SOURCE);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+  });
+
+  // The commit a submodule points at is the parent's own tracked content, so moving it is drift the
+  // parent diff sees — provided config cannot hide the gitlink line from that diff.
+  it("digests a submodule moved to a different commit, whatever the repo asks git to ignore", () => {
+    const dir = gitCheckout();
+    const origin = submodule(dir, "vendor");
+    spawnSync("git", ["-C", dir, "config", "diff.ignoreSubmodules", "all"]);
+    spawnSync("git", ["-C", dir, "config", "submodule.vendor.ignore", "all"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    writeFileSync(join(origin, "lib.ts"), SOURCE.replace("1", "2"));
+    spawnSync("git", ["-C", origin, "add", "-A"]);
+    spawnSync("git", ["-C", origin, ...AUTHOR, "commit", "-qm", "second"]);
+    spawnSync("git", ["-C", join(dir, "vendor"), "fetch", "-q", "origin"]);
+    spawnSync("git", ["-C", join(dir, "vendor"), "checkout", "-q", "FETCH_HEAD"]);
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
   // A walk that stops at the entry cap hashes the same bytes however the entries past the cutoff
