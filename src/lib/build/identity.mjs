@@ -236,10 +236,10 @@ function git(appRoot, args, input) {
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
- * that class back in; the diff hides two more — what a tracked link points at, and the bytes a clean
- * filter converts before git ever compares them — so `uncoveredTrackedLinks` and
- * `filteredTrackedPaths` name those back; and it flattens a fourth to a single line, so
- * `submoduleDigests` reads those worktrees itself. All of them read git, and a read git could not
+ * that class back in; the diff hides two more — what a tracked link points at, and the bytes git
+ * canonicalizes (a clean filter, the `ident` attribute) before it ever compares them — so
+ * `uncoveredTrackedLinks` and `convertedTrackedPaths` name those back; and it flattens a fourth to a
+ * single line, so `submoduleDigests` reads those worktrees itself. All of them read git, and a read git could not
  * answer collapses the digest exactly as the two above do: a digest missing an input vouches for a
  * build compiled from something else (PR #217 review).
  *
@@ -256,13 +256,13 @@ function readWorktreeDigest(appRoot) {
   if (tracked === null) return null;
   const links = uncoveredTrackedLinks(appRoot, trackedPaths(tracked, SYMLINK_MODE));
   if (links === null) return null;
-  const filtered = filteredTrackedPaths(appRoot, trackedPaths(tracked, ...FILE_MODES));
-  if (filtered === null) return null;
+  const converted = convertedTrackedPaths(appRoot, trackedPaths(tracked, ...FILE_MODES));
+  if (converted === null) return null;
   const envFiles = ignoredEnvFiles(appRoot);
   if (envFiles === null) return null;
   const submodules = submoduleDigests(appRoot, trackedPaths(tracked, GITLINK_MODE));
   if (submodules === null) return null;
-  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links, ...filtered];
+  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links, ...converted];
   const files = [...new Set(inputs)].sort();
   if (!files.length && !diff && !submodules.length) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
@@ -291,32 +291,44 @@ function trackedPaths(listed, ...modes) {
 }
 
 /**
- * The tracked files a clean FILTER stands in front of, named back into the digest by CONTENT — the
- * last class of tracked input `git diff HEAD` cannot vouch for (PR #217 review).
+ * The tracked files git CANONICALIZES on the way into the diff, named back into the digest by
+ * CONTENT — the last class of tracked input `git diff HEAD` cannot vouch for (PR #217 review).
  *
- * git documents a clean command as converting worktree contents to their canonical repository form,
- * and the diff compares that OUTPUT on both sides. So a lossy driver — a stripper, a redactor,
- * anything that summarizes — reports no change however often the file is rewritten, while Next
- * compiles the raw bytes on disk. `--no-ext-diff` and `--no-textconv` do not reach it: those
- * disable diff-time conversions, and this one happens before the diff.
+ * Two attributes put a conversion there, and `--no-ext-diff` / `--no-textconv` reach neither, since
+ * both happen before diff time rather than during it:
  *
- * Only paths a CONFIGURED driver actually converts count. `filter=x` with neither a `filter.x.clean`
+ * `filter` — git documents a clean command as converting worktree contents to their canonical
+ * repository form, and the diff compares that OUTPUT on both sides. So a lossy driver — a stripper,
+ * a redactor, anything that summarizes — reports no change however often the file is rewritten,
+ * while Next compiles the raw bytes on disk.
+ *
+ * `ident` — git documents check-in as rewriting an expanded `$Id: <sha> $` back to the bare `$Id$`,
+ * so every worktree byte between those markers is canonicalized away too: two files differing only
+ * there diff identically and leave the worktree `WORKTREE_CLEAN`, while Next reads what is actually
+ * on disk (PR #217 review).
+ *
+ * Only paths a CONFIGURED filter driver converts count. `filter=x` with neither a `filter.x.clean`
  * command nor a `filter.x.process` one leaves the bytes alone, so the diff already covers them — and
  * re-reading every tracked file in a repo that merely declares the attribute would hash the whole
- * tree for nothing. Regular files only, for the same reason: git runs no filter over a symlink or a
- * gitlink, both of which the digest already covers on their own terms.
+ * tree for nothing. `ident` needs no such check: it is a built-in conversion, set is set. Regular
+ * files only, for the same reason as ever: git runs neither over a symlink or a gitlink, both of
+ * which the digest already covers on their own terms.
  */
-function filteredTrackedPaths(appRoot, paths) {
+function convertedTrackedPaths(appRoot, paths) {
+  if (!paths.length) return [];
   const drivers = convertingFilterDrivers(appRoot);
   if (drivers === null) return null;
-  if (!drivers.size || !paths.length) return [];
-  const attrs = git(appRoot, ["check-attr", "--stdin", "-z", "filter"], paths.join("\0"));
+  const attrs = git(appRoot, ["check-attr", "--stdin", "-z", "filter", "ident"], paths.join("\0"));
   if (attrs === null) return null;
-  // `<path>\0filter\0<value>` per path, where the value is a driver name, "unspecified" or "unset".
+  // `<path>\0<attribute>\0<value>` per path per attribute, in the order the attributes were asked
+  // for. A filter value is a driver name, "unspecified" or "unset"; ident's is "set" when it applies.
   const fields = attrs.split("\0");
-  const filtered = [];
-  for (let i = 0; i + 2 < fields.length; i += 3) if (drivers.has(fields[i + 2])) filtered.push(fields[i]);
-  return filtered;
+  const converted = new Set();
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    const [path, attribute, value] = fields.slice(i, i + 3);
+    if (attribute === "ident" ? value === "set" : drivers.has(value)) converted.add(path);
+  }
+  return [...converted];
 }
 
 /**

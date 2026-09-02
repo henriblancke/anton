@@ -364,6 +364,27 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).not.toBe(first);
   });
 
+  // `ident` is git's BUILT-IN canonicalization: check-in rewrites an expanded `$Id: <sha> $` back to
+  // the bare `$Id$`, so every worktree byte between those markers is converted away before the diff
+  // ever runs. Two different files therefore diff identically, and reading only configured filter
+  // drivers left them out of the raw-content inputs — a stale `.next` then passed as this checkout
+  // (PR #217 review).
+  it("digests a tracked edit the ident attribute would canonicalize away", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitattributes"), "*.ts ident\n");
+    writeFileSync(join(dir, "src.ts"), `// $Id$\n${SOURCE}`);
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "ident"]);
+
+    writeFileSync(join(dir, "src.ts"), `// $Id: aaaaaaa $\n${SOURCE}`);
+    expect(spawnSync("git", ["-C", dir, "diff", "HEAD"]).stdout.toString()).toBe("");
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "src.ts"), `// $Id: bbbbbbb $\n${SOURCE}`);
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
   // Only a driver with a `clean` command configured converts anything: the attribute on its own
   // leaves the bytes alone, the diff already covers them, and re-reading the tree for that would
   // cost every checkout declaring a filter it has no driver for.
