@@ -1114,6 +1114,26 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
 }
 
 /**
+ * Is a server up for THE INSTALL BEING DIAGNOSED? Only asked when no build record exists, which is
+ * the one case where liveness itself is the evidence (identity.mjs `buildDrift`).
+ *
+ * Each mode reads only its OWN evidence, because both signals are shared across installs and
+ * crossing them names the wrong process. The pidfile lives under the global state dir and is
+ * written by exactly one thing — the bundle's daemonized `anton start` — so a source checkout that
+ * consulted it would report the installed bundle's daemon as its own unstamped server and hand the
+ * operator source-mode restart instructions for a process `anton stop` owns. The port is the mirror
+ * image: any anton can hold it, so a bundle that probed it would attribute a source checkout's
+ * server to a bundle that is stopped.
+ *
+ * The cost is bundle `--foreground`, which writes no pidfile: an unstamped one reads as stopped.
+ * A liveness claim about the wrong install is worse than a missing one — restarting the wrong
+ * server kills a run and leaves the stale one up.
+ */
+async function serverIsUp({ isBundle = IS_BUNDLE, port = "3000", pid = runningPid, answering = antonAnswering } = {}) {
+  return isBundle ? !!pid() : await answering(port);
+}
+
+/**
  * Report the build the RUNNING server is serving against the one on disk (anton-pzfb) — the same
  * verdict the health page shows, from the shared comparison in src/lib/build/identity.mjs.
  *
@@ -1125,8 +1145,9 @@ async function reportServerBuild(dbPath, args = []) {
   const recordPath = buildRecordPath(dbPath);
   const record = readBuildRecord(recordPath);
   // One read, one verdict: re-reading the record inside buildDrift would let a restart between the
-  // two reads produce a verdict and a liveness check that describe different processes.
-  const serverRunning = !!runningPid() || (!record && (await antonAnswering(resolvePort(args) ?? "3000")));
+  // two reads produce a verdict and a liveness check that describe different processes. A record
+  // carries its own pid, so liveness is only worth establishing (and probing for) without one.
+  const serverRunning = record ? false : await serverIsUp({ port: resolvePort(args) });
   const drift = buildDrift({ appRoot: APP_ROOT, recordPath, record, serverRunning });
   if (!drift) {
     // No drift means one of two things, and they are different claims — a matching build is a
@@ -1135,8 +1156,8 @@ async function reportServerBuild(dbPath, args = []) {
     if (running) {
       console.log(`  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`running the build on disk (${describeBuildIdentity(record)})`)}`);
     } else {
-      // Not "stopped": nothing answered the port either, so all anton can honestly claim here is
-      // that nothing recorded a boot against this install.
+      // Not "stopped": this install's own liveness evidence came back empty too, so all anton can
+      // honestly claim here is that nothing recorded a boot against it.
       console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
     }
     return;
@@ -1969,6 +1990,7 @@ export {
   provisionAgentsSkills,
   installSkillDir,
   staleSkills,
+  serverIsUp,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

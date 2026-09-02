@@ -14,7 +14,7 @@ import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
-import { agentsFromArgs, nextArgs, resolvePort } from "./anton.mjs";
+import { agentsFromArgs, nextArgs, resolvePort, serverIsUp } from "./anton.mjs";
 
 import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
@@ -324,6 +324,29 @@ describe("anton doctor — skill drift", () => {
 });
 
 /**
+ * Whose server the liveness evidence belongs to (anton-pzfb). Both signals are shared across
+ * installs — the pidfile sits in the global state dir, and any anton can hold the port — so each
+ * mode may read only its own. The end-to-end cases below all run from this source checkout, which
+ * is why bundle mode is asserted on the unit here.
+ */
+describe("anton doctor — liveness evidence is scoped to the install", () => {
+  const answers = () => Promise.resolve(true);
+  const silent = () => Promise.resolve(false);
+
+  it("trusts only the daemon pidfile in bundle mode", async () => {
+    expect(await serverIsUp({ isBundle: true, port: "3000", pid: () => 42, answering: silent })).toBe(true);
+    // A separate source checkout serving anton's page is not this bundle's stopped daemon.
+    expect(await serverIsUp({ isBundle: true, port: "3000", pid: () => null, answering: answers })).toBe(false);
+  });
+
+  it("trusts only the port in source mode", async () => {
+    expect(await serverIsUp({ isBundle: false, port: "3000", pid: () => null, answering: answers })).toBe(true);
+    // `anton dev` writes no pidfile, so the one on disk is the installed bundle's.
+    expect(await serverIsUp({ isBundle: false, port: "3000", pid: () => 42, answering: silent })).toBe(false);
+  });
+});
+
+/**
  * `anton doctor` on the RUNNING server (anton-pzfb). A server holds the code it booted with, so a
  * fix can ship, sit on disk, and never run — which is how three nightly scans re-filed a signal two
  * landed filters already dropped. Doctor is the CLI half of saying so, and like the skill-drift
@@ -393,13 +416,13 @@ describe("anton doctor — stale server build", () => {
     expect(r.stdout).not.toContain("Restart it");
   });
 
-  // The first upgrade past this change, and the state that hid the stale process for three nights:
-  // the running build is too old to have written a record, so its absence beside a live daemon is
-  // the entire evidence — and it is enough to name the restart.
-  it("reports a live daemon that left no record as unestablished", async () => {
+  // The pidfile lives under the GLOBAL state dir and only the bundle's daemon writes one, so a
+  // source checkout that read it would call the installed bundle's server its own — and print
+  // source-mode restart instructions for a process `anton stop` owns.
+  it("does not read the installed bundle's daemon as this checkout's server", async () => {
     const r = await runDoctorWith(null, { daemonPid: process.pid });
-    expect(r.stdout).toContain("recorded no build identity");
-    expect(r.stdout).toContain("Restart it to run the build on disk");
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
   });
 
   // A source checkout's `anton dev` / `anton start` writes no pidfile, so on the first upgrade past
