@@ -238,8 +238,8 @@ export async function answersAsAnton(port) {
  * listeners is the mirror image: its own daemon is already the pidfile's answer, and anything else
  * holding a port is someone else's server.
  *
- * The pidfile is evidence only for the process that wrote it, which is why `livePid` proves the
- * pid's birth stamp before answering: a crashed daemon's leftover pid, reused by the OS, would
+ * The pidfile is evidence only for the process that wrote it, which is why `pidFileVerdict` proves
+ * the pid's birth stamp before answering: a crashed daemon's leftover pid, reused by the OS, would
  * otherwise be reported here as an unstamped anton and send the operator to `anton stop` a stranger.
  *
  * The cost is bundle `--foreground`, which writes no pidfile: an unstamped one reads as stopped.
@@ -296,40 +296,55 @@ export function antonPidFile(stateDir = process.env.ANTON_STATE_DIR ?? join(home
 }
 
 /**
- * The pid a pidfile names WHILE that process is still the one it recorded — null otherwise, and
- * null for a file that is missing or says nothing.
+ * What a pidfile PROVES about the daemon it names: `pid` while the recorded process is still the one
+ * running, null otherwise — and `stale`, whether the file is proven not to name that daemon, which
+ * is the CLI's cue to delete it.
  *
  * Alive means the recorded process, not the recorded NUMBER: a daemon that crashed without clearing
  * its pidfile leaves a pid the OS reuses, and signal 0 alone then reports an unrelated process as
  * anton's server (PR #217). Doctor would name it an unstamped anton and send the operator to
  * `anton stop`, which signals a stranger. So the birth stamp on line two has to match too.
  *
- * A pidfile carrying no stamp — one written by an older anton, or on a machine that cannot read a
- * birth time — still answers on the pid alone: an absence is not evidence, and that is exactly the
- * check this always was.
+ * A STAMPED pid the birth-time read cannot recheck — an unreadable procfs, a `ps` that failed or
+ * timed out — is not answered with either (PR #217 review). The stamp is there because this machine
+ * could read birth times when the daemon started, so a lookup failing now leaves the reuse case
+ * indistinguishable from the live one, and answering would hand `anton stop` a pid it goes on to
+ * SIGTERM and SIGKILL. Killing a stranger is the one outcome here that damages something outside
+ * anton; not naming a daemon costs a duplicate `anton start` that fails to bind and says so.
  *
- * Read-only, so a request path can ask: clearing a file this rejects is the CLI's call, not a
+ * That silence is why the two verdicts are separate: an unverifiable file is KEPT, so the daemon is
+ * named again by the next read that can prove it, rather than deleted out from under a live server
+ * anton could then no longer stop.
+ *
+ * A pidfile carrying no stamp — one written by an older anton, or on a machine that cannot read a
+ * birth time at all — still answers on the pid alone: an absence is not evidence, and that is
+ * exactly the check this always was.
+ *
+ * Read-only, so a request path can ask: clearing what this rejects is the CLI's call, not a
  * reader's (see `runningPid` in bin/anton.mjs).
  *
  * @param {string} pidFile
- * @returns {number|null}
+ * @param {(pid: number) => string|null} [startedAtNow] birth-time reader, injectable for tests
+ * @returns {{pid: number|null, stale: boolean}}
  */
-export function livePid(pidFile) {
+export function pidFileVerdict(pidFile, startedAtNow = processStartedAt) {
   let pid, startedAt;
   try {
     [pid, startedAt] = readFileSync(pidFile, "utf8").split("\n", 2);
     pid = parseInt(String(pid).trim(), 10);
     startedAt = (startedAt ?? "").trim();
   } catch {
-    return null;
+    // Missing or unreadable: nothing was proven, and there is nothing to clear.
+    return { pid: null, stale: false };
   }
-  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (!Number.isInteger(pid) || pid <= 0) return { pid: null, stale: true };
   try {
     process.kill(pid, 0); // signal 0 = existence check
   } catch {
-    return null;
+    return { pid: null, stale: true };
   }
-  if (!startedAt) return pid;
-  const now = processStartedAt(pid);
-  return now === null || now === startedAt ? pid : null;
+  if (!startedAt) return { pid, stale: false };
+  const now = startedAtNow(pid);
+  if (now === startedAt) return { pid, stale: false };
+  return { pid: null, stale: now !== null };
 }

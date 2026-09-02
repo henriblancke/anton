@@ -5,9 +5,12 @@
  * the probes do not queue behind each other — the upgrade window this check exists for is exactly
  * the one with several listeners up, and the operator meets it through a health page render.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { unstampedServers } from "./servers.mjs";
+import { pidFileVerdict, unstampedServers } from "./servers.mjs";
 
 /** A probe that reports how many of its kind were in flight at once, and answers for one port. */
 function probes(answers: number[], expected: number) {
@@ -78,5 +81,48 @@ describe("the unstamped servers of this checkout", () => {
 
     expect(found).toEqual([22]);
     expect(probed).toEqual([3001]);
+  });
+});
+
+/**
+ * The daemon pidfile read, over the case no fixture of a live process can produce: the stamp is
+ * there and the birth time cannot be read back. `anton stop` acts on this answer by signalling the
+ * pid, so an unverifiable stamp must name nobody — and must not cost the file that carries it.
+ */
+describe("the daemon pidfile verdict", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function stamped(startedAt: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "anton-pid-"));
+    dirs.push(dir);
+    const path = join(dir, "anton.pid");
+    writeFileSync(path, `${process.pid}\n${startedAt}\n`);
+    return path;
+  }
+
+  it("answers with the pid while the birth stamp still matches", () => {
+    expect(pidFileVerdict(stamped("born-then"), () => "born-then")).toEqual({ pid: process.pid, stale: false });
+  });
+
+  // The reuse case proven: this number belongs to something else, and the file is the CLI's to clear.
+  it("reads a reused pid as stopped and the file as stale", () => {
+    expect(pidFileVerdict(stamped("born-then"), () => "born-now")).toEqual({ pid: null, stale: true });
+  });
+
+  // Unreadable procfs, or a `ps` that failed or timed out. Reuse and liveness are indistinguishable
+  // here, so answering would hand `anton stop` a pid it goes on to SIGKILL — but the file is KEPT,
+  // so the next read that CAN prove the stamp still finds the daemon.
+  it("names nobody when a stamped pid cannot be revalidated, and keeps the file", () => {
+    expect(pidFileVerdict(stamped("born-then"), () => null)).toEqual({ pid: null, stale: false });
+  });
+
+  // A pidfile written before the stamp existed never claimed one, so there is nothing to revalidate.
+  it("still answers on the pid alone for a file that carries no stamp", () => {
+    const path = stamped("");
+    writeFileSync(path, String(process.pid));
+    expect(pidFileVerdict(path, () => null)).toEqual({ pid: process.pid, stale: false });
   });
 });

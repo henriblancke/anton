@@ -73,7 +73,7 @@ import {
 } from "../src/lib/build/identity.mjs";
 import {
   antonPidFile,
-  livePid,
+  pidFileVerdict,
   procfsListeningEndpoints,
   unstampedServers,
 } from "../src/lib/build/servers.mjs";
@@ -168,10 +168,14 @@ function writePidFile(pid, pidFile = PID_FILE) {
 /**
  * Read the daemon PID if the daemon is actually alive; clears a stale pidfile otherwise.
  *
- * `livePid` is the read — shared with the server, which asks the same file who else of this install
- * is up — and it answers only for the process that actually wrote the file: a daemon that crashed
- * without clearing its pidfile leaves a pid the OS reuses, and signal 0 alone would then report an
- * unrelated process as anton's server (PR #217).
+ * `pidFileVerdict` is the read — shared with the server, which asks the same file who else of this
+ * install is up — and it answers only for the process that actually wrote the file: a daemon that
+ * crashed without clearing its pidfile leaves a pid the OS reuses, and signal 0 alone would then
+ * report an unrelated process as anton's server (PR #217).
+ *
+ * Only a file that read PROVES stale is deleted (PR #217 review). A stamped pid whose birth time
+ * cannot be reread names nobody either, but deleting it would strand a daemon that is merely
+ * unverifiable this second — `anton stop` could then never find it again.
  *
  * Clearing what that read rejects belongs HERE and not in the shared reader: this is the process
  * that owns the daemon's lifecycle, while a request path asking the same question must not delete
@@ -181,8 +185,8 @@ function writePidFile(pid, pidFile = PID_FILE) {
  * seams here (`staleSkills`, `unstampedServers`); every caller passes nothing and gets the real one.
  */
 function runningPid(pidFile = PID_FILE) {
-  const pid = livePid(pidFile);
-  if (pid === null) {
+  const { pid, stale } = pidFileVerdict(pidFile);
+  if (stale) {
     try { unlinkSync(pidFile); } catch {}
   }
   return pid;

@@ -649,6 +649,24 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).toBe("clean");
   });
 
+  // Deinitializing a clean submodule leaves the gitlink and the parent diff untouched — `git status`
+  // reports nothing — while the source the build compiled through is gone from disk. Skipping an
+  // empty worktree made that state and a checked-out clean one the same digest, so `anton start`
+  // would hand back a `.next` built from code the machine no longer has.
+  it("digests whether a submodule is checked out at all", () => {
+    const dir = gitCheckout();
+    submodule(dir, "vendor");
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    spawnSync("git", ["-C", dir, "submodule", "--quiet", "deinit", "-f", "vendor"]);
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+
+    // And back: the source is on disk again, so the build compiled through it is provable again.
+    const allow = ["-c", "protocol.file.allow=always"];
+    spawnSync("git", ["-C", dir, ...allow, "submodule", "update", "--init", "-q", "vendor"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+  });
+
   // The commit a submodule points at is the parent's own tracked content, so moving it is drift the
   // parent diff sees — provided config cannot hide the gitlink line from that diff.
   it("digests a submodule moved to a different commit, whatever the repo asks git to ignore", () => {

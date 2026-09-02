@@ -27,7 +27,7 @@ import {
   sameDirectory,
   writeBuildRecord,
 } from "./identity.mjs";
-import { antonPidFile, livePid, unstampedServers } from "./servers.mjs";
+import { antonPidFile, pidFileVerdict, unstampedServers } from "./servers.mjs";
 
 export type BuildDriftState = "outdated" | "modified" | "unstamped";
 
@@ -461,7 +461,7 @@ async function unstampedNeighbours(root: string | null, records: BuildRecord[]):
     isBundle: isBundleInstall(root),
     appRoot: root,
     livePids: accounted,
-    pid: () => livePid(antonPidFile()),
+    pid: () => pidFileVerdict(antonPidFile()).pid,
   });
 }
 

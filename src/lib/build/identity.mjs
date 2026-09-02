@@ -443,8 +443,9 @@ const SKIP_WORKTREE_TAG = "S";
 
 /**
  * What each DIRTY submodule worktree holds that its own HEAD does not, as `[path, digest]` pairs —
- * the build inputs the parent's diff flattens to one line. A clean one contributes nothing, so a
- * checkout whose submodules are all committed still reads `WORKTREE_CLEAN`.
+ * the build inputs the parent's diff flattens to one line — plus a marker for every gitlink with no
+ * worktree at all. A clean, checked-out one contributes nothing, so a checkout whose submodules are
+ * all present and committed still reads `WORKTREE_CLEAN`.
  *
  * A submodule is a gitlink: `git diff HEAD` in the parent compares the COMMIT it points at and
  * summarizes everything uncommitted inside it as the suffix `-dirty` (PR #217 review). So a source
@@ -459,20 +460,31 @@ const SKIP_WORKTREE_TAG = "S";
  * reaches a submodule nested inside a submodule on the same terms. The parent's own diff already
  * carries the commit each one points at, so nothing is hashed twice.
  *
- * An uninitialized submodule is skipped: with nothing checked out there is no content to digest, and
- * `git -C` inside that empty directory would walk up and answer for the PARENT repository instead.
+ * An uninitialized submodule has nothing to read — `git -C` inside that empty directory would walk
+ * up and answer for the PARENT repository instead — so it is named by the marker `SUBMODULE_ABSENT`
+ * rather than skipped (PR #217 review). Deinitializing a clean submodule moves neither the gitlink
+ * nor the parent's diff, so skipping it made "checked out" and "gone from disk" the same digest, and
+ * `buildMatchesCheckout` would reuse a `.next` compiled through source no longer on the machine.
+ * Marking only the absent state keeps the ordinary checkout — every submodule present and committed
+ * — reading `WORKTREE_CLEAN`.
  */
 function submoduleDigests(appRoot, paths) {
   const digests = [];
   for (const path of paths) {
     const root = join(appRoot, path);
-    if (!isCheckout(root)) continue;
+    if (!isCheckout(root)) {
+      digests.push([path, SUBMODULE_ABSENT]);
+      continue;
+    }
     const worktree = readWorktreeDigest(root);
     if (worktree === null) return null;
     if (worktree !== WORKTREE_CLEAN) digests.push([path, worktree]);
   }
   return digests;
 }
+
+/** What a gitlink with no worktree hashes as — no digest can collide, they are 12 hex characters. */
+const SUBMODULE_ABSENT = "absent";
 
 /**
  * The TRACKED symlinks nothing else in the digest covers — build inputs the tracked diff cannot
