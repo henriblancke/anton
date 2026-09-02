@@ -858,6 +858,27 @@ describe("applyPickerPlan", () => {
       expect(read("t1").assignee).toBeUndefined();
       expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
+
+    it("takes its writes back when the project is disarmed while the review queue is checked", async () => {
+      // The window the WIP check itself opens (PR #218 review): confirming a full queue is a `gh pr
+      // view` per waiting PR, minutes wide at its ceiling, and a breaker tripping inside it would
+      // otherwise fall straight through to the enqueue.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          await freeze();
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("disarmed");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
   });
 
   describe("the flow brake behind the start", () => {
@@ -907,6 +928,44 @@ describe("applyPickerPlan", () => {
       expect(outcome).toMatchObject({ started: { beadId: "t1" } });
       expect(seen).toHaveLength(1);
       expect(seen[0]?.map((b) => b.id)).toEqual(["t1"]);
+    });
+
+    it("takes its writes back when the picker is moved off apply while the queue is checked", async () => {
+      // The stance is re-asked on the FAR side of the WIP check, not only before it (PR #218 review):
+      // that check is the longest await in the window, and an operator stepping back to `shadow`
+      // inside it has withdrawn the standing approval this start rests on.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          arm({}, "shadow");
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("no longer apply");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("takes its writes back when the policy is narrowed while the queue is checked", async () => {
+      // The other half of the stance, over the same window: a criterion that stops admitting the
+      // target mid-check is the standing approval narrowing past it.
+      put(bead("t1", { issue_type: "task" }));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          arm({ types: ["bug"] });
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("no longer admits it");
+      expect(read("t1").assignee).toBeUndefined();
     });
   });
 
