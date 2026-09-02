@@ -192,3 +192,23 @@ function blockedGap(
       : "blocked: every ticket it would run is held by an open blocker — approval is the run trigger, and there is nothing here a worker could pick up";
   return [{ rule: "blocked", message: `${target.id} → ${why}` }];
 }
+
+/**
+ * The beads in this target's run that only a PERSON can do (anton-qfso.2) — one `<id> → <title>`
+ * line each, in board order.
+ *
+ * Advisory by construction, and deliberately not a fifth {@link ApprovalRule}: `agent:human` is
+ * real, shaped, approved work. What it costs is the operator's OWN time — the run reaches the ticket,
+ * arms a human gate and holds it (and whatever depends on it) until a person answers (execute-epic's
+ * per-ticket gate) — and the moment to learn how often that will happen is when you decide to start
+ * the run, not three hours in.
+ *
+ * Judged over the set approval ALREADY judges: {@link contractGatedBeads} over the run's tickets,
+ * never the target alone. That is what counts a human ticket nested three cards deep exactly when
+ * the run would reach it, and what keeps a bead the run skips (closed, already in review) out of the
+ * count. A target carrying the label itself counts too — anton refuses to run it at all, which is
+ * the loudest version of the same fact.
+ */
+export function humanGates(gated: Bead[]): string[] {
+  return gated.filter((bead) => beads.isHumanWork(bead)).map((bead) => `${bead.id} → ${bead.title}`);
+}

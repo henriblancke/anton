@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
+import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
 import { loadAllIssues, refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
@@ -461,6 +462,35 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       ]
     : [];
 
+  // What this run will cost the OPERATOR, on the same advisory channel (anton-qfso.2): every bead in
+  // the dispatch set labelled `agent:human` is a point the run reaches and then holds, waiting for a
+  // person. Never a refusal — human work is real, shaped, approved work — but it is the one cost the
+  // operator can only weigh before starting. Same `willEnqueue` gate as the advisory above, so a
+  // take-over that starts no run promises no gates either.
+  //
+  // Derived under the lock from the SAME locked board as `humanTarget`, not from the pre-lock
+  // `contractGated`: a child gaining or losing `agent:human` in that window changes which gates the
+  // run actually arms, and the executor reloads the board and gates off the label as of the write.
+  // Answering from the stale set would omit a stop the run will hold at, or promise a stop for work
+  // an agent will just do (PR #214 review).
+  let humanWork: string[] = [];
+  // The one case where "anton runs the rest" is a lie (PR #214 review): when the TARGET itself
+  // carries the label, execute-epic poisons it before dispatching a single child, so the run the
+  // operator just triggered never starts. Reported separately from the gate lines because the two
+  // ask for different things — hold-and-resume versus do-it-yourself, no run pending.
+  //
+  // Read off the TARGET's own label, never off the gate lines: `contractGatedBeads` empties on the
+  // two recovery shapes — a grouped target whose children are all closed, and a standalone target
+  // already in review — and both still hit the target-level poison when re-run. Conditioning this on
+  // a non-empty dispatch set would answer those with silence about the one thing that decides the
+  // outcome (PR #214 review).
+  //
+  // Filled from the LOCKED read below, not from the pre-lock `target`: the label can be added or
+  // removed in the window between them, and the executor acts on the label as of the write. Deciding
+  // it here would announce a started run for a target that is already poison, or promise silence
+  // about a run that in fact never starts (PR #214 review).
+  let humanTarget = false;
+
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
@@ -545,6 +575,15 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     // re-check refuses the draft.
     const refusal = notRunTargetReason(locked, lockedBoard);
     if (refusal) return { refused: refusal } as const;
+
+    // The human-work report, taken off the same locked read the approval writes against — see the
+    // declarations above for why the pre-lock read is not good enough. The child gates are re-derived
+    // through the same `runTickets`/`contractGatedBeads` pair the pre-lock gate used, so the lines
+    // describe the board the run is about to consume rather than the one that passed the gate.
+    humanTarget = willEnqueue && beads.isHumanWork(locked);
+    humanWork = willEnqueue
+      ? humanGates(contractGatedBeads(locked, runTickets(lockedBoard, epicId)))
+      : [];
 
     // Re-derive the stage HERE too — not only from the pre-lock `target` read above. On a steal
     // (owner !== operator) the pre-lock stage gate can pass on a backlog snapshot, then the original
@@ -690,13 +729,29 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // `advisory` carries the contract gaps that did NOT refuse the approval — the run is starting
   // despite them, so the operator hears about them once, here, rather than never. Empty when this
   // request enqueued nothing (a pure take-over of a blocked target): no run, nothing degraded.
+  // `humanGates` rides the same channel and is OMITTED when the run stops for nobody, so the common
+  // case adds nothing to the body and the client has nothing to say. `humanTarget` marks the shape
+  // of that report: gates on a running target hold it, a human target starts no run at all.
+  //
+  // The gate lines are withheld when the enqueue THREW (PR #214 review): they describe a run that
+  // reaches each ticket and holds there, and with no run enqueued that is a promise about something
+  // that does not exist — contradicting the failure the same response reports. `elsewhere` and
+  // `covered` keep them: a run does cover the target, it is just not a new one. `humanTarget` is
+  // unaffected — "no agent-run starts" is true of a poisoned target however the enqueue went.
   const written = { approved: true, assignee: swap.bead.assignee ?? null };
+  const reported = {
+    jobId,
+    run,
+    advisory,
+    ...(humanWork.length > 0 && run !== "failed" ? { humanGates: humanWork } : {}),
+    ...(humanTarget ? { humanTarget: true } : {}),
+  };
   if (epic) {
     const updatedEpic = { ...epic, ...written };
-    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, jobId, run, advisory });
+    return NextResponse.json({ epic: updatedEpic, item: updatedEpic, ...reported });
   }
   if (standalone) {
-    return NextResponse.json({ item: { ...standalone, ...written }, jobId, run, advisory });
+    return NextResponse.json({ item: { ...standalone, ...written }, ...reported });
   }
   return notFoundResponse("Run target not found");
 });

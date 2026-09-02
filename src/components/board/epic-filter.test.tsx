@@ -138,6 +138,7 @@ function fixture(): Board {
     version: "1:sync",
     columns,
     standalone: chips,
+    operatorQueue: [],
     sync: {
       state: "synced",
       lastSyncedAt: 1,

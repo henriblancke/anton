@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import type { TicketDetail, TicketNote } from "@/lib/types";
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastApprovalOutcome } from "@/components/board/contract-advisory";
 import { readAppliedSummary } from "@/components/board/proposal-applied";
 import {
   diffTicketPatch,
@@ -210,9 +210,12 @@ function useTicketRun(slug: string, ticketId: string, detail: TicketDetail | nul
     setOptimisticApproved(true);
     try {
       const res = await postApprove(slug, ticketId);
-      toast.success(runToastMessage(detail.title, approved, await readAppliedSummary(res)));
-      // The run starts with whatever thin sections it has; say so once, here (mirrors the board chip).
-      await toastContractAdvisory(res);
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here (mirrors the board chip).
+      await toastApprovalOutcome(res, {
+        started: runToastMessage(detail.title, approved, await readAppliedSummary(res)),
+        title: detail.title,
+      });
     } catch (err) {
       setOptimisticApproved(false);
       toast.error(errorMessage(err, "Failed to start run"));

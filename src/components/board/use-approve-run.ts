@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastApprovalOutcome } from "@/components/board/contract-advisory";
 import { usePickDecision } from "@/components/board/pick-decision";
 import { readAppliedSummary } from "@/components/board/proposal-applied";
 
@@ -48,8 +48,9 @@ export interface ApproveRun {
 
 /**
  * The approve POST behind every run-target surface — feature card and standalone chip alike. One
- * copy so the two never drift on what approval does: optimistic lock, the T2 approve route, the
- * outcome toast, then the advisory gaps the route reported.
+ * copy so the two never drift on what approval does: optimistic lock, the T2 approve route, then
+ * the outcome the response reports — the success line included, since only the body knows whether a
+ * run actually started.
  *
  * The override is optimistic only — `target` stays the source of truth, refreshed by a later board
  * poll. Approval is one-way (a surface never un-approves itself), so a plain flag that hides the
@@ -90,9 +91,12 @@ export function useApproveRun({
       }
       decision.settle();
       const applied = await readAppliedSummary(res);
-      toast.success(approveOutcomeMessage({ applied, immediate, title: target.title }));
-      // The run starts with whatever thin sections it has; say so once, here.
-      await toastContractAdvisory(res);
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here.
+      await toastApprovalOutcome(res, {
+        started: approveOutcomeMessage({ applied, immediate, title: target.title }),
+        title: target.title,
+      });
     } catch (err) {
       // Nothing was approved, so the pick goes back on offer — including to the vetoes.
       decision.abandon();

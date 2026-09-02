@@ -15,6 +15,7 @@ import {
 import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { BoardToolbar } from "@/components/board/board-toolbar";
 import { EscalationStrip } from "@/components/board/escalation-strip";
+import { OperatorQueue } from "@/components/board/operator-queue";
 import { useBoardBreaker } from "@/components/board/use-board-breaker";
 import { useBoardDrag } from "@/components/board/use-board-drag";
 import { useBoardPoll } from "@/components/board/use-board-poll";
@@ -61,8 +62,9 @@ export function EpicBoard({
   const [sort, setSort] = useState<BoardSort>("default");
   // Stage columns or epic swimlanes — the same cards either way, remembered per project.
   const [grouping, setGrouping] = useBoardGrouping(slug);
-  // The standalone task/bug whose detail dialog is open. Epics still deep-link to their own page;
-  // standalone chips (an epic-of-one) reuse the shared TicketDialog inline.
+  // The ticket whose detail dialog is open. Epics still deep-link to their own page; standalone
+  // chips (an epic-of-one) and the operator queue's parented human tickets — neither of which the
+  // epic page can act on — reuse the shared TicketDialog inline.
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
 
   const state = useBoardPoll(slug, initialBoard);
@@ -102,6 +104,10 @@ export function EpicBoard({
           come from the page's server render — they are answered by an action that reloads, not by a
           poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}
       <EscalationStrip slug={slug} escalations={escalations} />
+      {/* Below the escalations, never instead of them: a stopped run needs a decision now, while
+          this band is standing work that was always the founder's. It reads the UNFILTERED board on
+          purpose — a queue narrowed by the column filters would quietly under-report what is owed. */}
+      <OperatorQueue slug={slug} items={state.board.operatorQueue} onOpenTicket={setOpenTicketId} />
       <BoardCanvas
         slug={slug}
         view={view}

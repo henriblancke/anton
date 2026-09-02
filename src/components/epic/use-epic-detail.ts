@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import type { EpicDetail, ReviewReport } from "@/lib/types";
-import { toastContractAdvisory } from "@/components/board/contract-advisory";
+import { toastApprovalOutcome } from "@/components/board/contract-advisory";
 
 /** How a run is paced and worded — `force` re-triggers an in-flight run, `immediate` bypasses pacing. */
 export interface RunOptions {
@@ -139,9 +139,12 @@ function useEpicActions({ slug, epicId }: EpicTarget, refresh: () => void) {
         body: JSON.stringify({ immediate }),
       });
       if (!res.ok) throw new Error(await failureMessage(res, `Run failed (${res.status})`));
-      toast.success(runOutcomeMessage({ force: opts.force, immediate, title }));
-      // The run starts with whatever thin sections it has; say so once, here.
-      await toastContractAdvisory(res);
+      // The response decides whether a run actually starts, and the run starts with whatever thin
+      // sections it has; both are said once, here.
+      await toastApprovalOutcome(res, {
+        started: runOutcomeMessage({ force: opts.force, immediate, title }),
+        title,
+      });
       refresh();
     } catch (err) {
       toast.error(errorMessage(err, "Failed to start run"));

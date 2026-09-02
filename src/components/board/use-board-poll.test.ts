@@ -21,6 +21,7 @@ function board(version = "1:sync"): Board {
     version,
     columns,
     standalone: Object.fromEntries(STAGES.map((s) => [s, []])) as unknown as Board["standalone"],
+    operatorQueue: [],
     sync: {
       state: "synced",
       lastSyncedAt: 1,

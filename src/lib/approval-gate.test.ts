@@ -9,8 +9,15 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { approvalGaps, formatApprovalGaps, makeApprovalGate, notRunnableWhy } from "./approval-gate";
+import {
+  approvalGaps,
+  formatApprovalGaps,
+  humanGates,
+  makeApprovalGate,
+  notRunnableWhy,
+} from "./approval-gate";
 import type { Bead } from "./beads/bd";
+import { contractGatedBeads, runTickets } from "./ticket-view";
 
 /** Any bd stamp: without one a bead never came from a bd read, and the contract never judges it. */
 const STAMP = "2026-08-01T00:00:00Z";
@@ -403,5 +410,80 @@ describe("formatApprovalGaps — the string a human reads at the gate", () => {
     expect(line).toContain("anton-f → no Acceptance criteria");
     expect(line).toContain("anton-t1 → no Acceptance criteria");
     expect(line).not.toContain("anton-t2");
+  });
+});
+
+/**
+ * The advisory half (anton-qfso.2). Composed exactly as the approve route composes it —
+ * `contractGatedBeads` over `runTickets` — because the whole promise of this count is that it names
+ * the human work in the set approval ALREADY judges, not a second guess at what the run contains.
+ */
+describe("human gates — how many times the run will stop for the operator", () => {
+  const human = (id: string, parent: string, extra: Partial<Bead> = {}): Bead =>
+    ticket(id, parent, { labels: ["agent:human"], ...extra });
+
+  const gatesOf = (board: Bead[], id: string) =>
+    humanGates(contractGatedBeads(find(board, id), runTickets(board, id)));
+
+  it("counts and names every human ticket the run would reach, however deep it nests", () => {
+    const board = [
+      feature("anton-f"),
+      ticket("anton-t1", "anton-f"),
+      human("anton-t2", "anton-f", { title: "Buy the domain" }),
+      // Arbitrary-depth nesting: a subtask ships in its grandparent's PR, so its gate is the
+      // feature's gate — a direct-children-only count would promise a run that never stops.
+      human("anton-t3", "anton-t2", { title: "Sign the DPA" }),
+    ];
+
+    expect(gatesOf(board, "anton-f")).toEqual([
+      "anton-t2 → Buy the domain",
+      "anton-t3 → Sign the DPA",
+    ]);
+  });
+
+  it("says nothing about a run that stops for nobody", () => {
+    const board = fixtureBoard();
+
+    expect(gatesOf(board, "anton-clean")).toEqual([]);
+  });
+
+  it("counts a human RUN TARGET too — anton refuses to run it at all", () => {
+    const board = [feature("anton-f", undefined, { labels: ["agent:human"], title: "Pick a name" })];
+
+    expect(gatesOf(board, "anton-f")).toEqual(["anton-f → Pick a name"]);
+  });
+
+  it("never counts a bead the run skips", () => {
+    const board = [
+      feature("anton-f"),
+      human("anton-t1", "anton-f", { status: "closed", title: "Already bought" }),
+      human("anton-t2", "anton-f", { title: "Still owed" }),
+    ];
+
+    expect(gatesOf(board, "anton-f")).toEqual(["anton-t2 → Still owed"]);
+  });
+
+  it("only reads this target's tickets, not a sibling run's", () => {
+    const board = [
+      epic("anton-e"),
+      feature("anton-f1", "anton-e"),
+      human("anton-t1", "anton-f1", { title: "Mine" }),
+      feature("anton-f2", "anton-e"),
+      human("anton-t2", "anton-f2", { title: "Theirs" }),
+    ];
+
+    expect(gatesOf(board, "anton-f1")).toEqual(["anton-t1 → Mine"]);
+  });
+
+  // The load-bearing half of "advisory": human work is real, shaped, approved work, so it must never
+  // become a fifth blocking rule. A board that is all human work still clears the gate.
+  it("adds no blocking rule — approvalGaps is unchanged by the label", () => {
+    const board = [
+      feature("anton-f", undefined, { labels: ["agent:human"] }),
+      human("anton-t1", "anton-f"),
+      human("anton-t2", "anton-t1"),
+    ];
+
+    expect(of(find(board, "anton-f"), board)).toEqual([]);
   });
 });
