@@ -1543,6 +1543,64 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.ts");
     });
 
+    // ...and a mapping the app INHERITS answers exactly as one it declares. An app extending a
+    // shared base config publishes no `paths` of its own, so a reader stopping at the local file
+    // finds no rule, falls back to the specifier's tail, and binds an unrelated package's default
+    // to the caller's name — inventing a caller and deleting a finding that was right. The
+    // inherited targets resolve against the BASE config's directory, which is what its `baseUrl`
+    // is relative to.
+    it("resolves an alias inherited through the app tsconfig's `extends`", async () => {
+      const repo = initRepo({
+        "tsconfig.base.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./apps/web/src/*"] } },
+        }),
+        "apps/web/tsconfig.json": JSON.stringify({ extends: "../../tsconfig.base.json" }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/src/ui/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/src/home.ts": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/src/ui/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the inherited mapping still resolves the module it does name, so the caller
+      // binding that default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.ts");
+    });
+
+    // `export default interface Widget {}` stands a keyword where the name usually does. A reader
+    // consuming only `function` and `class` takes `interface` for the exported name, reads the
+    // module as declaring no default at all, and never resolves the binding its caller took — and
+    // `import type Renamed from './widget'` writes `Widget` nowhere for a per-word match to find,
+    // so a live type is reported dead.
+    it("counts a default export declared as an interface", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default interface Widget {\n  id: string;\n}\n",
+        "src/lib/page.ts":
+          "import type Renamed from './widget';\nexport const page = (w: Renamed) => w.id;\n",
+        // Not vacuous: a default-exported type nothing imports is still reported.
+        "src/lib/orphan.ts": "export default interface Orphan {\n  id: string;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget", "unused-type"),
+        unused("src/lib/orphan.ts", "Orphan", "unused-type"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused type: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget", kind: "unused-type" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
     // A formatter wraps an export list as readily as an import one, leaving `Widget as default` on
     // a line whose `export {` opened above it. Read line by line the module declares no default at
     // all, so the binding its caller took is never resolved and a live symbol is reported dead.

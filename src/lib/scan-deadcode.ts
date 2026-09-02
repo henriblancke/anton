@@ -2773,9 +2773,15 @@ function moduleWord(module: string): string | undefined {
  * `export default`, and the two `exports` spellings of it, up to the name being exported. The head
  * has to stand at the start of a statement: `export default` inside a string or after other code is
  * not this module's default, and `module.exports` reached through a property is not either.
+ *
+ * Every keyword a declaration can stand between `default` and its name is consumed, `interface` and
+ * `abstract class` among them (anton-23xe). One left out doesn't merely miss a shape: the keyword is
+ * read as the exported name, the module is taken to declare no default at all, and the caller that
+ * imported it under another name — `import type Renamed from './widget'`, which writes the symbol
+ * nowhere for a per-word match to find — goes unfound, leaving a live symbol reported dead.
  */
 const DEFAULT_EXPORT_HEAD =
-  /(?:^|[;{}])[ \t]*(?:export[ \t]+default[ \t]+(?:async[ \t]+)?(?:function[ \t*]+|class[ \t]+)?|(?:module\.exports|exports\.default)[ \t]*=[ \t]*)/gm;
+  /(?:^|[;{}])[ \t]*(?:export[ \t]+default[ \t]+(?:async[ \t]+)?(?:function[ \t*]+|(?:abstract[ \t]+)?class[ \t]+|interface[ \t]+)?|(?:module\.exports|exports\.default)[ \t]*=[ \t]*)/gm;
 
 /**
  * `export { Widget as default }` — the same claim written as a re-export, and the list is read

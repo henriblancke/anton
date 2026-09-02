@@ -138,24 +138,38 @@ export interface AliasRule {
   targets: string[];
 }
 
+/** As much of a tsconfig as a path mapping is read out of. */
+interface TsConfig {
+  extends?: string | string[];
+  compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> };
+}
+
 /**
- * The path aliases the tsconfig in `dir` publishes — the repo root's by default — so a cycle closed
- * by `@/lib/x` is still visible. Best-effort: a tsconfig anton can't read costs alias edges (which
- * only ever ADD proof of a real cycle, so the signal is kept), never a wrong drop.
- *
- * `dir` is repo-relative, and the targets come back repo-relative with it, because a monorepo
- * declares `@/*` in the app that uses it and its `baseUrl` is that app's own directory.
+ * How many `extends` links one config chain is followed through. A real chain is two or three deep
+ * — an app extending a shared base extending a preset — and the bound is what stops a config that
+ * extends itself from being read forever.
  */
-export async function readAliases(repoPath: string, dir = "."): Promise<AliasRule[]> {
-  let config: { compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> } };
+const EXTENDS_DEPTH = 8;
+
+/** The tsconfig at `file`, or undefined when there is none anton can read. */
+async function readConfig(repoPath: string, file: string): Promise<TsConfig | undefined> {
   try {
-    config = JSON.parse(await readFile(join(repoPath, dir, "tsconfig.json"), "utf8"));
+    return JSON.parse(await readFile(join(repoPath, file), "utf8")) as TsConfig;
   } catch {
-    return [];
+    return undefined;
   }
-  const paths = config.compilerOptions?.paths;
+}
+
+/**
+ * The rules a `paths` mapping declares, resolved against the directory of the config DECLARING it.
+ * That is the directory the mapping's own `baseUrl` is relative to, which is why an inherited
+ * mapping cannot be resolved against the inheriting app: `"@/*": ["./src/*"]` written in the repo
+ * root's base config names the ROOT's `src`, whatever app extends it.
+ */
+function rulesOf(dir: string, options: TsConfig["compilerOptions"]): AliasRule[] {
+  const paths = options?.paths;
   if (!paths) return [];
-  const base = config.compilerOptions?.baseUrl ?? ".";
+  const base = options?.baseUrl ?? ".";
   const rules: AliasRule[] = [];
   for (const [pattern, targets] of Object.entries(paths)) {
     if (!pattern.endsWith("/*")) continue;
@@ -165,6 +179,70 @@ export async function readAliases(repoPath: string, dir = "."): Promise<AliasRul
     if (mapped.length > 0) rules.push({ prefix: pattern.slice(0, -1), targets: mapped });
   }
   return rules;
+}
+
+/**
+ * The files an `extends` value can name, in the order tsc tries them: the path as written when it
+ * already ends `.json`, else that path with `.json` appended and then the directory's own
+ * `tsconfig.json`.
+ *
+ * Only a RELATIVE target is followed. A bare `@tsconfig/next/tsconfig.json` resolves through
+ * node_modules — outside the tree anton scans, and a preset publishes no `paths` worth chasing —
+ * and one climbing out of the repo is not this project's to read. Both leave the mapping
+ * unresolved, which is the behaviour every unreadable config already has.
+ */
+function extendsTargets(dir: string, spec: string): string[] {
+  if (!spec.startsWith("./") && !spec.startsWith("../")) return [];
+  const candidates = spec.endsWith(".json")
+    ? [join(dir, spec)]
+    : [join(dir, `${spec}.json`), join(dir, spec, "tsconfig.json")];
+  return candidates.map(insideRepo).filter((path): path is string => path !== undefined);
+}
+
+/**
+ * The `paths` mapping the config at `file` supplies, its `extends` chain included. A config
+ * publishing its own mapping answers with it; one that only inherits is answered by the nearest
+ * config in its chain that publishes one, resolved against THAT config's directory.
+ *
+ * `extends` arrays are read last-first, because a later entry overrides an earlier one.
+ */
+async function aliasesOf(repoPath: string, file: string, depth: number): Promise<AliasRule[]> {
+  if (depth <= 0) return [];
+  const config = await readConfig(repoPath, file);
+  if (!config) return [];
+  const dir = normalize(dirname(file));
+  const own = rulesOf(dir, config.compilerOptions);
+  if (own.length > 0) return own;
+  const bases =
+    config.extends === undefined
+      ? []
+      : Array.isArray(config.extends)
+        ? config.extends
+        : [config.extends];
+  for (const spec of [...bases].reverse())
+    for (const target of extendsTargets(dir, spec)) {
+      const inherited = await aliasesOf(repoPath, target, depth - 1);
+      if (inherited.length > 0) return inherited;
+    }
+  return [];
+}
+
+/**
+ * The path aliases the tsconfig in `dir` publishes — the repo root's by default — so a cycle closed
+ * by `@/lib/x` is still visible. Best-effort: a tsconfig anton can't read costs alias edges (which
+ * only ever ADD proof of a real cycle, so the signal is kept), never a wrong drop.
+ *
+ * `dir` is repo-relative, and the targets come back repo-relative with it, because a monorepo
+ * declares `@/*` in the app that uses it and its `baseUrl` is that app's own directory.
+ *
+ * A config declaring no mapping of its own is read through its `extends` chain (anton-23xe).
+ * Stopping at the local file reads an app that INHERITS `@/*` from a shared base as publishing no
+ * mapping at all, which sends the specifier to the path-tail fallback — and the tail is what reads
+ * `@/ui/widget` as an unrelated package's same-named module, inventing a caller and deleting a
+ * true finding.
+ */
+export async function readAliases(repoPath: string, dir = "."): Promise<AliasRule[]> {
+  return aliasesOf(repoPath, join(dir, "tsconfig.json"), EXTENDS_DEPTH);
 }
 
 /** A repo-relative path that stays inside the repo; undefined for anything that escapes it. */
