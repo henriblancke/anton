@@ -38,6 +38,12 @@ export interface BuildIdentity {
    * comparison treats it as evidence only when both sides carry one.
    */
   worktree?: string | null;
+  /**
+   * A digest of the `NEXT_PUBLIC_*` values a build compiles in — null when none are set. Recorded
+   * so a stamp names the environment it was built with; only the freshness check (`sameCheckout`)
+   * compares it, never the drift verdict, whose reader stands in a different shell.
+   */
+  env?: string | null;
 }
 
 export interface BuildDrift {
@@ -124,7 +130,7 @@ function onDiskIdentity(): BuildIdentity {
   const root = appRoot();
   const identity = root
     ? (readBuildIdentity(root) as BuildIdentity)
-    : { version: null, revision: null, worktree: null };
+    : { version: null, revision: null, worktree: null, env: null };
   onDiskCache = { at: now, identity };
   return identity;
 }
@@ -184,7 +190,12 @@ function artifactIdentity(): BuildIdentity | null {
   if (!root) return null;
   const stamp = readBuildRecord(buildStampPath(root)) as BuildIdentity | null;
   if (!stamp?.version) return null;
-  return { version: stamp.version, revision: stamp.revision ?? null, worktree: stamp.worktree ?? null };
+  return {
+    version: stamp.version,
+    revision: stamp.revision ?? null,
+    worktree: stamp.worktree ?? null,
+    env: stamp.env ?? null,
+  };
 }
 
 /**

@@ -109,6 +109,15 @@ describe("compareBuild", () => {
     expect(compareBuild({ ...RUNNING, worktree: "9f2c1a4bb001" }, undigested).state).toBe("current");
   });
 
+  // A verdict is read from OUTSIDE the server — `anton doctor` in whatever shell the operator is
+  // standing in — and that shell's inlined values say nothing about the code on disk. Comparing
+  // them would demand a restart whenever doctor runs somewhere else, citing two identical builds.
+  it("does not read the reader's own environment as drift", () => {
+    const running = { ...RUNNING, env: "aa11bb22cc33" };
+    expect(compareBuild(running, { ...RUNNING, env: "dd44ee55ff66" }).state).toBe("current");
+    expect(compareBuild(running, { ...RUNNING, env: null }).state).toBe("current");
+  });
+
   it("calls a build that recorded no version unstamped", () => {
     expect(compareBuild(null, RUNNING).state).toBe("unstamped");
     expect(compareBuild({ version: null, revision: null }, RUNNING).state).toBe("unstamped");
@@ -126,7 +135,7 @@ describe("readBuildIdentity", () => {
   it("falls back to the checkout's package.json version, and names no commit outside git", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
-    expect(readBuildIdentity(dir)).toEqual({ version: "0.4.0", revision: null, worktree: null });
+    expect(readBuildIdentity(dir, {})).toEqual({ version: "0.4.0", revision: null, worktree: null, env: null });
   });
 
   // `git rev-parse` walks up until it finds ANY repository, so a bundle installed under a
@@ -143,7 +152,7 @@ describe("readBuildIdentity", () => {
 
     // Same guard covers the worktree digest: the bundle is itself untracked in that repo, so
     // reading it would report the dotfiles' dirt as this build's uncommitted work.
-    expect(readBuildIdentity(bundle)).toEqual({ version: "0.9.1", revision: null, worktree: null });
+    expect(readBuildIdentity(bundle, {})).toEqual({ version: "0.9.1", revision: null, worktree: null, env: null });
   });
 
   it("calls a committed checkout clean, and digests the edits nobody committed", () => {
@@ -265,6 +274,57 @@ describe("readBuildIdentity", () => {
   });
 });
 
+// Next inlines a `NEXT_PUBLIC_*` value at COMPILE time from wherever it reads it — and a `.env`
+// file is only one of those places. `NEXT_PUBLIC_API_URL=x anton start` puts it straight in the
+// build's environment, where no digest of the checkout can see it.
+describe("the build-time environment in an identity", () => {
+  const app = () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    return dir;
+  };
+
+  it("is nothing at all when the build compiles no inlined value in", () => {
+    expect(readBuildIdentity(app(), { PATH: "/usr/bin" }).env).toBe(null);
+  });
+
+  it("digests an inlined value by content, so changing it is a different build", () => {
+    const dir = app();
+    const first = readBuildIdentity(dir, { NEXT_PUBLIC_API_URL: "https://one" }).env;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    expect(readBuildIdentity(dir, { NEXT_PUBLIC_API_URL: "https://two" }).env).not.toBe(first);
+    // Same value again is the same build, so the digest is a function of the environment.
+    expect(readBuildIdentity(dir, { NEXT_PUBLIC_API_URL: "https://one" }).env).toBe(first);
+  });
+
+  // The scope is the prefix Next documents as compiled in. Digesting the environment wholesale
+  // would fold in PWD, TERM and every per-invocation variable, and rebuild on each one.
+  it("ignores variables the build does not compile in", () => {
+    const dir = app();
+    const bare = readBuildIdentity(dir, { NEXT_PUBLIC_API_URL: "https://one" }).env;
+    const noisy = readBuildIdentity(dir, { NEXT_PUBLIC_API_URL: "https://one", PWD: "/tmp/x", TERM: "dumb" }).env;
+    expect(noisy).toBe(bare);
+  });
+
+  // Two variables whose name/value bytes could otherwise run together into one string, so no pair
+  // of environments digests alike.
+  it("frames each name from its value", () => {
+    const dir = app();
+    const a = readBuildIdentity(dir, { NEXT_PUBLIC_A: "b", NEXT_PUBLIC_AB: "" }).env;
+    const b = readBuildIdentity(dir, { NEXT_PUBLIC_A: "", NEXT_PUBLIC_AB: "b" }).env;
+    expect(a).not.toBe(b);
+  });
+
+  // Order is the shell's, not the build's: the same two values exported the other way round is the
+  // same artifact, and rebuilding on it would be churn nobody can explain.
+  it("does not depend on the order the shell exported them in", () => {
+    const dir = app();
+    expect(readBuildIdentity(dir, { NEXT_PUBLIC_A: "1", NEXT_PUBLIC_B: "2" }).env).toBe(
+      readBuildIdentity(dir, { NEXT_PUBLIC_B: "2", NEXT_PUBLIC_A: "1" }).env,
+    );
+  });
+});
+
 describe("sameCheckout", () => {
   const IDENTITY = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
 
@@ -300,6 +360,22 @@ describe("sameCheckout", () => {
   it("refuses two failed digest reads that agree only in what they could not read", () => {
     const noDigest = { ...IDENTITY, worktree: null };
     expect(sameCheckout(noDigest, { ...noDigest })).toBe(false);
+  });
+
+  // The reviewer's case (PR #217): the checkout never moved, but the value the build compiles in
+  // did — accepting that stamp reuses a `.next` holding the OLD value while every drift surface
+  // calls the server current.
+  it("catches a build compiled with a different inlined value", () => {
+    expect(sameCheckout({ ...IDENTITY, env: "aa11bb22cc33" }, { ...IDENTITY, env: "dd44ee55ff66" })).toBe(false);
+    expect(sameCheckout({ ...IDENTITY, env: "aa11bb22cc33" }, { ...IDENTITY, env: "aa11bb22cc33" })).toBe(true);
+  });
+
+  // A stamp predating the field against a shell that sets nothing is two absences that agree, so
+  // the field costs no existing install a rebuild on the upgrade that introduced it.
+  it("does not read a stamp written before the env digest as a change", () => {
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, env: null })).toBe(true);
+    // But a stamp that names no environment cannot vouch for one that now sets a value.
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, env: "aa11bb22cc33" })).toBe(false);
   });
 
   it("reads this repo's own version and HEAD", () => {
@@ -473,6 +549,14 @@ describe("buildMatchesCheckout", () => {
   // digest it cannot produce would rebuild it on every single start.
   it("accepts a checkout with no git at all on its version alone", () => {
     const onDisk = { version: "0.4.0", revision: null, worktree: null };
+    expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(true);
+  });
+
+  // `NEXT_PUBLIC_API_URL=old anton start`, then `NEXT_PUBLIC_API_URL=new anton start`: the checkout
+  // is byte-for-byte the same, and the artifact still holds the value Next inlined the first time.
+  it("rejects a build compiled with a different inlined environment value", () => {
+    const onDisk = { ...RUNNING, env: "dd44ee55ff66" };
+    expect(buildMatchesCheckout(checkout(onDisk, { ...RUNNING, env: "aa11bb22cc33" }), onDisk)).toBe(false);
     expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(true);
   });
 

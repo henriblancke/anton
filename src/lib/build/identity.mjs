@@ -69,6 +69,7 @@ const READ_CHUNK = 64 * 1024;
  * @property {string|null} version
  * @property {string|null} revision
  * @property {string|null} [worktree]
+ * @property {string|null} [env]
  */
 
 /**
@@ -247,21 +248,55 @@ function hashFile(path) {
   return hash.digest();
 }
 
+/** The prefix Next inlines from the BUILD's environment into the bundle it compiles. */
+const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
+
 /**
- * What the code at `appRoot` IS right now: `{ version, revision, worktree }` (any may be null).
+ * A digest of the build-time environment values Next compiles in — null when none are set.
+ *
+ * `ignoredEnvFiles` closes this hole on the FILE side only, and a `.env` file is not the only place
+ * Next reads an inlined value from: `NEXT_PUBLIC_API_URL=x anton start` puts it straight in the
+ * build's environment, and Next inlines it just the same. Without it in the identity, re-running
+ * with a different value finds a stamp that still matches the checkout, reuses the `.next` compiled
+ * from the OLD value, and every drift surface calls that server current (PR #217 review).
+ *
+ * The prefix is the whole scope, deliberately: it is the one class of variable Next documents as
+ * compiled into the artifact, and it is stable per shell. Digesting the environment wholesale would
+ * fold in `PWD`, `TERM` and every per-invocation variable, and rebuild on each one.
+ *
+ * `\0` frames name from value because neither can contain one, so no pair of variables can digest
+ * into the same bytes as another.
+ */
+function readEnvDigest(env) {
+  const names = Object.keys(env)
+    .filter((name) => name.startsWith(INLINED_ENV_PREFIX) && env[name] !== undefined)
+    .sort();
+  if (!names.length) return null;
+  const digest = createHash("sha256");
+  for (const name of names) digest.update(name).update("\0").update(env[name]).update("\0");
+  return digest.digest("hex").slice(0, 12);
+}
+
+/**
+ * What the code at `appRoot` IS right now: `{ version, revision, worktree, env }` (any may be null).
  *
  * The worktree digest is read only where a revision was: `readRevision`'s toplevel check is what
  * proves `appRoot` is its own checkout, and without it a bundle unpacked in a git-tracked $HOME
- * would wear that repo's uncommitted dotfile edits.
+ * would wear that repo's uncommitted dotfile edits. The env digest carries no such condition — it
+ * is a read of this process's own environment, which is exactly the environment `anton start` hands
+ * the `next build` it spawns (`runLocal` inherits it).
  *
+ * @param {string} appRoot
+ * @param {Record<string, string|undefined>} [env] the environment a build from this process compiles with
  * @returns {BuildIdentity}
  */
-export function readBuildIdentity(appRoot) {
+export function readBuildIdentity(appRoot, env = process.env) {
   const revision = readRevision(appRoot);
   return {
     version: readVersion(appRoot),
     revision,
     worktree: revision ? readWorktreeDigest(appRoot) : null,
+    env: readEnvDigest(env),
   };
 }
 
@@ -471,6 +506,14 @@ export function recordAlive(record, startedAt = processStartedAt) {
  * existed carries none, and calling that "modified" would demand one restart of every install on
  * the upgrade that introduced it.
  *
+ * The env digest is not compared at all, though both sides carry one. A verdict is read from
+ * OUTSIDE the running server — `anton doctor` in whatever shell the operator is standing in — and
+ * that shell's `NEXT_PUBLIC_*` values are not a fact about the code on disk. Comparing them would
+ * report drift whenever doctor runs in a different shell from the one that started the server, and
+ * print two identical build strings as the evidence. Freshness is where the env belongs, and
+ * `sameCheckout` reads it there: `anton start` compares the stamp against its OWN environment,
+ * which is the environment its `next build` would compile with.
+ *
  * @param {BuildIdentity|null|undefined} running
  * @param {BuildIdentity} onDisk
  */
@@ -511,12 +554,23 @@ export function compareBuild(running, onDisk) {
  * all (a source tarball) names neither field on either side and stays a version comparison, as it
  * always was.
  *
+ * The env digest is compared here and NOWHERE else, because freshness is the only question it
+ * answers. A stamp carrying none (written before the field existed) against a process with no
+ * `NEXT_PUBLIC_*` set is two absences that agree — the common case, so the field costs no install a
+ * rebuild on the upgrade that introduced it — while a stamp with none against an environment that
+ * now sets one is a build that cannot be shown to hold that value, and is compiled again.
+ *
  * @param {BuildIdentity} a
  * @param {BuildIdentity} b
  */
 export function sameCheckout(a, b) {
   const agree = (x, y) => (x ?? null) === (y ?? null);
-  if (!agree(a.version, b.version) || !agree(a.revision, b.revision) || !agree(a.worktree, b.worktree)) {
+  if (
+    !agree(a.version, b.version) ||
+    !agree(a.revision, b.revision) ||
+    !agree(a.worktree, b.worktree) ||
+    !agree(a.env, b.env)
+  ) {
     return false;
   }
   return !b.revision || (b.worktree ?? null) !== null;

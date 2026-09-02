@@ -2086,8 +2086,9 @@ const MAX_BUILD_ATTEMPTS = 3;
  * code: 0 to go on, non-zero to stop.
  *
  * `next start` serves whatever `.next` holds, whichever code produced it — so a checkout that moved
- * since its last build (a pull, or an edit nobody committed) would boot stamping the NEW code while
- * serving the old one, and every drift surface would then call a stale server current (anton-pzfb).
+ * since its last build (a pull, an edit nobody committed, or a different `NEXT_PUBLIC_*` value in
+ * this shell, which Next inlines at compile time) would boot stamping the NEW code while serving
+ * the old one, and every drift surface would then call a stale server current (anton-pzfb).
  * Rebuilding instead is what makes "restart to run the build on disk" true advice for a source
  * install. A bundle is exempt: it ships its own prebuilt `.next` and no toolchain to rebuild with.
  *
