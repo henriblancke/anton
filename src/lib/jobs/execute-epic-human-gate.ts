@@ -288,6 +288,232 @@ export interface HumanTicketPreflight {
 export const MAX_HUMAN_TICKET_PASSES = 5;
 
 /**
+ * The mutable state one preflight carries ACROSS its passes — what earlier passes decided, which the
+ * later ones reconcile against a board that has moved under them.
+ *
+ * Threaded explicitly through the steps below rather than captured by closures inside
+ * {@link preflightHumanTickets}, so each step of a pass is a named function that can be read on its
+ * own — and so the pass loop reads as its sequence rather than as one body around its parts.
+ */
+interface HumanTicketPreflightState {
+  repo: string;
+  targetId: string;
+  /** Tickets an earlier pass already closed or armed — never re-armed, so no wait is stacked. */
+  handled: Set<string>;
+  /** Tickets whose gate a person answered but whose ordinary blockers still hold them. */
+  answeredButBlocked: Map<string, string[]>;
+  /** Every wait armed so far, so a kill in a later pass takes the earlier passes' gates back too. */
+  armedGates: ArmedTicketGate[];
+}
+
+/** What one pass found to act on. `undefined` once the board and the arm agree — the loop is done. */
+interface HumanTicketPass {
+  /** Tickets a person owns that no earlier pass handled. */
+  humanTickets: Bead[];
+  /** Tickets an earlier pass armed that STOPPED being a person's work. */
+  relabelled: Bead[];
+}
+
+/** A person's work this preflight has not acted on yet — the tickets a pass arms. */
+function isUnarmedHumanWork(
+  state: HumanTicketPreflightState,
+  isResumeSkipped: (t: Bead) => boolean,
+  t: Bead,
+): boolean {
+  return !state.handled.has(t.id) && !isResumeSkipped(t) && beads.isHumanWork(t);
+}
+
+/** A ticket an earlier pass armed that an operator has since reclassified as agent work. */
+function isRelabelledAgentWork(state: HumanTicketPreflightState, t: Bead): boolean {
+  return state.handled.has(t.id) && !beads.isHumanWork(t);
+}
+
+/**
+ * What this pass has to act on, read off the CURRENT tickets: newly human work, work that stopped
+ * being human, and holds an earlier pass judged against a board the refresh has since replaced.
+ */
+function humanTicketPass(
+  state: HumanTicketPreflightState,
+  tickets: Bead[],
+  isResumeSkipped: (t: Bead) => boolean,
+  /** A refresh landed and the holds it may already have released have not been re-judged yet. */
+  holdsJudgedOnStaleBoard: boolean,
+): HumanTicketPass | undefined {
+  const humanTickets = tickets.filter((t) => isUnarmedHumanWork(state, isResumeSkipped, t));
+  const relabelled = tickets.filter((t) => isRelabelledAgentWork(state, t));
+  const staleHolds = holdsJudgedOnStaleBoard && state.answeredButBlocked.size > 0;
+  if (humanTickets.length === 0 && relabelled.length === 0 && !staleHolds) return undefined;
+  return { humanTickets, relabelled };
+}
+
+/**
+ * The holds a refresh owes a re-judge: tickets held on prerequisites read off the board the arming
+ * pass held, which the refresh may already have closed.
+ *
+ * Computed only AFTER {@link retireRelabelledGates} has run — it drops the tickets that stopped being
+ * a person's work, and re-judging one of those would re-arm a wait the retire just took back.
+ */
+function holdsOwedRejudge(
+  state: HumanTicketPreflightState,
+  tickets: Bead[],
+  isResumeSkipped: (t: Bead) => boolean,
+  holdsJudgedOnStaleBoard: boolean,
+): Bead[] {
+  if (!holdsJudgedOnStaleBoard) return [];
+  return tickets.filter((t) => state.answeredButBlocked.has(t.id) && !isResumeSkipped(t));
+}
+
+/**
+ * Refuse a preflight whose labels are still moving under it.
+ *
+ * Plain Error, not a park: the next attempt re-gates from a board that has settled rather than this
+ * run arming behind a moving target forever.
+ */
+function refuseMovingLabels(
+  state: HumanTicketPreflightState,
+  pass: HumanTicketPass,
+): never {
+  const moving = [...pass.humanTickets, ...pass.relabelled].map((t) => t.id);
+  throw new Error(
+    `${state.targetId} kept finding newly-labelled ${LABELS.agentHuman} tickets after ` +
+      `${MAX_HUMAN_TICKET_PASSES} arming passes ` +
+      `(${(moving.length > 0 ? moving : [...state.answeredButBlocked.keys()]).join(", ")}) ` +
+      `— retrying so the run gates a settled board rather than dispatching a person's work`,
+  );
+}
+
+/**
+ * Retire the waits armed for tickets that STOPPED being a person's work (PR #213 review).
+ *
+ * The gate outlives the label: nothing auto-resolves a human gate, so a ticket an operator
+ * reclassified mid-arm stays blocked by an ask that no longer applies, and the run parks asking a
+ * person to do work an agent can now do. Retiring is safe precisely because the ask is retired with
+ * it — this leaves the ticket carrying no wait, which is the correct state for agent work.
+ *
+ * Un-handles the ticket rather than only clearing its gate, so a label that flips back is armed again
+ * by a later pass instead of running ungated.
+ *
+ * THROWS when a resolve fails, naming every gate still standing: the ticket is then blocked by a wait
+ * this run knows is dead and nothing else on the board points at it.
+ */
+async function retireRelabelledGates(
+  state: HumanTicketPreflightState,
+  tickets: Bead[],
+): Promise<boolean> {
+  const { repo, targetId, armedGates } = state;
+  let wrote = false;
+  const stranded: string[] = [];
+  for (const t of tickets) {
+    const armedGate = armedGates.find((g) => g.ticketId === t.id);
+    if (armedGate) {
+      const resolved = await retireArmedGate(
+        repo,
+        armedGate.gate.gateId,
+        `${t.id} is no longer labelled ${LABELS.agentHuman} — an agent runs it, so the wait ` +
+          `on a person no longer applies`,
+      );
+      // Left handled: the wait still stands, so re-arming it would stack a second one beside it.
+      if (!resolved) {
+        stranded.push(`${armedGate.gate.gateId} (${t.id})`);
+        continue;
+      }
+      armedGates.splice(armedGates.indexOf(armedGate), 1);
+      wrote = true;
+      console.log(
+        `[execute-epic] ${targetId}: resolved human gate ${armedGate.gate.gateId} — ${t.id} no ` +
+          `longer carries ${LABELS.agentHuman}, so an agent runs it after all`,
+      );
+    }
+    state.handled.delete(t.id);
+    state.answeredButBlocked.delete(t.id);
+  }
+  if (stranded.length > 0) {
+    throw new Error(
+      `${targetId}'s human gate(s) ${stranded.join(", ")} could not be resolved after their ` +
+        `ticket(s) stopped carrying ${LABELS.agentHuman} — they still block work an agent can ` +
+        `now run, so the run would park asking a person for work the operator reclassified. ` +
+        `Resolve them by hand (\`bd gate resolve\`), then re-run the target`,
+    );
+  }
+  return wrote;
+}
+
+/**
+ * Act on this pass's tickets: close what a person answered, arm what they have not, and re-judge the
+ * holds a refresh may already have released. Answers whether anything landed on the board.
+ *
+ * `rejudge` is computed by the CALLER after {@link retireRelabelledGates} has run, which drops the
+ * tickets that stopped being a person's work — re-judging one of those would re-arm a wait the retire
+ * just took back.
+ */
+async function armHumanTicketPass(
+  state: HumanTicketPreflightState,
+  args: {
+    /** The board these tickets were read from — the pre-pass snapshot. */
+    board: Bead[];
+    humanTickets: Bead[];
+    /** Held tickets whose blockers were judged against a board the refresh has since replaced. */
+    rejudge: Bead[];
+    signal: AbortSignal | undefined;
+  },
+): Promise<boolean> {
+  const { board, humanTickets, rejudge, signal } = args;
+  const batch = [...humanTickets, ...rejudge];
+  if (batch.length === 0) return false;
+  for (const t of humanTickets) state.handled.add(t.id);
+  // Dropped before the pass, re-added from its answer: a hold that has been released must not
+  // survive as a stale entry the caller would fold into the run's verdict.
+  for (const t of rejudge) state.answeredButBlocked.delete(t.id);
+  // What a person answered is closed here, what they have not is armed, and what their answer
+  // cannot yet release is reported back as held.
+  const stillHeld = await armHumanTicketGates(
+    state.repo,
+    state.targetId,
+    board,
+    batch,
+    signal,
+    state.armedGates,
+  );
+  for (const [id, blockers] of stillHeld) state.answeredButBlocked.set(id, blockers);
+  return batch.some((t) => !stillHeld.has(t.id));
+}
+
+/**
+ * Re-read the board the gates and the closes are ON — the TARGET and the ticket SET.
+ *
+ * A ticket closed by the pass is done work now, and the dispatch loop reads its status off these
+ * objects. The target is adopted, not just its children: every `armHumanGate` pulls the shared board
+ * first, so a relabel another machine pushed lands in exactly this read, and a `target` left at its
+ * pre-arm snapshot would carry the superseded labels through every step that follows.
+ *
+ * The refreshed SET is confirmed, never silently adopted (PR #213 review): step 1c proved this run's
+ * ticket set under the run-lease, and a child attached while the arm was writing would otherwise
+ * enter the run behind the approval, contract and agent-allowlist gates that already ran — or a
+ * detached one disappear after selection. Same question, same words as step 1c.
+ */
+async function refreshAfterArming(
+  state: HumanTicketPreflightState,
+  target: Bead,
+  children: Bead[],
+): Promise<{ board: Bead[]; target: Bead; children: Bead[] }> {
+  const { repo, targetId } = state;
+  const board = await loadAllIssues(repo, { strictGates: true });
+  // Adopted BEFORE the set is judged: a target relabelled `agent:human` mid-arm is the backstop's
+  // refusal, and a set that also drifted must not answer for it in a retry's voice instead.
+  const adopted = adoptRefreshedTarget(board, targetId, target);
+  const refreshed = runTickets(board, targetId);
+  const drift = ticketSetDrift(children, refreshed);
+  if (drift) {
+    throw new Error(
+      `${targetId}'s ticket set changed while its human tickets were gated (${drift}) — ` +
+        `retrying so the run re-gates and executes the whole set rather than adopting a ticket ` +
+        `that never passed the gates this run already ran`,
+    );
+  }
+  return { board, target: adopted, children: refreshed };
+}
+
+/**
  * The human tickets' preflight (anton-mv70): classify the run's tickets, arm what a person owns,
  * then re-classify what the refresh brought back.
  *
@@ -304,18 +530,15 @@ export const MAX_HUMAN_TICKET_PASSES = 5;
  * Each refresh is RECONCILED against what the earlier passes decided, not merely adopted (PR #213
  * review) — the board moved under all three of them:
  *
- *   • The ticket SET. `runTickets` on the refreshed board would silently replace the set step 1c
- *     confirmed under the run-lease, so a child attached mid-arm would enter the run behind the
- *     approval, contract and agent-allowlist gates that already ran, and a detached one would
- *     vanish after selection. Judged with the same {@link ticketSetDrift} as step 1c and retried,
- *     so the next attempt re-gates the whole set.
+ *   • The ticket SET, judged with the same {@link ticketSetDrift} as step 1c and retried
+ *     ({@link refreshAfterArming}), so the next attempt re-gates the whole set.
  *   • The HOLDS. A ticket whose gate is answered is held on the ordinary prerequisites open in the
  *     board the pass READ; one that closed in the arm's own window would park the run behind an
  *     already-closed bead, with no blocker event left to resume it. Re-judged against the refreshed
  *     board, which closes it instead.
- *   • The LABEL. An operator who drops `agent:human` mid-arm leaves a wait holding a ticket an
- *     agent can now run, and the run parks asking a person for work that was reclassified. The gate
- *     this preflight armed for it is retired.
+ *   • The LABEL. An operator who drops `agent:human` mid-arm leaves a wait holding a ticket an agent
+ *     can now run, and the run parks asking a person for work that was reclassified. The gate this
+ *     preflight armed for it is retired ({@link retireRelabelledGates}).
  */
 export async function preflightHumanTickets(args: {
   repo: string;
@@ -332,140 +555,48 @@ export async function preflightHumanTickets(args: {
   const { repo, targetId, standaloneRun, isResumeSkipped, signal } = args;
   let { board, target, children } = args;
   const ticketsOf = () => (standaloneRun ? [target] : children);
-  const answeredButBlocked = new Map<string, string[]>();
-  const handled = new Set<string>();
-  // Carried ACROSS passes so a kill in a later one takes back the earlier passes' waits too.
-  const armedGates: ArmedTicketGate[] = [];
+  const state: HumanTicketPreflightState = {
+    repo,
+    targetId,
+    handled: new Set<string>(),
+    answeredButBlocked: new Map<string, string[]>(),
+    armedGates: [],
+  };
   let armed = false;
   // Set by every refresh, cleared by the re-judge it owes: the holds below were decided against the
   // board the pass READ, and the refresh can already have closed what was holding them.
   let holdsJudgedOnStaleBoard = false;
 
-  /**
-   * Retire the waits armed for tickets that STOPPED being a person's work (PR #213 review).
-   *
-   * The gate outlives the label: nothing auto-resolves a human gate, so a ticket an operator
-   * reclassified mid-arm stays blocked by an ask that no longer applies, and the run parks asking a
-   * person to do work an agent can now do. Retiring is safe precisely because the ask is retired
-   * with it — this leaves the ticket carrying no wait, which is the correct state for agent work.
-   *
-   * Un-handles the ticket rather than only clearing its gate, so a label that flips back is armed
-   * again by a later pass instead of running ungated.
-   *
-   * THROWS when a resolve fails, naming every gate still standing: the ticket is then blocked by a
-   * wait this run knows is dead and nothing else on the board points at it.
-   */
-  const retireGatesFor = async (tickets: Bead[]): Promise<boolean> => {
-    let wrote = false;
-    const stranded: string[] = [];
-    for (const t of tickets) {
-      const armedGate = armedGates.find((g) => g.ticketId === t.id);
-      if (armedGate) {
-        const resolved = await retireArmedGate(
-          repo,
-          armedGate.gate.gateId,
-          `${t.id} is no longer labelled ${LABELS.agentHuman} — an agent runs it, so the wait ` +
-            `on a person no longer applies`,
-        );
-        // Left handled: the wait still stands, so re-arming it would stack a second one beside it.
-        if (!resolved) {
-          stranded.push(`${armedGate.gate.gateId} (${t.id})`);
-          continue;
-        }
-        armedGates.splice(armedGates.indexOf(armedGate), 1);
-        wrote = true;
-        console.log(
-          `[execute-epic] ${targetId}: resolved human gate ${armedGate.gate.gateId} — ${t.id} no ` +
-            `longer carries ${LABELS.agentHuman}, so an agent runs it after all`,
-        );
-      }
-      handled.delete(t.id);
-      answeredButBlocked.delete(t.id);
-    }
-    if (stranded.length > 0) {
-      throw new Error(
-        `${targetId}'s human gate(s) ${stranded.join(", ")} could not be resolved after their ` +
-          `ticket(s) stopped carrying ${LABELS.agentHuman} — they still block work an agent can ` +
-          `now run, so the run would park asking a person for work the operator reclassified. ` +
-          `Resolve them by hand (\`bd gate resolve\`), then re-run the target`,
-      );
-    }
-    return wrote;
-  };
-
-  for (let pass = 0; ; pass++) {
-    const humanTickets = ticketsOf().filter(
-      (t) => !handled.has(t.id) && !isResumeSkipped(t) && beads.isHumanWork(t),
-    );
-    const relabelled = ticketsOf().filter((t) => handled.has(t.id) && !beads.isHumanWork(t));
-    const staleHolds = holdsJudgedOnStaleBoard && answeredButBlocked.size > 0;
-    if (humanTickets.length === 0 && relabelled.length === 0 && !staleHolds) break;
-    // Plain Error, not a park: the labels are still moving, and the next attempt re-gates from a
-    // board that has settled rather than this run arming behind a moving target forever.
-    if (pass >= MAX_HUMAN_TICKET_PASSES) {
-      const moving = [...humanTickets, ...relabelled].map((t) => t.id);
-      throw new Error(
-        `${targetId} kept finding newly-labelled ${LABELS.agentHuman} tickets after ` +
-          `${MAX_HUMAN_TICKET_PASSES} arming passes ` +
-          `(${(moving.length > 0 ? moving : [...answeredButBlocked.keys()]).join(", ")}) ` +
-          `— retrying so the run gates a settled board rather than dispatching a person's work`,
-      );
-    }
+  for (let attempt = 0; ; attempt++) {
+    const pass = humanTicketPass(state, ticketsOf(), isResumeSkipped, holdsJudgedOnStaleBoard);
+    if (!pass) break;
+    if (attempt >= MAX_HUMAN_TICKET_PASSES) refuseMovingLabels(state, pass);
     armed = true;
-    let wrote = await retireGatesFor(relabelled);
-    // The holds the refresh may already have released, re-judged against the board it brought back.
-    // Computed AFTER the retire above, which drops the ones that stopped being a person's work.
-    const rejudge = holdsJudgedOnStaleBoard
-      ? ticketsOf().filter((t) => answeredButBlocked.has(t.id) && !isResumeSkipped(t))
-      : [];
+    let wrote = await retireRelabelledGates(state, pass.relabelled);
+    const rejudge = holdsOwedRejudge(state, ticketsOf(), isResumeSkipped, holdsJudgedOnStaleBoard);
     holdsJudgedOnStaleBoard = false;
-    const batch = [...humanTickets, ...rejudge];
-    if (batch.length > 0) {
-      for (const t of humanTickets) handled.add(t.id);
-      // Dropped before the pass, re-added from its answer: a hold that has been released must not
-      // survive as a stale entry the caller would fold into the run's verdict.
-      for (const t of rejudge) answeredButBlocked.delete(t.id);
-      // What a person answered is closed here, what they have not is armed, and what their answer
-      // cannot yet release is reported back as held.
-      const stillHeld = await armHumanTicketGates(
-        repo,
-        targetId,
-        board,
-        batch,
-        signal,
-        armedGates,
-      );
-      for (const [id, blockers] of stillHeld) answeredButBlocked.set(id, blockers);
-      wrote ||= batch.some((t) => !stillHeld.has(t.id));
-    }
+    const landed = await armHumanTicketPass(state, {
+      board,
+      humanTickets: pass.humanTickets,
+      rejudge,
+      signal,
+    });
+    wrote = landed || wrote;
     // Nothing landed on the board this pass — every ticket it touched is still held on the very
     // board we hold, so a refresh could only re-read what is already here.
     if (!wrote) break;
-    // Re-read the board the gates and the closes are ON — the TARGET and the ticket SET. A ticket
-    // closed just above is done work now, and the dispatch loop reads its status off these objects.
-    // The target is adopted, not just its children: every `armHumanGate` pulls the shared board
-    // first, so a relabel another machine pushed lands in exactly this read, and a `target` left at
-    // its pre-arm snapshot would carry the superseded labels through every step that follows.
-    board = await loadAllIssues(repo, { strictGates: true });
-    target = adoptRefreshedTarget(board, targetId, target);
-    const refreshed = runTickets(board, targetId);
-    // The refreshed SET is confirmed, never silently adopted (PR #213 review): step 1c proved this
-    // run's ticket set under the run-lease, and a child attached while the arm was writing would
-    // otherwise enter the run behind the approval, contract and agent-allowlist gates that already
-    // ran — or a detached one disappear after selection. Same question, same words as step 1c.
-    const drift = ticketSetDrift(children, refreshed);
-    if (drift) {
-      throw new Error(
-        `${targetId}'s ticket set changed while its human tickets were gated (${drift}) — ` +
-          `retrying so the run re-gates and executes the whole set rather than adopting a ticket ` +
-          `that never passed the gates this run already ran`,
-      );
-    }
-    children = refreshed;
+    ({ board, target, children } = await refreshAfterArming(state, target, children));
     holdsJudgedOnStaleBoard = true;
   }
 
-  return { board, target, children, tickets: ticketsOf(), answeredButBlocked, armed };
+  return {
+    board,
+    target,
+    children,
+    tickets: ticketsOf(),
+    answeredButBlocked: state.answeredButBlocked,
+    armed,
+  };
 }
 
 /**
@@ -592,111 +723,225 @@ export interface ArmedHumanGate {
 }
 
 /**
- * Arm the run target's HUMAN wait: a `human` gate blocking the target, whose reason IS the agent's
- * ask, verbatim. Returns that gate's id alongside the ids of every OTHER open human gate on the
- * target — the holds a person armed, which this arm leaves untouched but which keep the target
- * blocked, so the park message can name them instead of promising one `bd gate resolve` is enough.
+ * One arm in progress: who is being armed, the live kill signal, and the plan's verdict on the waits
+ * the target already carries.
  *
- * The one gate flavour nothing automates away, by design on both sides: `bd gate check` never
- * evaluates a human gate, and gate-check's expiry pass deliberately skips it (a wait on a person is
- * never anton's to call overdue). So it carries no timeout and ends only when someone runs
- * `bd gate resolve` — at which point the gate-resume pass hands this target back to the runner,
- * which is why the resume half needed nothing new here.
- *
- * Re-entrant (anton-287p.4), because a park is not the only way this is reached: a settle lost after
- * the gate landed, a resume, or a fresh worktree on another machine all re-run the arm against a
- * board that may already carry the wait. PULLED and then read fresh and STRICTLY — the run's own
- * snapshot predates any gate an earlier attempt (or another machine) armed, and a gate listing that
- * failed must never read as "nothing armed" — then mirror the merge gate's shape:
- *
- *   • THIS ask ALREADY ARMED — return that gate's id, create nothing. Two gates for one ask is one
- *     dead wait: resolving either leaves the target blocked by the other.
- *   • A DIFFERENT ask ANTON armed — this run stopped for a new reason, so the old wait is superseded
- *     and resolved here. Nothing else ever would, and it blocks the target while it lives. Retired
- *     only AFTER the replacement is armed, never before: a create that fails between the two would
- *     otherwise leave the target with no wait at all on an ask nobody answered — runnable again, and
- *     on a shared board claimable elsewhere. Overshooting into two open waits blocks the target
- *     instead of freeing it, and the next arm supersedes what is left.
- *   • A DIFFERENT ask A PERSON armed — left exactly where it is. A hand-made human gate is a hold
- *     only its author may release; superseding it would let this run resume through someone's
- *     explicit stop.
- *
- * THROWS when the gate cannot be created, when a superseded gate cannot be resolved (the replacement
- * stands — it is the target's only blocker by then — and every still-open id rides out in the
- * error), when a kill lands anywhere from the board read through the label write (a gate this run
- * created is undone first, which is safe only while the superseded wait is still open; one it was
- * only reusing is left where it stands), or when the shared board cannot be refreshed or read —
- * before the arm, where arming blind is how the duplicate wait gets made, or after it, where a
- * re-read that fails cannot rule out a gate armed concurrently (the created gate is undone first) —
- * so the caller settles the run LOUDLY instead of parking it. They are all the same failure: a park
- * is only meaningful if resolving the gate it names makes the target runnable, and it does not when
- * there is no gate, when a twin blocks the target, when anton's own superseded wait is still open
- * beside it, or when a wait the park never names holds it. An epic
- * target is the first case up front — bd refuses a gate edge onto one ("epics can only block other
- * epics") and a failed `gate create` still leaves an orphan gate bead behind, so it is refused here
- * rather than attempted.
+ * Threaded explicitly through the steps below rather than captured by closures inside
+ * {@link armHumanGate}, so each step of the arm is a named function that can be read on its own —
+ * and so the sequence the arm performs is visible in one place rather than buried under its parts.
  */
-export async function armHumanGate(
-  repo: string,
-  targetId: string,
-  /** The ask AND the ticket that raised it — both go into the gate's reason (PR #205 review). */
-  ask: HumanAsk,
+interface ArmAttempt {
+  repo: string;
+  targetId: string;
   /** The run's LIVE cancellation signal, re-read immediately before every board write below. */
-  signal?: AbortSignal,
-): Promise<ArmedHumanGate> {
-  const reason = humanGateReason(targetId, ask);
-  // A kill can only be observed between awaits, and this function awaits the board twice before it
-  // writes anything — so the caller's pre-arm read of the signal is already stale here (anton-287p).
-  // Re-read it before each write instead: a gate armed after an operator stopped the run blocks the
-  // target until someone clears it by hand, for a wait nobody is waiting on. Refusing the SUPERSEDE
-  // matters for the same reason in reverse — resolving the older ask while arming nothing would
-  // leave the target with no wait at all, silently runnable again on an ask nobody answered.
-  const refuseIfCancelled = (consequence: string) => {
-    if (signal?.aborted) {
-      throw new Error(
-        `refusing to arm ${targetId}'s human gate — the run was cancelled while the board was ` +
-          `read; ${consequence}`,
-      );
-    }
-  };
-  // The writes below are uninterruptible awaits of their own, so no check BEFORE one covers a kill
-  // that lands while it runs (anton-287p): the gate would exist, the caller would read a successful
-  // arm, and a cancelled run would park behind a wait nobody is waiting on. Re-read the signal after
-  // each and undo the create, so the ask settles in its cancelled form exactly as if it never landed.
-  //
-  // Only ever called BEFORE the supersede: undoing is safe exactly while every wait this ask
-  // supersedes is still open, so the undo can never be what leaves the target bare.
-  const undoIfCancelled = async (gateId: string, during: string) => {
-    if (!signal?.aborted) return;
-    const undone = await retireArmedGate(
-      repo,
-      gateId,
-      `run cancelled while ${targetId}'s human gate was armed`,
+  signal: AbortSignal | undefined;
+  /** Anton's OWN waits this ask supersedes — retired only once the replacement is armed. */
+  stale: Gate[];
+  /** Every other open human gate on the target: a person's own hold, reported but never touched. */
+  held: Gate[];
+}
+
+/**
+ * Refuse an arm the run was cancelled under.
+ *
+ * A kill can only be observed between awaits, and {@link armHumanGate} awaits the board twice before
+ * it writes anything — so the caller's pre-arm read of the signal is already stale by then
+ * (anton-287p). Re-read it before each write instead: a gate armed after an operator stopped the run
+ * blocks the target until someone clears it by hand, for a wait nobody is waiting on. Refusing the
+ * SUPERSEDE matters for the same reason in reverse — resolving the older ask while arming nothing
+ * would leave the target with no wait at all, silently runnable again on an ask nobody answered.
+ */
+function refuseArmIfCancelled(arm: ArmAttempt, consequence: string): void {
+  if (arm.signal?.aborted) {
+    throw new Error(
+      `refusing to arm ${arm.targetId}'s human gate — the run was cancelled while the board was ` +
+        `read; ${consequence}`,
     );
-    if (undone) {
-      throw new Error(
-        `refusing to arm ${targetId}'s human gate — the run was cancelled while ${during}; gate ` +
-          `${gateId} was resolved, so the target carries no wait from this run`,
-      );
-    }
-    // The undo was the only thing that would ever have closed it: no automatic pass resolves a human
-    // gate, so the target stays blocked until someone clears this id by hand. It rides out in the
-    // error because nothing else on the board names it.
+  }
+}
+
+/**
+ * Take a just-armed gate back when the kill landed inside the write that created or labelled it.
+ *
+ * Those writes are uninterruptible awaits of their own, so no check BEFORE one covers a kill that
+ * lands while it runs (anton-287p): the gate would exist, the caller would read a successful arm, and
+ * a cancelled run would park behind a wait nobody is waiting on. Re-read the signal after each and
+ * undo the create, so the ask settles in its cancelled form exactly as if it never landed.
+ *
+ * Only ever called BEFORE the supersede: undoing is safe exactly while every wait this ask supersedes
+ * is still open, so the undo can never be what leaves the target bare.
+ */
+async function undoArmIfCancelled(arm: ArmAttempt, gateId: string, during: string): Promise<void> {
+  if (!arm.signal?.aborted) return;
+  const undone = await retireArmedGate(
+    arm.repo,
+    gateId,
+    `run cancelled while ${arm.targetId}'s human gate was armed`,
+  );
+  if (undone) {
+    throw new Error(
+      `refusing to arm ${arm.targetId}'s human gate — the run was cancelled while ${during}; gate ` +
+        `${gateId} was resolved, so the target carries no wait from this run`,
+    );
+  }
+  // The undo was the only thing that would ever have closed it: no automatic pass resolves a human
+  // gate, so the target stays blocked until someone clears this id by hand. It rides out in the
+  // error because nothing else on the board names it.
+  throw new StrandedHumanGateError(
+    arm.targetId,
+    gateId,
+    `the run was cancelled while ${during}, and gate ${gateId} could not be resolved`,
+  );
+}
+
+/**
+ * Retire the waits this ask supersedes — ONLY ever with `armed` already live on the board.
+ *
+ * Ordering is the safety property (anton-287p): closing the old wait first would, on a `gate create`
+ * that fails or a kill that lands in it, leave the target carrying no human gate at all while its
+ * current ask is still unanswered — silently claimable again, on a shared board by another machine.
+ * Armed-then-retired can only ever overshoot into TWO open waits, which blocks the target rather than
+ * freeing it, and which the next arm's own supersede clears.
+ *
+ * THROWS with every still-open id when a supersede fails, or when a kill lands inside one: past this
+ * point the replacement is the target's only blocker, so undoing it is exactly the failure above. The
+ * gate stands and rides out in the error instead — the run settles FAILED naming it.
+ */
+async function retireSupersededGates(arm: ArmAttempt, armed: string): Promise<void> {
+  const { repo, targetId, stale } = arm;
+  const unresolved: string[] = [];
+  for (const gate of stale) {
+    const resolved = await retireArmedGate(
+      repo,
+      gate.id,
+      `superseded — ${targetId} now waits on a newer ask`,
+    );
+    if (!resolved) unresolved.push(gate.id);
+  }
+  // Nothing else will ever close them, and each is a real blocker while it lives — so a park behind
+  // the current ask is a wait resolving the named gate cannot end. Fail the arm instead: the run
+  // settles FAILED carrying the ask and every id still holding the target.
+  if (unresolved.length > 0) {
     throw new StrandedHumanGateError(
       targetId,
-      gateId,
-      `the run was cancelled while ${during}, and gate ${gateId} could not be resolved`,
+      armed,
+      `${targetId}'s superseded human gate(s) ${unresolved.join(", ")} could not be resolved, so ` +
+        `they stay open beside the wait this run armed (${armed})`,
+      unresolved,
     );
-  };
-  // Refresh from the SHARED board first, and refuse the arm when that cannot be done (PR #205
-  // review). The run's own step-0 pull is a whole run old by the time an ask lands here, and on a
-  // shared board another machine — or an operator — can have armed a human gate for this target in
-  // between. Planned against a stale local working set that gate is invisible, so the strict read
-  // below reports the target as bare and this arm creates a SECOND wait, which the run's next sync
-  // then publishes: the same duplicate the read is strict to prevent, and the park would name only
-  // the new one. `beads.pull` resolves for a board with no remote and for a shared server (nothing
-  // to reconcile in either), so a rejection means exactly "anton cannot establish that it is looking
-  // at the current board" — which is not a board to arm a human wait against.
+  }
+  if (stale.length > 0 && arm.signal?.aborted) {
+    throw new StrandedHumanGateError(
+      targetId,
+      armed,
+      `the run was cancelled while ${targetId}'s superseded human gate(s) were retired, so the ` +
+        `wait this run armed stands rather than leaving the target with none`,
+    );
+  }
+}
+
+/**
+ * End an arm whose holds could not be reconciled — taking the gate back where that is still safe.
+ *
+ * Mirrors the cancellation unwind, and for the same reason: a gate this arm CREATED can be resolved
+ * right up to the supersede, so the ask settles exactly as if it never landed. A gate an earlier
+ * attempt armed carries this same ask and is not this run's to close — it stands, and rides out named
+ * in the error, because nothing else on the board would point at it.
+ */
+async function unreconciledArmFailure(
+  arm: ArmAttempt,
+  gateId: string,
+  undoable: boolean,
+  cause: unknown,
+): Promise<unknown> {
+  const why =
+    `${arm.targetId}'s human gates could not be re-read after arming ${gateId} (${
+      cause instanceof Error ? cause.message : String(cause)
+    }), so a gate armed for this target while this run planned would be missing from the park`;
+  if (undoable) {
+    const undone = await retireArmedGate(arm.repo, gateId, `arm abandoned — ${why}`);
+    if (undone) {
+      return new Error(
+        `refusing to park ${arm.targetId} behind ${gateId} — ${why}; the gate was resolved, so the ` +
+          `target carries no wait from this run`,
+        { cause },
+      );
+    }
+  }
+  return new StrandedHumanGateError(arm.targetId, gateId, why);
+}
+
+/**
+ * Re-read the target's waits AFTER the arm, so the park names every gate that actually holds it
+ * (PR #205 review).
+ *
+ * The plan and the write are separate bd transactions with nothing serializing them: an operator —
+ * or another machine, whose commits are global the moment bd makes them on a shared server — can arm
+ * a human gate for this target in the window between them. That gate is invisible to the plan, so a
+ * park composed from the plan alone promises the operator that resolving THIS run's gate resumes the
+ * run, while the target stays blocked by a wait nothing names.
+ *
+ * REPORTS rather than resolves, whoever armed it: a gate that appeared after the plan was made was
+ * never judged against this ask, and closing a live wait anton did not plan to supersede is exactly
+ * what the ownership label exists to prevent. The waits this ask DOES supersede are excluded — they
+ * are retired moments later, and naming them would send the operator after gates that are about to
+ * close.
+ *
+ * ABORTS the arm when the re-read fails, rather than falling back to the plan's holds (PR #205
+ * review). The plan is exactly the reading that cannot see a gate armed since it was taken, so
+ * parking on it publishes a message promising that resolving anton's gate resumes the run while an
+ * unnamed wait keeps blocking the target — the same dead park the preflight read is strict to
+ * prevent, reached from the other side. Failing costs only a re-run: the gate the arm created is
+ * taken back first (safe only while the waits this ask supersedes are all still open behind it), and
+ * the run settles FAILED carrying the ask.
+ */
+async function reconcileHeldGates(
+  arm: ArmAttempt,
+  armed: string,
+  undoable: boolean,
+): Promise<string[]> {
+  let fresh: Bead[];
+  try {
+    // Pulled as well as re-read: the other writer may be another MACHINE, whose gate reaches this
+    // workspace only through a pull. Both legs resolve trivially for a board with no remote.
+    await beads.pull(arm.repo);
+    fresh = await loadAllIssues(arm.repo, { strictGates: true });
+  } catch (e) {
+    throw await unreconciledArmFailure(arm, armed, undoable, e);
+  }
+  const staleIds = new Set(arm.stale.map((g) => g.id));
+  const plannedHolds = new Set(arm.held.map((g) => g.id));
+  const stillHeld = openHumanGates(fresh, arm.targetId)
+    .map((g) => g.id)
+    .filter((id) => id !== armed && !staleIds.has(id));
+  for (const id of stillHeld.filter((id) => !plannedHolds.has(id))) {
+    console.warn(
+      `[execute-epic] ${arm.targetId} gained human gate ${id} while this run armed ${armed} — left ` +
+        `open, because it was never judged against this ask; the run resumes only once it is ` +
+        `resolved too`,
+    );
+  }
+  return stillHeld;
+}
+
+/**
+ * The board an arm plans against: the SHARED board, refreshed and read strictly, with a target the
+ * ask can never become a gate on refused up front.
+ *
+ * Refresh first, and refuse the arm when that cannot be done (PR #205 review). The run's own step-0
+ * pull is a whole run old by the time an ask lands here, and on a shared board another machine — or
+ * an operator — can have armed a human gate for this target in between. Planned against a stale local
+ * working set that gate is invisible, so the strict read below reports the target as bare and the arm
+ * creates a SECOND wait, which the run's next sync then publishes: the same duplicate the read is
+ * strict to prevent, and the park would name only the new one. `beads.pull` resolves for a board with
+ * no remote and for a shared server (nothing to reconcile in either), so a rejection means exactly
+ * "anton cannot establish that it is looking at the current board" — which is not a board to arm a
+ * human wait against.
+ *
+ * An EPIC target is refused here rather than attempted: bd rejects a gate edge onto one ("epics can
+ * only block other epics") and a failed `gate create` still leaves an orphan gate bead behind.
+ */
+async function armBoard(repo: string, targetId: string): Promise<Bead[]> {
   try {
     await beads.pull(repo);
   } catch (e) {
@@ -724,163 +969,42 @@ export async function armHumanGate(
       `${targetId} is an epic — bd refuses a gate edge onto one, so the ask cannot become a gate`,
     );
   }
+  return board;
+}
 
-  const { stale, held, open } = humanGatePlan(board, targetId, reason);
+/**
+ * Reuse the gate an earlier attempt armed for THIS ask. Two gates for one ask is one dead wait:
+ * resolving either leaves the target blocked by the other.
+ */
+async function reuseArmedGate(arm: ArmAttempt, open: Gate): Promise<ArmedHumanGate> {
+  // Reconciled before the cancellation check, not after: the re-read is an uninterruptible await
+  // like every other, so a kill landing inside it must still reach the refusal below rather than
+  // ride out as a successful arm. Not undoable: an earlier attempt armed this wait for this same
+  // ask, so a reconcile that fails leaves it standing and names it instead.
+  const stillHeld = await reconcileHeldGates(arm, open.id, false);
+  // Reusing writes nothing, so it reaches neither guarded write in the create path — but a successful
+  // return is what makes the caller PARK, and a cancelled run must never park (anton-287p). The gate
+  // itself stays: an earlier attempt armed it for this same ask, and it is not this run's to take
+  // back.
+  refuseArmIfCancelled(
+    arm,
+    `gate ${open.id} already carries this ask, so the cancelled run must settle instead of ` +
+      `parking behind a wait it is no longer taking`,
+  );
+  // Still retires what this ask supersedes — the reused gate IS the armed replacement, so an earlier
+  // attempt's leftovers would otherwise stay open beside it forever.
+  await retireSupersededGates(arm, open.id);
+  // No `undo`: an earlier attempt armed this wait for this same ask, and closing someone else's live
+  // wait is not how this run stops.
+  return { gateId: open.id, held: stillHeld };
+}
 
-  /**
-   * Retire the waits this ask supersedes — ONLY ever with `armed` already live on the board.
-   *
-   * Ordering is the safety property (anton-287p): closing the old wait first would, on a `gate
-   * create` that fails or a kill that lands in it, leave the target carrying no human gate at all
-   * while its current ask is still unanswered — silently claimable again, on a shared board by
-   * another machine. Armed-then-retired can only ever overshoot into TWO open waits, which blocks
-   * the target rather than freeing it, and which the next arm's own supersede clears.
-   *
-   * THROWS with every still-open id when a supersede fails, or when a kill lands inside one: past
-   * this point the replacement is the target's only blocker, so undoing it is exactly the failure
-   * above. The gate stands and rides out in the error instead — the run settles FAILED naming it.
-   */
-  const retireSuperseded = async (armed: string) => {
-    const unresolved: string[] = [];
-    for (const gate of stale) {
-      const resolved = await retireArmedGate(
-        repo,
-        gate.id,
-        `superseded — ${targetId} now waits on a newer ask`,
-      );
-      if (!resolved) unresolved.push(gate.id);
-    }
-    // Nothing else will ever close them, and each is a real blocker while it lives — so a park
-    // behind the current ask is a wait resolving the named gate cannot end. Fail the arm instead:
-    // the run settles FAILED carrying the ask and every id still holding the target.
-    if (unresolved.length > 0) {
-      throw new StrandedHumanGateError(
-        targetId,
-        armed,
-        `${targetId}'s superseded human gate(s) ${unresolved.join(", ")} could not be resolved, so ` +
-          `they stay open beside the wait this run armed (${armed})`,
-        unresolved,
-      );
-    }
-    if (stale.length > 0 && signal?.aborted) {
-      throw new StrandedHumanGateError(
-        targetId,
-        armed,
-        `the run was cancelled while ${targetId}'s superseded human gate(s) were retired, so the ` +
-          `wait this run armed stands rather than leaving the target with none`,
-      );
-    }
-  };
-
-  // A person's own hold is not anton's to close, and it keeps blocking the target after this ask is
-  // answered — the park would otherwise read as though one `bd gate resolve` resumes the run.
-  for (const gate of held) {
-    console.warn(
-      `[execute-epic] ${targetId} also waits on human gate ${gate.id}, which anton did not arm — ` +
-        `left open; the run resumes only once that hold is resolved too`,
-    );
-  }
-  const heldIds = held.map((g) => g.id);
-  const staleIds = new Set(stale.map((g) => g.id));
-
-  /**
-   * End an arm whose holds could not be reconciled — taking the gate back where that is still safe.
-   *
-   * Mirrors the cancellation unwind, and for the same reason: a gate this call CREATED can be
-   * resolved right up to the supersede, so the ask settles exactly as if it never landed. A gate an
-   * earlier attempt armed carries this same ask and is not this run's to close — it stands, and
-   * rides out named in the error, because nothing else on the board would point at it.
-   */
-  const unreconciledFailure = async (gateId: string, undoable: boolean, cause: unknown) => {
-    const why =
-      `${targetId}'s human gates could not be re-read after arming ${gateId} (${
-        cause instanceof Error ? cause.message : String(cause)
-      }), so a gate armed for this target while this run planned would be missing from the park`;
-    if (undoable) {
-      const undone = await retireArmedGate(repo, gateId, `arm abandoned — ${why}`);
-      if (undone) {
-        return new Error(
-          `refusing to park ${targetId} behind ${gateId} — ${why}; the gate was resolved, so the ` +
-            `target carries no wait from this run`,
-          { cause },
-        );
-      }
-    }
-    return new StrandedHumanGateError(targetId, gateId, why);
-  };
-
-  /**
-   * Re-read the target's waits AFTER the arm, so the park names every gate that actually holds it
-   * (PR #205 review).
-   *
-   * The plan above and the write below are separate bd transactions with nothing serializing them:
-   * an operator — or another machine, whose commits are global the moment bd makes them on a shared
-   * server — can arm a human gate for this target in the window between them. That gate is invisible
-   * to the plan, so a park composed from the plan alone promises the operator that resolving THIS
-   * run's gate resumes the run, while the target stays blocked by a wait nothing names.
-   *
-   * REPORTS rather than resolves, whoever armed it: a gate that appeared after the plan was made was
-   * never judged against this ask, and closing a live wait anton did not plan to supersede is
-   * exactly what the ownership label exists to prevent. The waits this ask DOES supersede are
-   * excluded — they are retired moments later, and naming them would send the operator after gates
-   * that are about to close.
-   *
-   * ABORTS the arm when the re-read fails, rather than falling back to the plan's holds (PR #205
-   * review). The plan is exactly the reading that cannot see a gate armed since it was taken, so
-   * parking on it publishes a message promising that resolving anton's gate resumes the run while an
-   * unnamed wait keeps blocking the target — the same dead park the preflight read is strict to
-   * prevent, reached from the other side. Failing costs only a re-run: the gate this call created is
-   * taken back first (safe here, and only here — the waits this ask supersedes are all still open
-   * behind it), and the run settles FAILED carrying the ask.
-   */
-  const reconcileHeld = async (armed: string, undoable: boolean): Promise<string[]> => {
-    let fresh: Bead[];
-    try {
-      // Pulled as well as re-read: the other writer may be another MACHINE, whose gate reaches this
-      // workspace only through a pull. Both legs resolve trivially for a board with no remote.
-      await beads.pull(repo);
-      fresh = await loadAllIssues(repo, { strictGates: true });
-    } catch (e) {
-      throw await unreconciledFailure(armed, undoable, e);
-    }
-    const stillHeld = openHumanGates(fresh, targetId)
-      .map((g) => g.id)
-      .filter((id) => id !== armed && !staleIds.has(id));
-    for (const id of stillHeld.filter((id) => !heldIds.includes(id))) {
-      console.warn(
-        `[execute-epic] ${targetId} gained human gate ${id} while this run armed ${armed} — left ` +
-          `open, because it was never judged against this ask; the run resumes only once it is ` +
-          `resolved too`,
-      );
-    }
-    return stillHeld;
-  };
-
-  // this ask is already with a human — a second gate would race it
-  if (open) {
-    // Reconciled before the cancellation check, not after: the re-read is an uninterruptible await
-    // like every other, so a kill landing inside it must still reach the refusal below rather than
-    // ride out as a successful arm. Not undoable: an earlier attempt armed this wait for this same
-    // ask, so a reconcile that fails leaves it standing and names it instead.
-    const stillHeld = await reconcileHeld(open.id, false);
-    // Reusing writes nothing, so it reaches neither guarded write above — but a successful return is
-    // what makes the caller PARK, and a cancelled run must never park (anton-287p). The gate itself
-    // stays: an earlier attempt armed it for this same ask, and it is not this run's to take back.
-    refuseIfCancelled(
-      `gate ${open.id} already carries this ask, so the cancelled run must settle instead of ` +
-        `parking behind a wait it is no longer taking`,
-    );
-    // Still retires what this ask supersedes — the reused gate IS the armed replacement, so an
-    // earlier attempt's leftovers would otherwise stay open beside it forever.
-    await retireSuperseded(open.id);
-    // No `undo`: an earlier attempt armed this wait for this same ask, and closing someone else's
-    // live wait is not how this run stops.
-    return { gateId: open.id, held: stillHeld };
-  }
-
-  refuseIfCancelled("a gate armed now would block the target with nobody waiting on it");
+/** Arm a NEW wait for this ask, then retire the older ones it supersedes — in that order, always. */
+async function createArmedGate(arm: ArmAttempt, reason: string): Promise<ArmedHumanGate> {
+  const { repo, targetId, stale } = arm;
+  refuseArmIfCancelled(arm, "a gate armed now would block the target with nobody waiting on it");
   const gateId = await beads.gateCreate(repo, { blocks: targetId, type: "human", reason });
-  await undoIfCancelled(gateId, "the gate was created");
+  await undoArmIfCancelled(arm, gateId, "the gate was created");
   // Best-effort, unlike everything above: the gate exists and carries the ask, so the park is
   // already valid. A lost tag only costs a later arm the right to supersede this wait — it reads as
   // a person's hold and stays open, which is the safe direction for a gate only a human ends.
@@ -893,13 +1017,13 @@ export async function armHumanGate(
   // Before the last cancellation check, so that check covers the re-read's own window too. Undoable
   // for the same reason the kill's undo is: the waits this ask supersedes are all still open behind
   // this gate, so taking it back cannot be what leaves the target bare.
-  const stillHeld = await reconcileHeld(gateId, true);
+  const stillHeld = await reconcileHeldGates(arm, gateId, true);
   // The label write and the re-read are the last uninterruptible awaits, and a kill landing inside
   // one would otherwise ride out as a successful arm past every check above. Last point an undo is
   // still safe: the waits this ask supersedes are all still open behind it.
-  await undoIfCancelled(gateId, "the gate was labelled");
+  await undoArmIfCancelled(arm, gateId, "the gate was labelled");
   // Replacement armed — only now is the older ask's wait retired.
-  await retireSuperseded(gateId);
+  await retireSupersededGates(arm, gateId);
   return {
     gateId,
     held: stillHeld,
@@ -909,12 +1033,69 @@ export async function armHumanGate(
       stale.length > 0
         ? undefined
         : () =>
-            retireArmedGate(
-              repo,
-              gateId,
-              `run cancelled after ${targetId}'s human gate was armed`,
-            ),
+            retireArmedGate(repo, gateId, `run cancelled after ${targetId}'s human gate was armed`),
   };
+}
+
+/**
+ * Arm the run target's HUMAN wait: a `human` gate blocking the target, whose reason IS the agent's
+ * ask, verbatim. Returns that gate's id alongside the ids of every OTHER open human gate on the
+ * target — the holds a person armed, which this arm leaves untouched but which keep the target
+ * blocked, so the park message can name them instead of promising one `bd gate resolve` is enough.
+ *
+ * The one gate flavour nothing automates away, by design on both sides: `bd gate check` never
+ * evaluates a human gate, and gate-check's expiry pass deliberately skips it (a wait on a person is
+ * never anton's to call overdue). So it carries no timeout and ends only when someone runs
+ * `bd gate resolve` — at which point the gate-resume pass hands this target back to the runner,
+ * which is why the resume half needed nothing new here.
+ *
+ * Re-entrant (anton-287p.4), because a park is not the only way this is reached: a settle lost after
+ * the gate landed, a resume, or a fresh worktree on another machine all re-run the arm against a
+ * board that may already carry the wait. Planned against a board pulled and read strictly
+ * ({@link armBoard}) — then mirror the merge gate's shape:
+ *
+ *   • THIS ask ALREADY ARMED — return that gate's id, create nothing ({@link reuseArmedGate}).
+ *   • A DIFFERENT ask ANTON armed — this run stopped for a new reason, so the old wait is superseded
+ *     and resolved here ({@link retireSupersededGates}). Nothing else ever would, and it blocks the
+ *     target while it lives.
+ *   • A DIFFERENT ask A PERSON armed — left exactly where it is. A hand-made human gate is a hold
+ *     only its author may release; superseding it would let this run resume through someone's
+ *     explicit stop.
+ *
+ * THROWS when the gate cannot be created, when a superseded gate cannot be resolved (the replacement
+ * stands — it is the target's only blocker by then — and every still-open id rides out in the
+ * error), when a kill lands anywhere from the board read through the label write (a gate this run
+ * created is undone first, which is safe only while the superseded wait is still open; one it was
+ * only reusing is left where it stands), or when the shared board cannot be refreshed or read —
+ * before the arm, where arming blind is how the duplicate wait gets made, or after it, where a
+ * re-read that fails cannot rule out a gate armed concurrently (the created gate is undone first) —
+ * so the caller settles the run LOUDLY instead of parking it. They are all the same failure: a park
+ * is only meaningful if resolving the gate it names makes the target runnable, and it does not when
+ * there is no gate, when a twin blocks the target, when anton's own superseded wait is still open
+ * beside it, or when a wait the park never names holds it.
+ */
+export async function armHumanGate(
+  repo: string,
+  targetId: string,
+  /** The ask AND the ticket that raised it — both go into the gate's reason (PR #205 review). */
+  ask: HumanAsk,
+  /** The run's LIVE cancellation signal, re-read immediately before every board write below. */
+  signal?: AbortSignal,
+): Promise<ArmedHumanGate> {
+  const reason = humanGateReason(targetId, ask);
+  const board = await armBoard(repo, targetId);
+  const { stale, held, open } = humanGatePlan(board, targetId, reason);
+  const arm: ArmAttempt = { repo, targetId, signal, stale, held };
+  // A person's own hold is not anton's to close, and it keeps blocking the target after this ask is
+  // answered — the park would otherwise read as though one `bd gate resolve` resumes the run.
+  for (const gate of held) {
+    console.warn(
+      `[execute-epic] ${targetId} also waits on human gate ${gate.id}, which anton did not arm — ` +
+        `left open; the run resumes only once that hold is resolved too`,
+    );
+  }
+  // this ask is already with a human — a second gate would race it
+  return open ? reuseArmedGate(arm, open) : createArmedGate(arm, reason);
 }
 
 /** A ticket's human wait as this preflight armed it — the ticket, and the arm's own undo rights. */
