@@ -237,12 +237,12 @@ function git(appRoot, args, input) {
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
  * that class back in; the diff hides three more — what a tracked link points at, the bytes git
- * canonicalizes (a clean filter, the `ident` attribute) before it ever compares them, and the paths
- * an index flag tells git not to look at on disk at all — so `uncoveredTrackedLinks`,
- * `convertedTrackedPaths` and `hiddenTrackedPaths` name those back; and it flattens a fifth to a
- * single line, so `submoduleDigests` reads those worktrees itself. All of them read git, and a read git could not
- * answer collapses the digest exactly as the two above do: a digest missing an input vouches for a
- * build compiled from something else (PR #217 review).
+ * canonicalizes (a clean filter, the `ident` attribute, line-ending normalization) before it ever
+ * compares them, and the paths an index flag tells git not to look at on disk at all — so
+ * `uncoveredTrackedLinks`, `convertedTrackedPaths` and `hiddenTrackedPaths` name those back; and it
+ * flattens a fifth to a single line, so `submoduleDigests` reads those worktrees itself. All of them
+ * read git, and a read git could not answer collapses the digest exactly as the two above do: a
+ * digest missing an input vouches for a build compiled from something else (PR #217 review).
  *
  * `--ignore-submodules=none` because that flattened line is the only record of a submodule moving to
  * a different commit, and either repository's config (`diff.ignoreSubmodules`,
@@ -282,7 +282,7 @@ function readWorktreeDigest(appRoot) {
 const SYMLINK_MODE = "120000 ";
 const GITLINK_MODE = "160000 ";
 
-/** git's modes for a regular file — the only entries a clean filter is ever run over. */
+/** git's modes for a regular file — the only entries git runs a content conversion over. */
 const FILE_MODES = ["100644 ", "100755 "];
 
 /** The paths `ls-files -s` reported at any of `modes`, in the order git listed them (sorted by path). */
@@ -297,8 +297,8 @@ function trackedPaths(listed, ...modes) {
  * The tracked files git CANONICALIZES on the way into the diff, named back into the digest by
  * CONTENT — the last class of tracked input `git diff HEAD` cannot vouch for (PR #217 review).
  *
- * Two attributes put a conversion there, and `--no-ext-diff` / `--no-textconv` reach neither, since
- * both happen before diff time rather than during it:
+ * Three conversions put one there, and `--no-ext-diff` / `--no-textconv` reach none of them, since
+ * all happen before diff time rather than during it:
  *
  * `filter` — git documents a clean command as converting worktree contents to their canonical
  * repository form, and the diff compares that OUTPUT on both sides. So a lossy driver — a stripper,
@@ -310,51 +310,96 @@ function trackedPaths(listed, ...modes) {
  * there diff identically and leave the worktree `WORKTREE_CLEAN`, while Next reads what is actually
  * on disk (PR #217 review).
  *
+ * `text`/`eol` — git documents the `text` attribute as normalizing line endings in the index, and
+ * `core.autocrlf` asks for the same normalization on every path no attribute speaks for. The diff
+ * therefore compares NORMALIZED content: rewriting a tracked file from LF to CRLF leaves it empty
+ * and the worktree `WORKTREE_CLEAN`, while the raw bytes the build reads did move (PR #217 review).
+ *
  * Only paths a CONFIGURED filter driver converts count. `filter=x` with neither a `filter.x.clean`
  * command nor a `filter.x.process` one leaves the bytes alone, so the diff already covers them — and
  * re-reading every tracked file in a repo that merely declares the attribute would hash the whole
- * tree for nothing. `ident` needs no such check: it is a built-in conversion, set is set. Regular
- * files only, for the same reason as ever: git runs neither over a symlink or a gitlink, both of
- * which the digest already covers on their own terms.
+ * tree for nothing. `ident` needs no such check: it is a built-in conversion, set is set. Line-ending
+ * normalization is the one that legitimately DOES reach the whole tree — `* text=auto` and
+ * `core.autocrlf` really do put a conversion in front of every tracked file, and a digest that skips
+ * them vouches for bytes it never read. Regular files only, for the same reason as ever: git runs
+ * none of the three over a symlink or a gitlink, both of which the digest already covers on their
+ * own terms.
  */
 function convertedTrackedPaths(appRoot, paths) {
   if (!paths.length) return [];
-  const drivers = convertingFilterDrivers(appRoot);
-  if (drivers === null) return null;
-  const attrs = git(appRoot, ["check-attr", "--stdin", "-z", "filter", "ident"], paths.join("\0"));
+  const config = conversionConfig(appRoot);
+  if (config === null) return null;
+  const attrs = git(appRoot, ["check-attr", "--stdin", "-z", "filter", "ident", "text", "eol"], paths.join("\0"));
   if (attrs === null) return null;
   // `<path>\0<attribute>\0<value>` per path per attribute, in the order the attributes were asked
-  // for. A filter value is a driver name, "unspecified" or "unset"; ident's is "set" when it applies.
+  // for: the attribute's setting, or "unspecified"/"unset"/"set" where it carries no value of its own.
   const fields = attrs.split("\0");
-  const converted = new Set();
+  const settings = new Map();
   for (let i = 0; i + 2 < fields.length; i += 3) {
     const [path, attribute, value] = fields.slice(i, i + 3);
-    if (attribute === "ident" ? value === "set" : drivers.has(value)) converted.add(path);
+    const values = settings.get(path) ?? {};
+    values[attribute] = value;
+    settings.set(path, values);
   }
-  return [...converted];
+  const converted = [];
+  for (const [path, values] of settings) {
+    const canonicalized =
+      config.drivers.has(values.filter) || values.ident === "set" || normalizesEol(values, config.autocrlf);
+    if (canonicalized) converted.push(path);
+  }
+  return converted;
 }
 
 /**
- * The filter drivers this repo has configured a conversion for — the only ones that change anything
- * on the way into the diff. Read from the merged config, because the command can just as well come
- * from the user's global file as from the checkout's own.
+ * Whether git normalizes THIS path's line endings on the way into the diff.
+ *
+ * `-text` is the one setting that refuses the conversion outright; `text` and `text=auto` ask for it;
+ * and a path no attribute speaks for takes `core.autocrlf`, which git documents as the same
+ * normalization by config. An `eol` value marks a path as text where nothing else does.
+ *
+ * `text=auto` skips a file git detects as binary and this does not, deliberately: over-including one
+ * path costs a read, while excluding one vouches for bytes nobody compared.
+ */
+function normalizesEol({ text, eol }, autocrlf) {
+  if (text === "unset") return false;
+  if (text === "set" || text === "auto") return true;
+  return eol === "crlf" || eol === "lf" || autocrlf;
+}
+
+/**
+ * The two config settings that put a conversion in front of the diff — the filter drivers this repo
+ * has configured a command for, and whether `core.autocrlf` normalizes line endings. Read from the
+ * merged config, because either can just as well come from the user's global file as from the
+ * checkout's own.
  *
  * A long-running `filter.<driver>.process` counts alongside `filter.<driver>.clean`: git asks the
  * process filter for its `clean` capability and diffs that canonicalized output, so a lossy
  * process-only driver — the shape git-lfs and its kind ship — hides a rewritten file exactly as a
  * `clean` command does, and matching only `.clean` would omit those paths from the digest and let
  * `buildMatchesCheckout` accept a stale artifact (PR #217 review).
+ *
+ * `core.autocrlf` is read the way git reads a boolean that also takes `input`: every spelling but a
+ * false one converts something, so an unfamiliar value hashes more rather than vouching for less.
  */
-function convertingFilterDrivers(appRoot) {
+function conversionConfig(appRoot) {
   const listed = git(appRoot, ["config", "--list", "-z"]);
   if (listed === null) return null;
   const drivers = new Set();
+  let autocrlf = false;
   for (const record of listed.split("\0")) {
-    const driver = /^filter\.(.+)\.(?:clean|process)$/.exec(record.split("\n", 1)[0]);
+    // `<key>\n<value>`, or the key alone where it was set without one — which git reads as true.
+    const split = record.indexOf("\n");
+    const key = split === -1 ? record : record.slice(0, split);
+    const driver = /^filter\.(.+)\.(?:clean|process)$/.exec(key);
     if (driver) drivers.add(driver[1]);
+    // Later records win, exactly as git resolves the same key set in two files.
+    if (key === "core.autocrlf") autocrlf = split === -1 || !GIT_FALSE.has(record.slice(split + 1).toLowerCase());
   }
-  return drivers;
+  return { drivers, autocrlf };
 }
+
+/** How git spells a false boolean — every other spelling of `core.autocrlf` converts something. */
+const GIT_FALSE = new Set(["false", "no", "off", "0", ""]);
 
 /**
  * The tracked paths an INDEX FLAG hides from the diff, named back into the digest by CONTENT — the
@@ -629,7 +674,13 @@ const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
  */
 const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
 
-/** One expansion in an env-file value: `$NAME` or `${NAME}`, unless the `$` is escaped. */
+/**
+ * One expansion in an env-file value: `$NAME` or `${NAME}`, unless the `$` is escaped.
+ *
+ * The single-character lookbehind is the one `@next/env`'s bundled expander uses itself
+ * (`(?!(?<=\\))\$`), so this names a variable exactly when the build expands one: a `$` behind a
+ * backslash expands nothing there either, however many backslashes precede it (PR #217 review).
+ */
 const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
 
 /**

@@ -385,6 +385,49 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).not.toBe(first);
   });
 
+  // Git documents the `text` attribute as normalizing line endings in the index, so `git diff HEAD`
+  // compares CONVERTED content: rewriting a tracked file from LF to CRLF moves nothing there while
+  // the raw bytes the build reads did move. Reading only the diff left those paths out of the
+  // raw-content inputs, and a stale `.next` then passed as this checkout (PR #217 review).
+  it("digests a tracked edit line-ending normalization would hide", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitattributes"), "*.ts text\n");
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "text"]);
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace(/\n/g, "\r\n"));
+    expect(spawnSync("git", ["-C", dir, "diff", "HEAD"]).stdout.toString()).toBe("");
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
+  // `core.autocrlf` asks for the same normalization on every path no attribute speaks for — git's
+  // own Windows default — so the hole is open in a checkout carrying no `.gitattributes` at all.
+  it("digests a tracked edit core.autocrlf would normalize away", () => {
+    const dir = gitCheckout();
+    spawnSync("git", ["-C", dir, "config", "core.autocrlf", "input"]);
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace(/\n/g, "\r\n"));
+    expect(spawnSync("git", ["-C", dir, "diff", "HEAD"]).stdout.toString()).toBe("");
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
+  // `-text` is the setting that refuses the conversion outright, so the diff does vouch for those
+  // paths and re-reading them would cost every checkout that declares it.
+  it("leaves a path marked -text to the diff", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitattributes"), "* -text\n");
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "no text"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   // An index flag is the one thing that stops git looking at the worktree AT ALL: git documents
   // both `--assume-unchanged` and `--skip-worktree` (what sparse checkout sets) as suppressing that
   // inspection, so `git diff HEAD` reports nothing however often the file is rewritten. Reading only
