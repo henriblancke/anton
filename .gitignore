@@ -50,6 +50,10 @@ anton.db
 anton.db-*
 .anton/
 .stringer/
+# Written beside anton.db at every server boot (anton-pzfb) — on a source checkout that is the repo
+# root, and the record holds a pid and a boot timestamp. Name kept in sync with BUILD_RECORD_FILE
+# (src/lib/build/identity.mjs), which identity.test.ts asserts is ignored here.
+server-build.json
 
 # Beads / Dolt files (added by bd init)
 .dolt/

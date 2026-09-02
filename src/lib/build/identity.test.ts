@@ -8,11 +8,13 @@
  * two shipped filters, and nothing anywhere said so.
  */
 import { afterEach, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  BUILD_RECORD_FILE,
   buildDrift,
   buildRecordPath,
   compareBuild,
@@ -94,6 +96,13 @@ describe("the record a running server leaves", () => {
     expect(path).toBe(join(dir, "server-build.json"));
     expect(writeBuildRecord(path, RUNNING, { pid: 4242, bootedAt: 1_700_000_000_000 })).toBe(true);
     expect(readBuildRecord(path)).toEqual({ ...RUNNING, pid: 4242, bootedAt: 1_700_000_000_000 });
+  });
+
+  // A source checkout resolves the record to the repo root, so an unignored name would leave a pid
+  // and a boot timestamp staged by the next routine `git add -A`.
+  it("carries a name this repo ignores, so a boot never dirties the checkout", () => {
+    const ignored = spawnSync("git", ["check-ignore", "-q", BUILD_RECORD_FILE], { cwd: process.cwd() });
+    expect(ignored.status).toBe(0);
   });
 
   it("survives an unwritable state dir and an unreadable record without throwing", () => {
