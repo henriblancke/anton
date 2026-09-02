@@ -116,10 +116,23 @@ function bundleVersion() {
   }
 }
 
+/**
+ * The `ANTON_DB` override as an ABSOLUTE path, or null when it is unset.
+ *
+ * The override is documented as a path, and a RELATIVE one names a different file for every reader:
+ * the server resolves it from APP_ROOT (both `runLocal` and the daemon spawn with that cwd) and
+ * writes its build record beside THAT database, while `anton doctor` run from anywhere else would
+ * scan beside a database in the caller's directory — and report "no running server recorded" over a
+ * live, stale one (PR #217 review). Resolved once, here, so every reader names the same file.
+ */
+function antonDbOverride() {
+  return process.env.ANTON_DB ? resolve(APP_ROOT, process.env.ANTON_DB) : null;
+}
+
 /** Env that redirects anton's writable state OUT of the (replaceable) runtime dir in bundle mode. */
 function bundleStateEnv() {
   return {
-    ANTON_DB: process.env.ANTON_DB ?? join(STATE_DIR, "anton.db"),
+    ANTON_DB: antonDbOverride() ?? join(STATE_DIR, "anton.db"),
     ANTON_SESSIONS_ROOT: process.env.ANTON_SESSIONS_ROOT ?? join(STATE_DIR, "sessions"),
     ANTON_SCANS_ROOT: process.env.ANTON_SCANS_ROOT ?? join(STATE_DIR, "scans"),
   };
@@ -499,7 +512,10 @@ function runLocal(bin, args, env = {}) {
  * pathname from `import.meta.url`, which no deletion touches; `src/lib/build/drift.ts` reads it.
  */
 function serverRootEnv() {
-  return { ANTON_APP_ROOT: process.env.ANTON_APP_ROOT ?? APP_ROOT };
+  const db = antonDbOverride();
+  // Handed down absolute so the server's own readers (getDb, src/lib/build/drift.ts) resolve the
+  // override identically to the CLI, whatever directory the operator invoked anton from.
+  return { ANTON_APP_ROOT: process.env.ANTON_APP_ROOT ?? APP_ROOT, ...(db ? { ANTON_DB: db } : {}) };
 }
 
 // ── Agents & skills provisioning (anton setup + anton init) ─────────────────────────────────
@@ -1517,7 +1533,7 @@ async function cmdDoctor() {
   }
   // Resolve the DB the same way the server does: in a bundle it lives in the persistent state dir
   // (where `anton setup` creates it), NOT under the runtime dir — so doctor must check there too.
-  const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (process.env.ANTON_DB ?? join(APP_ROOT, "anton.db"));
+  const dbPath = IS_BUNDLE ? bundleStateEnv().ANTON_DB : (antonDbOverride() ?? join(APP_ROOT, "anton.db"));
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
@@ -1700,8 +1716,7 @@ function parseInitArgs(args) {
 
 /** The anton.db the server reads — env override, else the persistent state dir (bundle) / APP_ROOT. */
 function resolveAntonDb() {
-  if (process.env.ANTON_DB) return process.env.ANTON_DB;
-  return IS_BUNDLE ? join(STATE_DIR, "anton.db") : join(APP_ROOT, "anton.db");
+  return antonDbOverride() ?? (IS_BUNDLE ? join(STATE_DIR, "anton.db") : join(APP_ROOT, "anton.db"));
 }
 
 /** The repo's current branch, defaulting to "main" (mirrors detectDefaultBranch in projects.ts). */

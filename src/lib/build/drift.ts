@@ -115,10 +115,11 @@ let bootedFrom: BuildIdentity | null = null;
 
 /**
  * How long one read of the code on disk stands. `serverBuildDrift` runs on every health render and
- * `readBuildIdentity` spawns git SYNCHRONOUSLY — three reads, once the worktree digest is in it —
- * which would block the event loop on every request. Which build is on disk moves at the speed of a
- * deploy or a save, so a read a few seconds old is as true as a fresh one — and drift the operator
- * must act on stays visible within one page refresh.
+ * `readBuildIdentity` spawns git SYNCHRONOUSLY — four reads on a clean-path miss (the revision, the
+ * untracked listing, the diff, and the ignored env files), each capped at git's 5s timeout — which
+ * would block the event loop on every request. Which build is on disk moves at the speed of a deploy
+ * or a save, so a read a few seconds old is as true as a fresh one — and drift the operator must act
+ * on stays visible within one page refresh.
  */
 const ON_DISK_TTL_MS = 15_000;
 

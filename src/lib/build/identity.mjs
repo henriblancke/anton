@@ -53,6 +53,18 @@ const SHORT_SHA = 7;
 const WORKTREE_CLEAN = "clean";
 
 /**
+ * `revision` for a checkout git could not name a commit for — the `.git` is there, the read failed.
+ * A literal, so it can never collide with a sha.
+ *
+ * Kept apart from `null` because the two absences mean opposite things (PR #217 review). A tarball
+ * HAS no commit, so version alone is its whole identity and comparing it against itself is proof.
+ * A checkout whose git read timed out, or whose `.git` was briefly unreadable, has a commit anton
+ * simply could not see — and reading that silence as "no commit exists" lets `sameCheckout` accept
+ * an artifact compiled from code that may already have moved, on both sides of the same failure.
+ */
+export const REVISION_UNREADABLE = "unreadable";
+
+/**
  * Cap on one git read. A digest anton cannot compute degrades to "no evidence" (see `compareBuild`),
  * so the limit only has to be far above any plausible uncommitted diff.
  */
@@ -67,7 +79,7 @@ const READ_CHUNK = 64 * 1024;
  *
  * @typedef {object} BuildIdentity
  * @property {string|null} version
- * @property {string|null} revision
+ * @property {string|null} revision the commit, `REVISION_UNREADABLE`, or null where there is none
  * @property {string|null} [worktree]
  * @property {string|null} [env]
  */
@@ -123,9 +135,9 @@ export function sameDirectory(a, b) {
 }
 
 /**
- * The commit `appRoot` ITSELF holds, or null when it is not the root of a git checkout (every
- * installed bundle — a release tarball carries no .git, and its RELEASE_VERSION already identifies
- * it exactly).
+ * The commit `appRoot` ITSELF holds, `REVISION_UNREADABLE` when it is a checkout git could not read,
+ * or null when it is not the root of a git checkout (every installed bundle — a release tarball
+ * carries no .git, and its RELEASE_VERSION already identifies it exactly).
  *
  * The toplevel check is what makes that "itself": `git rev-parse` walks UP the tree until it finds
  * any repository, so a bundle installed under a git-tracked $HOME would otherwise report the
@@ -134,10 +146,35 @@ export function sameDirectory(a, b) {
  */
 function readRevision(appRoot) {
   const out = git(appRoot, ["rev-parse", "--show-toplevel", "HEAD"]);
-  if (out === null) return null;
+  if (out === null) return unreadableOrAbsent(appRoot);
   const [top, sha] = out.trim().split("\n", 2);
-  if (!top || !sha || !/^[0-9a-f]{7,40}$/.test(sha.trim())) return null;
+  // 7..64 hex: a SHA-256 repository names HEAD in 64 characters, and rejecting those as malformed
+  // would report every such checkout as a tarball with no commit at all.
+  if (!top || !sha || !/^[0-9a-f]{7,64}$/.test(sha.trim())) return unreadableOrAbsent(appRoot);
   return sameDirectory(top.trim(), appRoot) ? sha.trim() : null;
+}
+
+/**
+ * What a failed revision read MEANS: `REVISION_UNREADABLE` where `appRoot` holds a `.git` of its
+ * own, else null.
+ *
+ * The `.git` entry answers the same question `readRevision`'s toplevel check does — is this
+ * directory a checkout in its own right — without needing the git that just failed. A worktree's
+ * `.git` is a file rather than a directory, hence lstat over any directory test.
+ */
+function unreadableOrAbsent(appRoot) {
+  try {
+    lstatSync(join(appRoot, ".git"));
+    return REVISION_UNREADABLE;
+  } catch {
+    return null;
+  }
+}
+
+/** The commit a read can actually name — an unreadable one is no evidence, not a different sha. */
+function namedRevision(identity) {
+  const revision = identity?.revision ?? null;
+  return revision === REVISION_UNREADABLE ? null : revision;
 }
 
 /** One git read at `appRoot`: its stdout, or null when git failed, timed out, or ran away. */
@@ -359,7 +396,7 @@ export function readBuildIdentity(appRoot, env = process.env) {
   return {
     version: readVersion(appRoot),
     revision,
-    worktree: revision ? readWorktreeDigest(appRoot) : null,
+    worktree: revision && revision !== REVISION_UNREADABLE ? readWorktreeDigest(appRoot) : null,
     env: readEnvDigest(env),
   };
 }
@@ -599,6 +636,11 @@ export function recordAlive(record, startedAt = processStartedAt) {
  * against null would report "outdated" and send the operator to restart a server that is fine, when
  * the fault is the install on disk. The revision comparison below still stands on its own there.
  *
+ * A revision anton could not READ (`REVISION_UNREADABLE`) is no evidence either, and is normalised
+ * away rather than compared: a git call that timed out on one side of the comparison is not a
+ * different commit, and reporting it as "modified" would demand a restart that changes nothing.
+ * Freshness is where an unreadable commit has to block — see `sameCheckout`.
+ *
  * The worktree digest follows the same rule and needs it more: a record written before this field
  * existed carries none, and calling that "modified" would demand one restart of every install on
  * the upgrade that introduced it.
@@ -618,9 +660,9 @@ export function compareBuild(running, onDisk) {
   const verdict = (state) => ({ state, running: running ?? null, onDisk });
   if (!running || !running.version) return verdict("unstamped");
   if (onDisk.version && running.version !== onDisk.version) return verdict("outdated");
-  if (running.revision && onDisk.revision && running.revision !== onDisk.revision) {
-    return verdict("modified");
-  }
+  const ranAt = namedRevision(running);
+  const onDiskAt = namedRevision(onDisk);
+  if (ranAt && onDiskAt && ranAt !== onDiskAt) return verdict("modified");
   if (running.worktree && onDisk.worktree && running.worktree !== onDisk.worktree) {
     return verdict("modified");
   }
@@ -645,6 +687,10 @@ export function compareBuild(running, onDisk) {
  * - A checkout git CAN name a commit for must also name what it holds past that commit, or the one
  *   field an uncommitted edit moves is the one nothing read. Two failed digest reads in a row agree
  *   with each other and still prove nothing.
+ * - A commit NEITHER read could name (`REVISION_UNREADABLE` — git timed out, `.git` was briefly
+ *   unreadable) is the same trap one step earlier: two failures agree, and the tarball rule below
+ *   would then accept the artifact on version alone while an edit made during the compile goes
+ *   unseen — and every later start under the same failure reuses that `.next`.
  *
  * Either way `ensureFreshBuild` builds again and, if the reads never resolve, refuses to start —
  * which is the honest end, since nothing can then say what `.next` holds. A checkout with no git at
@@ -670,6 +716,7 @@ export function sameCheckout(a, b) {
   ) {
     return false;
   }
+  if (a.revision === REVISION_UNREADABLE || b.revision === REVISION_UNREADABLE) return false;
   return !b.revision || (b.worktree ?? null) !== null;
 }
 
@@ -719,7 +766,8 @@ export function buildDrift({
 export function describeBuildIdentity(identity) {
   if (!identity || !identity.version) return "an unrecorded build";
   const parts = [];
-  if (identity.revision) parts.push(identity.revision.slice(0, SHORT_SHA));
+  const revision = namedRevision(identity);
+  if (revision) parts.push(revision.slice(0, SHORT_SHA));
   if (identity.worktree && identity.worktree !== WORKTREE_CLEAN) {
     parts.push(`uncommitted ${identity.worktree.slice(0, SHORT_SHA)}`);
   }

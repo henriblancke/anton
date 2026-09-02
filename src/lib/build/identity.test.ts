@@ -30,6 +30,7 @@ import {
   readBuildRecord,
   recordAlive,
   recordFromInstall,
+  REVISION_UNREADABLE,
   sameCheckout,
   writeBuildRecord,
   writeBuildStamp,
@@ -118,6 +119,14 @@ describe("compareBuild", () => {
     const running = { ...RUNNING, env: "aa11bb22cc33" };
     expect(compareBuild(running, { ...RUNNING, env: "dd44ee55ff66" }).state).toBe("current");
     expect(compareBuild(running, { ...RUNNING, env: null }).state).toBe("current");
+  });
+
+  // A verdict answers "must the operator restart?", and a git call that timed out on one side is no
+  // evidence either way. Calling it "modified" would demand a restart that changes nothing — the
+  // unreadable commit has to block FRESHNESS instead (see sameCheckout).
+  it("does not read a commit git could not name as a different commit", () => {
+    expect(compareBuild(RUNNING, { ...RUNNING, revision: REVISION_UNREADABLE }).state).toBe("current");
+    expect(compareBuild({ ...RUNNING, revision: REVISION_UNREADABLE }, RUNNING).state).toBe("current");
   });
 
   it("calls a build that recorded no version unstamped", () => {
@@ -335,6 +344,33 @@ describe("readBuildIdentity", () => {
 // Next inlines a `NEXT_PUBLIC_*` value at COMPILE time from wherever it reads it — and a `.env`
 // file is only one of those places. `NEXT_PUBLIC_API_URL=x anton start` puts it straight in the
 // build's environment, where no digest of the checkout can see it.
+/**
+ * "No commit" and "no readable commit" are opposite facts, and only the second one blocks (PR #217).
+ * A `.git` git rejects reproduces every shape of the failure at once — a timed-out read, a briefly
+ * unreadable `.git`, an object format this git cannot parse.
+ */
+describe("a checkout whose git identity cannot be read", () => {
+  function unreadableCheckout(): string {
+    const dir = tempDir();
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    writeFileSync(join(dir, ".git"), "not a gitfile\n");
+    return dir;
+  }
+
+  it("is unreadable, not a tarball that has no commit", () => {
+    const identity = readBuildIdentity(unreadableCheckout(), {});
+    expect(identity.revision).toBe(REVISION_UNREADABLE);
+    // Nothing to digest past a commit nothing could name — and the same git would fail on it anyway.
+    expect(identity.worktree).toBeNull();
+  });
+
+  it("still reads a real tarball — no .git at all — as having no commit", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    expect(readBuildIdentity(dir, {}).revision).toBeNull();
+  });
+});
+
 describe("the build-time environment in an identity", () => {
   const app = () => {
     const dir = tempDir();
@@ -418,6 +454,17 @@ describe("sameCheckout", () => {
   it("refuses two failed digest reads that agree only in what they could not read", () => {
     const noDigest = { ...IDENTITY, worktree: null };
     expect(sameCheckout(noDigest, { ...noDigest })).toBe(false);
+  });
+
+  // The reviewer's case (PR #217): both revision reads fail at once — git times out, `.git` is
+  // briefly unreadable — so two absences agree and the tarball rule below would accept the artifact
+  // on version alone, stamping an edit made mid-compile as current and reusing that `.next` on every
+  // later start under the same failure.
+  it("refuses two revision reads that failed rather than found no repository", () => {
+    const unreadable = { ...IDENTITY, revision: REVISION_UNREADABLE, worktree: null };
+    expect(sameCheckout(unreadable, { ...unreadable })).toBe(false);
+    expect(sameCheckout(IDENTITY, unreadable)).toBe(false);
+    expect(sameCheckout(unreadable, IDENTITY)).toBe(false);
   });
 
   // The reviewer's case (PR #217): the checkout never moved, but the value the build compiles in
@@ -609,6 +656,18 @@ describe("buildMatchesCheckout", () => {
     expect(buildMatchesCheckout(checkout(onDisk, { ...RUNNING, worktree: "clean" }), onDisk)).toBe(false);
   });
 
+  // The artifact side of the both-reads-failed case (PR #217): the stamp and the checkout are read
+  // through the same broken git, so both used to come back `revision: null` — a tarball, accepted on
+  // version alone — and every start under that failure reused a `.next` nothing could vouch for.
+  it("rejects a build whose commit git could not read on either side", () => {
+    const app = checkout(RUNNING);
+    writeFileSync(join(app, ".git"), "not a gitfile\n");
+    const identity = readBuildIdentity(app, {});
+    expect(identity.revision).toBe(REVISION_UNREADABLE);
+    writeFileSync(buildStampPath(app), JSON.stringify(identity));
+    expect(buildMatchesCheckout(app, identity)).toBe(false);
+  });
+
   // An unstamped `.next` is one anton cannot identify, and a build it cannot name is one it cannot
   // claim is current — rebuilding costs a build, serving it costs the whole verdict.
   it("rejects a build that carries no stamp at all", () => {
@@ -734,6 +793,11 @@ describe("the sentence an operator reads", () => {
   it("renders a bundle without a commit as its version alone", () => {
     expect(describeBuildIdentity({ version: "0.4.0", revision: null })).toBe("0.4.0");
     expect(describeBuildIdentity(RUNNING)).toBe("0.4.0 (aaaaaaa)");
+  });
+
+  // The sentinel is a fact about the READ, never a commit to print at the operator.
+  it("names no commit for a build whose commit could not be read", () => {
+    expect(describeBuildIdentity({ version: "0.4.0", revision: REVISION_UNREADABLE })).toBe("0.4.0");
   });
 
   // Both sides of an uncommitted drift sit at one commit, so without this the sentence would claim

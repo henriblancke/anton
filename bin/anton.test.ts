@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 
 import {
@@ -19,6 +20,7 @@ import {
   ensureFreshBuild,
   nextArgs,
   procfsListeningEndpoints,
+  resolveAntonDb,
   resolvePort,
   runningPid,
   unstampedServers,
@@ -81,6 +83,31 @@ describe("port resolution", () => {
     expect(resolvePort([])).toBe("5000");
     expect(resolvePort(["--port", "6000"])).toBe("6000");
     expect(nextArgs("start", [])).toEqual(["start", "-p", "5000"]);
+  });
+});
+
+/**
+ * A relative `ANTON_DB` names a different file for every reader unless one directory settles it
+ * (PR #217). The server always runs with the app root as its cwd, so its build record lands beside
+ * the app-root-relative database — and doctor invoked from any other directory used to scan the
+ * caller's, reporting "no running server recorded" over a live, stale server.
+ */
+describe("the ANTON_DB override", () => {
+  const declared = process.env.ANTON_DB;
+
+  afterEach(() => {
+    if (declared === undefined) delete process.env.ANTON_DB;
+    else process.env.ANTON_DB = declared;
+  });
+
+  it("resolves a relative path against the app root, not the caller's cwd", () => {
+    process.env.ANTON_DB = "state/anton.db";
+    expect(resolveAntonDb()).toBe(join(REPO_ROOT, "state", "anton.db"));
+  });
+
+  it("leaves an absolute path exactly as given", () => {
+    process.env.ANTON_DB = join(tmpdir(), "elsewhere.db");
+    expect(resolveAntonDb()).toBe(join(tmpdir(), "elsewhere.db"));
   });
 });
 
