@@ -816,6 +816,34 @@ describe("the source digest of an install no git can describe", () => {
     expect(readBuildIdentity(dir, {}).source).toBe(first);
   });
 
+  // Those same names are ordinary source further down — anton's own drift modules live in
+  // `src/lib/build/` — so excluding them by name at any depth made an edit to them invisible and let
+  // a git-less install serve a `.next` compiled before it (PR #217 review).
+  it("walks a source directory that shares a name with a build output root", () => {
+    const dir = tarball();
+    mkdirSync(join(dir, "src", "lib", "build"), { recursive: true });
+    const nested = join(dir, "src", "lib", "build", "drift.ts");
+    writeFileSync(nested, SOURCE);
+    const first = readBuildIdentity(dir, {}).source;
+
+    writeFileSync(nested, SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+    writeFileSync(nested, SOURCE);
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+
+    // The root ones stay out: that is where the build writes, and a digest reading them would move
+    // on its own.
+    mkdirSync(join(dir, "dist"));
+    writeFileSync(join(dir, "dist", "bundle.js"), SOURCE);
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+
+    // A nested dependency tree is a dependency wherever it sits, so that one name is skipped at
+    // every depth.
+    mkdirSync(join(dir, "src", "node_modules"));
+    writeFileSync(join(dir, "src", "node_modules", "dep.js"), SOURCE);
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+  });
+
   it("is not read where git can answer, nor for a bundle that needs no rebuild", () => {
     expect(readBuildIdentity(gitCheckout(), {}).source).toBeNull();
     const bundle = tempDir();
@@ -932,6 +960,33 @@ describe("the build-time environment in an identity", () => {
     expect(first).toMatch(/^[0-9a-f]{12}$/);
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env).not.toBe(first);
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toBe(first);
+  });
+
+  // `const { BUILD_FLAVOR } = process.env` reads the same variable without ever spelling
+  // `process.env.NAME`, so a name-only scan missed it and `anton start` accepted a `.next` holding
+  // the previous configuration (PR #217 review).
+  it("reads a variable the config destructures out of the environment", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.mjs"),
+      "const { BUILD_FLAVOR } = process.env;\nexport default { env: { F: BUILD_FLAVOR } };\n",
+    );
+    const first = readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env).not.toBe(first);
+  });
+
+  // A binding may be renamed or defaulted on its way out of the destructure — what names the
+  // variable is the KEY, never the local it lands in.
+  it("reads a destructured variable that is renamed or defaulted", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.ts"),
+      'const { BUILD_FLAVOR: flavor = "dev", ANALYZE } = process.env;\nexport default { env: { flavor }, analyze: ANALYZE };\n',
+    );
+    const base = { BUILD_FLAVOR: "one", ANALYZE: "0" };
+    expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
   });
 
   it("reads the same variable through an indexed access", () => {

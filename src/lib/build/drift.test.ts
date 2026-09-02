@@ -171,6 +171,34 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(drift?.onDisk.version).toBe("0.4.0");
   });
 
+  // An install with no git — a source tarball, `npm i -g anton` — has no commit to be judged on, so
+  // the source digest its stamp carries is the ONLY evidence an edit landed under the running
+  // build. `compareBuild` weighs a field only where both sides hold one, so a record that dropped it
+  // could never be found stale (PR #217 review).
+  it("carries the source digest of a git-less build's stamp into the record", async () => {
+    const app = join(dir, "tarball");
+    mkdirSync(join(app, ".next"), { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    writeFileSync(join(app, "page.tsx"), "export default () => null;\n");
+    const { readBuildIdentity } = await import("./identity.mjs");
+    const compiled = readBuildIdentity(app).source;
+    expect(compiled).toMatch(/^[0-9a-f]{12}$/);
+    writeFileSync(
+      join(app, ".next", "anton-build.json"),
+      JSON.stringify({ version: "0.4.0", revision: null, source: compiled, builtAt: 1 }),
+    );
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    vi.stubEnv("NODE_ENV", "production");
+
+    const { recordServerBuild, serverBuildDrift, checkoutMoved } = await freshModule();
+    recordServerBuild({ runner: true });
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).source).toBe(compiled);
+
+    writeFileSync(join(app, "page.tsx"), "export default () => 1;\n");
+    checkoutMoved(app); // the read taken at boot is what the TTL would otherwise still hand back
+    expect(serverBuildDrift()?.state).toBe("modified");
+  });
+
   // The 2026-08-17 shape, forced: the process is up and the record says it booted somewhere else.
   it("reports the drift once the code on disk is no longer what this process booted from", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();

@@ -300,6 +300,11 @@ const UNIDENTIFIED: BuildIdentity = { version: null, revision: null, worktree: n
  * version says nothing either — an identity with no version is exactly what `compareBuild` calls
  * unstamped — so it is discarded rather than adopted. What that absence MEANS is `bootIdentity`'s
  * call, and it differs by install.
+ *
+ * Every digest the stamp carries is carried through, the source one included (PR #217 review):
+ * `compareBuild` weighs a field only when both identities hold it, so dropping `source` here left a
+ * git-less production server with nothing to compare — the one install shape where that digest is
+ * the ONLY evidence of an edit — and every drift surface called it current.
  */
 function artifactIdentity(): BuildIdentity | null {
   const root = appRoot();
@@ -310,6 +315,7 @@ function artifactIdentity(): BuildIdentity | null {
     version: stamp.version,
     revision: stamp.revision ?? null,
     worktree: stamp.worktree ?? null,
+    source: stamp.source ?? null,
     env: stamp.env ?? null,
   };
 }

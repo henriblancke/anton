@@ -614,7 +614,7 @@ function hashFile(path) {
  * that becomes `config/` under a linked source tree would digest identically while Next compiles
  * something else entirely — and `buildMatchesCheckout` would hand back the old `.next`.
  */
-function hashEntry(path, budget) {
+function hashEntry(path, budget, depth = 0) {
   const hash = createHash("sha256");
   try {
     let entry = lstatSync(path);
@@ -624,7 +624,7 @@ function hashEntry(path, budget) {
     }
     if (entry.isDirectory()) {
       hash.update("\0dir");
-      hashTree(hash, path, budget);
+      hashTree(hash, path, budget, depth);
     } else if (entry.isFile()) {
       hash.update("\0file");
       hashContents(hash, path);
@@ -641,12 +641,14 @@ function hashEntry(path, budget) {
 /**
  * Every entry under `dir`, in a fixed order so the digest is a function of the tree and not of
  * readdir's. `budget.skip` names the entries a walk never enters (see `readSourceDigest`); a walk
- * with none set reads everything.
+ * with none set reads everything. It is asked with the entry's DEPTH — 0 for the entries of the
+ * directory the walk started from — because the names a build writes and the names it compiles
+ * overlap: `build/` at the root is output, while `src/lib/build/` is source (PR #217 review).
  *
  * Cycles are what a followed link makes possible — a directory linking back to its own ancestor
  * would recurse forever — so each directory is entered once per walk, keyed by its resolved path.
  */
-function hashTree(hash, dir, budget) {
+function hashTree(hash, dir, budget, depth = 0) {
   const resolved = realpathSync(dir);
   if (budget.seen.has(resolved)) {
     hash.update("\0cycle");
@@ -654,13 +656,13 @@ function hashTree(hash, dir, budget) {
   }
   budget.seen.add(resolved);
   for (const name of readdirSync(dir).sort()) {
-    if (budget.skip?.(name)) continue;
+    if (budget.skip?.(name, depth)) continue;
     if (budget.left <= 0) {
       budget.truncated = true;
       return;
     }
     budget.left -= 1;
-    hash.update(name).update("\0").update(hashEntry(join(dir, name), budget));
+    hash.update(name).update("\0").update(hashEntry(join(dir, name), budget, depth + 1));
   }
 }
 
@@ -683,15 +685,20 @@ function hashContents(hash, path) {
 export const MAX_SOURCE_ENTRIES = 16384;
 
 /**
- * What a source walk never enters, by name at any depth: build output, dependencies, and the state
- * a running anton writes beside its own code. Every one of these is in .gitignore as well — this is
- * that list applied by hand, because the installs needing this digest are the ones with no git to
- * apply it for them.
+ * What a source walk never enters AT THE ROOT: build output, and the state a running anton writes
+ * beside its own code. Every one of these is in .gitignore as well — this is that list applied by
+ * hand, because the installs needing this digest are the ones with no git to apply it for them.
+ *
+ * Root-level, not by name at any depth (PR #217 review). These names are output only where a build
+ * puts them; further down they are ordinary source. This repo compiles `src/lib/build/` — including
+ * these very modules — so excluding every directory called `build` left an edit to them invisible,
+ * and a git-less install could serve a `.next` compiled before it.
  */
-const SOURCE_IGNORED = new Set(["node_modules", "coverage", "out", "build", "dist", "server-port"]);
+const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist", "server-port"]);
 
 /**
- * Is this entry outside the source a build compiles from?
+ * Is this entry outside the source a build compiles from? `depth` is 0 for the entries of the
+ * install root itself.
  *
  * Dot-entries go wholesale, and that is this digest's deliberate edge — the trade
  * `readWorktreeDigest` already makes over ignored files. `.next`, `.git`, `.anton`, `.beads` and
@@ -699,14 +706,18 @@ const SOURCE_IGNORED = new Set(["node_modules", "coverage", "out", "build", "dis
  * would move on its own and put a permanent restart banner in front of an operator with nothing to
  * restart for. The dot-files a build actually reads — `.env*` — are digested by `readEnvDigest`,
  * which is why dropping them here loses nothing.
+ *
+ * `node_modules` is the one name skipped at every depth: nested ones hold dependencies too, and a
+ * dependency is never the source this install is judged on. What anton itself writes — the
+ * database, its per-process build records — lands beside the install root, so it is excluded there
+ * and nowhere else.
  */
-function skipsSourceEntry(name) {
+function skipsSourceEntry(name, depth) {
   return (
     name.startsWith(".") ||
-    SOURCE_IGNORED.has(name) ||
-    name.startsWith("anton.db") ||
+    name === "node_modules" ||
     name.endsWith(".tsbuildinfo") ||
-    BUILD_RECORD_NAME.test(name)
+    (depth === 0 && (OUTPUT_AT_ROOT.has(name) || name.startsWith("anton.db") || BUILD_RECORD_NAME.test(name)))
   );
 }
 
@@ -766,6 +777,25 @@ const NEXT_CONFIG_FILES = ["next.config.js", "next.config.mjs", "next.config.ts"
 const CONFIG_ENV_READ = /process\.env\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/g;
 
 /**
+ * The bindings of a destructured read — `const { BUILD_FLAVOR } = process.env` — which names a
+ * variable without ever spelling `process.env.NAME` (PR #217 review). Everything up to the `=` is
+ * captured and the names picked out of it separately, since a binding may be renamed, defaulted or
+ * quoted.
+ */
+const CONFIG_ENV_DESTRUCTURE = /\{([^{}]*)\}\s*(?::[^=]+)?=\s*process\s*\.\s*env\b/g;
+
+/**
+ * One bound name in that pattern: whatever sits in KEY position — at the start or after a comma —
+ * as `NAME`, `NAME: alias`, `NAME = fallback` or `"NAME": alias`.
+ *
+ * A `...rest` binding matches nothing, deliberately: it reads the whole environment, which no set of
+ * names can stand for. A default value holding a comma (`{ A = f(x, y) }`) names one variable too
+ * many, which costs a rebuild only if this environment happens to set it — the trade every other
+ * read here makes.
+ */
+const DESTRUCTURED_KEY = /(?:^|,)\s*(?:["'`]([^"'`]+)["'`]|([A-Za-z_$][\w$]*))/g;
+
+/**
  * The build-environment variables the NEXT CONFIG reads — the third route a value takes into the
  * artifact (PR #217 review).
  *
@@ -790,6 +820,8 @@ function configEnvNames(appRoot) {
       continue;
     }
     for (const [, dotted, indexed] of text.matchAll(CONFIG_ENV_READ)) names.add(dotted ?? indexed);
+    for (const [, bindings] of text.matchAll(CONFIG_ENV_DESTRUCTURE))
+      for (const [, quoted, bare] of bindings.matchAll(DESTRUCTURED_KEY)) names.add(quoted ?? bare);
   }
   return names;
 }
