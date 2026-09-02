@@ -257,8 +257,13 @@ type SettleVerdict = { held: true } | { lost: string } | { unverified: string } 
  * status), and two processes can both read the target free and both write, with the LAST write
  * standing. Waiting the propagation window and re-reading is what turns that last-write-wins into a
  * decided race: after both writes have landed, both processes read the same single assignee, and
- * only its owner starts anything. Skipped only on a not-wired embedded board, which has no second
- * machine to race.
+ * only its owner starts anything.
+ *
+ * A not-wired embedded board drops the propagation WINDOW and keeps the re-validation, exactly as
+ * `beads.claimVerified` does (PR #218 review): with no remote there is no merge to wait out, but the
+ * board and the operator's stance can still have moved while this pass's own approve and claim
+ * commands ran, and those are the checks that would otherwise never be re-asked on the default local
+ * board.
  *
  * The assignee is machine-scoped, not per-instance (see `lib/operator.ts`: it is the same identity
  * the run ownership gate and review-fix's PR filter compare against), so two machines resolving to
@@ -283,6 +288,9 @@ async function settleClaim(
   const readBoard = deps.board ?? loadAllIssues;
   const sleep = deps.sleep ?? sleepMs;
 
+  // Is there a second writer whose write this pass has to WAIT OUT? A shared server always has one;
+  // an embedded board has one only once it is wired to a remote.
+  let arbitrated = shared;
   if (!shared) {
     let outcome: SyncOutcome;
     try {
@@ -290,16 +298,21 @@ async function settleClaim(
     } catch (e) {
       return { unverified: `the claim could not be published before starting (${errorText(e)})` };
     }
-    if (outcome !== "synced") return { held: true };
+    // An unwired board publishes nowhere, so there is no merge to settle for and nothing to pull
+    // back — but that is the REMOTE half only (PR #218 review). Everything below still runs: the
+    // operator can move the picker off `apply`, narrow the policy or relabel the target as human
+    // work while this pass's own `bd` writes are in flight, and on the default local board this is
+    // the only place those answers are re-asked after the under-lock read.
+    arbitrated = outcome === "synced";
   }
 
-  await sleep(deps.settleMs ?? CLAIM_SETTLE_MS);
+  if (arbitrated) await sleep(deps.settleMs ?? CLAIM_SETTLE_MS);
   // The whole board, not just the bead: winning the assignee proves the race was won, not that the
   // prize is still worth having, and the re-validation below judges the target against its parents,
   // its children and its blockers.
   let board: Bead[];
   try {
-    if (!shared) await pull(repoPath);
+    if (arbitrated && !shared) await pull(repoPath);
     board = await readBoard(repoPath);
   } catch (e) {
     return { unverified: `the claim could not be read back before starting (${errorText(e)})` };

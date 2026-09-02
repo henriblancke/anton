@@ -213,7 +213,7 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
       // re-decided over the post-write board, which drops the started target as `claimed` and leaves
       // the survivors current.
       if ("started" in applied) {
-        await restampAfterStart(ctx, { db, clock, projectId, repoPath: project.repoPath, armed });
+        await restampAfterStart(ctx, { db, clock, projectId, repoPath: project.repoPath });
       }
     }
 
@@ -276,13 +276,18 @@ async function restampAfterStart(
     clock: Clock;
     projectId: string;
     repoPath: string;
-    armed?: Policy;
   },
 ): Promise<void> {
-  const { db, clock, projectId, repoPath, armed } = input;
+  const { db, clock, projectId, repoPath } = input;
   try {
     await ctx.heartbeat();
     const observedAtMs = clock.now();
+    // BOTH inputs are re-read, not just the board (PR #218 review): the policy this restamp is
+    // decided under is the plan's freshness fence, so restamping a fresh board under the snapshot
+    // taken before the start would record survivors the current policy excludes and stamp them with
+    // the superseded digest — which the next pass reads as stale, withholding Up Next for another
+    // cadence, the very thing this restamp exists to prevent.
+    const armed = resolvePickerPolicy(await getProjectSettings(db, projectId));
     const board = await loadAllIssues(repoPath, { strictGates: true });
     const decision = await decideOver(db, { projectId, board, observedAtMs, armed });
     if (ctx.signal.aborted) return;

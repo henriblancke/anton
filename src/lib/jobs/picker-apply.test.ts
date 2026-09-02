@@ -671,6 +671,59 @@ describe("applyPickerPlan", () => {
       expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
 
+    it("takes its writes back when a NOT-WIRED board's stance is withdrawn during the write", async () => {
+      // The default local board publishes nowhere, so it skips the propagation window — but not the
+      // re-validation (PR #218 review). The approve and the claim are two `bd` invocations wide, and
+      // an operator stepping off `apply` inside them leaves this start resting on an approval that
+      // no longer exists, with nothing else on this path re-asking.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, {
+        board: async () => {
+          arm({}, "shadow");
+          return [...board.current.values()] as unknown as Bead[];
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("no longer apply");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("re-validates a NOT-WIRED board without waiting out a window it has no remote for", async () => {
+      // Skip the REMOTE half only: no push to settle, no pull to merge, no sleep — and still a
+      // read-back the eligibility rule and the stance are judged against.
+      put(bead("t1"));
+      const sleep = vi.fn(async () => {});
+      const pull = vi.fn(async () => {});
+
+      const outcome = await apply("t1", 1, { sleep, pull });
+
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+      expect(sleep).not.toHaveBeenCalled();
+      expect(pull).not.toHaveBeenCalled();
+    });
+
+    it("takes its writes back when a NOT-WIRED board's target stops being startable", async () => {
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, {
+        board: async () => {
+          const b = board.current.get("t1")!;
+          b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
+          return [...board.current.values()] as unknown as Bead[];
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("stopped being startable");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
     it("judges the settled target with its OWN reservation cleared, not as claimed work", async () => {
       // The startable projection the policy is evaluated over excludes claimed targets, so a
       // post-settle check that read the board as written would refuse every start it ever made.

@@ -534,6 +534,37 @@ describe("makeBoardPickerHandler", () => {
     );
   });
 
+  it("restamps under the policy as it reads NOW, not the snapshot the pass opened with", async () => {
+    // The apply is seconds of `bd`, and the policy is half the plan's freshness fence. Restamping a
+    // fresh board under the pre-start policy would record survivors the current one excludes and
+    // stamp them with the superseded digest — read as stale on the next pass, withholding Up Next
+    // for the cadence this restamp exists to save (PR #218 review).
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2, issue_type: "bug" })];
+    arm(t, "apply", { policy: { types: ["task", "bug"] } });
+    applyPickerPlan.mockImplementationOnce(async () => {
+      board.current = [
+        bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
+        bead("t2", { priority: 2, issue_type: "bug" }),
+      ];
+      arm(t, "apply", { policy: { types: ["task"] }, record: false });
+      return {
+        started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
+      };
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual([]);
+    expect(plan?.exclusions).toContainEqual(
+      expect.objectContaining({ beadId: "t2", reason: "policy" }),
+    );
+    // Stamped with the NARROWED policy, so the next pass reads the row as current.
+    expect(isPlanStale(plan!, stampBoard(board.current, clock.now(), { types: ["task"] }))).toBe(
+      false,
+    );
+  });
+
   it("keeps the start when the restamp fails, rather than retrying the pass", async () => {
     // The run is already enqueued: a throw here would retry the pass, and the retry — reading a
     // board whose top pick is now claimed — would start the NEXT target.
