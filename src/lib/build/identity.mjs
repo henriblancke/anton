@@ -30,7 +30,17 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readlinkSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 /** Short form of a commit sha in operator-facing copy — long enough to be unambiguous, short enough to read. */
@@ -44,6 +54,9 @@ const WORKTREE_CLEAN = "clean";
  * so the limit only has to be far above any plausible uncommitted diff.
  */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
+/** Read size for hashing an untracked file — bounded, so an oversized one costs time and not memory. */
+const READ_CHUNK = 64 * 1024;
 
 /**
  * One build's identity — what a comparison here is between. Written to both stamps, so a record
@@ -125,16 +138,47 @@ function git(appRoot, args) {
  *
  * Hence both reads: the diff (`--binary`, so a changed asset is content and not "Binary files
  * differ"; `--no-ext-diff`, so a configured diff driver cannot summarize content away) for what
- * tracked files now say, and the untracked list for files that exist only on disk — a new
+ * tracked files now say, and the untracked files, which no diff against HEAD can see — a new
  * `page.tsx` changes the build while no tracked file moves.
+ *
+ * Untracked files are digested by CONTENT, not by name: a listing is the same "?? page.tsx" however
+ * many times that file is rewritten, which is the same edit-twice blindness the diff exists to close
+ * on the tracked side. `git ls-files --others --exclude-standard` names them (honouring .gitignore,
+ * so `.next` and node_modules never enter the digest) and this reads them — bounded chunks folded
+ * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  */
 function readWorktreeDigest(appRoot) {
-  const untracked = git(appRoot, ["status", "--porcelain", "--untracked-files=all"]);
-  if (untracked === null) return null;
+  const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  if (listed === null) return null;
   const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "HEAD"]);
   if (diff === null) return null;
-  if (!untracked && !diff) return WORKTREE_CLEAN;
-  return createHash("sha256").update(untracked).update("\0").update(diff).digest("hex").slice(0, 12);
+  const untracked = listed.split("\0").filter(Boolean);
+  if (!untracked.length && !diff) return WORKTREE_CLEAN;
+  const digest = createHash("sha256").update(diff).update("\0");
+  for (const path of untracked) digest.update(path).update("\0").update(hashFile(join(appRoot, path)));
+  return digest.digest("hex").slice(0, 12);
+}
+
+/**
+ * One file's contents as a fixed-width digest. A file that cannot be read (it vanished between the
+ * listing and the read, or it is a directory symlink) still counted as present under its path, so
+ * the marker keeps the digest defined rather than collapsing the whole worktree read to null.
+ */
+function hashFile(path) {
+  const hash = createHash("sha256");
+  try {
+    if (lstatSync(path).isSymbolicLink()) return hash.update(readlinkSync(path)).digest();
+    const fd = openSync(path, "r");
+    try {
+      const buf = Buffer.allocUnsafe(READ_CHUNK);
+      for (let n = 0; (n = readSync(fd, buf, 0, READ_CHUNK, null)) > 0; ) hash.update(buf.subarray(0, n));
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return hash.update("\0unreadable").digest();
+  }
+  return hash.digest();
 }
 
 /**
@@ -263,6 +307,24 @@ export function compareBuild(running, onDisk) {
     return verdict("modified");
   }
   return verdict("current");
+}
+
+/**
+ * Are two reads of the same checkout the same code? What `anton start` asks after `next build`
+ * returns, to prove the tree did not move while it was compiling — an edit saved mid-build lands in
+ * `.next` only if Next had not read that file yet, so the artifact belongs to a checkout that no
+ * longer exists.
+ *
+ * Absence is not difference, the same rule `compareBuild` states at length: a field neither read
+ * could name (no git to name a commit, no readable package.json) cannot witness a change, and
+ * treating it as one would rebuild such an install forever.
+ *
+ * @param {BuildIdentity} a
+ * @param {BuildIdentity} b
+ */
+export function sameCheckout(a, b) {
+  const same = (x, y) => !x || !y || x === y;
+  return same(a.version, b.version) && same(a.revision, b.revision) && same(a.worktree, b.worktree);
 }
 
 /**

@@ -24,6 +24,7 @@ import {
   describeBuildIdentity,
   readBuildIdentity,
   readBuildRecord,
+  sameCheckout,
   writeBuildRecord,
   writeBuildStamp,
 } from "./identity.mjs";
@@ -43,15 +44,17 @@ afterEach(() => {
 
 const SOURCE = "export const a = 1;\n";
 
+/** Commit as somebody, whatever the machine's git config says — CI boxes have no user.name. */
+const AUTHOR = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
 /** A committed checkout — the only shape whose worktree is read, since only it is its own repo. */
 function gitCheckout(version = "0.4.0"): string {
   const dir = tempDir();
   writeFileSync(join(dir, "package.json"), JSON.stringify({ version }));
   writeFileSync(join(dir, "src.ts"), SOURCE);
-  const author = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
   spawnSync("git", ["init", "-q", dir]);
   spawnSync("git", ["-C", dir, "add", "-A"]);
-  spawnSync("git", ["-C", dir, ...author, "commit", "-qm", "initial"]);
+  spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "initial"]);
   return dir;
 }
 
@@ -162,6 +165,59 @@ describe("readBuildIdentity", () => {
     const dir = gitCheckout();
     writeFileSync(join(dir, "page.tsx"), "export default () => null;\n");
     expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // The untracked half of the edit-twice blindness: no diff against HEAD can see this file at all,
+  // so a digest built from its NAME is identical however many times it is rewritten — and `.next`
+  // falls a whole edit behind while every surface calls the server current.
+  it("digests an untracked file by content, not by name", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, "page.tsx"), "export default () => null;\n");
+    const first = readBuildIdentity(dir).worktree;
+
+    writeFileSync(join(dir, "page.tsx"), "export default () => <p>hi</p>;\n");
+    const second = readBuildIdentity(dir).worktree;
+    expect(second).toMatch(/^[0-9a-f]{12}$/);
+    expect(second).not.toBe(first);
+
+    // Same contents at the same path is the same build, so the digest is a function of the tree.
+    writeFileSync(join(dir, "page.tsx"), "export default () => null;\n");
+    expect(readBuildIdentity(dir).worktree).toBe(first);
+  });
+
+  // .gitignore is what keeps `.next` and node_modules — which every build rewrites — out of the
+  // digest; without it a build would invalidate itself the moment it finished.
+  it("ignores what git ignores", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitignore"), "junk/\n");
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "ignore junk"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    mkdirSync(join(dir, "junk"));
+    writeFileSync(join(dir, "junk", "build.log"), "noise\n");
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+  });
+});
+
+describe("sameCheckout", () => {
+  const IDENTITY = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
+
+  it("is true for two reads of the same code", () => {
+    expect(sameCheckout(IDENTITY, { ...IDENTITY })).toBe(true);
+  });
+
+  it("catches a save that landed while the build was compiling", () => {
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, worktree: "9f2c1a4bb001" })).toBe(false);
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, revision: "b".repeat(40) })).toBe(false);
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, version: "0.5.0" })).toBe(false);
+  });
+
+  // An install with no git and no readable package.json would otherwise rebuild forever, never able
+  // to prove the tree held still.
+  it("does not read an absence as a change", () => {
+    expect(sameCheckout(IDENTITY, { version: null, revision: null, worktree: null })).toBe(true);
+    expect(sameCheckout({ version: null, revision: null, worktree: null }, IDENTITY)).toBe(true);
   });
 
   it("reads this repo's own version and HEAD", () => {

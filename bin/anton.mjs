@@ -69,6 +69,7 @@ import {
   pidAlive,
   readBuildIdentity,
   readBuildRecord,
+  sameCheckout,
   writeBuildStamp,
 } from "../src/lib/build/identity.mjs";
 import { createInterface } from "node:readline/promises";
@@ -1861,6 +1862,62 @@ function cmdDev(args) {
   return runLocal("next", nextArgs("dev", args));
 }
 
+/**
+ * How many builds `anton start` will spend on a checkout that keeps moving. Two rebuilds past the
+ * first is already a person editing through a compile; a fourth would just keep the terminal busy.
+ */
+const MAX_BUILD_ATTEMPTS = 3;
+
+/**
+ * Leave `.next` provably compiled from the checkout on disk, or refuse to start. Returns an exit
+ * code: 0 to go on, non-zero to stop.
+ *
+ * `next start` serves whatever `.next` holds, whichever code produced it — so a checkout that moved
+ * since its last build (a pull, or an edit nobody committed) would boot stamping the NEW code while
+ * serving the old one, and every drift surface would then call a stale server current (anton-pzfb).
+ * Rebuilding instead is what makes "restart to run the build on disk" true advice for a source
+ * install. A bundle is exempt: it ships its own prebuilt `.next` and no toolchain to rebuild with.
+ *
+ * The identity is read BEFORE compiling and RE-READ after: an edit saved mid-build lands in the
+ * artifact only if Next had not already read that file, so the tree the build started from is the
+ * most it can honestly claim — and if the tree moved meanwhile, that claim is false and the build
+ * runs again rather than being stamped with a checkout it never saw.
+ *
+ * `build` and `readIdentity` are injected so the loop is testable without spawning a real compile.
+ */
+function ensureFreshBuild({
+  appRoot,
+  isBundle,
+  build = () => runLocal("next", ["build"]),
+  readIdentity = readBuildIdentity,
+}) {
+  let compiledFrom = isBundle ? null : readIdentity(appRoot);
+  const built = existsSync(join(appRoot, ".next"));
+  if (built && (compiledFrom === null || buildMatchesCheckout(appRoot, compiledFrom))) return 0;
+
+  let why = built
+    ? "the build in .next is not this checkout — rebuilding so the server runs what is here…"
+    : "no build found — running `next build` first…";
+  for (let attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
+    console.log(c.dim(why));
+    const code = build();
+    if (code !== 0) return code;
+    if (!compiledFrom) return 0;
+    const now = readIdentity(appRoot);
+    if (sameCheckout(compiledFrom, now)) {
+      writeBuildStamp(appRoot, compiledFrom);
+      return 0;
+    }
+    compiledFrom = now;
+    why = "the checkout changed while it compiled — rebuilding so .next is the code on disk…";
+  }
+  console.log(
+    c.red(`\n✗ the checkout kept changing across ${MAX_BUILD_ATTEMPTS} builds — the server was NOT started.`),
+  );
+  console.log(c.dim("  (nothing here can say what .next holds; re-run `anton start` once the tree stops moving.)"));
+  return 1;
+}
+
 async function cmdStart(args) {
   // Installed bundle: run as a background daemon (foolery-style) unless --foreground is passed.
   // (startDaemon applies pending migrations before spawning the server.)
@@ -1879,31 +1936,9 @@ async function cmdStart(args) {
     return 1;
   }
 
-  // `next start` serves whatever `.next` holds, whichever code produced it — so a checkout that
-  // moved since its last build (a pull, or an edit nobody committed) would boot stamping the NEW
-  // code while serving the old one, and every drift surface would then call a stale server current
-  // (anton-pzfb). Rebuild instead, which also makes "restart to run the build on disk" true advice
-  // for a source install. A bundle is exempt: it ships its own prebuilt .next and no toolchain to
-  // rebuild with.
-  //
-  // The identity is read BEFORE compiling: an edit saved mid-build belongs to the next build, not
-  // this one, so stamping the tree the build started from fails toward rebuilding rather than
-  // blessing an artifact that missed it.
-  const built = existsSync(join(APP_ROOT, ".next"));
-  const compiledFrom = IS_BUNDLE ? null : readBuildIdentity(APP_ROOT);
-  const staleBuild = built && compiledFrom !== null && !buildMatchesCheckout(APP_ROOT, compiledFrom);
-  if (!built || staleBuild) {
-    console.log(
-      c.dim(
-        staleBuild
-          ? "the build in .next is not this checkout — rebuilding so the server runs what is here…"
-          : "no build found — running `next build` first…",
-      ),
-    );
-    const b = runLocal("next", ["build"]);
-    if (b !== 0) return b;
-    if (compiledFrom) writeBuildStamp(APP_ROOT, compiledFrom);
-  }
+  const fresh = ensureFreshBuild({ appRoot: APP_ROOT, isBundle: IS_BUNDLE });
+  if (fresh !== 0) return fresh;
+
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
   // In bundle mode the server's writable state — including the DB getDb() opens — must point at
   // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
@@ -1987,6 +2022,7 @@ if (invokedDirectly) Promise.resolve(main(process.argv)).then((code) => process.
 export {
   resolvePort,
   nextArgs,
+  ensureFreshBuild,
   main,
   parseInitArgs,
   parseServerModeArgs,

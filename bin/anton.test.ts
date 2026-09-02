@@ -8,13 +8,13 @@
  * (anton-k7q2) — `anton-init.test.ts`, `anton-skills.test.ts`, `anton-migrations.test.ts`,
  * `anton-release.test.ts` — over the harness they all share, `anton.fixture.ts`.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
-import { agentsFromArgs, nextArgs, resolvePort, serverIsUp } from "./anton.mjs";
+import { agentsFromArgs, ensureFreshBuild, nextArgs, resolvePort, serverIsUp } from "./anton.mjs";
 
 import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
@@ -560,5 +560,106 @@ describe("anton doctor — shared-server board reachability", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).not.toContain("shared Dolt server");
     expect(r.stdout).toContain("All required tools present");
+  });
+});
+
+/**
+ * What `anton start` will actually serve (anton-pzfb). `next start` never checks which code produced
+ * `.next`, so the launcher has to: it rebuilds a checkout that moved, and — since a build takes
+ * minutes — proves the tree held still across the compile before stamping the artifact with it.
+ */
+describe("anton start — the build it will serve", () => {
+  const dirs = tempDirs();
+  afterEach(dirs.cleanup);
+
+  const CHECKOUT = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
+  const EDITED = { ...CHECKOUT, worktree: "9f2c1a4bb001" };
+
+  /** A checkout whose `.next` was compiled from `stamp` — omitted, it has never been built. */
+  async function checkout(stamp?: object): Promise<string> {
+    const dir = await dirs.make("anton-app-");
+    if (stamp) {
+      mkdirSync(join(dir, ".next"), { recursive: true });
+      writeFileSync(join(dir, ".next", "anton-build.json"), JSON.stringify(stamp));
+    }
+    return dir;
+  }
+
+  const stampOf = (dir: string) => JSON.parse(readFileSync(join(dir, ".next", "anton-build.json"), "utf8"));
+
+  /** Feed the identity reader a scripted sequence: one read before the build, one after each. */
+  const reads = (...seq: (typeof CHECKOUT)[]) => () => (seq.length > 1 ? seq.shift()! : seq[0]);
+
+  it("builds and stamps the checkout it compiled when nothing is built", async () => {
+    const dir = await checkout();
+    const builds: number[] = [];
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build: () => (builds.push(1), 0),
+      readIdentity: reads(CHECKOUT, CHECKOUT),
+    });
+    expect(code).toBe(0);
+    expect(builds).toHaveLength(1);
+    expect(stampOf(dir)).toMatchObject(CHECKOUT);
+  });
+
+  it("starts without building when .next is already this checkout", async () => {
+    const dir = await checkout(CHECKOUT);
+    const build = vi.fn(() => 0);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build, readIdentity: () => CHECKOUT })).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it("rebuilds a .next compiled before the edit sitting in the worktree", async () => {
+    const dir = await checkout(CHECKOUT);
+    const build = vi.fn(() => 0);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build, readIdentity: reads(EDITED, EDITED) })).toBe(0);
+    expect(build).toHaveBeenCalledTimes(1);
+    expect(stampOf(dir)).toMatchObject(EDITED);
+  });
+
+  // The stale artifact nothing else catches: a save lands after Next has compiled that file, so the
+  // build is pre-edit while the server boots recording the post-edit checkout — and every drift
+  // surface then calls that stale process current.
+  it("rebuilds when a save lands mid-compile, and stamps only the tree that survived one", async () => {
+    const dir = await checkout();
+    const build = vi.fn(() => 0);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build, readIdentity: reads(CHECKOUT, EDITED, EDITED) })).toBe(0);
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(stampOf(dir)).toMatchObject(EDITED);
+  });
+
+  // Rebuilding forever behind someone who is still typing is worse than saying so: an unstamped
+  // `.next` is what makes the next `anton start` rebuild rather than serve code nobody can name.
+  it("refuses to start a checkout that never stops moving", async () => {
+    const dir = await checkout();
+    let n = 0;
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: () => ({ ...CHECKOUT, worktree: `edit${n++}` }),
+    });
+    expect(code).toBe(1);
+    expect(build).toHaveBeenCalledTimes(3);
+    expect(existsSync(join(dir, ".next", "anton-build.json"))).toBe(false);
+  });
+
+  it("gives up when the build itself fails", async () => {
+    const dir = await checkout();
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: false, build: () => 2, readIdentity: () => CHECKOUT })).toBe(2);
+  });
+
+  // A bundle ships its own prebuilt .next and no toolchain to rebuild with, and its RELEASE_VERSION
+  // already identifies it exactly.
+  it("leaves a bundle's prebuilt .next alone", async () => {
+    const dir = await checkout({ version: "0.9.1", revision: null });
+    const build = vi.fn(() => 0);
+    const readIdentity = vi.fn(() => CHECKOUT);
+    expect(ensureFreshBuild({ appRoot: dir, isBundle: true, build, readIdentity })).toBe(0);
+    expect(build).not.toHaveBeenCalled();
+    expect(readIdentity).not.toHaveBeenCalled();
   });
 });
