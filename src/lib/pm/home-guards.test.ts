@@ -51,9 +51,9 @@ const BOARD = [
 
 const index = indexBoard(BOARD);
 
-const rehome = (bead: string, home: string): PmClaimRehome => ({
+const rehome = (id: string, home: string): PmClaimRehome => ({
   kind: "rehome",
-  bead,
+  bead: id,
   home,
   summary: "it belongs over there",
   evidence: ["its goal is the other card's goal"],

@@ -44,9 +44,9 @@ const BOARD = [
 
 const index = indexBoard(BOARD);
 
-const order = (bead: string, blockedBy: string): PmClaimOrder => ({
+const order = (id: string, blockedBy: string): PmClaimOrder => ({
   kind: "order",
-  bead,
+  bead: id,
   blockedBy,
   summary: "the second one cannot start until the first lands",
   evidence: ["the API contract lands in the first"],

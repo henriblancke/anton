@@ -31,9 +31,9 @@ const BOARD = [
 
 const index = indexBoard(BOARD);
 
-const start = (bead: string): PmClaimStart => ({
+const start = (id: string): PmClaimStart => ({
   kind: "start",
-  bead,
+  bead: id,
   summary: "this is the work to run next",
   evidence: ["it unblocks the two beads behind it"],
 });
