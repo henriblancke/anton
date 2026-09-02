@@ -10,6 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beads, LABELS } from "../beads/bd";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { Bead } from "../beads/types";
 import * as schema from "../db/schema";
@@ -104,6 +105,56 @@ function stubBd(): void {
   });
 }
 
+/**
+ * The STANCE every start rests on: an armed policy, `apply`, and the record that level has to be
+ * earned on. Re-resolved by the apply itself at both its gates (`pickerStance`), so a test that
+ * does not set it is testing a picker the operator switched off.
+ *
+ * The policy is empty on purpose — every criterion is optional, so `{}` is an armed policy that
+ * admits its whole startable set. It leaves these cases about the CLAIM, and the narrowing ones
+ * below arm a criterion of their own.
+ */
+function arm(policy: unknown = {}, autonomy = "apply"): void {
+  t.db
+    .update(schema.projects)
+    .set({ settingsJson: JSON.stringify({ pickerPolicy: policy, pickerAutonomy: autonomy }) })
+    .run();
+}
+
+/** The bar the picker's own record clears — read off the shared ladder, never restated here. */
+const PICKER_BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+
+/** Enough released picks for `apply` to be EARNED, written where the release route writes them. */
+function answerPicks(settled = PICKER_BAR.minSettled, accepted = PICKER_BAR.minSettled): void {
+  for (let i = 0; i < settled; i++) {
+    t.db
+      .insert(schema.pickerVerdicts)
+      .values({
+        id: `v${i}`,
+        projectId: "p1",
+        beadId: `answered-${i}`,
+        verdict: i < accepted ? "accepted" : "declined",
+        action: i < accepted ? "release" : "not-now",
+        planId: `plan-${i}`,
+        decidedAt: new Date(NOW - (settled - i) * 60_000),
+      })
+      .run();
+  }
+}
+
+/**
+ * The anton.db with its enqueue knocked out. Layered over the real handle rather than spread from
+ * it: the apply also READS through this db (the stance it re-resolves), and a spread would drop
+ * every method drizzle keeps on the prototype.
+ */
+function brokenDb(): TestDb["db"] {
+  return Object.assign(Object.create(t.db) as TestDb["db"], {
+    transaction: () => {
+      throw new Error("anton.db is gone");
+    },
+  });
+}
+
 let t: TestDb;
 beforeEach(() => {
   board.current = new Map();
@@ -112,6 +163,8 @@ beforeEach(() => {
   pullFails = false;
   pulls = 0;
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: REPO });
+  arm();
+  answerPicks();
   vi.mocked(nudgeSync).mockClear();
   stubBd();
 });
@@ -347,12 +400,7 @@ describe("applyPickerPlan", () => {
     // Otherwise the target is stranded: approved and self-claimed reads as work already under way,
     // to the next pass and to a human alike, with no run behind it.
     put(bead("t1"));
-    const broken = {
-      ...t.db,
-      transaction: () => {
-        throw new Error("anton.db is gone");
-      },
-    };
+    const broken = brokenDb();
 
     const outcome = await applyPickerPlan({
       db: broken as unknown as TestDb["db"],
@@ -371,12 +419,7 @@ describe("applyPickerPlan", () => {
   it("keeps a human's approval when its own enqueue fails", async () => {
     // The label was not ours to take back — a person approved this target and never started it.
     put(bead("t1", { labels: [LABELS.approved] }));
-    const broken = {
-      ...t.db,
-      transaction: () => {
-        throw new Error("anton.db is gone");
-      },
-    };
+    const broken = brokenDb();
 
     await applyPickerPlan({
       db: broken as unknown as TestDb["db"],
@@ -556,6 +599,89 @@ describe("applyPickerPlan", () => {
     expect(read("t1").assignee).toBeUndefined();
   });
 
+  describe("the standing approval behind the start", () => {
+    /** The reason a skip carries, without the cast at every call site. */
+    const why = (outcome: unknown) => (outcome as { skipped: { reason: string } }).skipped.reason;
+
+    it("writes nothing when the picker was moved off apply between the plan and the write", async () => {
+      // The stance was read once, before the ranking. An operator who steps back to `shadow` in that
+      // window has withdrawn the standing approval this start rests on, and the board cannot say so.
+      put(bead("t1"));
+      arm({}, "shadow");
+
+      const outcome = await apply("t1");
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("no longer apply");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("writes nothing when the policy stopped admitting the target before the write", async () => {
+      put(bead("t1", { issue_type: "task" }));
+      arm({ types: ["bug"] });
+
+      const outcome = await apply("t1");
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("no longer admits it");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+    });
+
+    it("writes nothing when the record stopped earning apply before the write", async () => {
+      // The EARNED floor is half the resolution, so it has to bite here exactly as it does where the
+      // pass decided to call the apply at all — a record that degrades mid-pass is a demotion.
+      put(bead("t1"));
+      t.db.delete(schema.pickerVerdicts).run();
+
+      const outcome = await apply("t1");
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("no longer apply");
+      expect(read("t1").assignee).toBeUndefined();
+    });
+
+    it("takes its writes back when the policy is narrowed while the claim settles", async () => {
+      // The window the guard cannot cover: the settle is seconds long, and the approval this start
+      // rests on can be withdrawn inside it as easily as the target can move under it.
+      put(bead("t1", { issue_type: "task" }));
+
+      const outcome = await apply("t1", 1, wired({ sleep: async () => arm({ types: ["bug"] }) }));
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("standing approval was withdrawn");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      // Fail closed, like every other settle refusal: the writes come off so the next pass re-decides.
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("takes its writes back when the picker is moved off apply while the claim settles", async () => {
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired({ sleep: async () => arm({}, "shadow") }));
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("no longer apply");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("judges the settled target with its OWN reservation cleared, not as claimed work", async () => {
+      // The startable projection the policy is evaluated over excludes claimed targets, so a
+      // post-settle check that read the board as written would refuse every start it ever made.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired());
+
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+    });
+  });
+
   it("does not settle a claim it never wrote", async () => {
     // A no-op swap (the target already reads as ours) took no reservation of its own, so there is
     // nothing to prove and no settle window to pay for.
@@ -646,12 +772,7 @@ describe("applyPickerPlan", () => {
     // any worker starts — approved and unclaimed — so the target waits for a person instead.
     put(bead("t1"));
     vi.spyOn(beads, "untag").mockRejectedValue(new Error("bd update timed out"));
-    const broken = {
-      ...t.db,
-      transaction: () => {
-        throw new Error("anton.db is gone");
-      },
-    };
+    const broken = brokenDb();
 
     const outcome = await applyPickerPlan({
       db: broken as unknown as TestDb["db"],

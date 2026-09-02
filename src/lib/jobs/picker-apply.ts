@@ -43,6 +43,9 @@ import type { Bead } from "../beads/types";
 import type { PickerPlanEntry } from "../board-picker-plan";
 import { resolveOperator } from "../operator";
 import { recordPickerStart } from "../picker-starts";
+import { pickerTrackRecord } from "../picker-veto";
+import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "../projects";
+import { armedPickerPolicy } from "./picker-policy";
 import { ineligibility } from "./picker-targets";
 import {
   activeExecuteEpicId,
@@ -102,6 +105,54 @@ export interface PickerApplyInput {
    * mid-teardown — while a test drives them db-directly.
    */
   run?: PickerRunOps;
+  /**
+   * The standing-approval re-check, defaulting to {@link pickerStance} over this pass's own db. A
+   * seam only so a test can drive the withdrawal window without a settings row to race against.
+   */
+  stance?: PickerStanceCheck;
+}
+
+/**
+ * Is the operator's standing approval STILL what this start rests on? Answers with the reason it is
+ * not, or undefined while it holds — the same shape as the board's own exclusions, because to a
+ * reader "the policy stopped admitting it" and "the target stopped being startable" are one question
+ * asked of two sources.
+ */
+export type PickerStanceCheck = (target: Bead, board: Bead[]) => Promise<string | undefined>;
+
+/**
+ * Re-resolve the picker's stance and judge the target against it (PR #218 review).
+ *
+ * `ineligibility` re-asks the BOARD's question under the lock and again after the settle; this asks
+ * the SETTINGS one, which nothing else re-asks. The stance the pass is acting on was read once,
+ * before the ranking, and everything since is a board read, a CAS and a settle window — long enough
+ * for the operator to withdraw the very approval the start stands on. Removing the work policy,
+ * narrowing it past this target, relabelling the target out of it, or moving the picker off `apply`
+ * are all the same act: the standing approval is gone, and a start made on the old one is
+ * unattended work nobody currently sanctions.
+ *
+ * Resolved through `resolvePickerAutonomy`/`resolvePickerPolicy` rather than by re-reading the
+ * stored fields, so both floors — the armed policy and the EARNED record — bite here exactly as they
+ * do where the pass first decided to call the apply at all.
+ */
+export function pickerStance(db: AntonDb, projectId: string): PickerStanceCheck {
+  return async (target, board) => {
+    const settings = await getProjectSettings(db, projectId);
+    const autonomy = resolvePickerAutonomy(settings, await pickerTrackRecord(db, projectId));
+    if (autonomy !== "apply") {
+      return `this project's picker autonomy is no longer apply (now ${autonomy})`;
+    }
+    const armed = resolvePickerPolicy(settings);
+    // Unreachable while `resolvePickerAutonomy` floors an unarmed project to `shadow`; kept because
+    // the two resolutions are separate functions and a start off no policy is the one outcome this
+    // whole gate exists to refuse.
+    if (!armed) return "the work policy behind this start was withdrawn";
+    const verdict = armedPickerPolicy(armed, board).admits(target);
+    if (verdict.admitted) return undefined;
+    return verdict.detail
+      ? `the work policy no longer admits it — ${verdict.detail}`
+      : "the work policy no longer admits it";
+  };
 }
 
 /**
@@ -221,6 +272,7 @@ async function settleClaim(
   repoPath: string,
   beadId: string,
   owner: string,
+  stance: PickerStanceCheck,
   deps: ClaimSettleDeps = {},
 ): Promise<SettleVerdict> {
   // On a shared server the board IS the remote: every leg below that reconciles a local mirror is
@@ -283,11 +335,23 @@ async function settleClaim(
   // feature child inside the settle window while leaving this assignee untouched; the holder check
   // above cannot see any of it, and enqueueing anyway buys a run execute-epic only poison-parks.
   // Judged with the reservation cleared, because the claim under test is the very one we just took —
-  // exactly the assignee leg `staleClaimReason` leaves out for the same reason.
-  const excluded = ineligibility({ ...settled, assignee: undefined }, board);
+  // exactly the assignee leg `staleClaimReason` leaves out for the same reason. The board is cleared
+  // with it: the policy stance below reads the target out of the startable projection, which the
+  // assignee alone would keep it out of.
+  const free = { ...settled, assignee: undefined };
+  const asFree = board.map((b) => (b.id === beadId ? free : b));
+  const excluded = ineligibility(free, asFree);
   if (excluded) {
     const why = excluded.detail ? `${excluded.reason} — ${excluded.detail}` : excluded.reason;
     return { stale: `the target stopped being startable while the claim settled (${why})` };
+  }
+
+  // And the OPERATOR's half of the same question, which no board read can answer (PR #218 review):
+  // the standing approval this start rests on can be withdrawn inside the settle window as easily as
+  // the target can move under it. See {@link pickerStance}.
+  const withdrawn = await stance(free, asFree);
+  if (withdrawn) {
+    return { stale: `the standing approval was withdrawn while the claim settled (${withdrawn})` };
   }
   return { held: true };
 }
@@ -388,6 +452,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     input.run?.enqueueIfAbsent ??
     ((project: string, epic: string) => enqueueExecuteEpicIfAbsent(db, clock, project, epic));
   const resume = input.run?.resume ?? ((jobId: string) => resumeJob(db, clock, jobId));
+  const stance = input.stance ?? pickerStance(db, projectId);
 
   // Publish this pass's writes on EVERY path that made one, not only the started one (PR #218
   // review). A skip is not a no-op once the approval and the claim have landed: unpublished, they
@@ -427,7 +492,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     expectedOwner: undefined,
     nextOwner: operator,
     refresh: refreshFor(repoPath),
-    guard: (locked, board) => {
+    guard: async (locked, board) => {
       // Re-ask the pass's OWN eligibility rule under the lock, not a hand-rolled subset of it: a
       // target claimed, closed, abandoned, blocked, labelled `agent:human` or newly failing the
       // approve gate since the plan was decided must lose here rather than be started on a verdict
@@ -437,6 +502,11 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
         const why = excluded.detail ? `${excluded.reason} — ${excluded.detail}` : excluded.reason;
         return { ineligible: why };
       }
+      // And the stance behind the start, re-resolved here so a withdrawal that lands between the
+      // ranking and the lock costs nothing to honour: the settle re-asks it too, but only this one
+      // refuses BEFORE the approval and the claim are written.
+      const withdrawn = await stance(locked, board);
+      if (withdrawn) return { ineligible: withdrawn };
       wroteLabel = !beads.isApproved(locked);
       return undefined;
     },
@@ -476,7 +546,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // working the same target. Only a swap that actually WROTE is settled — a no-op swap took no
   // reservation of its own to prove.
   if (swap.wrote) {
-    const settled = await settleClaim(repoPath, top.beadId, operator, input.settle);
+    const settled = await settleClaim(repoPath, top.beadId, operator, stance, input.settle);
     if ("lost" in settled) {
       publish();
       return { skipped: { beadId: top.beadId, reason: settled.lost } };

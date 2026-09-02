@@ -83,11 +83,20 @@ export function PickerAutonomySection({
   // promise unattended starts this project is not getting — the setting is still on the row below,
   // said in words, because it is the thing the operator has to be able to account for.
   const floored = stored === "apply" && blocked !== undefined;
-  // Derived from the server's answer, with the pending choice laid over it — not a copy of `stored`
-  // seeded once. Accepting a policy in the panel above re-renders this one with a different
-  // structural floor, and a mirrored state would keep showing the level from before that.
+  // What the server says this picker will do, once both floors are applied.
+  const resolved = floored ? "shadow" : (stored ?? (armed ? "shadow" : "propose"));
+  // The pending choice, laid OVER the server's answer and dropped the moment the server's answer
+  // moves — `router.refresh()` keeps this component's state, so an overlay that outlived the
+  // refresh would go on reporting a level the picker is no longer running at (PR #218 review).
+  // Accepting or removing a policy in the panel above changes the structural floor here, and the
+  // demotion it causes has to reach the control, not just the sentence beside it.
   const [chosen, setChosen] = useState<PickerAutonomy>();
-  const level = chosen ?? (floored ? "shadow" : (stored ?? (armed ? "shadow" : "propose")));
+  const [reconciled, setReconciled] = useState(resolved);
+  if (reconciled !== resolved) {
+    setReconciled(resolved);
+    setChosen(undefined);
+  }
+  const level = chosen ?? resolved;
   const [saving, setSaving] = useState(false);
 
   async function choose(next: PickerAutonomy) {
