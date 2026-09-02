@@ -368,6 +368,10 @@ function holdsOwedRejudge(
  *
  * Plain Error, not a park: the next attempt re-gates from a board that has settled rather than this
  * run arming behind a moving target forever.
+ *
+ * Reached only AFTER {@link retireRelabelledGates} ran for this pass (PR #219 review) — the waits
+ * left standing here are all for tickets a person still owns, which is the state the next attempt
+ * should find.
  */
 function refuseMovingLabels(
   state: HumanTicketPreflightState,
@@ -570,9 +574,13 @@ export async function preflightHumanTickets(args: {
   for (let attempt = 0; ; attempt++) {
     const pass = humanTicketPass(state, ticketsOf(), isResumeSkipped, holdsJudgedOnStaleBoard);
     if (!pass) break;
-    if (attempt >= MAX_HUMAN_TICKET_PASSES) refuseMovingLabels(state, pass);
     armed = true;
+    // Retired BEFORE the budget is judged (PR #219 review). A wait whose ticket stopped being a
+    // person's work is dead whichever way this pass ends, and refusing first strands it: the retry
+    // parks at the readiness gate the gate itself blocks (step 0a-bis), which runs long before this
+    // preflight — so the one code path that could take the wait back is never reached again.
     let wrote = await retireRelabelledGates(state, pass.relabelled);
+    if (attempt >= MAX_HUMAN_TICKET_PASSES) refuseMovingLabels(state, pass);
     const rejudge = holdsOwedRejudge(state, ticketsOf(), isResumeSkipped, holdsJudgedOnStaleBoard);
     holdsJudgedOnStaleBoard = false;
     const landed = await armHumanTicketPass(state, {
