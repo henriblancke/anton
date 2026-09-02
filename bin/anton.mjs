@@ -1995,7 +1995,14 @@ function ensureFreshBuild({
     if (!compiledFrom) return 0;
     const now = readIdentity(appRoot);
     if (sameCheckout(compiledFrom, now)) {
-      writeBuildStamp(appRoot, compiledFrom);
+      // A stamp anton could not write leaves the server running exactly this checkout and unable to
+      // prove it: every drift surface reads the unstamped `.next` as a build nothing can name and
+      // reports the freshly-started server as stale until the next restart. Saying so here is what
+      // tells that false alarm from a real one — the build is fine, the disk is not (PR #217 review).
+      if (!writeBuildStamp(appRoot, compiledFrom)) {
+        console.log(c.yellow("  ! could not write .next/anton-build.json — starting anyway, but nothing can name this build."));
+        console.log(c.dim("    Health and `anton doctor` will call this server unstamped until a restart with a writable .next/"));
+      }
       return 0;
     }
     compiledFrom = now;

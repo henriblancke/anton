@@ -131,15 +131,32 @@ function dbPath(): string | null {
   return root ? join(root, "anton.db") : null;
 }
 
-/**
- * What THIS process booted from, held in memory as the backstop for a record anton could not write.
- * Null in anything that never booted a server — a unit test, a script — which is what keeps those
- * silent: no boot identity and no record on disk means there is no running server to call stale.
- */
-let bootedFrom: BuildIdentity | null = null;
+/** What THIS process booted from, and whether it is the server that runs the scheduled jobs. */
+interface Boot {
+  identity: BuildIdentity;
+  runner: boolean;
+}
 
-/** Whether THIS process runs the scheduled jobs — held with `bootedFrom`, for the same fallback. */
-let bootedRunner: boolean | undefined;
+/**
+ * Anchored on `globalThis` rather than in module scope, for the reason `APP_ROOT_ENV` above is:
+ * Next compiles the instrumentation hook and the request graph into SEPARATE module registries, so
+ * the copy that stamped this at boot is never the copy a health render reads from. A module-level
+ * `let` would therefore hold the boot identity in the one place nothing asks, and the fallback it
+ * exists to be would cover nothing: with the record write failed, the rendering copy finds no
+ * record, a null boot identity, and — since this process is never a candidate in the search beside
+ * the records — no neighbour either, so the page calls a server it cannot name clean (PR #217
+ * review). `Symbol.for` keyed, matching the convention for process-wide state here.
+ */
+const BOOT_KEY = Symbol.for("anton.build.bootedFrom");
+
+/**
+ * The backstop for a record anton could not write. Null in anything that never booted a server — a
+ * unit test, a script — which is what keeps those silent: no boot identity and no record on disk
+ * means there is no running server to call stale.
+ */
+function booted(): Boot | null {
+  return (globalThis as unknown as Record<symbol, Boot | undefined>)[BOOT_KEY] ?? null;
+}
 
 /**
  * How long one read of the code on disk stands. `serverBuildDrift` runs on every health render and
@@ -189,11 +206,11 @@ function onDiskIdentity(): BuildIdentity {
  * servers a stale build is costing anything (PR #217 review).
  */
 export function recordServerBuild({ runner }: { runner: boolean }): void {
-  bootedFrom = bootIdentity();
-  bootedRunner = runner;
+  const identity = bootIdentity();
+  (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner };
   const db = dbPath();
   if (!db) return;
-  writeBuildRecord(buildRecordPath(db), bootedFrom, { appRoot: appRoot(), runner });
+  writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner });
   pruneBuildRecords(db);
 }
 
@@ -274,10 +291,9 @@ function artifactIdentity(): BuildIdentity | null {
  * the one this verdict stands on. Nothing here checks liveness either: the process asking is the
  * process being described.
  *
- * The record is read from disk rather than taken from `bootedFrom` because Next.js bundles the
- * instrumentation hook separately from the request graph, so the module instance that stamped
- * `bootedFrom` at boot is not necessarily this one — the file is the one thing both copies see.
- * `bootedFrom` answers only the case the file cannot: a state dir anton could not write to.
+ * The record is read from disk rather than taken from the boot identity because only the file
+ * carries the boot time a reader dates the drift by. The in-memory copy answers the one case the
+ * file cannot: a state dir anton could not write to.
  *
  * Silent when neither exists. In-process that means nothing here ever booted a server (a test, a
  * script), and inventing an "unstamped" verdict there would put a false warning on the health page
@@ -287,7 +303,7 @@ function artifactIdentity(): BuildIdentity | null {
 export function serverBuildDrift(): BuildDrift | null {
   const db = dbPath();
   const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
-  const running = record ?? bootedFrom;
+  const running = record ?? booted()?.identity ?? null;
   if (!running) return null;
   const verdict = compareBuild(running, onDiskIdentity());
   if (verdict.state === "current") return null;
@@ -318,9 +334,11 @@ let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
  * Liveness is checked here, unlike above: a record of a server that has exited is a leftover, and
  * only the process asking can be assumed to still be up.
  *
- * `bootedFrom` covers this process when the state dir could not be written, the same fallback the
- * per-process read has. A NEIGHBOUR whose record is missing has no such stand-in, so it is found the
- * only way it can be — as a live process of this checkout ({@link unstampedNeighbours}).
+ * The boot identity covers this process when the state dir could not be written, the same fallback
+ * the per-process read has — and it is process-wide, so the copy of this module rendering the page
+ * sees what the copy that booted the server stamped. A NEIGHBOUR whose record is missing has no such
+ * stand-in, so it is found the only way it can be — as a live process of this checkout
+ * ({@link unstampedNeighbours}).
  */
 export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   const now = Date.now();
@@ -340,9 +358,10 @@ async function readServerDrifts(): Promise<ServerDrift[]> {
     const drift = driftOf(record, typeof record.bootedAt === "number" ? record.bootedAt : null);
     if (drift) drifts.push({ pid: record.pid, self: record.pid === process.pid, runner: runsJobs(record), drift });
   }
-  if (bootedFrom && !records.some((record) => record.pid === process.pid)) {
-    const drift = driftOf(bootedFrom, null);
-    if (drift) drifts.push({ pid: process.pid, self: true, runner: bootedRunner, drift });
+  const boot = booted();
+  if (boot && !records.some((record) => record.pid === process.pid)) {
+    const drift = driftOf(boot.identity, null);
+    if (drift) drifts.push({ pid: process.pid, self: true, runner: boot.runner, drift });
   }
   for (const pid of await unstampedNeighbours(root, records)) {
     drifts.push({ pid, self: false, runner: undefined, drift: unstampedDrift() });
@@ -363,8 +382,10 @@ async function readServerDrifts(): Promise<ServerDrift[]> {
  *
  * THIS process is never a candidate, whatever the records say. The search proves a listener is
  * anton's by fetching its page, and a server fetching its own page from inside a render of that page
- * would recurse; the process asking is also the one case a record can never be needed for, since
- * `bootedFrom` already stands in for it.
+ * would recurse; the process asking is also the one case a record can never be needed for, since the
+ * process-wide boot identity already stands in for it — which is exactly why that identity may not
+ * be module state (see {@link BOOT_KEY}): held per registry it would be null here, and dropping the
+ * pid on the strength of a stand-in that does not exist is how an unstamped self goes unreported.
  */
 async function unstampedNeighbours(root: string | null, records: BuildRecord[]): Promise<number[]> {
   if (!root) return [];

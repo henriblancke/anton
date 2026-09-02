@@ -25,9 +25,19 @@ const realDb = process.env.ANTON_DB;
 /** This process's own record — the one file `serverBuildDrift` is judged against. */
 const recordPath = () => join(dir, `server-build.${process.pid}.json`);
 
-/** A fresh module instance per case — `bootedFrom` is module state, and boot is what's under test. */
+/**
+ * A fresh module instance per case, in a process that has not booted a server — and boot is what's
+ * under test. Resetting the registry is not enough to un-boot one: the boot identity is anchored on
+ * `globalThis` precisely so it survives that (it has to cross Next's module registries), so the
+ * anchor is cleared too.
+ */
+function unboot() {
+  delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.bootedFrom")];
+}
+
 function freshModule() {
   vi.resetModules();
+  unboot();
   return import("./drift");
 }
 
@@ -37,6 +47,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  unboot(); // process-wide by design, so it outlives the module registry a case reset
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.useRealTimers();
@@ -421,6 +432,35 @@ describe("serverBuildDrifts", () => {
     expect(drifts).toHaveLength(1);
     expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: true });
     expect(drifts[0].drift.state).toBe("outdated");
+  });
+
+  // The registry split, on the one path the in-memory fallback exists for (PR #217 review): Next
+  // compiles the instrumentation hook and the request graph separately, so the copy of this module
+  // rendering the page is not the copy that booted. Held per module instance, the boot identity is
+  // null in the copy that renders — which, with the record write failed and this process never a
+  // search candidate, leaves the page calling a server it cannot name clean.
+  it("reports the boot identity from the copy of this module that renders the page", async () => {
+    writeFileSync(join(dir, "blocked"), "");
+    process.env.ANTON_DB = join(dir, "blocked", "anton.db");
+
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const instrumentation = await import("./drift");
+    instrumentation.recordServerBuild({ runner: true });
+    expect(existsSync(join(dir, "blocked", `server-build.${process.pid}.json`))).toBe(false);
+
+    onDisk = { version: "0.4.1", revision: null };
+    vi.resetModules(); // the request graph — a second instance of this module, in the same process
+    const requestGraph = await import("./drift");
+
+    const drifts = await requestGraph.serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: true });
+    expect(drifts[0].drift.state).toBe("outdated");
+    expect(drifts[0].drift.running?.version).toBe("0.4.0");
   });
 
   // The upgrade this whole module exists for: a server predating build stamps still up beside the

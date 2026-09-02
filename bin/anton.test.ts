@@ -870,6 +870,27 @@ describe("anton start — the build it will serve", () => {
     expect(stampOf(dir)).toMatchObject(CHECKOUT);
   });
 
+  // A stamp anton could not write leaves a server that IS this checkout unable to prove it, and
+  // every drift surface then reports the freshly-started process as unstamped. Starting is still
+  // right — the code is current — but doing it silently makes that false alarm unreadable.
+  it("starts, saying so, when the stamp cannot be written", async () => {
+    const dir = await dirs.make("anton-app-");
+    writeFileSync(join(dir, ".next"), ""); // a file where the build goes: every write under it fails
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const code = ensureFreshBuild({
+        appRoot: dir,
+        isBundle: false,
+        build: () => 0,
+        readIdentity: reads(CHECKOUT, CHECKOUT),
+      });
+      expect(code).toBe(0);
+      expect(log.mock.calls.flat().join("\n")).toContain("anton-build.json");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("starts without building when .next is already this checkout", async () => {
     const dir = await checkout(CHECKOUT);
     const build = vi.fn(() => 0);
