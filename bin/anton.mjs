@@ -70,6 +70,7 @@ import {
   readBuildIdentity,
   readBuildRecord,
   sameCheckout,
+  sameDirectory,
   writeBuildStamp,
 } from "../src/lib/build/identity.mjs";
 import { createInterface } from "node:readline/promises";
@@ -167,13 +168,74 @@ async function waitForReady(port, timeoutMs = 30000) {
 }
 
 /**
- * Is an anton server answering on `port`? The liveness probe for a SOURCE checkout (anton-pzfb):
- * `anton dev` and source `anton start` run in a terminal and write no pidfile, so a server too old
- * to have left a build record is otherwise invisible — and that first upgrade past this change is
- * exactly the stale server doctor exists to name. Sniffing the title is what keeps the claim
- * honest: any dev server can hold 3000, only anton's answers with anton's page.
+ * The pids listening on `port`: `[]` when nothing is, null when this machine cannot say.
+ *
+ * lsof is the one enumerator present by default on both platforms anton runs on, and its exit
+ * status separates the two answers that must not be confused — 1 with no output is "nothing is
+ * listening", while a missing binary or an error is "no evidence" and must not read as either.
  */
-async function antonAnswering(port) {
+function listeningPids(port) {
+  const r = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  if (r.error) return null;
+  const out = (r.stdout ?? "").trim();
+  if (r.status !== 0) return out ? null : [];
+  return out
+    .split("\n")
+    .map((n) => parseInt(n, 10))
+    .filter((n) => Number.isInteger(n) && n > 0);
+}
+
+/** A running process's working directory, or null when it cannot be read. */
+function processCwd(pid) {
+  try {
+    return realpathSync(`/proc/${pid}/cwd`); // Linux publishes it; macOS has no /proc.
+  } catch {}
+  const r = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  if (r.error || r.status !== 0) return null;
+  const line = (r.stdout ?? "").split("\n").find((l) => l.startsWith("n"));
+  return line ? line.slice(1) : null;
+}
+
+/**
+ * Is the process holding `port` running from THIS checkout?
+ *
+ * The port is shared by every anton on the box, so answering that from the response alone attributes
+ * a neighbouring install's server to this one — a bundle, or a second worktree, serving anton's page
+ * on this checkout's port would be reported as this checkout's unstamped server, with restart
+ * instructions for the wrong install. `dev` and `start` both spawn the server with `cwd: APP_ROOT`
+ * (`runLocal`), so the listener's working directory is the install-specific evidence that closes it.
+ *
+ * Evidence anton cannot gather is not evidence against: a machine without lsof answers no, which
+ * costs the pre-stamp probe and claims nothing — the same trade the pidfile scoping makes, since a
+ * liveness claim about the wrong install is worse than a missing one.
+ */
+function servedFromCheckout(port, appRoot) {
+  const pids = listeningPids(port);
+  if (!pids?.length) return false;
+  return pids.some((pid) => {
+    const cwd = processCwd(pid);
+    return !!cwd && sameDirectory(cwd, appRoot);
+  });
+}
+
+/**
+ * Is an anton server answering on `port`, from this checkout? The liveness probe for a SOURCE
+ * checkout (anton-pzfb): `anton dev` and source `anton start` run in a terminal and write no
+ * pidfile, so a server too old to have left a build record is otherwise invisible — and that first
+ * upgrade past this change is exactly the stale server doctor exists to name.
+ *
+ * Both halves are required, because each rules out a different stranger: the title is what tells
+ * anton's page from any other dev server on the port, and the listener's working directory is what
+ * tells THIS install's server from another anton's (`servedFromCheckout`).
+ */
+async function antonAnswering(port, appRoot = APP_ROOT) {
+  if (!servedFromCheckout(port, appRoot)) return false;
   try {
     const r = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
     if (!r.ok) return false;

@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -203,6 +203,47 @@ describe("readBuildIdentity", () => {
     // By content, like every other input: an edited value is a different build.
     writeFileSync(join(dir, ".env.production"), "NEXT_PUBLIC_API=https://two\n");
     expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
+  // A `textconv` filter is git's OTHER content conversion, documented apart from external diff
+  // drivers — so `--no-ext-diff` alone does not disable it. With one configured, `git diff` compares
+  // the CONVERTED text, and a driver that summarizes (a header, a size, a constant) reports no
+  // change at all: the digest stays "clean" and `anton start` reuses a `.next` compiled from the
+  // previous file.
+  it("digests a tracked edit a configured textconv driver would summarize away", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitattributes"), "*.ts diff=flat\n");
+    // Ignores the path git appends, so both sides of the diff convert to the same text.
+    spawnSync("git", ["-C", dir, "config", "diff.flat.textconv", "sh -c 'echo constant'"]);
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "textconv"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // A build input is often a LINK: `.env.local` pointing at a shared secrets file is the common
+  // setup, and Next inlines what stands at the end of it. Hashing the link text alone would call
+  // the build current after the file behind the link changed.
+  it("follows a symlinked build input to the contents the build reads", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitignore"), ".env*\n");
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "ignore env"]);
+    const shared = join(tempDir(), "secrets.env");
+    writeFileSync(shared, "NEXT_PUBLIC_API=https://one\n");
+    symlinkSync(shared, join(dir, ".env.local"));
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(shared, "NEXT_PUBLIC_API=https://two\n");
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+
+    // A link that leads nowhere is still an input anton can name, so the read stays defined
+    // rather than collapsing the whole digest to null.
+    rmSync(shared);
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
   // .gitignore is what keeps `.next` and node_modules — which every build rewrites — out of the

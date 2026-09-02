@@ -9,7 +9,7 @@
  * `anton-release.test.ts` — over the harness they all share, `anton.fixture.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -363,12 +363,39 @@ describe("anton doctor — stale server build", () => {
     await Promise.all(servers.splice(0).map((s) => new Promise((done) => s.close(done))));
   });
 
-  /** Serve `body` on a free port, so doctor's liveness probe has something real to ask. */
+  /**
+   * Serve `body` on a free port, so doctor's liveness probe has something real to ask.
+   *
+   * In-process on purpose: the probe now also asks WHERE the listener runs from, and this process's
+   * cwd is the checkout doctor is diagnosing — which is what a source-mode `anton dev` looks like.
+   */
   async function serve(body: string): Promise<number> {
     const server = createServer((_req, res) => res.end(body));
     servers.push(server);
     await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
     return (server.address() as { port: number }).port;
+  }
+
+  const strangers: ChildProcess[] = [];
+
+  afterEach(() => {
+    for (const child of strangers.splice(0)) child.kill();
+  });
+
+  /** The same page served from ANOTHER directory — a second anton install holding this port. */
+  async function serveFrom(body: string, cwd: string): Promise<number> {
+    const script =
+      'require("node:http").createServer((_q, r) => r.end(process.env.BODY)).listen(0, "127.0.0.1", function () {\n' +
+      "  console.log(this.address().port);\n" +
+      "});";
+    const child = spawn(process.execPath, ["-e", script], {
+      cwd,
+      env: { ...process.env, BODY: body },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    strangers.push(child);
+    child.stdout.setEncoding("utf8");
+    return new Promise((ready) => child.stdout.once("data", (chunk) => ready(Number(String(chunk).trim()))));
   }
 
   /**
@@ -391,10 +418,11 @@ describe("anton doctor — stale server build", () => {
     const args = recordedPort ? [CLI, "doctor"] : [CLI, "doctor", "--port", String(port)];
     // Spawned ASYNCHRONOUSLY on purpose: doctor probes the port, and `spawnSync` would block this
     // process's event loop — the very loop the stub server above answers from.
-    const child = spawn(process.execPath, args, {
-      cwd: await dirs.make("anton-cwd-"),
-      env: { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state },
-    });
+    // PORT is dropped, not inherited: it outranks the recorded note the way `--port` does, so a
+    // developer's own `PORT=3000` would send the probe at whatever they have running instead.
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state };
+    delete env.PORT;
+    const child = spawn(process.execPath, args, { cwd: await dirs.make("anton-cwd-"), env });
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => (stdout += chunk));
@@ -452,6 +480,16 @@ describe("anton doctor — stale server build", () => {
   // restart a server that was never up.
   it("does not claim another app on the port is a stale anton", async () => {
     const r = await runDoctorWith(null, { port: await serve("<html><head><title>grafana</title></head>") });
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // Any anton can hold the port, and the page it serves is the same page — so the response alone
+  // attributes a neighbouring install's server (a bundle, a second worktree) to this checkout, and
+  // hands the operator restart instructions for an install they are not in.
+  it("does not claim another anton install's server on the port", async () => {
+    const elsewhere = await dirs.make("anton-elsewhere-");
+    const r = await runDoctorWith(null, { port: await serveFrom("<html><head><title>anton</title></head>", elsewhere) });
     expect(r.stdout).toContain("no running server recorded");
     expect(r.stdout).not.toContain("Restart it");
   });

@@ -39,6 +39,7 @@ import {
   readSync,
   readlinkSync,
   realpathSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -90,7 +91,7 @@ function readVersion(appRoot) {
 }
 
 /** Do two paths name the same directory? Resolved, because a symlinked state dir is still that dir. */
-function sameDirectory(a, b) {
+export function sameDirectory(a, b) {
   try {
     return realpathSync(a) === realpathSync(b);
   } catch {
@@ -137,9 +138,11 @@ function git(appRoot, args) {
  * twice reports "M src/x.ts" both times while the artifact falls a whole edit behind.
  *
  * Hence both reads: the diff (`--binary`, so a changed asset is content and not "Binary files
- * differ"; `--no-ext-diff`, so a configured diff driver cannot summarize content away) for what
- * tracked files now say, and the untracked files, which no diff against HEAD can see — a new
- * `page.tsx` changes the build while no tracked file moves.
+ * differ"; `--no-ext-diff` AND `--no-textconv`, because git documents the two conversions
+ * separately and either one — an external driver or a `textconv` filter — can summarize the content
+ * away and leave two different files diffing identically) for what tracked files now say, and the
+ * untracked files, which no diff against HEAD can see — a new `page.tsx` changes the build while no
+ * tracked file moves.
  *
  * Untracked files are digested by CONTENT, not by name: a listing is the same "?? page.tsx" however
  * many times that file is rewritten, which is the same edit-twice blindness the diff exists to close
@@ -153,7 +156,7 @@ function git(appRoot, args) {
 function readWorktreeDigest(appRoot) {
   const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (listed === null) return null;
-  const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "HEAD"]);
+  const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"]);
   if (diff === null) return null;
   const files = [...new Set([...listed.split("\0").filter(Boolean), ...ignoredEnvFiles(appRoot)])].sort();
   if (!files.length && !diff) return WORKTREE_CLEAN;
@@ -195,11 +198,20 @@ function ignoredEnvFiles(appRoot) {
  * One file's contents as a fixed-width digest. A file that cannot be read (it vanished between the
  * listing and the read, or it is a directory symlink) still counted as present under its path, so
  * the marker keeps the digest defined rather than collapsing the whole worktree read to null.
+ *
+ * A symlink is BOTH its target path and what stands at the end of it: `.env.local` pointing at a
+ * shared secrets file is the common shape here, and Next inlines what that file holds at build
+ * time — so hashing the link alone would call the build current after the secrets behind it moved.
+ * The link text stays in the digest because repointing it is a change too; only a link that leads
+ * nowhere readable (dangling, or a directory) stops there.
  */
 function hashFile(path) {
   const hash = createHash("sha256");
   try {
-    if (lstatSync(path).isSymbolicLink()) return hash.update(readlinkSync(path)).digest();
+    if (lstatSync(path).isSymbolicLink()) {
+      hash.update(readlinkSync(path)).update("\0");
+      if (!statSync(path).isFile()) return hash.digest();
+    }
     const fd = openSync(path, "r");
     try {
       const buf = Buffer.allocUnsafe(READ_CHUNK);
