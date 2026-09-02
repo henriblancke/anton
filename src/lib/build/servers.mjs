@@ -312,9 +312,13 @@ export function antonPidFile(stateDir = process.env.ANTON_STATE_DIR ?? join(home
  * SIGTERM and SIGKILL. Killing a stranger is the one outcome here that damages something outside
  * anton; not naming a daemon costs a duplicate `anton start` that fails to bind and says so.
  *
- * That silence is why the two verdicts are separate: an unverifiable file is KEPT, so the daemon is
- * named again by the next read that can prove it, rather than deleted out from under a live server
- * anton could then no longer stop.
+ * That silence is why the THREE verdicts are separate. An unverifiable file is KEPT, so the daemon
+ * is named again by the next read that can prove it, rather than deleted out from under a live
+ * server anton could then no longer stop — and `unverifiable` carries the recorded pid so a caller
+ * can tell that case from a proven-stopped one (PR #217 review). Silence alone reads as "stopped",
+ * which is safe for a reader but not for a lifecycle command: `anton start` would spawn a duplicate
+ * over the live daemon's pidfile, `update` would swap the runtime under it and `uninstall` delete
+ * it. Those callers abort on this field instead.
  *
  * A pidfile carrying no stamp — one written by an older anton, or on a machine that cannot read a
  * birth time at all — still answers on the pid alone: an absence is not evidence, and that is
@@ -325,7 +329,7 @@ export function antonPidFile(stateDir = process.env.ANTON_STATE_DIR ?? join(home
  *
  * @param {string} pidFile
  * @param {(pid: number) => string|null} [startedAtNow] birth-time reader, injectable for tests
- * @returns {{pid: number|null, stale: boolean}}
+ * @returns {{pid: number|null, stale: boolean, unverifiable: number|null}}
  */
 export function pidFileVerdict(pidFile, startedAtNow = processStartedAt) {
   let pid, startedAt;
@@ -335,16 +339,19 @@ export function pidFileVerdict(pidFile, startedAtNow = processStartedAt) {
     startedAt = (startedAt ?? "").trim();
   } catch {
     // Missing or unreadable: nothing was proven, and there is nothing to clear.
-    return { pid: null, stale: false };
+    return { pid: null, stale: false, unverifiable: null };
   }
-  if (!Number.isInteger(pid) || pid <= 0) return { pid: null, stale: true };
+  if (!Number.isInteger(pid) || pid <= 0) return { pid: null, stale: true, unverifiable: null };
   try {
     process.kill(pid, 0); // signal 0 = existence check
   } catch {
-    return { pid: null, stale: true };
+    return { pid: null, stale: true, unverifiable: null };
   }
-  if (!startedAt) return { pid, stale: false };
+  if (!startedAt) return { pid, stale: false, unverifiable: null };
   const now = startedAtNow(pid);
-  if (now === startedAt) return { pid, stale: false };
-  return { pid: null, stale: now !== null };
+  if (now === startedAt) return { pid, stale: false, unverifiable: null };
+  // The birth-time read failed: this pid is alive, and nothing here can say whether it is the
+  // daemon or the stranger the OS handed the number to.
+  if (now === null) return { pid: null, stale: false, unverifiable: pid };
+  return { pid: null, stale: true, unverifiable: null };
 }

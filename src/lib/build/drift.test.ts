@@ -640,6 +640,37 @@ describe("serverBuildDrifts", () => {
     expect(drifts[0].drift.state).toBe("outdated");
   });
 
+  // The other half of that invalidation (PR #217 review): the pre-pull read must not be HANDED to a
+  // caller arriving after the pull either. Withholding it from the cache only spares later renders;
+  // the render that lands inside the window would still be answered with the pre-move verdict.
+  it("does not hand a read started before the checkout moved to a caller arriving after it", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { checkoutMoved, recordServerBuild, serverBuildDrifts } = await import("./drift");
+    recordServerBuild({ runner: true });
+
+    let release: (pids: number[]) => void = () => {};
+    const search = await searchFinds([]);
+    search.mockReturnValueOnce(new Promise<number[]>((resolve) => (release = resolve)));
+    const inflight = serverBuildDrifts();
+
+    onDisk = { version: "0.4.1", revision: null };
+    checkoutMoved(app);
+    const afterPull = serverBuildDrifts(); // a health render one tick behind the nightly's pull
+    release([]);
+
+    expect(await inflight).toEqual([]); // answered as it was taken
+    const drifts = await afterPull;
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0].drift.state).toBe("outdated");
+    expect(search).toHaveBeenCalledTimes(2); // the fresh read, not the inherited one
+  });
+
   // A failed read must not be replayed to every later caller for the rest of the TTL — the next one
   // retries it.
   it("retries after a search that threw rather than caching the failure", async () => {

@@ -104,25 +104,34 @@ describe("the daemon pidfile verdict", () => {
   }
 
   it("answers with the pid while the birth stamp still matches", () => {
-    expect(pidFileVerdict(stamped("born-then"), () => "born-then")).toEqual({ pid: process.pid, stale: false });
+    expect(pidFileVerdict(stamped("born-then"), () => "born-then")).toEqual({
+      pid: process.pid,
+      stale: false,
+      unverifiable: null,
+    });
   });
 
   // The reuse case proven: this number belongs to something else, and the file is the CLI's to clear.
   it("reads a reused pid as stopped and the file as stale", () => {
-    expect(pidFileVerdict(stamped("born-then"), () => "born-now")).toEqual({ pid: null, stale: true });
+    expect(pidFileVerdict(stamped("born-then"), () => "born-now")).toEqual({ pid: null, stale: true, unverifiable: null });
   });
 
   // Unreadable procfs, or a `ps` that failed or timed out. Reuse and liveness are indistinguishable
   // here, so answering would hand `anton stop` a pid it goes on to SIGKILL — but the file is KEPT,
-  // so the next read that CAN prove the stamp still finds the daemon.
+  // so the next read that CAN prove the stamp still finds the daemon. The pid comes back under
+  // `unverifiable` so a lifecycle command can tell this from a proven-stopped daemon (PR #217 review).
   it("names nobody when a stamped pid cannot be revalidated, and keeps the file", () => {
-    expect(pidFileVerdict(stamped("born-then"), () => null)).toEqual({ pid: null, stale: false });
+    expect(pidFileVerdict(stamped("born-then"), () => null)).toEqual({
+      pid: null,
+      stale: false,
+      unverifiable: process.pid,
+    });
   });
 
   // A pidfile written before the stamp existed never claimed one, so there is nothing to revalidate.
   it("still answers on the pid alone for a file that carries no stamp", () => {
     const path = stamped("");
     writeFileSync(path, String(process.pid));
-    expect(pidFileVerdict(path, () => null)).toEqual({ pid: process.pid, stale: false });
+    expect(pidFileVerdict(path, () => null)).toEqual({ pid: process.pid, stale: false, unverifiable: null });
   });
 });

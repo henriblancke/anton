@@ -24,6 +24,7 @@ import {
   resolveAntonDb,
   resolvePort,
   runningPid,
+  unverifiableDaemon,
   unstampedServers,
   writePidFile,
 } from "./anton.mjs";
@@ -438,6 +439,35 @@ describe("the daemon pidfile", () => {
     writeFileSync(path, `${dead.pid}\n`);
     expect(runningPid(path)).toBeNull();
     expect(existsSync(path)).toBe(false);
+  });
+
+  /**
+   * What `anton start`, `anton update` and `anton uninstall` act on (PR #217 review). Those three
+   * read `runningPid`'s silence as "nothing is running" and then do something irreversible to a
+   * daemon that may be alive — spawn a duplicate over its pidfile, swap the runtime under it, delete
+   * it. So the unverifiable case is reported as its own state and they abort instead.
+   */
+  describe("a daemon that cannot be verified either way", () => {
+    it("names the recorded pid so a lifecycle command can refuse to act", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(unverifiableDaemon(path, () => null)).toBe(process.pid);
+    });
+
+    it("names nobody once the read settles it — live, reused, dead, or absent", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(unverifiableDaemon(path)).toBeNull();
+
+      writeFileSync(path, `${process.pid}\na process that has exited\n`);
+      expect(unverifiableDaemon(path)).toBeNull();
+
+      const dead = spawnSync("node", ["-e", "process.exit(0)"]);
+      writeFileSync(path, `${dead.pid}\n`);
+      expect(unverifiableDaemon(path)).toBeNull();
+
+      expect(unverifiableDaemon(join(await dirs.make("anton-state-"), "absent.pid"))).toBeNull();
+    });
   });
 
   /**

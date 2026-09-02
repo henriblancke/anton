@@ -393,8 +393,15 @@ let driftsCache: { at: number; generation: number; drifts: ServerDrift[] } | nul
  * The cache alone only spares the SECOND render: concurrent ones all miss together, and each then
  * fires the whole neighbour search independently — one enumeration of the machine's sockets and a
  * fetch per candidate port, multiplied by the requests in flight.
+ *
+ * Tagged with the generation it started in, because sharing is only correct WITHIN one (PR #217
+ * review): a read that began before `checkoutMoved` fired answers with pre-pull identities, and a
+ * caller arriving after the invalidation would otherwise be handed that promise and shown the
+ * verdict the pull just changed. It is not enough to clear this in `invalidateCaches` — that runs in
+ * whichever module registry called it, and the health page holds its own copy — so the generation
+ * travels with the promise and every registry checks it against the shared counter.
  */
-let inflightDrifts: Promise<ServerDrift[]> | null = null;
+let inflightDrifts: { generation: number; drifts: Promise<ServerDrift[]> } | null = null;
 
 /**
  * Every server of this install that is running something other than the code on disk — empty when
@@ -425,16 +432,20 @@ export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   }
   // Dropped in `finally`, so a read that threw is retried by the next caller rather than replayed
   // to every one of them for the rest of the TTL. The generation is rechecked on the way in, so a
-  // read that STARTED before an invalidation cannot store its pre-move verdict after it.
-  inflightDrifts ??= readServerDrifts()
-    .then((drifts) => {
-      if (cacheGeneration() === generation) driftsCache = { at: Date.now(), generation, drifts };
-      return drifts;
-    })
-    .finally(() => {
-      inflightDrifts = null;
-    });
-  return inflightDrifts;
+  // read that STARTED before an invalidation cannot store its pre-move verdict after it — and is
+  // rechecked on the way out so the drop cannot discard a NEWER read that replaced this one.
+  if (!inflightDrifts || inflightDrifts.generation !== generation) {
+    const drifts = readServerDrifts()
+      .then((drifts) => {
+        if (cacheGeneration() === generation) driftsCache = { at: Date.now(), generation, drifts };
+        return drifts;
+      })
+      .finally(() => {
+        if (inflightDrifts?.generation === generation) inflightDrifts = null;
+      });
+    inflightDrifts = { generation, drifts };
+  }
+  return inflightDrifts.drifts;
 }
 
 async function readServerDrifts(): Promise<ServerDrift[]> {

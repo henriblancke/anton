@@ -210,6 +210,31 @@ function daemonExited(pidFile = PID_FILE, startedAtNow = processStartedAt) {
   return stale || !existsSync(pidFile);
 }
 
+/**
+ * The pid a pidfile names that this machine cannot prove either way — the daemon, or the stranger
+ * the OS handed its number to. Null whenever the read settled it (PR #217 review).
+ *
+ * `runningPid` answers null here, which every lifecycle command below would otherwise read as proof
+ * that nothing is running: `start` spawns a duplicate and overwrites the live daemon's pidfile
+ * (leaving the original unmanageable, while the duplicate dies on the occupied port), `update` swaps
+ * the runtime out from under it and `uninstall` deletes it. None of those are recoverable by the
+ * next read that works, so they refuse to act rather than guess.
+ *
+ * The seam is injectable for the reason `daemonExited`'s is: an unverifiable birth time cannot be
+ * staged over a real process.
+ */
+function unverifiableDaemon(pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  return pidFileVerdict(pidFile, startedAtNow).unverifiable;
+}
+
+/** Say why a lifecycle command refused to act, and what makes it safe to retry. */
+function reportUnverifiableDaemon(pid, action) {
+  console.log(c.yellow(`cannot ${action}: a daemon may still be running (pid ${pid}).`));
+  console.log(c.dim(`  ${PID_FILE} names it, but its birth time could not be reread, so anton cannot tell`));
+  console.log(c.dim("  a live server from a reused pid — and acting would strand it. Re-run once the process"));
+  console.log(c.dim(`  table is readable, or stop that process yourself and delete ${PID_FILE}.`));
+}
+
 /** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
 async function waitForReady(port, timeoutMs = 30000) {
   const url = `http://127.0.0.1:${port}/`;
@@ -733,6 +758,11 @@ function ensureMigrated(opts = {}) {
 
 /** Daemonize `next start` from the bundle, redirecting output to the persistent state log dir. */
 async function startDaemon(args) {
+  const unverifiable = unverifiableDaemon();
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "start");
+    return 1;
+  }
   const running = runningPid();
   const port = resolvePort(args) ?? "3000";
   if (running) {
@@ -828,12 +858,16 @@ async function cmdStop() {
 /** Print install/runtime/state paths and whether the daemon is running. */
 function cmdStatus(args) {
   const pid = runningPid();
+  const unverifiable = pid ? null : unverifiableDaemon();
   const port = serverPort(args, resolveAntonDb());
   console.log(c.bold("anton status"));
   console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
   console.log(`  runtime   ${APP_ROOT}`);
   console.log(`  state     ${STATE_DIR}`);
   if (pid) console.log(`  server    ${c.green("running")}${c.dim(` (pid ${pid}) → http://localhost:${port}`)}`);
+  // "stopped" would be a claim this read cannot make: the pidfile names a live pid whose identity
+  // could not be rechecked, and the lifecycle commands refuse to act on it for the same reason.
+  else if (unverifiable) console.log(`  server    ${c.yellow("unknown")}${c.dim(` (pid ${unverifiable} — birth time unreadable)`)}`);
   else console.log(`  server    ${c.dim("stopped")}`);
   return 0;
 }
@@ -953,6 +987,12 @@ async function cmdUpdate() {
     return 1;
   }
 
+  const unverifiable = unverifiableDaemon();
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "update");
+    rmSync(tmp, { recursive: true, force: true });
+    return 1;
+  }
   const wasRunning = !!runningPid();
   if (wasRunning) await cmdStop();
 
@@ -977,6 +1017,11 @@ async function cmdUpdate() {
 async function cmdUninstall(args = []) {
   if (!IS_BUNDLE) {
     console.log(c.yellow("`anton uninstall` applies to an installed bundle only."));
+    return 1;
+  }
+  const unverifiable = unverifiableDaemon();
+  if (unverifiable) {
+    reportUnverifiableDaemon(unverifiable, "uninstall");
     return 1;
   }
   if (runningPid()) await cmdStop();
@@ -2176,6 +2221,7 @@ export {
   procfsListeningEndpoints,
   runningPid,
   daemonExited,
+  unverifiableDaemon,
   writePidFile,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
