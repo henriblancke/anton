@@ -735,6 +735,29 @@ describe("applyPickerPlan", () => {
       expect(notes).toEqual([]);
     });
 
+    it("takes its writes back when teardown deleted the run while the audit line was writing", async () => {
+      // The same sweep, one await later (PR #218 review): the note and the start log are two more
+      // windows for `abortProject` to delete the row, and a start reported over a run that no longer
+      // exists is the leftover the post-insert check was added to prevent.
+      put(bead("t1"));
+      const controller = new AbortController();
+      vi.spyOn(beads, "note").mockImplementation(async () => {
+        controller.abort();
+        await t.db.delete(schema.jobs);
+        return "";
+      });
+
+      const outcome = await apply("t1", 1, undefined, { signal: controller.signal });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+        "cancelled and its run removed with it",
+      );
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+      expect(await listPickerStarts(t.db, "p1")).toEqual([]);
+    });
+
     it("keeps its writes when the cancel spared the run it enqueued", async () => {
       // Not every cancel is a teardown: a runner stop leaves the queued row behind, and the approval
       // and the claim are exactly what that run needs when it is re-leased.

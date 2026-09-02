@@ -552,7 +552,12 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // run is re-read rather than assumed — gone means the approval and the claim now cover nothing and
   // are ours to take back, exactly as when no run could be started at all. A cancel whose run
   // SURVIVED (a runner stop, a lost lease) leaves real queued work, so those writes stand.
-  if (cancelled(signal) && !activeExecuteEpicId(db, projectId, top.beadId)) {
+  //
+  // Asked at every seam of the audit writes below, not once before them (PR #218 review): each is
+  // another await for teardown to delete the row under, and a pass that slept through one would
+  // answer `started` with the approval and the claim standing over a run that no longer exists.
+  const sweptAway = async (): Promise<PickerApplyOutcome | undefined> => {
+    if (!cancelled(signal) || activeExecuteEpicId(db, projectId, top.beadId)) return undefined;
     const leftover = await unwindStart(repoPath, top.beadId, operator, {
       label: wroteLabel,
       claim: swap.wrote,
@@ -560,7 +565,10 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     publish();
     const reason = withLeftover("the pass was cancelled and its run removed with it", leftover);
     return { skipped: { beadId: top.beadId, reason } };
-  }
+  };
+
+  const sweptBeforeNote = await sweptAway();
+  if (sweptBeforeNote) return sweptBeforeNote;
 
   // The board-native record of the start, written as `policy` so bd's own history says who decided.
   // Best-effort: the run is already enqueued, and failing the pass over the audit line would leave a
@@ -568,6 +576,9 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   await beads
     .note(repoPath, top.beadId, pickerStartNote(top, entries.length), POLICY_ACTOR)
     .catch((e) => console.error(`[picker-apply] could not note the start of ${top.beadId}`, e));
+
+  const sweptDuringNote = await sweptAway();
+  if (sweptDuringNote) return sweptDuringNote;
 
   // The operator-facing half of the same record (anton-vfvg): the note answers a reader already
   // looking at the bead, this answers one who does not yet know anything happened. Best-effort for
@@ -581,6 +592,9 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     rule: top.rule,
     jobId,
   }).catch((e) => console.error(`[picker-apply] could not log the start of ${top.beadId}`, e));
+
+  const sweptDuringLog = await sweptAway();
+  if (sweptDuringLog) return sweptDuringLog;
 
   // Publish the approval and the claim, exactly as the approve route does after its own write.
   publish();

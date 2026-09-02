@@ -266,8 +266,11 @@ function clearsBar(
     const has = settled === 0 ? `no ${words.decided} yet` : so_far;
     return { eligible: false, reason: `${has} — ${unlocks}` };
   }
-  const pct = Math.round((accepted / settled) * 100);
-  if (pct < bar.minAppliedPct) {
+  // Compared by cross multiplication, not on the rounded percentage (PR #218 review): 26/29 is
+  // 89.66% and rounds to 90, which would arm `apply` on a record that never met the bar. Rounding
+  // stays where it belongs — the sentence the operator reads.
+  if (accepted * 100 < bar.minAppliedPct * settled) {
+    const pct = Math.round((accepted / settled) * 100);
     return { eligible: false, reason: `${so_far} (${pct}%) — ${unlocks}` };
   }
   return { eligible: true };

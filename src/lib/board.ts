@@ -228,10 +228,14 @@ async function readPickerStance(project: Project): Promise<PickerStance> {
 async function readPickerLevel(project: Project): Promise<PickerStance> {
   try {
     const db = getDb();
-    const settings = await getProjectSettings(db, project.id);
+    // Two independent reads, so one round trip rather than two on every board view.
+    const [settings, record] = await Promise.all([
+      getProjectSettings(db, project.id),
+      pickerTrackRecord(db, project.id),
+    ]);
     // The EARNED floor rides along (`resolvePickerAutonomy`): a project demoted off `apply` lands on
     // `shadow`, which still offers — the lane is where the record that lifts it back is made.
-    const autonomy = resolvePickerAutonomy(settings, await pickerTrackRecord(db, project.id));
+    const autonomy = resolvePickerAutonomy(settings, record);
     const armed = resolvePickerPolicy(settings);
     return { ...(armed ? { policy: armed } : {}), offers: autonomy !== "propose" };
   } catch (err) {
