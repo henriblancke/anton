@@ -14,7 +14,7 @@
  * fresh board next cadence, when the brakes, the budget and the operator's vetoes have all had a
  * chance to move.
  *
- * Four things this deliberately does NOT do:
+ * Five things this deliberately does NOT do:
  *
  *   • It never takes a target a HUMAN holds. The plan already excludes claimed targets, and the
  *     guard re-asks under the lock — a claim landing in that window loses the target, not the claim.
@@ -23,6 +23,10 @@
  *     won. Losing is a SKIP, never a retry — retrying into a race is how one target becomes two runs.
  *   • It never bypasses the budget. The enqueue asks for no `bypassBudget`, so a governed project
  *     paces a policy start exactly as it paces a queued one.
+ *   • It never outlives its own cancellation. The pass's signal is carried through every seam here,
+ *     not just checked before the call, and the queue verbs run through the runner's quiesce gate —
+ *     so a project being deleted mid-apply gets its writes taken back rather than a run it has to
+ *     sweep and a bead left approved and claimed by anton (see {@link cancelled}).
  *   • It never invents a claim protocol. The bead write-lock and the assignee CAS are the ones the
  *     approve route uses; on an embedded board the mirror they judge is refreshed first (see
  *     {@link refreshFor}), and on every board with a second writer the reservation is settled and
@@ -85,6 +89,32 @@ export interface PickerApplyInput {
   entries: readonly PickerPlanEntry[];
   /** The settle seam — production passes none. See {@link ClaimSettleDeps}. */
   settle?: ClaimSettleDeps;
+  /**
+   * The pass's cancellation, carried THROUGH the apply rather than only checked before it (PR #218
+   * review). The refresh, the settle and the claim are seconds of awaits, and a cancel landing in
+   * them is `abortProject` tearing the project down: the writes this pass has made must come back
+   * off rather than be left on the board of a project that is going away. See {@link cancelled}.
+   */
+  signal?: AbortSignal;
+  /**
+   * The two queue verbs a start needs, injectable exactly as unstick's `EpicResumeOps` is, so the
+   * scheduled pass routes them through the runner singleton — whose quiesce gate refuses a project
+   * mid-teardown — while a test drives them db-directly.
+   */
+  run?: PickerRunOps;
+}
+
+/**
+ * The queue half of a start, behind a seam.
+ *
+ * The raw `./queue` functions insert unconditionally; the runner's methods of the same name check
+ * the project's quiesce barrier FIRST, in the same synchronous step as the insert, so a delete that
+ * raised the barrier cannot have a run slip in behind it (PR #218 review). Only the runner can make
+ * that check atomic — the barrier is its own in-memory set — so the pass takes the verbs from it.
+ */
+export interface PickerRunOps {
+  enqueueIfAbsent(projectId: string, epicBeadId: string): string | undefined;
+  resume(jobId: string): Promise<boolean>;
 }
 
 /**
@@ -317,13 +347,27 @@ function withLeftover(reason: string, leftover: string | undefined): string {
  */
 async function resumeSettledRun(
   db: AntonDb,
-  clock: Clock,
   projectId: string,
   epicBeadId: string,
+  resume: (jobId: string) => Promise<boolean>,
 ): Promise<string | undefined> {
   const resumable = await resumableExecuteEpicId(db, projectId, epicBeadId);
   if (!resumable) return undefined;
-  return (await resumeJob(db, clock, resumable)) ? resumable : undefined;
+  return (await resume(resumable)) ? resumable : undefined;
+}
+
+/**
+ * Whether the pass has been cancelled — asked at every seam that separates two of its writes, not
+ * once before the first (PR #218 review).
+ *
+ * The caller's pre-call gate only proves the pass was live when the apply STARTED. What follows is
+ * seconds of I/O — a mirror refresh, the CAS, the settle window — and a cancel landing anywhere in
+ * it is `abortProject`: the project's queued rows are being deleted, so a run enqueued after it is
+ * one teardown deletes (leaving an approved, anton-claimed bead behind) or one that trips teardown's
+ * own leftover guard. Both are avoided the same way — stop, and take back whatever was written.
+ */
+function cancelled(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
 }
 
 /**
@@ -334,9 +378,16 @@ async function resumeSettledRun(
  * second run behind an overlapping pass, and nothing left half-written when the enqueue falls over.
  */
 export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerApplyOutcome> {
-  const { db, clock, projectId, repoPath, entries } = input;
+  const { db, clock, projectId, repoPath, entries, signal } = input;
   const top = entries[0];
   if (!top) return { skipped: { reason: "the plan ranked nothing to start" } };
+
+  // db-direct by default (a test drives them that way); the scheduled pass is handed the runner's,
+  // which refuse a project mid-teardown. See {@link PickerRunOps}.
+  const enqueueIfAbsent =
+    input.run?.enqueueIfAbsent ??
+    ((project: string, epic: string) => enqueueExecuteEpicIfAbsent(db, clock, project, epic));
+  const resume = input.run?.resume ?? ((jobId: string) => resumeJob(db, clock, jobId));
 
   // Publish this pass's writes on EVERY path that made one, not only the started one (PR #218
   // review). A skip is not a no-op once the approval and the claim have landed: unpublished, they
@@ -354,6 +405,13 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     const reason =
       "this machine has no claim identity to start work under — set ANTON_OPERATOR (or a global " +
       "git user.name)";
+    return { skipped: { beadId: top.beadId, reason } };
+  }
+
+  // The cheapest cancel to honour: nothing is written yet, so a pass cancelled while it resolved its
+  // identity stands down with no board state of its own to take back.
+  if (cancelled(signal)) {
+    const reason = "the pass was cancelled before it claimed anything";
     return { skipped: { beadId: top.beadId, reason } };
   }
 
@@ -438,13 +496,28 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     }
   }
 
+  // The last gate before the irreversible half. Everything above this line is reversible; a run is
+  // not, so a cancel that landed anywhere in the refresh, the CAS or the settle window is spent HERE
+  // rather than on a run teardown would have to delete out from under an approved, claimed bead.
+  if (cancelled(signal)) {
+    const leftover = await unwindStart(repoPath, top.beadId, operator, {
+      label: wroteLabel,
+      claim: swap.wrote,
+    });
+    publish();
+    const reason = withLeftover("the pass was cancelled before its run was enqueued", leftover);
+    return { skipped: { beadId: top.beadId, reason } };
+  }
+
   // The idempotent enqueue, then the resume it cannot do: a run already covering this epic locally
   // withholds an id rather than spawning a second, which is what makes two overlapping passes one
   // run. No `bypassBudget` — a policy start is paced by the governor exactly as a queued one is.
+  // Both verbs go through the runner in production, so a project whose teardown raised the quiesce
+  // barrier throws here instead of being handed a fresh row (caught below, writes taken back).
   let jobId: string | undefined;
   try {
-    jobId = enqueueExecuteEpicIfAbsent(db, clock, projectId, top.beadId);
-    jobId ??= await resumeSettledRun(db, clock, projectId, top.beadId);
+    jobId = enqueueIfAbsent(projectId, top.beadId);
+    jobId ??= await resumeSettledRun(db, projectId, top.beadId, resume);
   } catch (e) {
     console.error(`[picker-apply] could not start a run for ${top.beadId}`, e);
     const leftover = await unwindStart(repoPath, top.beadId, operator, {
@@ -472,6 +545,21 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     }
     publish();
     return { skipped: { beadId: top.beadId, reason: "a run already covers this target" } };
+  }
+
+  // The window on the FAR side of the insert (PR #218 review): a cancel that lands here is teardown
+  // sweeping the project's rows, and the row it deletes may be the one this pass just wrote. So the
+  // run is re-read rather than assumed — gone means the approval and the claim now cover nothing and
+  // are ours to take back, exactly as when no run could be started at all. A cancel whose run
+  // SURVIVED (a runner stop, a lost lease) leaves real queued work, so those writes stand.
+  if (cancelled(signal) && !activeExecuteEpicId(db, projectId, top.beadId)) {
+    const leftover = await unwindStart(repoPath, top.beadId, operator, {
+      label: wroteLabel,
+      claim: swap.wrote,
+    });
+    publish();
+    const reason = withLeftover("the pass was cancelled and its run removed with it", leftover);
+    return { skipped: { beadId: top.beadId, reason } };
   }
 
   // The board-native record of the start, written as `policy` so bd's own history says who decided.

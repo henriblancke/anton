@@ -490,6 +490,20 @@ describe("makeBoardPickerHandler", () => {
     expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 2)" });
   });
 
+  it("hands the start its cancellation and the runner's queue verbs", async () => {
+    // The pre-call abort gate only proves the pass was live when the apply began (PR #218 review):
+    // the apply itself spends seconds on `bd`, so it needs the signal to re-ask at its own seams —
+    // and the runner's enqueue, whose quiesce barrier refuses a project mid-teardown.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const run = { enqueueIfAbsent: () => undefined, resume: async () => false };
+    const ctx = fakeCtx();
+
+    await makeBoardPickerHandler({ db: t.db, clock, run })(ctx);
+
+    expect(applyPickerPlan.mock.calls[0][0]).toMatchObject({ signal: ctx.signal, run });
+  });
+
   it("restamps the plan against the board its own start rewrote", async () => {
     // R3.5's apply lane is a LIVE PREVIEW: the start writes `approved` and the assignee, both inputs
     // to the plan's freshness fence, so the row saved before it reads stale the instant it lands —

@@ -164,7 +164,20 @@ export function getRunner(): JobRunner {
   runner.registerHandler("gate-check", makeGateCheckHandler({ db }));
   runner.registerHandler("gardener", makeGardenerHandler({ db }));
   runner.registerHandler("product-master", makeProductMasterHandler({ db }));
-  runner.registerHandler("board-picker", makeBoardPickerHandler({ db }));
+  // The picker's start is the one scheduled path that inserts an execute-epic row, so its queue
+  // verbs go through the runner: the quiesce barrier a project deletion raises is checked in the
+  // same synchronous step as the insert, which db-direct verbs cannot do.
+  runner.registerHandler(
+    "board-picker",
+    makeBoardPickerHandler({
+      db,
+      run: {
+        enqueueIfAbsent: (projectId, epicBeadId) =>
+          runner.enqueueExecuteEpicIfAbsent(projectId, epicBeadId),
+        resume: (jobId) => runner.resume(jobId),
+      },
+    }),
+  );
   runner.registerHandler("worktree-reaper", makeWorktreeReaperHandler({ db }));
   s.runner = runner;
   return runner;

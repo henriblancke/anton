@@ -40,7 +40,12 @@ import {
   resolvePickerPolicy,
 } from "../projects";
 import { PoisonError } from "./errors";
-import { applyPickerPlan, type PickerApplyInput, type PickerApplyOutcome } from "./picker-apply";
+import {
+  applyPickerPlan,
+  type PickerApplyInput,
+  type PickerApplyOutcome,
+  type PickerRunOps,
+} from "./picker-apply";
 import { checkFailureStreak } from "./picker-failure-breaker";
 import { checkScoreSlide } from "./picker-score-breaker";
 import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
@@ -67,6 +72,12 @@ export interface BoardPickerDeps {
    * don't need `gh`; the default is the real read-only `gh pr view`, as run-health uses.
    */
   readPrActivity?: ReadPrActivity;
+  /**
+   * How a start reaches the queue. Wired to the runner in `service.ts` so an apply racing project
+   * deletion is refused by the same quiesce barrier every other enqueue path crosses; a test that
+   * passes none gets the db-direct verbs. See {@link PickerRunOps}.
+   */
+  run?: PickerRunOps;
 }
 
 /** Build the runner handler. Register it as the "board-picker" handler. */
@@ -188,6 +199,11 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
         projectId,
         repoPath: project.repoPath,
         entries: decision.entries,
+        // The gate above only proves the pass was live when the apply began; the apply itself spends
+        // seconds on `bd`, so it re-asks at every seam and unwinds its own writes when a cancel wins
+        // (PR #218 review).
+        signal: ctx.signal,
+        ...(deps.run ? { run: deps.run } : {}),
       });
       // The start rewrote the very board the plan above was stamped from — the assignee and the
       // `approved` label are both inputs to that fence (`stampBoard`) — so the row just saved now

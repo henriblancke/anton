@@ -17,8 +17,13 @@ import type { TestDb } from "../db/testing";
 import { makeProjectDb } from "@/lib/testing/project";
 import { nudgeSync } from "../beads/sync-nudge";
 import { listPickerStarts } from "../picker-starts";
-import { applyPickerPlan, POLICY_ACTOR, type ClaimSettleDeps } from "./picker-apply";
-import type { Clock } from "./queue";
+import {
+  applyPickerPlan,
+  POLICY_ACTOR,
+  type ClaimSettleDeps,
+  type PickerApplyInput,
+} from "./picker-apply";
+import { enqueueExecuteEpicIfAbsent, type Clock } from "./queue";
 
 const REPO = "/tmp/picker-apply";
 const NOW = 1_800_000_000_000;
@@ -117,7 +122,12 @@ afterEach(() => {
 });
 
 /** One apply pass over a plan whose top pick is `beadId`. */
-function apply(beadId: string, ranked = 1, settle?: ClaimSettleDeps) {
+function apply(
+  beadId: string,
+  ranked = 1,
+  settle?: ClaimSettleDeps,
+  over: Pick<PickerApplyInput, "signal" | "run"> = {},
+) {
   const entries = [{ beadId, rank: 1, rule: "the work policy armed on this machine" }];
   for (let i = 2; i <= ranked; i += 1) {
     entries.push({ beadId: `filler-${i}`, rank: i, rule: "the work policy armed on this machine" });
@@ -129,6 +139,7 @@ function apply(beadId: string, ranked = 1, settle?: ClaimSettleDeps) {
     repoPath: REPO,
     entries,
     ...(settle ? { settle } : {}),
+    ...over,
   });
 }
 
@@ -655,5 +666,121 @@ describe("applyPickerPlan", () => {
     );
     expect(read("t1").labels).toContain(LABELS.approved);
     expect(read("t1").assignee).toBe("anton-box");
+  });
+
+  describe("cancellation", () => {
+    // The pass's own signal, carried THROUGH the apply (PR #218 review). A cancel here is
+    // `abortProject`: the project's rows are being deleted, so anything this pass wrote to the real
+    // board has to come back off rather than outlive the project it was written for.
+
+    it("writes nothing at all when the pass is already cancelled", async () => {
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, undefined, { signal: AbortSignal.abort() });
+
+      expect(outcome).toMatchObject({
+        skipped: { beadId: "t1", reason: "the pass was cancelled before it claimed anything" },
+      });
+      // Not even the mirror refresh: the stand-down is before the CAS, so nothing was read or written.
+      expect(pulls).toBe(0);
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(await jobs()).toHaveLength(0);
+    });
+
+    it("takes its writes back when the cancel lands while the claim settles", async () => {
+      // The window the pre-call gate cannot cover: the label and the claim are already on the board
+      // when teardown starts, and the enqueue that would justify them has not happened yet.
+      put(bead("t1"));
+      const controller = new AbortController();
+
+      const outcome = await apply("t1", 1, wired({ sleep: async () => controller.abort() }), {
+        signal: controller.signal,
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+        "cancelled before its run was enqueued",
+      );
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(nudgeSync).toHaveBeenCalled();
+    });
+
+    it("takes its writes back when teardown deleted the run it had just enqueued", async () => {
+      // The far side of the insert: `abortProject` sweeps the project's rows, and the row it deletes
+      // is this pass's own. Left standing, the approval and the claim would cover nothing.
+      put(bead("t1"));
+      const controller = new AbortController();
+
+      const outcome = await apply("t1", 1, undefined, {
+        signal: controller.signal,
+        run: {
+          enqueueIfAbsent: () => {
+            controller.abort();
+            return "job-swept-by-teardown";
+          },
+          resume: async () => false,
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+        "cancelled and its run removed with it",
+      );
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+      expect(notes).toEqual([]);
+    });
+
+    it("keeps its writes when the cancel spared the run it enqueued", async () => {
+      // Not every cancel is a teardown: a runner stop leaves the queued row behind, and the approval
+      // and the claim are exactly what that run needs when it is re-leased.
+      put(bead("t1"));
+      const controller = new AbortController();
+
+      const outcome = await apply("t1", 1, undefined, {
+        signal: controller.signal,
+        run: {
+          enqueueIfAbsent: (projectId, epicBeadId) => {
+            const id = enqueueExecuteEpicIfAbsent(t.db, clock, projectId, epicBeadId);
+            controller.abort();
+            return id;
+          },
+          resume: async () => false,
+        },
+      });
+
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+      expect(read("t1").assignee).toBe("anton-box");
+      expect(read("t1").labels).toContain(LABELS.approved);
+      expect(await jobs()).toHaveLength(1);
+    });
+
+    it("takes its writes back when the enqueue is refused for a project being deleted", async () => {
+      // The quiesce barrier the runner's verbs add: a raw db-direct insert would strand an
+      // execute-epic row in a project mid-teardown, and the bead approved and claimed beside it.
+      put(bead("t1"));
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const outcome = await apply("t1", 1, undefined, {
+        run: {
+          enqueueIfAbsent: () => {
+            throw new Error("Project is being deleted: p1");
+          },
+          resume: async () => false,
+        },
+      });
+
+      expect(outcome).toMatchObject({
+        skipped: { beadId: "t1", reason: "the run could not be enqueued" },
+      });
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+      expect(await jobs()).toHaveLength(0);
+      error.mockRestore();
+    });
   });
 });
