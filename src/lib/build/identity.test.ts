@@ -772,6 +772,36 @@ describe("a checkout whose git identity cannot be read", () => {
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
     expect(readBuildIdentity(dir, {}).revision).toBeNull();
   });
+
+  /**
+   * A `git init` with nothing committed fails `rev-parse HEAD` exactly as a corrupt repository
+   * does, and reading it as unreadable left the checkout with no digest of any kind: `sameCheckout`
+   * then rejected its own pre/post-build identities, so `anton start` built three times and refused
+   * to start (PR #217 review).
+   */
+  it("reads a checkout with no commit yet as having none, and digests its source", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    writeFileSync(join(dir, "src.ts"), SOURCE);
+    spawnSync("git", ["init", "-q", dir]);
+
+    const identity = readBuildIdentity(dir, {});
+    expect(identity.revision).toBeNull();
+    expect(identity.worktree).toBeNull(); // nothing to diff an unborn HEAD against
+    expect(identity.source).toMatch(/^[0-9a-f]{12}$/);
+    // Which is what makes it buildable: two reads of an unchanged tree are the same checkout.
+    expect(sameCheckout(identity, readBuildIdentity(dir, {}))).toBe(true);
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir, {}).source).not.toBe(identity.source);
+  });
+
+  it("goes back to reading the commit once that checkout has one", () => {
+    const dir = gitCheckout();
+    const identity = readBuildIdentity(dir, {});
+    expect(identity.revision).toMatch(/^[0-9a-f]{7,64}$/);
+    expect(identity.source).toBeNull();
+  });
 });
 
 // An install with no `.git` — an extracted source tarball, or the `npm i -g anton` the README

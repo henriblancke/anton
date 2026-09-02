@@ -166,6 +166,28 @@ function booted(): Boot | null {
 }
 
 /**
+ * How many times anything in this process has invalidated a cached read — held on `globalThis`, for
+ * the reason `BOOT_KEY` is (PR #217 review).
+ *
+ * The caches below are module-local, and Next compiles the instrumentation hook and the request
+ * graph into SEPARATE module registries: the copy the nightly runner calls `checkoutMoved` on is not
+ * the copy that renders the health page. Clearing only the caller's own caches therefore leaves the
+ * request graph serving its pre-pull verdict for the rest of the TTL — the stale server hidden on
+ * the exact pass whose answer changed. A counter both registries read makes one invalidation reach
+ * every cached read in the process.
+ */
+const GENERATION_KEY = Symbol.for("anton.build.cacheGeneration");
+
+function cacheGeneration(): number {
+  return (globalThis as unknown as Record<symbol, number | undefined>)[GENERATION_KEY] ?? 0;
+}
+
+/** Retire every cached read in this process, in whichever registry holds it. */
+function invalidateCaches(): void {
+  (globalThis as unknown as Record<symbol, number>)[GENERATION_KEY] = cacheGeneration() + 1;
+}
+
+/**
  * How long one read of the code on disk stands. `serverBuildDrift` runs on every health render and
  * `readBuildIdentity` spawns git SYNCHRONOUSLY — six reads at minimum on a clean-path miss (the
  * revision, the untracked listing, the diff, the tracked listing, the merged config naming the
@@ -178,16 +200,19 @@ function booted(): Boot | null {
  */
 const ON_DISK_TTL_MS = 15_000;
 
-let onDiskCache: { at: number; identity: BuildIdentity } | null = null;
+let onDiskCache: { at: number; generation: number; identity: BuildIdentity } | null = null;
 
 function onDiskIdentity(): BuildIdentity {
   const now = Date.now();
-  if (onDiskCache && now - onDiskCache.at < ON_DISK_TTL_MS) return onDiskCache.identity;
+  const generation = cacheGeneration();
+  if (onDiskCache && onDiskCache.generation === generation && now - onDiskCache.at < ON_DISK_TTL_MS) {
+    return onDiskCache.identity;
+  }
   const root = appRoot();
   const identity = root
     ? (readBuildIdentity(root) as BuildIdentity)
     : { version: null, revision: null, worktree: null, source: null, env: null };
-  onDiskCache = { at: now, identity };
+  onDiskCache = { at: now, generation, identity };
   return identity;
 }
 
@@ -209,14 +234,16 @@ function onDiskIdentity(): BuildIdentity {
  * through one — `~/src/anton -> /Volumes/work/anton` — spells the same directory differently here.
  * Read as another project, the pull would leave the pre-pull read cached and the scan firing inside
  * the TTL would omit the stale-server warning: the exact silence this exists to end.
+ *
+ * The invalidation is process-wide rather than module-local (PR #217 review): the runner calling
+ * this and the request graph rendering the health page hold separate copies of this module, so
+ * clearing only these variables would leave the page answering from its own pre-pull cache.
  */
 export function checkoutMoved(repoPath: string): void {
   const root = appRoot();
   if (!root) return;
   if (resolve(repoPath) !== resolve(root) && !sameDirectory(repoPath, root)) return;
-  onDiskCache = null;
-  driftsCache = null;
-  driftsGeneration += 1;
+  invalidateCaches();
 }
 
 /**
@@ -359,7 +386,7 @@ export function serverBuildDrift(): BuildDrift | null {
  * prove it alive, plus one enumeration of the machine's listening sockets and a fetch per candidate
  * to find the servers no record names.
  */
-let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
+let driftsCache: { at: number; generation: number; drifts: ServerDrift[] } | null = null;
 
 /**
  * The read currently running, shared with every caller that arrives while it does (PR #217 review).
@@ -368,14 +395,6 @@ let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
  * fetch per candidate port, multiplied by the requests in flight.
  */
 let inflightDrifts: Promise<ServerDrift[]> | null = null;
-
-/**
- * Bumped by every invalidation, so a read that STARTED before one cannot store its result after it
- * (PR #217 review). `checkoutMoved` clears the cache, but a read already in flight resolves later
- * and would write the pre-move verdict straight back — leaving the health page calling a
- * now-stale server current for the rest of the TTL, on the exact pass whose answer changed.
- */
-let driftsGeneration = 0;
 
 /**
  * Every server of this install that is running something other than the code on disk — empty when
@@ -400,13 +419,16 @@ let driftsGeneration = 0;
  */
 export async function serverBuildDrifts(): Promise<ServerDrift[]> {
   const now = Date.now();
-  if (driftsCache && now - driftsCache.at < ON_DISK_TTL_MS) return driftsCache.drifts;
-  const generation = driftsGeneration;
+  const generation = cacheGeneration();
+  if (driftsCache && driftsCache.generation === generation && now - driftsCache.at < ON_DISK_TTL_MS) {
+    return driftsCache.drifts;
+  }
   // Dropped in `finally`, so a read that threw is retried by the next caller rather than replayed
-  // to every one of them for the rest of the TTL.
+  // to every one of them for the rest of the TTL. The generation is rechecked on the way in, so a
+  // read that STARTED before an invalidation cannot store its pre-move verdict after it.
   inflightDrifts ??= readServerDrifts()
     .then((drifts) => {
-      if (driftsGeneration === generation) driftsCache = { at: Date.now(), drifts };
+      if (cacheGeneration() === generation) driftsCache = { at: Date.now(), generation, drifts };
       return drifts;
     })
     .finally(() => {

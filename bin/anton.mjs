@@ -192,6 +192,24 @@ function runningPid(pidFile = PID_FILE) {
   return pid;
 }
 
+/**
+ * Has the daemon PROVEN gone? True only where the pidfile is stale — the recorded process is dead,
+ * or the pid now names something born after it — or where the file is no longer there at all.
+ *
+ * `runningPid` returning null is NOT that proof (PR #217 review). A stamped pid whose birth time
+ * cannot be reread answers null while the daemon may be perfectly alive, and `cmdStop` reading that
+ * as death would skip the rest of its wait and its SIGKILL and then delete the pidfile — leaving a
+ * live daemon no later `anton stop` can find. So death is asserted, never inferred from silence.
+ *
+ * Both seams are injectable for the reason `runningPid`'s path is: an unverifiable birth time
+ * cannot be staged over a real process.
+ */
+function daemonExited(pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid, stale } = pidFileVerdict(pidFile, startedAtNow);
+  if (pid !== null) return false;
+  return stale || !existsSync(pidFile);
+}
+
 /** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
 async function waitForReady(port, timeoutMs = 30000) {
   const url = `http://127.0.0.1:${port}/`;
@@ -775,7 +793,16 @@ async function startDaemon(args) {
   return 0;
 }
 
-/** Stop the running daemon (SIGTERM, then SIGKILL if it lingers). */
+/**
+ * Stop the running daemon (SIGTERM, then SIGKILL if it lingers).
+ *
+ * Every step waits on `daemonExited` rather than on `runningPid` going quiet, and the pidfile is
+ * deleted only once that proves the daemon dead (PR #217 review): a birth-time read that fails
+ * mid-wait makes a live daemon unnameable, and treating that as its exit would drop the SIGKILL and
+ * then remove the one record of the process still holding the port. Keeping the file leaves it for
+ * the next `anton stop` to find; the operator is told rather than shown a green tick over a server
+ * that never stopped.
+ */
 async function cmdStop() {
   const pid = runningPid();
   if (!pid) {
@@ -783,9 +810,15 @@ async function cmdStop() {
     return 0;
   }
   try { process.kill(pid, "SIGTERM"); } catch {}
-  for (let i = 0; i < 20 && runningPid(); i++) await sleep(150); // up to ~3s grace
-  if (runningPid()) {
+  for (let i = 0; i < 20 && !daemonExited(); i++) await sleep(150); // up to ~3s grace
+  if (!daemonExited()) {
     try { process.kill(pid, "SIGKILL"); } catch {}
+    for (let i = 0; i < 10 && !daemonExited(); i++) await sleep(100); // let the kill land
+  }
+  if (!daemonExited()) {
+    console.log(c.yellow(`could not confirm anton stopped (pid ${pid})`) + c.dim(` — keeping ${PID_FILE}`));
+    console.log(c.dim("  Its birth time could not be reread, so the pid may not be anton's. Re-run `anton stop`."));
+    return 1;
   }
   try { unlinkSync(PID_FILE); } catch {}
   console.log(c.green("✓ anton stopped") + c.dim(` (pid ${pid})`));
@@ -2142,6 +2175,7 @@ export {
   unstampedServers,
   procfsListeningEndpoints,
   runningPid,
+  daemonExited,
   writePidFile,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,

@@ -154,8 +154,9 @@ export function sameDirectory(a, b) {
 
 /**
  * The commit `appRoot` ITSELF holds, `REVISION_UNREADABLE` when it is a checkout git could not read,
- * or null when it is not the root of a git checkout (every installed bundle — a release tarball
- * carries no .git, and its RELEASE_VERSION already identifies it exactly).
+ * or null when it holds no commit to name — it is not the root of a git checkout (every installed
+ * bundle — a release tarball carries no .git, and its RELEASE_VERSION already identifies it
+ * exactly), or it is one whose first commit has yet to be made (see `unbornHead`).
  *
  * The toplevel check is what makes that "itself": `git rev-parse` walks UP the tree until it finds
  * any repository, so a bundle installed under a git-tracked $HOME would otherwise report the
@@ -188,11 +189,35 @@ function isCheckout(dir) {
 }
 
 /**
- * What a failed revision read MEANS: `REVISION_UNREADABLE` where `appRoot` holds a `.git` of its
- * own, else null.
+ * Is `appRoot` a checkout git reads perfectly well that simply has no commit yet? `git init` with
+ * nothing committed leaves HEAD pointing at a branch that does not exist, and `rev-parse HEAD`
+ * fails on it exactly as a corrupt repository does.
+ *
+ * The two have to be told apart (PR #217 review). Read as unreadable, a fresh checkout gets no
+ * revision, no worktree digest and — because that field is read only where there is no commit at
+ * all — no source digest either, so `sameCheckout` rejects its own pre/post-build identities and
+ * `anton start` rebuilds three times and then refuses to start.
+ *
+ * A symbolic HEAD that resolves to nothing is what makes it unborn rather than broken: a git that
+ * cannot read the repository fails both reads, and a detached HEAD is not symbolic.
+ */
+function unbornHead(appRoot) {
+  const top = git(appRoot, ["rev-parse", "--show-toplevel"]);
+  if (top === null || !sameDirectory(top.trim(), appRoot)) return false;
+  return (
+    git(appRoot, ["symbolic-ref", "--quiet", "HEAD"]) !== null &&
+    git(appRoot, ["rev-parse", "--verify", "--quiet", "HEAD"]) === null
+  );
+}
+
+/**
+ * What a failed revision read MEANS: null where there is no commit to name — no `.git` of its own,
+ * or a checkout whose first commit has yet to be made — and `REVISION_UNREADABLE` where there is
+ * one this git could not read.
  */
 function unreadableOrAbsent(appRoot) {
-  return isCheckout(appRoot) ? REVISION_UNREADABLE : null;
+  if (!isCheckout(appRoot)) return null;
+  return unbornHead(appRoot) ? null : REVISION_UNREADABLE;
 }
 
 /** The commit a read can actually name — an unreadable one is no evidence, not a different sha. */

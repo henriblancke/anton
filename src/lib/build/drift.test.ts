@@ -544,6 +544,33 @@ describe("serverBuildDrifts", () => {
     expect(drifts[0].drift.running?.version).toBe("0.4.0");
   });
 
+  // The other half of that split (PR #217 review): only the instrumentation graph ever calls
+  // `checkoutMoved` — the nightly runner lives there — while the health page answers from the
+  // request graph's own module-local caches. Cleared per instance, the page keeps handing back its
+  // pre-pull verdict for the rest of the TTL, hiding the stale server the pull just created.
+  it("invalidates the caches of the OTHER module registry when the checkout moves", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const instrumentation = await import("./drift");
+    instrumentation.recordServerBuild({ runner: true });
+
+    vi.resetModules(); // the request graph, with caches of its own
+    const requestGraph = await import("./drift");
+    expect(await requestGraph.serverBuildDrifts()).toEqual([]); // cached by the page, pre-pull
+
+    onDisk = { version: "0.4.1", revision: null };
+    instrumentation.checkoutMoved(app); // the nightly's own fast-forward, in the runner's graph
+
+    const drifts = await requestGraph.serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0].drift.state).toBe("outdated");
+  });
+
   // The upgrade this whole module exists for: a server predating build stamps still up beside the
   // current one, with no record to its name. Reading records alone, this page calls the install
   // clean while that process goes on running the nightlies from code that shipped days ago.

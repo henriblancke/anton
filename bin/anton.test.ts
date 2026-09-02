@@ -17,6 +17,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileS
 
 import {
   agentsFromArgs,
+  daemonExited,
   ensureFreshBuild,
   nextArgs,
   procfsListeningEndpoints,
@@ -437,6 +438,39 @@ describe("the daemon pidfile", () => {
     writeFileSync(path, `${dead.pid}\n`);
     expect(runningPid(path)).toBeNull();
     expect(existsSync(path)).toBe(false);
+  });
+
+  /**
+   * What `anton stop` acts on. `runningPid` going quiet is not the daemon exiting: a birth time
+   * that cannot be reread mid-wait leaves a live daemon unnameable, and stop reading that as death
+   * would drop its SIGKILL and delete the pidfile — stranding a server no later stop can find
+   * (PR #217 review).
+   */
+  describe("proving the daemon gone", () => {
+    it("is not proven by a pid that is merely unverifiable", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(daemonExited(path, () => null)).toBe(false);
+      expect(existsSync(path)).toBe(true); // and so the file `anton stop` needs is still there
+    });
+
+    it("is not proven while the recorded process is still the one running", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(daemonExited(path)).toBe(false);
+    });
+
+    it("is proven by a dead pid, by a reused one, and by a file that is gone", async () => {
+      const path = await pidFile();
+      const dead = spawnSync("node", ["-e", "process.exit(0)"]);
+      writeFileSync(path, `${dead.pid}\n`);
+      expect(daemonExited(path)).toBe(true);
+
+      writeFileSync(path, `${process.pid}\na process that has exited\n`);
+      expect(daemonExited(path)).toBe(true);
+
+      expect(daemonExited(join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);
+    });
   });
 });
 
