@@ -26,7 +26,8 @@
  *   • It never outlives its own cancellation. The pass's signal is carried through every seam here,
  *     not just checked before the call, and the queue verbs run through the runner's quiesce gate —
  *     so a project being deleted mid-apply gets its writes taken back rather than a run it has to
- *     sweep and a bead left approved and claimed by anton (see {@link cancelled}).
+ *     sweep and a bead left approved and claimed by anton (see {@link cancelled}) — and the same
+ *     check is handed back for the awaits the CALLER spends after a start (see {@link ConfirmStart}).
  *   • It never invents a claim protocol. The bead write-lock and the assignee CAS are the ones the
  *     approve route uses; on an embedded board the mirror they judge is refreshed first (see
  *     {@link refreshFor}), and on every board with a second writer the reservation is settled and
@@ -72,13 +73,38 @@ export interface PickerStart {
 }
 
 /**
+ * Why a pass started nothing, and whether it left anything behind.
+ *
+ * `wroteBoard` is the caller's cue that this skip still moved the board (PR #218 review): a target
+ * an already-live run covers keeps the approval and the claim, and an unwind that could not finish
+ * leaves part of them. Both are inputs to the plan's freshness fence, so a caller that stamped a
+ * plan before the apply has to re-stamp it exactly as it does after a start.
+ */
+export interface PickerSkip {
+  beadId?: string;
+  reason: string;
+  wroteBoard?: boolean;
+}
+
+/**
+ * Re-ask the teardown question once the CALLER's own post-start awaits are done (PR #218 review).
+ *
+ * `applyPickerPlan` re-checks the sweep at every seam of its own audit writes, but its last check is
+ * still before it returns — and the caller then spends a board read of its own restamping the plan.
+ * A cancel landing in that window is `abortProject` deleting the run this pass just enqueued, which
+ * would leave the approval and the claim standing over nothing. Answers with the skip the pass
+ * became, or undefined while the run stands.
+ */
+export type ConfirmStart = () => Promise<PickerApplyOutcome | undefined>;
+
+/**
  * One apply pass's outcome. A skip is a VALUE and carries its reason: a pass that starts nothing is
  * the common case (a moved board, a claim lost, a run already covering the target), and it has to be
  * readable in the log without being an error.
  */
 export type PickerApplyOutcome =
-  | { started: PickerStart }
-  | { skipped: { beadId?: string; reason: string } };
+  | { started: PickerStart; confirmStart: ConfirmStart }
+  | { skipped: PickerSkip };
 
 /** Why the under-lock guard abandoned the start — see {@link applyPickerPlan}. */
 type StartRefusal = { stale: string } | { ineligible: string };
@@ -544,7 +570,13 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     });
     publish();
     const reason = `the target could not be approved (${swap.approveFailed})`;
-    return { skipped: { beadId: top.beadId, reason: withLeftover(reason, leftover) } };
+    return {
+      skipped: {
+        beadId: top.beadId,
+        reason: withLeftover(reason, leftover),
+        wroteBoard: leftover !== undefined,
+      },
+    };
   }
   // Lost the claim race. Abandoned cleanly and NOT retried: the winner holds the target, nothing was
   // written here (the label is contingent on this swap), and the next pass re-decides from a board
@@ -554,6 +586,25 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     return { skipped: { beadId: top.beadId, reason: `${holder} claimed it first` } };
   }
 
+  // Every stand-down past the CAS is the same three moves — take the writes back, publish whatever
+  // moved, and name what could not be taken back — and they all have to agree on whether the board
+  // still carries this pass's writes, which is what tells the caller its saved plan reads stale
+  // (PR #218 review). One closure, so that answer cannot drift between them.
+  const standDown = async (reason: string): Promise<PickerApplyOutcome> => {
+    const leftover = await unwindStart(repoPath, top.beadId, operator, {
+      label: wroteLabel,
+      claim: swap.wrote,
+    });
+    publish();
+    return {
+      skipped: {
+        beadId: top.beadId,
+        reason: withLeftover(reason, leftover),
+        wroteBoard: leftover !== undefined,
+      },
+    };
+  };
+
   // Settle the reservation across machines before the enqueue, not after: the local swap only
   // ordered this process, and a run started on a claim that loses the merge is a second machine
   // working the same target. Only a swap that actually WROTE is settled — a no-op swap took no
@@ -562,35 +613,22 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     const settled = await settleClaim(repoPath, top.beadId, operator, stance, input.settle);
     if ("lost" in settled) {
       publish();
-      return { skipped: { beadId: top.beadId, reason: settled.lost } };
+      // The label is deliberately NOT taken back above, so a lost claim still leaves this pass's
+      // approval on the board when it was the one to write it.
+      return { skipped: { beadId: top.beadId, reason: settled.lost, wroteBoard: wroteLabel } };
     }
     // A claim we cannot PROVE and a claim whose target stopped being startable come off the same
     // way: fail closed, like the pre-CAS refresh, so the next pass re-decides against a target that
     // is free again rather than one anton holds with no run behind it.
     const unusable =
       "unverified" in settled ? settled.unverified : "stale" in settled ? settled.stale : undefined;
-    if (unusable !== undefined) {
-      const leftover = await unwindStart(repoPath, top.beadId, operator, {
-        label: wroteLabel,
-        claim: swap.wrote,
-      });
-      publish();
-      return { skipped: { beadId: top.beadId, reason: withLeftover(unusable, leftover) } };
-    }
+    if (unusable !== undefined) return standDown(unusable);
   }
 
   // The last gate before the irreversible half. Everything above this line is reversible; a run is
   // not, so a cancel that landed anywhere in the refresh, the CAS or the settle window is spent HERE
   // rather than on a run teardown would have to delete out from under an approved, claimed bead.
-  if (cancelled(signal)) {
-    const leftover = await unwindStart(repoPath, top.beadId, operator, {
-      label: wroteLabel,
-      claim: swap.wrote,
-    });
-    publish();
-    const reason = withLeftover("the pass was cancelled before its run was enqueued", leftover);
-    return { skipped: { beadId: top.beadId, reason } };
-  }
+  if (cancelled(signal)) return standDown("the pass was cancelled before its run was enqueued");
 
   // The idempotent enqueue, then the resume it cannot do: a run already covering this epic locally
   // withholds an id rather than spawning a second, which is what makes two overlapping passes one
@@ -603,13 +641,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     jobId ??= await resumeSettledRun(db, projectId, top.beadId, resume);
   } catch (e) {
     console.error(`[picker-apply] could not start a run for ${top.beadId}`, e);
-    const leftover = await unwindStart(repoPath, top.beadId, operator, {
-      label: wroteLabel,
-      claim: swap.wrote,
-    });
-    publish();
-    const reason = withLeftover("the run could not be enqueued", leftover);
-    return { skipped: { beadId: top.beadId, reason } };
+    return standDown("the run could not be enqueued");
   }
   if (!jobId) {
     // Nothing of this pass's making runs. An ACTIVE job genuinely covers the target — an overlapping
@@ -618,16 +650,14 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     // writes cover nothing, and left standing they hide the target from every later pass (its own
     // guard reads a claimed bead as taken), so they come back off (PR #218 review).
     if (!activeExecuteEpicId(db, projectId, top.beadId)) {
-      const leftover = await unwindStart(repoPath, top.beadId, operator, {
-        label: wroteLabel,
-        claim: swap.wrote,
-      });
-      publish();
-      const reason = withLeftover("no run could be started for this target", leftover);
-      return { skipped: { beadId: top.beadId, reason } };
+      return standDown("no run could be started for this target");
     }
     publish();
-    return { skipped: { beadId: top.beadId, reason: "a run already covers this target" } };
+    // The approval and the claim STAND here, so the caller's plan — stamped against a board where
+    // this target was neither — is as stale as it would be after a start (PR #218 review).
+    return {
+      skipped: { beadId: top.beadId, reason: "a run already covers this target", wroteBoard: true },
+    };
   }
 
   // The window on the FAR side of the insert (PR #218 review): a cancel that lands here is teardown
@@ -641,13 +671,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // answer `started` with the approval and the claim standing over a run that no longer exists.
   const sweptAway = async (): Promise<PickerApplyOutcome | undefined> => {
     if (!cancelled(signal) || activeExecuteEpicId(db, projectId, top.beadId)) return undefined;
-    const leftover = await unwindStart(repoPath, top.beadId, operator, {
-      label: wroteLabel,
-      claim: swap.wrote,
-    });
-    publish();
-    const reason = withLeftover("the pass was cancelled and its run removed with it", leftover);
-    return { skipped: { beadId: top.beadId, reason } };
+    return standDown("the pass was cancelled and its run removed with it");
   };
 
   const sweptBeforeNote = await sweptAway();
@@ -682,5 +706,12 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // Publish the approval and the claim, exactly as the approve route does after its own write.
   publish();
 
-  return { started: { beadId: top.beadId, rank: top.rank, rule: top.rule, jobId } };
+  return {
+    started: { beadId: top.beadId, rank: top.rank, rule: top.rule, jobId },
+    // The caller's own post-start awaits are one more window for the same sweep (PR #218 review):
+    // it restamps its plan over a fresh board read after this returns, and teardown landing in
+    // there deletes the run this just enqueued. So the seam check is handed back rather than ending
+    // at this return. See {@link ConfirmStart}.
+    confirmStart: sweptAway,
+  };
 }

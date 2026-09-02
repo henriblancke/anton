@@ -22,7 +22,12 @@ import { PoisonError } from "./errors";
 import type { Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeBoardPickerHandler } from "./board-picker";
-import type { PickerApplyInput, PickerApplyOutcome } from "./picker-apply";
+import type {
+  ConfirmStart,
+  PickerApplyInput,
+  PickerApplyOutcome,
+  PickerStart,
+} from "./picker-apply";
 import { makeProjectDb } from "@/lib/testing/project";
 
 const board = vi.hoisted(() => ({ current: [] as Bead[], calls: [] as unknown[][] }));
@@ -43,6 +48,26 @@ const applyPickerPlan = vi.hoisted(() =>
   })),
 );
 vi.mock("./picker-apply", () => ({ applyPickerPlan }));
+
+/**
+ * A start, with the post-restamp re-confirmation the real apply hands back (PR #218 review). Default
+ * `confirmStart` answers "the run still stands"; the teardown case below hands its own.
+ */
+function started(
+  over: Partial<PickerStart> = {},
+  confirmStart: ConfirmStart = async () => undefined,
+) {
+  return {
+    started: {
+      beadId: "t1",
+      rank: 1,
+      rule: "the work policy armed on this machine",
+      jobId: "j1",
+      ...over,
+    },
+    confirmStart,
+  } satisfies PickerApplyOutcome;
+}
 
 const NOW = 1_800_000_000_000;
 const clock: Clock = { now: () => NOW };
@@ -471,9 +496,7 @@ describe("makeBoardPickerHandler", () => {
     // re-derived there, so the start and the lane can never name different targets.
     board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
     arm(t, "apply");
-    applyPickerPlan.mockResolvedValueOnce({
-      started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
-    });
+    applyPickerPlan.mockResolvedValueOnce(started());
 
     const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
 
@@ -516,9 +539,7 @@ describe("makeBoardPickerHandler", () => {
         bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
         bead("t2", { priority: 2 }),
       ];
-      return {
-        started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
-      };
+      return started();
     });
 
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
@@ -547,9 +568,7 @@ describe("makeBoardPickerHandler", () => {
         bead("t2", { priority: 2, issue_type: "bug" }),
       ];
       arm(t, "apply", { policy: { types: ["task"] }, record: false });
-      return {
-        started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
-      };
+      return started();
     });
 
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
@@ -570,9 +589,7 @@ describe("makeBoardPickerHandler", () => {
     // board whose top pick is now claimed — would start the NEXT target.
     board.current = [bead("t1", { priority: 0 })];
     arm(t, "apply");
-    applyPickerPlan.mockResolvedValueOnce({
-      started: { beadId: "t1", rank: 1, rule: "the work policy armed on this machine", jobId: "j1" },
-    });
+    applyPickerPlan.mockResolvedValueOnce(started());
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     // The pass's own read stands; the RESTAMP's re-read is the one that falls over.
     vi.mocked(loadAllIssues)
@@ -586,6 +603,74 @@ describe("makeBoardPickerHandler", () => {
     expect(effect).toEqual({ changed: true, note: "started t1 (rank 1 of 1)" });
     expect(warn.mock.calls.some((args) => String(args[0]).includes("restamped"))).toBe(true);
     warn.mockRestore();
+  });
+
+  it("restamps when a SKIP left this pass's writes on the board", async () => {
+    // A skip is not always a no-op (PR #218 review): an approved, unassigned target whose run is
+    // still queued keeps the approval and the claim the apply wrote, which move the same freshness
+    // fence a start does. Restamping only started outcomes would withhold Up Next for a cadence over
+    // a board change anton made itself.
+    board.current = [bead("t1", { priority: 0 }), bead("t2", { priority: 2 })];
+    arm(t, "apply");
+    applyPickerPlan.mockImplementationOnce(async () => {
+      board.current = [
+        bead("t1", { priority: 0, assignee: "anton-box", labels: [LABELS.approved] }),
+        bead("t2", { priority: 2 }),
+      ];
+      return {
+        skipped: { beadId: "t1", reason: "a run already covers this target", wroteBoard: true },
+      };
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    const plan = await getBoardPickerPlan(t.db, "p1");
+    expect(plan?.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(isPlanStale(plan!, stampBoard(board.current, clock.now(), { types: ["task"] }))).toBe(
+      false,
+    );
+  });
+
+  it("leaves the plan alone when a skip wrote nothing", async () => {
+    // The other half of that rule: a stand-down that took its own writes back left the board exactly
+    // as the plan above was stamped from, so a second board read would buy nothing.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    applyPickerPlan.mockResolvedValueOnce({
+      skipped: { beadId: "t1", reason: "the run could not be enqueued", wroteBoard: false },
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    // One read: the pass's own. No restamp followed it.
+    expect(board.calls).toHaveLength(1);
+  });
+
+  it("reports no start when teardown removed the run while the plan was restamped", async () => {
+    // The window on the far side of the apply (PR #218 review): the restamp is a board read long,
+    // and `abortProject` landing in it deletes the run the apply just enqueued. Reporting `started`
+    // there would leave the target approved and claimed by anton with nothing behind it — so the
+    // apply's own seam check is re-asked after the restamp, and the pass reports what it became.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    applyPickerPlan.mockResolvedValueOnce(
+      started({}, async () => ({
+        skipped: {
+          beadId: "t1",
+          reason: "the pass was cancelled and its run removed with it",
+          wroteBoard: false,
+        },
+      })),
+    );
+
+    const effect = await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(effect).toEqual({ changed: true, note: "ranked 1 target(s)" });
+    expect(info.mock.calls.map((args) => String(args[0]))).toContainEqual(
+      expect.stringContaining("run removed with it"),
+    );
+    info.mockRestore();
   });
 
   it("still only ranks at shadow — the level below apply starts nothing", async () => {

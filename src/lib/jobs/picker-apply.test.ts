@@ -22,6 +22,7 @@ import {
   applyPickerPlan,
   POLICY_ACTOR,
   type ClaimSettleDeps,
+  type ConfirmStart,
   type PickerApplyInput,
 } from "./picker-apply";
 import { enqueueExecuteEpicIfAbsent, type Clock } from "./queue";
@@ -390,7 +391,9 @@ describe("applyPickerPlan", () => {
     const outcome = await apply("t1");
 
     expect(outcome).toMatchObject({
-      skipped: { beadId: "t1", reason: "a run already covers this target" },
+      // The approval and the claim STAND, so the caller's plan is as stale as after a start and it
+      // is told so (PR #218 review).
+      skipped: { beadId: "t1", reason: "a run already covers this target", wroteBoard: true },
     });
     expect(await jobs()).toHaveLength(1);
     expect(notes).toEqual([]);
@@ -812,7 +815,12 @@ describe("applyPickerPlan", () => {
     const outcome = await apply("t1");
 
     expect(outcome).toMatchObject({
-      skipped: { beadId: "t1", reason: "no run could be started for this target" },
+      // Nothing of this pass's is left on the board, so the caller's plan still reads current.
+      skipped: {
+        beadId: "t1",
+        reason: "no run could be started for this target",
+        wroteBoard: false,
+      },
     });
     expect(read("t1").assignee).toBeUndefined();
     expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
@@ -838,6 +846,8 @@ describe("applyPickerPlan", () => {
     expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
       "left approved and claimed",
     );
+    // An unwind that could not finish leaves writes behind, and the caller's plan is stale with them.
+    expect(outcome).toMatchObject({ skipped: { wroteBoard: true } });
     expect(read("t1").labels).toContain(LABELS.approved);
     expect(read("t1").assignee).toBe("anton-box");
   });
@@ -953,6 +963,39 @@ describe("applyPickerPlan", () => {
       expect(outcome).toMatchObject({ started: { beadId: "t1" } });
       expect(read("t1").assignee).toBe("anton-box");
       expect(read("t1").labels).toContain(LABELS.approved);
+      expect(await jobs()).toHaveLength(1);
+    });
+
+    it("hands back a re-check that unwinds when teardown deletes the run after it returned", async () => {
+      // The window this module cannot close from the inside (PR #218 review): the caller spends a
+      // board read of its own restamping the plan once this returns, and `abortProject` landing in
+      // there sweeps the row just enqueued. The seam check is handed back so that window unwinds
+      // through the same path every earlier one does.
+      put(bead("t1"));
+      const controller = new AbortController();
+      const outcome = await apply("t1", 1, undefined, { signal: controller.signal });
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+
+      // Teardown, inside the caller's restamp.
+      controller.abort();
+      await t.db.delete(schema.jobs);
+      const swept = await (outcome as { confirmStart: ConfirmStart }).confirmStart();
+
+      expect(swept).toMatchObject({
+        skipped: { beadId: "t1", reason: expect.stringContaining("run removed with it") },
+      });
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("re-confirms a start whose run outlived the caller's awaits", async () => {
+      // The common case: nothing was cancelled, so the re-check costs one lookup and the start
+      // stands exactly as reported.
+      put(bead("t1"));
+      const outcome = await apply("t1");
+
+      expect(await (outcome as { confirmStart: ConfirmStart }).confirmStart()).toBeUndefined();
+      expect(read("t1").assignee).toBe("anton-box");
       expect(await jobs()).toHaveLength(1);
     });
 

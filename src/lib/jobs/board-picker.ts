@@ -213,7 +213,22 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
       // re-decided over the post-write board, which drops the started target as `claimed` and leaves
       // the survivors current.
       if ("started" in applied) {
-        await restampAfterStart(ctx, { db, clock, projectId, repoPath: project.repoPath });
+        await restampAfterWrites(ctx, { db, clock, projectId, repoPath: project.repoPath });
+        // That restamp is a board read long, and a cancel landing in it is `abortProject` deleting
+        // the run the apply just enqueued (PR #218 review). A start whose run the sweep took is not
+        // a start: its approval and claim now cover nothing, so they come back off and the pass
+        // reports the skip it became rather than a success with no run behind it.
+        const swept = await applied.confirmStart();
+        if (swept) {
+          logApplyOutcome(projectId, swept);
+          applied = swept;
+        }
+      } else if (applied.skipped.wroteBoard) {
+        // A skip is not always a no-op on the board (PR #218 review): a target an already-live run
+        // covers keeps the approval and the claim this pass wrote, which move the same fence a start
+        // does. Restamping follows the WRITES, not the start — otherwise those passes withhold Up
+        // Next for a cadence for a board change anton made itself.
+        await restampAfterWrites(ctx, { db, clock, projectId, repoPath: project.repoPath });
       }
     }
 
@@ -258,7 +273,8 @@ async function decideOver(
 }
 
 /**
- * Re-decide and re-record the plan over the board this pass's own start rewrote.
+ * Re-decide and re-record the plan over the board this pass's own writes rewrote — a start, or a
+ * skip that left the approval and the claim standing (PR #218 review).
  *
  * BEST-EFFORT by construction, and that is the whole reason it is a function rather than a second
  * inline block: the run is already enqueued, so a throw here would retry the pass — and the retry,
@@ -269,7 +285,7 @@ async function decideOver(
  * this would otherwise resurrect. It bails quietly rather than throwing, so teardown is not logged
  * as a restamp failure.
  */
-async function restampAfterStart(
+async function restampAfterWrites(
   ctx: JobContext,
   input: {
     db: AntonDb;
@@ -318,16 +334,25 @@ async function startTopPick(
 ): Promise<PickerApplyOutcome> {
   await ctx.heartbeat();
   const outcome = await applyPickerPlan(input);
+  logApplyOutcome(input.projectId, outcome);
+  return outcome;
+}
+
+/**
+ * One line per apply outcome, whichever way it went — shared with the post-restamp re-confirmation,
+ * so a start the teardown sweep took back is reported in the same band as any other stand-down
+ * rather than left as a "started" line the run behind it no longer backs.
+ */
+function logApplyOutcome(projectId: string, outcome: PickerApplyOutcome): void {
   if ("started" in outcome) {
     const { beadId, rank, rule, jobId } = outcome.started;
     console.info(
-      `[board-picker] ${input.projectId}: started ${beadId} (rank ${rank}, ${rule}) as job ${jobId}`,
+      `[board-picker] ${projectId}: started ${beadId} (rank ${rank}, ${rule}) as job ${jobId}`,
     );
-  } else {
-    const { beadId, reason } = outcome.skipped;
-    console.info(
-      `[board-picker] ${input.projectId}: started nothing${beadId ? ` (${beadId})` : ""} — ${reason}`,
-    );
+    return;
   }
-  return outcome;
+  const { beadId, reason } = outcome.skipped;
+  console.info(
+    `[board-picker] ${projectId}: started nothing${beadId ? ` (${beadId})` : ""} — ${reason}`,
+  );
 }
