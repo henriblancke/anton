@@ -47,7 +47,9 @@ const applyPickerPlan = vi.hoisted(() =>
     skipped: { reason: "stubbed" },
   })),
 );
-vi.mock("./picker-apply", () => ({ applyPickerPlan }));
+/** The flow brake's re-check, built by this module and re-asked at the apply's own final gate. */
+const pickerWipHold = vi.hoisted(() => vi.fn(() => async () => undefined));
+vi.mock("./picker-apply", () => ({ applyPickerPlan, pickerWipHold }));
 
 /**
  * A start, with the post-restamp re-confirmation the real apply hands back (PR #218 review). Default
@@ -818,6 +820,25 @@ describe("makeBoardPickerHandler", () => {
     await pass(fakeCtx());
     expect(applyPickerPlan).toHaveBeenCalledTimes(1);
     info.mockRestore();
+  });
+
+  it("hands the apply a hold re-check built on this pass's own PR reader", async () => {
+    // The entry verdict above is read before the ranking, and the apply spends a claim and a settle
+    // after it — so the brake is re-asked there, through the same `gh` reader rather than a fresh
+    // spawn of its own (PR #218 review).
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const readPrActivity = async (_repo: string, number: number) => prActivity(number, "OPEN");
+
+    await makeBoardPickerHandler({ db: t.db, clock, readPrActivity })(fakeCtx());
+
+    expect(applyPickerPlan).toHaveBeenCalledWith(
+      expect.objectContaining({ held: expect.any(Function) }),
+    );
+    expect(pickerWipHold).toHaveBeenCalledWith(
+      t.db,
+      expect.objectContaining({ projectId: "p1", readPrActivity }),
+    );
   });
 
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {

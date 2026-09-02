@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { disarmAutopilot } from "../autopilot-disarm";
 import { beads, LABELS } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { Bead } from "../beads/types";
@@ -21,6 +22,7 @@ import { nudgeSync } from "../beads/sync-nudge";
 import { listPickerStarts } from "../picker-starts";
 import {
   applyPickerPlan,
+  pickerWipHold,
   POLICY_ACTOR,
   type ClaimSettleDeps,
   type ConfirmStart,
@@ -181,7 +183,7 @@ function apply(
   beadId: string,
   ranked = 1,
   settle?: ClaimSettleDeps,
-  over: Pick<PickerApplyInput, "signal" | "run"> = {},
+  over: Pick<PickerApplyInput, "signal" | "run" | "held"> = {},
 ) {
   const entries = [{ beadId, rank: 1, rule: "the work policy armed on this machine" }];
   for (let i = 2; i <= ranked; i += 1) {
@@ -858,6 +860,56 @@ describe("applyPickerPlan", () => {
     });
   });
 
+  describe("the flow brake behind the start", () => {
+    const why = (outcome: unknown) => (outcome as { skipped: { reason: string } }).skipped.reason;
+    const FULL = "3 open PRs are waiting on review — this project pauses new work at 3";
+
+    it("takes its writes back when the review queue fills while the claim settles", async () => {
+      // The hold is derived, never latched, so the verdict the caller cleared this pass against goes
+      // stale the moment another run reaches `stage:in-review` — or the operator lowers the limit.
+      put(bead("t1"));
+      let full = false;
+
+      const outcome = await apply(
+        "t1",
+        1,
+        wired({
+          sleep: async () => {
+            full = true;
+          },
+        }),
+        { held: async () => (full ? FULL : undefined) },
+      );
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("waiting on review");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      // Reversible, like every other late refusal: the target is startable again on the pass after
+      // the operator's next merge.
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("judges the queue against the board the settle just read", async () => {
+      // The freshest board this pass holds, handed over rather than re-read: a second `bd list` at
+      // the same instant could only cost a round trip to say the same thing.
+      put(bead("t1"));
+      const seen: (Bead[] | undefined)[] = [];
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async (board) => {
+          seen.push(board);
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.map((b) => b.id)).toEqual(["t1"]);
+    });
+  });
+
   it("does not settle a claim it never wrote", async () => {
     // A no-op swap (the target already reads as ours) took no reservation of its own, so there is
     // nothing to prove and no settle window to pay for.
@@ -1142,5 +1194,78 @@ describe("applyPickerPlan", () => {
       expect(await jobs()).toHaveLength(0);
       error.mockRestore();
     });
+  });
+});
+
+/**
+ * The flow brake's own re-check (PR #218 review) — the default the scheduled pass hands down.
+ *
+ * The arithmetic is pinned in autopilot-wip.test.ts and the join in picker-wip-hold.test.ts; what is
+ * pinned here is the wording the apply stands down on, and that an unreadable queue fails CLOSED.
+ */
+describe("pickerWipHold", () => {
+  const IN_REVIEW = LABELS.stage("in-review");
+
+  /** An open run target in review, pointing at its PR — one occupied slot in the operator's queue. */
+  function inReview(id: string, prNumber: number): Bead {
+    return {
+      id,
+      title: id,
+      status: "open",
+      issue_type: "feature",
+      labels: [IN_REVIEW],
+      metadata: { pr: `gh-${prNumber}` },
+    };
+  }
+
+  const open = async (_repo: string, number: number) => ({
+    number,
+    state: "OPEN",
+    url: `https://example.test/pull/${number}`,
+    updatedAtMs: 0,
+    isDraft: false,
+  });
+
+  it("reports the hold in the copy every other surface shows it in", async () => {
+    const held = pickerWipHold(t.db, {
+      projectId: "p1",
+      repoPath: REPO,
+      readPrActivity: open,
+    });
+
+    const reason = await held([inReview("a", 11), inReview("b", 12), inReview("c", 13)]);
+
+    expect(reason).toContain("pauses new work at 3");
+    expect(reason).toContain("#11, #12, #13");
+  });
+
+  it("clears the start while the operator still has review bandwidth", async () => {
+    const held = pickerWipHold(t.db, {
+      projectId: "p1",
+      repoPath: REPO,
+      readPrActivity: open,
+    });
+
+    expect(await held([inReview("a", 11), inReview("b", 12)])).toBeUndefined();
+  });
+
+  it("reads its own board when the caller has none to hand over", async () => {
+    put(inReview("a", 11), inReview("b", 12), inReview("c", 13));
+    const held = pickerWipHold(t.db, {
+      projectId: "p1",
+      repoPath: REPO,
+      readPrActivity: open,
+    });
+
+    expect(await held()).toContain("pauses new work at 3");
+  });
+
+  it("fails closed when the queue cannot be read at all", async () => {
+    // A stand-down is reversible and a start is not, so an unanswerable brake refuses — the same
+    // direction the pre-CAS refresh fails in.
+    vi.mocked(loadAllIssues).mockRejectedValueOnce(new Error("bd is down"));
+    const held = pickerWipHold(t.db, { projectId: "p1", repoPath: REPO, readPrActivity: open });
+
+    expect(await held()).toContain("could not be checked before starting");
   });
 });

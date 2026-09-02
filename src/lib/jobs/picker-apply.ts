@@ -35,6 +35,7 @@
  *     whenever either leg fails.
  */
 import { activeDisarm } from "../autopilot-disarm";
+import { describeWipHold } from "../autopilot-wip";
 import { beads, CLAIM_SETTLE_MS, type SyncOutcome } from "../beads/bd";
 import { isServerMode } from "../beads/board-mode";
 import { approveAndClaim, unwindApproveClaim } from "../beads/approve-claim";
@@ -49,6 +50,7 @@ import { pickerTrackRecord } from "../picker-veto";
 import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "../projects";
 import { armedPickerPolicy } from "./picker-policy";
 import { ineligibility } from "./picker-targets";
+import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
 import {
   activeExecuteEpicId,
   enqueueExecuteEpicIfAbsent,
@@ -146,6 +148,12 @@ export interface PickerApplyInput {
    * only so a test can latch the freeze inside the window rather than around it.
    */
   disarmed?: PickerDisarmCheck;
+  /**
+   * The flow-brake re-check, defaulting to {@link pickerWipHold} over this pass's own db. A seam so
+   * the scheduled pass can hand down its injected `gh` reader, and so a test can fill the review
+   * queue inside the window rather than around it.
+   */
+  held?: PickerHoldCheck;
 }
 
 /**
@@ -162,6 +170,13 @@ export type PickerStanceCheck = (target: Bead, board: Bead[]) => Promise<string 
  * start still happen?") asked of two tables.
  */
 export type PickerDisarmCheck = () => Promise<string | undefined>;
+
+/**
+ * Is the operator's review queue full right now? Answers with the hold's own copy, or undefined
+ * while there is bandwidth — the third of the three brakes, asked in the same shape as the other
+ * two. Takes the board to judge, so a caller holding a fresh one spends no second `bd list`.
+ */
+export type PickerHoldCheck = (board?: Bead[]) => Promise<string | undefined>;
 
 /**
  * Re-resolve the picker's stance and judge the target against it (PR #218 review).
@@ -221,6 +236,44 @@ export function pickerDisarmed(db: AntonDb, projectId: string): PickerDisarmChec
   return async () => {
     const disarm = await activeDisarm(db, projectId);
     return disarm ? `this project's autopilot is disarmed — ${disarm.detail}` : undefined;
+  };
+}
+
+/**
+ * Re-ask the WIP hold, the flow brake the caller read before the ranking (PR #218 review).
+ *
+ * Same window as the disarm and the stance, different owner: a run entering `stage:in-review` — or
+ * the operator lowering the limit — inside the refresh, the CAS and the settle turns a queue that
+ * had bandwidth into a full one, and honouring the entry verdict would start the N+1th unattended
+ * run the brake exists to hold back. The hold is derived and never latched, so re-asking is the
+ * only way to see it; nothing else here does.
+ *
+ * Judged against the board the caller passes — the settle's read, the freshest this pass has — and
+ * only against a fresh one of its own when there is none. An unreadable verdict FAILS CLOSED, like
+ * the pre-CAS refresh: the stand-down is reversible, a start is not.
+ */
+export function pickerWipHold(
+  db: AntonDb,
+  input: {
+    projectId: string;
+    repoPath: string;
+    signal?: AbortSignal;
+    readPrActivity?: ReadPrActivity;
+  },
+): PickerHoldCheck {
+  return async (board) => {
+    try {
+      const hold = await checkWipLimit(db, {
+        projectId: input.projectId,
+        repoPath: input.repoPath,
+        board: board ?? (await loadAllIssues(input.repoPath)),
+        ...(input.signal ? { signal: input.signal } : {}),
+        ...(input.readPrActivity ? { readPrActivity: input.readPrActivity } : {}),
+      });
+      return hold ? describeWipHold(hold) : undefined;
+    } catch (e) {
+      return `the review queue could not be checked before starting (${errorText(e)})`;
+    }
   };
 }
 
@@ -305,8 +358,16 @@ export interface ClaimSettleDeps {
  * Whether the reservation survived the remote's merge AND still names startable work — see
  * {@link settleClaim}. `stale` is the claim we WON on a target that stopped being eligible while we
  * settled: ours on paper, not runnable, and the writes are ours to take back.
+ *
+ * A held claim hands back the board it settled against: it is the freshest read this pass has, and
+ * the flow brake at the final gate judges the review queue off it rather than spending a second
+ * `bd list` on the same instant (see {@link PickerHoldCheck}).
  */
-type SettleVerdict = { held: true } | { lost: string } | { unverified: string } | { stale: string };
+type SettleVerdict =
+  | { held: true; board: Bead[] }
+  | { lost: string }
+  | { unverified: string }
+  | { stale: string };
 
 /**
  * Prove the claim cross-machine BEFORE the enqueue — the settle half of the pickup protocol
@@ -435,7 +496,7 @@ async function settleClaim(
   if (withdrawn) {
     return { stale: `the standing approval was withdrawn while the claim settled (${withdrawn})` };
   }
-  return { held: true };
+  return { held: true, board };
 }
 
 /**
@@ -519,9 +580,11 @@ function cancelled(signal: AbortSignal | undefined): boolean {
 /**
  * Start the plan's top-ranked target: approve it, claim it, enqueue its run, and record why.
  *
- * The caller owns the decision to CALL this — the armed level, the disarms, the WIP hold. What is
- * owned here is that the start is atomic, idempotent and reversible: no label without a claim, no
- * second run behind an overlapping pass, and nothing left half-written when the enqueue falls over.
+ * The caller owns the decision to CALL this — the armed level, the disarms, the WIP hold; all three
+ * are re-asked here before the enqueue, because the window between that entry gate and this write is
+ * long enough for any of them to move. What is owned here is that the start is atomic, idempotent
+ * and reversible: no label without a claim, no second run behind an overlapping pass, and nothing
+ * left half-written when the enqueue falls over.
  */
 export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerApplyOutcome> {
   const { db, clock, projectId, repoPath, entries, signal } = input;
@@ -536,6 +599,8 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   const resume = input.run?.resume ?? ((jobId: string) => resumeJob(db, clock, jobId));
   const stance = input.stance ?? pickerStance(db, projectId);
   const disarmed = input.disarmed ?? pickerDisarmed(db, projectId);
+  const held =
+    input.held ?? pickerWipHold(db, { projectId, repoPath, ...(signal ? { signal } : {}) });
 
   // Publish this pass's writes on EVERY path that made one, not only the started one (PR #218
   // review). A skip is not a no-op once the approval and the claim have landed: unpublished, they
@@ -676,6 +741,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // ordered this process, and a run started on a claim that loses the merge is a second machine
   // working the same target. Only a swap that actually WROTE is settled — a no-op swap took no
   // reservation of its own to prove.
+  let settledBoard: Bead[] | undefined;
   if (swap.wrote) {
     const settled = await settleClaim(repoPath, top.beadId, operator, stance, input.settle);
     if ("lost" in settled) {
@@ -690,6 +756,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     const unusable =
       "unverified" in settled ? settled.unverified : "stale" in settled ? settled.stale : undefined;
     if (unusable !== undefined) return standDown(unusable);
+    if ("held" in settled) settledBoard = settled.board;
   }
 
   // The last gate before the irreversible half. Everything above this line is reversible; a run is
@@ -705,6 +772,14 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // exactly as a cancel does.
   const frozen = await disarmed();
   if (frozen) return standDown(frozen);
+
+  // And the FLOW brake beside it (PR #218 review), for the same reason and over the same window: a
+  // run that reached `stage:in-review` while this pass claimed and settled — or an operator who
+  // lowered the limit in it — fills the review queue the entry gate found bandwidth in. The hold is
+  // derived rather than latched, so only re-asking can see it. Judged against the board the settle
+  // just read, so the freshest answer costs no extra `bd list`. See {@link pickerWipHold}.
+  const holding = await held(settledBoard);
+  if (holding) return standDown(holding);
 
   // The idempotent enqueue, then the resume it cannot do: a run already covering this epic locally
   // withholds an id rather than spawning a second, which is what makes two overlapping passes one

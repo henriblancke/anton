@@ -43,6 +43,7 @@ import { PoisonError } from "./errors";
 import {
   applyPickerPlan,
   type PickerApplyInput,
+  pickerWipHold,
   type PickerApplyOutcome,
   type PickerRunOps,
 } from "./picker-apply";
@@ -190,8 +191,9 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // `apply` never asked for this at all.
     //
     // This verdict is the pass's ENTRY gate, not its last word: the apply spends a mirror refresh, a
-    // CAS and a settle window before it enqueues, and re-asks the freeze and the stance at its own
-    // final gate — unwinding its writes when either moved in that window (PR #218 review).
+    // CAS and a settle window before it enqueues, and re-asks all three — the freeze, the stance and
+    // this hold — at its own final gate, unwinding its writes when any of them moved in that window
+    // (PR #218 review).
     let applied: PickerApplyOutcome | undefined;
     if (autonomy === "apply" && !disarm && !hold) {
       // Re-gated on the signal, like the plan write above and for a sharper reason: `abortProject`
@@ -210,6 +212,15 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
         // seconds on `bd`, so it re-asks at every seam and unwinds its own writes when a cancel wins
         // (PR #218 review).
         signal: ctx.signal,
+        // The flow brake's re-check, built here so it re-asks through the same `gh` reader this
+        // pass's entry check used — a test that never spawns `gh` must not start doing so at the
+        // apply's final gate.
+        held: pickerWipHold(db, {
+          projectId,
+          repoPath: project.repoPath,
+          signal: ctx.signal,
+          ...(deps.readPrActivity ? { readPrActivity: deps.readPrActivity } : {}),
+        }),
         ...(deps.run ? { run: deps.run } : {}),
       });
       // The apply rewrote the very board the plan above was stamped from — the assignee and the
