@@ -140,6 +140,23 @@ function arm(policy: unknown = {}, autonomy = "apply"): void {
     .run();
 }
 
+/**
+ * The operator's flow limit, written beside the stance because the settings blob holds both — a
+ * partial write here would read as a picker switched off rather than a limit moved.
+ */
+function setWipLimit(limit: number): void {
+  t.db
+    .update(schema.projects)
+    .set({
+      settingsJson: JSON.stringify({
+        pickerPolicy: {},
+        pickerAutonomy: "apply",
+        autopilotWipLimit: limit,
+      }),
+    })
+    .run();
+}
+
 /** The bar the picker's own record clears — read off the shared ladder, never restated here. */
 const PICKER_BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
 
@@ -198,7 +215,7 @@ function apply(
   beadId: string,
   ranked = 1,
   settle?: ClaimSettleDeps,
-  over: Pick<PickerApplyInput, "signal" | "run" | "held"> = {},
+  over: Pick<PickerApplyInput, "signal" | "run" | "held" | "wipLimit"> = {},
 ) {
   const entries = [{ beadId, rank: 1, rule: "the work policy armed on this machine" }];
   for (let i = 2; i <= ranked; i += 1) {
@@ -1059,6 +1076,85 @@ describe("applyPickerPlan", () => {
       expect(asked).toBe(3);
       expect(outcome).toMatchObject({ started: { beadId: "t1" } });
       expect(await jobs()).toHaveLength(1);
+    });
+
+    it("re-asks the brake when the operator lowers the limit while the SECOND confirmation runs", async () => {
+      // The verdict's other input, and the one no board read can fault (PR #218 review): the limit is
+      // resolved when the brake is ASKED, ahead of its `gh pr view` per waiting PR, so an operator
+      // lowering it inside that confirmation leaves a verdict judged against a rule the project no
+      // longer has — with nothing new in the queue for `filledSince` to catch.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) setWipLimit(1);
+          return asked >= 3 ? FULL : undefined;
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("waiting on review");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("starts once the brake re-asked on the moved limit clears", async () => {
+      // The other side of that reconciliation: a limit the operator RAISED costs exactly one extra
+      // verdict, and the pass starts on it. The re-ask is what makes the start rest on the setting
+      // the project has now rather than the one it had when the confirmation began.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) setWipLimit(9);
+          return undefined;
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+      expect(await jobs()).toHaveLength(1);
+    });
+
+    it("stands down when the limit keeps moving under the confirmation", async () => {
+      // Bounded like the queue half, and worded for its own cause: a setting nobody can pin down is
+      // not a queue that keeps filling, and the operator reading the skip has to be able to tell
+      // which of the two it was.
+      put(bead("t1"));
+      let limit = 3;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => undefined,
+        wipLimit: async () => limit--,
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("limit kept changing");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("takes its writes back when the limit cannot be read at all", async () => {
+      // Fails closed like every other unreadable answer in this window: a start cannot be taken
+      // back, and a stand-down leaves the target startable next cadence.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), { wipLimit: async () => undefined });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("review limit could not be read");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
 
     it("stands down when the review queue fills faster than it can be confirmed", async () => {

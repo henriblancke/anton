@@ -47,7 +47,12 @@ import type { PickerPlanEntry } from "../board-picker-plan";
 import { resolveOperator } from "../operator";
 import { recordPickerStart } from "../picker-starts";
 import { pickerTrackRecord } from "../picker-veto";
-import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "../projects";
+import {
+  getProjectSettings,
+  resolvePickerAutonomy,
+  resolvePickerPolicy,
+  resolveWipLimit,
+} from "../projects";
 import { armedPickerPolicy } from "./picker-policy";
 import { ineligibility } from "./picker-targets";
 import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
@@ -155,6 +160,12 @@ export interface PickerApplyInput {
    * queue inside the window rather than around it.
    */
   held?: PickerHoldCheck;
+  /**
+   * The flow brake's limit on its own, defaulting to {@link pickerWipLimit} over this pass's own db.
+   * Read on both sides of every hold verdict so a limit the operator moved inside one cannot be
+   * spent (PR #218 review); a seam only so a test can move it there.
+   */
+  wipLimit?: PickerWipLimitCheck;
 }
 
 /**
@@ -275,6 +286,32 @@ export function pickerWipHold(
       return hold ? describeWipHold(hold) : undefined;
     } catch (e) {
       return `the review queue could not be checked before starting (${errorText(e)})`;
+    }
+  };
+}
+
+/**
+ * Read the flow brake's OTHER input on its own — the operator's limit, without the `gh` reads
+ * (PR #218 review).
+ *
+ * A hold is a verdict about a board AND a limit, and the limit is resolved when the brake is asked,
+ * ahead of its `gh pr view` per waiting PR. So an operator lowering it — or switching the hold on
+ * from `0` — inside that confirmation leaves the verdict judged against a rule the project no longer
+ * has, and the board reconciliation cannot see it: no bead joined the queue, so a stale "there is
+ * bandwidth" looks covered while the current setting would refuse the start outright.
+ *
+ * Answers `0` for a hold the operator has turned off, and `undefined` for a limit that could not be
+ * read at all — which the pass treats like every other unreadable answer here and fails closed on.
+ */
+export type PickerWipLimitCheck = () => Promise<number | undefined>;
+
+/** {@link PickerWipLimitCheck} over this pass's own db — the settings read `checkWipLimit` makes. */
+export function pickerWipLimit(db: AntonDb, projectId: string): PickerWipLimitCheck {
+  return async () => {
+    try {
+      return resolveWipLimit(await getProjectSettings(db, projectId))?.limit ?? 0;
+    } catch {
+      return undefined;
     }
   };
 }
@@ -662,6 +699,9 @@ function cancelled(signal: AbortSignal | undefined): boolean {
 /** One wording for every stand-down in the window between the claim and the enqueue. */
 const CANCELLED_BEFORE_ENQUEUE = "the pass was cancelled before its run was enqueued";
 
+/** A flow limit that could not be read fails closed, exactly as an unreadable hold does. */
+const LIMIT_UNREADABLE = "the review limit could not be read before starting";
+
 /**
  * Start the plan's top-ranked target: approve it, claim it, enqueue its run, and record why.
  *
@@ -686,6 +726,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   const disarmed = input.disarmed ?? pickerDisarmed(db, projectId);
   const held =
     input.held ?? pickerWipHold(db, { projectId, repoPath, ...(signal ? { signal } : {}) });
+  const wipLimit = input.wipLimit ?? pickerWipLimit(db, projectId);
 
   // Publish this pass's writes on EVERY path that made one, not only the started one (PR #218
   // review). A skip is not a no-op once the approval and the claim have landed: unpublished, they
@@ -920,6 +961,13 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // wherever the board still shows bandwidth — under the limit the hold spawns no `gh` at all (see
   // {@link checkWipLimit}). Asked before the settings brakes for the same reason the first call is:
   // they are the correctness half, and they get the last word.
+  //
+  // Its limit is snapshotted on the NEAR side, because the verdict resolves its own copy between
+  // this read and the one below it: a limit that reads the same on both sides is the one the verdict
+  // was taken under, and a limit that moved leaves the verdict spent on a rule the project no longer
+  // has. See {@link pickerWipLimit}.
+  const judgedLimit = await wipLimit();
+  if (judgedLimit === undefined) return standDown(LIMIT_UNREADABLE);
   const stillHolding = await held(gate.board);
   if (stillHolding) return standDown(stillHolding);
 
@@ -939,23 +987,40 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // extra `gh` at all. A queue filling faster than it can be confirmed never converges, so the pass
   // fails closed rather than spinning: the target is startable again next cadence.
   //
+  // The verdict's OTHER input is reconciled the same way (PR #218 review): the operator's limit is
+  // resolved when the brake is asked, so one lowered — or switched on from `0` — while those PRs
+  // were confirmed leaves a verdict no board read can fault, since no bead joined the queue. So the
+  // limit is carried beside the board and re-asked on the same terms. Costs one settings read per
+  // pass, and a limit nobody touched re-asks nothing at all.
+  //
   // This is the LAST board read before the enqueue, and no blocking await sits between it and the
   // insert — only the local reads below.
   let judged = gate.board;
+  let limit = judgedLimit;
   let final: GateRead;
   for (let confirmations = 2; ; confirmations += 1) {
     const fresh = await refreshGate();
     if (!("board" in fresh)) return fresh;
-    if (!filledSince(judged, fresh.board)) {
+    // The limit read on the far side of the verdict, and the near side of the next one: the queue is
+    // only half of what the brake judged, and a setting the operator moved inside that confirmation
+    // ages exactly as the board does.
+    const freshLimit = await wipLimit();
+    if (freshLimit === undefined) return standDown(LIMIT_UNREADABLE);
+    const drifted =
+      freshLimit !== limit
+        ? "the review limit kept changing while the queue was confirmed"
+        : filledSince(judged, fresh.board)
+          ? "the review queue kept filling while it was confirmed"
+          : undefined;
+    if (!drifted) {
       final = fresh;
       break;
     }
-    if (confirmations >= FLOW_CONFIRMATION_LIMIT) {
-      return standDown("the review queue kept filling while it was confirmed");
-    }
+    if (confirmations >= FLOW_CONFIRMATION_LIMIT) return standDown(drifted);
     const refilled = await held(fresh.board);
     if (refilled) return standDown(refilled);
     judged = fresh.board;
+    limit = freshLimit;
   }
   const { board: finalBoard, target } = final;
 
