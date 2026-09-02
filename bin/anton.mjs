@@ -61,6 +61,13 @@ import {
 import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
+import {
+  buildDrift,
+  buildRecordPath,
+  describeBuildIdentity,
+  pidAlive,
+  readBuildRecord,
+} from "../src/lib/build/identity.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -1087,6 +1094,43 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
   return out;
 }
 
+/**
+ * Report the build the RUNNING server is serving against the one on disk (anton-pzfb) — the same
+ * verdict the health page shows, from the shared comparison in src/lib/build/identity.mjs.
+ *
+ * Read-only, like the skill-drift check above it: a restart can kill an in-flight run, so anton
+ * names the action and leaves it to the operator. The restart itself differs by install — a bundle
+ * has a daemon to stop and start, a source checkout has whatever terminal `anton dev` is in.
+ */
+function reportServerBuild(dbPath) {
+  const recordPath = buildRecordPath(dbPath);
+  const record = readBuildRecord(recordPath);
+  const drift = buildDrift({ appRoot: APP_ROOT, recordPath, serverRunning: !!runningPid() });
+  if (!drift) {
+    // No drift means one of two things, and they are different claims — a matching build is a
+    // check that PASSED, while a stopped server is a check with nothing to run against.
+    const running = record && pidAlive(record.pid);
+    if (running) {
+      console.log(`  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`running the build on disk (${describeBuildIdentity(record)})`)}`);
+    } else {
+      // Not "stopped": a source checkout's server leaves no pidfile, so all anton can honestly
+      // claim here is that nothing recorded a boot against this install.
+      console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
+    }
+    return;
+  }
+  const why =
+    drift.state === "unstamped"
+      ? "is running but recorded no build identity — what it is serving cannot be established"
+      : `is running ${describeBuildIdentity(drift.running)} but the ${drift.state === "outdated" ? "runtime" : "checkout"} on disk is ${describeBuildIdentity(drift.onDisk)}`;
+  console.log(`  ${c.yellow("!")} ${"server".padEnd(9)} ${c.yellow(why)}`);
+  console.log(
+    c.dim("    Restart it to run the build on disk — ") +
+      c.dim(IS_BUNDLE ? "`anton stop && anton start`." : "stop the server and re-run `anton dev` / `anton start`.") +
+      c.dim("\n    Nothing else clears it, and anton will not restart itself: a live process may be mid-run."),
+  );
+}
+
 function cmdDoctor() {
   const ok = checkPrereqs();
   const stale = staleSkills();
@@ -1123,6 +1167,7 @@ function cmdDoctor() {
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
+  reportServerBuild(dbPath);
   // Last, because it is the only check that leaves the machine: a board on a shared server that
   // nothing here can reach is as fatal as a missing tool, and doctor is where an operator looks first.
   // Gated on the tool check: probing a board with no usable bd would report an "unreachable server"
@@ -1811,7 +1856,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
   ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim(SERVER_MODE_FLAGS)}
-  ${c.bold("doctor")}   check prereqs + anton.db + stale skills (non-destructive)
+  ${c.bold("doctor")}   check prereqs + anton.db + stale skills + a stale running server (non-destructive)
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}

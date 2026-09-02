@@ -188,7 +188,7 @@ The **job runner and cron scheduler start automatically** with the server (via `
 anton setup     check prereqs, migrate DB, install/refresh agents & skills  [--agents <a,b,c>|all] [--force-skills]
 anton init      configure beads in a target repo + register it       [path] [--prefix <p>] [--force-skills]
 anton server-mode  point one project's board at a shared Dolt server + verify it  [path] --host <h> [--port <n>] [--user <u>] --database <db> [--no-backup] [--force]
-anton doctor    check prereqs + anton.db + stale skills (non-destructive)
+anton doctor    check prereqs + anton.db + stale skills + a stale running server (non-destructive)
 anton board-check  report beads that break epic → feature → ticket   [path...] (default: cwd)
 anton dev       run the dev server (next dev)                         [--port <n>]
 anton start     run the server — bundle: background, source: foreground  [--port <n>] [--foreground]
@@ -338,6 +338,8 @@ Then restart the server. (A node upgrade can break the ABI again — re-run the 
 **The sync pill says `Sync failing` on a shared-server board.** anton preflights the shared Dolt server and reports the configured host, port, and database in the error. Check that the server is up and reachable from this machine, that `.beads/metadata.json` names the right host/port/user, and that the password variable for that user (`BEADS_DOLT_PASSWORD_<USER>`, or `BEADS_DOLT_PASSWORD`) is set **in the environment anton itself was started from** — a `direnv` approval that never got granted is a common cause. No restart is needed once it's fixed: the next heartbeat picks the server back up. To keep working while the server is down, a machine that still has its old embedded database can set `dolt_mode` back to `"embedded"` — see [Board modes](#board-modes--solo-or-team).
 
 **`anton doctor` shows `anton.db not created`.** Run `anton setup` — it applies the Drizzle migrations that create/update `anton.db`. `anton.db` is disposable machine-local state; deleting it and re-running `anton setup` is a safe reset (your work lives in beads + git, not here).
+
+**`anton doctor` (or the Health page) says the running server is older than the code on disk.** A server holds the code it booted with: a `git pull` or an `anton update` under a running process changes nothing about what is actually serving, so a fix can ship and sit un-run while the nightly job it fixes keeps reporting the bug. anton stamps what each server booted from and compares it with what is on disk — naming both builds, on `anton doctor`, on the project's Health page, and on the session log of any scheduled job that ran under the stale process. **Restarting the server is the whole fix**, and the only one: `anton stop && anton start` for an installed bundle, or stop and re-run `anton dev` / `anton start` from a source checkout. anton never restarts itself — a running process may be mid-run, so when to take it down is your call.
 
 **`anton doctor` flags a drifted skill.** The copy in `~/.claude/skills/` (or the repo's `.claude/skills/`) isn't the one this release ships, so `/shape` will keep shaping work against rules the current release has replaced. What to do depends on which drift doctor names:
 

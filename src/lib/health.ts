@@ -18,6 +18,7 @@
  */
 import { rankAttention, type AttentionItem } from "./attention";
 import { getBoard } from "./board";
+import { serverBuildDrift, type BuildDrift } from "./build/drift";
 import { openEscalations } from "./escalations";
 import type { Board, HygieneReport, Project, ReviewTrajectory, ScanHealth } from "./types";
 
@@ -35,6 +36,13 @@ export interface ProjectHealth {
   trajectory: ReviewTrajectory | undefined;
   /** Open, stopped escalations — answered on the board, named here only as a count. */
   stoppedCount: number;
+  /**
+   * The running server against the code on disk (anton-pzfb), or null when they agree. Not a
+   * property of this project at all — it is the process every project's jobs run under, which is
+   * exactly why it belongs here: a nightly degraded by a stale build shows up as this page's
+   * findings, so this page is where the reason has to be legible without a CLI.
+   */
+  buildDrift: BuildDrift | null;
 }
 
 /**
@@ -45,6 +53,7 @@ export interface ProjectHealth {
 export function projectHealthFromBoard(
   board: Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">,
   stoppedCount: number,
+  buildDrift: BuildDrift | null = null,
 ): ProjectHealth {
   const { items, housekeeping } = rankAttention({
     hygiene: board.hygiene,
@@ -57,6 +66,7 @@ export function projectHealthFromBoard(
     scanHealth: board.scanHealth,
     trajectory: board.reviewTrajectory,
     stoppedCount,
+    buildDrift,
   };
 }
 
@@ -68,5 +78,7 @@ export function projectHealthFromBoard(
  */
 export async function getProjectHealth(project: Project): Promise<ProjectHealth> {
   const [board, escalations] = await Promise.all([getBoard(project), openEscalations(project.id)]);
-  return projectHealthFromBoard(board, escalations.length);
+  // Read live rather than from a stored report: which build is running is a fact about this instant,
+  // and a patrol row written by a since-restarted process would report drift that no longer exists.
+  return projectHealthFromBoard(board, escalations.length, serverBuildDrift());
 }

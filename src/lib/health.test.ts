@@ -7,6 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { projectHealthFromBoard } from "./health";
+import type { BuildDrift } from "./build/drift";
 import type { Board, HygieneFinding, HygieneReport, ReviewTrajectory } from "./types";
 
 type BoardSlice = Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">;
@@ -104,5 +105,26 @@ describe("projectHealthFromBoard", () => {
     // An open escalation must not turn a project with no findings into a "not clean" one — it's a
     // different question, answered on the board, and this page never mixes the two.
     expect(health.worthALook).toEqual([]);
+  });
+});
+
+// The stale-process verdict is about the SERVER, not this project, and the page is where it has to
+// be legible without a CLI (anton-pzfb) — so this composition carries it through untouched, and
+// carries nothing when the running build is the build on disk.
+describe("build drift on the health page", () => {
+  const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: undefined };
+
+  it("carries the drift verdict through to the page", () => {
+    const drift: BuildDrift = {
+      state: "modified",
+      running: { version: "0.4.0", revision: "a".repeat(40) },
+      onDisk: { version: "0.4.0", revision: "b".repeat(40) },
+      bootedAt: null,
+    };
+    expect(projectHealthFromBoard(board, 0, drift).buildDrift).toBe(drift);
+  });
+
+  it("reports none for a server started from the current checkout", () => {
+    expect(projectHealthFromBoard(board, 0).buildDrift).toBeNull();
   });
 });

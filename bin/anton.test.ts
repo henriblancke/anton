@@ -15,7 +15,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 import { agentsFromArgs, nextArgs, resolvePort } from "./anton.mjs";
 
-import { CLI, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
+import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
 describe("anton CLI dispatch", () => {
   it("--help prints usage and exits 0", () => {
@@ -319,6 +319,65 @@ describe("anton doctor — skill drift", () => {
   it("says nothing is drifted when no copy is installed at either scope", async () => {
     const r = runDoctor(await dirs.make("anton-home-"), await dirs.make("anton-cwd-"));
     expect(r.stdout).toContain("installed copies match the bundle");
+  });
+});
+
+/**
+ * `anton doctor` on the RUNNING server (anton-pzfb). A server holds the code it booted with, so a
+ * fix can ship, sit on disk, and never run — which is how three nightly scans re-filed a signal two
+ * landed filters already dropped. Doctor is the CLI half of saying so, and like the skill-drift
+ * check beside it, it only ever reports: a restart can kill an in-flight run.
+ */
+describe("anton doctor — stale server build", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  /** Point doctor's state dir at a temp dir and leave `record` there as the running server's stamp. */
+  async function runDoctorWith(record: object | null, { daemonPid }: { daemonPid?: number } = {}) {
+    const home = await dirs.make("anton-home-");
+    const state = await dirs.make("anton-state-");
+    if (record) writeFileSync(join(state, "server-build.json"), JSON.stringify(record));
+    if (daemonPid) writeFileSync(join(state, "anton.pid"), String(daemonPid));
+    return spawnSync(process.execPath, [CLI, "doctor"], {
+      encoding: "utf8",
+      cwd: await dirs.make("anton-cwd-"),
+      env: { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state },
+    });
+  }
+
+  // The vitest process itself stands in for the running server: its pid is alive, which is the only
+  // thing that makes a record a claim about NOW rather than a leftover.
+  const running = (over: object) => ({ version: "0.4.0", revision: null, pid: process.pid, bootedAt: Date.now(), ...over });
+
+  it("names the running build, the one on disk, and the restart that clears it", async () => {
+    const r = await runDoctorWith(running({ version: "0.0.1" }));
+    expect(r.stdout).toContain("is running 0.0.1");
+    expect(r.stdout).toContain(String(JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version));
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  it("says nothing is running when no record and no daemon exist", async () => {
+    const r = await runDoctorWith(null);
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
+  });
+
+  // The first upgrade past this change, and the state that hid the stale process for three nights:
+  // the running build is too old to have written a record, so its absence beside a live daemon is
+  // the entire evidence — and it is enough to name the restart.
+  it("reports a live daemon that left no record as unestablished", async () => {
+    const r = await runDoctorWith(null, { daemonPid: process.pid });
+    expect(r.stdout).toContain("recorded no build identity");
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  it("stays silent for a server started from the current checkout", async () => {
+    const onDisk = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version;
+    const head = spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    const r = await runDoctorWith(running({ version: onDisk, revision: head }));
+    expect(r.stdout).toContain("running the build on disk");
+    expect(r.stdout).not.toContain("Restart it");
   });
 });
 

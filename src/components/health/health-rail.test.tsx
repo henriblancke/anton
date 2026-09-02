@@ -20,6 +20,7 @@ function baseHealth(over: Partial<ProjectHealth> = {}): ProjectHealth {
     scanHealth: undefined,
     trajectory: undefined,
     stoppedCount: 0,
+    buildDrift: null,
     ...over,
   };
 }

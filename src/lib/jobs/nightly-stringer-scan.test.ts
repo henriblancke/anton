@@ -34,6 +34,17 @@ vi.mock("../git/refresh", () => ({
   refreshCheckout: async () => ({ head: "abc1234" }),
 }));
 
+// What the process running this pass booted from — null (matching the checkout) unless a case says
+// otherwise. Real drift needs a real stale server, which no unit test can boot.
+const build = vi.hoisted(() => ({
+  drift: null as { state: string; running: unknown; onDisk: unknown; bootedAt: number | null } | null,
+}));
+
+vi.mock("../build/drift", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../build/drift")>()),
+  serverBuildDrift: () => build.drift,
+}));
+
 const scanned = vi.hoisted(() => ({ restoreBaseline: async (): Promise<string | undefined> => undefined }));
 
 vi.mock("../stringer", async (importOriginal) => {
@@ -64,6 +75,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-stringer-scan-"));
   logPath = join(dir, "session.log");
   failLogWrite = undefined;
+  build.drift = null;
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 
@@ -140,4 +152,28 @@ it("reports what the scan lost when the log is writable", async () => {
   // The duplication filter can remove most of a scan; silence would read as a collector that
   // found nothing (anton-vb2h).
   expect(log).toContain("dropped 1 duplication signal(s)");
+});
+
+// A pass that ran under a stale process must say so where the run is reconstructed afterwards
+// (anton-pzfb): the three nightlies that re-filed an already-filtered signal left session logs whose
+// only tell was a line the running build was too old to write.
+it("names a stale server on the session, beside the line recording what it invoked", async () => {
+  build.drift = {
+    state: "modified",
+    running: { version: "0.4.0", revision: "a".repeat(40) },
+    onDisk: { version: "0.4.0", revision: "b".repeat(40) },
+    bootedAt: null,
+  };
+
+  await runScan();
+
+  const log = readFileSync(logPath, "utf8");
+  expect(log).toContain("[stringer] scan --delta /repo @ abc1234");
+  expect(log).toContain("[stringer] WARNING: the running anton server is 0.4.0 (aaaaaaa)");
+  expect(log).toContain("Restart the server");
+});
+
+it("says nothing when the pass runs under the build on disk", async () => {
+  await runScan();
+  expect(readFileSync(logPath, "utf8")).not.toContain("Restart the server");
 });
