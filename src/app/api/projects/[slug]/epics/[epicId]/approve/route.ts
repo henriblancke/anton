@@ -644,6 +644,18 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     }
     return NextResponse.json({ error: refusal.notRunTarget }, { status: 422 });
   }
+  // The claim write fell over ambiguously (PR #218 review): `bd assign` can commit and then throw or
+  // time out, so a 500 alone could leave the target reserved by an approver whose request reported
+  // nothing changed. approve-claim re-reads and hands the reservation back under the lock; only what
+  // it could not take off is the operator's to clear.
+  if ("claimFailed" in swap) {
+    const error = swap.stranded
+      ? `${epicId} could not be approved, and the claim this request took could not be handed ` +
+        `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
+        swap.claimFailed
+      : `${epicId} could not be approved — nothing was changed. ${swap.claimFailed}`;
+    return NextResponse.json({ error }, { status: 500 });
+  }
   // The claim landed and the label did not (PR #218 review). The CAS has already moved the assignee,
   // so failing the request here would leave the target reserved by an approver who never approved
   // it — claimed-looking work with no approval and no run. Take this request's writes back, then

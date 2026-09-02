@@ -456,6 +456,47 @@ describe("applyPickerPlan", () => {
     expect(nudgeSync).toHaveBeenCalled();
   });
 
+  it("hands the claim back when the claim write commits and then throws", async () => {
+    // `bd assign` is ambiguous on failure: it can land the assignee and still reject. Left to
+    // propagate, the rejection would skip the unwind entirely and strand the target as claimed with
+    // no approval and no run — the same shape a failed label write leaves.
+    put(bead("t1"));
+    vi.spyOn(beads, "assign").mockImplementation(async (_cwd, id, actor) => {
+      board.current.get(id)!.assignee = actor;
+      throw new Error("bd assign timed out");
+    });
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "could not be claimed",
+    );
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
+  });
+
+  it("names the target a human has to clear when the ambiguous claim will not come off", async () => {
+    put(bead("t1"));
+    vi.spyOn(beads, "assign").mockImplementation(async (_cwd, id, actor) => {
+      board.current.get(id)!.assignee = actor;
+      throw new Error("bd assign timed out");
+    });
+    vi.spyOn(beads, "unassign").mockRejectedValue(new Error("dolt is locked"));
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: true } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "left claimed by anton",
+    );
+    expect(read("t1").assignee).toBe("anton-box");
+    // The reservation is real to the other machines, so it has to reach them.
+    expect(nudgeSync).toHaveBeenCalled();
+  });
+
   it("publishes the approval and the claim when a run already covers the target", async () => {
     // The writes landed even though nothing started, and unpublished they are invisible to the
     // machine whose next pass would then read the target as free.

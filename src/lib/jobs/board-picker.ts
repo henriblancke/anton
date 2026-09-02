@@ -144,16 +144,19 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // that says a policy is armed while the plan admits everything is advertising a boundary anton
     // does not keep. An unarmed project keeps the structural default — the pass starts nothing, so
     // an unnarrowed plan is a ranking, not an autopilot.
-    const settings = await getProjectSettings(db, projectId);
+    //
+    // The record is the second half of the autonomy resolution below (anton-vkp9): `apply` is
+    // floored by what this project's own releases and vetoes have EARNED, not by the setting alone.
+    // Re-read every pass — the window rolls, so a record that degrades after arming returns the
+    // picker to `shadow` on the next tick rather than the next time somebody looks at settings. Two
+    // independent reads, so one round trip rather than two on every pass.
+    const [settings, record] = await Promise.all([
+      getProjectSettings(db, projectId),
+      pickerTrackRecord(db, projectId),
+    ]);
     const armed = resolvePickerPolicy(settings);
     // How far this pass may go with what it decides. Resolved here, before the decision, so the one
     // fact that turns a ranking into a start is read from the same settings snapshot the policy is.
-    //
-    // The record is the second half of that resolution (anton-vkp9): `apply` is floored by what this
-    // project's own releases and vetoes have EARNED, not by the setting alone. Re-read every pass —
-    // the window rolls, so a record that degrades after arming returns the picker to `shadow` on the
-    // next tick rather than the next time somebody looks at settings.
-    const record = await pickerTrackRecord(db, projectId);
     const autonomy = resolvePickerAutonomy(settings, record);
     // Said out loud, because a setting the pass silently ignores is the unexplained state this whole
     // floor exists to avoid: the operator asked for `apply` and is getting `shadow`, and the counts

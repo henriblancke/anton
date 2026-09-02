@@ -163,8 +163,14 @@ export type PickerStanceCheck = (target: Bead, board: Bead[]) => Promise<string 
  */
 export function pickerStance(db: AntonDb, projectId: string): PickerStanceCheck {
   return async (target, board) => {
-    const settings = await getProjectSettings(db, projectId);
-    const autonomy = resolvePickerAutonomy(settings, await pickerTrackRecord(db, projectId));
+    // Two independent reads, and this closure runs twice per apply — under the claim lock and again
+    // after the settle — so they go in parallel rather than costing a round trip each on the
+    // critical path.
+    const [settings, record] = await Promise.all([
+      getProjectSettings(db, projectId),
+      pickerTrackRecord(db, projectId),
+    ]);
+    const autonomy = resolvePickerAutonomy(settings, record);
     if (autonomy !== "apply") {
       return `this project's picker autonomy is no longer apply (now ${autonomy})`;
     }
@@ -558,6 +564,24 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   if ("refused" in swap) {
     const reason = "stale" in swap.refused ? swap.refused.stale : swap.refused.ineligible;
     return { skipped: { beadId: top.beadId, reason } };
+  }
+  // The claim write itself fell over, ambiguously — approve-claim has already re-read the assignee
+  // and handed the reservation back under the lock, so what is left here is the wording. Only a
+  // reservation it could NOT take off leaves the target claimed-but-unapproved, which no later pass
+  // re-picks.
+  if ("claimFailed" in swap) {
+    publish();
+    const reason = `the target could not be claimed (${swap.claimFailed})`;
+    const leftover = swap.stranded
+      ? `${top.beadId} is left claimed by anton — clear its assignee by hand`
+      : undefined;
+    return {
+      skipped: {
+        beadId: top.beadId,
+        reason: withLeftover(reason, leftover),
+        wroteBoard: swap.stranded,
+      },
+    };
   }
   // The claim landed and the label did not. Left alone this is the worst state the pass can produce:
   // an assignee with no approval and no run, which every later pass reads as "already claimed" and

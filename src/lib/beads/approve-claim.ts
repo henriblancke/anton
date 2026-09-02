@@ -19,9 +19,10 @@
  *     answered from a read anything could have moved since; whatever must still hold at the instant
  *     of the write is re-asked here, over a raw `loadAllIssues` (never the snapshot-backed refresh,
  *     whose last-good fallback is right for a view and wrong for a gate about to write).
- *   • A half-written sequence is REPORTED, not thrown. The one order that can break is a won swap
- *     followed by a refused label write, and it strands the target — so it comes back as
- *     `approveFailed` carrying the swap, which is what lets a caller undo its own claim.
+ *   • A half-written sequence is REPORTED, not thrown. Both writes are ambiguous on failure — bd can
+ *     commit and then time out — and either one left standing strands the target. A won swap under a
+ *     refused label comes back as `approveFailed` carrying the swap, which is what lets a caller undo
+ *     its own claim; a swap that threw is handed back here and comes back as `claimFailed`.
  *
  * What it does NOT do is make the swap atomic across machines: the lock is keyed on `repoPath` and
  * so serializes THIS process only (see ./claim). Cross-machine the guard is the CAS itself, which on
@@ -29,7 +30,7 @@
  * is for.
  */
 import { beads, LABELS, type Bead } from "./bd";
-import { setAssigneeIfOwner, withClaimLock, type SwapResult } from "./claim";
+import { setAssigneeIfOwner, withClaimLock, type LockedSwap, type SwapResult } from "./claim";
 import { loadAllIssues } from "./issues";
 
 /**
@@ -44,11 +45,18 @@ import { loadAllIssues } from "./issues";
  * holding a reservation it never approved — a target that reads as claimed to every later pass and
  * to a human, with no approval and no run behind it. Reported as a value, carrying the swap, so the
  * caller can take its own writes back (picker-apply's `unwindStart`) instead of stranding them.
+ *
+ * `claimFailed` is the same argument one step earlier (PR #218 review): the CAS itself is AMBIGUOUS
+ * on failure — `bd assign` can commit the assignee and then throw or time out, and the post-write
+ * read-back can fail on its own. Letting that reject would skip every caller's compensation and
+ * leave the identical stranded target, so the assignee is re-read and handed back here (see
+ * {@link releaseAmbiguousClaim}) and only what could NOT be taken back is reported, as `stranded`.
  */
 export type ApproveClaimResult<R> =
   | SwapResult
   | { refused: R }
   | { vanished: true }
+  | { claimFailed: string; stranded: boolean }
   | { approveFailed: string; swap: Extract<SwapResult, { ok: true }> };
 
 export interface ApproveClaimInput<R> {
@@ -73,6 +81,34 @@ export interface ApproveClaimInput<R> {
 }
 
 /**
+ * Hand back a claim whose own write THREW, and answer whether anything is still standing.
+ *
+ * A rejected `bd assign` proves nothing about the assignee: the command can commit and then time
+ * out, and the CAS's post-write read-back can fail over a write that landed. So the reservation is
+ * re-read and reversed through the SAME locked CAS — inside the lock, where no other writer can slip
+ * between the ambiguous write and its compensation, and conditional by construction: a swap that
+ * never landed reads as `expectedOwner` and short-circuits to a no-op, and a third party who holds
+ * the target now loses the CAS and keeps it.
+ *
+ * Stranded ONLY when the target still reads as `nextOwner` afterwards — that reservation is ours,
+ * has no approval and no run behind it, and needs a human. An unreadable board fails closed to
+ * stranded, as {@link unwindApproveClaim} does for the same reason.
+ */
+async function releaseAmbiguousClaim<R>(
+  cas: LockedSwap,
+  beadId: string,
+  input: ApproveClaimInput<R>,
+): Promise<boolean> {
+  try {
+    const restored = await cas(input.nextOwner, input.expectedOwner);
+    return !restored.ok && restored.owner === input.nextOwner;
+  } catch (e) {
+    console.error(`[approve-claim] could not hand back the ambiguous claim on ${beadId}`, e);
+    return true;
+  }
+}
+
+/**
  * Claim `beadId` for `nextOwner` and label it `approved`, both under its claim-write lock.
  *
  * The CAS is handed the locked read rather than re-reading: the lock is precisely what makes the two
@@ -91,7 +127,13 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     const refused = await input.guard(locked, board);
     if (refused !== undefined) return { refused };
 
-    const swap = await cas(input.expectedOwner, input.nextOwner, locked);
+    let swap: SwapResult;
+    try {
+      swap = await cas(input.expectedOwner, input.nextOwner, locked);
+    } catch (e) {
+      const stranded = await releaseAmbiguousClaim(cas, beadId, input);
+      return { claimFailed: e instanceof Error ? e.message : String(e), stranded };
+    }
     if (!swap.ok) return swap;
     // Contingent, never speculative: the label goes on only once the reservation is provably ours.
     try {
