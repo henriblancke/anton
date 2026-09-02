@@ -331,6 +331,29 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  // "Inside the checkout" is not proof the target is digested: an IGNORED in-checkout target is in
+  // neither the diff nor the untracked listing, so dropping the link on location alone leaves the
+  // bytes Next compiles through it invisible — the worktree reads "clean" however often they change.
+  it("follows a tracked link whose in-checkout target git ignores", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitignore"), "generated/\n");
+    mkdirSync(join(dir, "generated"));
+    writeFileSync(join(dir, "generated", "shared.ts"), SOURCE);
+    symlinkSync(join(dir, "generated", "shared.ts"), join(dir, "linked.ts"));
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "track the link"]);
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "generated", "shared.ts"), SOURCE.replace("1", "2"));
+    const edited = readBuildIdentity(dir).worktree;
+    expect(edited).not.toBe(first);
+
+    // Same bytes behind the same link is the same build, so the digest stays a function of them.
+    writeFileSync(join(dir, "generated", "shared.ts"), SOURCE);
+    expect(readBuildIdentity(dir).worktree).toBe(first);
+  });
+
   // A walk that stops at the entry cap hashes the same bytes however the entries past the cutoff
   // change, so an edit behind it would leave the identity unmoved and `buildMatchesCheckout` would
   // vouch for a `.next` compiled from the old contents. Unreadable is the honest verdict — it makes

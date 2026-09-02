@@ -212,16 +212,20 @@ function git(appRoot, args) {
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
- * that class back in, and the diff hides another, so `trackedLinksOutside` names that one back.
+ * that class back in, and the diff hides another, so `uncoveredTrackedLinks` names that one back.
+ * Both read git, and a read git could not answer collapses the digest exactly as the two above do:
+ * a digest missing an input vouches for a build compiled from something else (PR #217 review).
  */
 function readWorktreeDigest(appRoot) {
   const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (listed === null) return null;
   const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"]);
   if (diff === null) return null;
-  const links = trackedLinksOutside(appRoot);
+  const links = uncoveredTrackedLinks(appRoot);
   if (links === null) return null;
-  const inputs = [...listed.split("\0").filter(Boolean), ...ignoredEnvFiles(appRoot), ...links];
+  const envFiles = ignoredEnvFiles(appRoot);
+  if (envFiles === null) return null;
+  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links];
   const files = [...new Set(inputs)].sort();
   if (!files.length && !diff) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
@@ -234,8 +238,8 @@ function readWorktreeDigest(appRoot) {
 }
 
 /**
- * The TRACKED symlinks whose targets stand outside the checkout — build inputs the tracked diff
- * cannot see, and the untracked listing never names.
+ * The TRACKED symlinks nothing else in the digest covers — build inputs the tracked diff cannot
+ * see, and the untracked listing never names.
  *
  * A tracked link is committed as its link TEXT, so `git diff HEAD` compares the path it points at
  * and never the bytes at the end of it: a committed `linked.ts -> ../shared/lib.ts`, or a
@@ -244,17 +248,22 @@ function readWorktreeDigest(appRoot) {
  * `.next` and serve the old target while every drift surface calls the server current — the same
  * blindness the untracked-symlink walk already closes, on the half of the tree git DOES track.
  *
- * Links resolving back INSIDE the checkout are left out: their targets are already digested where
- * they stand (tracked ones by the diff, untracked ones by the listing), so following them would
- * hash the same bytes twice — and a link to a source directory would drag every ignored file under
- * it, `.next` and node_modules included, past `MAX_LINKED_ENTRIES` and collapse the digest on every
- * read. A link resolving nowhere counts as outside, which keeps its text in the digest.
+ * A link resolving back INSIDE the checkout is dropped only once its target is PROVEN digested
+ * where it stands (PR #217 review) — tracked targets by the diff, untracked ones by the listing —
+ * because a third kind hides there: an IGNORED in-checkout target is in neither, so a committed
+ * `linked.ts -> generated/shared.ts` under an ignored `generated/` would leave the worktree "clean"
+ * however often those bytes change. `ignoredUnder` is that proof: nothing ignored at the target,
+ * nothing to name back in. Proven ones are dropped because following them would hash the same bytes
+ * twice — and a link to a whole source tree would drag every ignored file under it, `.next` and
+ * node_modules included, past `MAX_LINKED_ENTRIES`, which collapses the digest and forces the
+ * rebuild rather than vouching for a partial read. A link resolving nowhere counts as uncovered,
+ * which keeps its text in the digest.
  *
  * `ls-files -s` is the only listing that reports MODE, and mode 120000 is git's symlink. A read git
  * could not answer collapses the digest rather than returning a partial input set, for the reason
  * the walk cap does: a digest missing an input vouches for a build compiled from something else.
  */
-function trackedLinksOutside(appRoot) {
+function uncoveredTrackedLinks(appRoot) {
   const listed = git(appRoot, ["ls-files", "-s", "-z"]);
   if (listed === null) return null;
   let root;
@@ -263,21 +272,44 @@ function trackedLinksOutside(appRoot) {
   } catch {
     return null;
   }
-  return listed
+  const links = listed
     .split("\0")
     .filter((entry) => entry.startsWith("120000 "))
-    .map((entry) => entry.slice(entry.indexOf("\t") + 1))
-    .filter((path) => !resolvesUnder(root, join(appRoot, path)));
+    .map((entry) => entry.slice(entry.indexOf("\t") + 1));
+  const uncovered = [];
+  for (const path of links) {
+    const inside = resolvedInside(root, join(appRoot, path));
+    if (inside === null) {
+      uncovered.push(path);
+      continue;
+    }
+    const hidden = ignoredUnder(appRoot, [inside === "" ? "." : `:(literal)${inside}`]);
+    if (hidden === null) return null;
+    if (hidden.length) uncovered.push(path);
+  }
+  return uncovered;
 }
 
-/** Does `path` lead to something inside `root`? False for a link leading nowhere — it leads out. */
-function resolvesUnder(root, path) {
+/**
+ * Where under `root` does `path` lead — as a root-relative path, or null when it leads out.
+ *
+ * The relative form is what git can be asked about: a pathspec is how the caller proves the target
+ * is already an input. A link leading nowhere leads out, and the empty string means the root itself.
+ */
+function resolvedInside(root, path) {
   try {
     const target = realpathSync(path);
-    return target === root || target.startsWith(root + sep);
+    if (target === root) return "";
+    return target.startsWith(root + sep) ? target.slice(root.length + sep.length) : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** The ignored paths git hides at `pathspecs` — the build inputs `--exclude-standard` leaves out. */
+function ignoredUnder(appRoot, pathspecs) {
+  const listed = git(appRoot, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...pathspecs]);
+  return listed === null ? null : listed.split("\0").filter(Boolean);
 }
 
 /**
@@ -294,19 +326,14 @@ function resolvesUnder(root, path) {
  * and the session logs all live under the app root and are all ignored too, and folding those in
  * would re-digest the tree on every write — a permanent "restart the server" banner. Top level
  * only, because that is the only place Next looks; tracked env files are left to the diff.
+ *
+ * A read git could not answer is null, not an empty list (PR #217 review): the two say opposite
+ * things. Empty means "no env file here", and a digest that treats a timed-out or lock-blocked git
+ * as that would hash an `.env.local` edit into the same digest as the unedited file — `anton start`
+ * reusing a `.next` compiled from the old value, the staleness this function exists to prevent.
  */
 function ignoredEnvFiles(appRoot) {
-  const listed = git(appRoot, [
-    "ls-files",
-    "--others",
-    "--ignored",
-    "--exclude-standard",
-    "-z",
-    "--",
-    ".env",
-    ".env.*",
-  ]);
-  return listed === null ? [] : listed.split("\0").filter(Boolean);
+  return ignoredUnder(appRoot, [".env", ".env.*"]);
 }
 
 /**
