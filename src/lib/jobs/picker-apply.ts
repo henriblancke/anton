@@ -477,38 +477,50 @@ async function settleClaim(
     };
   }
 
+  const moved = await stillStartable(board, settled, stance, "while the claim settled");
+  if (moved) return { stale: moved };
+  return { held: true, board };
+}
+
+/**
+ * Is the reservation still worth having on THIS board? The three questions every re-validation after
+ * the CAS asks, in one place so the settle and the final gate cannot drift apart (PR #218 review) —
+ * and so a caller that has just spent a long await knows exactly what re-reading the board buys it.
+ * Answers with the reason the start must be abandoned, or undefined while it holds. `when` names the
+ * window the caller just spent, since that is the only part a reader needs to tell them apart.
+ */
+async function stillStartable(
+  board: Bead[],
+  target: Bead,
+  stance: PickerStanceCheck,
+  when: string,
+): Promise<string | undefined> {
   // The approval, which the eligibility rule below deliberately never asks about: the picker is the
   // label's second WRITER, so its rule tests whether approval WOULD hold, not whether it is there
-  // (picker-targets.ts). After the settle that is the wrong question — this pass already wrote the
+  // (picker-targets.ts). Past the CAS that is the wrong question — this pass already wrote the
   // label, and another client can withdraw it inside the window while leaving this assignee
-  // untouched. Enqueueing then buys a run execute-epic only poison-parks as unapproved (PR #218
-  // review), so the label is re-checked here, beside the rule that cannot see it.
-  if (!beads.isApproved(settled)) {
-    return { stale: "the approval was withdrawn while the claim settled" };
-  }
+  // untouched. Enqueueing then buys a run execute-epic only poison-parks as unapproved, so the label
+  // is re-checked here, beside the rule that cannot see it.
+  if (!beads.isApproved(target)) return `the approval was withdrawn ${when}`;
 
-  // Re-ask the pass's OWN eligibility rule against the board the settle just pulled — the same
-  // post-settle re-validation `beads.staleClaimReason` does for a worker's pickup (PR #218 review).
-  // Another machine can close, abandon or block the target, label it `agent:human`, or attach a
-  // feature child inside the settle window while leaving this assignee untouched; the holder check
-  // above cannot see any of it, and enqueueing anyway buys a run execute-epic only poison-parks.
-  // Judged with the reservation cleared (see {@link asUnclaimed}) — exactly the assignee leg
-  // `staleClaimReason` leaves out, and for the same reason.
-  const { free, board: asFree } = asUnclaimed(board, settled);
+  // The pass's OWN eligibility rule against the board just read — the same re-validation
+  // `beads.staleClaimReason` does for a worker's pickup. Another machine can close, abandon or block
+  // the target, label it `agent:human`, or attach a feature child inside the window while leaving
+  // this assignee untouched; the holder check cannot see any of it, and enqueueing anyway buys a run
+  // execute-epic only poison-parks. Judged with the reservation cleared (see {@link asUnclaimed}) —
+  // exactly the assignee leg `staleClaimReason` leaves out, and for the same reason.
+  const { free, board: asFree } = asUnclaimed(board, target);
   const excluded = ineligibility(free, asFree);
   if (excluded) {
     const why = excluded.detail ? `${excluded.reason} — ${excluded.detail}` : excluded.reason;
-    return { stale: `the target stopped being startable while the claim settled (${why})` };
+    return `the target stopped being startable ${when} (${why})`;
   }
 
-  // And the OPERATOR's half of the same question, which no board read can answer (PR #218 review):
-  // the standing approval this start rests on can be withdrawn inside the settle window as easily as
-  // the target can move under it. See {@link pickerStance}.
+  // And the OPERATOR's half of the same question, which no board read can answer: the standing
+  // approval this start rests on can be withdrawn inside the window as easily as the target can move
+  // under it. See {@link pickerStance}.
   const withdrawn = await stance(free, asFree);
-  if (withdrawn) {
-    return { stale: `the standing approval was withdrawn while the claim settled (${withdrawn})` };
-  }
-  return { held: true, board };
+  return withdrawn ? `the standing approval was withdrawn ${when} (${withdrawn})` : undefined;
 }
 
 /**
@@ -779,39 +791,43 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // rather than on a run teardown would have to delete out from under an approved, claimed bead.
   if (cancelled(signal)) return standDown(CANCELLED_BEFORE_ENQUEUE);
 
-  // The board the three brakes below are judged against: the settle's read where there was one — the
-  // freshest this pass has — and a fresh one otherwise, since a no-op swap settles nothing and
-  // leaves none. Read ONCE and shared by the flow brake and the stance, so the two answer about the
-  // same instant at no second `bd list`, and FAILS CLOSED like every other read in this window.
-  let gateBoard: Bead[];
-  try {
-    gateBoard = settledBoard ?? (await loadAllIssues(repoPath));
-  } catch (e) {
-    return standDown(`the board could not be read before starting (${errorText(e)})`);
-  }
-  const target = gateBoard.find((b) => b.id === top.beadId);
-  if (!target) return standDown("the target left the board before its run was enqueued");
-  const { free, board: asFree } = asUnclaimed(gateBoard, target);
-
   // The FLOW brake first of the three, because it is the only one that can BLOCK (PR #218 review): a
   // queue at the limit is confirmed with a `gh pr view` per waiting PR, each with a two-minute
   // ceiling of its own. Asked ahead of the two settings brakes so THEY get the last word before the
   // enqueue rather than aging behind it. A run that reached `stage:in-review` while this pass claimed
   // and settled — or an operator who lowered the limit in it — fills the review queue the entry gate
   // found bandwidth in, and the hold is derived rather than latched, so only re-asking can see it.
-  // See {@link pickerWipHold}.
-  const holding = await held(gateBoard);
+  // Judged against the settle's read where there was one — the freshest board this pass has — and
+  // against one of its own otherwise, since a no-op swap settles nothing. See {@link pickerWipHold}.
+  const holding = await held(settledBoard);
   if (holding) return standDown(holding);
 
-  // Then the two brakes the operator holds, re-asked on the FAR side of that window (PR #218 review)
-  // and together, so neither ages behind the other's read. The settle asked both, but the WIP check
-  // between there and here is minutes wide: long enough for a breaker to latch a freeze on a run
-  // settling into a failing streak, or for the operator to step off `apply` and withdraw the standing
-  // approval this whole start rests on. Both are local reads, so what is left after them is the
-  // enqueue itself. See {@link pickerDisarmed} and {@link pickerStance}.
-  const [frozen, withdrawn] = await Promise.all([disarmed(), stance(free, asFree)]);
+  // THEN the board is re-read, because that confirmation is the one await left in this window that
+  // can run for MINUTES and everything below it is judged against the board (PR #218 review): another
+  // client can relabel the target out of the policy, block it, label it `agent:human`, close it or
+  // withdraw the approval while those PRs are confirmed, and answering from the snapshot the
+  // confirmation started with would enqueue work that is no longer claimable or no longer admitted.
+  // FAILS CLOSED like every other read here, and it is deliberately the LAST board read before the
+  // enqueue: what follows are local reads only, so nothing below can age behind another round trip.
+  let gateBoard: Bead[];
+  try {
+    gateBoard = await loadAllIssues(repoPath);
+  } catch (e) {
+    return standDown(`the board could not be read before starting (${errorText(e)})`);
+  }
+  const target = gateBoard.find((b) => b.id === top.beadId);
+  if (!target) return standDown("the target left the board before its run was enqueued");
+
+  // The last three questions, together on that one fresh read so none of them ages behind another's
+  // await: the disarm latch — which a breaker can raise on a run settling into a failing streak —
+  // beside the board's own eligibility rule and the operator's policy, re-asked exactly as the settle
+  // asked them (PR #218 review). See {@link pickerDisarmed} and {@link stillStartable}.
+  const [frozen, moved] = await Promise.all([
+    disarmed(),
+    stillStartable(gateBoard, target, stance, "while the review queue was confirmed"),
+  ]);
   if (frozen) return standDown(frozen);
-  if (withdrawn) return standDown(withdrawn);
+  if (moved) return standDown(moved);
 
   // And the same question once more on the far side of the brakes (PR #218 review), because every
   // one of them is an await: a cancel landing while the WIP hold is derived or the freeze is read

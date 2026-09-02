@@ -3,7 +3,7 @@
  * live loop against a real in-memory anton.db with a controllable clock — lease/reclaim,
  * quota backoff (park + reschedule, attempt refunded), and poison-pill parking after N attempts.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
@@ -1254,6 +1254,27 @@ describe("JobRunner (live, in-memory db)", () => {
     await r.whenIdle();
     expect((await getJob(tdb.db, bypassed))?.status).toBe("queued");
     expect((await getJob(tdb.db, other))?.status).toBe("done");
+  });
+
+  it("refuses a resume for a project quiesced at the write itself (PR #218)", async () => {
+    // The window the pre-read guard left open: teardown raises the barrier and sweeps the project's
+    // active rows while the resume is already under way. Checked before the read, the resume would
+    // still flip the parked row to `queued` behind that sweep — and teardown's leftover guard fails
+    // the delete over it. The barrier is handed down into the resume's transaction, so the write
+    // itself is what sees it.
+    seedProjects("A");
+    const r = runner(async () => {});
+    const parked = await r.enqueue({ type: "execute-epic", projectId: "A" });
+    await tdb.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parked));
+
+    const transaction = tdb.db.transaction.bind(tdb.db);
+    vi.spyOn(tdb.db, "transaction").mockImplementationOnce(((fn: never) => {
+      r.quiesceProject("A").catch(() => {});
+      return transaction(fn);
+    }) as typeof tdb.db.transaction);
+
+    expect(await r.resume(parked)).toBe(false);
+    expect((await getJob(tdb.db, parked))?.status).toBe("parked");
   });
 
   it("runningJobInfo returns what the handler reported while in flight, undefined after settle (anton-susu)", async () => {

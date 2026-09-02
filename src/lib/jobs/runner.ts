@@ -564,9 +564,14 @@ export class JobRunner {
    * The manual-resume UI (anton's separate ticket) drives this; parking is no longer terminal.
    */
   async resume(jobId: string): Promise<boolean> {
-    const job = await getJob(this.db, jobId);
-    if (job?.projectId && this.quiescedProjects.has(job.projectId)) return false;
-    return resumeJob(this.db, this.clock, jobId);
+    // The barrier is crossed INSIDE the resume's own transaction, not read here first (PR #218
+    // review): `quiesceProject` raises the flag and then sweeps the project's active rows, and a
+    // resume that passed a check here would still flip the parked row to `queued` behind that sweep
+    // — leaving teardown's leftover guard to fail the project delete over a row revived after it.
+    // `resumeJob` asks this in the same synchronous step as the status write, so there is no window.
+    return resumeJob(this.db, this.clock, jobId, {
+      refuseProject: (projectId) => this.quiescedProjects.has(projectId),
+    });
   }
 
   /**

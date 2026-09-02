@@ -1155,45 +1155,64 @@ export async function park(
  * applied in the UPDATE's WHERE so a concurrent settle can't race it between the read and the write,
  * and the return value is that CAS's affected-row count: `true` means this call un-parked the job,
  * never merely that it looked resumable a moment earlier.
+ *
+ * `refuseProject` is a caller-owned veto on the row's project, asked INSIDE the transaction (PR #218
+ * review). The runner's project-teardown barrier lives in memory, so a caller that checked it before
+ * this call would still be racing: `quiesceProject` can raise it and sweep the project's active rows
+ * between that check and this write, and the revived `queued` row then trips teardown's leftover
+ * guard and fails the delete. Handed down instead, it is crossed in the same synchronous step as the
+ * status flip — the whole body runs without an await, on better-sqlite3's single connection, exactly
+ * like the enqueue helpers above. Don't reintroduce one.
  */
-export async function resumeJob(db: AntonDb, clock: Clock, jobId: string): Promise<boolean> {
+export async function resumeJob(
+  db: AntonDb,
+  clock: Clock,
+  jobId: string,
+  opts?: { refuseProject?: (projectId: string) => boolean },
+): Promise<boolean> {
   const nowMs = clock.now();
-  const job = await getJob(db, jobId);
-  // Only a settled-but-recoverable job un-parks: `parked` (retry budget exhausted / permanent error
-  // a human resolved) or `failed` (reserved terminal). A running/queued/done job must not be reset —
-  // that would corrupt its lifecycle or duplicate work.
-  if (!job || (job.status !== "parked" && job.status !== "failed")) return false;
-
-  // Un-parking returns the job to `queued` — an active status. For execute-epic that competes with
-  // `jobs_active_epic_unique`: after this job parked/failed, the dedupe path (which ignores
-  // parked/failed) may have already spawned a fresh queued/running job for the same project + epic.
-  // Reviving this stale row would then be a *second* active job for that epic and raise UNIQUE. So
-  // no-op instead of surfacing a 500 — the fresh job already covers the work (anton-ner).
-  if (job.type === "execute-epic" && job.projectId) {
-    const epicBeadId = epicBeadIdOf(job.payloadJson);
-    if (epicBeadId && activeExecuteEpicId(db, job.projectId, epicBeadId)) return false;
-  }
-
   try {
-    const updated = await db
-      .update(schema.jobs)
-      .set({
-        status: "queued",
-        runAt: secDate(nowMs),
-        leaseExpiresAt: null,
-        attempts: 0,
-        lastError: null,
-        updatedAt: secDate(nowMs),
-      })
-      // Re-assert the resumable status in the WHERE so a concurrent settle can't race it between the
-      // read above and this write.
-      .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])))
-      .returning({ id: schema.jobs.id });
-    // The WHERE is the CAS, so the affected-row count is the only truthful answer: zero means a
-    // concurrent settle (an operator's cancel, most of all) took the row after the read above and
-    // this resume did NOT happen. Reporting `true` there would let `resumeEpic` claim `resumed-job`
-    // and skip its cancellation re-read, so the UI would call a still-cancelled job restarted.
-    return updated.length > 0;
+    return db.transaction((tx) => {
+      const job = tx.select().from(schema.jobs).where(eq(schema.jobs.id, jobId)).limit(1).all()[0];
+      // Only a settled-but-recoverable job un-parks: `parked` (retry budget exhausted / permanent
+      // error a human resolved) or `failed` (reserved terminal). A running/queued/done job must not
+      // be reset — that would corrupt its lifecycle or duplicate work.
+      if (!job || (job.status !== "parked" && job.status !== "failed")) return false;
+
+      if (job.projectId && opts?.refuseProject?.(job.projectId)) return false;
+
+      // Un-parking returns the job to `queued` — an active status. For execute-epic that competes
+      // with `jobs_active_epic_unique`: after this job parked/failed, the dedupe path (which ignores
+      // parked/failed) may have already spawned a fresh queued/running job for the same project +
+      // epic. Reviving this stale row would then be a *second* active job for that epic and raise
+      // UNIQUE. So no-op instead of surfacing a 500 — the fresh job already covers the work
+      // (anton-ner).
+      if (job.type === "execute-epic" && job.projectId) {
+        const epicBeadId = epicBeadIdOf(job.payloadJson);
+        if (epicBeadId && activeExecuteEpicId(tx, job.projectId, epicBeadId)) return false;
+      }
+
+      const updated = tx
+        .update(schema.jobs)
+        .set({
+          status: "queued",
+          runAt: secDate(nowMs),
+          leaseExpiresAt: null,
+          attempts: 0,
+          lastError: null,
+          updatedAt: secDate(nowMs),
+        })
+        // Re-assert the resumable status in the WHERE so a concurrent settle — one that landed
+        // before this transaction opened — can't be overwritten by a read taken before it.
+        .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, ["parked", "failed"])))
+        .returning({ id: schema.jobs.id })
+        .all();
+      // The WHERE is the CAS, so the affected-row count is the only truthful answer: zero means a
+      // concurrent settle (an operator's cancel, most of all) took the row and this resume did NOT
+      // happen. Reporting `true` there would let `resumeEpic` claim `resumed-job` and skip its
+      // cancellation re-read, so the UI would call a still-cancelled job restarted.
+      return updated.length > 0;
+    });
   } catch (e) {
     // Backstop for the race the check above can't fully close: a concurrent enqueue could win the
     // active slot between the check and this write. Absorb the index violation as a clean no-op.

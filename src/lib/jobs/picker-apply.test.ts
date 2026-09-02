@@ -227,13 +227,6 @@ async function settledJob(status: "parked" | "failed"): Promise<string> {
   return id;
 }
 
-/** Make every job CAS lose — the concurrent settle `resumeJob`'s guarded UPDATE exists to catch. */
-function jobWritesLoseTheirRace(): void {
-  vi.spyOn(t.db, "update").mockReturnValue({
-    set: () => ({ where: () => ({ returning: async () => [] }) }),
-  } as unknown as ReturnType<TestDb["db"]["update"]>);
-}
-
 describe("applyPickerPlan", () => {
   it("approves, claims and enqueues the top pick, and records the start as `policy`", async () => {
     put(bead("t1"));
@@ -930,6 +923,48 @@ describe("applyPickerPlan", () => {
       expect(seen[0]?.map((b) => b.id)).toEqual(["t1"]);
     });
 
+    it("takes its writes back when the target stops being startable while the queue is checked", async () => {
+      // The board-derived half of the same window (PR #218 review): confirming a full queue is a
+      // `gh pr view` per waiting PR, and another client can block the target, close it or label it
+      // `agent:human` inside it. Judged off the snapshot the confirmation began with, the pass would
+      // enqueue work that is no longer claimable — so the board is re-read on its far side.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          const b = board.current.get("t1")!;
+          b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("stopped being startable");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("takes its writes back when the approval is withdrawn while the queue is checked", async () => {
+      // The label the eligibility rule never asks about, over the same window: withdrawn mid-check,
+      // the run it would buy only poison-parks as unapproved.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          const b = board.current.get("t1")!;
+          b.labels = ((b.labels as string[]) ?? []).filter((l) => l !== LABELS.approved);
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("approval was withdrawn");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+    });
+
     it("takes its writes back when the picker is moved off apply while the queue is checked", async () => {
       // The stance is re-asked on the FAR side of the WIP check, not only before it (PR #218 review):
       // that check is the longest await in the window, and an operator stepping back to `shadow`
@@ -1041,9 +1076,16 @@ describe("applyPickerPlan", () => {
     // pass reads as work already under way and never re-picks.
     put(bead("t1"));
     await settledJob("failed");
-    jobWritesLoseTheirRace();
 
-    const outcome = await apply("t1");
+    const outcome = await apply("t1", 1, undefined, {
+      run: {
+        enqueueIfAbsent: (projectId, epicBeadId) =>
+          enqueueExecuteEpicIfAbsent(t.db, clock, projectId, epicBeadId),
+        // The job CAS loses: the concurrent settle `resumeJob`'s guarded UPDATE exists to catch —
+        // an operator's cancel taking the covering row between the pick and the write.
+        resume: async () => false,
+      },
+    });
 
     expect(outcome).toMatchObject({
       // Nothing of this pass's is left on the board, so the caller's plan still reads current.
