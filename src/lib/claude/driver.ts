@@ -87,8 +87,15 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
       stderr += chunk.toString("utf8");
     });
 
-    /** Every ending settles exactly once, and always releases the timer and the abort listener. */
+    /**
+     * Every ending settles exactly once, and always releases the timer and the abort listener. The
+     * once-flag matters because an abort delivers two endings — Node's `spawn({signal})` emits
+     * 'error' with an AbortError AND `onAbort` fires — and the loser must not re-run `finish()`.
+     */
+    let settled = false;
     const settle = (finish: () => void) => {
+      if (settled) return;
+      settled = true;
       watchdog.clear();
       opts.signal?.removeEventListener("abort", onAbort);
       finish();

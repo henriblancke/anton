@@ -105,13 +105,17 @@ function joinList(values: readonly string[] | undefined): string | undefined {
  * prompt arrives on stdin and the system prompt via a file, so neither is ever visible in `ps`.
  */
 export function buildClaudeArgs(opts: ClaudeCliOptions, systemPromptFile?: string): string[] {
-  const args = ["-p", "--output-format", "stream-json", "--verbose"];
+  // --permission-mode is always sent: unattended runs default to bypassPermissions rather than
+  // inheriting whatever the session's settings would pick.
+  const args = [
+    "-p", "--output-format", "stream-json", "--verbose",
+    "--permission-mode", opts.permissionMode ?? "bypassPermissions",
+  ];
 
   // In argv order; an undefined value omits the flag entirely.
   const optional: Array<[string, string | undefined]> = [
     ["--append-system-prompt-file", systemPromptFile],
     ["--model", opts.model],
-    ["--permission-mode", opts.permissionMode ?? "bypassPermissions"],
     ["--allowedTools", joinList(opts.allowedTools)],
     ["--disallowedTools", joinList(opts.disallowedTools)],
     ["--setting-sources", joinList(opts.settingSources)],
