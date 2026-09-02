@@ -51,6 +51,7 @@ import { getProjectSettings, resolvePickerAutonomy, resolvePickerPolicy } from "
 import { armedPickerPolicy } from "./picker-policy";
 import { ineligibility } from "./picker-targets";
 import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
+import { inReviewTargets } from "./run-health";
 import {
   activeExecuteEpicId,
   enqueueExecuteEpicIfAbsent,
@@ -360,13 +361,18 @@ export interface ClaimSettleDeps {
  * {@link settleClaim}. `stale` is the claim we WON on a target that stopped being eligible while we
  * settled: ours on paper, not runnable, and the writes are ours to take back.
  *
+ * `released` splits the losses (PR #218 review): a claim a NAMED worker won carries the approval
+ * with it and is none of ours to reverse, while one that came off with nobody behind it leaves this
+ * pass's approval covering nothing — so only the second is unwound. A target that left the board
+ * entirely is neither: there is no bead left to take a write off.
+ *
  * A held claim hands back the board it settled against: it is the freshest read this pass has, and
  * the flow brake at the final gate judges the review queue off it rather than spending a second
  * `bd list` on the same instant (see {@link PickerHoldCheck}).
  */
 type SettleVerdict =
   | { held: true; board: Bead[] }
-  | { lost: string }
+  | { lost: string; released?: true }
   | { unverified: string }
   | { stale: string };
 
@@ -467,14 +473,17 @@ async function settleClaim(
 
   const holder = ownerOf(settled);
   if (holder !== owner) {
-    // A claim that did not survive the merge is not ours to unwind: the `approved` label merged too,
-    // and whoever holds the reservation now is the one whose decision that label belongs to. Pulling
-    // it back would be worse than leaving it (PR #218 review): the winner is almost always the other
-    // picker, which wrote the SAME single label, so a withdrawal here would strip the approval out
-    // from under a run that has already started and leave it parked on a target it legitimately won.
-    return {
-      lost: holder ? `${holder} claimed it first` : "the claim did not survive the board merge",
-    };
+    // A claim that lost the merge to a NAMED holder is not ours to unwind: the `approved` label
+    // merged too, and whoever holds the reservation now is the one whose decision that label belongs
+    // to. Pulling it back would be worse than leaving it (PR #218 review): the winner is almost
+    // always the other picker, which wrote the SAME single label, so a withdrawal here would strip
+    // the approval out from under a run that has already started and leave it parked on a target it
+    // legitimately won. A reservation that came off with no successor is the opposite case, and the
+    // caller unwinds it — which is why the two losses are told apart in the verdict, not just in
+    // their wording.
+    return holder
+      ? { lost: `${holder} claimed it first` }
+      : { lost: "the claim did not survive the board merge", released: true };
   }
 
   const moved = await stillStartable(board, settled, stance, "while the claim settled");
@@ -522,6 +531,35 @@ async function stillStartable(
   const withdrawn = await stance(free, asFree);
   return withdrawn ? `the standing approval was withdrawn ${when} (${withdrawn})` : undefined;
 }
+
+/**
+ * Has a run joined the review queue that a given verdict never judged? (PR #218 review)
+ *
+ * The flow brake's verdict is taken over one board and spent on a later one, with a `gh pr view` per
+ * waiting PR in between — minutes, at that read's ceiling. Confirming can only SHRINK the queue: a
+ * merged or closed PR drops out of the count and nothing joins it, because joining means a RUN
+ * reaching `stage:in-review`, which only the board can show. So a later board whose in-review targets
+ * are all ones the verdict already weighed cannot have filled a slot it cleared, and the verdict
+ * stands. One it has never seen can, and only a fresh verdict can say whether it did.
+ *
+ * Compared by bead id against the same `inReviewTargets` join the brake itself counts, so the two
+ * cannot disagree about what occupies a slot.
+ */
+function filledSince(judged: Bead[], fresh: Bead[]): boolean {
+  const weighed = new Set(inReviewTargets(judged).map((slot) => slot.bead.id));
+  return inReviewTargets(fresh).some((slot) => !weighed.has(slot.bead.id));
+}
+
+/**
+ * How many flow-brake verdicts one pass will spend before it gives up (PR #218 review).
+ *
+ * Each re-ask exists to catch a slot taken while the previous one confirmed its PRs, so the loop
+ * only turns while the queue keeps GROWING under it — which on a healthy project it never does. A
+ * queue filling that fast is a flow problem the brake is already reporting; standing down leaves the
+ * target startable next cadence rather than confirming PRs forever against a run that cannot be
+ * taken back.
+ */
+const FLOW_CONFIRMATION_LIMIT = 3;
 
 /**
  * Undo what THIS pass wrote when the enqueue never happened — the one failure that would otherwise
@@ -790,9 +828,12 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   if (swap.wrote) {
     const settled = await settleClaim(repoPath, top.beadId, operator, stance, input.settle);
     if ("lost" in settled) {
+      // Only a NAMED successor keeps this pass's approval standing (PR #218 review): the label is
+      // theirs to run on, and the unwind above deliberately leaves it. A reservation that came off
+      // with nobody behind it keeps nothing — an approved, unassigned target with no run is what any
+      // worker starts on — so those writes come back off like every other stand-down.
+      if (settled.released) return standDown(settled.lost);
       publish();
-      // The label is deliberately NOT taken back above, so a lost claim still leaves this pass's
-      // approval on the board when it was the one to write it.
       return { skipped: { beadId: top.beadId, reason: settled.lost, wroteBoard: wroteLabel } };
     }
     // A claim we cannot PROVE and a claim whose target stopped being startable come off the same
@@ -835,29 +876,43 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
       return `the board could not be read before starting (${errorText(e)})`;
     }
   };
-  const gateBoard = await readGateBoard();
-  if (typeof gateBoard === "string") return standDown(gateBoard);
 
   // A reservation this pass no longer holds, wherever it is read (PR #218 review). Every gate below
   // judges the target with the claim cleared (see {@link asUnclaimed}), so an ownership change — a
   // merge this machine lost, or a human clearing the assignee — would otherwise be discarded and the
-  // pass would enqueue a second run against someone else's reservation. Taken back exactly as the
-  // settle takes a lost claim back: the approval STANDS, because a withdrawal now would strip it out
-  // from under the holder whose decision it has become.
-  const lostClaim = (holder: string | undefined): PickerApplyOutcome => {
+  // pass would enqueue a second run against someone else's reservation.
+  //
+  // A NAMED successor keeps this pass's approval, exactly as a lost merge does: withdrawing it now
+  // would strip it out from under the holder whose decision it has become. A claim that was merely
+  // RELEASED keeps nothing (PR #218 review) — nobody is running on that approval, and an approved,
+  // unassigned target with no run is precisely what the next worker starts on, which is the
+  // unattended start this pass just stood down from. So it unwinds like any other stand-down.
+  const lostClaim = async (holder: string | undefined): Promise<PickerApplyOutcome> => {
+    if (!holder) return standDown("the claim was released while the review queue was confirmed");
     publish();
-    const reason = holder
-      ? `${holder} claimed it first`
-      : "the claim was released while the review queue was confirmed";
+    const reason = `${holder} claimed it first`;
     return { skipped: { beadId: top.beadId, reason, wroteBoard: wroteLabel } };
   };
 
-  const claimed = gateBoard.find((b) => b.id === top.beadId);
-  if (!claimed) return standDown("the target left the board before its run was enqueued");
-  // Asked before the confirmation as well as after it: a target this pass has already lost is not
-  // worth minutes of `gh` reads to decide about.
-  const gateHolder = ownerOf(claimed);
-  if (gateHolder !== operator) return lostClaim(gateHolder);
+  /** A board read past the CAS, with the reservation re-proven on it — see {@link refreshGate}. */
+  type GateRead = { board: Bead[]; target: Bead };
+
+  // Re-read the board and re-prove the claim on it: the pair of questions every gate below is judged
+  // over, in one place because they are asked once per confirmation rather than once per pass.
+  // Ownership is asked BEFORE each further confirmation as well as after it — a target this pass has
+  // already lost is not worth minutes of `gh` reads to decide about.
+  const refreshGate = async (): Promise<GateRead | PickerApplyOutcome> => {
+    const board = await readGateBoard();
+    if (typeof board === "string") return standDown(board);
+    const target = board.find((b) => b.id === top.beadId);
+    if (!target) return standDown("the target left the board before its run was enqueued");
+    const holder = ownerOf(target);
+    if (holder !== operator) return lostClaim(holder);
+    return { board, target };
+  };
+
+  const gate = await refreshGate();
+  if (!("board" in gate)) return gate;
 
   // The flow brake once more, now against THIS read (PR #218 review): a run reaching
   // `stage:in-review` while the first call confirmed its PRs fills the very slot that call cleared
@@ -865,26 +920,44 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // wherever the board still shows bandwidth — under the limit the hold spawns no `gh` at all (see
   // {@link checkWipLimit}). Asked before the settings brakes for the same reason the first call is:
   // they are the correctness half, and they get the last word.
-  const stillHolding = await held(gateBoard);
+  const stillHolding = await held(gate.board);
   if (stillHolding) return standDown(stillHolding);
 
   // And the board ONE more time, on the far side of that second confirmation (PR #218 review). It
   // can block for exactly as long as the first — a `gh pr view` per waiting PR — and a verdict it
   // CLEARS is precisely the case where PRs moved, so the board very likely moved with them: judging
   // the reservation, the eligibility rule or the policy off the snapshot the confirmation began with
-  // would reopen the window the read above exists to close. This is the LAST board read before the
-  // enqueue, and no blocking await sits between it and the insert — only the flow brake's own
-  // verdict ages past it, by the local reads below rather than by another confirmation.
+  // would reopen the window the read above exists to close.
   //
-  // Paid on every apply rather than only on the confirming one, because the brake reports a hold,
-  // not whether it had to spawn `gh` to decide: one `bd list` against a start that cannot be taken
-  // back.
-  const finalBoard = await readGateBoard();
-  if (typeof finalBoard === "string") return standDown(finalBoard);
-  const target = finalBoard.find((b) => b.id === top.beadId);
-  if (!target) return standDown("the target left the board before its run was enqueued");
-  const holder = ownerOf(target);
-  if (holder !== operator) return lostClaim(holder);
+  // Which leaves the brake's OWN verdict as the last thing that can age behind a confirmation
+  // (PR #218 review): a run entering review while those PRs were checked fills the slot the verdict
+  // cleared, and the fresh read sees it while the verdict cannot. So the two are reconciled rather
+  // than layered — the read is taken, and while it shows an occupant no verdict has judged, the
+  // brake is re-asked over IT and the board re-read on the far side of that. Confirming can only
+  // shrink the queue (see {@link filledSince}), so a read that adds nothing new is one the standing
+  // verdict already covers, and the loop ends there — on the common pass, at the first read, with no
+  // extra `gh` at all. A queue filling faster than it can be confirmed never converges, so the pass
+  // fails closed rather than spinning: the target is startable again next cadence.
+  //
+  // This is the LAST board read before the enqueue, and no blocking await sits between it and the
+  // insert — only the local reads below.
+  let judged = gate.board;
+  let final: GateRead;
+  for (let confirmations = 2; ; confirmations += 1) {
+    const fresh = await refreshGate();
+    if (!("board" in fresh)) return fresh;
+    if (!filledSince(judged, fresh.board)) {
+      final = fresh;
+      break;
+    }
+    if (confirmations >= FLOW_CONFIRMATION_LIMIT) {
+      return standDown("the review queue kept filling while it was confirmed");
+    }
+    const refilled = await held(fresh.board);
+    if (refilled) return standDown(refilled);
+    judged = fresh.board;
+  }
+  const { board: finalBoard, target } = final;
 
   // The last three questions, together on that one fresh read so none of them ages behind another's
   // await: the disarm latch — which a breaker can raise on a run settling into a failing streak —

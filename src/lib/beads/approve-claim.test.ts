@@ -141,6 +141,28 @@ describe("unwindApproveClaim", () => {
     expect(beads.untag).not.toHaveBeenCalled();
   });
 
+  it("takes the approval back when the reservation was merely RELEASED", async () => {
+    // The other half of that same read (PR #218 review): a human clearing the assignee leaves nobody
+    // whose decision the approval has become. Standing down on it the way a transfer does would
+    // publish an approved, unassigned target with no run behind it — the exact shape a picker pass
+    // or a worker starts on — so a cleared assignee unwinds like any other failure.
+    put({ labels: [LABELS.approved] });
+
+    await expect(
+      unwindApproveClaim({
+        repoPath: repo,
+        beadId: ID,
+        owner: "anton-box",
+        restoreTo: undefined,
+        wroteLabel: true,
+        wroteClaim: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(read().labels).not.toContain(LABELS.approved);
+    expect(read().assignee).toBeUndefined();
+  });
+
   it("still takes its writes back when the bead cannot be re-read", async () => {
     // An unreadable board answers neither question, and the two failures are not symmetric: a
     // stranded approval nobody can see hides the target from every later pass, while an untag that

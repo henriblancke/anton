@@ -61,6 +61,21 @@ function bead(id: string, o: Partial<Bead> = {}): Bead {
   };
 }
 
+/**
+ * An open run target already waiting on review, pointing at its PR — what execute-epic leaves
+ * behind, and what the flow brake counts as an occupied slot.
+ */
+function inReview(id: string, prNumber: number): Bead {
+  return {
+    id,
+    title: id,
+    status: "open",
+    issue_type: "feature",
+    labels: [LABELS.stage("in-review")],
+    metadata: { pr: `gh-${prNumber}` },
+  } as Bead;
+}
+
 function put(...beads: Bead[]): void {
   for (const b of beads) board.current.set(b.id, { ...b } as Record<string, unknown>);
 }
@@ -1000,6 +1015,76 @@ describe("applyPickerPlan", () => {
       expect(read("t1").labels ?? []).toContain(LABELS.approved);
     });
 
+    it("re-asks the brake when a run joins the review queue while the SECOND confirmation runs", async () => {
+      // The slot the re-ask itself can age behind (PR #218 review). That second call confirms a `gh
+      // pr view` per waiting PR; a run reaching `stage:in-review` inside it fills the very slot the
+      // verdict cleared, and the read on its far side is the only thing that can see the new
+      // occupant. Answering from the verdict alone would enqueue past the operator's limit.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) put(inReview("t2", 41));
+          return asked >= 3 ? FULL : undefined;
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("waiting on review");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("stops re-asking once the queue adds nothing the standing verdict has not judged", async () => {
+      // The other side of that loop: confirming can only SHRINK the queue, so a read that adds no
+      // occupant is one the verdict already covers and the pass starts on it. Bounded by the board,
+      // not by a fixed number of asks — a settled queue costs exactly one extra verdict, and only
+      // the pass that actually saw a slot taken pays for it.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) put(inReview("t2", 41));
+          return undefined;
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+      expect(await jobs()).toHaveLength(1);
+    });
+
+    it("stands down when the review queue fills faster than it can be confirmed", async () => {
+      // The loop cannot chase a queue that grows under every confirmation, and a start is the one
+      // thing here that cannot be taken back — so it fails closed rather than spinning `gh` at it.
+      // The target is startable again next cadence.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked >= 2) put(inReview(`t${asked}`, 40 + asked));
+          return undefined;
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("kept filling");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
     it("takes its writes back when the target stops being startable while the SECOND confirmation runs", async () => {
       // The board-derived half of that same window: blocked, closed, or labelled `agent:human` while
       // the re-ask confirmed its PRs. Only the read on its far side can see it.
@@ -1026,9 +1111,12 @@ describe("applyPickerPlan", () => {
       expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
 
-    it("enqueues nothing when its claim is cleared while the queue is checked", async () => {
+    it("takes its approval back when its claim is CLEARED while the queue is checked", async () => {
       // The other half of the same loss: a human clearing the assignee leaves the target unowned,
       // which the cleared-claim projection below cannot tell from a target this pass still holds.
+      // And unlike a claim another worker WON, nothing is running on the approval this pass wrote —
+      // left standing it would publish an approved, unassigned target, which is exactly what the
+      // next worker starts on (PR #218 review).
       put(bead("t1"));
 
       const outcome = await apply("t1", 1, wired(), {
@@ -1038,11 +1126,12 @@ describe("applyPickerPlan", () => {
         },
       });
 
-      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: true } });
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
       expect(why(outcome)).toContain("released while the review queue was confirmed");
       expect(await jobs()).toHaveLength(0);
       expect(notes).toEqual([]);
       expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
 
     it("takes its writes back when the target stops being startable while the queue is checked", async () => {

@@ -150,9 +150,11 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
  * depending on who was holding the reservation (the picker's own claim, an approver's hand-back).
  *
  * `approval` and `claim` are writes it could not take back — both need a human. `transferred` is the
- * opposite (PR #218 review): the reservation passed to another worker while this request held it, so
- * the writes stopped being ours to reverse. Nobody has to clear anything, but the approval this
- * request wrote is still standing, which a caller whose plan was stamped before it has to know.
+ * opposite (PR #218 review): the reservation passed to another NAMED worker while this request held
+ * it, so the writes stopped being ours to reverse. Nobody has to clear anything, but the approval
+ * this request wrote is still standing, which a caller whose plan was stamped before it has to know.
+ * A claim that was released rather than handed on is not this: with no successor the approval covers
+ * nothing, so it comes off like any other failed sequence.
  */
 export type UnwindLeftover = "approval" | "claim" | "transferred";
 
@@ -193,10 +195,12 @@ export interface UnwindApproveClaimInput {
  * and the lock orders this process only, so on a shared-server board a competing picker can win the
  * assignee race between the ambiguous `beads.approve` and this compensation. Stripping the label
  * then erases the approval the WINNER is now running on, which stands their run down or poison-parks
- * it. So an owner that is no longer `owner` ends the unwind as `transferred`: their reservation,
- * their approval, and nothing of ours left to reverse — the same call the picker's settle makes when
- * its claim loses the board merge. An unreadable board still fails closed toward unwinding, because
- * a stranded claim nobody can see is the worse of the two.
+ * it. So a NAMED successor ends the unwind as `transferred`: their reservation, their approval, and
+ * nothing of ours left to reverse — the same call the picker's settle makes when its claim loses the
+ * board merge. A reservation that came off without one is the opposite case and unwinds normally: an
+ * approval standing over an unassigned target with no run behind it is what any worker starts on. An
+ * unreadable board still fails closed toward unwinding, because a stranded claim nobody can see is
+ * the worse of the two.
  *
  * The WHOLE unwind runs under the bead's claim-write lock, not just its release (PR #218 review).
  * Unlocked, the re-read, the untag and the release are three separately-ordered writes, and a retry
@@ -228,7 +232,13 @@ export async function unwindApproveClaim(
           return undefined;
         })
       : undefined;
-    if (current && ownerOf(current) !== input.owner) return "transferred";
+    // Only a REAL successor ends the compensation (PR #218 review). A reservation that was merely
+    // RELEASED — a human clearing the assignee while this request was in flight — leaves nobody
+    // whose decision the approval has become, and standing down on it publishes the approved,
+    // unassigned target this whole ordering exists never to produce. So a cleared assignee unwinds
+    // like any other failure; only a named holder keeps the label.
+    const holder = current ? ownerOf(current) : undefined;
+    if (holder !== undefined && holder !== input.owner) return "transferred";
 
     // No read at all (an unreadable board) fails closed to "approved", like every other unanswerable
     // question here: leaving the label on a target this request also claimed strands it for good.
