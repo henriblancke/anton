@@ -19,9 +19,9 @@
 import { rankAttention, type AttentionItem } from "./attention";
 import { getBoard } from "./board";
 import { openEscalations } from "./escalations";
-import { pickerLogEntries, type PickerLogEntry } from "./picker-log";
+import { PICKER_LOG_LIMIT, pickerLogEntries, type PickerLogEntry } from "./picker-log";
 import { latestPickerStarts, type PickerStartRow } from "./picker-starts";
-import { latestPickerVerdicts, type PickerVerdictRow } from "./picker-veto";
+import { latestPickerDeclines, type PickerVerdictRow } from "./picker-veto";
 import type { Board, HygieneReport, Project, ReviewTrajectory, ScanHealth } from "./types";
 
 export interface ProjectHealth {
@@ -82,7 +82,9 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
     getBoard(project),
     openEscalations(project.id),
     latestPickerStarts(project.id),
-    latestPickerVerdicts(project.id),
+    // Declines only, and no more of them than the log can show: the merge below keeps the newest
+    // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
+    latestPickerDeclines(project.id, PICKER_LOG_LIMIT),
   ]);
   return projectHealthFromBoard(board, escalations.length, { starts, verdicts });
 }

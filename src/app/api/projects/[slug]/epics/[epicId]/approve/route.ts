@@ -687,8 +687,8 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
     });
     const error =
       leftover === "approval"
-        ? `${epicId} could not be approved, and the approval this request wrote could not be ` +
-          `removed — it is left approved and assigned to ${operator ?? owner}; unapprove it by ` +
+        ? `${epicId} could not be approved, and the approval this request wrote was not taken ` +
+          `back — it is left approved and assigned to ${operator ?? owner}; unapprove it by ` +
           `hand. ${swap.approveFailed}`
         : leftover === "claim"
           ? `${epicId} could not be approved, and the claim this request took could not be handed ` +

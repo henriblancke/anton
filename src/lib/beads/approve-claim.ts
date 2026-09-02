@@ -149,7 +149,9 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
  * What an unwind LEFT on the board. The caller words it: the same value names a different state
  * depending on who was holding the reservation (the picker's own claim, an approver's hand-back).
  *
- * `approval` and `claim` are writes it could not take back — both need a human. `transferred` is the
+ * `approval` and `claim` are writes it could not take back — both need a human; `approval` also
+ * covers a write it REFUSED to take back, because an unreadable board left it unable to say the
+ * reservation was still ours (PR #218 review). `transferred` is the
  * opposite (PR #218 review): the reservation passed to another NAMED worker while this request held
  * it, so the writes stopped being ours to reverse. Nobody has to clear anything, but the approval
  * this request wrote is still standing, which a caller whose plan was stamped before it has to know.
@@ -188,7 +190,7 @@ export interface UnwindApproveClaimInput {
  * `wroteLabel` says the label is ours to take back, not that it is there. The bead is re-read and an
  * untag is only attempted on a label that actually landed (PR #218 review): an untag refusing a
  * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
- * this exists to prevent. An unreadable board is treated as approved, so the unwind fails closed.
+ * this exists to prevent.
  *
  * That same re-read decides whether the writes are still OURS at all (PR #218 review). The untag is
  * the one unconditional write here — the release is a CAS and refuses a target somebody else holds —
@@ -198,9 +200,14 @@ export interface UnwindApproveClaimInput {
  * it. So a NAMED successor ends the unwind as `transferred`: their reservation, their approval, and
  * nothing of ours left to reverse — the same call the picker's settle makes when its claim loses the
  * board merge. A reservation that came off without one is the opposite case and unwinds normally: an
- * approval standing over an unassigned target with no run behind it is what any worker starts on. An
- * unreadable board still fails closed toward unwinding, because a stranded claim nobody can see is
- * the worse of the two.
+ * approval standing over an unassigned target with no run behind it is what any worker starts on.
+ *
+ * When that read FAILS the unwind stops without writing anything and reports the approval as a
+ * leftover (PR #218 review). A missing answer is not evidence the reservation is still ours: guess
+ * "ours" and an untag strips the approval out from under whoever took it, standing their run down
+ * over a transient `bd show`. The leftover leaves the board as the failed sequence left it — visibly
+ * approved and claimed, with an operator line naming both — which is the failure a person can see
+ * and undo, rather than one that lands on somebody else's run.
  *
  * The WHOLE unwind runs under the bead's claim-write lock, not just its release (PR #218 review).
  * Unlocked, the re-read, the untag and the release are three separately-ordered writes, and a retry
@@ -226,32 +233,36 @@ export async function unwindApproveClaim(
     // One read, two questions: is the reservation still ours to reverse, and did the label actually
     // land. Read only when there is a label to take off — with none, the release below is a CAS that
     // asks the ownership question itself.
-    const current = input.wroteLabel
-      ? await beads.show(repoPath, beadId).catch((e) => {
-          console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
-          return undefined;
-        })
-      : undefined;
-    // Only a REAL successor ends the compensation (PR #218 review). A reservation that was merely
-    // RELEASED — a human clearing the assignee while this request was in flight — leaves nobody
-    // whose decision the approval has become, and standing down on it publishes the approved,
-    // unassigned target this whole ordering exists never to produce. So a cleared assignee unwinds
-    // like any other failure; only a named holder keeps the label.
-    const holder = current ? ownerOf(current) : undefined;
-    if (holder !== undefined && holder !== input.owner) return "transferred";
+    if (input.wroteLabel) {
+      const current = await beads.show(repoPath, beadId).catch((e) => {
+        console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
+        return undefined;
+      });
+      // A board that cannot be read answers NEITHER question, and the untag below is the one
+      // unconditional write here (PR #218 review) — so the unwind stops rather than guessing at
+      // ownership it could not verify. Untagging on the assumption the reservation is still ours
+      // erases the approval a successor's run is already executing on; the leftover reported instead
+      // sends a person to a target that is visibly approved, not one silently stood down.
+      if (!current) return "approval";
 
-    // No read at all (an unreadable board) fails closed to "approved", like every other unanswerable
-    // question here: leaving the label on a target this request also claimed strands it for good.
-    const approved = input.wroteLabel && (current ? beads.isApproved(current) : true);
-    if (approved) {
-      const unapproved = await beads
-        .untag(repoPath, beadId, [LABELS.approved])
-        .then(() => true)
-        .catch((e) => {
-          console.error(`[approve-claim] could not unapprove ${beadId}`, e);
-          return false;
-        });
-      if (!unapproved) return "approval";
+      // Only a REAL successor ends the compensation (PR #218 review). A reservation that was merely
+      // RELEASED — a human clearing the assignee while this request was in flight — leaves nobody
+      // whose decision the approval has become, and standing down on it publishes the approved,
+      // unassigned target this whole ordering exists never to produce. So a cleared assignee unwinds
+      // like any other failure; only a named holder keeps the label.
+      const holder = ownerOf(current);
+      if (holder !== undefined && holder !== input.owner) return "transferred";
+
+      if (beads.isApproved(current)) {
+        const unapproved = await beads
+          .untag(repoPath, beadId, [LABELS.approved])
+          .then(() => true)
+          .catch((e) => {
+            console.error(`[approve-claim] could not unapprove ${beadId}`, e);
+            return false;
+          });
+        if (!unapproved) return "approval";
+      }
     }
 
     if (input.wroteClaim) {

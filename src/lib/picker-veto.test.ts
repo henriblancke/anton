@@ -225,6 +225,41 @@ describe("the decline record", () => {
     );
   });
 
+  it("keeps a decline the newer accepts would have pushed out of the window", async () => {
+    // The decision log asks for declines only, and the narrowing has to happen in the QUERY (PR #218
+    // review): a project that released a full window of picks since its last veto would otherwise
+    // fetch nothing but accepts and filter them all away, showing an EMPTY log over a board that has
+    // a refusal to explain.
+    await test.db.insert(schema.pickerVerdicts).values([
+      {
+        id: "v-00",
+        projectId: PROJECT,
+        beadId: "anton-vetoed",
+        verdict: "declined",
+        action: "never",
+        decidedAt: at(NOW),
+      },
+      ...Array.from({ length: PICKER_RECORD_WINDOW }, (_, i) => ({
+        id: `v-${String(i + 1).padStart(2, "0")}`,
+        projectId: PROJECT,
+        beadId: `anton-${i + 1}`,
+        verdict: "accepted",
+        action: "release",
+        decidedAt: at(NOW + (i + 1) * 1000),
+      })),
+    ]);
+
+    expect(
+      (await listPickerVerdicts(test.db, PROJECT, PICKER_RECORD_WINDOW, "declined")).map(
+        (r) => r.beadId,
+      ),
+    ).toEqual(["anton-vetoed"]);
+    // Unfiltered, the same window is all accepts — which is what the log used to be handed.
+    expect(
+      (await listPickerVerdicts(test.db, PROJECT)).every((r) => r.verdict === "accepted"),
+    ).toBe(true);
+  });
+
   it("counts an accept beside the declines, so the record has two sides", async () => {
     await test.db.insert(schema.pickerVerdicts).values({
       id: "v-accept",

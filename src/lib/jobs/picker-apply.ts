@@ -579,12 +579,17 @@ async function stillStartable(
  * are all ones the verdict already weighed cannot have filled a slot it cleared, and the verdict
  * stands. One it has never seen can, and only a fresh verdict can say whether it did.
  *
- * Compared by bead id against the same `inReviewTargets` join the brake itself counts, so the two
- * cannot disagree about what occupies a slot.
+ * Compared by (bead id, PR number) against the same `inReviewTargets` join the brake itself counts,
+ * so the two cannot disagree about what occupies a slot. The PR number is half the identity (PR #218
+ * review): a target whose merged PR is relinked to a fresh open one inside the window keeps its bead
+ * id, so an id-only comparison would report no drift and spend a verdict that cleared the OLD
+ * reference — while the new PR occupies a review slot the brake never counted, letting the pass
+ * enqueue past the configured limit.
  */
 function filledSince(judged: Bead[], fresh: Bead[]): boolean {
-  const weighed = new Set(inReviewTargets(judged).map((slot) => slot.bead.id));
-  return inReviewTargets(fresh).some((slot) => !weighed.has(slot.bead.id));
+  const slotId = (slot: { bead: Bead; prNumber: number }) => `${slot.bead.id}#${slot.prNumber}`;
+  const weighed = new Set(inReviewTargets(judged).map(slotId));
+  return inReviewTargets(fresh).some((slot) => !weighed.has(slotId(slot)));
 }
 
 /**

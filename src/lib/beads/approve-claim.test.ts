@@ -163,11 +163,11 @@ describe("unwindApproveClaim", () => {
     expect(read().assignee).toBeUndefined();
   });
 
-  it("still takes its writes back when the bead cannot be re-read", async () => {
-    // An unreadable board answers neither question, and the two failures are not symmetric: a
-    // stranded approval nobody can see hides the target from every later pass, while an untag that
-    // was not ours to make needs the same human either way. So it fails closed toward unwinding,
-    // exactly as the label ambiguity above it does.
+  it("writes nothing and reports the approval when the bead cannot be re-read", async () => {
+    // An unreadable board answers neither question, and the untag is unconditional (PR #218 review):
+    // assuming the reservation is still ours would strip the approval a successor's run is already
+    // executing on, over a transient `bd show`. So the unwind stops and names what it left, which is
+    // a state a person can see and undo.
     put({ labels: [LABELS.approved], assignee: "anton-box" });
     vi.spyOn(beads, "show").mockRejectedValue(new Error("bd is down"));
 
@@ -178,11 +178,13 @@ describe("unwindApproveClaim", () => {
         owner: "anton-box",
         restoreTo: undefined,
         wroteLabel: true,
-        wroteClaim: false,
+        wroteClaim: true,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe("approval");
 
-    expect(read().labels).not.toContain(LABELS.approved);
+    expect(read().labels).toContain(LABELS.approved);
+    expect(read().assignee).toBe("anton-box");
+    expect(beads.untag).not.toHaveBeenCalled();
   });
 
   it("holds the bead lock across the whole unwind, so a retry cannot land between its legs", async () => {

@@ -1078,6 +1078,28 @@ describe("applyPickerPlan", () => {
       expect(await jobs()).toHaveLength(1);
     });
 
+    it("re-asks the brake when an in-review target is relinked to a NEW PR", async () => {
+      // A slot is a (target, PR) pair, not a target (PR #218 review): relinking t2 from the merged
+      // PR the verdict cleared to a fresh open one keeps its bead id, so an id-only comparison would
+      // report no drift and spend a verdict that judged the OLD reference — while the new PR sits in
+      // the queue uncounted and the pass enqueues past the operator's limit.
+      put(bead("t1"), inReview("t2", 41));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          if (asked === 2) put(inReview("t2", 42));
+          return asked >= 3 ? FULL : undefined;
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("waiting on review");
+      expect(await jobs()).toHaveLength(0);
+    });
+
     it("re-asks the brake when the operator lowers the limit while the SECOND confirmation runs", async () => {
       // The verdict's other input, and the one no board read can fault (PR #218 review): the limit is
       // resolved when the brake is ASKED, ahead of its `gh pr view` per waiting PR, so an operator
