@@ -66,11 +66,9 @@ import {
   buildDrift,
   buildMatchesCheckout,
   describeBuildIdentity,
-  listBuildRecords,
+  liveBuildRecords,
   readBuildIdentity,
   processStartedAt,
-  recordAlive,
-  recordFromInstall,
   sameCheckout,
   sameDirectory,
   writeBuildStamp,
@@ -1450,9 +1448,7 @@ async function reportServerBuild(dbPath) {
   // several servers — a UI-only one beside the runner, or two ports mid-hand-over — and each is its
   // own answer, while a neighbouring checkout sharing this database (`ANTON_DB`) is not this
   // checkout's answer at all.
-  const live = listBuildRecords(dbPath).filter(
-    ({ record }) => recordFromInstall(record, APP_ROOT) && recordAlive(record),
-  );
+  const live = liveBuildRecords(dbPath, APP_ROOT);
   // The servers no record above can see: one too old to have written one, which is the state that
   // hid a stale process for three nights.
   const unstamped = await unstampedServers({ livePids: new Set(live.map(({ record }) => record.pid)) });

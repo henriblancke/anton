@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { projectHealthFromBoard } from "./health";
-import type { BuildDrift } from "./build/drift";
+import type { ServerDrift } from "./build/drift";
 import type { Board, HygieneFinding, HygieneReport, ReviewTrajectory } from "./types";
 
 type BoardSlice = Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">;
@@ -108,23 +108,33 @@ describe("projectHealthFromBoard", () => {
   });
 });
 
-// The stale-process verdict is about the SERVER, not this project, and the page is where it has to
-// be legible without a CLI (anton-pzfb) — so this composition carries it through untouched, and
-// carries nothing when the running build is the build on disk.
+// The stale-process verdict is about the SERVERS, not this project, and the page is where it has to
+// be legible without a CLI (anton-pzfb) — so this composition carries them through untouched, and
+// carries nothing when every running build is the build on disk.
 describe("build drift on the health page", () => {
   const board: BoardSlice = { hygiene: undefined, scanHealth: undefined, reviewTrajectory: undefined };
 
-  it("carries the drift verdict through to the page", () => {
-    const drift: BuildDrift = {
-      state: "modified",
-      running: { version: "0.4.0", revision: "a".repeat(40) },
-      onDisk: { version: "0.4.0", revision: "b".repeat(40) },
-      bootedAt: null,
-    };
-    expect(projectHealthFromBoard(board, 0, drift).buildDrift).toBe(drift);
+  // One entry per drifting process, not one for the process that rendered the page: an install can
+  // serve its UI from an `ANTON_RUNNER=off` server while a second one executes the nightlies, and
+  // only the second explains a degraded scan (PR #217 review).
+  it("carries every drifting server through to the page", () => {
+    const servers: ServerDrift[] = [
+      {
+        pid: 4242,
+        self: false,
+        runner: true,
+        drift: {
+          state: "modified",
+          running: { version: "0.4.0", revision: "a".repeat(40) },
+          onDisk: { version: "0.4.0", revision: "b".repeat(40) },
+          bootedAt: null,
+        },
+      },
+    ];
+    expect(projectHealthFromBoard(board, 0, servers).staleServers).toBe(servers);
   });
 
-  it("reports none for a server started from the current checkout", () => {
-    expect(projectHealthFromBoard(board, 0).buildDrift).toBeNull();
+  it("reports none when every running server started from the current checkout", () => {
+    expect(projectHealthFromBoard(board, 0).staleServers).toEqual([]);
   });
 });

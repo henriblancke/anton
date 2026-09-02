@@ -18,7 +18,7 @@
  */
 import { rankAttention, type AttentionItem } from "./attention";
 import { getBoard } from "./board";
-import { serverBuildDrift, type BuildDrift } from "./build/drift";
+import { serverBuildDrifts, type ServerDrift } from "./build/drift";
 import { openEscalations } from "./escalations";
 import type { Board, HygieneReport, Project, ReviewTrajectory, ScanHealth } from "./types";
 
@@ -37,12 +37,14 @@ export interface ProjectHealth {
   /** Open, stopped escalations — answered on the board, named here only as a count. */
   stoppedCount: number;
   /**
-   * The running server against the code on disk (anton-pzfb), or null when they agree. Not a
-   * property of this project at all — it is the process every project's jobs run under, which is
-   * exactly why it belongs here: a nightly degraded by a stale build shows up as this page's
-   * findings, so this page is where the reason has to be legible without a CLI.
+   * Every server of this install running something other than the code on disk (anton-pzfb), empty
+   * when they all match. Not a property of this project at all — these are the processes every
+   * project's jobs run under, which is exactly why they belong here: a nightly degraded by a stale
+   * build shows up as this page's findings, so this page is where the reason has to be legible
+   * without a CLI. One entry per process, because an install can run a UI-only server beside the
+   * one executing the jobs and only the second explains a degraded nightly.
    */
-  buildDrift: BuildDrift | null;
+  staleServers: ServerDrift[];
 }
 
 /**
@@ -53,7 +55,7 @@ export interface ProjectHealth {
 export function projectHealthFromBoard(
   board: Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">,
   stoppedCount: number,
-  buildDrift: BuildDrift | null = null,
+  staleServers: ServerDrift[] = [],
 ): ProjectHealth {
   const { items, housekeeping } = rankAttention({
     hygiene: board.hygiene,
@@ -66,7 +68,7 @@ export function projectHealthFromBoard(
     scanHealth: board.scanHealth,
     trajectory: board.reviewTrajectory,
     stoppedCount,
-    buildDrift,
+    staleServers,
   };
 }
 
@@ -80,5 +82,5 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
   const [board, escalations] = await Promise.all([getBoard(project), openEscalations(project.id)]);
   // Read live rather than from a stored report: which build is running is a fact about this instant,
   // and a patrol row written by a since-restarted process would report drift that no longer exists.
-  return projectHealthFromBoard(board, escalations.length, serverBuildDrift());
+  return projectHealthFromBoard(board, escalations.length, serverBuildDrifts());
 }

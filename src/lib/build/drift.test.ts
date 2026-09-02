@@ -38,17 +38,26 @@ afterEach(() => {
 describe("recordServerBuild / serverBuildDrift", () => {
   it("reports no drift for a server booted from the checkout it is reading", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     expect(serverBuildDrift()).toBeNull();
   });
 
   it("records beside anton.db, naming this process so a later reader can tell it is still up", async () => {
     const { recordServerBuild } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const record = JSON.parse(readFileSync(recordPath(), "utf8"));
     expect(record.pid).toBe(process.pid);
     expect(record.version).toMatch(/^\d+\.\d+\.\d+/);
     expect(record.bootedAt).toBeGreaterThan(0);
+    // Whether THIS process runs the jobs is what makes its drift cost anything, so it is recorded
+    // with the identity rather than inferred by a reader that cannot see the process (PR #217).
+    expect(record.runner).toBe(true);
+  });
+
+  it("records a UI-only server as one the scheduled jobs do not run under", async () => {
+    const { recordServerBuild } = await freshModule();
+    recordServerBuild({ runner: false });
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).runner).toBe(false);
   });
 
   // A saved edit does not make a dev server stale — `next dev` recompiles it — and a development
@@ -57,7 +66,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   it("records uncommitted work only for a production server", async () => {
     const record = () => JSON.parse(readFileSync(recordPath(), "utf8"));
     const dev = await freshModule();
-    dev.recordServerBuild();
+    dev.recordServerBuild({ runner: true });
     expect(record().worktree).toBeNull();
 
     // A production server is judged on what its ARTIFACT was compiled from, so the digest comes from
@@ -72,7 +81,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     vi.stubEnv("ANTON_APP_ROOT", app);
     vi.stubEnv("NODE_ENV", "production");
     const prod = await freshModule();
-    prod.recordServerBuild();
+    prod.recordServerBuild({ runner: true });
 
     expect(record().worktree).toBe("9f2c1a4");
   });
@@ -93,7 +102,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     vi.stubEnv("NODE_ENV", "production");
 
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
 
     expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBe("0.3.9");
     const drift = serverBuildDrift();
@@ -114,7 +123,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     vi.stubEnv("NODE_ENV", "production");
 
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
 
     expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBe("0.4.0");
     expect(serverBuildDrift()).toBeNull();
@@ -133,7 +142,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     vi.stubEnv("NODE_ENV", "production");
 
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
 
     expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBeNull();
     const drift = serverBuildDrift();
@@ -144,7 +153,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   // The 2026-08-17 shape, forced: the process is up and the record says it booted somewhere else.
   it("reports the drift once the code on disk is no longer what this process booted from", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const path = recordPath();
     const record = JSON.parse(readFileSync(path, "utf8"));
     writeFileSync(path, JSON.stringify({ ...record, version: "0.0.1" }));
@@ -158,12 +167,12 @@ describe("recordServerBuild / serverBuildDrift", () => {
   // Restart is the whole remediation: a new boot overwrites the record, and the verdict is gone.
   it("clears on the next boot with nothing else done", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const path = recordPath();
     writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), version: "0.0.1" }));
     expect(serverBuildDrift()).not.toBeNull();
 
-    recordServerBuild();
+    recordServerBuild({ runner: true });
 
     expect(serverBuildDrift()).toBeNull();
   });
@@ -175,7 +184,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   // had something to say.
   it("keeps reporting after the runtime dir it booted from is deleted", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const path = recordPath();
     writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), version: "0.0.1" }));
 
@@ -202,7 +211,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     });
 
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const path = recordPath();
     const record = JSON.parse(readFileSync(path, "utf8"));
     expect(record.version).toMatch(/^\d+\.\d+\.\d+/); // it read the checkout, not an empty identity
@@ -218,7 +227,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   // after a pull matched the code on disk and silently cleared the older process's stale verdict.
   it("is not silenced by a second server that booted from the current checkout", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
     writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
     // The neighbour: booted later, running exactly what is on disk — which under a shared filename
@@ -237,7 +246,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
   // stale, this process is not, and only the process being asked about is the one described.
   it("does not report a neighbouring server's drift as its own", async () => {
     const { recordServerBuild, serverBuildDrift } = await freshModule();
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
     writeFileSync(
       join(dir, `server-build.${process.pid + 1}.json`),
@@ -253,7 +262,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     writeFileSync(join(dir, "server-build.999999.json"), JSON.stringify({ version: "0.0.1", pid: 999999, bootedAt: 1 }));
     const { recordServerBuild } = await freshModule();
 
-    recordServerBuild();
+    recordServerBuild({ runner: true });
 
     expect(existsSync(join(dir, "server-build.999999.json"))).toBe(false);
     expect(existsSync(recordPath())).toBe(true);
@@ -277,7 +286,7 @@ describe("recordServerBuild / serverBuildDrift", () => {
     vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
     const { recordServerBuild, serverBuildDrift } = await import("./drift");
 
-    recordServerBuild();
+    recordServerBuild({ runner: true });
     expect(existsSync(join(dir, "blocked", `server-build.${process.pid}.json`))).toBe(false);
     expect(serverBuildDrift()).toBeNull();
 
@@ -290,5 +299,115 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(drift?.running?.version).toBe("0.4.0");
     expect(drift?.onDisk.version).toBe("0.4.1");
     expect(drift?.bootedAt).toBeNull();
+  });
+});
+
+/**
+ * The aggregate every operator-facing surface reads (PR #217 review). One install routinely runs two
+ * servers — a UI-only `ANTON_RUNNER=off` one serving the pages, a second executing the scheduled jobs
+ * — and a verdict about only the process answering the request is silent on the one that matters.
+ */
+describe("serverBuildDrifts", () => {
+  /** A neighbour's record: a pid that is genuinely alive, so `recordAlive` keeps it. */
+  function neighbour(pid: number, over: Record<string, unknown> = {}) {
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(join(dir, `server-build.${pid}.json`), JSON.stringify({ ...mine, pid, startedAt: null, ...over }));
+  }
+
+  // The silence the reviewer found: the page renders in the UI-only process, which is current, while
+  // the runner beside it grinds through nightlies on a build that shipped days ago.
+  it("reports a stale runner beside a current process serving the page", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: false });
+    neighbour(process.ppid, { version: "0.0.1", runner: true });
+
+    const drifts = serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0]).toMatchObject({ pid: process.ppid, self: false, runner: true });
+    expect(drifts[0].drift.state).toBe("outdated");
+    expect(drifts[0].drift.running?.version).toBe("0.0.1");
+  });
+
+  // The mirror image, and the false alarm: this process is stale but runs nothing scheduled, so the
+  // reader must be able to say so rather than blame the nightlies on it.
+  it("says a stale UI-only process is not the one the jobs run under", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: false });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    const drifts = serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: false });
+  });
+
+  // A record predates the flag: neither claim is safe, so the reader is told nothing rather than
+  // guessed at — the same rule the identity comparison follows field by field.
+  it("leaves the runner unknown for a record written before the flag existed", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+    delete mine.runner;
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
+
+    expect(serverBuildDrifts()[0]?.runner).toBeUndefined();
+  });
+
+  it("says nothing when every running server is the build on disk", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    neighbour(process.ppid);
+
+    expect(serverBuildDrifts()).toEqual([]);
+  });
+
+  // Nothing deletes a record at exit, so a stopped server's leftover would banner the health page
+  // forever — and no restart would clear it, because the process it names is already gone.
+  it("ignores the leftover record of a server that has exited", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    neighbour(999_999, { version: "0.0.1", pid: 999_999 });
+
+    expect(serverBuildDrifts()).toEqual([]);
+  });
+
+  // `ANTON_DB` deliberately points two checkouts at one database, and a neighbour's build says
+  // nothing about the code in front of the operator reading this page.
+  it("does not report a server of another install sharing this database", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    neighbour(process.ppid, { version: "0.0.1", appRoot: join(dir, "elsewhere") });
+
+    expect(serverBuildDrifts()).toEqual([]);
+  });
+
+  // The state dir anton could not write to: no record exists for anyone, so the identity this
+  // process kept in memory at boot is the only evidence there is — for itself alone.
+  it("falls back to the identity it holds in memory when the record could not be written", async () => {
+    writeFileSync(join(dir, "blocked"), "");
+    process.env.ANTON_DB = join(dir, "blocked", "anton.db");
+
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { recordServerBuild, serverBuildDrifts } = await import("./drift");
+
+    recordServerBuild({ runner: true });
+    expect(serverBuildDrifts()).toEqual([]);
+
+    onDisk = { version: "0.4.1", revision: null };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000); // past the TTL on both the on-disk read and this one
+
+    const drifts = serverBuildDrifts();
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: true });
+    expect(drifts[0].drift.state).toBe("outdated");
+  });
+
+  it("says nothing in a process that never booted a server", async () => {
+    const { serverBuildDrifts } = await freshModule();
+    expect(serverBuildDrifts()).toEqual([]);
   });
 });

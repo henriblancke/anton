@@ -45,7 +45,7 @@ export function HealthReport({ slug, health }: { slug: string; health: ProjectHe
       <div className="flex flex-col gap-4 min-[900px]:flex-row min-[900px]:items-start">
         <div className="flex min-w-0 flex-1 flex-col gap-3">
           {/* Above everything: a stale process is the reason to distrust the sections below it. */}
-          <StaleServerBanner drift={health.buildDrift} />
+          <StaleServerBanner servers={health.staleServers} />
           {neverChecked ? <NeverCheckedBanner /> : null}
           <WorthALookSection slug={slug} items={health.worthALook} />
           <CodebaseSignalsSection scanHealth={health.scanHealth} />

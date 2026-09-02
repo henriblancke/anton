@@ -20,6 +20,7 @@ import {
   describeBuildDrift,
   describeBuildIdentity,
   isBundleInstall,
+  liveBuildRecords,
   pruneBuildRecords,
   readBuildIdentity,
   readBuildRecord,
@@ -59,6 +60,24 @@ export interface BuildDrift {
   /** Unix ms the running process booted, when it recorded one. */
   bootedAt: number | null;
 }
+
+/** One drifting server of this install, with the two facts a reader needs to say WHOSE drift it is. */
+export interface ServerDrift {
+  /** The process this verdict describes. */
+  pid: number;
+  /** True for the process answering the request — the only one whose in-memory identity can stand in. */
+  self: boolean;
+  /**
+   * Whether this process executes the scheduled jobs. Undefined when its record predates the field,
+   * where a reader must claim neither: attributing a nightly to a UI-only server is the mistake
+   * this field exists to prevent.
+   */
+  runner: boolean | undefined;
+  drift: BuildDrift;
+}
+
+/** What a boot record holds beyond the identity itself — `listBuildRecords` proves the pid a number. */
+type BuildRecord = BuildIdentity & { pid: number; bootedAt?: unknown; runner?: unknown };
 
 function readCwd(): string | null {
   try {
@@ -117,6 +136,9 @@ function dbPath(): string | null {
  */
 let bootedFrom: BuildIdentity | null = null;
 
+/** Whether THIS process runs the scheduled jobs — held with `bootedFrom`, for the same fallback. */
+let bootedRunner: boolean | undefined;
+
 /**
  * How long one read of the code on disk stands. `serverBuildDrift` runs on every health render and
  * `readBuildIdentity` spawns git SYNCHRONOUSLY — five reads at minimum on a clean-path miss (the
@@ -156,12 +178,18 @@ function onDiskIdentity(): BuildIdentity {
  * The install this process booted from is recorded with it: the database these records sit beside
  * may be shared with another checkout (`ANTON_DB`), and a reader that cannot tell whose server a
  * record describes compares a neighbour's build against its own code.
+ *
+ * `runner` says whether this process is the one that will execute the scheduled jobs. The caller
+ * passes it rather than this module re-reading `ANTON_RUNNER`, so the record and the gate that
+ * actually starts the runner can never disagree — and a reader can then say which of an install's
+ * servers a stale build is costing anything (PR #217 review).
  */
-export function recordServerBuild(): void {
+export function recordServerBuild({ runner }: { runner: boolean }): void {
   bootedFrom = bootIdentity();
+  bootedRunner = runner;
   const db = dbPath();
   if (!db) return;
-  writeBuildRecord(buildRecordPath(db), bootedFrom, { appRoot: appRoot() });
+  writeBuildRecord(buildRecordPath(db), bootedFrom, { appRoot: appRoot(), runner });
   pruneBuildRecords(db);
 }
 
@@ -232,6 +260,9 @@ function artifactIdentity(): BuildIdentity | null {
 
 /**
  * The drift verdict for THIS process, or null when what it booted from matches the code on disk.
+ * What a caller running INSIDE the process it is reporting on wants — the nightly job naming the
+ * build its own pass executed. A surface reporting on "the anton server" wants
+ * {@link serverBuildDrifts}, which answers for every process of this install rather than one.
  *
  * The identity compared is always this process's own, never another server's. `buildRecordPath`
  * keys on `process.pid`, so a second server on the same install — a UI-only `ANTON_RUNNER=off` one
@@ -258,6 +289,67 @@ export function serverBuildDrift(): BuildDrift | null {
   if (verdict.state === "current") return null;
   const bootedAt = record && typeof record.bootedAt === "number" ? record.bootedAt : null;
   return { ...verdict, bootedAt } as BuildDrift;
+}
+
+/**
+ * Held for the same window as the on-disk read, and for the same reason: this runs on every health
+ * render, and proving a record's process alive costs a `ps` per record on a platform without procfs.
+ */
+let driftsCache: { at: number; drifts: ServerDrift[] } | null = null;
+
+/**
+ * Every server of this install that is running something other than the code on disk — empty when
+ * they all match, which is the ordinary case.
+ *
+ * The per-process verdict above is not enough for an operator-facing surface (PR #217 review). One
+ * install routinely runs TWO servers: a UI-only `ANTON_RUNNER=off` one serving the pages and a
+ * second one executing the scheduled jobs. Asked only about the process rendering the request, the
+ * health page stays silent while the runner grinds through nightlies on a build that shipped days
+ * ago — the exact silence this module exists to end — and, mirrored, banners a stale UI process with
+ * a claim about jobs that a current runner is executing perfectly well. So every live record is read
+ * and each is reported as its own process, `runner` saying which one the jobs are actually costing.
+ *
+ * Liveness is checked here, unlike above: a record of a server that has exited is a leftover, and
+ * only the process asking can be assumed to still be up.
+ *
+ * `bootedFrom` covers this process when the state dir could not be written, the same fallback the
+ * per-process read has — the difference being that nothing can stand in for a NEIGHBOUR whose record
+ * is missing. That server is `anton doctor`'s to name; it has the pidfile and the port.
+ */
+export function serverBuildDrifts(): ServerDrift[] {
+  const now = Date.now();
+  if (driftsCache && now - driftsCache.at < ON_DISK_TTL_MS) return driftsCache.drifts;
+  const drifts = readServerDrifts();
+  driftsCache = { at: now, drifts };
+  return drifts;
+}
+
+function readServerDrifts(): ServerDrift[] {
+  const db = dbPath();
+  const root = appRoot();
+  const records: BuildRecord[] =
+    db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
+  const drifts: ServerDrift[] = [];
+  for (const record of records) {
+    const drift = driftOf(record, typeof record.bootedAt === "number" ? record.bootedAt : null);
+    if (drift) drifts.push({ pid: record.pid, self: record.pid === process.pid, runner: runsJobs(record), drift });
+  }
+  if (bootedFrom && !records.some((record) => record.pid === process.pid)) {
+    const drift = driftOf(bootedFrom, null);
+    if (drift) drifts.push({ pid: process.pid, self: true, runner: bootedRunner, drift });
+  }
+  return drifts;
+}
+
+function driftOf(running: BuildIdentity, bootedAt: number | null): BuildDrift | null {
+  const verdict = compareBuild(running, onDiskIdentity());
+  if (verdict.state === "current") return null;
+  return { ...verdict, bootedAt } as BuildDrift;
+}
+
+/** Whether a record claims its process runs the jobs — undefined when it predates the field. */
+function runsJobs(record: BuildRecord): boolean | undefined {
+  return typeof record.runner === "boolean" ? record.runner : undefined;
 }
 
 export { describeBuildDrift, describeBuildIdentity };

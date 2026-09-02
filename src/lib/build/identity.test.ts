@@ -24,6 +24,7 @@ import {
   describeBuildIdentity,
   isBundleInstall,
   listBuildRecords,
+  liveBuildRecords,
   MAX_LINKED_ENTRIES,
   processStartedAt,
   pruneBuildRecords,
@@ -617,9 +618,23 @@ describe("the record a running server leaves", () => {
     const dir = tempDir();
     const path = buildRecordPath(join(dir, "anton.db"));
     expect(path).toBe(join(dir, `server-build.${process.pid}.json`));
-    const stamp = { pid: 4242, bootedAt: 1_700_000_000_000, startedAt: "when-4242-began", appRoot: "/opt/anton" };
+    const stamp = {
+      pid: 4242,
+      bootedAt: 1_700_000_000_000,
+      startedAt: "when-4242-began",
+      appRoot: "/opt/anton",
+      runner: true,
+    };
     expect(writeBuildRecord(buildRecordPath(join(dir, "anton.db"), 4242), RUNNING, stamp)).toBe(true);
     expect(readBuildRecord(join(dir, "server-build.4242.json"))).toEqual({ ...RUNNING, ...stamp });
+  });
+
+  // A record written before the runner flag existed says nothing about the jobs either way, so the
+  // absence is written as null rather than guessed at as false (PR #217 review).
+  it("leaves the runner unclaimed when the caller does not say", () => {
+    const dir = tempDir();
+    writeBuildRecord(buildRecordPath(join(dir, "anton.db"), 4242), RUNNING, { pid: 4242 });
+    expect(readBuildRecord(join(dir, "server-build.4242.json"))?.runner).toBeNull();
   });
 
   // The failure a shared filename causes: two servers from one install (a UI-only `ANTON_RUNNER=off`
@@ -684,6 +699,21 @@ describe("the record a running server leaves", () => {
     const [{ record }] = listBuildRecords(join(dir, "anton.db"));
     expect(recordFromInstall(record, dir)).toBe(true);
     expect(recordFromInstall(record, join(dir, "elsewhere"))).toBe(false);
+  });
+
+  // What every reader reporting on "the running anton" starts from, shared so doctor and the health
+  // page cannot answer differently: a neighbouring install's record and a dead server's leftover are
+  // dropped, and everything still up is kept — including a second server of this install.
+  it("keeps only the live servers of this install", () => {
+    const dir = tempDir();
+    const db = join(dir, "anton.db");
+    writeBuildRecord(buildRecordPath(db, 4242), RUNNING, { pid: 4242, bootedAt: 1, appRoot: dir });
+    writeBuildRecord(buildRecordPath(db, 4243), RUNNING, { pid: 4243, bootedAt: 2, appRoot: dir });
+    writeBuildRecord(buildRecordPath(db, 4244), RUNNING, { pid: 4244, bootedAt: 3, appRoot: join(dir, "elsewhere") });
+
+    const live = liveBuildRecords(db, dir, (record) => record.pid !== 4243);
+
+    expect(live.map(({ record }) => record.pid)).toEqual([4242]);
   });
 
   // An absence is not evidence — the same rule the comparison itself follows field by field — so a

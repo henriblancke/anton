@@ -20,7 +20,7 @@ function health(over: Partial<ProjectHealth> = {}): ProjectHealth {
     scanHealth: undefined,
     trajectory: undefined,
     stoppedCount: 0,
-    buildDrift: null,
+    staleServers: [],
     ...over,
   };
 }
@@ -64,12 +64,19 @@ describe("HealthReport", () => {
       <HealthReport
         slug="anton"
         health={health({
-          buildDrift: {
-            state: "outdated",
-            running: { version: "0.3.9", revision: null },
-            onDisk: { version: "0.4.0", revision: null },
-            bootedAt: null,
-          },
+          staleServers: [
+            {
+              pid: 4242,
+              self: true,
+              runner: true,
+              drift: {
+                state: "outdated",
+                running: { version: "0.3.9", revision: null },
+                onDisk: { version: "0.4.0", revision: null },
+                bootedAt: null,
+              },
+            },
+          ],
         })}
       />,
     );

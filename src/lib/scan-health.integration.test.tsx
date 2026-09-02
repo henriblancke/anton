@@ -233,7 +233,7 @@ process.stdin.on('end',()=>{
             scanHealth: health,
             trajectory: undefined,
             stoppedCount: 0,
-            buildDrift: null,
+            staleServers: [],
           }}
         />
       </>,

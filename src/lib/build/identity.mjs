@@ -572,16 +572,28 @@ function writeStampFile(path, value) {
  * record describes (see `recordFromInstall`) — the directory is not implied by where the record
  * sits, since `ANTON_DB` can point two checkouts at one database.
  *
+ * `runner` is whether THIS process executes the scheduled jobs (`ANTON_RUNNER` is not `off`), written
+ * because that is the whole consequence of the drift: a stale runner runs the nightlies from old
+ * code, while a stale `ANTON_RUNNER=off` UI beside it only draws an old page (PR #217 review). A
+ * record written before this field existed carries null — unknown, which no reader may read as
+ * either answer.
+ *
  * @param {string} path
  * @param {BuildIdentity} identity
- * @param {{pid?: number, bootedAt?: number, startedAt?: string|null, appRoot?: string|null}} [stamp]
+ * @param {{pid?: number, bootedAt?: number, startedAt?: string|null, appRoot?: string|null, runner?: boolean|null}} [stamp]
  */
 export function writeBuildRecord(
   path,
   identity,
-  { pid = process.pid, bootedAt = Date.now(), startedAt = processStartedAt(pid), appRoot = null } = {},
+  {
+    pid = process.pid,
+    bootedAt = Date.now(),
+    startedAt = processStartedAt(pid),
+    appRoot = null,
+    runner = null,
+  } = {},
 ) {
-  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt, appRoot });
+  return writeStampFile(path, { ...identity, pid, bootedAt, startedAt, appRoot, runner });
 }
 
 /**
@@ -647,6 +659,23 @@ export function listBuildRecords(dbPath) {
     if (record && record.pid === Number(match[1])) out.push({ path, record });
   }
   return out.sort((a, b) => (a.record.bootedAt ?? 0) - (b.record.bootedAt ?? 0));
+}
+
+/**
+ * Every server of THIS install that is still up — the set any reader reporting on "the running
+ * anton" has to start from, shared so doctor and the health page cannot answer differently.
+ *
+ * Two filters, both load-bearing: `recordFromInstall` drops a neighbouring checkout sharing this
+ * database, and `recordAlive` drops the leftover of a server that has since exited. What remains is
+ * every process the operator would have to restart, which on an install running a runner beside an
+ * `ANTON_RUNNER=off` UI is more than one.
+ *
+ * @param {string} dbPath
+ * @param {string} appRoot
+ * @param {(record: {[key: string]: unknown}) => boolean} [isAlive]
+ */
+export function liveBuildRecords(dbPath, appRoot, isAlive = recordAlive) {
+  return listBuildRecords(dbPath).filter(({ record }) => recordFromInstall(record, appRoot) && isAlive(record));
 }
 
 /**
