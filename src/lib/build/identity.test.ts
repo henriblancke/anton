@@ -686,6 +686,13 @@ describe("readBuildIdentity", () => {
     mkdirSync(join(dir, "junk"));
     writeFileSync(join(dir, "junk", "build.log"), "noise\n");
     expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    // The edge of that rule, asserted so crossing it has to be a decision: an ignored module the
+    // build would IMPORT is a miss anton accepts (PR #217 review). Digesting the ignored tree to
+    // catch it would move the digest on every anton.db write and every `.DS_Store` macOS drops —
+    // a restart banner with no release behind it, which costs more than the miss does.
+    writeFileSync(join(dir, "junk", "config.ts"), "export const url = 'old';\n");
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
   });
 });
 

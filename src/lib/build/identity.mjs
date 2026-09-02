@@ -244,6 +244,14 @@ function git(appRoot, args, input) {
  * read git, and a read git could not answer collapses the digest exactly as the two above do: a
  * digest missing an input vouches for a build compiled from something else (PR #217 review).
  *
+ * Every OTHER ignored file stays out, and that is this digest's deliberate edge: an ignored
+ * generated module the build imports moves the artifact without moving the digest (PR #217 review).
+ * Naming the ignored tree back in costs more than it buys — `ignoredEnvFiles` lists the state files
+ * that would then re-digest the tree on every write, and `.DS_Store`, which macOS rewrites whenever
+ * a folder is opened, would do it from outside anton entirely. A restart banner with no release
+ * behind it is one nobody reads, which is the failure this whole module exists to end. A generated
+ * build input belongs in the tree or behind a tracked link — both of which this already digests.
+ *
  * `--ignore-submodules=none` because that flattened line is the only record of a submodule moving to
  * a different commit, and either repository's config (`diff.ignoreSubmodules`,
  * `submodule.<name>.ignore`) can otherwise suppress it.
