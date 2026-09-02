@@ -12,9 +12,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 
-import { agentsFromArgs, ensureFreshBuild, nextArgs, resolvePort, serverIsUp } from "./anton.mjs";
+import { agentsFromArgs, ensureFreshBuild, nextArgs, procfsListeningPids, resolvePort, serverIsUp } from "./anton.mjs";
 
 import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
@@ -343,6 +343,58 @@ describe("anton doctor — liveness evidence is scoped to the install", () => {
     expect(await serverIsUp({ isBundle: false, port: "3000", pid: () => null, answering: answers })).toBe(true);
     // `anton dev` writes no pidfile, so the one on disk is the installed bundle's.
     expect(await serverIsUp({ isBundle: false, port: "3000", pid: () => 42, answering: silent })).toBe(false);
+  });
+});
+
+/**
+ * Port ownership on Linux is read from procfs, not from lsof (anton-pzfb): anton neither installs
+ * lsof nor declares it a prereq, and most distros ship without it — an enumerator that is merely
+ * absent would answer "nothing is listening" about every live source server on those boxes.
+ */
+describe("listeningPids — procfs", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const row = (portHex: string, inode: string, state = "0A") =>
+    `   0: 0100007F:${portHex} 00000000:0000 ${state} 00000000:00000000 00:00000000 00000000  1000        0 ${inode} 1 0000000000000000 100 0 0 10 0`;
+  const table = (...rows: string[]) =>
+    ["  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode", ...rows, ""].join("\n");
+
+  /** A procfs with the given tcp table, and one process per [pid, inode] holding that socket. */
+  const fakeProc = async (tcp: string, owners: Array<[number, string]> = []) => {
+    const root = await dirs.make("anton-proc-");
+    mkdirSync(join(root, "net"), { recursive: true });
+    writeFileSync(join(root, "net", "tcp"), tcp);
+    for (const [pid, inode] of owners) {
+      mkdirSync(join(root, String(pid), "fd"), { recursive: true });
+      symlinkSync(`socket:[${inode}]`, join(root, String(pid), "fd", "3"));
+    }
+    return root;
+  };
+
+  it("resolves the pid holding the listening socket", async () => {
+    const root = await fakeProc(table(row("0BB8", "99001")), [[4242, "99001"]]);
+    expect(procfsListeningPids("3000", root)).toEqual([4242]);
+  });
+
+  it("says nothing is listening when no LISTEN socket is bound to the port", async () => {
+    // Same port, but established — and a listener on a different port.
+    const root = await fakeProc(table(row("0BB8", "99001", "01"), row("0FA0", "99002")), [
+      [4242, "99001"],
+      [4243, "99002"],
+    ]);
+    expect(procfsListeningPids("3000", root)).toEqual([]);
+  });
+
+  it("cannot say when there is no procfs to read", async () => {
+    expect(procfsListeningPids("3000", await dirs.make("anton-noproc-"))).toBeNull();
+  });
+
+  it("cannot say when the listening socket belongs to a process anton can't read", async () => {
+    // Another user's server: the socket is in the table, but no readable fd links back to it.
+    const root = await fakeProc(table(row("0BB8", "99001")));
+    expect(procfsListeningPids("3000", root)).toBeNull();
   });
 });
 

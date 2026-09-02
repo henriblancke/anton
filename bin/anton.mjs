@@ -29,6 +29,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   unlinkSync,
@@ -170,11 +171,89 @@ async function waitForReady(port, timeoutMs = 30000) {
 /**
  * The pids listening on `port`: `[]` when nothing is, null when this machine cannot say.
  *
- * lsof is the one enumerator present by default on both platforms anton runs on, and its exit
- * status separates the two answers that must not be confused — 1 with no output is "nothing is
- * listening", while a missing binary or an error is "no evidence" and must not read as either.
+ * Each platform is answered by something it always has, because anton installs no enumerator and
+ * declares none as a prereq: Linux reads procfs directly (most distros ship no lsof, and one that
+ * is merely absent would answer "nothing is listening" on every such box), macOS — which has no
+ * procfs — uses the lsof in its base system.
  */
 function listeningPids(port) {
+  return osPlatform() === "linux" ? procfsListeningPids(port) : lsofListeningPids(port);
+}
+
+/** `/proc/net/tcp` connection state for LISTEN. */
+const TCP_LISTEN = "0A";
+
+/**
+ * listeningPids via procfs: the LISTEN sockets bound to `port` in /proc/net/tcp{,6}, resolved to
+ * their owning pids through /proc/<pid>/fd. `procRoot` is injectable so the parse is testable.
+ */
+function procfsListeningPids(port, procRoot = "/proc") {
+  const wanted = parseInt(port, 10);
+  if (!Number.isInteger(wanted) || wanted <= 0) return null;
+  const suffix = `:${wanted.toString(16).toUpperCase().padStart(4, "0")}`;
+  const inodes = new Set();
+  let tables = 0;
+  for (const table of ["net/tcp", "net/tcp6"]) {
+    let text;
+    try {
+      text = readFileSync(join(procRoot, table), "utf8");
+    } catch {
+      continue;
+    }
+    tables++;
+    for (const line of text.split("\n").slice(1)) {
+      const f = line.trim().split(/\s+/);
+      if (f.length < 10 || f[3] !== TCP_LISTEN || !f[1].endsWith(suffix)) continue;
+      inodes.add(f[9]);
+    }
+  }
+  if (!tables) return null; // no procfs (a container without it) — no evidence, not "nothing".
+  if (!inodes.size) return [];
+  const pids = socketOwners(inodes, procRoot);
+  // A socket anton found but cannot attribute belongs to another user: still no evidence.
+  return pids.length ? pids : null;
+}
+
+/** The pids holding any of `inodes` as an open socket. Processes anton can't read are skipped. */
+function socketOwners(inodes, procRoot) {
+  const targets = new Set([...inodes].map((i) => `socket:[${i}]`));
+  const pids = [];
+  let entries;
+  try {
+    entries = readdirSync(procRoot);
+  } catch {
+    return pids;
+  }
+  for (const entry of entries) {
+    const pid = parseInt(entry, 10);
+    if (!Number.isInteger(pid) || String(pid) !== entry) continue;
+    let fds;
+    try {
+      fds = readdirSync(join(procRoot, entry, "fd"));
+    } catch {
+      continue; // another user's process
+    }
+    for (const fd of fds) {
+      let link;
+      try {
+        link = readlinkSync(join(procRoot, entry, "fd", fd));
+      } catch {
+        continue;
+      }
+      if (targets.has(link)) {
+        pids.push(pid);
+        break;
+      }
+    }
+  }
+  return pids;
+}
+
+/**
+ * listeningPids via lsof. Its exit status separates the two answers that must not be confused —
+ * 1 with no output is "nothing is listening", while a missing binary or an error is "no evidence".
+ */
+function lsofListeningPids(port) {
   const r = spawnSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
     encoding: "utf8",
     timeout: 5000,
@@ -2161,6 +2240,7 @@ export {
   installSkillDir,
   staleSkills,
   serverIsUp,
+  procfsListeningPids,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,
