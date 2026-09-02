@@ -40,7 +40,8 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "board-picker",
     label: "board-picker",
-    description: "ranks what could run next · records the plan · starts nothing yet",
+    description:
+      "ranks what could run next · records the plan · starts its top pick where you armed apply",
     group: "Board maintenance",
   },
   {
@@ -457,12 +458,12 @@ describe("the automation rows", () => {
   });
 
   it("says what the board-picker does and how often it would fire", () => {
-    // The pass decides only — it ranks the board and records the plan, and starts nothing. A row
-    // that promised a start would have an operator flip the switch and watch nothing happen, so the
-    // copy has to name the limit, not just the ambition.
+    // The row carries the ambition AND its condition: every armed project gets the ranking, only
+    // one armed to apply gets the unattended start. Copy that drops either half misleads an
+    // operator at the switch — about what will happen, or about what already is.
     renderTable();
     expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
-    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
+    expect(screen.getByText(/starts its top pick where you armed apply/)).toBeTruthy();
     expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
   });
 

@@ -95,7 +95,8 @@ export const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "board-picker",
     label: "board-picker",
-    description: "ranks what could run next · records the plan · starts nothing yet",
+    description:
+      "ranks what could run next · records the plan · starts its top pick where you armed apply",
     group: "Board maintenance",
   },
   {

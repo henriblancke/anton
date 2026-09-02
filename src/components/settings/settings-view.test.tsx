@@ -720,10 +720,11 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     expect(screen.getByRole("switch", { name: "board-picker" }).getAttribute("aria-checked")).toBe(
       "false",
     );
-    // The pass decides only. The row must promise the ranking and NOT a start, or arming it reads
-    // as autopilot and the operator waits for work that was never going to begin.
+    // The row must name BOTH halves of what arming does: the ranking every project gets, and the
+    // unattended start the ones armed to apply get. Promising only the ranking sells autopilot as a
+    // report; promising only the start sells it to a project that never armed apply.
     expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
-    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
+    expect(screen.getByText(/starts its top pick where you armed apply/)).toBeTruthy();
   });
 
   it("reads 'not scheduled' when the automation is off or has no row", () => {
@@ -1558,11 +1559,12 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     await waitFor(() => expect(offer()).toBeTruthy());
     const prompt = offer();
     // The WHY, not the mechanism: the picker consumes these priorities now, so staleness costs
-    // something. And only what the build actually does — the picker records a plan, it starts
-    // nothing — because the offer buys a daily claude session and must not sell an absent feature.
+    // something. And only what the build actually does — it ranks, and where apply is armed it
+    // approves, claims and starts — because the offer buys a daily claude session and must neither
+    // sell an absent feature nor hide the one that starts work unattended.
     expect(prompt!.textContent).toMatch(/ranks what could run next/);
-    expect(prompt!.textContent).toMatch(/starts nothing yet/);
-    expect(prompt!.textContent).not.toMatch(/executed/);
+    expect(prompt!.textContent).toMatch(/where you armed apply, it approves, claims and starts/);
+    expect(prompt!.textContent).not.toMatch(/starts nothing/);
     expect(prompt!.textContent).toContain("Weekly on Monday at 06:00");
     expect(prompt!.textContent).toContain("Daily at 06:00");
     // Asking is not doing — the cadence is untouched until the operator answers.
