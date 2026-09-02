@@ -183,6 +183,47 @@ async function antonAnswering(port) {
   }
 }
 
+/** The launcher's note of the port it last started this install's server on. Sits beside anton.db. */
+const SERVER_PORT_FILE = "server-port";
+
+function serverPortPath(dbPath) {
+  return join(dirname(dbPath), SERVER_PORT_FILE);
+}
+
+/**
+ * Remember the port `dev`/`start` is launching on, so a LATER `anton doctor` probes the right
+ * endpoint (anton-pzfb).
+ *
+ * doctor is its own invocation and carries no memory of `anton dev --port 4000`: without this it
+ * probes 3000, finds nothing, and says "no running server recorded" about a live stale server —
+ * precisely the pre-stamp case that probe exists for. Beside anton.db, because that is the one
+ * directory this install resolves identically in both modes; the global state dir is shared with
+ * every other anton on the box, and a port read from there would name someone else's server.
+ *
+ * Best-effort, and a stale note costs nothing: the probe still has to find anton's own page there.
+ */
+function recordServerPort(dbPath, port) {
+  try {
+    mkdirSync(dirname(dbPath), { recursive: true });
+    writeFileSync(serverPortPath(dbPath), `${port}\n`);
+  } catch {}
+}
+
+/** The port this install's server was last started on, or null when nothing recorded one. */
+function recordedServerPort(dbPath) {
+  try {
+    const port = readFileSync(serverPortPath(dbPath), "utf8").trim();
+    return /^\d+$/.test(port) ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where the server is: an explicit flag/`PORT`, else the port `dev`/`start` last recorded, else Next's default. */
+function serverPort(args, dbPath) {
+  return resolvePort(args) ?? recordedServerPort(dbPath) ?? "3000";
+}
+
 const c = {
   bold: (s) => `\x1b[1m${s}\x1b[0m`,
   green: (s) => `\x1b[32m${s}\x1b[0m`,
@@ -239,9 +280,22 @@ function runLocal(bin, args, env = {}) {
   const r = spawnSync(target, args, {
     cwd: APP_ROOT,
     stdio: "inherit",
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...serverRootEnv(), ...env },
   });
   return r.status ?? 1;
+}
+
+/**
+ * The runtime dir, handed to the server as an env var rather than left as its cwd (anton-pzfb).
+ *
+ * `anton update` deletes the directory the running server booted from, and from then on
+ * `process.cwd()` throws ENOENT inside it — so a module registry that first loads AFTER the upgrade
+ * (Next bundles instrumentation separately from the request graph) has nothing to resolve its paths
+ * from and reports no drift on the one upgrade drift exists to name. The launcher knows the
+ * pathname from `import.meta.url`, which no deletion touches; `src/lib/build/drift.ts` reads it.
+ */
+function serverRootEnv() {
+  return { ANTON_APP_ROOT: process.env.ANTON_APP_ROOT ?? APP_ROOT };
 }
 
 // ── Agents & skills provisioning (anton setup + anton init) ─────────────────────────────────
@@ -658,6 +712,7 @@ async function startDaemon(args) {
     return 1;
   }
 
+  recordServerPort(stateEnv.ANTON_DB, port);
   mkdirSync(LOG_DIR, { recursive: true });
   const out = openSync(join(LOG_DIR, "stdout.log"), "a");
   const err = openSync(join(LOG_DIR, "stderr.log"), "a");
@@ -679,6 +734,7 @@ async function startDaemon(args) {
       NODE_ENV: "production",
       PORT: String(port),
       HOSTNAME: process.env.ANTON_HOST ?? "127.0.0.1",
+      ...serverRootEnv(),
       ...stateEnv,
     },
   });
@@ -716,7 +772,7 @@ async function cmdStop() {
 /** Print install/runtime/state paths and whether the daemon is running. */
 function cmdStatus(args) {
   const pid = runningPid();
-  const port = resolvePort(args) ?? "3000";
+  const port = serverPort(args, resolveAntonDb());
   console.log(c.bold("anton status"));
   console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
   console.log(`  runtime   ${APP_ROOT}`);
@@ -1149,7 +1205,7 @@ async function reportServerBuild(dbPath, args = []) {
   // One read, one verdict: re-reading the record inside buildDrift would let a restart between the
   // two reads produce a verdict and a liveness check that describe different processes. A record
   // carries its own pid, so liveness is only worth establishing (and probing for) without one.
-  const serverRunning = record ? false : await serverIsUp({ port: resolvePort(args) });
+  const serverRunning = record ? false : await serverIsUp({ port: serverPort(args, dbPath) });
   const drift = buildDrift({ appRoot: APP_ROOT, recordPath, record, serverRunning });
   if (!drift) {
     // No drift means one of two things, and they are different claims — a matching build is a
@@ -1859,6 +1915,7 @@ async function cmdServerMode(args = []) {
 
 function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
+  recordServerPort(resolveAntonDb(), resolvePort(args) ?? "3000");
   return runLocal("next", nextArgs("dev", args));
 }
 
@@ -1944,6 +2001,7 @@ async function cmdStart(args) {
   // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
   // rather than falling back to a stray anton.db under the cwd. Source checkouts resolve their own DB.
   const serverEnv = IS_BUNDLE ? bundleStateEnv() : {};
+  recordServerPort(serverEnv.ANTON_DB ?? resolveAntonDb(), resolvePort(args) ?? "3000");
   return runLocal("next", nextArgs("start", args), serverEnv);
 }
 
@@ -1954,7 +2012,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("setup")}    check prereqs, migrate DB, rebuild node-pty, install/refresh agents & skills, wire beads Dolt sync  ${c.dim("[--agents <a,b,c>|all] [--force-skills]")}
   ${c.bold("init")}     configure beads in a target repo + register it with anton  ${c.dim("[path] [--prefix <p>] [--force-skills]")}
   ${c.bold("server-mode")} point ONE project's board at a shared Dolt server + verify it  ${c.dim(SERVER_MODE_FLAGS)}
-  ${c.bold("doctor")}   check prereqs + anton.db + stale skills + a stale running server (non-destructive)
+  ${c.bold("doctor")}   check prereqs + anton.db + stale skills + a stale running server (non-destructive)  ${c.dim("[--port <n>]")}
   ${c.bold("board-check")} report beads that break epic → feature → ticket  ${c.dim("[path...] (default: cwd)")}
   ${c.bold("dev")}      run the dev server (next dev)          ${c.dim("[--port <n>]")}
   ${c.bold("start")}    run the server ${c.dim("(installed: background; source: foreground)")}  ${c.dim("[--port <n>] [--foreground]")}
@@ -1966,6 +2024,7 @@ ${c.bold("Usage:")} anton <command>
   ${c.bold("--help")}   show this help
 
 ${c.dim("Port: dev/start default to 3000; override with --port <n> (alias -p) or PORT=<n>.")}
+${c.dim("      doctor probes whichever port dev/start last used; pass --port <n> to point it elsewhere.")}
 The runner + scheduler start automatically with the server (set ANTON_RUNNER=off to disable).
 `;
 

@@ -7,7 +7,7 @@
  * things a TypeScript caller needs: how THIS install resolves its paths, and the discriminated types
  * the UI narrows on.
  *
- * Paths follow anton.db exactly (`ANTON_DB`, else the cwd the server runs from), so a bundle install
+ * Paths follow anton.db exactly (`ANTON_DB`, else the runtime dir the server runs from), so a bundle install
  * — whose writable state lives outside the replaceable runtime dir — records beside the database
  * `anton setup` created rather than inside a directory the next update deletes.
  */
@@ -58,17 +58,34 @@ function readCwd(): string | null {
 }
 
 /**
- * The runtime directory, captured while it still exists.
+ * Where this install's runtime directory is published, so it outlives the directory itself.
  *
  * `anton update` (scripts/install.sh) moves the live runtime dir aside and deletes it, so a server
  * that booted from it is left with a cwd that no longer resolves — `process.cwd()` throws ENOENT
  * from then on. That upgrade is precisely the drift this module reports, so it must survive it:
  * holding the pathname keeps every later read pointed at the replacement that took its place.
+ *
+ * A module-level cache alone is not enough to hold it. Next bundles the instrumentation hook and
+ * the request graph into SEPARATE module registries (see lib/jobs/service), so the copy of this
+ * module that renders the health page may first load long after boot — and if that is after the
+ * upgrade, its cache is seeded from a cwd that is already gone. `process.env` is the one thing both
+ * registries share: the launcher sets this before spawning the server, and a boot that finds it
+ * unset writes the cwd back while it still resolves.
  */
-let appRootCache: string | null = readCwd();
+const APP_ROOT_ENV = "ANTON_APP_ROOT";
+
+function resolveAppRoot(): string | null {
+  const declared = process.env[APP_ROOT_ENV];
+  if (declared) return declared;
+  const cwd = readCwd();
+  if (cwd) process.env[APP_ROOT_ENV] = cwd;
+  return cwd;
+}
+
+let appRootCache: string | null = resolveAppRoot();
 
 function appRoot(): string | null {
-  return (appRootCache ??= readCwd());
+  return (appRootCache ??= resolveAppRoot());
 }
 
 /**

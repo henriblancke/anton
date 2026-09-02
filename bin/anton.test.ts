@@ -379,15 +379,19 @@ describe("anton doctor — stale server build", () => {
    */
   async function runDoctorWith(
     record: object | null,
-    { daemonPid, port = 1 }: { daemonPid?: number; port?: number } = {},
+    { daemonPid, port = 1, recordedPort }: { daemonPid?: number; port?: number; recordedPort?: number } = {},
   ) {
     const home = await dirs.make("anton-home-");
     const state = await dirs.make("anton-state-");
     if (record) writeFileSync(join(state, "server-build.json"), JSON.stringify(record));
     if (daemonPid) writeFileSync(join(state, "anton.pid"), String(daemonPid));
+    // `recordedPort` stands in for a `dev`/`start` that ran earlier on a nondefault port and left
+    // its note beside anton.db; doctor is then invoked with no flag at all, which is the case.
+    if (recordedPort) writeFileSync(join(state, "server-port"), `${recordedPort}\n`);
+    const args = recordedPort ? [CLI, "doctor"] : [CLI, "doctor", "--port", String(port)];
     // Spawned ASYNCHRONOUSLY on purpose: doctor probes the port, and `spawnSync` would block this
     // process's event loop — the very loop the stub server above answers from.
-    const child = spawn(process.execPath, [CLI, "doctor", "--port", String(port)], {
+    const child = spawn(process.execPath, args, {
       cwd: await dirs.make("anton-cwd-"),
       env: { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state },
     });
@@ -430,6 +434,16 @@ describe("anton doctor — stale server build", () => {
   // Without it doctor calls that exact case "nothing running" and the stale server stays silent.
   it("reports a source-mode server answering the port but leaving no record", async () => {
     const r = await runDoctorWith(null, { port: await serve("<html><head><title>anton</title></head>") });
+    expect(r.stdout).toContain("recorded no build identity");
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // doctor is its own invocation: nothing on its command line remembers `anton dev --port 4000`,
+  // so without the note `dev`/`start` leaves it probes 3000 and calls a live stale server "nothing
+  // running" — in exactly the pre-stamp upgrade this probe exists for.
+  it("probes the port dev/start recorded, not 3000, when the invocation names none", async () => {
+    const recordedPort = await serve("<html><head><title>anton</title></head>");
+    const r = await runDoctorWith(null, { recordedPort });
     expect(r.stdout).toContain("recorded no build identity");
     expect(r.stdout).toContain("Restart it to run the build on disk");
   });

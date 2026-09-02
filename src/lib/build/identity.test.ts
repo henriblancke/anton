@@ -185,6 +185,25 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).toBe(first);
   });
 
+  // Next reads `.env*` at BUILD time and inlines every NEXT_PUBLIC_* value into the bundle, but the
+  // file is gitignored — so without naming it back in, changing a compiled-in value leaves the
+  // digest untouched and `anton start` serves the old value while calling the build current.
+  it("counts an ignored .env file, which the build compiles in", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitignore"), ".env*\n");
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "ignore env"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    writeFileSync(join(dir, ".env.production"), "NEXT_PUBLIC_API=https://one\n");
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    // By content, like every other input: an edited value is a different build.
+    writeFileSync(join(dir, ".env.production"), "NEXT_PUBLIC_API=https://two\n");
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
   // .gitignore is what keeps `.next` and node_modules — which every build rewrites — out of the
   // digest; without it a build would invalidate itself the moment it finished.
   it("ignores what git ignores", () => {
@@ -240,6 +259,13 @@ describe("the record a running server leaves", () => {
   // and a boot timestamp staged by the next routine `git add -A`.
   it("carries a name this repo ignores, so a boot never dirties the checkout", () => {
     const ignored = spawnSync("git", ["check-ignore", "-q", BUILD_RECORD_FILE], { cwd: process.cwd() });
+    expect(ignored.status).toBe(0);
+  });
+
+  // Same hazard, same fix: the launcher's port note also lands at the repo root on a source
+  // checkout, where an unignored name would enter the worktree digest and invalidate every build.
+  it("keeps the launcher's port note out of the checkout too", () => {
+    const ignored = spawnSync("git", ["check-ignore", "-q", "server-port"], { cwd: process.cwd() });
     expect(ignored.status).toBe(0);
   });
 

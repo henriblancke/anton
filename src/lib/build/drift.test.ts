@@ -113,6 +113,29 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(drift?.running?.version).toBe("0.0.1");
   });
 
+  // The other half of that upgrade, and the one a module-level cache cannot cover: Next bundles the
+  // instrumentation hook and the request graph into SEPARATE module registries, so the copy of this
+  // module that renders the health page may first load long after boot — and if that is after
+  // `anton update` deleted the directory the server booted from, its cwd never resolved once. The
+  // launcher publishes the pathname in the environment, which is the one thing both registries see.
+  it("resolves the runtime dir from the environment when the cwd is already gone at load", async () => {
+    vi.stubEnv("ANTON_APP_ROOT", process.cwd());
+    vi.spyOn(process, "cwd").mockImplementation(() => {
+      throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), { code: "ENOENT" });
+    });
+
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+    const path = join(dir, "server-build.json");
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    expect(record.version).toMatch(/^\d+\.\d+\.\d+/); // it read the checkout, not an empty identity
+    writeFileSync(path, JSON.stringify({ ...record, version: "0.0.1" }));
+
+    const drift = serverBuildDrift();
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.onDisk.version).toBe(record.version);
+  });
+
   it("says nothing in a process that never booted a server", async () => {
     const { serverBuildDrift } = await freshModule();
     expect(serverBuildDrift()).toBeNull();

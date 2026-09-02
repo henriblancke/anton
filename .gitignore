@@ -54,6 +54,10 @@ anton.db-*
 # root, and the record holds a pid and a boot timestamp. Name kept in sync with BUILD_RECORD_FILE
 # (src/lib/build/identity.mjs), which identity.test.ts asserts is ignored here.
 server-build.json
+# Written beside anton.db by `anton dev` / `anton start` (anton-pzfb) so a later `anton doctor`
+# probes the port the server actually listens on. Ignored for the same reason as the record above —
+# and because an unignored one would enter the worktree digest and invalidate every build.
+server-port
 
 # Beads / Dolt files (added by bd init)
 .dolt/

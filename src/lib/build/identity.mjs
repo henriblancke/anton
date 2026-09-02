@@ -146,17 +146,49 @@ function git(appRoot, args) {
  * on the tracked side. `git ls-files --others --exclude-standard` names them (honouring .gitignore,
  * so `.next` and node_modules never enter the digest) and this reads them — bounded chunks folded
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
+ *
+ * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
+ * that class back in.
  */
 function readWorktreeDigest(appRoot) {
   const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (listed === null) return null;
   const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "HEAD"]);
   if (diff === null) return null;
-  const untracked = listed.split("\0").filter(Boolean);
-  if (!untracked.length && !diff) return WORKTREE_CLEAN;
+  const files = [...new Set([...listed.split("\0").filter(Boolean), ...ignoredEnvFiles(appRoot)])].sort();
+  if (!files.length && !diff) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
-  for (const path of untracked) digest.update(path).update("\0").update(hashFile(join(appRoot, path)));
+  for (const path of files) digest.update(path).update("\0").update(hashFile(join(appRoot, path)));
   return digest.digest("hex").slice(0, 12);
+}
+
+/**
+ * The IGNORED env files Next compiles into the artifact, named back into the digest that
+ * `--exclude-standard` just hid.
+ *
+ * `.env*` is gitignored here (and by the template Next ships), so the untracked listing never sees
+ * it — yet Next reads `.env`, `.env.local` and `.env.<mode>` at BUILD time and inlines every
+ * `NEXT_PUBLIC_*` value into the bundle. Change one and the compiled build serves a value the
+ * checkout no longer holds while both digests still match: `anton start` accepts the stale `.next`
+ * and every drift surface calls the server current.
+ *
+ * Asked for by name rather than by un-ignoring everything but `.next`/node_modules: anton.db, .dolt
+ * and the session logs all live under the app root and are all ignored too, and folding those in
+ * would re-digest the tree on every write — a permanent "restart the server" banner. Top level
+ * only, because that is the only place Next looks; tracked env files are left to the diff.
+ */
+function ignoredEnvFiles(appRoot) {
+  const listed = git(appRoot, [
+    "ls-files",
+    "--others",
+    "--ignored",
+    "--exclude-standard",
+    "-z",
+    "--",
+    ".env",
+    ".env.*",
+  ]);
+  return listed === null ? [] : listed.split("\0").filter(Boolean);
 }
 
 /**
