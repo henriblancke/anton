@@ -677,15 +677,13 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
         const why = excluded.detail ? `${excluded.reason} — ${excluded.detail}` : excluded.reason;
         return { ineligible: why };
       }
-      // And the stance behind the start, re-resolved here so a withdrawal that lands between the
-      // ranking and the lock costs nothing to honour: the settle re-asks it too, but only this one
-      // refuses BEFORE the approval and the claim are written.
-      const withdrawn = await stance(locked, board);
+      // And the stance behind the start plus the safety brake, re-resolved here so a withdrawal or
+      // a freeze that lands between the ranking and the lock costs nothing to honour: the settle
+      // re-asks the stance too, but only this one refuses BEFORE the approval and the claim are
+      // written (see {@link pickerDisarmed}). Both are independent board reads, so they run together
+      // rather than holding the claim lock across two round trips.
+      const [withdrawn, frozen] = await Promise.all([stance(locked, board), disarmed()]);
       if (withdrawn) return { ineligible: withdrawn };
-      // And the safety brake, re-asked here for the same reason the stance is: a freeze latched
-      // between the caller's read and this lock must cost a refusal, not an unwind (see
-      // {@link pickerDisarmed}).
-      const frozen = await disarmed();
       if (frozen) return { ineligible: frozen };
       wroteLabel = !beads.isApproved(locked);
       return undefined;

@@ -192,12 +192,6 @@ export interface UnwindApproveClaimInput {
  * goes through the LOCKED CAS rather than `setAssigneeIfOwner`, which would wait on the lock this
  * body already holds and deadlock.
  *
- * `bd update --add-label` is AMBIGUOUS on failure — it can commit and then throw or time out — so
- * `wroteLabel` says the label is ours to take back, not that it is there. The bead is re-read and an
- * untag is only attempted on a label that actually landed (PR #218 review): an untag refusing a
- * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
- * this exists to prevent. An unreadable board is treated as approved, so the unwind fails closed.
- *
  * A swap lost to a THIRD PARTY is not a failure: someone else holds the reservation now, which is a
  * safe final state and none of ours to repair. A swap lost while the target still reads as `owner`
  * is the opposite (PR #218 review) — the release did not take, so the reservation is still ours,
