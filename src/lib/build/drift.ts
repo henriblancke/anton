@@ -56,6 +56,25 @@ function dbPath(): string {
 let bootedFrom: BuildIdentity | null = null;
 
 /**
+ * How long one read of the code on disk stands. `serverBuildDrift` runs on every health render and
+ * `readBuildIdentity` spawns git SYNCHRONOUSLY, which would block the event loop once per request
+ * (up to the 5s git timeout). Which build is on disk moves at the speed of a deploy, so a read a few
+ * seconds old is as true as a fresh one — and drift the operator must act on stays visible within
+ * one page refresh.
+ */
+const ON_DISK_TTL_MS = 15_000;
+
+let onDiskCache: { at: number; identity: BuildIdentity } | null = null;
+
+function onDiskIdentity(): BuildIdentity {
+  const now = Date.now();
+  if (onDiskCache && now - onDiskCache.at < ON_DISK_TTL_MS) return onDiskCache.identity;
+  const identity = readBuildIdentity(process.cwd()) as BuildIdentity;
+  onDiskCache = { at: now, identity };
+  return identity;
+}
+
+/**
  * Record what this process is running. Called once from the instrumentation hook, BEFORE the runner
  * starts: a UI-only server (`ANTON_RUNNER=off`) is just as capable of being stale, and a record
  * written only on the runner path would leave that one silently unstamped.
@@ -64,7 +83,7 @@ let bootedFrom: BuildIdentity | null = null;
  * short-lived one); the in-memory copy is what keeps it readable inside when the file write fails.
  */
 export function recordServerBuild(): void {
-  bootedFrom = readBuildIdentity(process.cwd()) as BuildIdentity;
+  bootedFrom = onDiskIdentity();
   writeBuildRecord(buildRecordPath(dbPath()), bootedFrom);
 }
 
@@ -83,11 +102,17 @@ export function recordServerBuild(): void {
  */
 export function serverBuildDrift(): BuildDrift | null {
   const recordPath = buildRecordPath(dbPath());
-  if (!readBuildRecord(recordPath) && bootedFrom) {
-    const verdict = compareBuild(bootedFrom, readBuildIdentity(process.cwd()));
+  const record = readBuildRecord(recordPath);
+  if (!record && bootedFrom) {
+    const verdict = compareBuild(bootedFrom, onDiskIdentity());
     return verdict.state === "current" ? null : ({ ...verdict, bootedAt: null } as BuildDrift);
   }
-  return buildDrift({ appRoot: process.cwd(), recordPath }) as BuildDrift | null;
+  return buildDrift({
+    appRoot: process.cwd(),
+    recordPath,
+    record,
+    onDisk: onDiskIdentity(),
+  }) as BuildDrift | null;
 }
 
 export { describeBuildDrift, describeBuildIdentity };

@@ -5,7 +5,7 @@
  * must a process that never booted a server (every unit test in this repo is one).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.doUnmock("./identity.mjs");
   process.env.ANTON_DB = realDb;
   rmSync(dir, { recursive: true, force: true });
 });
@@ -74,5 +76,33 @@ describe("recordServerBuild / serverBuildDrift", () => {
   it("says nothing in a process that never booted a server", async () => {
     const { serverBuildDrift } = await freshModule();
     expect(serverBuildDrift()).toBeNull();
+  });
+
+  // The one case the file cannot answer: a state dir anton could not write to leaves no record for
+  // anyone — including this process — so the identity it kept in memory at boot is the only evidence
+  // that the server is running something other than what is on disk.
+  it("falls back to the identity it holds in memory when the record could not be written", async () => {
+    writeFileSync(join(dir, "blocked"), "");
+    process.env.ANTON_DB = join(dir, "blocked", "anton.db");
+
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { recordServerBuild, serverBuildDrift } = await import("./drift");
+
+    recordServerBuild();
+    expect(existsSync(join(dir, "blocked", "server-build.json"))).toBe(false);
+    expect(serverBuildDrift()).toBeNull();
+
+    onDisk = { version: "0.4.1", revision: null };
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000); // past the TTL on the on-disk read
+    const drift = serverBuildDrift();
+
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.running?.version).toBe("0.4.0");
+    expect(drift?.onDisk.version).toBe("0.4.1");
+    expect(drift?.bootedAt).toBeNull();
   });
 });

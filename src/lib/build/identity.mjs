@@ -28,7 +28,7 @@
  * Pure Node, no deps: bin/anton.mjs (the launcher, which runs before any build) imports this.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /** Short form of a commit sha in operator-facing copy — long enough to be unambiguous, short enough to read. */
@@ -55,15 +55,34 @@ function readVersion(appRoot) {
   }
 }
 
+/** Do two paths name the same directory? Resolved, because a symlinked state dir is still that dir. */
+function sameDirectory(a, b) {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The commit `appRoot` holds, or null when it isn't a git checkout (every installed bundle — a
- * release tarball carries no .git, and its RELEASE_VERSION already identifies it exactly).
+ * The commit `appRoot` ITSELF holds, or null when it is not the root of a git checkout (every
+ * installed bundle — a release tarball carries no .git, and its RELEASE_VERSION already identifies
+ * it exactly).
+ *
+ * The toplevel check is what makes that "itself": `git rev-parse` walks UP the tree until it finds
+ * any repository, so a bundle installed under a git-tracked $HOME would otherwise report the
+ * dotfiles repo's HEAD — an unrelated sha on both sides of the comparison, flipping to "modified"
+ * and demanding a restart of a current server after every dotfile commit.
  */
 function readRevision(appRoot) {
-  const r = spawnSync("git", ["-C", appRoot, "rev-parse", "HEAD"], { encoding: "utf8", timeout: 5000 });
+  const r = spawnSync("git", ["-C", appRoot, "rev-parse", "--show-toplevel", "HEAD"], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
   if (r.status !== 0) return null;
-  const sha = (r.stdout ?? "").trim();
-  return /^[0-9a-f]{7,40}$/.test(sha) ? sha : null;
+  const [top, sha] = (r.stdout ?? "").trim().split("\n", 2);
+  if (!top || !sha || !/^[0-9a-f]{7,40}$/.test(sha.trim())) return null;
+  return sameDirectory(top.trim(), appRoot) ? sha.trim() : null;
 }
 
 /** What the code at `appRoot` IS right now: `{ version, revision }` (either may be null). */
@@ -131,14 +150,26 @@ export function compareBuild(running, onDisk) {
  *
  * A record whose pid is dead is a stopped server's leftover: silent, which is what makes a restart
  * the only action needed to clear any verdict here.
+ *
+ * `record` and `onDisk` let a caller that already holds either one pass it in rather than pay for a
+ * second read — `readBuildIdentity` spawns git, and a request-path caller reads both once. Both are
+ * resolved lazily, so a verdict that needs neither (a dead pid) still costs nothing.
  */
-export function buildDrift({ appRoot, recordPath, serverRunning = false, isAlive = pidAlive }) {
-  const record = readBuildRecord(recordPath);
-  if (!record) return serverRunning ? { ...compareBuild(null, readBuildIdentity(appRoot)), bootedAt: null } : null;
-  if (!isAlive(record.pid)) return null;
-  const verdict = compareBuild(record, readBuildIdentity(appRoot));
+export function buildDrift({
+  appRoot,
+  recordPath,
+  serverRunning = false,
+  isAlive = pidAlive,
+  record = /** @type {any} */ (undefined),
+  onDisk = /** @type {any} */ (undefined),
+}) {
+  const identity = () => onDisk ?? readBuildIdentity(appRoot);
+  const found = record === undefined ? readBuildRecord(recordPath) : record;
+  if (!found) return serverRunning ? { ...compareBuild(null, identity()), bootedAt: null } : null;
+  if (!isAlive(found.pid)) return null;
+  const verdict = compareBuild(found, identity());
   if (verdict.state === "current") return null;
-  return { ...verdict, bootedAt: typeof record.bootedAt === "number" ? record.bootedAt : null };
+  return { ...verdict, bootedAt: typeof found.bootedAt === "number" ? found.bootedAt : null };
 }
 
 /** One build in operator-facing copy: `0.4.0 (a1b2c3d)`, or `0.4.0` where no commit names it. */

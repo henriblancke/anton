@@ -9,7 +9,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -82,6 +82,21 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir)).toEqual({ version: "0.4.0", revision: null });
   });
 
+  // `git rev-parse` walks up until it finds ANY repository, so a bundle installed under a
+  // git-tracked $HOME would otherwise wear the dotfiles repo's HEAD and be called "modified" — a
+  // restart demanded of a current server after every unrelated dotfile commit.
+  it("names no commit for a bundle unpacked inside someone else's repo", () => {
+    const home = tempDir();
+    spawnSync("git", ["init", "-q", home]);
+    const identity = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+    spawnSync("git", ["-C", home, ...identity, "commit", "--allow-empty", "-qm", "dotfiles"]);
+    const bundle = join(home, "bundle");
+    mkdirSync(bundle);
+    writeFileSync(join(bundle, "RELEASE_VERSION"), "0.9.1\n");
+
+    expect(readBuildIdentity(bundle)).toEqual({ version: "0.9.1", revision: null });
+  });
+
   it("reads this repo's own version and HEAD", () => {
     const identity = readBuildIdentity(process.cwd());
     expect(identity.version).toMatch(/^\d+\.\d+\.\d+/);
@@ -105,9 +120,21 @@ describe("the record a running server leaves", () => {
     expect(ignored.status).toBe(0);
   });
 
-  it("survives an unwritable state dir and an unreadable record without throwing", () => {
+  it("creates the state dir on the way, so a first boot needs no setup step", () => {
     const dir = tempDir();
     expect(writeBuildRecord(join(dir, "anton.db", "nested", "rec.json"), RUNNING)).toBe(true);
+  });
+
+  // Best-effort is the whole contract: a state dir anton cannot write must cost it a stamp, not a
+  // boot. `drift.ts` covers that gap with the identity it holds in memory.
+  it("reports failure instead of throwing when the record cannot be written", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "blocked"), "");
+    expect(writeBuildRecord(join(dir, "blocked", "rec.json"), RUNNING)).toBe(false);
+  });
+
+  it("treats an unreadable or absent record as no record", () => {
+    const dir = tempDir();
     writeFileSync(join(dir, "junk.json"), "{not json");
     expect(readBuildRecord(join(dir, "junk.json"))).toBeNull();
     expect(readBuildRecord(join(dir, "absent.json"))).toBeNull();
