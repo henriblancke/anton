@@ -30,7 +30,7 @@
  * is for.
  */
 import { beads, LABELS, type Bead } from "./bd";
-import { setAssigneeIfOwner, withClaimLock, type LockedSwap, type SwapResult } from "./claim";
+import { withClaimLock, type LockedSwap, type SwapResult } from "./claim";
 import { loadAllIssues } from "./issues";
 
 /**
@@ -183,46 +183,61 @@ export interface UnwindApproveClaimInput {
  * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
  * this exists to prevent. An unreadable board is treated as approved, so the unwind fails closed.
  *
- * A LOST swap on the release is not a failure: someone else holds the reservation now, which is a
- * safe final state and none of ours to repair. Only an unreachable board leaves the claim standing.
+ * The WHOLE unwind runs under the bead's claim-write lock, not just its release (PR #218 review).
+ * Unlocked, the re-read, the untag and the release are three separately-ordered writes, and a retry
+ * approving the same target between them lands inside the compensation: this unwind then strips the
+ * retry's approval, or releases the claim the retry took while its fresh approval stands — an
+ * approved, unassigned target, the exact shape this ordering exists never to publish. Holding one
+ * lock across all three makes the compensation as atomic as the sequence it reverses, so the release
+ * goes through the LOCKED CAS rather than `setAssigneeIfOwner`, which would wait on the lock this
+ * body already holds and deadlock.
+ *
+ * `bd update --add-label` is AMBIGUOUS on failure — it can commit and then throw or time out — so
+ * `wroteLabel` says the label is ours to take back, not that it is there. The bead is re-read and an
+ * untag is only attempted on a label that actually landed (PR #218 review): an untag refusing a
+ * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
+ * this exists to prevent. An unreadable board is treated as approved, so the unwind fails closed.
+ *
+ * A swap lost to a THIRD PARTY is not a failure: someone else holds the reservation now, which is a
+ * safe final state and none of ours to repair. A swap lost while the target still reads as `owner`
+ * is the opposite (PR #218 review) — the release did not take, so the reservation is still ours,
+ * still has no run behind it, and is reported as a leftover rather than swallowed because a
+ * `SwapResult` object came back at all. An unreachable board leaves the claim standing too.
  */
 export async function unwindApproveClaim(
   input: UnwindApproveClaimInput,
 ): Promise<UnwindLeftover | undefined> {
   const { repoPath, beadId } = input;
 
-  const approved =
-    input.wroteLabel &&
-    (await beads
-      .show(repoPath, beadId)
-      .then((b) => beads.isApproved(b))
-      .catch((e) => {
-        console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
-        return true;
-      }));
-  if (approved) {
-    const unapproved = await beads
-      .untag(repoPath, beadId, [LABELS.approved])
-      .then(() => true)
-      .catch((e) => {
-        console.error(`[approve-claim] could not unapprove ${beadId}`, e);
-        return false;
+  return withClaimLock(repoPath, beadId, async (cas) => {
+    const approved =
+      input.wroteLabel &&
+      (await beads
+        .show(repoPath, beadId)
+        .then((b) => beads.isApproved(b))
+        .catch((e) => {
+          console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
+          return true;
+        }));
+    if (approved) {
+      const unapproved = await beads
+        .untag(repoPath, beadId, [LABELS.approved])
+        .then(() => true)
+        .catch((e) => {
+          console.error(`[approve-claim] could not unapprove ${beadId}`, e);
+          return false;
+        });
+      if (!unapproved) return "approval";
+    }
+
+    if (input.wroteClaim) {
+      const released = await cas(input.owner, input.restoreTo).catch((e) => {
+        console.error(`[approve-claim] could not release the claim on ${beadId}`, e);
+        return undefined;
       });
-    if (!unapproved) return "approval";
-  }
+      if (!released || (!released.ok && released.owner === input.owner)) return "claim";
+    }
 
-  if (input.wroteClaim) {
-    const released = await setAssigneeIfOwner(
-      repoPath,
-      beadId,
-      input.owner,
-      input.restoreTo,
-    ).catch((e) => {
-      console.error(`[approve-claim] could not release the claim on ${beadId}`, e);
-      return undefined;
-    });
-    if (!released) return "claim";
-  }
-
-  return undefined;
+    return undefined;
+  });
 }

@@ -9,6 +9,7 @@
  * on demand.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { disarmAutopilot } from "../autopilot-disarm";
 import { beads, LABELS } from "../beads/bd";
 import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "../gardener/autonomy";
 import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
@@ -802,6 +803,58 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired());
 
       expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+    });
+  });
+
+  describe("the safety brake behind the start", () => {
+    const why = (outcome: unknown) => (outcome as { skipped: { reason: string } }).skipped.reason;
+
+    /** Freeze the project exactly as a breaker does — the latch the caller read before the ranking. */
+    const freeze = () =>
+      disarmAutopilot(t.db, clock, {
+        projectId: "p1",
+        reason: "consecutive-failures",
+        detail: "3 runs in a row stopped without delivering",
+      });
+
+    it("writes nothing when the project is disarmed between the plan and the write", async () => {
+      // The caller cleared this pass against a latch read before the ranking; an overlapping pass's
+      // breaker can trip in the window before the lock, and a freeze means start nothing.
+      put(bead("t1"));
+      await freeze();
+
+      const outcome = await apply("t1");
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect(why(outcome)).toContain("disarmed");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("takes its writes back when the project is disarmed while the claim settles", async () => {
+      // The window nothing else covers: the stance re-asks the operator's settings and the settle
+      // re-asks the board, but neither can see a breaker latching while this pass claims.
+      put(bead("t1"));
+
+      const outcome = await apply(
+        "t1",
+        1,
+        wired({
+          sleep: async () => {
+            await freeze();
+          },
+        }),
+      );
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("disarmed");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      // Fail closed, like every other late refusal: the writes come off so a re-armed project can
+      // re-decide the target from scratch.
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
   });
 

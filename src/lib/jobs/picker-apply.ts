@@ -34,6 +34,7 @@
  *     read back before anything is enqueued (see {@link settleClaim}) — the pass stands down
  *     whenever either leg fails.
  */
+import { activeDisarm } from "../autopilot-disarm";
 import { beads, CLAIM_SETTLE_MS, type SyncOutcome } from "../beads/bd";
 import { isServerMode } from "../beads/board-mode";
 import { approveAndClaim, unwindApproveClaim } from "../beads/approve-claim";
@@ -140,6 +141,11 @@ export interface PickerApplyInput {
    * seam only so a test can drive the withdrawal window without a settings row to race against.
    */
   stance?: PickerStanceCheck;
+  /**
+   * The safety-brake re-check, defaulting to {@link pickerDisarmed} over this pass's own db. A seam
+   * only so a test can latch the freeze inside the window rather than around it.
+   */
+  disarmed?: PickerDisarmCheck;
 }
 
 /**
@@ -149,6 +155,13 @@ export interface PickerApplyInput {
  * asked of two sources.
  */
 export type PickerStanceCheck = (target: Bead, board: Bead[]) => Promise<string | undefined>;
+
+/**
+ * Is the project FROZEN right now? Answers with the reason it is, or undefined while it is armed —
+ * the same shape as {@link PickerStanceCheck}, because to the pass they are one question ("may this
+ * start still happen?") asked of two tables.
+ */
+export type PickerDisarmCheck = () => Promise<string | undefined>;
 
 /**
  * Re-resolve the picker's stance and judge the target against it (PR #218 review).
@@ -188,6 +201,26 @@ export function pickerStance(db: AntonDb, projectId: string): PickerStanceCheck 
     return verdict.detail
       ? `the work policy no longer admits it — ${verdict.detail}`
       : "the work policy no longer admits it";
+  };
+}
+
+/**
+ * Re-ask the DISARM latch, the one brake nothing else here re-asks (PR #218 review).
+ *
+ * The caller reads it once, before the ranking; what follows is a mirror refresh, a board read, the
+ * CAS and the settle window, and a latch can appear anywhere in it — an overlapping pass's failure
+ * breaker or score slide tripping on a run that settled in the meantime. The disarm is the strongest
+ * refusal anton has (a frozen project starts nothing until a HUMAN re-arms it), so honouring a stale
+ * "armed" verdict here would start exactly the unattended run the freeze was raised to stop.
+ *
+ * Separate from {@link pickerStance} rather than folded into it because the two name different
+ * states to the operator and have different remedies: a withdrawn stance is a setting they changed,
+ * a disarm is a brake they have to clear.
+ */
+export function pickerDisarmed(db: AntonDb, projectId: string): PickerDisarmCheck {
+  return async () => {
+    const disarm = await activeDisarm(db, projectId);
+    return disarm ? `this project's autopilot is disarmed — ${disarm.detail}` : undefined;
   };
 }
 
@@ -502,6 +535,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     ((project: string, epic: string) => enqueueExecuteEpicIfAbsent(db, clock, project, epic));
   const resume = input.run?.resume ?? ((jobId: string) => resumeJob(db, clock, jobId));
   const stance = input.stance ?? pickerStance(db, projectId);
+  const disarmed = input.disarmed ?? pickerDisarmed(db, projectId);
 
   // Publish this pass's writes on EVERY path that made one, not only the started one (PR #218
   // review). A skip is not a no-op once the approval and the claim have landed: unpublished, they
@@ -556,6 +590,11 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
       // refuses BEFORE the approval and the claim are written.
       const withdrawn = await stance(locked, board);
       if (withdrawn) return { ineligible: withdrawn };
+      // And the safety brake, re-asked here for the same reason the stance is: a freeze latched
+      // between the caller's read and this lock must cost a refusal, not an unwind (see
+      // {@link pickerDisarmed}).
+      const frozen = await disarmed();
+      if (frozen) return { ineligible: frozen };
       wroteLabel = !beads.isApproved(locked);
       return undefined;
     },
@@ -657,6 +696,15 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // not, so a cancel that landed anywhere in the refresh, the CAS or the settle window is spent HERE
   // rather than on a run teardown would have to delete out from under an approved, claimed bead.
   if (cancelled(signal)) return standDown("the pass was cancelled before its run was enqueued");
+
+  // And the last look at the safety brake (PR #218 review). The freeze the caller cleared this pass
+  // against was read before the ranking, and the CAS and the settle window are long enough for an
+  // overlapping pass — or a run settling into a failing streak or a sliding score — to latch one.
+  // Nothing else re-asks it: the stance covers the operator's settings and the settle covers the
+  // board. So a latch that appeared in the window stands the pass down and its writes come back off,
+  // exactly as a cancel does.
+  const frozen = await disarmed();
+  if (frozen) return standDown(frozen);
 
   // The idempotent enqueue, then the resume it cannot do: a run already covering this epic locally
   // withholds an id rather than spawning a second, which is what makes two overlapping passes one

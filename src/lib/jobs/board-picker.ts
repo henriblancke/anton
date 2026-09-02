@@ -188,6 +188,10 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // three refusals are the brakes, in the order an operator would ask about them: a frozen project
     // needs a human to re-arm, a held one releases itself on the next merge, and a project below
     // `apply` never asked for this at all.
+    //
+    // This verdict is the pass's ENTRY gate, not its last word: the apply spends a mirror refresh, a
+    // CAS and a settle window before it enqueues, and re-asks the freeze and the stance at its own
+    // final gate — unwinding its writes when either moved in that window (PR #218 review).
     let applied: PickerApplyOutcome | undefined;
     if (autonomy === "apply" && !disarm && !hold) {
       // Re-gated on the signal, like the plan write above and for a sharper reason: `abortProject`
