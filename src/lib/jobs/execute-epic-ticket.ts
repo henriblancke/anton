@@ -201,11 +201,6 @@ function startTicketBudget(
   // through it — so every child process a step spawns dies on either. The job-level signal is left
   // untouched: it means "the whole run is over", and the failure paths read it (not this one) to tell
   // an operator's kill from a ticket that merely ran long.
-  //
-  // Snapshot the tree BEFORE any step runs, so the timeout path can put back exactly what this
-  // ticket found. Everything committed at this point belongs to earlier tickets; the delta a
-  // timeout leaves behind is this ticket's alone — which is what makes rolling it back safe, and
-  // what stops half-finished work from being swept into the NEXT ticket's commit.
   const ticketAbort = new AbortController();
   const abortTicket = () => ticketAbort.abort();
   ctx.signal.addEventListener("abort", abortTicket, { once: true });
