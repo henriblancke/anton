@@ -31,6 +31,12 @@ export interface BuildIdentity {
   version: string | null;
   /** The commit the checkout held; null for an installed bundle (a tarball carries no git). */
   revision: string | null;
+  /**
+   * A digest of what the checkout holds beyond that commit — `"clean"` when nothing, null for a
+   * bundle. Absent entirely on a record written before this field existed, which is why the
+   * comparison treats it as evidence only when both sides carry one.
+   */
+  worktree?: string | null;
 }
 
 export interface BuildDrift {
@@ -85,10 +91,10 @@ let bootedFrom: BuildIdentity | null = null;
 
 /**
  * How long one read of the code on disk stands. `serverBuildDrift` runs on every health render and
- * `readBuildIdentity` spawns git SYNCHRONOUSLY, which would block the event loop once per request
- * (up to the 5s git timeout). Which build is on disk moves at the speed of a deploy, so a read a few
- * seconds old is as true as a fresh one — and drift the operator must act on stays visible within
- * one page refresh.
+ * `readBuildIdentity` spawns git SYNCHRONOUSLY — three reads, once the worktree digest is in it —
+ * which would block the event loop on every request. Which build is on disk moves at the speed of a
+ * deploy or a save, so a read a few seconds old is as true as a fresh one — and drift the operator
+ * must act on stays visible within one page refresh.
  */
 const ON_DISK_TTL_MS = 15_000;
 
@@ -98,7 +104,9 @@ function onDiskIdentity(): BuildIdentity {
   const now = Date.now();
   if (onDiskCache && now - onDiskCache.at < ON_DISK_TTL_MS) return onDiskCache.identity;
   const root = appRoot();
-  const identity = root ? (readBuildIdentity(root) as BuildIdentity) : { version: null, revision: null };
+  const identity = root
+    ? (readBuildIdentity(root) as BuildIdentity)
+    : { version: null, revision: null, worktree: null };
   onDiskCache = { at: now, identity };
   return identity;
 }
@@ -112,9 +120,22 @@ function onDiskIdentity(): BuildIdentity {
  * short-lived one); the in-memory copy is what keeps it readable inside when the file write fails.
  */
 export function recordServerBuild(): void {
-  bootedFrom = onDiskIdentity();
+  bootedFrom = bootIdentity();
   const db = dbPath();
   if (db) writeBuildRecord(buildRecordPath(db), bootedFrom);
+}
+
+/**
+ * What this process is running — the code on disk, minus the worktree digest outside production.
+ *
+ * A saved edit does not make a dev server stale: `next dev` recompiles the file you just saved. In
+ * a development session the checkout is dirty by definition, so recording the digest there would
+ * put a permanent "restart the server" banner in front of the one person who least needs it.
+ * Dropping it leaves the version/commit comparison, which is what a dev server can actually miss.
+ */
+function bootIdentity(): BuildIdentity {
+  const identity = onDiskIdentity();
+  return process.env.NODE_ENV === "production" ? identity : { ...identity, worktree: null };
 }
 
 /**

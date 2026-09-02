@@ -41,6 +41,20 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+const SOURCE = "export const a = 1;\n";
+
+/** A committed checkout — the only shape whose worktree is read, since only it is its own repo. */
+function gitCheckout(version = "0.4.0"): string {
+  const dir = tempDir();
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ version }));
+  writeFileSync(join(dir, "src.ts"), SOURCE);
+  const author = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  spawnSync("git", ["init", "-q", dir]);
+  spawnSync("git", ["-C", dir, "add", "-A"]);
+  spawnSync("git", ["-C", dir, ...author, "commit", "-qm", "initial"]);
+  return dir;
+}
+
 describe("compareBuild", () => {
   it("says nothing when the running build is the build on disk", () => {
     expect(compareBuild(RUNNING, { ...RUNNING }).state).toBe("current");
@@ -72,6 +86,21 @@ describe("compareBuild", () => {
     expect(compareBuild(RUNNING, { version: null, revision: "b".repeat(40) }).state).toBe("modified");
   });
 
+  // The dev-loop drift: same release, same commit, and `.next` compiled before the edit that is
+  // sitting in the worktree. Nothing above this line can tell those two builds apart.
+  it("calls the same commit carrying different uncommitted work modified", () => {
+    const running = { ...RUNNING, worktree: "clean" };
+    expect(compareBuild(running, { ...RUNNING, worktree: "9f2c1a4bb001" }).state).toBe("modified");
+    expect(compareBuild(running, { ...RUNNING, worktree: "clean" }).state).toBe("current");
+  });
+
+  // A record written before the digest existed carries none, and reading that absence as drift
+  // would demand one restart of every install on the upgrade that introduced it.
+  it("ignores a worktree digest only one side carries", () => {
+    expect(compareBuild(RUNNING, { ...RUNNING, worktree: "9f2c1a4bb001" }).state).toBe("current");
+    expect(compareBuild({ ...RUNNING, worktree: "9f2c1a4bb001" }, RUNNING).state).toBe("current");
+  });
+
   it("calls a build that recorded no version unstamped", () => {
     expect(compareBuild(null, RUNNING).state).toBe("unstamped");
     expect(compareBuild({ version: null, revision: null }, RUNNING).state).toBe("unstamped");
@@ -89,7 +118,7 @@ describe("readBuildIdentity", () => {
   it("falls back to the checkout's package.json version, and names no commit outside git", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
-    expect(readBuildIdentity(dir)).toEqual({ version: "0.4.0", revision: null });
+    expect(readBuildIdentity(dir)).toEqual({ version: "0.4.0", revision: null, worktree: null });
   });
 
   // `git rev-parse` walks up until it finds ANY repository, so a bundle installed under a
@@ -104,7 +133,35 @@ describe("readBuildIdentity", () => {
     mkdirSync(bundle);
     writeFileSync(join(bundle, "RELEASE_VERSION"), "0.9.1\n");
 
-    expect(readBuildIdentity(bundle)).toEqual({ version: "0.9.1", revision: null });
+    // Same guard covers the worktree digest: the bundle is itself untracked in that repo, so
+    // reading it would report the dotfiles' dirt as this build's uncommitted work.
+    expect(readBuildIdentity(bundle)).toEqual({ version: "0.9.1", revision: null, worktree: null });
+  });
+
+  it("calls a committed checkout clean, and digests the edits nobody committed", () => {
+    const dir = gitCheckout();
+    const clean = readBuildIdentity(dir);
+    expect(clean.worktree).toBe("clean");
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    const edited = readBuildIdentity(dir);
+    expect(edited.revision).toBe(clean.revision);
+    expect(edited.worktree).toMatch(/^[0-9a-f]{12}$/);
+
+    // The edit a name-and-status digest misses: still `M src.ts`, still that commit, other code.
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "3"));
+    expect(readBuildIdentity(dir).worktree).not.toBe(edited.worktree);
+
+    // And back, so undoing an edit clears the verdict the way committing one does.
+    writeFileSync(join(dir, "src.ts"), SOURCE);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+  });
+
+  // A new route file changes what a build produces while every tracked file stays where it was.
+  it("counts a file that exists only on disk", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, "page.tsx"), "export default () => null;\n");
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
   it("reads this repo's own version and HEAD", () => {
@@ -159,7 +216,7 @@ describe("the record a running server leaves", () => {
  */
 describe("buildMatchesCheckout", () => {
   /** A checkout at `version`/`revision` whose `.next` was compiled from `builtFrom` (if given). */
-  function checkout(onDisk: { version: string; revision: string | null }, builtFrom?: object) {
+  function checkout(onDisk: { version: string; revision: string | null; worktree?: string }, builtFrom?: object) {
     const app = tempDir();
     writeFileSync(join(app, "package.json"), JSON.stringify({ version: onDisk.version }));
     mkdirSync(join(app, ".next"));
@@ -180,6 +237,13 @@ describe("buildMatchesCheckout", () => {
   it("rejects a build another release produced", () => {
     const app = checkout(RUNNING, { version: "0.3.9", revision: RUNNING.revision });
     expect(buildMatchesCheckout(app, RUNNING)).toBe(false);
+  });
+
+  // What `next start` cannot see either, and what a commit-only comparison misses: the artifact
+  // was compiled, then a tracked file was edited and never committed.
+  it("rejects a build compiled before the edit sitting in the worktree", () => {
+    const onDisk = { ...RUNNING, worktree: "9f2c1a4bb001" };
+    expect(buildMatchesCheckout(checkout(onDisk, { ...RUNNING, worktree: "clean" }), onDisk)).toBe(false);
   });
 
   // An unstamped `.next` is one anton cannot identify, and a build it cannot name is one it cannot
@@ -268,5 +332,14 @@ describe("the sentence an operator reads", () => {
   it("renders a bundle without a commit as its version alone", () => {
     expect(describeBuildIdentity({ version: "0.4.0", revision: null })).toBe("0.4.0");
     expect(describeBuildIdentity(RUNNING)).toBe("0.4.0 (aaaaaaa)");
+  });
+
+  // Both sides of an uncommitted drift sit at one commit, so without this the sentence would claim
+  // that `0.4.0 (aaaaaaa)` differs from `0.4.0 (aaaaaaa)` and read as a bug.
+  it("names uncommitted work, so the two builds it compares print differently", () => {
+    expect(describeBuildIdentity({ ...RUNNING, worktree: "9f2c1a4bb001" })).toBe(
+      "0.4.0 (aaaaaaa, uncommitted 9f2c1a4)",
+    );
+    expect(describeBuildIdentity({ ...RUNNING, worktree: "clean" })).toBe("0.4.0 (aaaaaaa)");
   });
 });

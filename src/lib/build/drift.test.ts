@@ -25,6 +25,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   vi.useRealTimers();
   vi.doUnmock("./identity.mjs");
   process.env.ANTON_DB = realDb;
@@ -45,6 +46,22 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(record.pid).toBe(process.pid);
     expect(record.version).toMatch(/^\d+\.\d+\.\d+/);
     expect(record.bootedAt).toBeGreaterThan(0);
+  });
+
+  // A saved edit does not make a dev server stale — `next dev` recompiles it — and a development
+  // checkout is dirty by definition, so recording the digest there would pin a permanent "restart
+  // the server" banner on the one person who least needs it. A production server has no recovery.
+  it("records uncommitted work only for a production server", async () => {
+    const record = () => JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8"));
+    const dev = await freshModule();
+    dev.recordServerBuild();
+    expect(record().worktree).toBeNull();
+
+    vi.stubEnv("NODE_ENV", "production");
+    const prod = await freshModule();
+    prod.recordServerBuild();
+
+    expect(record().worktree).toEqual(expect.any(String));
   });
 
   // The 2026-08-17 shape, forced: the process is up and the record says it booted somewhere else.

@@ -67,6 +67,7 @@ import {
   buildRecordPath,
   describeBuildIdentity,
   pidAlive,
+  readBuildIdentity,
   readBuildRecord,
   writeBuildStamp,
 } from "../src/lib/build/identity.mjs";
@@ -1878,13 +1879,19 @@ async function cmdStart(args) {
     return 1;
   }
 
-  // `next start` serves whatever `.next` holds, whichever commit produced it — so a checkout that
-  // moved since its last build would boot stamping the NEW commit while serving the old one, and
-  // every drift surface would then call a stale server current (anton-pzfb). Rebuild instead, which
-  // also makes "restart to run the build on disk" true advice for a source install. A bundle is
-  // exempt: it ships its own prebuilt .next and no toolchain to rebuild with.
+  // `next start` serves whatever `.next` holds, whichever code produced it — so a checkout that
+  // moved since its last build (a pull, or an edit nobody committed) would boot stamping the NEW
+  // code while serving the old one, and every drift surface would then call a stale server current
+  // (anton-pzfb). Rebuild instead, which also makes "restart to run the build on disk" true advice
+  // for a source install. A bundle is exempt: it ships its own prebuilt .next and no toolchain to
+  // rebuild with.
+  //
+  // The identity is read BEFORE compiling: an edit saved mid-build belongs to the next build, not
+  // this one, so stamping the tree the build started from fails toward rebuilding rather than
+  // blessing an artifact that missed it.
   const built = existsSync(join(APP_ROOT, ".next"));
-  const staleBuild = built && !IS_BUNDLE && !buildMatchesCheckout(APP_ROOT);
+  const compiledFrom = IS_BUNDLE ? null : readBuildIdentity(APP_ROOT);
+  const staleBuild = built && compiledFrom !== null && !buildMatchesCheckout(APP_ROOT, compiledFrom);
   if (!built || staleBuild) {
     console.log(
       c.dim(
@@ -1895,7 +1902,7 @@ async function cmdStart(args) {
     );
     const b = runLocal("next", ["build"]);
     if (b !== 0) return b;
-    if (!IS_BUNDLE) writeBuildStamp(APP_ROOT);
+    if (compiledFrom) writeBuildStamp(APP_ROOT, compiledFrom);
   }
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
   // In bundle mode the server's writable state — including the DB getDb() opens — must point at
