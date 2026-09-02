@@ -152,6 +152,15 @@ interface TsConfig {
 const EXTENDS_DEPTH = 8;
 
 /**
+ * The files a project publishes a `paths` mapping in, tried in that order. A JavaScript project
+ * writes `jsconfig.json` and no tsconfig at all (anton-23xe), and looking only for the latter reads
+ * it as publishing no mapping — which sends `@/ui/widget` to the path-tail fallback and lets it
+ * name an unrelated package's same-named module, inventing a caller and deleting a true finding.
+ * The two files carry the same `compilerOptions.paths` shape, so one reader serves both.
+ */
+const CONFIG_NAMES = ["tsconfig.json", "jsconfig.json"];
+
+/**
  * A tsconfig with its JSONC removed. tsconfig.json is JSONC, not JSON — `tsc --init` writes a file
  * of `//` comments, and a trailing comma before a closing brace is legal in it. `JSON.parse`
  * rejects both, and a config read as unparseable publishes no mapping at all, which sends the
@@ -298,7 +307,11 @@ async function aliasesOf(repoPath: string, file: string, depth: number): Promise
  * true finding.
  */
 export async function readAliases(repoPath: string, dir = "."): Promise<AliasRule[]> {
-  return aliasesOf(repoPath, join(dir, "tsconfig.json"), EXTENDS_DEPTH);
+  for (const name of CONFIG_NAMES) {
+    const rules = await aliasesOf(repoPath, join(dir, name), EXTENDS_DEPTH);
+    if (rules.length > 0) return rules;
+  }
+  return [];
 }
 
 /** A repo-relative path that stays inside the repo; undefined for anything that escapes it. */

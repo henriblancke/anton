@@ -1576,6 +1576,36 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.ts");
     });
 
+    // ...and a JavaScript project publishes the same mapping in `jsconfig.json`, with no tsconfig
+    // in the tree at all. Looking only for the latter reads the app as publishing no mapping and
+    // falls back to the specifier's tail, which binds an unrelated package's default to the
+    // caller's name — inventing a caller and deleting a finding that was right.
+    it("resolves an alias through a JavaScript project's `jsconfig.json`", async () => {
+      const repo = initRepo({
+        "apps/web/jsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "packages/unused/ui/widget.js": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/ui/widget.js": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/src/ui/panel.js": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/src/page.js":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/src/home.js": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.js", "Widget"),
+        unused("apps/web/src/ui/panel.js", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the jsconfig mapping still resolves the module it does name, so the caller
+      // binding that default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.js");
+    });
+
     // `export default interface Widget {}` stands a keyword where the name usually does. A reader
     // consuming only `function` and `class` takes `interface` for the exported name, reads the
     // module as declaring no default at all, and never resolves the binding its caller took — and
