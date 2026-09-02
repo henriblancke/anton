@@ -62,6 +62,13 @@ describe("compareBuild", () => {
     expect(compareBuild(RUNNING, { version: "0.4.0", revision: null }).state).toBe("current");
   });
 
+  // A checkout that cannot name its own version is a broken install, not a release: calling it
+  // "outdated" would tell the operator to restart a server that is running exactly what is there.
+  it("does not call a running build outdated against a version the disk cannot name", () => {
+    expect(compareBuild(RUNNING, { version: null, revision: RUNNING.revision }).state).toBe("current");
+    expect(compareBuild(RUNNING, { version: null, revision: "b".repeat(40) }).state).toBe("modified");
+  });
+
   it("calls a build that recorded no version unstamped", () => {
     expect(compareBuild(null, RUNNING).state).toBe("unstamped");
     expect(compareBuild({ version: null, revision: null }, RUNNING).state).toBe("unstamped");

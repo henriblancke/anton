@@ -126,13 +126,17 @@ export function pidAlive(pid) {
  * The verdict for one (running, on-disk) pair — the whole comparison, free of files and processes so
  * it can be exercised over fixtures. Returns `{ state, running, onDisk }`.
  *
- * A missing revision on EITHER side makes the comparison version-only: an installed bundle has no
- * git to name a commit, and inventing drift from an absence would nag every bundle install forever.
+ * An absence on either side is never evidence of drift. A missing revision makes the comparison
+ * version-only — an installed bundle has no git to name a commit, and inventing drift from an
+ * absence would nag every bundle install forever. Likewise a checkout that cannot name its own
+ * version (no RELEASE_VERSION, no readable package.json) cannot prove a release landed: comparing
+ * against null would report "outdated" and send the operator to restart a server that is fine, when
+ * the fault is the install on disk. The revision comparison below still stands on its own there.
  */
 export function compareBuild(running, onDisk) {
   const verdict = (state) => ({ state, running: running ?? null, onDisk });
   if (!running || !running.version) return verdict("unstamped");
-  if (running.version !== onDisk.version) return verdict("outdated");
+  if (onDisk.version && running.version !== onDisk.version) return verdict("outdated");
   if (running.revision && onDisk.revision && running.revision !== onDisk.revision) {
     return verdict("modified");
   }
