@@ -82,6 +82,7 @@ const READ_CHUNK = 64 * 1024;
  * @property {string|null} version
  * @property {string|null} revision the commit, `REVISION_UNREADABLE`, or null where there is none
  * @property {string|null} [worktree]
+ * @property {string|null} [source] the source digest of an install no git can describe
  * @property {string|null} [env]
  */
 
@@ -639,7 +640,8 @@ function hashEntry(path, budget) {
 
 /**
  * Every entry under `dir`, in a fixed order so the digest is a function of the tree and not of
- * readdir's.
+ * readdir's. `budget.skip` names the entries a walk never enters (see `readSourceDigest`); a walk
+ * with none set reads everything.
  *
  * Cycles are what a followed link makes possible — a directory linking back to its own ancestor
  * would recurse forever — so each directory is entered once per walk, keyed by its resolved path.
@@ -652,6 +654,7 @@ function hashTree(hash, dir, budget) {
   }
   budget.seen.add(resolved);
   for (const name of readdirSync(dir).sort()) {
+    if (budget.skip?.(name)) continue;
     if (budget.left <= 0) {
       budget.truncated = true;
       return;
@@ -672,6 +675,66 @@ function hashContents(hash, path) {
   }
 }
 
+/**
+ * Ceiling on a source walk. Larger than `MAX_LINKED_ENTRIES` because this one is a whole
+ * application rather than one linked input, and it collapses the same way for the same reason: an
+ * install anton could only read part of is one it rebuilds, never one it vouches for.
+ */
+export const MAX_SOURCE_ENTRIES = 16384;
+
+/**
+ * What a source walk never enters, by name at any depth: build output, dependencies, and the state
+ * a running anton writes beside its own code. Every one of these is in .gitignore as well — this is
+ * that list applied by hand, because the installs needing this digest are the ones with no git to
+ * apply it for them.
+ */
+const SOURCE_IGNORED = new Set(["node_modules", "coverage", "out", "build", "dist", "server-port"]);
+
+/**
+ * Is this entry outside the source a build compiles from?
+ *
+ * Dot-entries go wholesale, and that is this digest's deliberate edge — the trade
+ * `readWorktreeDigest` already makes over ignored files. `.next`, `.git`, `.anton`, `.beads` and
+ * `.dolt` all live there and every one is rewritten while anton runs, so a digest that read them
+ * would move on its own and put a permanent restart banner in front of an operator with nothing to
+ * restart for. The dot-files a build actually reads — `.env*` — are digested by `readEnvDigest`,
+ * which is why dropping them here loses nothing.
+ */
+function skipsSourceEntry(name) {
+  return (
+    name.startsWith(".") ||
+    SOURCE_IGNORED.has(name) ||
+    name.startsWith("anton.db") ||
+    name.endsWith(".tsbuildinfo") ||
+    BUILD_RECORD_NAME.test(name)
+  );
+}
+
+/**
+ * A digest of the source an install with no git holds — null when the tree could not be walked in
+ * full.
+ *
+ * `readWorktreeDigest` is how anton sees an edit nobody committed, and it needs a commit to diff
+ * against. An install with no `.git` — an extracted source tarball, or the `npm i -g anton` the
+ * README documents, which builds locally too — has none, so version was its whole identity: editing
+ * any ordinary source file left both sides identical, `buildMatchesCheckout` accepted the previous
+ * `.next`, and `anton start` served the code the operator had just replaced (PR #217 review).
+ *
+ * Only that shape pays for the walk. A checkout has git for this, and a release bundle is exempt
+ * from the rebuild entirely — its RELEASE_VERSION identifies it exactly, and it ships no toolchain
+ * to compile with.
+ */
+function readSourceDigest(appRoot) {
+  const budget = { left: MAX_SOURCE_ENTRIES, seen: new Set(), truncated: false, skip: skipsSourceEntry };
+  const digest = createHash("sha256");
+  try {
+    hashTree(digest, appRoot, budget);
+  } catch {
+    return null;
+  }
+  return budget.truncated ? null : digest.digest("hex").slice(0, 12);
+}
+
 /** The prefix Next inlines from the BUILD's environment into the bundle it compiles. */
 const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
 
@@ -690,6 +753,46 @@ const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production
  * backslash expands nothing there either, however many backslashes precede it (PR #217 review).
  */
 const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+
+/**
+ * The config files Next loads a build's configuration from (`CONFIG_FILES`, next 16). `.cjs`/`.cts`
+ * are deliberately absent: Next refuses to start on them. Every one present is read, rather than
+ * only the one Next resolves first — a sibling naming a variable this build ignores costs at most a
+ * rebuild, while guessing the resolution order wrong costs the value.
+ */
+const NEXT_CONFIG_FILES = ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.mts"];
+
+/** One `process.env` read in a config file: `process.env.NAME` or `process.env["NAME"]`. */
+const CONFIG_ENV_READ = /process\.env\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/g;
+
+/**
+ * The build-environment variables the NEXT CONFIG reads — the third route a value takes into the
+ * artifact (PR #217 review).
+ *
+ * `next.config.ts` is ordinary JavaScript that runs at build time, so `env: { FLAVOR:
+ * process.env.BUILD_FLAVOR }` or a webpack branch behind `process.env.ANALYZE` compiles a different
+ * artifact from the same files. Neither digest moved for it: the config's bytes are unchanged, and
+ * the variable wears no `NEXT_PUBLIC_` prefix and appears in no env file. The stamp compared equal
+ * and `anton start` reused the `.next` holding the previous configuration.
+ *
+ * Names only, read off the config's own text — the caller folds in just those this environment
+ * SETS, and the config's bytes are digested by the worktree (or source) read. What a config reads
+ * through an imported module stays invisible, so this narrows the hole rather than closing it: a
+ * build input the digest cannot see belongs in the config file or behind a variable named there.
+ */
+function configEnvNames(appRoot) {
+  const names = new Set();
+  for (const file of NEXT_CONFIG_FILES) {
+    let text;
+    try {
+      text = readFileSync(join(appRoot, file), "utf8");
+    } catch {
+      continue;
+    }
+    for (const [, dotted, indexed] of text.matchAll(CONFIG_ENV_READ)) names.add(dotted ?? indexed);
+  }
+  return names;
+}
 
 /** The env files present at `appRoot`, as `[file, contents]` pairs — read once for both their routes. */
 function readEnvFiles(appRoot) {
@@ -726,7 +829,7 @@ function expandedEnvNames(files) {
 
 /**
  * A digest of everything Next compiles in from the build's environment: the env FILES it loads and
- * the inlined values of the process environment it loads them into — null when there is neither.
+ * the values of the process environment that reach the artifact — null when there is neither.
  *
  * Both halves, because either alone leaves a hole. `NEXT_PUBLIC_API_URL=x anton start` puts a value
  * straight in the build's environment where no file holds it; and the files' own bytes are digested
@@ -735,9 +838,10 @@ function expandedEnvNames(files) {
  * a tarball editing `.env.local` from `NEXT_PUBLIC_URL=old` to `=new` left both identities identical,
  * and `anton start` reused the `.next` holding the old inlined value (PR #217 review).
  *
- * The environment half stays scoped to the prefix plus whatever the files expand into one: those are
- * the variables that reach the artifact, and they are stable per shell. Digesting the environment
- * wholesale would fold in `PWD`, `TERM` and every per-invocation variable, and rebuild on each one.
+ * The environment half stays scoped to the prefix plus whatever the files expand into one and
+ * whatever the Next config reads: those are the variables that reach the artifact, and they are
+ * stable per shell. Digesting the environment wholesale would fold in `PWD`, `TERM` and every
+ * per-invocation variable, and rebuild on each one.
  *
  * A `\0`-framed tag leads each entry because no path, name or value can contain one — so no pair of
  * files or variables can digest into the same bytes as another, and a file cannot digest as a
@@ -747,6 +851,7 @@ function readEnvDigest(env, appRoot) {
   const files = readEnvFiles(appRoot);
   const inlined = new Set(Object.keys(env).filter((name) => name.startsWith(INLINED_ENV_PREFIX)));
   for (const name of expandedEnvNames(files)) inlined.add(name);
+  for (const name of configEnvNames(appRoot)) inlined.add(name);
   const names = [...inlined].filter((name) => env[name] !== undefined).sort();
   if (!names.length && !files.length) return null;
   const digest = createHash("sha256");
@@ -756,14 +861,19 @@ function readEnvDigest(env, appRoot) {
 }
 
 /**
- * What the code at `appRoot` IS right now: `{ version, revision, worktree, env }` (any may be null).
+ * What the code at `appRoot` IS right now: `{ version, revision, worktree, source, env }` (any may
+ * be null).
  *
  * The worktree digest is read only where a revision was: `readRevision`'s toplevel check is what
  * proves `appRoot` is its own checkout, and without it a bundle unpacked in a git-tracked $HOME
- * would wear that repo's uncommitted dotfile edits. The env digest carries no such condition, and
- * must not: it reads the env files directly plus this process's own environment — exactly the
- * environment `anton start` hands the `next build` it spawns (`runLocal` inherits it) — so it is the
- * only thing that sees an inlined value move on an install git cannot describe at all.
+ * would wear that repo's uncommitted dotfile edits. The source digest is its mirror image, read
+ * only where there is no commit AND no bundle marker — the one install shape nothing else can
+ * describe. The two never both stand: git is the better read wherever there is one.
+ *
+ * The env digest carries no such condition, and must not: it reads the env files directly plus this
+ * process's own environment — exactly the environment `anton start` hands the `next build` it spawns
+ * (`runLocal` inherits it) — so it is the only thing that sees an inlined value move on an install
+ * whose files did not.
  *
  * @param {string} appRoot
  * @param {Record<string, string|undefined>} [env] the environment a build from this process compiles with
@@ -775,6 +885,7 @@ export function readBuildIdentity(appRoot, env = process.env) {
     version: readVersion(appRoot),
     revision,
     worktree: revision && revision !== REVISION_UNREADABLE ? readWorktreeDigest(appRoot) : null,
+    source: revision === null && !isBundleInstall(appRoot) ? readSourceDigest(appRoot) : null,
     env: readEnvDigest(env, appRoot),
   };
 }
@@ -1068,7 +1179,9 @@ export function recordAlive(record, startedAt = processStartedAt) {
  *
  * The worktree digest follows the same rule and needs it more: a record written before this field
  * existed carries none, and calling that "modified" would demand one restart of every install on
- * the upgrade that introduced it.
+ * the upgrade that introduced it. The source digest — the same evidence for an install no git can
+ * describe — is compared on the same terms, and is the only thing that lets a verdict there say
+ * anything past the version.
  *
  * The env digest is not compared at all, though both sides carry one. A verdict is read from
  * OUTSIDE the running server — `anton doctor` in whatever shell the operator is standing in — and
@@ -1092,6 +1205,7 @@ export function compareBuild(running, onDisk) {
   if (running.worktree && onDisk.worktree && running.worktree !== onDisk.worktree) {
     return verdict("modified");
   }
+  if (running.source && onDisk.source && running.source !== onDisk.source) return verdict("modified");
   return verdict("current");
 }
 
@@ -1119,9 +1233,13 @@ export function compareBuild(running, onDisk) {
  *   unseen — and every later start under the same failure reuses that `.next`.
  *
  * Either way `ensureFreshBuild` builds again and, if the reads never resolve, refuses to start —
- * which is the honest end, since nothing can then say what `.next` holds. A checkout with no git at
- * all (a source tarball) names neither field on either side and stays a version comparison, as it
- * always was.
+ * which is the honest end, since nothing can then say what `.next` holds. An install with no git at
+ * all (a source tarball, `npm i -g anton`) names neither field and answers with its source digest
+ * instead: version alone was never proof there — it does not move when a source file is edited, so
+ * the artifact was accepted after the code under it was replaced (PR #217 review). A digest that
+ * walk could not produce is the same no as a git read that failed. Only a release BUNDLE is
+ * identified by version alone, and it never reaches here: `ensureFreshBuild` exempts it before any
+ * comparison, since it ships its `.next` prebuilt and no toolchain to rebuild with.
  *
  * The env digest is compared here and NOWHERE else, because freshness is the only question it
  * answers. A stamp carrying none (written before the field existed) against an install with no env
@@ -1138,12 +1256,13 @@ export function sameCheckout(a, b) {
     !agree(a.version, b.version) ||
     !agree(a.revision, b.revision) ||
     !agree(a.worktree, b.worktree) ||
+    !agree(a.source, b.source) ||
     !agree(a.env, b.env)
   ) {
     return false;
   }
   if (a.revision === REVISION_UNREADABLE || b.revision === REVISION_UNREADABLE) return false;
-  return !b.revision || (b.worktree ?? null) !== null;
+  return b.revision ? (b.worktree ?? null) !== null : (b.source ?? null) !== null;
 }
 
 /**
@@ -1185,7 +1304,9 @@ export function buildDrift({
  *
  * Uncommitted work is named too — `0.4.0 (a1b2c3d, uncommitted 9f2c1a4)` — because that is the one
  * drift where both sides otherwise print the same string, and a sentence claiming two identical
- * builds differ reads as a bug rather than as the restart it is asking for.
+ * builds differ reads as a bug rather than as the restart it is asking for. The source digest of a
+ * git-less install (`0.4.0 (sources 9f2c1a4)`) is named for exactly that reason: it is the only
+ * evidence such an install has, so leaving it out prints the version twice.
  *
  * @param {BuildIdentity|null|undefined} identity
  */
@@ -1197,6 +1318,7 @@ export function describeBuildIdentity(identity) {
   if (identity.worktree && identity.worktree !== WORKTREE_CLEAN) {
     parts.push(`uncommitted ${identity.worktree.slice(0, SHORT_SHA)}`);
   }
+  if (identity.source) parts.push(`sources ${identity.source.slice(0, SHORT_SHA)}`);
   return parts.length ? `${identity.version} (${parts.join(", ")})` : identity.version;
 }
 

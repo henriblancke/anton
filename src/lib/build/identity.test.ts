@@ -26,6 +26,7 @@ import {
   listBuildRecords,
   liveBuildRecords,
   MAX_LINKED_ENTRIES,
+  MAX_SOURCE_ENTRIES,
   processStartedAt,
   pruneBuildRecords,
   readBuildIdentity,
@@ -181,6 +182,16 @@ describe("compareBuild", () => {
 
   // A record written before the digest existed carries none, and reading that absence as drift
   // would demand one restart of every install on the upgrade that introduced it.
+  // The same evidence for an install no git can describe: its source digest is the only thing a
+  // verdict there has past the version (PR #217 review).
+  it("calls a git-less install whose source moved under the server modified", () => {
+    const running = { version: "0.4.0", revision: null, source: "aa11bb22cc33" };
+    expect(compareBuild(running, { ...running, source: "dd44ee55ff66" }).state).toBe("modified");
+    expect(compareBuild(running, { ...running }).state).toBe("current");
+    // And an absence stays no evidence: a record written before the field must not demand a restart.
+    expect(compareBuild(running, { ...running, source: null }).state).toBe("current");
+  });
+
   it("ignores a worktree digest only one side carries", () => {
     const undigested = { version: RUNNING.version, revision: RUNNING.revision };
     expect(compareBuild(undigested, { ...RUNNING, worktree: "9f2c1a4bb001" }).state).toBe("current");
@@ -221,7 +232,14 @@ describe("readBuildIdentity", () => {
   it("falls back to the checkout's package.json version, and names no commit outside git", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
-    expect(readBuildIdentity(dir, {})).toEqual({ version: "0.4.0", revision: null, worktree: null, env: null });
+    // No commit to diff against, so what such an install holds is read as a source digest instead.
+    expect(readBuildIdentity(dir, {})).toEqual({
+      version: "0.4.0",
+      revision: null,
+      worktree: null,
+      source: expect.stringMatching(/^[0-9a-f]{12}$/),
+      env: null,
+    });
   });
 
   // `git rev-parse` walks up until it finds ANY repository, so a bundle installed under a
@@ -238,7 +256,15 @@ describe("readBuildIdentity", () => {
 
     // Same guard covers the worktree digest: the bundle is itself untracked in that repo, so
     // reading it would report the dotfiles' dirt as this build's uncommitted work.
-    expect(readBuildIdentity(bundle, {})).toEqual({ version: "0.9.1", revision: null, worktree: null, env: null });
+    // And the source walk is skipped with it: RELEASE_VERSION identifies a bundle exactly, so the
+    // digest would only cost every read of one a walk of the whole install.
+    expect(readBuildIdentity(bundle, {})).toEqual({
+      version: "0.9.1",
+      revision: null,
+      worktree: null,
+      source: null,
+      env: null,
+    });
   });
 
   it("calls a committed checkout clean, and digests the edits nobody committed", () => {
@@ -717,12 +743,103 @@ describe("a checkout whose git identity cannot be read", () => {
     expect(identity.revision).toBe(REVISION_UNREADABLE);
     // Nothing to digest past a commit nothing could name — and the same git would fail on it anyway.
     expect(identity.worktree).toBeNull();
+    // Nor is it the git-less shape: a checkout whose git is momentarily unreadable has a commit,
+    // and `sameCheckout` blocks on that rather than substituting a digest of the tree.
+    expect(identity.source).toBeNull();
   });
 
   it("still reads a real tarball — no .git at all — as having no commit", () => {
     const dir = tempDir();
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
     expect(readBuildIdentity(dir, {}).revision).toBeNull();
+  });
+});
+
+// An install with no `.git` — an extracted source tarball, or the `npm i -g anton` the README
+// documents — has no commit to diff against, so version was its whole identity: editing any
+// ordinary file left both sides equal and `anton start` reused a `.next` compiled from the code the
+// operator had just replaced (PR #217 review).
+describe("the source digest of an install no git can describe", () => {
+  /** That shape: a package.json, source beside it, and neither a `.git` nor a RELEASE_VERSION. */
+  function tarball(): string {
+    const dir = tempDir();
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "src", "page.tsx"), SOURCE);
+    return dir;
+  }
+
+  it("moves when an ordinary source file is edited, and is a function of the tree", () => {
+    const dir = tarball();
+    const first = readBuildIdentity(dir, {}).source;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "src", "page.tsx"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+
+    // Same bytes at the same path is the same build, so undoing an edit clears the verdict.
+    writeFileSync(join(dir, "src", "page.tsx"), SOURCE);
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+  });
+
+  it("counts a file that is only added, and one only removed", () => {
+    const dir = tarball();
+    const first = readBuildIdentity(dir, {}).source;
+    writeFileSync(join(dir, "src", "route.ts"), SOURCE);
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+    rmSync(join(dir, "src", "route.ts"));
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+  });
+
+  // The digest has to be a fact about the CODE. anton writes its database, one record per running
+  // server and its port note beside its own source, and Next rewrites `.next` on every build — a
+  // digest that read any of them would move on its own, and a restart banner with no release behind
+  // it is one nobody reads.
+  it("ignores build output, dependencies and the state a running anton writes beside its code", () => {
+    const dir = tarball();
+    const first = readBuildIdentity(dir, {}).source;
+
+    writeFileSync(join(dir, "anton.db"), "sqlite");
+    writeFileSync(join(dir, "anton.db-wal"), "wal");
+    writeFileSync(join(dir, buildRecordFile(process.pid)), "{}");
+    writeFileSync(join(dir, "server-port"), "3000");
+    writeFileSync(join(dir, "tsconfig.tsbuildinfo"), "{}");
+    mkdirSync(join(dir, ".anton"));
+    writeFileSync(join(dir, ".anton", "session.log"), "noise");
+    mkdirSync(join(dir, ".next"));
+    writeFileSync(join(dir, ".next", "build-manifest.json"), "{}");
+    mkdirSync(join(dir, "node_modules"));
+    writeFileSync(join(dir, "node_modules", "dep.js"), SOURCE);
+    mkdirSync(join(dir, "coverage"));
+    writeFileSync(join(dir, "coverage", "index.html"), "<p>");
+
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+  });
+
+  it("is not read where git can answer, nor for a bundle that needs no rebuild", () => {
+    expect(readBuildIdentity(gitCheckout(), {}).source).toBeNull();
+    const bundle = tempDir();
+    writeFileSync(join(bundle, "RELEASE_VERSION"), "0.9.1\n");
+    writeFileSync(join(bundle, "server.js"), SOURCE);
+    expect(readBuildIdentity(bundle, {}).source).toBeNull();
+  });
+
+  // Same rule as every other read here: a tree anton could only read part of is one it rebuilds
+  // rather than vouches for, since a truncated walk hashes the same bytes however the entries past
+  // the cutoff change.
+  it("abandons a tree too large to read whole, which makes the build unprovable", () => {
+    const dir = tarball();
+    // Named so they sort LAST — past the cutoff, where a truncated walk stops looking.
+    for (let i = 0; i <= MAX_SOURCE_ENTRIES; i++) writeFileSync(join(dir, `z${String(i).padStart(6, "0")}.ts`), "");
+    expect(readBuildIdentity(dir, {}).source).toBeNull();
+
+    mkdirSync(join(dir, ".next"));
+    writeBuildStamp(dir, readBuildIdentity(dir, {}));
+    expect(buildMatchesCheckout(dir, readBuildIdentity(dir, {}))).toBe(false);
+  });
+
+  it("names nothing for a directory that is not there at all", () => {
+    expect(readBuildIdentity(join(tempDir(), "gone"), {}).source).toBeNull();
   });
 });
 
@@ -805,6 +922,33 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { API_HOST: "https://one" }).env).not.toBe(unset);
   });
 
+  // `next.config.ts` is ordinary JavaScript that runs at build time, so a variable it reads decides
+  // what Next compiles while every file on disk stays put — and it wears no `NEXT_PUBLIC_` prefix
+  // and appears in no env file, so nothing else in the identity sees it (PR #217 review).
+  it("digests a variable the Next config reads", () => {
+    const dir = app();
+    writeFileSync(join(dir, "next.config.ts"), "export default { env: { FLAVOR: process.env.BUILD_FLAVOR } };\n");
+    const first = readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env).not.toBe(first);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toBe(first);
+  });
+
+  it("reads the same variable through an indexed access", () => {
+    const dir = app();
+    writeFileSync(join(dir, "next.config.mjs"), 'export default { env: { F: process.env["BUILD_FLAVOR"] } };\n');
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).not.toBe(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env);
+  });
+
+  // Same rule as an expanded env-file name: a variable the config names but the environment does
+  // not set compiles nothing in, so it must not rebuild on every unrelated shell.
+  it("names a config variable only where the environment sets one", () => {
+    const dir = app();
+    writeFileSync(join(dir, "next.config.js"), "module.exports = { env: { F: process.env.BUILD_FLAVOR } };\n");
+    expect(readBuildIdentity(dir, { PATH: "/usr/bin" }).env).toBe(null);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   // Order is the shell's, not the build's: the same two values exported the other way round is the
   // same artifact, and rebuilding on it would be churn nobody can explain.
   it("does not depend on the order the shell exported them in", () => {
@@ -828,11 +972,22 @@ describe("sameCheckout", () => {
     expect(sameCheckout(IDENTITY, { ...IDENTITY, version: "0.5.0" })).toBe(false);
   });
 
-  // An install with no git and no readable package.json would otherwise rebuild forever, never able
-  // to prove the tree held still.
-  it("does not read an absence BOTH reads share as a change", () => {
-    const nothing = { version: null, revision: null, worktree: null };
+  // An install with no git proves itself with its source digest instead. Two reads that agree on
+  // one are the same code however little else either can name — including the version, which an
+  // unreadable package.json leaves null on both sides.
+  it("accepts a git-less install on the source digest it can produce", () => {
+    const nothing = { version: null, revision: null, worktree: null, source: "9f2c1a4bb001" };
     expect(sameCheckout(nothing, { ...nothing })).toBe(true);
+    expect(sameCheckout(nothing, { ...nothing, source: "aa11bb22cc33" })).toBe(false);
+  });
+
+  // The reviewer's case (PR #217): version alone was proof there, so an edited source file left
+  // both sides equal and `anton start` reused a `.next` compiled from the code just replaced. A
+  // walk that produced nothing is the same no as a git read that failed — two of them agree in
+  // what neither could read.
+  it("refuses a git-less install neither read could describe", () => {
+    const nothing = { version: "0.4.0", revision: null, worktree: null, source: null };
+    expect(sameCheckout(nothing, { ...nothing })).toBe(false);
   });
 
   // The post-build read is the one that can fail on a moving tree: an edit saved mid-compile can
@@ -1156,11 +1311,23 @@ describe("buildMatchesCheckout", () => {
     expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(false);
   });
 
-  // A source install with no git names no commit on either side, and never could: holding it to a
-  // digest it cannot produce would rebuild it on every single start.
-  it("accepts a checkout with no git at all on its version alone", () => {
-    const onDisk = { version: "0.4.0", revision: null, worktree: null };
-    expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(true);
+  // A source install with no git names no commit on either side and never could — so what it holds
+  // is read straight off disk, and the stamp is accepted only against the same source.
+  it("accepts a git-less install against the source it was compiled from", () => {
+    const app = checkout({ version: "0.4.0", revision: null });
+    writeFileSync(join(app, "src.ts"), SOURCE);
+    writeFileSync(buildStampPath(app), JSON.stringify(readBuildIdentity(app, {})));
+    expect(buildMatchesCheckout(app, readBuildIdentity(app, {}))).toBe(true);
+  });
+
+  // The hole the reviewer named (PR #217): nothing in the identity moved when an ordinary source
+  // file did, so `next start` served the code the operator had just replaced.
+  it("rejects a git-less install whose source changed under the build", () => {
+    const app = checkout({ version: "0.4.0", revision: null });
+    writeFileSync(join(app, "src.ts"), SOURCE);
+    writeFileSync(buildStampPath(app), JSON.stringify(readBuildIdentity(app, {})));
+    writeFileSync(join(app, "src.ts"), SOURCE.replace("1", "2"));
+    expect(buildMatchesCheckout(app, readBuildIdentity(app, {}))).toBe(false);
   });
 
   // The same install once it holds an `.env.local`: version alone stops being its whole identity,
@@ -1287,5 +1454,13 @@ describe("the sentence an operator reads", () => {
       "0.4.0 (aaaaaaa, uncommitted 9f2c1a4)",
     );
     expect(describeBuildIdentity({ ...RUNNING, worktree: "clean" })).toBe("0.4.0 (aaaaaaa)");
+  });
+
+  // The same problem one install shape over: a git-less install names no commit at all, so its
+  // source digest is the only thing that tells the two builds in the sentence apart.
+  it("names the source of an install no git can describe", () => {
+    expect(describeBuildIdentity({ version: "0.4.0", revision: null, source: "9f2c1a4bb001" })).toBe(
+      "0.4.0 (sources 9f2c1a4)",
+    );
   });
 });

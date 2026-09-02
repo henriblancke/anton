@@ -5,7 +5,7 @@
  * must a process that never booted a server (every unit test in this repo is one).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -344,6 +344,32 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(serverBuildDrift()).toBeNull();
 
     checkoutMoved(`${app}/`);
+
+    expect(serverBuildDrift()?.state).toBe("outdated");
+  });
+
+  // `addProject` stores `resolve(repoPath)`, which never dereferences a symlink, so anton's own
+  // checkout registered through one spells the same directory differently here. Read as somebody
+  // else's project, the nightly's own fast-forward would leave the pre-pull read cached and the
+  // scan firing inside the TTL would omit the stale-server warning (PR #217 review).
+  it("re-reads when this checkout is named through a symlink to it", async () => {
+    const app = join(dir, "app");
+    mkdirSync(app);
+    const link = join(dir, "link");
+    symlinkSync(app, link);
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { checkoutMoved, recordServerBuild, serverBuildDrift } = await import("./drift");
+
+    recordServerBuild({ runner: true });
+    onDisk = { version: "0.4.1", revision: null };
+    expect(serverBuildDrift()).toBeNull();
+
+    checkoutMoved(link);
 
     expect(serverBuildDrift()?.state).toBe("outdated");
   });

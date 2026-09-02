@@ -24,6 +24,7 @@ import {
   pruneBuildRecords,
   readBuildIdentity,
   readBuildRecord,
+  sameDirectory,
   writeBuildRecord,
 } from "./identity.mjs";
 import { antonPidFile, livePid, unstampedServers } from "./servers.mjs";
@@ -42,10 +43,16 @@ export interface BuildIdentity {
    */
   worktree?: string | null;
   /**
+   * A digest of the source an install with NO git holds — the one shape neither the commit nor the
+   * worktree digest can describe (a source tarball, `npm i -g anton`). Null wherever git can answer
+   * and for a bundle, whose RELEASE_VERSION identifies it exactly.
+   */
+  source?: string | null;
+  /**
    * A digest of the values a build compiles in — the `NEXT_PUBLIC_*` ones, plus whatever the
-   * checkout's env files expand into them — null when none are set. Recorded so a stamp names the
-   * environment it was built with; only the freshness check (`sameCheckout`) compares it, never the
-   * drift verdict, whose reader stands in a different shell.
+   * checkout's env files expand into them and whatever `next.config` reads — null when none are
+   * set. Recorded so a stamp names the environment it was built with; only the freshness check
+   * (`sameCheckout`) compares it, never the drift verdict, whose reader stands in a different shell.
    */
   env?: string | null;
 }
@@ -179,7 +186,7 @@ function onDiskIdentity(): BuildIdentity {
   const root = appRoot();
   const identity = root
     ? (readBuildIdentity(root) as BuildIdentity)
-    : { version: null, revision: null, worktree: null, env: null };
+    : { version: null, revision: null, worktree: null, source: null, env: null };
   onDiskCache = { at: now, identity };
   return identity;
 }
@@ -196,10 +203,17 @@ function onDiskIdentity(): BuildIdentity {
  *
  * Naming a path other than this install's checkout changes nothing: the projects anton scans are
  * usually somebody else's repo, and their commits say nothing about the build this server runs.
+ *
+ * The two paths are compared literally and then CANONICALLY (PR #217 review). `addProject` stores
+ * `resolve(repoPath)`, which never dereferences a symlink, so anton's own checkout registered
+ * through one — `~/src/anton -> /Volumes/work/anton` — spells the same directory differently here.
+ * Read as another project, the pull would leave the pre-pull read cached and the scan firing inside
+ * the TTL would omit the stale-server warning: the exact silence this exists to end.
  */
 export function checkoutMoved(repoPath: string): void {
   const root = appRoot();
-  if (!root || resolve(repoPath) !== resolve(root)) return;
+  if (!root) return;
+  if (resolve(repoPath) !== resolve(root) && !sameDirectory(repoPath, root)) return;
   onDiskCache = null;
   driftsCache = null;
 }
@@ -246,9 +260,10 @@ export function recordServerBuild({ runner }: { runner: boolean }): void {
  * that instead makes the late pull surface as the drift it is.
  *
  * Outside production the checkout IS the truth — `next dev` recompiles what you save — minus the
- * worktree digest: a development checkout is dirty by definition, so recording the digest would put
- * a permanent "restart the server" banner in front of the one person who least needs it. Dropping
- * it leaves the version/commit comparison, which is what a dev server can actually miss.
+ * worktree and source digests: a development checkout is dirty by definition and every save moves
+ * one of the two, so recording either would put a permanent "restart the server" banner in front of
+ * the one person who least needs it. Dropping them leaves the version/commit comparison, which is
+ * what a dev server can actually miss.
  *
  * A production artifact carrying NO stamp is recorded as nothing at all, not as the checkout beside
  * it (PR #217 review). `anton start` stamps every source build it makes, so an unstamped `.next` in
@@ -267,7 +282,7 @@ export function recordServerBuild({ runner }: { runner: boolean }): void {
  */
 function bootIdentity(): BuildIdentity {
   const identity = onDiskIdentity();
-  if (process.env.NODE_ENV !== "production") return { ...identity, worktree: null };
+  if (process.env.NODE_ENV !== "production") return { ...identity, worktree: null, source: null };
   const stamp = artifactIdentity();
   if (stamp) return stamp;
   const root = appRoot();
@@ -275,7 +290,7 @@ function bootIdentity(): BuildIdentity {
 }
 
 /** A build nothing can name — what `compareBuild` reads as "unstamped", since it carries no version. */
-const UNIDENTIFIED: BuildIdentity = { version: null, revision: null, worktree: null, env: null };
+const UNIDENTIFIED: BuildIdentity = { version: null, revision: null, worktree: null, source: null, env: null };
 
 /**
  * The checkout the compiled `.next` says it was built from, or null when nothing there says.
