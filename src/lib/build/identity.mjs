@@ -709,6 +709,13 @@ export const MAX_SOURCE_ENTRIES = 16384;
 const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist", "server-port"]);
 
 /**
+ * The env files `next build` loads in production — the mode `anton start` compiles in. Each one
+ * reaches the artifact twice: as the bytes Next inlines from, and as the names of build-ENVIRONMENT
+ * variables its values expand.
+ */
+const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
+
+/**
  * Is this entry outside the source a build compiles from? `depth` is 0 for the entries of the
  * install root itself.
  *
@@ -716,8 +723,16 @@ const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist", "server-port
  * `readWorktreeDigest` already makes over ignored files. `.next`, `.git`, `.anton`, `.beads` and
  * `.dolt` all live there and every one is rewritten while anton runs, so a digest that read them
  * would move on its own and put a permanent restart banner in front of an operator with nothing to
- * restart for. The dot-files a build actually reads — `.env*` — are digested by `readEnvDigest`,
- * which is why dropping them here loses nothing.
+ * restart for.
+ *
+ * The env files a production build LOADS are the one exception, named individually (PR #217
+ * review). `readEnvDigest` carries them too, but that field answers freshness only — `compareBuild`
+ * never weighs it, because its other half is the reading shell's own environment. So a git-less
+ * install editing `.env.local` under a running server moved nothing a VERDICT reads: the dot-skip
+ * hid the file from `source`, and both doctor and the health page called the server current while a
+ * `NEXT_PUBLIC_*` value it no longer holds stayed live in the served bundle. A checkout never had
+ * that hole — `ignoredEnvFiles` folds the same files into the worktree digest, which is compared —
+ * so naming them here is what makes a git-less install's evidence match.
  *
  * `node_modules` is the one name skipped at every depth: nested ones hold dependencies too, and a
  * dependency is never the source this install is judged on. What anton itself writes — the
@@ -725,6 +740,7 @@ const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist", "server-port
  * and nowhere else.
  */
 function skipsSourceEntry(name, depth) {
+  if (depth === 0 && BUILD_ENV_FILES.includes(name)) return false;
   return (
     name.startsWith(".") ||
     name === "node_modules" ||
@@ -760,13 +776,6 @@ function readSourceDigest(appRoot) {
 
 /** The prefix Next inlines from the BUILD's environment into the bundle it compiles. */
 const INLINED_ENV_PREFIX = "NEXT_PUBLIC_";
-
-/**
- * The env files `next build` loads in production — the mode `anton start` compiles in. Each one
- * reaches the artifact twice: as the bytes Next inlines from, and as the names of build-ENVIRONMENT
- * variables its values expand.
- */
-const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
 
 /**
  * One expansion in an env-file value: `$NAME` or `${NAME}`, unless the `$` is escaped.
@@ -876,11 +885,16 @@ function expandedEnvNames(files) {
  * the values of the process environment that reach the artifact — null when there is neither.
  *
  * Both halves, because either alone leaves a hole. `NEXT_PUBLIC_API_URL=x anton start` puts a value
- * straight in the build's environment where no file holds it; and the files' own bytes are digested
- * elsewhere only where there is a git to digest them with — `readWorktreeDigest` (through
- * `ignoredEnvFiles`) never runs on a source install with no `.git`, the extracted-tarball shape. So
- * a tarball editing `.env.local` from `NEXT_PUBLIC_URL=old` to `=new` left both identities identical,
- * and `anton start` reused the `.next` holding the old inlined value (PR #217 review).
+ * straight in the build's environment where no file holds it; and the files' own bytes reach no
+ * other digest on every install shape — `readWorktreeDigest` (through `ignoredEnvFiles`) reads them
+ * only where git can answer, `readSourceDigest` only where there is no git at all, and a checkout
+ * whose git read failed has neither. So a tarball editing `.env.local` from `NEXT_PUBLIC_URL=old` to
+ * `=new` left both identities identical, and `anton start` reused the `.next` holding the old
+ * inlined value (PR #217 review).
+ *
+ * Freshness is all this field answers, though — `compareBuild` cannot weigh it, since the
+ * environment half belongs to whatever shell is reading. The file half is mirrored into those two
+ * digests for exactly that reason, which is what lets a drift VERDICT see an env-file edit too.
  *
  * The environment half stays scoped to the prefix plus whatever the files expand into one and
  * whatever the Next config reads: those are the variables that reach the artifact, and they are
@@ -1066,11 +1080,18 @@ export function liveBuildRecords(dbPath, appRoot, isAlive = recordAlive) {
  * restarts its server all day does not accumulate one file per boot forever — and never at read
  * time, where deleting the evidence a concurrent reader is mid-way through would be a race.
  *
+ * Only a record PROVEN stale is deleted, never merely one that could not be verified: a birth-time
+ * read that fails this second says nothing about the server, and deleting its record would strand a
+ * live process no later read could name (see `recordVerdict`).
+ *
  * Best-effort by construction: a record anton cannot delete is one every reader already ignores.
+ *
+ * @param {string} dbPath
+ * @param {(record: {[key: string]: unknown}) => {alive: boolean, stale: boolean}} [verdict]
  */
-export function pruneBuildRecords(dbPath, isAlive = recordAlive) {
+export function pruneBuildRecords(dbPath, verdict = recordVerdict) {
   for (const { path, record } of listBuildRecords(dbPath)) {
-    if (isAlive(record)) continue;
+    if (!verdict(record).stale) continue;
     try {
       unlinkSync(path);
     } catch {}
@@ -1197,12 +1218,40 @@ export function processStartedAt(pid) {
  *
  * A record with no birth stamp (one this machine could not read at boot) still counts as alive on
  * the pid alone: an absence is not evidence, and the pid check is exactly as good as it ever was.
+ *
+ * A record that HAS one and cannot be rechecked is the opposite case and fails closed, exactly as
+ * the daemon pidfile does (see `pidFileVerdict`): the stamp exists because this machine could read
+ * birth times at boot, so a lookup failing now leaves a reused pid indistinguishable from the live
+ * one, and vouching for it attributes an unrelated process to anton — a drift surface then reports
+ * a server that no longer exists as current. Unproven is not alive.
+ *
+ * @param {{[key: string]: unknown}|null|undefined} record
+ * @param {(pid: number) => string|null} [startedAt]
  */
 export function recordAlive(record, startedAt = processStartedAt) {
-  if (!record || !pidAlive(record.pid)) return false;
-  if (!record.startedAt) return true;
-  const now = startedAt(record.pid);
-  return now === null || now === record.startedAt;
+  return recordVerdict(record, startedAt).alive;
+}
+
+/**
+ * What a record PROVES about the server it names: `alive` while the recorded process is still the
+ * one running, and `stale` whether it is proven not to be — the cue to delete the file.
+ *
+ * The two are separate for the reason the pidfile splits them (PR #217 review): a stamped record
+ * whose birth time cannot be reread this second names nobody a reader may trust, but it is not
+ * proven dead either, and pruning it would delete a live server's own record — leaving that process
+ * unaccounted for on every later read, when the next read that CAN resolve the stamp would have
+ * named it again.
+ *
+ * @param {{[key: string]: unknown}|null|undefined} record
+ * @param {(pid: number) => string|null} [startedAt]
+ * @returns {{alive: boolean, stale: boolean}}
+ */
+export function recordVerdict(record, startedAt = processStartedAt) {
+  if (!record || !pidAlive(record.pid)) return { alive: false, stale: true };
+  if (!record.startedAt) return { alive: true, stale: false };
+  const now = startedAt(/** @type {number} */ (record.pid));
+  if (now === record.startedAt) return { alive: true, stale: false };
+  return { alive: false, stale: now !== null };
 }
 
 /**
@@ -1235,6 +1284,12 @@ export function recordAlive(record, startedAt = processStartedAt) {
  * print two identical build strings as the evidence. Freshness is where the env belongs, and
  * `sameCheckout` reads it there: `anton start` compares the stamp against its OWN environment,
  * which is the environment its `next build` would compile with.
+ *
+ * The FILE half is still compared here — through the digests above rather than through that field
+ * (PR #217 review). An env file on disk is a fact about the install whatever shell reads it, so a
+ * checkout folds it into its worktree digest (`ignoredEnvFiles`) and a git-less install into its
+ * source digest (`skipsSourceEntry`), and an edit to `.env.local` under a running server moves the
+ * one thing this comparison weighs.
  *
  * @param {BuildIdentity|null|undefined} running
  * @param {BuildIdentity} onDisk

@@ -33,6 +33,7 @@ import {
   readBuildRecord,
   recordAlive,
   recordFromInstall,
+  recordVerdict,
   REVISION_UNREADABLE,
   sameCheckout,
   writeBuildRecord,
@@ -862,6 +863,31 @@ describe("the source digest of an install no git can describe", () => {
     expect(readBuildIdentity(dir, {}).source).toBe(first);
   });
 
+  // `readEnvDigest` hashes these files too, but only freshness reads that field — a drift VERDICT
+  // cannot weigh one whose other half is the reading shell's own environment. So while the dot-skip
+  // hid them, a git-less install could edit `.env.local` under a running server, go on serving the
+  // `NEXT_PUBLIC_*` value it no longer holds, and have doctor and the health page both call that
+  // server current (PR #217 review). A checkout never had the hole: `ignoredEnvFiles` puts the same
+  // files in the worktree digest, which is compared.
+  it("moves when an env file the production build inlines from is edited", () => {
+    const dir = tarball();
+    const clean = readBuildIdentity(dir, {}).source;
+
+    writeFileSync(join(dir, ".env.local"), "NEXT_PUBLIC_URL=old\n");
+    const running = readBuildIdentity(dir, {});
+    expect(running.source).not.toBe(clean);
+
+    writeFileSync(join(dir, ".env.local"), "NEXT_PUBLIC_URL=new\n");
+    const onDisk = readBuildIdentity(dir, {});
+    expect(onDisk.source).not.toBe(running.source);
+    expect(compareBuild(running, onDisk).state).toBe("modified");
+
+    // Named one by one, not `.env*` wholesale: only these reach a production build, and every other
+    // dot-entry at the root is state anton rewrites while it runs.
+    writeFileSync(join(dir, ".env.development"), "NEXT_PUBLIC_URL=dev\n");
+    expect(readBuildIdentity(dir, {}).source).toBe(onDisk.source);
+  });
+
   it("is not read where git can answer, nor for a bundle that needs no rebuild", () => {
     expect(readBuildIdentity(gitCheckout(), {}).source).toBeNull();
     const bundle = tempDir();
@@ -1160,7 +1186,7 @@ describe("the record a running server leaves", () => {
     writeBuildRecord(buildRecordPath(db), RUNNING);
     writeFileSync(join(dir, "server-build.notapid.json"), "{}");
 
-    pruneBuildRecords(db, (record) => record.pid === process.pid);
+    pruneBuildRecords(db, (record) => ({ alive: record.pid === process.pid, stale: record.pid !== process.pid }));
 
     expect(listBuildRecords(db).map(({ record }) => record.pid)).toEqual([process.pid]);
     // Only records are pruned: an unrelated file that merely starts with the prefix is not one.
@@ -1281,11 +1307,39 @@ describe("the record a running server leaves", () => {
   // Two absences, and neither is evidence: a machine that cannot read a birth time at all must not
   // start calling every live server stopped, and a record written before one could be read is
   // exactly as trustworthy as it was.
-  it("falls back to the pid alone when no birth time can be established", () => {
+  it("falls back to the pid alone when no birth time was ever recorded", () => {
     expect(recordAlive({ ...RUNNING, pid: process.pid })).toBe(true);
-    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: "unreadable" }, () => null)).toBe(true);
+    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: null }, () => null)).toBe(true);
     expect(recordAlive({ ...RUNNING, pid: 999999, startedAt: null })).toBe(false);
     expect(recordAlive(null)).toBe(false);
+  });
+
+  // A STAMPED record is the opposite case: the stamp is there because this machine could read birth
+  // times at boot, so a lookup failing now leaves a reused pid indistinguishable from the live one.
+  // Vouching for it hands doctor an unrelated process as anton's server (PR #217 review).
+  it("refuses to vouch for a stamped record whose birth time cannot be rechecked", () => {
+    const unverifiable = { ...RUNNING, pid: process.pid, startedAt: "born-then" };
+    expect(recordAlive(unverifiable, () => null)).toBe(false);
+    // ...and is not deleted for it: unproven is not proven dead, so the next read that CAN resolve
+    // the stamp names the server again rather than finding its record gone.
+    expect(recordVerdict(unverifiable, () => null)).toEqual({ alive: false, stale: false });
+    expect(recordVerdict(unverifiable, () => "born-now")).toEqual({ alive: false, stale: true });
+    expect(recordVerdict(unverifiable, () => "born-then")).toEqual({ alive: true, stale: false });
+  });
+
+  // The prune is the only writer here, so it stands on the STALE half: a record kept one boot too
+  // long costs a file, while deleting a live server's own leaves that process unaccounted for.
+  it("keeps a record it cannot verify and deletes only one proven stale", () => {
+    const dir = tempDir();
+    const db = join(dir, "anton.db");
+    writeBuildRecord(buildRecordPath(db, 4242), RUNNING, { pid: 4242, bootedAt: 1, startedAt: "born-then" });
+    writeBuildRecord(buildRecordPath(db, 4243), RUNNING, { pid: 4243, bootedAt: 2, startedAt: "born-then" });
+
+    pruneBuildRecords(db, (record) =>
+      record.pid === 4242 ? { alive: false, stale: false } : { alive: false, stale: true },
+    );
+
+    expect(listBuildRecords(db).map(({ record }) => record.pid)).toEqual([4242]);
   });
 
   it("treats an unreadable or absent record as no record", () => {
