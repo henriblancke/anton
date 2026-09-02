@@ -905,9 +905,11 @@ describe("applyPickerPlan", () => {
       expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
 
-    it("judges the queue against the board the settle just read", async () => {
+    it("judges the queue against the board the settle just read, then against the refreshed one", async () => {
       // The freshest board this pass holds, handed over rather than re-read: a second `bd list` at
-      // the same instant could only cost a round trip to say the same thing.
+      // the same instant could only cost a round trip to say the same thing. And once more against
+      // the read taken on the far side of the confirmation, which is the only board that can show a
+      // slot taken while those PRs were checked.
       put(bead("t1"));
       const seen: (Bead[] | undefined)[] = [];
 
@@ -919,8 +921,75 @@ describe("applyPickerPlan", () => {
       });
 
       expect(outcome).toMatchObject({ started: { beadId: "t1" } });
-      expect(seen).toHaveLength(1);
+      expect(seen).toHaveLength(2);
       expect(seen[0]?.map((b) => b.id)).toEqual(["t1"]);
+      expect(seen[1]?.map((b) => b.id)).toEqual(["t1"]);
+    });
+
+    it("takes its writes back when the queue fills while its own PRs are confirmed", async () => {
+      // The window the confirmation itself opens (PR #218 review): another run reaching
+      // `stage:in-review` inside it fills the slot the first verdict cleared this pass into, so the
+      // brake is re-asked against the read taken after that confirmation rather than trusted from
+      // before it.
+      put(bead("t1"));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          return asked === 1 ? undefined : FULL;
+        },
+      });
+
+      expect(asked).toBe(2);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("waiting on review");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("enqueues nothing when the reservation changes hands while the queue is checked", async () => {
+      // The final read observes the ownership change; every gate below it judges the target with the
+      // claim CLEARED, so without this assertion the pass would read the loss and start anyway
+      // (PR #218 review) — a second run on another machine's reservation.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          board.current.get("t1")!.assignee = "other-box";
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({
+        skipped: { beadId: "t1", reason: "other-box claimed it first", wroteBoard: true },
+      });
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      // Not ours to unwind, exactly as after a lost merge: the approval belongs to the holder now.
+      expect(read("t1").assignee).toBe("other-box");
+      expect(read("t1").labels ?? []).toContain(LABELS.approved);
+    });
+
+    it("enqueues nothing when its claim is cleared while the queue is checked", async () => {
+      // The other half of the same loss: a human clearing the assignee leaves the target unowned,
+      // which the cleared-claim projection below cannot tell from a target this pass still holds.
+      put(bead("t1"));
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          board.current.get("t1")!.assignee = undefined;
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: true } });
+      expect(why(outcome)).toContain("released while the review queue was confirmed");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
     });
 
     it("takes its writes back when the target stops being startable while the queue is checked", async () => {

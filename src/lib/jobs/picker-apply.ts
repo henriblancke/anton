@@ -798,7 +798,9 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // and settled — or an operator who lowered the limit in it — fills the review queue the entry gate
   // found bandwidth in, and the hold is derived rather than latched, so only re-asking can see it.
   // Judged against the settle's read where there was one — the freshest board this pass has — and
-  // against one of its own otherwise, since a no-op swap settles nothing. See {@link pickerWipHold}.
+  // against one of its own otherwise, since a no-op swap settles nothing. Re-asked once more below,
+  // on the far side of that confirmation, for the slot it can itself age behind. See
+  // {@link pickerWipHold}.
   const holding = await held(settledBoard);
   if (holding) return standDown(holding);
 
@@ -808,7 +810,8 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // withdraw the approval while those PRs are confirmed, and answering from the snapshot the
   // confirmation started with would enqueue work that is no longer claimable or no longer admitted.
   // FAILS CLOSED like every other read here, and it is deliberately the LAST board read before the
-  // enqueue: what follows are local reads only, so nothing below can age behind another round trip.
+  // enqueue: everything below judges THIS snapshot, so nothing can age behind another round trip
+  // except the flow brake's own re-ask, which is board-only wherever the queue has bandwidth.
   let gateBoard: Bead[];
   try {
     gateBoard = await loadAllIssues(repoPath);
@@ -817,6 +820,32 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   }
   const target = gateBoard.find((b) => b.id === top.beadId);
   if (!target) return standDown("the target left the board before its run was enqueued");
+
+  // The RESERVATION itself, re-asserted on this read (PR #218 review). Everything below judges the
+  // target with the claim cleared (see {@link asUnclaimed}), so an ownership change that landed
+  // while the review queue was confirmed — a merge this machine lost, or a human clearing the
+  // assignee — is read here and would otherwise be discarded, and the pass would enqueue a second
+  // run against someone else's reservation. Taken back exactly as the settle takes a lost claim
+  // back: the approval STANDS, because a withdrawal now would strip it out from under the holder
+  // whose decision it has become.
+  const holder = ownerOf(target);
+  if (holder !== operator) {
+    publish();
+    const reason = holder
+      ? `${holder} claimed it first`
+      : "the claim was released while the review queue was confirmed";
+    return { skipped: { beadId: top.beadId, reason, wroteBoard: wroteLabel } };
+  }
+
+  // The flow brake once more, now against THIS read (PR #218 review): a run reaching
+  // `stage:in-review` while the first call confirmed its PRs fills the very slot that call cleared
+  // the pass into, and only a verdict taken on the far side of that confirmation can see it. Free
+  // wherever the board still shows bandwidth — under the limit the hold spawns no `gh` at all (see
+  // {@link checkWipLimit}) — so on every path but a queue that has REACHED the limit on this read
+  // nothing below ages behind it. Asked before the settings brakes for the same reason the first
+  // call is: they are the correctness half, and they get the last word.
+  const stillHolding = await held(gateBoard);
+  if (stillHolding) return standDown(stillHolding);
 
   // The last three questions, together on that one fresh read so none of them ages behind another's
   // await: the disarm latch — which a breaker can raise on a run settling into a failing streak —
