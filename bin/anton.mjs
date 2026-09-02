@@ -1938,7 +1938,10 @@ const MAX_BUILD_ATTEMPTS = 3;
  * The identity is read BEFORE compiling and RE-READ after: an edit saved mid-build lands in the
  * artifact only if Next had not already read that file, so the tree the build started from is the
  * most it can honestly claim — and if the tree moved meanwhile, that claim is false and the build
- * runs again rather than being stamped with a checkout it never saw.
+ * runs again rather than being stamped with a checkout it never saw. A re-read that comes back
+ * unable to name the tree counts as moved, not as agreement (`sameCheckout`): a git call that timed
+ * out or overran its buffer is the check failing open, and stamping through it is the same false
+ * "current" by another route.
  *
  * `build` and `readIdentity` are injected so the loop is testable without spawning a real compile.
  */
@@ -1966,12 +1969,15 @@ function ensureFreshBuild({
       return 0;
     }
     compiledFrom = now;
-    why = "the checkout changed while it compiled — rebuilding so .next is the code on disk…";
+    why = "the build could not be tied to the checkout on disk — rebuilding so .next is the code here…";
   }
   console.log(
-    c.red(`\n✗ the checkout kept changing across ${MAX_BUILD_ATTEMPTS} builds — the server was NOT started.`),
+    c.red(`\n✗ ${MAX_BUILD_ATTEMPTS} builds later, .next still cannot be tied to this checkout — the server was NOT started.`),
   );
-  console.log(c.dim("  (nothing here can say what .next holds; re-run `anton start` once the tree stops moving.)"));
+  console.log(
+    c.dim("  (either the tree kept changing mid-compile, or git could not read it — nothing here can say\n" +
+      "   what .next holds. Re-run `anton start` once the tree is still and `git status` answers.)"),
+  );
   return 1;
 }
 

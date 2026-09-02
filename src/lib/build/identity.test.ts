@@ -235,9 +235,26 @@ describe("sameCheckout", () => {
 
   // An install with no git and no readable package.json would otherwise rebuild forever, never able
   // to prove the tree held still.
-  it("does not read an absence as a change", () => {
-    expect(sameCheckout(IDENTITY, { version: null, revision: null, worktree: null })).toBe(true);
-    expect(sameCheckout({ version: null, revision: null, worktree: null }, IDENTITY)).toBe(true);
+  it("does not read an absence BOTH reads share as a change", () => {
+    const nothing = { version: null, revision: null, worktree: null };
+    expect(sameCheckout(nothing, { ...nothing })).toBe(true);
+  });
+
+  // The post-build read is the one that can fail on a moving tree: an edit saved mid-compile can
+  // push the diff past GIT_MAX_BUFFER, or the git call can simply time out. Reading that silence as
+  // agreement would stamp the pre-build identity onto an artifact that may not hold the edit.
+  it("refuses to read a half-failed read as proof", () => {
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, worktree: null })).toBe(false);
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, revision: null })).toBe(false);
+    expect(sameCheckout(IDENTITY, { ...IDENTITY, version: null })).toBe(false);
+    expect(sameCheckout({ ...IDENTITY, worktree: null }, IDENTITY)).toBe(false);
+  });
+
+  // The failure that persists: a huge uncommitted diff overruns GIT_MAX_BUFFER on every read, so
+  // both come back digest-less and agree with each other while naming nothing an edit would move.
+  it("refuses two failed digest reads that agree only in what they could not read", () => {
+    const noDigest = { ...IDENTITY, worktree: null };
+    expect(sameCheckout(noDigest, { ...noDigest })).toBe(false);
   });
 
   it("reads this repo's own version and HEAD", () => {

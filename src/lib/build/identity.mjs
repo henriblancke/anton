@@ -300,28 +300,19 @@ export function buildMatchesCheckout(appRoot, onDisk = readBuildIdentity(appRoot
 }
 
 /**
- * Do these two reads PROVE the same code, rather than merely fail to contradict each other?
+ * Does the stamp inside `.next` PROVE it was compiled from the code on disk?
  *
- * `compareBuild` reads an absent field as "no evidence" and stays quiet — right for a drift verdict,
- * where inventing a restart out of a missing field would nag every bundle install forever. Freshness
- * is the opposite question and needs the opposite answer: a git read that failed, timed out, or
- * overran GIT_MAX_BUFFER (one large uncommitted binary is enough) leaves a null revision or digest,
- * and accepting that silence hands `next start` a `.next` nothing can tie to the code on disk —
- * exactly the staleness this file exists to catch. So a field present on one side alone is a
- * mismatch, and a checkout git CAN name a commit for must also name what it holds past that commit:
- * the digest is the only field an uncommitted edit moves. A checkout with no git at all (a source
- * tarball) names neither on either side and stays a version comparison, as it always was.
+ * `sameCheckout` is the whole comparison; this adds the one requirement a STAMP carries that two
+ * live reads do not — a build that could not name its own version identifies nothing, so it cannot
+ * vouch for an artifact. (Two live reads that both come up null are one unidentifiable checkout
+ * compared against itself, which is still worth starting; a stamp is a claim about the past.)
  *
  * @param {BuildIdentity} stamp
  * @param {BuildIdentity} onDisk
  */
 function provesSameCheckout(stamp, onDisk) {
-  const agree = (a, b) => (a ?? null) === (b ?? null);
   if (!stamp.version || !onDisk.version) return false;
-  if (!agree(stamp.version, onDisk.version)) return false;
-  if (!agree(stamp.revision, onDisk.revision)) return false;
-  if (!agree(stamp.worktree, onDisk.worktree)) return false;
-  return !onDisk.revision || (onDisk.worktree ?? null) !== null;
+  return sameCheckout(stamp, onDisk);
 }
 
 /** Does this pid name a live process? Signal 0 is the existence check every pidfile reader uses. */
@@ -372,16 +363,33 @@ export function compareBuild(running, onDisk) {
  * `.next` only if Next had not read that file yet, so the artifact belongs to a checkout that no
  * longer exists.
  *
- * Absence is not difference, the same rule `compareBuild` states at length: a field neither read
- * could name (no git to name a commit, no readable package.json) cannot witness a change, and
- * treating it as one would rebuild such an install forever.
+ * This is the freshness question, and it takes the opposite of `compareBuild`'s answer to a missing
+ * field. A drift VERDICT reads an absence as "no evidence" and stays quiet, because inventing a
+ * restart out of one would nag every bundle install forever. Freshness has to prove a negative
+ * instead, so an absence here is only "unchanged" when it is SYMMETRIC:
+ *
+ * - A field one read named and the other could not is a failed read, not agreement — the git call
+ *   timed out, or an edit made during the compile pushed the diff past GIT_MAX_BUFFER. Accepting
+ *   that silence would stamp the artifact with the PRE-build identity and start a server serving
+ *   code that edit may never have reached, the exact staleness this file exists to catch.
+ * - A checkout git CAN name a commit for must also name what it holds past that commit, or the one
+ *   field an uncommitted edit moves is the one nothing read. Two failed digest reads in a row agree
+ *   with each other and still prove nothing.
+ *
+ * Either way `ensureFreshBuild` builds again and, if the reads never resolve, refuses to start —
+ * which is the honest end, since nothing can then say what `.next` holds. A checkout with no git at
+ * all (a source tarball) names neither field on either side and stays a version comparison, as it
+ * always was.
  *
  * @param {BuildIdentity} a
  * @param {BuildIdentity} b
  */
 export function sameCheckout(a, b) {
-  const same = (x, y) => !x || !y || x === y;
-  return same(a.version, b.version) && same(a.revision, b.revision) && same(a.worktree, b.worktree);
+  const agree = (x, y) => (x ?? null) === (y ?? null);
+  if (!agree(a.version, b.version) || !agree(a.revision, b.revision) || !agree(a.worktree, b.worktree)) {
+    return false;
+  }
+  return !b.revision || (b.worktree ?? null) !== null;
 }
 
 /**

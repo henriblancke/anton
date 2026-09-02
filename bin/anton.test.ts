@@ -586,7 +586,9 @@ describe("anton start — the build it will serve", () => {
   const dirs = tempDirs();
   afterEach(dirs.cleanup);
 
-  const CHECKOUT = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
+  /** Nullable throughout: every field is a read that git or the filesystem can fail to answer. */
+  type Identity = { version: string | null; revision: string | null; worktree: string | null };
+  const CHECKOUT: Identity = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
   const EDITED = { ...CHECKOUT, worktree: "9f2c1a4bb001" };
 
   /** A checkout whose `.next` was compiled from `stamp` — omitted, it has never been built. */
@@ -602,7 +604,7 @@ describe("anton start — the build it will serve", () => {
   const stampOf = (dir: string) => JSON.parse(readFileSync(join(dir, ".next", "anton-build.json"), "utf8"));
 
   /** Feed the identity reader a scripted sequence: one read before the build, one after each. */
-  const reads = (...seq: (typeof CHECKOUT)[]) => () => (seq.length > 1 ? seq.shift()! : seq[0]);
+  const reads = (...seq: Identity[]) => () => (seq.length > 1 ? seq.shift()! : seq[0]);
 
   it("builds and stamps the checkout it compiled when nothing is built", async () => {
     const dir = await checkout();
@@ -655,6 +657,24 @@ describe("anton start — the build it will serve", () => {
       isBundle: false,
       build,
       readIdentity: () => ({ ...CHECKOUT, worktree: `edit${n++}` }),
+    });
+    expect(code).toBe(1);
+    expect(build).toHaveBeenCalledTimes(3);
+    expect(existsSync(join(dir, ".next", "anton-build.json"))).toBe(false);
+  });
+
+  // The post-build read is what catches a save that landed mid-compile — so a read that came back
+  // with nothing to say is not agreement, it is the check failing open. (Git times out, or an edit
+  // made during the build pushed the diff past GIT_MAX_BUFFER.) Starting there would serve an
+  // artifact that may predate the edit while stamping it as current.
+  it("refuses to start when the post-build read cannot say what the checkout holds", async () => {
+    const dir = await checkout();
+    const build = vi.fn(() => 0);
+    const code = ensureFreshBuild({
+      appRoot: dir,
+      isBundle: false,
+      build,
+      readIdentity: reads(CHECKOUT, { ...CHECKOUT, worktree: null }),
     });
     expect(code).toBe(1);
     expect(build).toHaveBeenCalledTimes(3);
