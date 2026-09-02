@@ -230,30 +230,6 @@ function promoteToBypass(
     .run();
 }
 
-/**
- * Strip the "run now" flag from a SETTLED execute-epic job, so resuming it is paced like any other
- * policy start (PR #218 review).
- *
- * A parked or failed job can carry `bypassBudget` from the operator's immediate "Approve & run" that
- * first created it, and the picker resumes whatever job covers its target rather than enqueueing a
- * fresh one. Left on, a person's run-now decision would ride into an UNATTENDED start and skip the
- * budget and value gates the governor holds a policy start to — the pacing that makes an armed
- * picker safe to leave running.
- *
- * Guarded to the resumable statuses, so it can only touch a job that is settled: nothing sets the
- * flag on a parked/failed row ({@link promoteToBypass} is `queued`-only), and a row an operator
- * revived first is left alone — as is its resume, which refuses the same statuses. `json_remove`
- * rather than a rewritten payload so nothing else the row carries is dropped on the way through.
- * `updatedAt` is deliberately untouched: this is a payload edit, not a lifecycle move, and the
- * resume that follows stamps it.
- */
-export async function clearBypassBudget(db: AntonDb, jobId: string): Promise<void> {
-  await db
-    .update(schema.jobs)
-    .set({ payloadJson: sql`json_remove(${schema.jobs.payloadJson}, '$.bypassBudget')` })
-    .where(and(eq(schema.jobs.id, jobId), inArray(schema.jobs.status, [...RESUMABLE_STATUSES])));
-}
-
 /** The `epicBeadId` carried in a job's payload, or undefined if absent/malformed. */
 function epicBeadIdOf(payloadJson: string | null): string | undefined {
   try {
@@ -1187,12 +1163,22 @@ export async function park(
  * guard and fails the delete. Handed down instead, it is crossed in the same synchronous step as the
  * status flip — the whole body runs without an await, on better-sqlite3's single connection, exactly
  * like the enqueue helpers above. Don't reintroduce one.
+ *
+ * `stripBypassBudget` un-parks the job as a POLICY start: the operator's "run now" flag comes off in
+ * the SAME guarded UPDATE as the status flip (PR #218 review). A settled job can carry `bypassBudget`
+ * from the immediate "Approve & run" that created it, and the picker resumes whatever job covers its
+ * target rather than enqueueing a fresh one — riding that flag into an UNATTENDED start would skip
+ * the budget and value gates the governor holds every policy start to. Stripping it as a separate
+ * statement would be worse than not stripping it: an operator's manual resume landing in between
+ * wins the row and then runs WITHOUT the bypass they asked for. Sharing the CAS makes the two
+ * outcomes the only ones — this resume takes the row and pays the pacing, or it loses and the flag
+ * stands. `json_remove` rather than a rewritten payload so nothing else the row carries is dropped.
  */
 export async function resumeJob(
   db: AntonDb,
   clock: Clock,
   jobId: string,
-  opts?: { refuseProject?: (projectId: string) => boolean },
+  opts?: { refuseProject?: (projectId: string) => boolean; stripBypassBudget?: boolean },
 ): Promise<boolean> {
   const nowMs = clock.now();
   try {
@@ -1225,6 +1211,9 @@ export async function resumeJob(
           attempts: 0,
           lastError: null,
           updatedAt: secDate(nowMs),
+          ...(opts?.stripBypassBudget
+            ? { payloadJson: sql`json_remove(${schema.jobs.payloadJson}, '$.bypassBudget')` }
+            : {}),
         })
         // Re-assert the resumable status in the WHERE so a concurrent settle — one that landed
         // before this transaction opened — can't be overwritten by a read taken before it.

@@ -174,7 +174,9 @@ export function getRunner(): JobRunner {
       run: {
         enqueueIfAbsent: (projectId, epicBeadId) =>
           runner.enqueueExecuteEpicIfAbsent(projectId, epicBeadId),
-        resume: (jobId) => runner.resume(jobId),
+        // A policy resume, so the operator's "run now" flag comes off inside the resume's own CAS
+        // rather than beside it (PR #218 review).
+        resume: (jobId) => runner.resume(jobId, { stripBypassBudget: true }),
       },
     }),
   );

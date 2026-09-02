@@ -31,6 +31,15 @@ function seed(id: string, status: string, opts: { leaseExpiresAt?: Date; runAt?:
     .run();
 }
 
+/** A payload on a seeded row — the execute-epic shape the bypass flag rides in. */
+function setPayload(id: string, payload: Record<string, unknown>) {
+  t.db
+    .update(schema.jobs)
+    .set({ payloadJson: JSON.stringify(payload) })
+    .where(eq(schema.jobs.id, id))
+    .run();
+}
+
 describe("park", () => {
   it("parks a running job and clears its lease", async () => {
     seed("running-job", "running", { leaseExpiresAt: new Date(systemClock.now() + 30_000) });
@@ -130,6 +139,49 @@ describe("resumeJob — the boolean is the CAS, not the read", () => {
     expect(refused).toBe(false);
     expect(seen).toEqual([projectId]);
     expect((await getJob(t.db, "doomed-job"))?.status).toBe("parked");
+  });
+
+  it("strips the operator's run-now flag when the caller resumes as a policy start (PR #218)", async () => {
+    seed("bypass-job", "parked");
+    setPayload("bypass-job", { projectId: "p1", epicBeadId: "e1", bypassBudget: true });
+
+    expect(await resumeJob(t.db, systemClock, "bypass-job", { stripBypassBudget: true })).toBe(true);
+
+    const job = await getJob(t.db, "bypass-job");
+    expect(job?.status).toBe("queued");
+    // json_remove, so everything else the payload carries survives the strip.
+    expect(JSON.parse(job!.payloadJson!) as Record<string, unknown>).toEqual({
+      projectId: "p1",
+      epicBeadId: "e1",
+    });
+  });
+
+  it("keeps the run-now flag when a manual resume takes the row first (PR #218)", async () => {
+    // The race the strip has to be atomic against: an operator resumes their parked "Approve & run"
+    // job between the picker's read and its write. The picker's CAS loses — and because the payload
+    // edit rides in that same statement, the operator's run keeps the bypass they asked for instead
+    // of being silently paced.
+    seed("contested-job", "parked");
+    setPayload("contested-job", { projectId: "p1", epicBeadId: "e1", bypassBudget: true });
+    const transaction = t.db.transaction.bind(t.db);
+    vi.spyOn(t.db, "transaction").mockImplementationOnce(((fn: never) => {
+      t.db
+        .update(schema.jobs)
+        .set({ status: "queued", attempts: 0 })
+        .where(eq(schema.jobs.id, "contested-job"))
+        .run();
+      return transaction(fn);
+    }) as typeof t.db.transaction);
+
+    expect(await resumeJob(t.db, systemClock, "contested-job", { stripBypassBudget: true })).toBe(
+      false,
+    );
+
+    const job = await getJob(t.db, "contested-job");
+    expect(job?.status).toBe("queued");
+    expect(
+      (JSON.parse(job!.payloadJson!) as Record<string, unknown>).bypassBudget,
+    ).toBe(true);
   });
 
   it("still reports true for the resume it actually performed", async () => {
