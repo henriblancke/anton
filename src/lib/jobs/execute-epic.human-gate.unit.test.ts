@@ -70,11 +70,10 @@ const {
   undoCancelledTicketGates,
   HUMAN_GATE_ARMED_LABEL,
   liveArmedAsk,
-  NeedsHumanError,
   reconcileCancelledArmedPark,
   settleArmedAsk,
-  StrandedHumanGateError,
-} = await import("./execute-epic");
+} = await import("./execute-epic-human-gate");
+const { NeedsHumanError, StrandedHumanGateError } = await import("./execute-epic-errors");
 
 const REPO = "/tmp/anton";
 const TICKET = "t-1";

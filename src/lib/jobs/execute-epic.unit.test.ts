@@ -15,32 +15,38 @@ import {
   PoisonEpic,
   RunAlreadyLiveError,
 } from "./errors";
+import { splitFormulaPhases } from "./execute-epic-formula";
 import {
-  adoptRefreshedTarget,
-  askSettleError,
-  claudeResumeDecision,
-  continuationPrompt,
   deliveredTickets,
   inactiveAgentTickets,
-  mergeGatePlan,
-  humanGatePlan,
-  humanGateReason,
-  HUMAN_GATE_ARMED_LABEL,
-  NeedsHumanError,
   orderTickets,
   reopenAbsorbedTimeouts,
   reopenableAfterStop,
-  type ReopenBoard,
-  ParkedAskError,
-  reviewParkMessage,
   runReadiness,
   runTargetDrift,
   skipNote,
   skippedDependents,
-  splitFormulaPhases,
-  ticketBlockNote,
   ticketSetDrift,
-} from "./execute-epic";
+  type ReopenBoard,
+} from "./execute-epic-board";
+import {
+  askSettleError,
+  NeedsHumanError,
+  ParkedAskError,
+} from "./execute-epic-errors";
+import {
+  adoptRefreshedTarget,
+  humanGatePlan,
+  humanGateReason,
+  HUMAN_GATE_ARMED_LABEL,
+} from "./execute-epic-human-gate";
+import { mergeGatePlan } from "./execute-epic-merge-gate";
+import { reviewParkMessage } from "./execute-epic-review";
+import {
+  claudeResumeDecision,
+  continuationPrompt,
+  ticketBlockNote,
+} from "./execute-epic-ticket";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";

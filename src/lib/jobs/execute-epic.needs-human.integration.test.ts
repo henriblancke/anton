@@ -31,7 +31,7 @@ import { eq } from "drizzle-orm";
 import { beads, gateReason, type Gate } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import * as schema from "../db/schema";
-import { armHumanGate, HUMAN_GATE_ARMED_LABEL } from "./execute-epic";
+import { armHumanGate, HUMAN_GATE_ARMED_LABEL } from "./execute-epic-human-gate";
 import { getJob, park } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { describeBd } from "@/lib/testing/integration";
