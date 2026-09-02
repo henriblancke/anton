@@ -68,6 +68,7 @@ import {
   describeBuildIdentity,
   listBuildRecords,
   readBuildIdentity,
+  processStartedAt,
   recordAlive,
   recordFromInstall,
   sameCheckout,
@@ -135,22 +136,57 @@ function compareVersions(a, b) {
   return 0;
 }
 
-/** Read the daemon PID if the process is actually alive; clears a stale pidfile otherwise. */
-function runningPid() {
-  let pid;
+/**
+ * Write the daemon pidfile: the pid on the first line, the pid's birth stamp on the second.
+ *
+ * The stamp is what `runningPid` needs to tell THIS daemon from whatever the OS later hands the
+ * same number — the same protection build records already carry (see `recordAlive`). Two lines
+ * rather than JSON because every reader of a pidfile, anton's or an operator's, expects to find a
+ * pid on line one; a machine that cannot say when a process was born writes that line alone.
+ */
+function writePidFile(pid, pidFile = PID_FILE) {
+  mkdirSync(dirname(pidFile), { recursive: true });
+  const startedAt = processStartedAt(pid);
+  writeFileSync(pidFile, startedAt ? `${pid}\n${startedAt}\n` : `${pid}\n`);
+}
+
+/**
+ * Read the daemon PID if the daemon is actually alive; clears a stale pidfile otherwise.
+ *
+ * Alive means the recorded process, not the recorded NUMBER: a daemon that crashed without clearing
+ * its pidfile leaves a pid the OS reuses, and signal 0 alone then reports an unrelated process as
+ * anton's server (PR #217). Doctor would name it an unstamped anton and send the operator to
+ * `anton stop`, which signals a stranger. So the birth stamp on line two has to match too.
+ *
+ * A pidfile carrying no stamp — one written by an older anton, or on a machine that cannot read a
+ * birth time — still answers on the pid alone: an absence is not evidence, and that is exactly the
+ * check this always was.
+ *
+ * The path is injectable so the reuse case can be exercised over a fixture, matching the other
+ * seams here (`staleSkills`, `unstampedServers`); every caller passes nothing and gets the real one.
+ */
+function runningPid(pidFile = PID_FILE) {
+  let pid, startedAt;
   try {
-    pid = parseInt(readFileSync(PID_FILE, "utf8").trim(), 10);
+    [pid, startedAt] = readFileSync(pidFile, "utf8").split("\n", 2);
+    pid = parseInt(String(pid).trim(), 10);
+    startedAt = (startedAt ?? "").trim();
   } catch {
     return null;
   }
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  const stale = () => {
+    try { unlinkSync(pidFile); } catch {}
+    return null;
+  };
   try {
     process.kill(pid, 0); // signal 0 = existence check
-    return pid;
   } catch {
-    try { unlinkSync(PID_FILE); } catch {}
-    return null;
+    return stale();
   }
+  if (!startedAt) return pid;
+  const now = processStartedAt(pid);
+  return now === null || now === startedAt ? pid : stale();
 }
 
 /** Poll until the server answers on the port, or timeout. Best-effort (uses global fetch). */
@@ -907,8 +943,7 @@ async function startDaemon(args) {
     },
   });
   child.unref();
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(PID_FILE, String(child.pid));
+  writePidFile(child.pid);
   console.log(c.dim(`anton starting (pid ${child.pid})…`));
 
   const ready = await waitForReady(port);
@@ -1357,6 +1392,10 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
  * operator source-mode restart instructions for a process `anton stop` owns. A bundle reading the
  * listeners is the mirror image: its own daemon is already the pidfile's answer, and anything else
  * holding a port is someone else's server.
+ *
+ * The pidfile is evidence only for the process that wrote it, which is why `runningPid` proves the
+ * pid's birth stamp before answering: a crashed daemon's leftover pid, reused by the OS, would
+ * otherwise be reported here as an unstamped anton and send the operator to `anton stop` a stranger.
  *
  * The cost is bundle `--foreground`, which writes no pidfile: an unstamped one reads as stopped.
  * A liveness claim about the wrong install is worse than a missing one — restarting the wrong
@@ -2315,6 +2354,8 @@ export {
   staleSkills,
   unstampedServers,
   procfsListeningEndpoints,
+  runningPid,
+  writePidFile,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

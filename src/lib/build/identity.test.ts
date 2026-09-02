@@ -23,6 +23,7 @@ import {
   describeBuildDrift,
   describeBuildIdentity,
   listBuildRecords,
+  MAX_LINKED_ENTRIES,
   processStartedAt,
   pruneBuildRecords,
   readBuildIdentity,
@@ -280,6 +281,28 @@ describe("readBuildIdentity", () => {
     // A file ADDED under the link is a build input the tracked diff cannot see either.
     writeFileSync(join(shared, "extra.ts"), "export const m = 3;\n");
     expect(readBuildIdentity(dir).worktree).not.toBe(edited);
+  });
+
+  // A walk that stops at the entry cap hashes the same bytes however the entries past the cutoff
+  // change, so an edit behind it would leave the identity unmoved and `buildMatchesCheckout` would
+  // vouch for a `.next` compiled from the old contents. Unreadable is the honest verdict — it makes
+  // the artifact unprovable, which is what forces the rebuild.
+  it("cannot name a worktree whose linked tree is too large to read whole", () => {
+    const dir = gitCheckout();
+    const shared = join(tempDir(), "huge");
+    mkdirSync(shared);
+    // Named so the edited file sorts LAST — past the cutoff, where a truncated walk stops looking.
+    const names = Array.from({ length: MAX_LINKED_ENTRIES + 4 }, (_, i) => `f${String(i).padStart(6, "0")}.ts`);
+    for (const name of names) writeFileSync(join(shared, name), SOURCE);
+    symlinkSync(shared, join(dir, "linked"));
+    expect(readBuildIdentity(dir).worktree).toBeNull();
+
+    // And an unprovable worktree is never a build anton will reuse.
+    writeBuildStamp(dir, readBuildIdentity(dir));
+    expect(buildMatchesCheckout(dir)).toBe(false);
+
+    for (const name of names.slice(MAX_LINKED_ENTRIES)) rmSync(join(shared, name));
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
   // Following links makes cycles reachable: a directory linking back to its own ancestor would

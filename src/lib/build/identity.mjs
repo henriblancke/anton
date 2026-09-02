@@ -152,7 +152,8 @@ function git(appRoot, args) {
 
 /**
  * A digest of everything the checkout holds that HEAD does not — `WORKTREE_CLEAN` when it holds
- * nothing, null when git could not say.
+ * nothing, null when git could not say or an input pulled in more than `MAX_LINKED_ENTRIES` (a
+ * partial read of a tree is not an identity for it).
  *
  * The commit alone cannot answer "is the artifact stale?" in the loop anton is actually developed
  * in: edit a tracked file without committing and `.next` was compiled from code that no longer
@@ -184,7 +185,11 @@ function readWorktreeDigest(appRoot) {
   const files = [...new Set([...listed.split("\0").filter(Boolean), ...ignoredEnvFiles(appRoot)])].sort();
   if (!files.length && !diff) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
-  for (const path of files) digest.update(path).update("\0").update(hashFile(join(appRoot, path)));
+  for (const path of files) {
+    const entry = hashFile(join(appRoot, path));
+    if (entry === null) return null;
+    digest.update(path).update("\0").update(entry);
+  }
   return digest.digest("hex").slice(0, 12);
 }
 
@@ -220,18 +225,23 @@ function ignoredEnvFiles(appRoot) {
 /**
  * Ceiling on the entries one listed path can pull in through a directory symlink. Nothing bounds
  * what a link points AT — `shared -> ~/work` would walk a whole home directory on every read, and
- * unlike the checkout itself that tree carries no .gitignore anton can honour. Past the cap the
- * walk stops at a marker: an incomplete read of a tree that large is the honest trade against
- * re-hashing it every fifteen seconds, and a linked SOURCE directory (the shape Next actually
- * compiles through) fits inside it many times over.
+ * unlike the checkout itself that tree carries no .gitignore anton can honour. A linked SOURCE
+ * directory (the shape Next actually compiles through) fits inside the cap many times over.
+ *
+ * Hitting it abandons the digest rather than truncating it (PR #217 review): a walk that stopped at
+ * a lexicographic cutoff hashes the same bytes however the entries past that point change, so an
+ * edit behind the cutoff would leave the identity identical and `buildMatchesCheckout` would reuse
+ * a `.next` compiled from the old contents. Unreadable is the honest answer — it forces the
+ * rebuild, where a truncated digest silently vouches for a stale one.
  */
-const MAX_LINKED_ENTRIES = 4096;
+export const MAX_LINKED_ENTRIES = 4096;
 
 /**
  * One listed build input as a fixed-width digest — its contents, or a whole tree's when the input
- * is a link to one. An input that cannot be read (it vanished between the listing and the read) is
- * still counted as present under its path, so the marker keeps the digest defined rather than
- * collapsing the whole worktree read to null.
+ * is a link to one. Null only when the walk ran past `MAX_LINKED_ENTRIES` and so read part of a
+ * tree; an input that cannot be read (it vanished between the listing and the read) is still
+ * counted as present under its path, so the marker keeps the digest defined rather than collapsing
+ * the whole worktree read.
  *
  * A symlink is BOTH its target path and what stands at the end of it: `.env.local` pointing at a
  * shared secrets file is the common shape here, and Next inlines what that file holds at build
@@ -245,7 +255,9 @@ const MAX_LINKED_ENTRIES = 4096;
  * and every drift surface would call that server current.
  */
 function hashFile(path) {
-  return hashEntry(path, { left: MAX_LINKED_ENTRIES, seen: new Set() });
+  const budget = { left: MAX_LINKED_ENTRIES, seen: new Set(), truncated: false };
+  const digest = hashEntry(path, budget);
+  return budget.truncated ? null : digest;
 }
 
 /** One entry — file, directory, or link to either — under a walk budget shared with its children. */
@@ -281,7 +293,7 @@ function hashTree(hash, dir, budget) {
   budget.seen.add(resolved);
   for (const name of readdirSync(dir).sort()) {
     if (budget.left <= 0) {
-      hash.update("\0truncated");
+      budget.truncated = true;
       return;
     }
     budget.left -= 1;

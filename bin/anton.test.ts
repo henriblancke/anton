@@ -20,7 +20,9 @@ import {
   nextArgs,
   procfsListeningEndpoints,
   resolvePort,
+  runningPid,
   unstampedServers,
+  writePidFile,
 } from "./anton.mjs";
 
 import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
@@ -361,6 +363,53 @@ describe("anton doctor — servers no record accounts for", () => {
     expect(await unstampedServers({ isBundle: false, livePids, servers: listening(7), answering: answers })).toEqual([]);
     expect(await unstampedServers({ isBundle: false, livePids, servers: listening(7, 9), answering: answers })).toEqual([9]);
     expect(await unstampedServers({ isBundle: true, livePids: new Set([42]), pid: () => 42, answering: answers })).toEqual([]);
+  });
+});
+
+/**
+ * The daemon pidfile is a liveness CLAIM, and a pid is not an identity (PR #217). A daemon that
+ * crashed without clearing its pidfile leaves a number the OS hands to something else, and every
+ * caller here acts on it — `anton stop` signals it, doctor names it an unstamped anton and tells the
+ * operator to stop it. So the file carries the pid's birth stamp and the read proves it.
+ */
+describe("the daemon pidfile", () => {
+  const dirs = tempDirs();
+
+  afterEach(dirs.cleanup);
+
+  const pidFile = async () => join(await dirs.make("anton-state-"), "anton.pid");
+
+  it("answers with the pid it recorded while that process is the one running", async () => {
+    const path = await pidFile();
+    writePidFile(process.pid, path);
+    expect(readFileSync(path, "utf8").split("\n")[0]).toBe(String(process.pid));
+    expect(runningPid(path)).toBe(process.pid);
+  });
+
+  // The reuse case: the pid is alive, and it is not anton's. Answering with it would send `anton
+  // stop` at a stranger.
+  it("does not answer with a live pid that is no longer the process it recorded", async () => {
+    const path = await pidFile();
+    writeFileSync(path, `${process.pid}\na process that has exited\n`);
+    expect(runningPid(path)).toBeNull();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  // A pidfile written by an older anton carries no stamp. An absence is not evidence — it degrades
+  // to the bare pid check, which is exactly what this always was.
+  it("still answers on the pid alone for a pidfile written before the stamp existed", async () => {
+    const path = await pidFile();
+    writeFileSync(path, String(process.pid));
+    expect(runningPid(path)).toBe(process.pid);
+  });
+
+  it("reads a dead pid as stopped and clears the file", async () => {
+    const path = await pidFile();
+    // Spawned and reaped, so the number named a process and now names nothing.
+    const dead = spawnSync("node", ["-e", "process.exit(0)"]);
+    writeFileSync(path, `${dead.pid}\n`);
+    expect(runningPid(path)).toBeNull();
+    expect(existsSync(path)).toBe(false);
   });
 });
 
