@@ -292,6 +292,45 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).not.toBe(edited);
   });
 
+  // A tracked link is committed as its link TEXT, so `git diff HEAD` compares the path and never
+  // the bytes behind it — the worktree stays "clean" however often the target is rewritten, and
+  // `anton start` reuses a `.next` Next compiled through that link from the old contents.
+  it("follows a tracked symlink out of the checkout to the contents the build reads", () => {
+    const dir = gitCheckout();
+    const shared = join(tempDir(), "lib.ts");
+    writeFileSync(shared, "export const n = 1;\n");
+    symlinkSync(shared, join(dir, "linked.ts"));
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "track the link"]);
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(shared, "export const n = 2;\n");
+    const edited = readBuildIdentity(dir).worktree;
+    expect(edited).not.toBe(first);
+
+    // Same contents behind the same link is the same build, so the digest stays a function of it.
+    writeFileSync(shared, "export const n = 1;\n");
+    expect(readBuildIdentity(dir).worktree).toBe(first);
+  });
+
+  // A link pointing back into the checkout needs no walk of its own — its target is digested where
+  // it stands — and walking one would drag every ignored file under it (`.next`, node_modules) past
+  // the entry cap and collapse the digest on every read.
+  it("leaves a tracked link that resolves back inside the checkout to the tracked diff", () => {
+    const dir = gitCheckout();
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "src", "lib.ts"), SOURCE);
+    symlinkSync(join(dir, "src"), join(dir, "linked"));
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "track the link"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    // Still seen — as the tracked edit it is, through the diff rather than through the link.
+    writeFileSync(join(dir, "src", "lib.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   // A walk that stops at the entry cap hashes the same bytes however the entries past the cutoff
   // change, so an edit behind it would leave the identity unmoved and `buildMatchesCheckout` would
   // vouch for a `.next` compiled from the old contents. Unreadable is the honest verdict — it makes
@@ -598,6 +637,31 @@ describe("the record a running server leaves", () => {
     expect(startedAt).toEqual(expect.any(String));
     expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt })).toBe(true);
     expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: "a different process" })).toBe(false);
+  });
+
+  // `ps -o lstart=` prints a FORMATTED date, so an uncanonicalized read makes the same live process
+  // wear a different stamp in every shell: start the daemon in Europe/Brussels, run `anton status`
+  // under TZ=UTC, and the pidfile of a running server is deleted as somebody else's.
+  it("reads the same birth stamp whatever time zone and locale the caller stands in", () => {
+    const shells = [
+      { TZ: "UTC", LC_ALL: "C" },
+      { TZ: "Asia/Tokyo", LC_ALL: "de_DE.UTF-8" },
+      { TZ: "America/Los_Angeles", LC_ALL: undefined },
+    ];
+    const stamps = shells.map((shell) => {
+      const restore = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL };
+      Object.assign(process.env, shell);
+      if (shell.LC_ALL === undefined) delete process.env.LC_ALL;
+      try {
+        return processStartedAt(process.pid);
+      } finally {
+        Object.assign(process.env, restore);
+        if (restore.TZ === undefined) delete process.env.TZ;
+        if (restore.LC_ALL === undefined) delete process.env.LC_ALL;
+      }
+    });
+    expect(stamps[0]).toEqual(expect.any(String));
+    expect(new Set(stamps).size).toBe(1);
   });
 
   // Two absences, and neither is evidence: a machine that cannot read a birth time at all must not

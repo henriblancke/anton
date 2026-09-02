@@ -44,7 +44,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 
 /** Short form of a commit sha in operator-facing copy — long enough to be unambiguous, short enough to read. */
 const SHORT_SHA = 7;
@@ -212,14 +212,17 @@ function git(appRoot, args) {
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
- * that class back in.
+ * that class back in, and the diff hides another, so `trackedLinksOutside` names that one back.
  */
 function readWorktreeDigest(appRoot) {
   const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (listed === null) return null;
   const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"]);
   if (diff === null) return null;
-  const files = [...new Set([...listed.split("\0").filter(Boolean), ...ignoredEnvFiles(appRoot)])].sort();
+  const links = trackedLinksOutside(appRoot);
+  if (links === null) return null;
+  const inputs = [...listed.split("\0").filter(Boolean), ...ignoredEnvFiles(appRoot), ...links];
+  const files = [...new Set(inputs)].sort();
   if (!files.length && !diff) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
   for (const path of files) {
@@ -228,6 +231,53 @@ function readWorktreeDigest(appRoot) {
     digest.update(path).update("\0").update(entry);
   }
   return digest.digest("hex").slice(0, 12);
+}
+
+/**
+ * The TRACKED symlinks whose targets stand outside the checkout — build inputs the tracked diff
+ * cannot see, and the untracked listing never names.
+ *
+ * A tracked link is committed as its link TEXT, so `git diff HEAD` compares the path it points at
+ * and never the bytes at the end of it: a committed `linked.ts -> ../shared/lib.ts`, or a
+ * force-added `.env.local`, leaves the worktree "clean" however often its target is rewritten
+ * (PR #217 review). Next compiles through that link, so `anton start` would accept the previous
+ * `.next` and serve the old target while every drift surface calls the server current — the same
+ * blindness the untracked-symlink walk already closes, on the half of the tree git DOES track.
+ *
+ * Links resolving back INSIDE the checkout are left out: their targets are already digested where
+ * they stand (tracked ones by the diff, untracked ones by the listing), so following them would
+ * hash the same bytes twice — and a link to a source directory would drag every ignored file under
+ * it, `.next` and node_modules included, past `MAX_LINKED_ENTRIES` and collapse the digest on every
+ * read. A link resolving nowhere counts as outside, which keeps its text in the digest.
+ *
+ * `ls-files -s` is the only listing that reports MODE, and mode 120000 is git's symlink. A read git
+ * could not answer collapses the digest rather than returning a partial input set, for the reason
+ * the walk cap does: a digest missing an input vouches for a build compiled from something else.
+ */
+function trackedLinksOutside(appRoot) {
+  const listed = git(appRoot, ["ls-files", "-s", "-z"]);
+  if (listed === null) return null;
+  let root;
+  try {
+    root = realpathSync(appRoot);
+  } catch {
+    return null;
+  }
+  return listed
+    .split("\0")
+    .filter((entry) => entry.startsWith("120000 "))
+    .map((entry) => entry.slice(entry.indexOf("\t") + 1))
+    .filter((path) => !resolvesUnder(root, join(appRoot, path)));
+}
+
+/** Does `path` lead to something inside `root`? False for a link leading nowhere — it leads out. */
+function resolvesUnder(root, path) {
+  try {
+    const target = realpathSync(path);
+    return target === root || target.startsWith(root + sep);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -580,6 +630,12 @@ function pidAlive(pid) {
 }
 
 /**
+ * The environment `ps` formats the birth stamp under — fixed, so the stamp is a function of the
+ * process and not of the shell that asked. `TZ` pins the clock, `LC_ALL` the month and day names.
+ */
+const BIRTH_STAMP_ENV = { TZ: "UTC", LC_ALL: "C" };
+
+/**
  * When the process holding `pid` was born, as an opaque stamp — null when this machine cannot say.
  *
  * A pid is not an identity: the OS reuses the number, and a record left by a server that exited
@@ -590,6 +646,14 @@ function pidAlive(pid) {
  * procfs first (no spawn, and the field is the kernel's own value in clock ticks since boot), then
  * `ps -o lstart=`, which macOS and procps both support. Neither is required: a platform that
  * answers with neither degrades to the bare pid check, which is where this started.
+ *
+ * The `ps` fallback is read under a FIXED locale and time zone (PR #217 review). `lstart` is a
+ * formatted date, not a token: the same live process prints `Wed Sep  2 07:16:57 2026` to a shell
+ * in Europe/Brussels and `11:16:57` to one in UTC, in German month names under `LC_TIME=de_DE`.
+ * Comparing a daemon's stamp against one read from a differently-configured shell would then say
+ * "different process" about the process itself — `runningPid` would delete a live server's pidfile
+ * and `recordAlive` would reject its record, letting a second daemon start over a first anton can
+ * no longer stop.
  */
 export function processStartedAt(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -600,7 +664,11 @@ export function processStartedAt(pid) {
     const started = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
     if (/^\d+$/.test(started ?? "")) return started;
   } catch {}
-  const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 });
+  const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    timeout: 5000,
+    env: { ...process.env, ...BIRTH_STAMP_ENV },
+  });
   const out = r.status === 0 && !r.error ? (r.stdout ?? "").trim() : "";
   return out || null;
 }
