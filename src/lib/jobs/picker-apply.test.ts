@@ -491,6 +491,33 @@ describe("applyPickerPlan", () => {
     expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
   });
 
+  it("enqueues nothing when the approval is withdrawn while the claim settles", async () => {
+    // The eligibility rule never asks about the label — the picker is its second WRITER — so a
+    // withdrawal inside the settle window is invisible to both the holder check and the
+    // re-validation, and the run it would buy only poison-parks as unapproved (PR #218 review).
+    put(bead("t1"));
+
+    const outcome = await apply(
+      "t1",
+      1,
+      wired({
+        pull: async () => {
+          const b = board.current.get("t1")!;
+          b.labels = ((b.labels as string[]) ?? []).filter((l) => l !== LABELS.approved);
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "approval was withdrawn",
+    );
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
+    // Fail closed: the claim comes off so the next pass re-decides against a free target.
+    expect(read("t1").assignee).toBeUndefined();
+  });
+
   it("does not settle a claim it never wrote", async () => {
     // A no-op swap (the target already reads as ours) took no reservation of its own, so there is
     // nothing to prove and no settle window to pay for.

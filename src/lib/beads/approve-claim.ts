@@ -28,8 +28,8 @@
  * an embedded board reads a possibly-stale mirror — which is what {@link ApproveClaimInput.refresh}
  * is for.
  */
-import { beads, type Bead } from "./bd";
-import { withClaimLock, type SwapResult } from "./claim";
+import { beads, LABELS, type Bead } from "./bd";
+import { setAssigneeIfOwner, withClaimLock, type SwapResult } from "./claim";
 import { loadAllIssues } from "./issues";
 
 /**
@@ -101,4 +101,86 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     }
     return swap;
   });
+}
+
+/**
+ * What an unwind could NOT take back. The caller words it: the same leftover names a different state
+ * depending on who was holding the reservation (the picker's own claim, an approver's hand-back).
+ */
+export type UnwindLeftover = "approval" | "claim";
+
+export interface UnwindApproveClaimInput {
+  repoPath: string;
+  beadId: string;
+  /** Who the CAS made the holder — the reservation this unwind takes off. */
+  owner: string | undefined;
+  /** Who it goes back to; `undefined` releases it outright. */
+  restoreTo: string | undefined;
+  /**
+   * Whether the approval is OURS to take back. False when the target was ALREADY approved before
+   * the caller touched it — removing it there would erase somebody else's decision.
+   */
+  wroteLabel: boolean;
+  /** Whether the CAS actually MOVED the assignee — a no-op swap took no reservation to release. */
+  wroteClaim: boolean;
+}
+
+/**
+ * Take back what a failed {@link approveAndClaim} left half-written — the compensation both callers
+ * owe an `approveFailed`, in the module that owns the ordering it has to reverse.
+ *
+ * The writes come off in the reverse order they went on: the label first, because the label is what
+ * locks the reservation — releasing the claim while the approval stood would publish an approved,
+ * unassigned target, the exact shape a picker pass or a worker starts on. So each leg GATES the
+ * next: a label that would not come off keeps its claim, and the target waits for a person instead
+ * of being handed to the run nobody decided to make.
+ *
+ * `bd update --add-label` is AMBIGUOUS on failure — it can commit and then throw or time out — so
+ * `wroteLabel` says the label is ours to take back, not that it is there. The bead is re-read and an
+ * untag is only attempted on a label that actually landed (PR #218 review): an untag refusing a
+ * label nobody wrote would otherwise gate the release and strand the claimed-but-unapproved target
+ * this exists to prevent. An unreadable board is treated as approved, so the unwind fails closed.
+ *
+ * A LOST swap on the release is not a failure: someone else holds the reservation now, which is a
+ * safe final state and none of ours to repair. Only an unreachable board leaves the claim standing.
+ */
+export async function unwindApproveClaim(
+  input: UnwindApproveClaimInput,
+): Promise<UnwindLeftover | undefined> {
+  const { repoPath, beadId } = input;
+
+  const approved =
+    input.wroteLabel &&
+    (await beads
+      .show(repoPath, beadId)
+      .then((b) => beads.isApproved(b))
+      .catch((e) => {
+        console.error(`[approve-claim] could not re-read ${beadId} before unapproving it`, e);
+        return true;
+      }));
+  if (approved) {
+    const unapproved = await beads
+      .untag(repoPath, beadId, [LABELS.approved])
+      .then(() => true)
+      .catch((e) => {
+        console.error(`[approve-claim] could not unapprove ${beadId}`, e);
+        return false;
+      });
+    if (!unapproved) return "approval";
+  }
+
+  if (input.wroteClaim) {
+    const released = await setAssigneeIfOwner(
+      repoPath,
+      beadId,
+      input.owner,
+      input.restoreTo,
+    ).catch((e) => {
+      console.error(`[approve-claim] could not release the claim on ${beadId}`, e);
+      return undefined;
+    });
+    if (!released) return "claim";
+  }
+
+  return undefined;
 }

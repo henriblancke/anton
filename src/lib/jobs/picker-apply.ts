@@ -28,10 +28,10 @@
  *     {@link refreshFor}), the reservation is then published and read back before anything is
  *     enqueued (see {@link settleClaim}), and the pass stands down whenever either leg fails.
  */
-import { beads, CLAIM_SETTLE_MS, LABELS, type SyncOutcome } from "../beads/bd";
+import { beads, CLAIM_SETTLE_MS, type SyncOutcome } from "../beads/bd";
 import { isServerMode } from "../beads/board-mode";
-import { approveAndClaim } from "../beads/approve-claim";
-import { ownerOf, setAssigneeIfOwner } from "../beads/claim";
+import { approveAndClaim, unwindApproveClaim } from "../beads/approve-claim";
+import { ownerOf } from "../beads/claim";
 import { loadAllIssues } from "../beads/issues";
 import { nudgeSync } from "../beads/sync-nudge";
 import type { Bead } from "../beads/types";
@@ -224,6 +224,16 @@ async function settleClaim(
     };
   }
 
+  // The approval, which the eligibility rule below deliberately never asks about: the picker is the
+  // label's second WRITER, so its rule tests whether approval WOULD hold, not whether it is there
+  // (picker-targets.ts). After the settle that is the wrong question — this pass already wrote the
+  // label, and another client can withdraw it inside the window while leaving this assignee
+  // untouched. Enqueueing then buys a run execute-epic only poison-parks as unapproved (PR #218
+  // review), so the label is re-checked here, beside the rule that cannot see it.
+  if (!beads.isApproved(settled)) {
+    return { stale: "the approval was withdrawn while the claim settled" };
+  }
+
   // Re-ask the pass's OWN eligibility rule against the board the settle just pulled — the same
   // post-settle re-validation `beads.staleClaimReason` does for a worker's pickup (PR #218 review).
   // Another machine can close, abandon or block the target, label it `agent:human`, or attach a
@@ -244,26 +254,13 @@ async function settleClaim(
  * strand the target for good.
  *
  * An approved, self-claimed target with no run is invisible to the next pass (its own guard reads it
- * as claimed) and to a human (it looks like work already under way). So the writes come back off in
- * the reverse order they went on: the label first, because the label is what locks the reservation —
- * releasing the claim while it stood would publish the target to any worker looking for approved,
- * unclaimed work.
+ * as claimed) and to a human (it looks like work already under way). The ordering that takes the
+ * writes back safely — label first, each leg gating the next, an ambiguous label write re-read
+ * before it is untagged — belongs to `beads/approve-claim.ts` alongside the sequence it reverses,
+ * and is shared with the approve route so the two compensations cannot drift (PR #218 review).
  *
- * Each leg GATES the next rather than being best-effort on its own (PR #218 review): a release that
- * follows a failed unapproval produces approved-and-unclaimed — the exact shape another worker
- * starts — so a label that would not come off keeps its claim, and the target waits for a person
- * instead of being handed to the run this pass just decided not to make.
- *
- * `wrote.label` is false when the target was ALREADY approved before this pass touched it (a human
- * approved it and never started it), and removing it there would erase somebody else's decision. It
- * says the label is OURS to take back, not that it is THERE: the `approveFailed` unwind runs on a
- * label write that threw, so the bead is re-read and an untag is only attempted on a label that
- * actually landed (PR #218 review) — otherwise a `bd update --remove-label` refusing a label nobody
- * wrote would gate the release and strand the very claimed-but-unapproved target this exists to
- * prevent. An unreadable board is treated as approved, so the unwind still fails closed.
- *
- * Returns what it could NOT take back, so the skip reason names the state it left rather than
- * reporting a clean stand-down over a half-written target.
+ * What stays here is the WORDING: a skip reason has to name the state this pass left rather than
+ * report a clean stand-down over a half-written target.
  */
 async function unwindStart(
   repoPath: string,
@@ -271,34 +268,18 @@ async function unwindStart(
   owner: string,
   wrote: { label: boolean; claim: boolean },
 ): Promise<string | undefined> {
-  const approved =
-    wrote.label &&
-    (await beads
-      .show(repoPath, beadId)
-      .then((b) => beads.isApproved(b))
-      .catch((e) => {
-        console.error(`[picker-apply] could not re-read ${beadId} before unapproving it`, e);
-        return true;
-      }));
-  if (approved) {
-    const unapproved = await beads
-      .untag(repoPath, beadId, [LABELS.approved])
-      .then(() => true)
-      .catch((e) => {
-        console.error(`[picker-apply] could not unapprove ${beadId}`, e);
-        return false;
-      });
-    if (!unapproved) return `${beadId} is left approved and claimed by anton — unapprove it by hand`;
+  const leftover = await unwindApproveClaim({
+    repoPath,
+    beadId,
+    owner,
+    restoreTo: undefined,
+    wroteLabel: wrote.label,
+    wroteClaim: wrote.claim,
+  });
+  if (leftover === "approval") {
+    return `${beadId} is left approved and claimed by anton — unapprove it by hand`;
   }
-  if (wrote.claim) {
-    // A LOST swap is not a failure here: someone else holds the reservation now, which is a safe
-    // final state and none of ours to repair. Only an unreachable board leaves the claim standing.
-    const released = await setAssigneeIfOwner(repoPath, beadId, owner, undefined).catch((e) => {
-      console.error(`[picker-apply] could not release the claim on ${beadId}`, e);
-      return undefined;
-    });
-    if (!released) return `${beadId} is left claimed by anton — clear its assignee by hand`;
-  }
+  if (leftover === "claim") return `${beadId} is left claimed by anton — clear its assignee by hand`;
   return undefined;
 }
 

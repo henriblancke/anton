@@ -624,6 +624,73 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(await executeEpicJobs(epic)).toHaveLength(0);
   });
 
+  it("removes an approval that landed before the label write threw", async () => {
+    // `bd update --add-label` is ambiguous on failure: it can commit and THEN throw or time out. A
+    // compensation that only handed the claim back would publish an approved, unassigned target —
+    // the exact shape a picker pass or a worker starts on — under a response reporting that nothing
+    // was changed (PR #218 review).
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Label lands then throws", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Its ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
+    const realTag = beads.tag.bind(beads);
+    const tagSpy = vi.spyOn(beads, "tag").mockImplementation(async (cwd, id, labels) => {
+      await realTag(cwd, id, labels);
+      throw new Error("bd update timed out");
+    });
+    try {
+      const res = await approve(epic);
+      expect(res.status).toBe(500);
+      expect((await res.json()).error).toContain("nothing was changed");
+    } finally {
+      tagSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+
+    // Both writes came back off, in that order — no approved, unclaimed target left behind.
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(false);
+    expect(bead.assignee ?? "").toBe("");
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
+  it("keeps the claim when a landed approval cannot be removed", async () => {
+    // The legs GATE each other: releasing the reservation over an approval that would not come off
+    // publishes approved-and-unclaimed work, so the target stays claimed and the message names the
+    // state a person has to clear (PR #218 review).
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Approval sticks", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Its ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
+    const realTag = beads.tag.bind(beads);
+    const tagSpy = vi.spyOn(beads, "tag").mockImplementation(async (cwd, id, labels) => {
+      await realTag(cwd, id, labels);
+      throw new Error("bd update timed out");
+    });
+    const untagSpy = vi.spyOn(beads, "untag").mockRejectedValue(new Error("bd is gone"));
+    try {
+      const res = await approve(epic);
+      expect(res.status).toBe(500);
+      const { error } = await res.json();
+      expect(error).toContain("unapprove it by hand");
+      expect(error).toContain("anton-test");
+    } finally {
+      untagSpy.mockRestore();
+      tagSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+
+    // The state the message names is the state the board is actually in.
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(true);
+    expect(bead.assignee).toBe("anton-test");
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
   it("reports the stranded claim when the hand-back itself fails", async () => {
     // The compensating write can fail too, and answering "nothing was changed" over a reservation
     // that is still ours would hide a target that reads as taken, has no approval and no run, and

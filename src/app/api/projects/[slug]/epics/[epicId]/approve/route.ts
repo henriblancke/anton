@@ -7,8 +7,8 @@ import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, setAssigneeIfOwner, stealRefused } from "@/lib/beads/claim";
-import { approveAndClaim } from "@/lib/beads/approve-claim";
+import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
+import { approveAndClaim, unwindApproveClaim } from "@/lib/beads/approve-claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
 import { getBoardPickerPlan, isPlanStale, stampBoard } from "@/lib/board-picker-plan";
@@ -499,6 +499,11 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // about a run that in fact never starts (PR #214 review).
   let humanTarget = false;
 
+  // Whether the `approved` label would be OURS to take back if the sequence then falls over — off
+  // the LOCKED read, not the pre-lock one, because that is the state the write is made against. A
+  // target somebody already approved keeps its label through the unwind (PR #218 review).
+  let wroteLabel = false;
+
   // Enforce the claim as a soft-lock at the run trigger, from the fresh ownership read above.
   if (owner && owner !== operator) {
     // Claimed by someone else → approving would silently run a teammate's reservation. Require an
@@ -584,6 +589,8 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       const refusal = notRunTargetReason(locked, lockedBoard);
       if (refusal) return { notRunTarget: refusal };
 
+      wroteLabel = !beads.isApproved(locked);
+
       // The human-work report, taken off the same locked read the approval writes against — see the
       // declarations above for why the pre-lock read is not good enough. The child gates are
       // re-derived through the same `runTickets`/`contractGatedBeads` pair the pre-lock gate used, so
@@ -625,37 +632,38 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   }
   // The claim landed and the label did not (PR #218 review). The CAS has already moved the assignee,
   // so failing the request here would leave the target reserved by an approver who never approved
-  // it — claimed-looking work with no approval and no run. Hand the reservation back to whoever held
-  // it before, then report the failure the operator can retry.
+  // it — claimed-looking work with no approval and no run. Take this request's writes back, then
+  // report the failure the operator can retry.
   if ("approveFailed" in swap) {
-    // The hand-back can itself fail, and reporting "nothing was changed" over a claim that is still
-    // ours would leave the operator with a target that reads as taken, has no approval and no run,
-    // and never comes back on a picker pass. So the compensation's own verdict decides the message.
-    // A LOST swap is not a failure: someone else holds the reservation now, which is a safe final
-    // state — only an unreachable board leaves the approver's claim standing.
-    let stranded = false;
-    if (swap.swap.wrote) {
-      const released = await setAssigneeIfOwner(
-        project.repoPath,
-        epicId,
-        operator ?? owner,
-        owner,
-      ).catch((e) => {
-        console.error(`[approve] could not release the claim on ${epicId} after a failed approval`, e);
-        return undefined;
-      });
-      stranded = !released;
-    }
-    return NextResponse.json(
-      {
-        error: stranded
+    // Through the shared unwind, not a bare hand-back: `bd update --add-label` can commit and THEN
+    // throw or time out, so releasing the claim alone would publish an approved, unassigned target —
+    // the exact shape a picker pass or a worker starts on — while this response says nothing was
+    // changed (PR #218 review). The unwind re-reads the bead and removes only an approval this
+    // request introduced, and a label that will not come off keeps its claim rather than arming the
+    // target.
+    //
+    // The compensation's own verdict decides the message: reporting "nothing was changed" over
+    // writes that are still standing would leave the operator with a target that reads as taken or
+    // approved, has no run, and never comes back on a picker pass.
+    const leftover = await unwindApproveClaim({
+      repoPath: project.repoPath,
+      beadId: epicId,
+      owner: operator ?? owner,
+      restoreTo: owner,
+      wroteLabel,
+      wroteClaim: swap.swap.wrote,
+    });
+    const error =
+      leftover === "approval"
+        ? `${epicId} could not be approved, and the approval this request wrote could not be ` +
+          `removed — it is left approved and assigned to ${operator ?? owner}; unapprove it by ` +
+          `hand. ${swap.approveFailed}`
+        : leftover === "claim"
           ? `${epicId} could not be approved, and the claim this request took could not be handed ` +
             `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
             swap.approveFailed
-          : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`,
-      },
-      { status: 500 },
-    );
+          : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
+    return NextResponse.json({ error }, { status: 500 });
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
