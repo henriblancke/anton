@@ -1065,6 +1065,31 @@ describe("applyPickerPlan", () => {
       expect(nudgeSync).toHaveBeenCalled();
     });
 
+    it("takes its writes back when the cancel lands while the brakes are re-asked", async () => {
+      // The seam the settle-window gate cannot cover (PR #218 review): the freeze and the WIP hold
+      // are two more awaits AFTER it, and a hold that answers "no hold" would otherwise fall
+      // straight into the enqueue — where the post-insert sweep check keeps a run it finds active.
+      put(bead("t1"));
+      const controller = new AbortController();
+
+      const outcome = await apply("t1", 1, wired(), {
+        signal: controller.signal,
+        held: async () => {
+          controller.abort();
+          return undefined;
+        },
+      });
+
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+      expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+        "cancelled before its run was enqueued",
+      );
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+    });
+
     it("takes its writes back when teardown deleted the run it had just enqueued", async () => {
       // The far side of the insert: `abortProject` sweeps the project's rows, and the row it deletes
       // is this pass's own. Left standing, the approval and the claim would cover nothing.

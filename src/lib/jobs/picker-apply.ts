@@ -577,6 +577,9 @@ function cancelled(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
+/** One wording for every stand-down in the window between the claim and the enqueue. */
+const CANCELLED_BEFORE_ENQUEUE = "the pass was cancelled before its run was enqueued";
+
 /**
  * Start the plan's top-ranked target: approve it, claim it, enqueue its run, and record why.
  *
@@ -762,7 +765,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // The last gate before the irreversible half. Everything above this line is reversible; a run is
   // not, so a cancel that landed anywhere in the refresh, the CAS or the settle window is spent HERE
   // rather than on a run teardown would have to delete out from under an approved, claimed bead.
-  if (cancelled(signal)) return standDown("the pass was cancelled before its run was enqueued");
+  if (cancelled(signal)) return standDown(CANCELLED_BEFORE_ENQUEUE);
 
   // And the last look at the safety brake (PR #218 review). The freeze the caller cleared this pass
   // against was read before the ranking, and the CAS and the settle window are long enough for an
@@ -780,6 +783,13 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // just read, so the freshest answer costs no extra `bd list`. See {@link pickerWipHold}.
   const holding = await held(settledBoard);
   if (holding) return standDown(holding);
+
+  // And the same question once more on the far side of the brakes (PR #218 review), because both of
+  // them are awaits: a cancel landing while the freeze is read or the WIP hold is derived would
+  // otherwise fall straight into the enqueue, and the post-insert sweep check deliberately KEEPS a
+  // run it finds active — so the pass would leave teardown exactly the unattended run it stands down
+  // to avoid. This is the last seam before the irreversible half.
+  if (cancelled(signal)) return standDown(CANCELLED_BEFORE_ENQUEUE);
 
   // The idempotent enqueue, then the resume it cannot do: a run already covering this epic locally
   // withholds an id rather than spawning a second, which is what makes two overlapping passes one
