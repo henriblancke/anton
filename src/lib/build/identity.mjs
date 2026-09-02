@@ -500,7 +500,14 @@ function hashFile(path) {
   return budget.truncated ? null : digest;
 }
 
-/** One entry — file, directory, or link to either — under a walk budget shared with its children. */
+/**
+ * One entry — file, directory, or link to either — under a walk budget shared with its children.
+ *
+ * The TYPE goes in ahead of the contents (PR #217 review), because contents alone do not tell two
+ * kinds of entry apart: an empty file and an empty directory both fold in nothing, so a `config`
+ * that becomes `config/` under a linked source tree would digest identically while Next compiles
+ * something else entirely — and `buildMatchesCheckout` would hand back the old `.next`.
+ */
 function hashEntry(path, budget) {
   const hash = createHash("sha256");
   try {
@@ -509,8 +516,16 @@ function hashEntry(path, budget) {
       hash.update(readlinkSync(path)).update("\0");
       entry = statSync(path);
     }
-    if (entry.isDirectory()) hashTree(hash, path, budget);
-    else if (entry.isFile()) hashContents(hash, path);
+    if (entry.isDirectory()) {
+      hash.update("\0dir");
+      hashTree(hash, path, budget);
+    } else if (entry.isFile()) {
+      hash.update("\0file");
+      hashContents(hash, path);
+    } else {
+      // A socket, fifo or device node has no contents a build reads — its being there is the fact.
+      hash.update("\0other");
+    }
   } catch {
     return hash.update("\0unreadable").digest();
   }

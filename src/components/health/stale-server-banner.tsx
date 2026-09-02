@@ -6,9 +6,11 @@ import { describeBuildIdentity, type ServerDrift } from "@/lib/build/drift";
 /**
  * What each verdict means in the operator's terms — the claim, then what it costs.
  *
- * `who` names the process when more than one is drifting, and stays generic when only one is: "this
- * anton server" is unambiguous until there are two of them, and a pid in front of every sentence is
- * noise on the install that has only ever run one.
+ * `who` stays generic only for the process rendering this page, alone: "this anton server" is what
+ * an operator reads as the tab in front of them, so a drifting NEIGHBOUR wearing it sends them to
+ * restart the wrong process — the current UI — while the stale runner keeps executing the
+ * nightlies (PR #217 review). Every other case is named by pid; the lone self-drift is the install
+ * that has only ever run one process, where a pid in front of every sentence is noise.
  */
 function driftCopy(server: ServerDrift, who: string): { headline: string; detail: string } {
   const { drift } = server;
@@ -64,7 +66,8 @@ export function StaleServerBanner({ servers }: { servers: ServerDrift[] }) {
   return (
     <>
       {servers.map((server) => {
-        const who = servers.length > 1 ? `The anton server on pid ${server.pid}` : "This anton server";
+        const sole = server.self && servers.length === 1;
+        const who = sole ? "This anton server" : `The anton server on pid ${server.pid}`;
         const { headline, detail } = driftCopy(server, who);
         const cost = consequence(server.runner);
         const headingId = `stale-server-heading-${server.pid}`;
@@ -92,8 +95,8 @@ export function StaleServerBanner({ servers }: { servers: ServerDrift[] }) {
               <p className="text-muted-foreground">{detail}</p>
               {cost ? <p className="text-muted-foreground">{cost}</p> : null}
               <p className="text-subtle">
-                Restart the server to adopt the build on disk. anton will not do it for you: a running
-                process may be mid-run.
+                Restart {sole ? "the server" : `pid ${server.pid}`} to adopt the build on disk. anton
+                will not do it for you: a running process may be mid-run.
               </p>
             </div>
           </section>

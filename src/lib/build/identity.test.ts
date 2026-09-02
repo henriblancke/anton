@@ -340,6 +340,23 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).not.toBe(edited);
   });
 
+  // Contents alone do not identify an entry: an empty file and an empty directory both fold in
+  // nothing, so a `config` replaced by a `config/` under a linked source tree would digest the same
+  // while Next compiles something else — and `buildMatchesCheckout` would hand back the old `.next`.
+  it("tells an empty file apart from an empty directory of the same name", () => {
+    const dir = gitCheckout();
+    const shared = join(tempDir(), "shared");
+    mkdirSync(shared);
+    writeFileSync(join(shared, "config"), "");
+    symlinkSync(shared, join(dir, "linked"));
+    const asFile = readBuildIdentity(dir).worktree;
+    expect(asFile).toMatch(/^[0-9a-f]{12}$/);
+
+    rmSync(join(shared, "config"));
+    mkdirSync(join(shared, "config"));
+    expect(readBuildIdentity(dir).worktree).not.toBe(asFile);
+  });
+
   // A tracked link is committed as its link TEXT, so `git diff HEAD` compares the path and never
   // the bytes behind it — the worktree stays "clean" however often the target is rewritten, and
   // `anton start` reuses a `.next` Next compiled through that link from the old contents.

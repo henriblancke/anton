@@ -102,6 +102,16 @@ describe("StaleServerBanner", () => {
     expect(screen.getByText("runs scheduled jobs")).toBeTruthy();
   });
 
+  // The shape the reviewer found second: the process rendering the page is current, so the ONE
+  // drift reported is a neighbour. Calling it "this anton server" sends the operator to restart the
+  // UI they are looking at while the stale runner keeps executing the nightlies.
+  it("names a lone drifting neighbour by pid rather than calling it this server", () => {
+    render(<StaleServerBanner servers={[server({ pid: 4243, self: false, runner: true })]} />);
+    expect(screen.getByText("The anton server on pid 4243 is older than the code on disk")).toBeTruthy();
+    expect(screen.getByText(/Restart pid 4243 to adopt the build on disk/)).toBeTruthy();
+    expect(screen.queryByText(/This anton server/)).toBeNull();
+  });
+
   // The verdict says "restart", so anton must not also be restarting itself: a live process may be
   // mid-run, and this page is read-only by construction.
   it("names no action but the operator's own restart", () => {
