@@ -4,13 +4,32 @@
  * here), the attention/housekeeping split still comes straight from `rankAttention`, and the stopped
  * count is carried through untouched for the right rail's "answered on the board" line.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { projectHealthFromBoard } from "./health";
 import type { ServerDrift } from "./build/drift";
-import type { Board, HygieneFinding, HygieneReport, ReviewTrajectory } from "./types";
+import type { Board, HygieneFinding, HygieneReport, Project, ReviewTrajectory } from "./types";
 
 type BoardSlice = Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">;
+
+const project: Project = {
+  id: "p1",
+  slug: "anton",
+  name: "anton",
+  repoPath: "/tmp/anton",
+  defaultBranch: "main",
+  hasBeads: true,
+  createdAt: 1_700_000_000,
+};
+
+afterEach(() => {
+  vi.doUnmock("./board");
+  vi.doUnmock("./escalations");
+  vi.doUnmock("./build/drift");
+  vi.doUnmock("./picker-starts");
+  vi.doUnmock("./picker-veto");
+  vi.resetModules();
+});
 
 function finding(kind: HygieneFinding["kind"], id: string): HygieneFinding {
   return { kind, key: `${kind}:${id}`, detail: `${kind} on ${id}`, beadId: id };
@@ -136,5 +155,28 @@ describe("build drift on the health page", () => {
 
   it("reports none when every running server started from the current checkout", () => {
     expect(projectHealthFromBoard(board, 0).staleServers).toEqual([]);
+  });
+});
+
+// Every read behind the page degrades rather than throwing — `getBoard` returns undefined on a bad
+// anton.db, and drift detection has to match it: it shells out to the process table, so an EAGAIN
+// under load must cost the page its drift banner, not the whole page (PR #217 review).
+describe("getProjectHealth", () => {
+  it("renders without a drift banner when drift detection fails", async () => {
+    vi.doMock("./board", () => ({
+      getBoard: vi.fn().mockResolvedValue({ hygiene: hygiene([]), scanHealth: undefined, reviewTrajectory: undefined }),
+    }));
+    vi.doMock("./escalations", () => ({ openEscalations: vi.fn().mockResolvedValue([]) }));
+    vi.doMock("./build/drift", () => ({
+      serverBuildDrifts: vi.fn().mockRejectedValue(new Error("spawnSync lsof EAGAIN")),
+    }));
+    vi.doMock("./picker-starts", () => ({ latestPickerStarts: vi.fn().mockResolvedValue([]) }));
+    vi.doMock("./picker-veto", () => ({ latestPickerDeclines: vi.fn().mockResolvedValue([]) }));
+
+    const { getProjectHealth } = await import("./health");
+    const health = await getProjectHealth(project);
+
+    expect(health.staleServers).toEqual([]);
+    expect(health.hygiene).toBeDefined();
   });
 });

@@ -97,7 +97,9 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
   const [board, escalations, staleServers, starts, verdicts] = await Promise.all([
     getBoard(project),
     openEscalations(project.id),
-    serverBuildDrifts(),
+    // Degrades to "no stale servers" like every other read here: drift detection shells out to the
+    // process table, and a transient failure there must not take the page down.
+    serverBuildDrifts().catch(() => [] as ServerDrift[]),
     latestPickerStarts(project.id),
     // Declines only, and no more of them than the log can show: the merge below keeps the newest
     // PICKER_LOG_LIMIT entries across both stores, so a wider read would only fetch rows it drops.
