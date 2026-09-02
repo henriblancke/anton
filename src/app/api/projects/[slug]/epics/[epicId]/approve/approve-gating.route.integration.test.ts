@@ -678,6 +678,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       const { error } = await res.json();
       expect(error).toContain("unapprove it by hand");
       expect(error).toContain("anton-test");
+      // Standing writes are published like any other (PR #218 review): unpushed, they exist only in
+      // this machine's mirror while every other box reads the target as untouched.
+      expect(syncSpy).toHaveBeenCalledWith(repo);
     } finally {
       untagSpy.mockRestore();
       tagSpy.mockRestore();
@@ -709,6 +712,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       const { error } = await res.json();
       expect(error).toContain("could not be handed back");
       expect(error).toContain("anton-test");
+      // Same rule, sharper case: a stranded claim that never reached the remote reads as FREE
+      // elsewhere, so another machine can still claim the target this response says is held.
+      expect(syncSpy).toHaveBeenCalledWith(repo);
     } finally {
       unassignSpy.mockRestore();
       tagSpy.mockRestore();

@@ -208,30 +208,29 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
         signal: ctx.signal,
         ...(deps.run ? { run: deps.run } : {}),
       });
-      // The start rewrote the very board the plan above was stamped from — the assignee and the
+      // The apply rewrote the very board the plan above was stamped from — the assignee and the
       // `approved` label are both inputs to that fence (`stampBoard`) — so the row just saved now
       // reads STALE, and a stale plan withholds the whole Up Next lane (PR #218 review). Left there,
       // apply mode would never show the live preview its lower-ranked picks are vetoed from: every
       // pass would start a target and invalidate its own ranking in the same breath. So the plan is
       // re-decided over the post-write board, which drops the started target as `claimed` and leaves
       // the survivors current.
-      if ("started" in applied) {
+      //
+      // Keyed on the WRITES, not on the start (PR #218 review): a skip is not always a no-op on the
+      // board — a target an already-live run covers keeps the approval and the claim this pass
+      // wrote, which move the same fence a start does — and those passes would otherwise withhold Up
+      // Next for a cadence over a board change anton made itself.
+      if ("started" in applied || applied.skipped.wroteBoard) {
         await restampAfterWrites(ctx, { db, clock, projectId, repoPath: project.repoPath });
         // That restamp is a board read long, and a cancel landing in it is `abortProject` deleting
-        // the run the apply just enqueued (PR #218 review). A start whose run the sweep took is not
-        // a start: its approval and claim now cover nothing, so they come back off and the pass
-        // reports the skip it became rather than a success with no run behind it.
-        const swept = await applied.confirmStart();
+        // the run those writes cover (PR #218 review) — the one the apply just enqueued, or the live
+        // one it deferred to. Writes covering no run are not a start: they come back off and the
+        // pass reports the skip it became rather than an outcome with no run behind it.
+        const swept = await applied.confirmStart?.();
         if (swept) {
           logApplyOutcome(projectId, swept);
           applied = swept;
         }
-      } else if (applied.skipped.wroteBoard) {
-        // A skip is not always a no-op on the board (PR #218 review): a target an already-live run
-        // covers keeps the approval and the claim this pass wrote, which move the same fence a start
-        // does. Restamping follows the WRITES, not the start — otherwise those passes withhold Up
-        // Next for a cadence for a board change anton made itself.
-        await restampAfterWrites(ctx, { db, clock, projectId, repoPath: project.repoPath });
       }
     }
 

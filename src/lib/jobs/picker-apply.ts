@@ -87,13 +87,17 @@ export interface PickerSkip {
 }
 
 /**
- * Re-ask the teardown question once the CALLER's own post-start awaits are done (PR #218 review).
+ * Re-ask the teardown question once the CALLER's own post-apply awaits are done (PR #218 review).
  *
  * `applyPickerPlan` re-checks the sweep at every seam of its own audit writes, but its last check is
  * still before it returns — and the caller then spends a board read of its own restamping the plan.
- * A cancel landing in that window is `abortProject` deleting the run this pass just enqueued, which
+ * A cancel landing in that window is `abortProject` deleting the run this pass's writes cover, which
  * would leave the approval and the claim standing over nothing. Answers with the skip the pass
  * became, or undefined while the run stands.
+ *
+ * Carried by BOTH outcomes that leave writes on the board: the start, and the skip that deferred to
+ * a run already covering the target (PR #218 review). Teardown deletes that covering run exactly as
+ * readily as a fresh one, and the approval and the claim are just as orphaned either way.
  */
 export type ConfirmStart = () => Promise<PickerApplyOutcome | undefined>;
 
@@ -104,7 +108,7 @@ export type ConfirmStart = () => Promise<PickerApplyOutcome | undefined>;
  */
 export type PickerApplyOutcome =
   | { started: PickerStart; confirmStart: ConfirmStart }
-  | { skipped: PickerSkip };
+  | { skipped: PickerSkip; confirmStart?: ConfirmStart };
 
 /** Why the under-lock guard abandoned the start — see {@link applyPickerPlan}. */
 type StartRefusal = { stale: string } | { ineligible: string };
@@ -667,6 +671,25 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     console.error(`[picker-apply] could not start a run for ${top.beadId}`, e);
     return standDown("the run could not be enqueued");
   }
+  // The window on the FAR side of the enqueue decision (PR #218 review): a cancel that lands here is
+  // teardown sweeping the project's rows, and the row it deletes may be the one this pass just wrote
+  // — or the live one it deferred to. So the run is re-read rather than assumed: gone means the
+  // approval and the claim now cover nothing and are ours to take back, exactly as when no run could
+  // be started at all. A cancel whose run SURVIVED (a runner stop, a lost lease) leaves real queued
+  // work, so those writes stand.
+  //
+  // Asked at every seam of the audit writes below, not once before them (PR #218 review): each is
+  // another await for teardown to delete the row under, and a pass that slept through one would
+  // answer `started` with the approval and the claim standing over a run that no longer exists. The
+  // caller's post-return restamp is one more such seam, which is why this is handed back rather than
+  // ending at the return. See {@link ConfirmStart}.
+  const sweptAway =
+    (reason: string): ConfirmStart =>
+    async () => {
+      if (!cancelled(signal) || activeExecuteEpicId(db, projectId, top.beadId)) return undefined;
+      return standDown(reason);
+    };
+
   if (!jobId) {
     // Nothing of this pass's making runs. An ACTIVE job genuinely covers the target — an overlapping
     // pass, or a run already in flight — and the approval and the claim are what that run needs, so
@@ -678,27 +701,21 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     }
     publish();
     // The approval and the claim STAND here, so the caller's plan — stamped against a board where
-    // this target was neither — is as stale as it would be after a start (PR #218 review).
+    // this target was neither — is as stale as it would be after a start (PR #218 review). And for
+    // the same reason the caller re-confirms a start after its restamp, it re-confirms this: the
+    // covering run is a project row like any other, and teardown landing in that restamp deletes it
+    // (PR #218 review), leaving this pass's approval and claim over nothing.
     return {
       skipped: { beadId: top.beadId, reason: "a run already covers this target", wroteBoard: true },
+      confirmStart: sweptAway(
+        "the pass was cancelled and the run covering this target removed with it",
+      ),
     };
   }
 
-  // The window on the FAR side of the insert (PR #218 review): a cancel that lands here is teardown
-  // sweeping the project's rows, and the row it deletes may be the one this pass just wrote. So the
-  // run is re-read rather than assumed — gone means the approval and the claim now cover nothing and
-  // are ours to take back, exactly as when no run could be started at all. A cancel whose run
-  // SURVIVED (a runner stop, a lost lease) leaves real queued work, so those writes stand.
-  //
-  // Asked at every seam of the audit writes below, not once before them (PR #218 review): each is
-  // another await for teardown to delete the row under, and a pass that slept through one would
-  // answer `started` with the approval and the claim standing over a run that no longer exists.
-  const sweptAway = async (): Promise<PickerApplyOutcome | undefined> => {
-    if (!cancelled(signal) || activeExecuteEpicId(db, projectId, top.beadId)) return undefined;
-    return standDown("the pass was cancelled and its run removed with it");
-  };
+  const confirmStart = sweptAway("the pass was cancelled and its run removed with it");
 
-  const sweptBeforeNote = await sweptAway();
+  const sweptBeforeNote = await confirmStart();
   if (sweptBeforeNote) return sweptBeforeNote;
 
   // The board-native record of the start, written as `policy` so bd's own history says who decided.
@@ -708,7 +725,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     .note(repoPath, top.beadId, pickerStartNote(top, entries.length), POLICY_ACTOR)
     .catch((e) => console.error(`[picker-apply] could not note the start of ${top.beadId}`, e));
 
-  const sweptDuringNote = await sweptAway();
+  const sweptDuringNote = await confirmStart();
   if (sweptDuringNote) return sweptDuringNote;
 
   // The operator-facing half of the same record (anton-vfvg): the note answers a reader already
@@ -724,18 +741,11 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     jobId,
   }).catch((e) => console.error(`[picker-apply] could not log the start of ${top.beadId}`, e));
 
-  const sweptDuringLog = await sweptAway();
+  const sweptDuringLog = await confirmStart();
   if (sweptDuringLog) return sweptDuringLog;
 
   // Publish the approval and the claim, exactly as the approve route does after its own write.
   publish();
 
-  return {
-    started: { beadId: top.beadId, rank: top.rank, rule: top.rule, jobId },
-    // The caller's own post-start awaits are one more window for the same sweep (PR #218 review):
-    // it restamps its plan over a fresh board read after this returns, and teardown landing in
-    // there deletes the run this just enqueued. So the seam check is handed back rather than ending
-    // at this return. See {@link ConfirmStart}.
-    confirmStart: sweptAway,
-  };
+  return { started: { beadId: top.beadId, rank: top.rank, rule: top.rule, jobId }, confirmStart };
 }

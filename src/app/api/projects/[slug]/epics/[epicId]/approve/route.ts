@@ -654,6 +654,12 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
         `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
         swap.claimFailed
       : `${epicId} could not be approved — nothing was changed. ${swap.claimFailed}`;
+    // Published either way (PR #218 review). Both halves of this branch left local-only writes: the
+    // hand-back that worked, or the reservation it could not take off. An unpublished stranded claim
+    // reads as FREE on every other machine until a later heartbeat — so the target this response
+    // says is held stays claimable by a picker pass elsewhere, which is the second run the claim
+    // exists to prevent. The nudge coalesces per repo, so the no-op case costs an idle push.
+    nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
     return NextResponse.json({ error }, { status: 500 });
   }
   // The claim landed and the label did not (PR #218 review). The CAS has already moved the assignee,
@@ -689,6 +695,10 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
             `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
             swap.approveFailed
           : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`;
+    // Same reason as the claim-failure branch above: the unwind is itself a board write, and what it
+    // could not take back is a partial write standing. Neither reaches another machine until it is
+    // published (PR #218 review).
+    nudgeSync({ id: project.id, repoPath: project.repoPath }, "approve");
     return NextResponse.json({ error }, { status: 500 });
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });

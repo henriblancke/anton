@@ -399,6 +399,32 @@ describe("applyPickerPlan", () => {
     expect(notes).toEqual([]);
   });
 
+  it("hands back a re-check that unwinds when teardown deletes the run it deferred to", async () => {
+    // The covered skip leaves the approval and the claim standing over a run this pass did not
+    // start, and the caller then spends a board read of its own restamping the plan (PR #218
+    // review). `abortProject` landing in there sweeps that covering run exactly as readily as a
+    // fresh one, and the writes are just as orphaned — so this skip carries the same seam check a
+    // start does.
+    put(bead("t1"));
+    await apply("t1");
+    board.current.get("t1")!.assignee = undefined;
+    const controller = new AbortController();
+    const outcome = await apply("t1", 1, undefined, { signal: controller.signal });
+    expect(outcome).toMatchObject({
+      skipped: { reason: "a run already covers this target", wroteBoard: true },
+    });
+
+    // Teardown, inside the caller's restamp.
+    controller.abort();
+    await t.db.delete(schema.jobs);
+    const swept = await (outcome as { confirmStart?: ConfirmStart }).confirmStart?.();
+
+    expect(swept).toMatchObject({
+      skipped: { beadId: "t1", reason: expect.stringContaining("removed with it") },
+    });
+    expect(read("t1").assignee).toBeUndefined();
+  });
+
   it("takes back its own label and claim when the enqueue fails", async () => {
     // Otherwise the target is stranded: approved and self-claimed reads as work already under way,
     // to the next pass and to a human alike, with no run behind it.

@@ -631,6 +631,33 @@ describe("makeBoardPickerHandler", () => {
     );
   });
 
+  it("re-confirms a board-writing skip whose covering run teardown removed", async () => {
+    // The far-side window is not the start's alone (PR #218 review): a skip that deferred to a live
+    // run keeps this pass's approval and claim, and the restamp behind it is a board read
+    // `abortProject` can land in. A covering run swept away leaves those writes over nothing, so the
+    // apply's seam check is re-asked here exactly as it is after a start.
+    board.current = [bead("t1", { priority: 0 })];
+    arm(t, "apply");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    applyPickerPlan.mockResolvedValueOnce({
+      skipped: { beadId: "t1", reason: "a run already covers this target", wroteBoard: true },
+      confirmStart: async () => ({
+        skipped: {
+          beadId: "t1",
+          reason: "the pass was cancelled and the run covering this target removed with it",
+          wroteBoard: false,
+        },
+      }),
+    });
+
+    await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
+
+    expect(info.mock.calls.map((args) => String(args[0]))).toContainEqual(
+      expect.stringContaining("covering this target removed with it"),
+    );
+    info.mockRestore();
+  });
+
   it("leaves the plan alone when a skip wrote nothing", async () => {
     // The other half of that rule: a stand-down that took its own writes back left the board exactly
     // as the plan above was stamped from, so a second board read would buy nothing.
