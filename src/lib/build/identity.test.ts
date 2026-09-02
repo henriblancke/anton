@@ -263,6 +263,38 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  // A clean FILTER converts worktree contents to their canonical repository form BEFORE git compares
+  // them, so `git diff HEAD` sees the driver's output on both sides — a conversion `--no-textconv`
+  // and `--no-ext-diff` do not reach, since neither disables anything outside diff time. A lossy
+  // driver therefore reports no change however often the file is rewritten, while Next compiles the
+  // raw bytes on disk and `anton start` reuses a `.next` built from the previous ones.
+  it("digests a tracked edit a configured clean filter would canonicalize away", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitattributes"), "*.ts filter=flat\n");
+    spawnSync("git", ["-C", dir, "config", "filter.flat.clean", "sh -c 'echo constant'"]);
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "clean filter"]);
+    const first = readBuildIdentity(dir).worktree;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
+  // Only a driver with a `clean` command configured converts anything: the attribute on its own
+  // leaves the bytes alone, the diff already covers them, and re-reading the tree for that would
+  // cost every checkout declaring a filter it has no driver for.
+  it("leaves a filter attribute with no configured driver to the diff", () => {
+    const dir = gitCheckout();
+    writeFileSync(join(dir, ".gitattributes"), "*.ts filter=absent\n");
+    spawnSync("git", ["-C", dir, "add", "-A"]);
+    spawnSync("git", ["-C", dir, ...AUTHOR, "commit", "-qm", "attribute only"]);
+    expect(readBuildIdentity(dir).worktree).toBe("clean");
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   // A build input is often a LINK: `.env.local` pointing at a shared secrets file is the common
   // setup, and Next inlines what stands at the end of it. Hashing the link text alone would call
   // the build current after the file behind the link changed.

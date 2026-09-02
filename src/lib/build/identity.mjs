@@ -201,9 +201,10 @@ function namedRevision(identity) {
 }
 
 /** One git read at `appRoot`: its stdout, or null when git failed, timed out, or ran away. */
-function git(appRoot, args) {
+function git(appRoot, args, input) {
   const r = spawnSync("git", ["-C", appRoot, ...args], {
     encoding: "utf8",
+    input,
     timeout: 5000,
     maxBuffer: GIT_MAX_BUFFER,
   });
@@ -235,10 +236,12 @@ function git(appRoot, args) {
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
- * that class back in; the diff hides another, so `uncoveredTrackedLinks` names that one back; and it
- * flattens a third to a single line, so `submoduleDigests` reads those worktrees itself. All three
- * read git, and a read git could not answer collapses the digest exactly as the two above do: a
- * digest missing an input vouches for a build compiled from something else (PR #217 review).
+ * that class back in; the diff hides two more — what a tracked link points at, and the bytes a clean
+ * filter converts before git ever compares them — so `uncoveredTrackedLinks` and
+ * `filteredTrackedPaths` name those back; and it flattens a fourth to a single line, so
+ * `submoduleDigests` reads those worktrees itself. All of them read git, and a read git could not
+ * answer collapses the digest exactly as the two above do: a digest missing an input vouches for a
+ * build compiled from something else (PR #217 review).
  *
  * `--ignore-submodules=none` because that flattened line is the only record of a submodule moving to
  * a different commit, and either repository's config (`diff.ignoreSubmodules`,
@@ -253,11 +256,13 @@ function readWorktreeDigest(appRoot) {
   if (tracked === null) return null;
   const links = uncoveredTrackedLinks(appRoot, trackedPaths(tracked, SYMLINK_MODE));
   if (links === null) return null;
+  const filtered = filteredTrackedPaths(appRoot, trackedPaths(tracked, ...FILE_MODES));
+  if (filtered === null) return null;
   const envFiles = ignoredEnvFiles(appRoot);
   if (envFiles === null) return null;
   const submodules = submoduleDigests(appRoot, trackedPaths(tracked, GITLINK_MODE));
   if (submodules === null) return null;
-  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links];
+  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links, ...filtered];
   const files = [...new Set(inputs)].sort();
   if (!files.length && !diff && !submodules.length) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
@@ -274,12 +279,60 @@ function readWorktreeDigest(appRoot) {
 const SYMLINK_MODE = "120000 ";
 const GITLINK_MODE = "160000 ";
 
-/** The paths `ls-files -s` reported at `mode`, in the order git listed them (sorted by path). */
-function trackedPaths(listed, mode) {
+/** git's modes for a regular file — the only entries a clean filter is ever run over. */
+const FILE_MODES = ["100644 ", "100755 "];
+
+/** The paths `ls-files -s` reported at any of `modes`, in the order git listed them (sorted by path). */
+function trackedPaths(listed, ...modes) {
   return listed
     .split("\0")
-    .filter((entry) => entry.startsWith(mode))
+    .filter((entry) => modes.some((mode) => entry.startsWith(mode)))
     .map((entry) => entry.slice(entry.indexOf("\t") + 1));
+}
+
+/**
+ * The tracked files a clean FILTER stands in front of, named back into the digest by CONTENT — the
+ * last class of tracked input `git diff HEAD` cannot vouch for (PR #217 review).
+ *
+ * git documents a clean command as converting worktree contents to their canonical repository form,
+ * and the diff compares that OUTPUT on both sides. So a lossy driver — a stripper, a redactor,
+ * anything that summarizes — reports no change however often the file is rewritten, while Next
+ * compiles the raw bytes on disk. `--no-ext-diff` and `--no-textconv` do not reach it: those
+ * disable diff-time conversions, and this one happens before the diff.
+ *
+ * Only paths a CONFIGURED driver actually converts count. `filter=x` with no `filter.x.clean`
+ * command leaves the bytes alone, so the diff already covers them — and re-reading every tracked
+ * file in a repo that merely declares the attribute would hash the whole tree for nothing. Regular
+ * files only, for the same reason: git runs no filter over a symlink or a gitlink, both of which
+ * the digest already covers on their own terms.
+ */
+function filteredTrackedPaths(appRoot, paths) {
+  const drivers = cleanFilterDrivers(appRoot);
+  if (drivers === null) return null;
+  if (!drivers.size || !paths.length) return [];
+  const attrs = git(appRoot, ["check-attr", "--stdin", "-z", "filter"], paths.join("\0"));
+  if (attrs === null) return null;
+  // `<path>\0filter\0<value>` per path, where the value is a driver name, "unspecified" or "unset".
+  const fields = attrs.split("\0");
+  const filtered = [];
+  for (let i = 0; i + 2 < fields.length; i += 3) if (drivers.has(fields[i + 2])) filtered.push(fields[i]);
+  return filtered;
+}
+
+/**
+ * The filter drivers this repo has a `clean` command configured for — the only ones that convert
+ * anything. Read from the merged config, because the command can just as well come from the user's
+ * global file as from the checkout's own.
+ */
+function cleanFilterDrivers(appRoot) {
+  const listed = git(appRoot, ["config", "--list", "-z"]);
+  if (listed === null) return null;
+  const drivers = new Set();
+  for (const record of listed.split("\0")) {
+    const driver = /^filter\.(.+)\.clean$/.exec(record.split("\n", 1)[0]);
+    if (driver) drivers.add(driver[1]);
+  }
+  return drivers;
 }
 
 /**
