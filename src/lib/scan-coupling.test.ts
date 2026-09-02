@@ -189,6 +189,56 @@ describe("importGraph", () => {
   });
 });
 
+describe("readAliases", () => {
+  // tsconfig.json is JSONC — `tsc --init` writes one full of `//` comments, and a trailing comma is
+  // legal in it. Read with plain `JSON.parse` such a config publishes no mapping at all, and the
+  // specifier falls back to its path tail, which binds an unrelated package's same-named module.
+  it("reads a tsconfig written as JSONC — comments, block comments and a trailing comma", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": [
+        "{",
+        "  // The app's own sources.",
+        "  /* baseUrl is what the targets below are relative to. */",
+        '  "note": "a // b, c",',
+        '  "compilerOptions": {',
+        '    "baseUrl": ".",',
+        '    "paths": { "@/*": ["./src/*"] },',
+        "  },",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    // `note` also proves strings are copied through untouched: a `//` and a `,`-before-`}` inside
+    // one, eaten as syntax, would leave a document `JSON.parse` rejects and no rules at all.
+    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src"] }]);
+  });
+
+  // `extends` comes off unvalidated JSON, so a config spelling it as anything but a string reaches
+  // the resolver as-is. Before, `null.startsWith` threw a TypeError out through `filterCouplingSignals`
+  // and failed the whole nightly pass over one malformed config.
+  it("ignores an `extends` value that is not a string instead of throwing", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({ extends: null, compilerOptions: { baseUrl: "." } }),
+    });
+
+    await expect(readAliases(repo)).resolves.toEqual([]);
+  });
+
+  // ...and one bad entry does not cost the chain the base that IS readable.
+  it("follows the string entries of an `extends` array past a malformed one", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      // An `extends` array is read last-first, so the malformed entry is reached FIRST here.
+      "tsconfig.json": JSON.stringify({ extends: ["./tsconfig.base.json", null] }),
+    });
+
+    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src"] }]);
+  });
+});
+
 describe("judgeCycle", () => {
   /** Two modules that only reference each other's types — the phantom this filter exists for. */
   const typePair = {

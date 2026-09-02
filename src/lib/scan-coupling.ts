@@ -151,10 +151,61 @@ interface TsConfig {
  */
 const EXTENDS_DEPTH = 8;
 
+/**
+ * A tsconfig with its JSONC removed. tsconfig.json is JSONC, not JSON — `tsc --init` writes a file
+ * of `//` comments, and a trailing comma before a closing brace is legal in it. `JSON.parse`
+ * rejects both, and a config read as unparseable publishes no mapping at all, which sends the
+ * specifier to the path-tail fallback — the one that reads `@/ui/widget` as an unrelated package's
+ * same-named module, inventing a caller and deleting a true finding (anton-23xe).
+ *
+ * A string literal is copied through untouched, so a `//` inside a path stays part of it, and a
+ * comma inside one is never mistaken for a trailing separator.
+ */
+function stripJsonc(text: string): string {
+  let out = "";
+  // Where the last comma landed in `out` while only whitespace and comments have followed it; -1
+  // once anything else has, since a comma with a value after it separates rather than trails.
+  let trailing = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === '"') {
+      const start = i;
+      for (i += 1; i < text.length && text[i] !== '"'; i += 1) if (text[i] === "\\") i += 1;
+      out += text.slice(start, i + 1);
+      trailing = -1;
+      continue;
+    }
+    if (char === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i += 1;
+      out += "\n";
+      continue;
+    }
+    if (char === "/" && text[i + 1] === "*") {
+      const close = text.indexOf("*/", i + 2);
+      i = close === -1 ? text.length : close + 1;
+      out += " ";
+      continue;
+    }
+    if (char === ",") {
+      trailing = out.length;
+      out += char;
+      continue;
+    }
+    if (char === "}" || char === "]") {
+      if (trailing !== -1) out = out.slice(0, trailing) + " " + out.slice(trailing + 1);
+      trailing = -1;
+    } else if (!/\s/.test(char)) {
+      trailing = -1;
+    }
+    out += char;
+  }
+  return out;
+}
+
 /** The tsconfig at `file`, or undefined when there is none anton can read. */
 async function readConfig(repoPath: string, file: string): Promise<TsConfig | undefined> {
   try {
-    return JSON.parse(await readFile(join(repoPath, file), "utf8")) as TsConfig;
+    return JSON.parse(stripJsonc(await readFile(join(repoPath, file), "utf8"))) as TsConfig;
   } catch {
     return undefined;
   }
@@ -190,8 +241,13 @@ function rulesOf(dir: string, options: TsConfig["compilerOptions"]): AliasRule[]
  * node_modules — outside the tree anton scans, and a preset publishes no `paths` worth chasing —
  * and one climbing out of the repo is not this project's to read. Both leave the mapping
  * unresolved, which is the behaviour every unreadable config already has.
+ *
+ * `spec` is `unknown` because it comes straight off unvalidated JSON: a config spelling `extends`
+ * as null or a number is invalid, but reading one may not throw a TypeError up through the nightly
+ * pass. It names no config anton can follow, which is the case this already answers with nothing.
  */
-function extendsTargets(dir: string, spec: string): string[] {
+function extendsTargets(dir: string, spec: unknown): string[] {
+  if (typeof spec !== "string") return [];
   if (!spec.startsWith("./") && !spec.startsWith("../")) return [];
   const candidates = spec.endsWith(".json")
     ? [join(dir, spec)]
