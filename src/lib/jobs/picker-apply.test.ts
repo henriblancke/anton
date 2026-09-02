@@ -385,6 +385,26 @@ describe("applyPickerPlan", () => {
     expect(nudgeSync).toHaveBeenCalledTimes(1);
   });
 
+  it("releases the claim when the approval failed and the label was never written", async () => {
+    // `wroteLabel` says the label is OURS to take back, not that it is THERE. The approve write
+    // threw, so nothing is on the bead — and an untag that then refuses the missing label must not
+    // gate the release, or the unwind leaves exactly the claimed-and-unapproved target it exists to
+    // prevent.
+    put(bead("t1"));
+    vi.spyOn(beads, "tag").mockRejectedValue(new Error("bd update timed out"));
+    const untag = vi
+      .spyOn(beads, "untag")
+      .mockRejectedValue(new Error("bd update: no such label `approved`"));
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).not.toContain("by hand");
+    expect(untag).not.toHaveBeenCalled();
+    expect(read("t1").assignee).toBeUndefined();
+    expect(await jobs()).toHaveLength(0);
+  });
+
   it("enqueues nothing when the claim does not survive the board merge", async () => {
     // The local CAS ordered this process only: two machines can both refresh, both find the target
     // free and both write. Whoever loses the merge must not start a run on a claim it does not hold.
@@ -441,6 +461,34 @@ describe("applyPickerPlan", () => {
 
     expect(outcome).toMatchObject({ started: { beadId: "t1" } });
     expect(await jobs()).toHaveLength(1);
+  });
+
+  it("enqueues nothing when the target stops being startable while the claim settles", async () => {
+    // Winning the assignee proves the race was won, not that the prize is still worth having: the
+    // holder check cannot see a close, a blocker or an `agent:human` label landing in the settle
+    // window, and enqueueing anyway buys a run execute-epic only poison-parks.
+    put(bead("t1"));
+
+    const outcome = await apply(
+      "t1",
+      1,
+      wired({
+        pull: async () => {
+          const b = board.current.get("t1")!;
+          b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "stopped being startable",
+    );
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
+    // Fail closed: the writes come off so the next pass re-decides against a free target.
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
   });
 
   it("does not settle a claim it never wrote", async () => {

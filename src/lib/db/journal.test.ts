@@ -28,9 +28,13 @@ const journal: { entries: JournalEntry[] } = JSON.parse(
 
 describe("drizzle journal", () => {
   it("stamps every migration later than the one before it", () => {
-    const inversions = journal.entries
-      .filter((entry, i) => i > 0 && entry.when <= journal.entries[i - 1]!.when)
-      .map((entry, i) => `${entry.tag} (when=${entry.when}) <= ${journal.entries[i]!.tag}`);
+    // One pass, so `i` stays the JOURNAL index: a filter-then-map would renumber it and the report
+    // would name an unrelated migration as the predecessor.
+    const inversions = journal.entries.flatMap((entry, i) =>
+      i > 0 && entry.when <= journal.entries[i - 1]!.when
+        ? [`${entry.tag} (when=${entry.when}) <= ${journal.entries[i - 1]!.tag}`]
+        : [],
+    );
 
     // Named rather than counted: the fix is to restamp the offending entry, and the report has to
     // say which one.

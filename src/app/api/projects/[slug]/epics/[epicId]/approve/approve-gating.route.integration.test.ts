@@ -624,6 +624,37 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(await executeEpicJobs(epic)).toHaveLength(0);
   });
 
+  it("reports the stranded claim when the hand-back itself fails", async () => {
+    // The compensating write can fail too, and answering "nothing was changed" over a reservation
+    // that is still ours would hide a target that reads as taken, has no approval and no run, and
+    // never comes back on a picker pass (PR #218 review).
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Hand-back fails", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Its ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
+    const tagSpy = vi.spyOn(beads, "tag").mockRejectedValue(new Error("bd update timed out"));
+    const unassignSpy = vi.spyOn(beads, "unassign").mockRejectedValue(new Error("bd is gone"));
+    try {
+      const res = await approve(epic);
+      expect(res.status).toBe(500);
+      const { error } = await res.json();
+      expect(error).toContain("could not be handed back");
+      expect(error).toContain("anton-test");
+    } finally {
+      unassignSpy.mockRestore();
+      tagSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+
+    // The state the message names is the state the board is actually in.
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(false);
+    expect(bead.assignee).toBe("anton-test");
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
   it("reads for the gate and the lock, and never re-reads the board after the write", async () => {
     // An unclaimed target additionally pays the CAS write chain (assign + its post-write verify
     // read), which is the claim guard and stays. What must NOT come back is a second forced `bd list`

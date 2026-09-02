@@ -32,6 +32,7 @@ import { beads, CLAIM_SETTLE_MS, LABELS, type SyncOutcome } from "../beads/bd";
 import { isServerMode } from "../beads/board-mode";
 import { approveAndClaim } from "../beads/approve-claim";
 import { ownerOf, setAssigneeIfOwner } from "../beads/claim";
+import { loadAllIssues } from "../beads/issues";
 import { nudgeSync } from "../beads/sync-nudge";
 import type { Bead } from "../beads/types";
 import type { PickerPlanEntry } from "../board-picker-plan";
@@ -143,13 +144,18 @@ const sleepMs = (ms: number): Promise<void> =>
 export interface ClaimSettleDeps {
   push?: (cwd: string) => Promise<SyncOutcome>;
   pull?: (cwd: string) => Promise<unknown>;
-  show?: (cwd: string, id: string) => Promise<Bead>;
+  /** Fresh `--status all` board, for the post-settle re-validation (see {@link settleClaim}). */
+  board?: (cwd: string) => Promise<Bead[]>;
   sleep?: (ms: number) => Promise<void>;
   settleMs?: number;
 }
 
-/** Whether the reservation survived the remote's merge — see {@link settleClaim}. */
-type SettleVerdict = { held: true } | { lost: string } | { unverified: string };
+/**
+ * Whether the reservation survived the remote's merge AND still names startable work — see
+ * {@link settleClaim}. `stale` is the claim we WON on a target that stopped being eligible while we
+ * settled: ours on paper, not runnable, and the writes are ours to take back.
+ */
+type SettleVerdict = { held: true } | { lost: string } | { unverified: string } | { stale: string };
 
 /**
  * Prove the claim cross-machine BEFORE the enqueue — the settle half of the pickup protocol
@@ -164,6 +170,13 @@ type SettleVerdict = { held: true } | { lost: string } | { unverified: string };
  *
  * Skipped where there is nothing to settle against: a shared-server board is authoritative the
  * moment it commits, and a not-wired embedded board has no second machine to race.
+ *
+ * The assignee is machine-scoped, not per-instance (see `lib/operator.ts`: it is the same identity
+ * the run ownership gate and review-fix's PR filter compare against), so two machines resolving to
+ * one operator string cannot be told apart HERE — that residual cross-process window is the one
+ * `beads/claim.ts` documents and anton-od4 tracks. It is not the last guard: the irreversible half,
+ * the run itself, arbitrates on a per-run lease token in `execute-epic.ts`, so a double enqueue
+ * still ends with exactly one run and the other parked.
  */
 async function settleClaim(
   repoPath: string,
@@ -174,7 +187,7 @@ async function settleClaim(
   if (isServerMode(repoPath)) return { held: true };
   const push = deps.push ?? beads.push;
   const pull = deps.pull ?? beads.pull;
-  const show = deps.show ?? beads.show;
+  const readBoard = deps.board ?? loadAllIssues;
   const sleep = deps.sleep ?? sleepMs;
 
   let outcome: SyncOutcome;
@@ -186,19 +199,44 @@ async function settleClaim(
   if (outcome !== "synced") return { held: true };
 
   await sleep(deps.settleMs ?? CLAIM_SETTLE_MS);
-  let holder: string | undefined;
+  // The whole board, not just the bead: winning the assignee proves the race was won, not that the
+  // prize is still worth having, and the re-validation below judges the target against its parents,
+  // its children and its blockers.
+  let board: Bead[];
   try {
     await pull(repoPath);
-    holder = ownerOf(await show(repoPath, beadId));
+    board = await readBoard(repoPath);
   } catch (e) {
     return { unverified: `the claim could not be read back before starting (${errorText(e)})` };
   }
-  if (holder === owner) return { held: true };
-  // A claim that did not survive the merge is not ours to unwind: the `approved` label merged too,
-  // and whoever holds the reservation now is the one whose decision that label belongs to.
-  return {
-    lost: holder ? `${holder} claimed it first` : "the claim did not survive the board merge",
-  };
+  const settled = board.find((b) => b.id === beadId);
+  if (!settled) return { lost: "the target left the board while the claim settled" };
+
+  const holder = ownerOf(settled);
+  if (holder !== owner) {
+    // A claim that did not survive the merge is not ours to unwind: the `approved` label merged too,
+    // and whoever holds the reservation now is the one whose decision that label belongs to. Pulling
+    // it back would be worse than leaving it (PR #218 review): the winner is almost always the other
+    // picker, which wrote the SAME single label, so a withdrawal here would strip the approval out
+    // from under a run that has already started and leave it parked on a target it legitimately won.
+    return {
+      lost: holder ? `${holder} claimed it first` : "the claim did not survive the board merge",
+    };
+  }
+
+  // Re-ask the pass's OWN eligibility rule against the board the settle just pulled — the same
+  // post-settle re-validation `beads.staleClaimReason` does for a worker's pickup (PR #218 review).
+  // Another machine can close, abandon or block the target, label it `agent:human`, or attach a
+  // feature child inside the settle window while leaving this assignee untouched; the holder check
+  // above cannot see any of it, and enqueueing anyway buys a run execute-epic only poison-parks.
+  // Judged with the reservation cleared, because the claim under test is the very one we just took —
+  // exactly the assignee leg `staleClaimReason` leaves out for the same reason.
+  const excluded = ineligibility({ ...settled, assignee: undefined }, board);
+  if (excluded) {
+    const why = excluded.detail ? `${excluded.reason} — ${excluded.detail}` : excluded.reason;
+    return { stale: `the target stopped being startable while the claim settled (${why})` };
+  }
+  return { held: true };
 }
 
 /**
@@ -217,7 +255,12 @@ async function settleClaim(
  * instead of being handed to the run this pass just decided not to make.
  *
  * `wrote.label` is false when the target was ALREADY approved before this pass touched it (a human
- * approved it and never started it), and removing it there would erase somebody else's decision.
+ * approved it and never started it), and removing it there would erase somebody else's decision. It
+ * says the label is OURS to take back, not that it is THERE: the `approveFailed` unwind runs on a
+ * label write that threw, so the bead is re-read and an untag is only attempted on a label that
+ * actually landed (PR #218 review) — otherwise a `bd update --remove-label` refusing a label nobody
+ * wrote would gate the release and strand the very claimed-but-unapproved target this exists to
+ * prevent. An unreadable board is treated as approved, so the unwind still fails closed.
  *
  * Returns what it could NOT take back, so the skip reason names the state it left rather than
  * reporting a clean stand-down over a half-written target.
@@ -228,7 +271,16 @@ async function unwindStart(
   owner: string,
   wrote: { label: boolean; claim: boolean },
 ): Promise<string | undefined> {
-  if (wrote.label) {
+  const approved =
+    wrote.label &&
+    (await beads
+      .show(repoPath, beadId)
+      .then((b) => beads.isApproved(b))
+      .catch((e) => {
+        console.error(`[picker-apply] could not re-read ${beadId} before unapproving it`, e);
+        return true;
+      }));
+  if (approved) {
     const unapproved = await beads
       .untag(repoPath, beadId, [LABELS.approved])
       .then(() => true)
@@ -377,15 +429,18 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
       publish();
       return { skipped: { beadId: top.beadId, reason: settled.lost } };
     }
-    if ("unverified" in settled) {
-      // Fail closed, like the pre-CAS refresh: a claim we cannot prove must not license a run, and
-      // the writes come off so the next pass re-decides against a target that is free again.
+    // A claim we cannot PROVE and a claim whose target stopped being startable come off the same
+    // way: fail closed, like the pre-CAS refresh, so the next pass re-decides against a target that
+    // is free again rather than one anton holds with no run behind it.
+    const unusable =
+      "unverified" in settled ? settled.unverified : "stale" in settled ? settled.stale : undefined;
+    if (unusable !== undefined) {
       const leftover = await unwindStart(repoPath, top.beadId, operator, {
         label: wroteLabel,
         claim: swap.wrote,
       });
       publish();
-      return { skipped: { beadId: top.beadId, reason: withLeftover(settled.unverified, leftover) } };
+      return { skipped: { beadId: top.beadId, reason: withLeftover(unusable, leftover) } };
     }
   }
 

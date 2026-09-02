@@ -628,13 +628,32 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // it — claimed-looking work with no approval and no run. Hand the reservation back to whoever held
   // it before, then report the failure the operator can retry.
   if ("approveFailed" in swap) {
+    // The hand-back can itself fail, and reporting "nothing was changed" over a claim that is still
+    // ours would leave the operator with a target that reads as taken, has no approval and no run,
+    // and never comes back on a picker pass. So the compensation's own verdict decides the message.
+    // A LOST swap is not a failure: someone else holds the reservation now, which is a safe final
+    // state — only an unreachable board leaves the approver's claim standing.
+    let stranded = false;
     if (swap.swap.wrote) {
-      await setAssigneeIfOwner(project.repoPath, epicId, operator ?? owner, owner).catch((e) =>
-        console.error(`[approve] could not release the claim on ${epicId} after a failed approval`, e),
-      );
+      const released = await setAssigneeIfOwner(
+        project.repoPath,
+        epicId,
+        operator ?? owner,
+        owner,
+      ).catch((e) => {
+        console.error(`[approve] could not release the claim on ${epicId} after a failed approval`, e);
+        return undefined;
+      });
+      stranded = !released;
     }
     return NextResponse.json(
-      { error: `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}` },
+      {
+        error: stranded
+          ? `${epicId} could not be approved, and the claim this request took could not be handed ` +
+            `back — it is left assigned to ${operator ?? owner}; clear its assignee by hand. ` +
+            swap.approveFailed
+          : `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}`,
+      },
       { status: 500 },
     );
   }
