@@ -25,6 +25,7 @@ import {
   REVIEW_MIN_SCORE_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
+  pickerAutonomySchema,
   pickerPolicySchema,
   proposalAutonomySchema,
   runHealthThresholdsSchema,
@@ -182,6 +183,12 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     // merged — dropping a criterion is how a policy is widened, and a merge would make that edit
     // silently impossible.
     settingsField("pickerPolicy", schemaValue(pickerPolicySchema, pathDetail)),
+    // Cleared, the project falls back to the level its policy implies — never to `apply`, which is
+    // only ever an explicit choice (see resolvePickerAutonomy).
+    settingsField(
+      "pickerAutonomy",
+      schemaValue(pickerAutonomySchema, messageDetail("unsupported level")),
+    ),
   ];
 }
 

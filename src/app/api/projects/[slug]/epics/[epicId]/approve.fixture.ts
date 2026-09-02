@@ -139,6 +139,9 @@ export async function setupApproveSuite(): Promise<ApproveSuiteCtx> {
     slug: "approvy",
     name: "approvy",
     repoPath: repo,
+    // `shadow` is the level that OFFERS the picker's picks (R3.5), and a release is an answer to one
+    // — at `propose` the route records no accept at all, which is its own case in the release suite.
+    settingsJson: JSON.stringify({ pickerAutonomy: "shadow" }),
   });
 
   const approve: ApprovePost = (epicId, body, slug = "approvy") =>

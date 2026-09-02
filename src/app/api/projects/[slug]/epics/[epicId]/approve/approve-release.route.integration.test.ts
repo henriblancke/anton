@@ -314,6 +314,32 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect((await verdictsFor(epic)).map((r) => r.verdict)).toEqual(["declined"]);
   });
 
+  it("records nothing while the picker is at propose", async () => {
+    // The level that ranks and offers nothing (R3.5). The board draws no `[Release]` there, so a
+    // flag arriving from a tab opened before the level changed must not become evidence for the
+    // `apply` that level never asked for (PR #218 review).
+    actAs("anton-test");
+    const epic = await runTarget("Proposing picker");
+    await planFor(epic);
+    const project = await projectId();
+    await getDb()
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerAutonomy: "propose" }) })
+      .where(eq(schema.projects.id, project));
+
+    try {
+      expect((await approve(epic, { release: true })).status).toBe(200);
+      expect(await executeEpicJobs(epic)).toHaveLength(1);
+      expect(await verdictsFor(epic)).toHaveLength(0);
+    } finally {
+      // Shared suite db: leave the picker offering for whatever runs next.
+      await getDb()
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify({ pickerAutonomy: "shadow" }) })
+        .where(eq(schema.projects.id, project));
+    }
+  });
+
   it("records nothing while the picker is disarmed", async () => {
     // A plan left behind by a pass the operator switched off is history. The board stops offering
     // `[Release]` on it for exactly that reason, and a release that arrives anyway must not become

@@ -56,12 +56,18 @@ let deferrals = new Map<string, number>();
 // THIS generation, holds expired included — what retires a generation no pass rewrote.
 let declined = new Set<string>();
 
+// The third read on that seam: the accept/veto record `resolvePickerAutonomy` floors `apply` on. It
+// only matters to the board when the stored level IS `apply`, but an unstubbed read reaches the real
+// anton.db like the two above it.
+let pickerRecord = { settled: 0, accepted: 0 };
+
 vi.mock("./picker-veto", async () => {
   const actual = await vi.importActual<typeof import("./picker-veto")>("./picker-veto");
   return {
     ...actual,
     latestPickerDeferrals: async () => deferrals,
     latestDeclinedPicks: async () => declined,
+    pickerTrackRecord: async () => pickerRecord,
   };
 });
 
@@ -89,7 +95,15 @@ vi.mock("./schedules", async () => {
 
 // The policy armed on this machine (anton-t9m4 review): half of the plan's freshness fence, so a
 // test can move it without touching a bead. Unarmed by default, as a project that never set one.
-let projectSettings: { pickerPolicy?: import("./policy/types").Policy } = {};
+//
+// The AUTONOMY rides with it, because the lane is a projection of what the pass would OFFER: R3.5
+// draws `propose` as an empty lane and only `shadow`/`apply` as cards. `shadow` is the default here
+// — the level a project sits at once it has a picker worth watching — so the suites below can move
+// the policy, the plan and the board without restating the level they are not testing.
+let projectSettings: {
+  pickerPolicy?: import("./policy/types").Policy;
+  pickerAutonomy?: import("./policy/types").PickerAutonomy;
+} = { pickerAutonomy: "shadow" };
 
 vi.mock("./projects", async () => {
   const actual = await vi.importActual<typeof import("./projects")>("./projects");
@@ -110,7 +124,8 @@ beforeEach(() => {
   declined = new Set();
   pickerPlan = undefined;
   pickerArmed = true;
-  projectSettings = {};
+  pickerRecord = { settled: 0, accepted: 0 };
+  projectSettings = { pickerAutonomy: "shadow" };
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1347,6 +1362,48 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     pickerArmed = false;
 
     expect((await getBoard(project)).upNext).toBeUndefined();
+  });
+
+  it("withholds the lane at propose, where nothing is offered (R3.5)", async () => {
+    // The pass still ranks and records at `propose` — the plan row is there — but the level promises
+    // a ranking and nothing else. A lane drawn from it would offer `[Release]` and vetoes, and RECORD
+    // those answers into the track record `apply` is earned on, against a level that asked for none
+    // of it (PR #218 review). This is also where every unarmed project sits by default.
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    projectSettings = { pickerAutonomy: "propose" };
+
+    const served = await getBoard(project);
+    expect(served.upNext).toBeUndefined();
+    // And no `◈ policy` badge either: `[Release]` is derived from it (isPickerPick), so leaving the
+    // mark would leave the offer standing on the card the lane just declined to draw.
+    expect(served.columns.backlog[0]?.provenance).toBeUndefined();
+  });
+
+  it("draws the lane at apply, the level that starts its own picks", async () => {
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    // Stored `apply`, earned: the lane is the live preview the lower-ranked picks are vetoed from.
+    const policy = { types: ["feature"] };
+    projectSettings = { pickerPolicy: policy, pickerAutonomy: "apply" };
+    pickerRecord = { settled: 50, accepted: 50 };
+    // Stamped under that policy, since it is half the plan's freshness fence.
+    pickerPlan = { ...planOver(board, "f-1"), stamp: stampBoard(board, 1_770_000_000_000, policy) };
+
+    expect((await getBoard(project)).upNext).toHaveLength(1);
+  });
+
+  it("moves the refresh token when the level stops offering, so the poll cannot 304 past it", async () => {
+    // Nothing else in the token sees this: moving between `propose` and `shadow` touches no bead, no
+    // plan row and no policy.
+    const board = [feature()];
+    listMock.mockResolvedValue(board);
+    pickerPlan = planOver(board, "f-1");
+    const offering = await getBoardVersion(project);
+
+    projectSettings = { pickerAutonomy: "propose" };
+    expect(await getBoardVersion(project)).not.toBe(offering);
   });
 
   it("drops a pick the operator vetoed since the pass ran", async () => {

@@ -17,8 +17,10 @@ import {
   PROPOSAL_AUTONOMY_LEVELS,
   autonomyFor,
   autonomyTierOf,
+  PICKER_AUTONOMY_TIER,
   earnedAutonomy,
   earnedAutonomyOfKind,
+  earnedPickerAutonomy,
   emptyTrackRecord,
   resolveProposalAutonomyPolicy,
   type ProposalAutonomyPolicy,
@@ -227,6 +229,64 @@ describe("the earned floor — a kind is armable only once its proposals have a 
     expect(earnedAutonomy("misfiled", { move: "retire", retireAs: "close" }, record).eligible).toBe(
       false,
     );
+  });
+});
+
+describe("the same floor over the picker's record (anton-vkp9)", () => {
+  const bar = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+
+  it("prices an unattended start at the tier the approve move already costs", () => {
+    // Not a second ladder with its own numbers: the picker writes `approved` and starts a run, which
+    // is the `approve` move, and the table above already says what that costs.
+    expect(PICKER_AUTONOMY_TIER).toBe(autonomyTierOf({ move: "approve" }));
+    expect(PICKER_AUTONOMY_TIER).toBe("history");
+  });
+
+  it("blocks apply on an empty record, and says so in counts", () => {
+    const verdict = earnedPickerAutonomy({ settled: 0, accepted: 0 });
+    expect(verdict.eligible).toBe(false);
+    expect(verdict.reason).toBe(
+      `no answered picks yet — apply unlocks at ${bar.minSettled} answered with ${bar.minAppliedPct}% released`,
+    );
+  });
+
+  it("blocks apply on a record that is too short to read, whatever its ratio", () => {
+    // A perfect three-for-three is not a record; `minSettled` is "have you seen enough of these to
+    // have an opinion", and it is not substitutable by the ratio beside it.
+    const verdict = earnedPickerAutonomy({ settled: 3, accepted: 3 });
+    expect(verdict.eligible).toBe(false);
+    expect(verdict.reason).toContain("3/3 released");
+  });
+
+  it("allows apply once the record supports it", () => {
+    expect(
+      earnedPickerAutonomy({ settled: bar.minSettled, accepted: bar.minSettled }).eligible,
+    ).toBe(true);
+  });
+
+  it("blocks apply on a full record the operator kept vetoing, naming the percentage", () => {
+    const accepted = Math.floor((bar.minSettled * (bar.minAppliedPct - 20)) / 100);
+    const verdict = earnedPickerAutonomy({ settled: bar.minSettled, accepted });
+    expect(verdict.eligible).toBe(false);
+    expect(verdict.reason).toContain(`${accepted}/${bar.minSettled} released (`);
+  });
+
+  it("weighs the ratio exactly, so a record that rounds UP to the bar still does not clear it", () => {
+    // 26/29 is 89.66% — a rounded comparison reads 90 and arms unattended starts on a record that
+    // never met the bar (PR #218 review). The rounding belongs to the sentence, not the verdict.
+    const verdict = earnedPickerAutonomy({ settled: 29, accepted: 26 });
+    expect(verdict.eligible).toBe(false);
+    expect(verdict.reason).toContain("26/29 released (90%)");
+    expect(earnedPickerAutonomy({ settled: 30, accepted: 27 }).eligible).toBe(true);
+  });
+
+  it("stops clearing the bar the moment the record degrades — the window rolls", () => {
+    // The same counts, one release turned into a veto: what was armable is not, with no latch and
+    // nothing for an operator to clear.
+    const armed = { settled: bar.minSettled, accepted: bar.minSettled };
+    const degraded = { settled: bar.minSettled, accepted: bar.minSettled - 3 };
+    expect(earnedPickerAutonomy(armed).eligible).toBe(true);
+    expect(earnedPickerAutonomy(degraded).eligible).toBe(false);
   });
 });
 

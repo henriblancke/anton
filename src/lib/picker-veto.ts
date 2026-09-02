@@ -559,16 +559,50 @@ export async function pickerTrackRecord(
   return { accepted, declined: rows.length - accepted, settled: rows.length };
 }
 
-/** This project's verdicts, newest first — the audit trail behind the counts above. */
+/**
+ * UI read path over the shared anton.db — the counts the earned-autonomy floor reads
+ * ({@link earnedPickerAutonomy}), so the settings surface and the pass weigh the same numbers.
+ */
+export function latestPickerTrackRecord(projectId: string): Promise<PickerTrackRecord> {
+  return pickerTrackRecord(getDb(), projectId);
+}
+
+/**
+ * UI read path over the shared anton.db — the decision log's half of the verdict record.
+ *
+ * DECLINES only, and filtered in the QUERY (PR #218 review): the log shows refusals, so selecting
+ * every verdict and dropping the accepts afterwards would let a run of newer accepts fill the window
+ * and leave the log short — or empty — while the vetoes it exists to show sit one row past the
+ * limit.
+ */
+export function latestPickerDeclines(
+  projectId: string,
+  limit?: number,
+): Promise<PickerVerdictRow[]> {
+  return listPickerVerdicts(getDb(), projectId, limit, "declined");
+}
+
+/**
+ * This project's verdicts, newest first — the audit trail behind the counts above. `only` narrows to
+ * one verdict before the limit applies, for callers that want the newest N of a KIND.
+ */
 export async function listPickerVerdicts(
   db: AntonDb,
   projectId: string,
   limit: number = PICKER_RECORD_WINDOW,
+  only?: PickerVerdict,
 ): Promise<PickerVerdictRow[]> {
   const rows = await db
     .select()
     .from(schema.pickerVerdicts)
-    .where(eq(schema.pickerVerdicts.projectId, projectId))
+    .where(
+      only
+        ? and(
+            eq(schema.pickerVerdicts.projectId, projectId),
+            eq(schema.pickerVerdicts.verdict, only),
+          )
+        : eq(schema.pickerVerdicts.projectId, projectId),
+    )
     // Same tiebreaker as the counts above: the audit trail and the window it explains must not
     // disagree about which verdicts are the newest.
     .orderBy(
