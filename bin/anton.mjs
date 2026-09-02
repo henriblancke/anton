@@ -1953,7 +1953,7 @@ function ensureFreshBuild({
   if (built && (compiledFrom === null || buildMatchesCheckout(appRoot, compiledFrom))) return 0;
 
   let why = built
-    ? "the build in .next is not this checkout — rebuilding so the server runs what is here…"
+    ? "the build in .next is not provably this checkout — rebuilding so the server runs what is here…"
     : "no build found — running `next build` first…";
   for (let attempt = 1; attempt <= MAX_BUILD_ATTEMPTS; attempt++) {
     console.log(c.dim(why));

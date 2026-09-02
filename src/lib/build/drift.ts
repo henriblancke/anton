@@ -16,6 +16,7 @@ import { join } from "node:path";
 import {
   buildDrift,
   buildRecordPath,
+  buildStampPath,
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
@@ -143,16 +144,41 @@ export function recordServerBuild(): void {
 }
 
 /**
- * What this process is running — the code on disk, minus the worktree digest outside production.
+ * What this process is running.
  *
- * A saved edit does not make a dev server stale: `next dev` recompiles the file you just saved. In
- * a development session the checkout is dirty by definition, so recording the digest there would
- * put a permanent "restart the server" banner in front of the one person who least needs it.
- * Dropping it leaves the version/commit comparison, which is what a dev server can actually miss.
+ * In production that is the ARTIFACT, not the checkout. `next start` serves the `.next` it found at
+ * boot, and `anton start` proved that artifact fresh BEFORE spawning it — a pull or a save landing
+ * in the gap between those two moments reaches the checkout this hook reads but never reaches the
+ * running code. Recording the checkout there would stamp the process with a build it is not
+ * serving, and every drift surface would report the stale server as current: the failure this
+ * module exists to end. The build's own stamp names the checkout it was compiled from, so recording
+ * that instead makes the late pull surface as the drift it is.
+ *
+ * Outside production the checkout IS the truth — `next dev` recompiles what you save — minus the
+ * worktree digest: a development checkout is dirty by definition, so recording the digest would put
+ * a permanent "restart the server" banner in front of the one person who least needs it. Dropping
+ * it leaves the version/commit comparison, which is what a dev server can actually miss.
  */
 function bootIdentity(): BuildIdentity {
   const identity = onDiskIdentity();
-  return process.env.NODE_ENV === "production" ? identity : { ...identity, worktree: null };
+  if (process.env.NODE_ENV !== "production") return { ...identity, worktree: null };
+  return artifactIdentity() ?? identity;
+}
+
+/**
+ * The checkout the compiled `.next` says it was built from, or null when nothing there says.
+ *
+ * Absent for an installed bundle (its `.next` ships prebuilt, and RELEASE_VERSION already identifies
+ * it exactly) and for a `.next` produced outside `anton start`. Falling back to the on-disk read
+ * there keeps those installs exactly as they were; a stamp too incomplete to name a version is
+ * treated the same, since adopting it would report every such server as "unstamped".
+ */
+function artifactIdentity(): BuildIdentity | null {
+  const root = appRoot();
+  if (!root) return null;
+  const stamp = readBuildRecord(buildStampPath(root)) as BuildIdentity | null;
+  if (!stamp?.version) return null;
+  return { version: stamp.version, revision: stamp.revision ?? null, worktree: stamp.worktree ?? null };
 }
 
 /**

@@ -29,7 +29,7 @@ import {
   writeBuildStamp,
 } from "./identity.mjs";
 
-const RUNNING = { version: "0.4.0", revision: "a".repeat(40) };
+const RUNNING = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -100,8 +100,9 @@ describe("compareBuild", () => {
   // A record written before the digest existed carries none, and reading that absence as drift
   // would demand one restart of every install on the upgrade that introduced it.
   it("ignores a worktree digest only one side carries", () => {
-    expect(compareBuild(RUNNING, { ...RUNNING, worktree: "9f2c1a4bb001" }).state).toBe("current");
-    expect(compareBuild({ ...RUNNING, worktree: "9f2c1a4bb001" }, RUNNING).state).toBe("current");
+    const undigested = { version: RUNNING.version, revision: RUNNING.revision };
+    expect(compareBuild(undigested, { ...RUNNING, worktree: "9f2c1a4bb001" }).state).toBe("current");
+    expect(compareBuild({ ...RUNNING, worktree: "9f2c1a4bb001" }, undigested).state).toBe("current");
   });
 
   it("calls a build that recorded no version unstamped", () => {
@@ -298,7 +299,7 @@ describe("the record a running server leaves", () => {
  */
 describe("buildMatchesCheckout", () => {
   /** A checkout at `version`/`revision` whose `.next` was compiled from `builtFrom` (if given). */
-  function checkout(onDisk: { version: string; revision: string | null; worktree?: string }, builtFrom?: object) {
+  function checkout(onDisk: { version: string; revision: string | null; worktree?: string | null }, builtFrom?: object) {
     const app = tempDir();
     writeFileSync(join(app, "package.json"), JSON.stringify({ version: onDisk.version }));
     mkdirSync(join(app, ".next"));
@@ -332,6 +333,26 @@ describe("buildMatchesCheckout", () => {
   // claim is current — rebuilding costs a build, serving it costs the whole verdict.
   it("rejects a build that carries no stamp at all", () => {
     expect(buildMatchesCheckout(checkout(RUNNING), RUNNING)).toBe(false);
+  });
+
+  // Freshness is a proof, so a git read that failed, timed out, or overran the buffer cap is a no.
+  // Read as "no evidence" instead, a stamp written before an uncommitted edit would be accepted and
+  // `anton start` would serve the pre-edit artifact.
+  it("rejects a build when git could no longer describe the checkout", () => {
+    const onDisk = { ...RUNNING, worktree: null };
+    expect(buildMatchesCheckout(checkout(onDisk, RUNNING), onDisk)).toBe(false);
+  });
+
+  it("rejects a git checkout neither read could describe — unprovable is not current", () => {
+    const onDisk = { ...RUNNING, worktree: null };
+    expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(false);
+  });
+
+  // A source install with no git names no commit on either side, and never could: holding it to a
+  // digest it cannot produce would rebuild it on every single start.
+  it("accepts a checkout with no git at all on its version alone", () => {
+    const onDisk = { version: "0.4.0", revision: null, worktree: null };
+    expect(buildMatchesCheckout(checkout(onDisk, onDisk), onDisk)).toBe(true);
   });
 
   it("round-trips a fresh stamp, so the build it just made is accepted next start", () => {

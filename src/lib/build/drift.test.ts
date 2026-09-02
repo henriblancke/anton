@@ -5,7 +5,7 @@
  * must a process that never booted a server (every unit test in this repo is one).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -62,6 +62,47 @@ describe("recordServerBuild / serverBuildDrift", () => {
     prod.recordServerBuild();
 
     expect(record().worktree).toEqual(expect.any(String));
+  });
+
+  // The window `anton start` cannot close: it proves `.next` fresh, THEN spawns the server, and a
+  // pull landing in between reaches the checkout this hook reads but never the code `next start` is
+  // serving. Recording the checkout there would stamp the process with a build it does not run and
+  // call the stale server current — so what the artifact says it was compiled from is what counts.
+  it("records what the compiled artifact was built from, not a checkout that moved past it", async () => {
+    const app = join(dir, "app");
+    mkdirSync(join(app, ".next"), { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    writeFileSync(
+      join(app, ".next", "anton-build.json"),
+      JSON.stringify({ version: "0.3.9", revision: "a".repeat(40), worktree: "clean", builtAt: 1 }),
+    );
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    vi.stubEnv("NODE_ENV", "production");
+
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+
+    expect(JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8")).version).toBe("0.3.9");
+    const drift = serverBuildDrift();
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.running?.version).toBe("0.3.9");
+    expect(drift?.onDisk.version).toBe("0.4.0");
+  });
+
+  // An installed bundle ships a prebuilt `.next` with no stamp in it, and its RELEASE_VERSION already
+  // identifies it exactly — reading the install itself is the only answer there is.
+  it("falls back to the install on disk when the artifact carries no stamp", async () => {
+    const app = join(dir, "bundle");
+    mkdirSync(join(app, ".next"), { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    vi.stubEnv("NODE_ENV", "production");
+
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+
+    expect(JSON.parse(readFileSync(join(dir, "server-build.json"), "utf8")).version).toBe("0.4.0");
+    expect(serverBuildDrift()).toBeNull();
   });
 
   // The 2026-08-17 shape, forced: the process is up and the record says it booted somewhere else.

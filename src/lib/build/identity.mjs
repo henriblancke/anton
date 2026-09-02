@@ -296,7 +296,32 @@ export function writeBuildStamp(appRoot, identity = readBuildIdentity(appRoot)) 
 export function buildMatchesCheckout(appRoot, onDisk = readBuildIdentity(appRoot)) {
   const stamp = readBuildRecord(buildStampPath(appRoot));
   if (!stamp) return false;
-  return compareBuild(stamp, onDisk).state === "current";
+  return provesSameCheckout(stamp, onDisk);
+}
+
+/**
+ * Do these two reads PROVE the same code, rather than merely fail to contradict each other?
+ *
+ * `compareBuild` reads an absent field as "no evidence" and stays quiet — right for a drift verdict,
+ * where inventing a restart out of a missing field would nag every bundle install forever. Freshness
+ * is the opposite question and needs the opposite answer: a git read that failed, timed out, or
+ * overran GIT_MAX_BUFFER (one large uncommitted binary is enough) leaves a null revision or digest,
+ * and accepting that silence hands `next start` a `.next` nothing can tie to the code on disk —
+ * exactly the staleness this file exists to catch. So a field present on one side alone is a
+ * mismatch, and a checkout git CAN name a commit for must also name what it holds past that commit:
+ * the digest is the only field an uncommitted edit moves. A checkout with no git at all (a source
+ * tarball) names neither on either side and stays a version comparison, as it always was.
+ *
+ * @param {BuildIdentity} stamp
+ * @param {BuildIdentity} onDisk
+ */
+function provesSameCheckout(stamp, onDisk) {
+  const agree = (a, b) => (a ?? null) === (b ?? null);
+  if (!stamp.version || !onDisk.version) return false;
+  if (!agree(stamp.version, onDisk.version)) return false;
+  if (!agree(stamp.revision, onDisk.revision)) return false;
+  if (!agree(stamp.worktree, onDisk.worktree)) return false;
+  return !onDisk.revision || (onDisk.worktree ?? null) !== null;
 }
 
 /** Does this pid name a live process? Signal 0 is the existence check every pidfile reader uses. */
