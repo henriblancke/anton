@@ -10,8 +10,8 @@ function driftCopy(drift: BuildDrift): { headline: string; detail: string } {
     return {
       headline: "This anton server can't say what build it is running",
       detail:
-        `It recorded no build identity, so it predates this check — nothing here can tell whether ` +
-        `it matches the ${onDisk} on disk.`,
+        `Its build carries no stamp — it predates this check, or it was compiled outside ` +
+        `\`anton start\` — so nothing here can tell whether it matches the ${onDisk} on disk.`,
     };
   }
   const moved = drift.state === "outdated" ? "the runtime on disk is now" : "the checkout has since moved to";

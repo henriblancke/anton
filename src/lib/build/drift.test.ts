@@ -60,11 +60,21 @@ describe("recordServerBuild / serverBuildDrift", () => {
     dev.recordServerBuild();
     expect(record().worktree).toBeNull();
 
+    // A production server is judged on what its ARTIFACT was compiled from, so the digest comes from
+    // the stamp inside `.next` rather than from a checkout that may have moved past it.
+    const app = join(dir, "prod");
+    mkdirSync(join(app, ".next"), { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    writeFileSync(
+      join(app, ".next", "anton-build.json"),
+      JSON.stringify({ version: "0.4.0", revision: "a".repeat(40), worktree: "9f2c1a4", builtAt: 1 }),
+    );
+    vi.stubEnv("ANTON_APP_ROOT", app);
     vi.stubEnv("NODE_ENV", "production");
     const prod = await freshModule();
     prod.recordServerBuild();
 
-    expect(record().worktree).toEqual(expect.any(String));
+    expect(record().worktree).toBe("9f2c1a4");
   });
 
   // The window `anton start` cannot close: it proves `.next` fresh, THEN spawns the server, and a
@@ -92,12 +102,14 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(drift?.onDisk.version).toBe("0.4.0");
   });
 
-  // An installed bundle ships a prebuilt `.next` with no stamp in it, and its RELEASE_VERSION already
-  // identifies it exactly — reading the install itself is the only answer there is.
-  it("falls back to the install on disk when the artifact carries no stamp", async () => {
+  // An installed bundle ships a prebuilt `.next` with no stamp in it — `anton start` exempts it from
+  // the rebuild every source install gets — and its RELEASE_VERSION identifies it exactly, so
+  // reading the install itself is the only answer there is.
+  it("falls back to the install on disk when a bundle's artifact carries no stamp", async () => {
     const app = join(dir, "bundle");
     mkdirSync(join(app, ".next"), { recursive: true });
     writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    writeFileSync(join(app, "RELEASE_VERSION"), "0.4.0\n");
     vi.stubEnv("ANTON_APP_ROOT", app);
     vi.stubEnv("NODE_ENV", "production");
 
@@ -106,6 +118,27 @@ describe("recordServerBuild / serverBuildDrift", () => {
 
     expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBe("0.4.0");
     expect(serverBuildDrift()).toBeNull();
+  });
+
+  // The other side of that fallback (PR #217 review): a SOURCE install's `.next` is stamped by
+  // `anton start` and by nothing else, so an unstamped one came from `bun run build && bun run
+  // start` or from a stamp write that failed — and `next start` is serving it either way. Recording
+  // the checkout there would vouch for the running process with code it may never have compiled,
+  // and a pull landing between that build and this boot would read as current forever.
+  it("records nothing identifiable when a source build left no stamp", async () => {
+    const app = join(dir, "checkout");
+    mkdirSync(join(app, ".next"), { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    vi.stubEnv("NODE_ENV", "production");
+
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+
+    expect(JSON.parse(readFileSync(recordPath(), "utf8")).version).toBeNull();
+    const drift = serverBuildDrift();
+    expect(drift?.state).toBe("unstamped");
+    expect(drift?.onDisk.version).toBe("0.4.0");
   });
 
   // The 2026-08-17 shape, forced: the process is up and the record says it booted somewhere else.

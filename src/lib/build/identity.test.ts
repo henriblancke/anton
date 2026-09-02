@@ -22,6 +22,7 @@ import {
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
+  isBundleInstall,
   listBuildRecords,
   MAX_LINKED_ENTRIES,
   processStartedAt,
@@ -711,6 +712,25 @@ describe("the record a running server leaves", () => {
  * without it, a source start on a `.next` built at an older commit boots stamping the new commit and
  * every drift surface reports a stale server as current.
  */
+// The line between the two kinds of install, and what decides who may be identified by VERSION
+// alone (PR #217 review): a bundle's prebuilt `.next` is never stamped, so it keeps that fallback,
+// while a source install's unstamped build is one nothing can name.
+describe("isBundleInstall", () => {
+  it("keys on the RELEASE_VERSION marker the launcher keys on", () => {
+    const app = tempDir();
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    expect(isBundleInstall(app)).toBe(false);
+
+    writeFileSync(join(app, "RELEASE_VERSION"), "0.4.0\n");
+
+    expect(isBundleInstall(app)).toBe(true);
+  });
+
+  it("says no for a directory that is not there at all", () => {
+    expect(isBundleInstall(join(tempDir(), "gone"))).toBe(false);
+  });
+});
+
 describe("buildMatchesCheckout", () => {
   /** A checkout at `version`/`revision` whose `.next` was compiled from `builtFrom` (if given). */
   function checkout(onDisk: { version: string; revision: string | null; worktree?: string | null }, builtFrom?: object) {

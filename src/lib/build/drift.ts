@@ -19,6 +19,7 @@ import {
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
+  isBundleInstall,
   pruneBuildRecords,
   readBuildIdentity,
   readBuildRecord,
@@ -48,7 +49,10 @@ export interface BuildIdentity {
 
 export interface BuildDrift {
   state: BuildDriftState;
-  /** What the running process booted from; null when it recorded nothing ("unstamped"). */
+  /**
+   * What the running process booted from; null when it recorded nothing. An identity carrying no
+   * version is the same claim — a build that names nothing — and reads as "unstamped" too.
+   */
   running: BuildIdentity | null;
   /** What is on disk now — the build a restart would adopt. */
   onDisk: BuildIdentity;
@@ -176,6 +180,14 @@ export function recordServerBuild(): void {
  * a permanent "restart the server" banner in front of the one person who least needs it. Dropping
  * it leaves the version/commit comparison, which is what a dev server can actually miss.
  *
+ * A production artifact carrying NO stamp is recorded as nothing at all, not as the checkout beside
+ * it (PR #217 review). `anton start` stamps every source build it makes, so an unstamped `.next` in
+ * a checkout came from something else — `bun run build && bun run start`, or a stamp write that
+ * failed — and `next start` is still serving that older artifact. Reading the checkout there is the
+ * same false "current" one paragraph up, by another route. Only an installed bundle keeps the
+ * version fallback: `ensureFreshBuild` deliberately leaves its prebuilt `.next` unstamped, and its
+ * RELEASE_VERSION identifies it exactly.
+ *
  * That leaves one gap open deliberately (PR #217 review): the job runner is started once from the
  * instrumentation hook and deliberately survives hot reloads (lib/jobs/service), so a scheduled job
  * under `anton dev` can keep executing pre-edit code while this reports the server current. A digest
@@ -186,16 +198,23 @@ export function recordServerBuild(): void {
 function bootIdentity(): BuildIdentity {
   const identity = onDiskIdentity();
   if (process.env.NODE_ENV !== "production") return { ...identity, worktree: null };
-  return artifactIdentity() ?? identity;
+  const stamp = artifactIdentity();
+  if (stamp) return stamp;
+  const root = appRoot();
+  return root && isBundleInstall(root) ? identity : UNIDENTIFIED;
 }
+
+/** A build nothing can name — what `compareBuild` reads as "unstamped", since it carries no version. */
+const UNIDENTIFIED: BuildIdentity = { version: null, revision: null, worktree: null, env: null };
 
 /**
  * The checkout the compiled `.next` says it was built from, or null when nothing there says.
  *
  * Absent for an installed bundle (its `.next` ships prebuilt, and RELEASE_VERSION already identifies
- * it exactly) and for a `.next` produced outside `anton start`. Falling back to the on-disk read
- * there keeps those installs exactly as they were; a stamp too incomplete to name a version is
- * treated the same, since adopting it would report every such server as "unstamped".
+ * it exactly) and for a `.next` produced outside `anton start`. A stamp too incomplete to name a
+ * version says nothing either — an identity with no version is exactly what `compareBuild` calls
+ * unstamped — so it is discarded rather than adopted. What that absence MEANS is `bootIdentity`'s
+ * call, and it differs by install.
  */
 function artifactIdentity(): BuildIdentity | null {
   const root = appRoot();

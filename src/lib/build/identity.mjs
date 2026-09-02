@@ -19,8 +19,9 @@
  *   "modified"  — the same version at a different COMMIT, or the same commit with different
  *                 UNCOMMITTED work: the source checkout moved under it. This is the 08-17 case —
  *                 0.4.0 both sides, days of fixes apart.
- *   "unstamped" — something is running that recorded no identity (a build predating this file, or a
- *                 record anton could not write). What it is running cannot be established.
+ *   "unstamped" — something is running that recorded no identity (a build predating this file, an
+ *                 artifact no `anton start` stamped, or a record anton could not write). What it is
+ *                 running cannot be established.
  *
  * Read-only by construction, exactly like the skill-drift check it copies: every surface here
  * REPORTS drift and names the restart. anton never restarts itself — a live process may be
@@ -122,6 +123,22 @@ function readVersion(appRoot) {
     return JSON.parse(readFileSync(join(appRoot, "package.json"), "utf8")).version ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Is `appRoot` an installed release bundle rather than a source install? Keyed on the same
+ * `RELEASE_VERSION` marker the launcher is (bin/anton.mjs), so the two agree on what an install is.
+ *
+ * It is the line that decides who may be identified by VERSION alone: `ensureFreshBuild` exempts a
+ * bundle from the rebuild-and-stamp every source install goes through, so a bundle legitimately
+ * serves a `.next` no stamp names — while an unstamped source build is one nothing can identify.
+ */
+export function isBundleInstall(appRoot) {
+  try {
+    return statSync(join(appRoot, "RELEASE_VERSION")).isFile();
+  } catch {
+    return false;
   }
 }
 
@@ -877,8 +894,9 @@ export function describeBuildDrift(drift) {
   const onDisk = describeBuildIdentity(drift.onDisk);
   if (drift.state === "unstamped") {
     return (
-      `the running anton server recorded no build identity — it predates build-drift reporting, so ` +
-      `nothing can say whether it matches the code on disk (${onDisk}). Restart the server to be sure`
+      `the running anton server recorded no build identity — its build predates build-drift ` +
+      `reporting or was compiled outside \`anton start\`, so nothing can say whether it matches the ` +
+      `code on disk (${onDisk}). Restart the server to be sure`
     );
   }
   const what = drift.state === "outdated" ? "the runtime on disk is" : "the checkout is now";
