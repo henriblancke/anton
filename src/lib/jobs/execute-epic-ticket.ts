@@ -81,7 +81,7 @@ export async function runTicket(args: {
   timeoutMs: number;
 }): Promise<void> {
   const { run, ticket, operator, timeoutMs } = args;
-  const { db, clock, ctx, worktreePath } = run;
+  const { ctx, worktreePath } = run;
   const closeOnDone = args.closeOnDone ?? true;
 
   await claimTicket(run, ticket, operator);
@@ -106,7 +106,6 @@ export async function runTicket(args: {
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
     await finishTicket(run, ticket, session.sessionId, closeOnDone);
-    await endSession(db, clock, session.sessionId, "done");
   } catch (e) {
     await settleFailedTicket({ run, ticket, session, budget, baseline, progress, timeoutMs, e });
   } finally {
@@ -559,7 +558,7 @@ async function settleTicketTimeout(args: {
       );
     }
     throw new TicketTimeoutError(ticket.id, timeoutMs, committed);
-}
+  }
 }
 
 /**
@@ -603,20 +602,18 @@ async function settleAbortedTicket(args: {
     // stop instead, carrying what was asked so it still reaches the operator through the run row.
     if (e instanceof NeedsHumanError) throw new CancelledAskError(ticket.id, why, e.ask);
     throw e;
-}
-// Release the claim so the board never shows a dead session's ticket as in-flight
-// (anton-live-sync R10). A usage-limit park is NOT dead — the run resumes with the claim
-// intact. Two states must NOT silently re-queue the ticket open: work already landed on the
-// branch (commits exist), OR the agent delivered nothing at all (zero diff). Both are
-// human-review states — block with an operator-facing note. Resetting a no-delivery ticket to
-// open would silently re-queue it into the ready pool and hide the false-success. A
-// `needs-human` ask is the exception to that rule and is excused above. All
-// best-effort: never mask the run's error; the epic-level finally sync pushes the release.
+  }
 }
 
 /**
  * Release the claim so the board never shows a dead session's ticket as in-flight
- * (anton-live-sync R10).
+ * (anton-live-sync R10). A usage-limit park is NOT dead — the run resumes with the claim intact.
+ * Two states must NOT silently re-queue the ticket open: work already landed on the branch
+ * (commits exist), OR the agent delivered nothing at all (zero diff). Both are human-review
+ * states — block with an operator-facing note. Resetting a no-delivery ticket to open would
+ * silently re-queue it into the ready pool and hide the false-success. A `needs-human` ask is
+ * the exception to that rule, excused by `settleAbortedTicket` before this runs. All
+ * best-effort: never mask the run's error; the epic-level finally sync pushes the release.
  */
 async function releaseFailedTicket(args: {
   run: Omit<StepContext, "tickets">;
