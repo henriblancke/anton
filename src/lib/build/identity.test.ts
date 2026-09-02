@@ -385,6 +385,35 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).not.toBe(first);
   });
 
+  // An index flag is the one thing that stops git looking at the worktree AT ALL: git documents
+  // both `--assume-unchanged` and `--skip-worktree` (what sparse checkout sets) as suppressing that
+  // inspection, so `git diff HEAD` reports nothing however often the file is rewritten. Reading only
+  // the diff left those paths out of the raw-content inputs, and a stale `.next` then passed as this
+  // checkout (PR #217 review).
+  it.each([["assume-unchanged"], ["skip-worktree"]])("digests a tracked edit %s hides from the diff", (flag) => {
+    const dir = gitCheckout();
+    spawnSync("git", ["-C", dir, "update-index", `--${flag}`, "src.ts"]);
+    expect(readBuildIdentity(dir).worktree).toMatch(/^[0-9a-f]{12}$/);
+    const first = readBuildIdentity(dir).worktree;
+
+    writeFileSync(join(dir, "src.ts"), SOURCE.replace("1", "2"));
+    expect(spawnSync("git", ["-C", dir, "diff", "HEAD"]).stdout.toString()).toBe("");
+    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+  });
+
+  // The sparse-checkout shape: skip-worktree on a path that is not on disk. The file's absence is
+  // itself an input, so the identity stays provable — and moves the moment the path is there.
+  it("digests a skip-worktree path that is not on disk", () => {
+    const dir = gitCheckout();
+    spawnSync("git", ["-C", dir, "update-index", "--skip-worktree", "src.ts"]);
+    rmSync(join(dir, "src.ts"));
+    const absent = readBuildIdentity(dir).worktree;
+    expect(absent).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "src.ts"), SOURCE);
+    expect(readBuildIdentity(dir).worktree).not.toBe(absent);
+  });
+
   // Only a driver with a `clean` command configured converts anything: the attribute on its own
   // leaves the bytes alone, the diff already covers them, and re-reading the tree for that would
   // cost every checkout declaring a filter it has no driver for.

@@ -246,6 +246,12 @@ export async function answersAsAnton(port) {
  * A liveness claim about the wrong install is worse than a missing one — restarting the wrong
  * server kills a run and leaves the stale one up.
  *
+ * The probes run TOGETHER because they are independent, and the case this whole check exists for is
+ * exactly the one with several listeners up (PR #217 review): probed in turn, each unanswered port
+ * spends its full timeout before the next begins, and the health page — a cache miss away from the
+ * operator — waits the sum of them. In parallel it waits the longest single probe however many
+ * ports are held.
+ *
  * @param {{
  *   isBundle?: boolean,
  *   appRoot?: string|null,
@@ -268,11 +274,13 @@ export async function unstampedServers({
     const daemon = pid();
     return daemon && !livePids.has(daemon) ? [daemon] : [];
   }
+  const candidates = servers(appRoot).filter(({ pid: listener }) => !livePids.has(listener));
+  const answers = await Promise.all(candidates.map(({ port }) => answering(port)));
   const found = [];
-  for (const { pid: listener, port } of servers(appRoot)) {
-    if (livePids.has(listener) || found.includes(listener)) continue;
-    if (await answering(port)) found.push(listener);
-  }
+  // One process can hold several ports, so a pid is reported once — by whichever of its ports answers.
+  candidates.forEach(({ pid: listener }, i) => {
+    if (answers[i] && !found.includes(listener)) found.push(listener);
+  });
   return found;
 }
 

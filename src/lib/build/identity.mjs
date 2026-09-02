@@ -236,9 +236,10 @@ function git(appRoot, args, input) {
  * into a per-file hash, so the fixed-width digest also frames path from content unambiguously.
  *
  * `--exclude-standard` hides one class of file the build DOES depend on, so `ignoredEnvFiles` names
- * that class back in; the diff hides two more — what a tracked link points at, and the bytes git
- * canonicalizes (a clean filter, the `ident` attribute) before it ever compares them — so
- * `uncoveredTrackedLinks` and `convertedTrackedPaths` name those back; and it flattens a fourth to a
+ * that class back in; the diff hides three more — what a tracked link points at, the bytes git
+ * canonicalizes (a clean filter, the `ident` attribute) before it ever compares them, and the paths
+ * an index flag tells git not to look at on disk at all — so `uncoveredTrackedLinks`,
+ * `convertedTrackedPaths` and `hiddenTrackedPaths` name those back; and it flattens a fifth to a
  * single line, so `submoduleDigests` reads those worktrees itself. All of them read git, and a read git could not
  * answer collapses the digest exactly as the two above do: a digest missing an input vouches for a
  * build compiled from something else (PR #217 review).
@@ -262,7 +263,9 @@ function readWorktreeDigest(appRoot) {
   if (envFiles === null) return null;
   const submodules = submoduleDigests(appRoot, trackedPaths(tracked, GITLINK_MODE));
   if (submodules === null) return null;
-  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links, ...converted];
+  const hidden = hiddenTrackedPaths(appRoot);
+  if (hidden === null) return null;
+  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links, ...converted, ...hidden];
   const files = [...new Set(inputs)].sort();
   if (!files.length && !diff && !submodules.length) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
@@ -352,6 +355,37 @@ function convertingFilterDrivers(appRoot) {
   }
   return drivers;
 }
+
+/**
+ * The tracked paths an INDEX FLAG hides from the diff, named back into the digest by CONTENT — the
+ * class of tracked input `git diff HEAD` never even looks on disk for (PR #217 review).
+ *
+ * `git update-index --assume-unchanged` and `--skip-worktree` both tell git to trust the index over
+ * the worktree, and git documents both as suppressing the normal worktree inspection the diff
+ * stands on — sparse checkout sets the second on every path it leaves out. So a flagged file
+ * reports no change however often it is rewritten, and `anton start` would reuse a `.next` compiled
+ * before the edit while every drift surface calls the server current.
+ *
+ * `ls-files -v` is the listing that reports those flags: `S` for skip-worktree, and the entry's tag
+ * lowercased for assume-unchanged. A flagged path that is not on disk — the sparse-checkout shape —
+ * folds in the absence marker `hashFile` returns rather than collapsing the read, so such a
+ * checkout stays provable and still moves the digest if the file appears.
+ */
+function hiddenTrackedPaths(appRoot) {
+  const listed = git(appRoot, ["ls-files", "-v", "-z"]);
+  if (listed === null) return null;
+  const hidden = [];
+  for (const entry of listed.split("\0")) {
+    // `<tag><space><path>`, and an unflagged tag is uppercase.
+    const path = entry.slice(2);
+    const tag = entry[0];
+    if (path && (tag === SKIP_WORKTREE_TAG || tag !== tag.toUpperCase())) hidden.push(path);
+  }
+  return hidden;
+}
+
+/** `ls-files -v`'s tag for skip-worktree — the one flag it does not report by lowercasing the tag. */
+const SKIP_WORKTREE_TAG = "S";
 
 /**
  * What each DIRTY submodule worktree holds that its own HEAD does not, as `[path, digest]` pairs —
