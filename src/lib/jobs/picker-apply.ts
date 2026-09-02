@@ -631,6 +631,13 @@ function slotKey(beadId: string, prNumber: number): string {
  * verdicts retiring the same slots agree about the PR states underneath them, and a reopen shows up
  * as the second verdict counting a slot the first did not — as a HOLD when it fills the limit, and
  * as a shrunken retired set when it does not.
+ *
+ * Where it STOPS is the final board read (PR #218 review): both agreeing verdicts are taken on its
+ * NEAR side, so a reopen landing inside that read is one no reconciliation here can see. Closing
+ * that window means a `gh pr view` between the last board read and the insert — a two-minute
+ * ceiling for the approval, the claim and the eligibility rule to age behind, spent to spare the
+ * flow limit one run it re-derives next cadence. The correctness half gets the last word, so this
+ * narrows to a reopen during one `bd list` and is deliberately left there.
  */
 function sameRetired(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
