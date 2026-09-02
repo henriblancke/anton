@@ -6,11 +6,10 @@ import type { StandaloneItem } from "@/lib/types";
 // The predicate itself, not a chip-local copy: approve and the runner ask the same one.
 import { contractBlocks } from "@/lib/beads/contract";
 import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
 import { SnoozeButton } from "@/components/ticket/snooze-button";
 import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
-import { ReleaseAction } from "@/components/board/release-action";
+import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
 import { VetoActions } from "@/components/board/veto-actions";
 import { usePickDecision } from "@/components/board/pick-decision";
 import { isPickerPick } from "@/components/board/board-utils";
@@ -48,13 +47,12 @@ export function ApproveRunAction({
   budgetAware: boolean;
   approval: StandaloneApproval;
 }) {
-  const [unrun, setUnrun] = useState(false);
-  const { approved, deferred, running, locked, approveRun } = approval;
   // A release whose approve landed with nothing enqueued leaves the target approved and idle, which
   // is precisely what `canOfferRun` withholds the run for — so the retry the failure copy points at
   // would vanish on the next poll (PR #212 review). Reopen the affordance until a run actually
   // starts; approve re-enqueues for an already-approved target.
-  if (!canOfferRun(item, approved, deferred) && !unrun) return null;
+  const [unrun, setUnrun] = useState(false);
+  if (!canOfferRun(item, approval.approved, approval.deferred) && !unrun) return null;
 
   if (contractBlocks(item.contract)) {
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;
@@ -65,57 +63,27 @@ export function ApproveRunAction({
   // set aside keeps the plain approve: offering [Release] there would re-offer the declined start.
   const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
 
-  if (budgetAware || picked) {
-    return (
-      // Budget-aware: run now or hand the run to the governor's pace-line. Release is always the
-      // immediate half, so the pair never makes the same promise twice.
-      <span className="pointer-events-auto flex items-center gap-1">
-        {budgetAware && (
-          <Button
-            size="xs"
-            variant="outline"
-            onClick={() => approveRun(false)}
-            disabled={running || locked}
-            title="Queue this run for the budget governor to pace against the weekly plan"
-          >
-            Queue
-          </Button>
-        )}
-        {picked ? (
-          <ReleaseAction
-            slug={slug}
-            beadId={item.id}
-            title={item.title}
-            disabled={running}
-            onReleased={() => {
-              setUnrun(false);
-              approval.setApproved();
-            }}
-            onApprovedWithoutRun={() => setUnrun(true)}
-          />
-        ) : (
-          <Button
-            size="xs"
-            onClick={() => approveRun(true)}
-            disabled={running || locked}
-            title="Approve and run now, bypassing budget pacing (the session limit still applies)"
-          >
-            {running ? "…" : "Approve"}
-          </Button>
-        )}
-      </span>
-    );
-  }
-
   return (
-    <Button
-      size="xs"
-      onClick={() => approveRun()}
-      disabled={running || locked}
-      className="pointer-events-auto"
-    >
-      {running ? "Starting…" : "Approve & run"}
-    </Button>
+    <ApproveRunButtons
+      budgetAware={budgetAware}
+      approval={approval}
+      label="Approve & run"
+      busyLabel="Starting…"
+      {...(picked
+        ? {
+            release: {
+              slug,
+              beadId: item.id,
+              title: item.title,
+              onReleased: () => {
+                setUnrun(false);
+                approval.setApproved();
+              },
+              onApprovedWithoutRun: () => setUnrun(true),
+            },
+          }
+        : {})}
+    />
   );
 }
 

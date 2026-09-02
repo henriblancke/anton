@@ -1,5 +1,3 @@
-import { GitPullRequestIcon } from "lucide-react";
-
 import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -7,9 +5,11 @@ import {
   AbandonedChip,
   BlockedChip,
   MetaChip,
-  PrLink,
+  PrChip,
   RiskChip,
   SnoozedChip,
+  WorkingPulse,
+  prLabel,
 } from "@/components/atoms";
 import { ReviewScoreChip } from "@/components/review-score";
 import { NotNowChip } from "@/components/board/not-now-chip";
@@ -23,12 +23,6 @@ import { ProvenanceBadges } from "@/components/board/provenance-badge";
  * each takes `hasOverlay` and stops eating pointer events for it — the few controls that must stay
  * clickable (PR link, copy) opt back in individually.
  */
-
-/** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
-export function prLabel(ref: string): string {
-  const m = /(\d+)\s*$/.exec(ref);
-  return m ? `#${m[1]}` : ref;
-}
 
 /** Title line: type icon, unread marker, title, and the run's PR or its live "working" pulse. */
 export function ChipHeader({ item, hasOverlay }: { item: StandaloneItem; hasOverlay: boolean }) {
@@ -46,20 +40,16 @@ export function ChipHeader({ item, hasOverlay }: { item: StandaloneItem; hasOver
         {item.title}
       </h4>
       {item.prRef && (
-        <PrLink href={item.prUrl} className={item.prUrl ? "pointer-events-auto" : undefined}>
-          {/* An abandoned item is closed (stage `done`) but nothing merged — never green-tint its PR. */}
-          <MetaChip tone={item.stage === "done" && !item.abandoned ? "done" : "pr"}>
-            <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-            {prLabel(item.prRef)}
-          </MetaChip>
-        </PrLink>
+        // An abandoned item is closed (stage `done`) but nothing merged — never green-tint its PR.
+        <PrChip
+          href={item.prUrl}
+          tone={item.stage === "done" && !item.abandoned ? "done" : "pr"}
+          className={item.prUrl ? "pointer-events-auto" : undefined}
+        >
+          {prLabel(item.prRef)}
+        </PrChip>
       )}
-      {item.stage === "implementing" && !item.prRef && (
-        <span className="inline-flex shrink-0 items-center gap-1 text-[10px] text-stage-implementing">
-          <span className="size-1.5 rounded-full bg-stage-implementing anton-pulse" aria-hidden="true" />
-          working
-        </span>
-      )}
+      {item.stage === "implementing" && !item.prRef && <WorkingPulse className="shrink-0" />}
     </div>
   );
 }

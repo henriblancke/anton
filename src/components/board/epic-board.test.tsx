@@ -17,6 +17,7 @@ import type { DragEndEvent } from "@dnd-kit/core";
 import { toast } from "sonner";
 
 import { STAGES, type Board, type Epic, type EscalationView, type Stage } from "@/lib/types";
+import { makeEpicRow } from "@/components/board/epic.fixture";
 import { STAGE_LABELS } from "@/components/board/board-utils";
 
 const LABEL_TO_STAGE = Object.fromEntries(
@@ -83,27 +84,7 @@ vi.mock("@dnd-kit/utilities", () => ({ CSS: { Translate: { toString: () => "" } 
 // Import after the mocks are registered.
 const { EpicBoard } = await import("@/components/board/epic-board");
 
-function epic(id: string, stage: Stage): Epic {
-  return {
-    id,
-    title: id,
-    type: "feature",
-    approved: false,
-    stage,
-    assignee: null,
-    createdAt: "2026-07-20T00:00:00.000Z",
-    createdBy: null,
-    blockedBy: [],
-    ready: true,
-    childReadiness: "ready",
-    readyChildren: [],
-    blockedChildren: [],
-    rank: 0,
-    priority: 2,
-    abandoned: false,
-    tickets: [],
-  };
-}
+const epic = (id: string, stage: Stage): Epic => makeEpicRow(id, { stage });
 
 /** A board with a single epic sitting in `cardStage`. */
 function board(version: string, cardStage: Stage): Board {

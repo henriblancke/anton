@@ -1,8 +1,11 @@
 import type { Epic } from "@/lib/types";
 
 /**
- * A ready, unapproved backlog feature — the shape every epic-card suite starts from, so the card and
- * the decision lock around it are judged against one target.
+ * The one `Epic` row every board suite builds its cards from — a ready, unapproved backlog feature.
+ * Each suite used to inline the same 17-field literal, so a new required field meant editing all of
+ * them and a card test could quietly drift from the shape `toEpic` actually produces.
+ *
+ * Test-support only (see `.stringer.yaml`): a suite overrides just the fields its case is about.
  */
 export function makeEpic(over: Partial<Epic> = {}): Epic {
   const ready = over.ready ?? true;
@@ -27,4 +30,9 @@ export function makeEpic(over: Partial<Epic> = {}): Epic {
     tickets: [],
     ...over,
   };
+}
+
+/** The same row keyed by id, for suites whose cards are only ever told apart by it. */
+export function makeEpicRow(id: string, over: Partial<Epic> = {}): Epic {
+  return makeEpic({ id, title: id, ...over });
 }

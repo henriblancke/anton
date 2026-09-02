@@ -1,9 +1,7 @@
 "use client";
 
-import { GitPullRequestIcon } from "lucide-react";
-
 import type { TicketDetail } from "@/lib/types";
-import { MetaChip, PrLink, RelativeTime } from "@/components/atoms";
+import { PrChip, RelativeTime } from "@/components/atoms";
 import { ClaimControl, InheritedOwner, StaticOwner } from "@/components/board/claim-control";
 import { PrLinkControl } from "@/components/board/pr-link-control";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -80,14 +78,7 @@ function TicketPr({
     );
   }
   if (!detail.prRef) return null;
-  return (
-    <PrLink href={detail.prUrl}>
-      <MetaChip tone="pr">
-        <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-        {detail.prUrl ? "PR" : detail.prRef}
-      </MetaChip>
-    </PrLink>
-  );
+  return <PrChip href={detail.prUrl}>{detail.prUrl ? "PR" : detail.prRef}</PrChip>;
 }
 
 /**

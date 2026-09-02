@@ -80,6 +80,12 @@ export const TYPE_BADGE: Record<IssueType, string> = {
   chore: "border-type-chore/30 bg-type-chore/10 text-type-chore",
 };
 
+/** A run target's work type in sentence case — "feature", "epic", "task" — for ids, titles and
+ * confirmations. A feature is the tier anton runs, so a card must never call itself an epic. */
+export function typeWord(type: IssueType): string {
+  return TYPE_LABELS[type].toLowerCase();
+}
+
 /**
  * The board, narrowed to one product epic. Every epic badge points here, so "click the badge to see
  * this epic's work" has a single URL shape across the detail breadcrumb and the feature cards
@@ -383,7 +389,8 @@ export interface EpicLane {
   loose: number;
 }
 
-function emptyStageMap<T>(): Record<Stage, T[]> {
+/** A fresh per-stage bucket map — the shape every column-keyed board structure starts from. */
+export function emptyStageMap<T>(): Record<Stage, T[]> {
   return Object.fromEntries(STAGES.map((stage) => [stage, [] as T[]])) as Record<Stage, T[]>;
 }
 
@@ -444,6 +451,19 @@ export function groupBoardByEpic(
       return byTitle !== 0 ? byTitle : a.epic!.id.localeCompare(b.epic!.id);
     });
   return noEpic ? [...sorted, noEpic] : sorted;
+}
+
+/** Drops an epic (by id) from every stage column, immutably — the optimistic half of a delete, so
+ * the card leaves the board on the confirmation rather than on the next poll. */
+export function removeEpicFromColumns(
+  columns: Record<Stage, Epic[]>,
+  epicId: string,
+): Record<Stage, Epic[]> {
+  const next = emptyStageMap<Epic>();
+  for (const stage of STAGES) {
+    next[stage] = (columns[stage] ?? []).filter((epic) => epic.id !== epicId);
+  }
+  return next;
 }
 
 // ── Up Next: this machine's plan, taken out of Backlog ────────────────────

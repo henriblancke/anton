@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { STAGES, type Epic, type Stage } from "@/lib/types";
+import { makeEpicRow } from "@/components/board/epic.fixture";
 import { BoardFilters } from "@/components/board/board-filters";
 
 const push = vi.fn();
@@ -20,28 +21,7 @@ vi.mock("next/navigation", () => ({
 const ONTOLOGY = { id: "anton-epc", title: "Ontology editing", area: "ontology" };
 const RETRIEVAL = { id: "anton-ret", title: "Trustworthy retrieval", area: "knowledge" };
 
-function epic(id: string, over: Partial<Epic> = {}): Epic {
-  return {
-    id,
-    title: id,
-    type: "feature",
-    approved: false,
-    stage: "backlog",
-    assignee: null,
-    createdAt: "2026-07-20T00:00:00.000Z",
-    createdBy: null,
-    blockedBy: [],
-    ready: true,
-    childReadiness: "ready",
-    readyChildren: [],
-    blockedChildren: [],
-    rank: 0,
-    priority: 2,
-    abandoned: false,
-    tickets: [],
-    ...over,
-  };
-}
+const epic = makeEpicRow;
 
 function columns(cards: Epic[] = []): Record<Stage, Epic[]> {
   const empty = Object.fromEntries(STAGES.map((s) => [s, [] as Epic[]])) as Record<Stage, Epic[]>;

@@ -176,6 +176,62 @@ describe("EpicCard review score (anton-tprv)", () => {
 });
 
 /**
+ * The rows the card was split into (anton-ol8f) — the shell, the PR/working header, the progress
+ * bar and the done outcome now live in epic-card-parts.tsx. Pinned here because the decomposition
+ * is only a refactor as long as each stage keeps rendering exactly what it rendered before it.
+ */
+describe("EpicCard rows per stage", () => {
+  it("shows a merged PR on a done card as a done-tinted chip, glyph-free", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ stage: "done", prRef: "gh-218", prUrl: "https://github.com/o/r/pull/218" })}
+      />,
+    );
+    expect(html).toContain("merged #218");
+    expect(html).toContain("text-stage-done");
+    expect(html).toContain('href="https://github.com/o/r/pull/218"');
+  });
+
+  it("reads an abandoned card as won't-do rather than delivered", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ stage: "done", abandoned: true })} />,
+    );
+    expect(html).toContain("abandoned");
+    expect(html).toContain("line-through");
+    expect(html).not.toContain("complete");
+  });
+
+  it("carries the in-review PR into the live card's header", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ stage: "in-review", prRef: "gh-218", prUrl: "https://x/218" })}
+      />,
+    );
+    expect(html).toContain("#218");
+    expect(html).not.toContain("working");
+  });
+
+  it("says a PR-less implementing run is working right now", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ stage: "implementing" })} />,
+    );
+    expect(html).toContain("working");
+    expect(html).toContain("anton-pulse");
+    // The stage rail is the other half of the active-stage cue.
+    expect(html).toContain("--stage-implementing");
+  });
+
+  it("drops the card link and the backlog controls on the drag overlay", () => {
+    const html = renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} overlay />);
+    expect(html).not.toContain("Open feature");
+    expect(html).not.toContain(">Approve<");
+    expect(html).toContain("rotate-1");
+  });
+});
+
+/**
  * A pick the operator vetoed stays on the board, drawn as set aside (anton-jqvy). A card that simply
  * stopped being offered would leave the operator wondering what they broke.
  */
