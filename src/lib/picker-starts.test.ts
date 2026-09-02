@@ -77,6 +77,22 @@ describe("recording a start", () => {
     ]);
   });
 
+  it("orders same-second starts by when they were recorded, not by their random id", async () => {
+    // The timestamp column is whole-second, so starts inside one second tie on it and the log would
+    // otherwise read them in whatever order their random ids happen to sort in.
+    for (const [i, beadId] of ["anton-1", "anton-2", "anton-3", "anton-4"].entries()) {
+      nowMs = NOW + i * 200;
+      await start({ beadId });
+    }
+
+    expect((await listPickerStarts(test.db, PROJECT)).map((row) => row.beadId)).toEqual([
+      "anton-4",
+      "anton-3",
+      "anton-2",
+      "anton-1",
+    ]);
+  });
+
   it("carries no run id when the enqueue reported none", async () => {
     await start({ jobId: undefined });
     expect((await listPickerStarts(test.db, PROJECT))[0]?.jobId).toBeUndefined();
@@ -95,6 +111,25 @@ describe("retention", () => {
     // The newest survives and the oldest is gone — a prune must never take the row about to render.
     expect(log[0]?.beadId).toBe(`anton-${PICKER_START_RETENTION + 4}`);
     expect(log.map((row) => row.beadId)).not.toContain("anton-0");
+  });
+
+  it("keeps the newest of a same-second group at the window boundary", async () => {
+    // Which row falls out of the window is decided by the order the log reads in, so a second-wide
+    // tie straddling the boundary must not evict a newer start and keep an older one.
+    for (let i = 0; i < PICKER_START_RETENTION - 1; i++) {
+      nowMs = NOW + 60_000 + i * 60_000;
+      await start({ beadId: `anton-${i}` });
+    }
+    // Three starts inside one second, all older than everything above: only the last one fits.
+    for (const [i, beadId] of ["anton-s1", "anton-s2", "anton-s3"].entries()) {
+      nowMs = NOW + i * 200;
+      await start({ beadId });
+    }
+
+    const kept = (await listPickerStarts(test.db, PROJECT)).map((row) => row.beadId);
+    expect(kept).toContain("anton-s3");
+    expect(kept).not.toContain("anton-s1");
+    expect(kept).not.toContain("anton-s2");
   });
 
   it("prunes only its own project's history", async () => {

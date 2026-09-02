@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
@@ -98,8 +98,14 @@ export function PickerAutonomySection({
   }
   const level = chosen ?? resolved;
   const [saving, setSaving] = useState(false);
+  // The save in flight, held in a ref rather than read off `saving`: the redundant-click path on the
+  // radios fires in the SAME native event as the change that started the save, so the state behind
+  // it has not been re-rendered yet and only a ref can tell the duplicate apart.
+  const inFlight = useRef<PickerAutonomy | undefined>(undefined);
 
   async function choose(next: PickerAutonomy) {
+    if (inFlight.current === next) return;
+    inFlight.current = next;
     setChosen(next);
     setSaving(true);
     try {
@@ -118,6 +124,7 @@ export function PickerAutonomySection({
       setChosen(undefined);
       toast.error(err instanceof Error ? err.message : "Save failed");
     } finally {
+      inFlight.current = undefined;
       setSaving(false);
     }
   }
@@ -178,7 +185,8 @@ export function PickerAutonomySection({
               <span className="text-[11px] text-risk-med">
                 You chose <span className="font-mono">apply</span>; anton is running this picker at{" "}
                 <span className="font-mono">shadow</span> until the record supports it. Nothing was
-                un-chosen — it takes effect on its own once the counts clear the bar.
+                un-chosen — it takes effect on its own once the counts clear the bar. Select{" "}
+                <span className="font-mono">shadow</span> to drop that choice for good.
               </span>
             )}
           </div>
@@ -207,6 +215,14 @@ export function PickerAutonomySection({
                       checked={level === each}
                       disabled={Boolean(unavailable)}
                       onChange={() => choose(each)}
+                      // Selecting the option already rendered as checked emits no change event, and
+                      // a floored `apply` renders `shadow` checked while `apply` is still what is
+                      // STORED — so without this the operator could never drop the pending return to
+                      // apply (PR #218 review). `choose` discards the duplicate a normal selection
+                      // produces.
+                      onClick={() => {
+                        if (stored !== each) choose(each);
+                      }}
                       aria-label={`picker · ${each}`}
                     />
                     <span className="block rounded-[7px] px-2 py-1 font-mono text-[10.5px] text-muted-foreground transition-colors peer-checked:bg-primary/15 peer-checked:text-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary/50 peer-disabled:text-subtle peer-disabled:opacity-50">

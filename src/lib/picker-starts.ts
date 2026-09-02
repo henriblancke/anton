@@ -15,7 +15,7 @@
  * UI read path goes through the shared anton.db.
  */
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, notInArray } from "drizzle-orm";
+import { and, desc, eq, notInArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 
@@ -28,6 +28,17 @@ import type { AntonDb, Clock } from "./jobs/queue";
  * at all under one, which is the same silence this record exists to end.
  */
 export const PICKER_START_RETENTION = 20;
+
+/**
+ * The tie-break behind `startedAt`, which is stored whole-second: two starts settled in the same
+ * second must not leave their order to SQLite's row order, and the id cannot break the tie because
+ * a random UUID sorts lexically and says nothing about which start came first (PR #218 review) —
+ * the log would read them backwards, and the prune would keep the older of the two at the window
+ * boundary. `rowid` is assigned in INSERT order, so descending it IS chronological for a tie, the
+ * same deterministic fallback the run list uses. Rows are append-only and the prune only ever takes
+ * the oldest, so a project's newest row keeps the highest rowid for its whole life.
+ */
+const NEWEST_FIRST = sql`rowid desc`;
 
 /** One unattended start: the pick, the rule that admitted it, and the run it enqueued. */
 export interface PickerStartRow {
@@ -98,7 +109,7 @@ async function prunePickerStarts(db: AntonDb, projectId: string): Promise<void> 
     .select({ id: schema.pickerStarts.id })
     .from(schema.pickerStarts)
     .where(eq(schema.pickerStarts.projectId, projectId))
-    .orderBy(desc(schema.pickerStarts.startedAt), desc(schema.pickerStarts.id))
+    .orderBy(desc(schema.pickerStarts.startedAt), NEWEST_FIRST)
     .limit(PICKER_START_RETENTION);
   if (kept.length < PICKER_START_RETENTION) return;
   await db.delete(schema.pickerStarts).where(
@@ -112,13 +123,7 @@ async function prunePickerStarts(db: AntonDb, projectId: string): Promise<void> 
   );
 }
 
-/**
- * This project's unattended starts, newest first.
- *
- * The id breaks a `startedAt` tie for the same reason the verdict read does: the column is
- * second-resolution, and two starts settled in the same second must not leave their order to
- * SQLite's row order — the log and the prune above have to agree about which one is newer.
- */
+/** This project's unattended starts, newest first. */
 export async function listPickerStarts(
   db: AntonDb,
   projectId: string,
@@ -128,7 +133,7 @@ export async function listPickerStarts(
     .select()
     .from(schema.pickerStarts)
     .where(eq(schema.pickerStarts.projectId, projectId))
-    .orderBy(desc(schema.pickerStarts.startedAt), desc(schema.pickerStarts.id))
+    .orderBy(desc(schema.pickerStarts.startedAt), NEWEST_FIRST)
     .limit(limit);
   return rows.map((row) => ({
     beadId: row.beadId,
