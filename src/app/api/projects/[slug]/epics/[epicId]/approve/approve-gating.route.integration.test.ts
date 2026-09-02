@@ -598,6 +598,32 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     expect(bead.assignee).toBe("anton-test");
   });
 
+  it("hands the reservation back when the approval write itself fails", async () => {
+    // The CAS moves the assignee before the label goes on, so a thrown label write would otherwise
+    // leave the target reserved by an approver who never approved it — claimed-looking work with no
+    // approval and no run (PR #218 review).
+    actAs("anton-test");
+    const epic = await beads.create(repo, { title: "Label write fails", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Its ticket", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+
+    const syncSpy = vi.spyOn(beads, "sync").mockResolvedValue(undefined);
+    const tagSpy = vi.spyOn(beads, "tag").mockRejectedValue(new Error("bd update timed out"));
+    try {
+      const res = await approve(epic);
+      expect(res.status).toBe(500);
+      expect((await res.json()).error).toContain("could not be approved");
+    } finally {
+      tagSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+
+    const bead = await beads.show(repo, epic);
+    expect(beads.isApproved(bead)).toBe(false);
+    expect(bead.assignee ?? "").toBe("");
+    expect(await executeEpicJobs(epic)).toHaveLength(0);
+  });
+
   it("reads for the gate and the lock, and never re-reads the board after the write", async () => {
     // An unclaimed target additionally pays the CAS write chain (assign + its post-write verify
     // read), which is the claim guard and stays. What must NOT come back is a second forced `bd list`

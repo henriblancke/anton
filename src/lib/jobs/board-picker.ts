@@ -179,16 +179,22 @@ export function makeBoardPickerHandler(deps: BoardPickerDeps): JobHandler {
     // three refusals are the brakes, in the order an operator would ask about them: a frozen project
     // needs a human to re-arm, a held one releases itself on the next merge, and a project below
     // `apply` never asked for this at all.
-    const applied =
-      autonomy === "apply" && !disarm && !hold
-        ? await startTopPick(ctx, {
-            db,
-            clock,
-            projectId,
-            repoPath: project.repoPath,
-            entries: decision.entries,
-          })
-        : undefined;
+    let applied: PickerApplyOutcome | undefined;
+    if (autonomy === "apply" && !disarm && !hold) {
+      // Re-gated on the signal, like the plan write above and for a sharper reason: `abortProject`
+      // aborts this pass AND deletes the project's queued/running rows, so a start that slipped
+      // through after the abort would write `approved` + a claim to the real board and insert a
+      // fresh execute-epic row — tripping the abort's own leftover guard and leaving an
+      // anton-claimed target on the board of a project being torn down.
+      ctx.signal.throwIfAborted();
+      applied = await startTopPick(ctx, {
+        db,
+        clock,
+        projectId,
+        repoPath: project.repoPath,
+        entries: decision.entries,
+      });
+    }
 
     // The pass always writes a row, so "changed" is about the RANKING, not the write: a board with
     // nothing claimable produces an empty plan, and calling that a result would make every idle slot

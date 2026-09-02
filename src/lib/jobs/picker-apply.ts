@@ -24,13 +24,15 @@
  *     paces a policy start exactly as it paces a queued one.
  *   • It never invents a claim protocol. The bead write-lock and the assignee CAS are the ones the
  *     approve route uses; on an embedded board the mirror they judge is refreshed first (see
- *     {@link refreshFor}) and the pass stands down when that refresh does not land.
+ *     {@link refreshFor}), the reservation is then published and read back before anything is
+ *     enqueued (see {@link settleClaim}), and the pass stands down whenever either leg fails.
  */
-import { beads, LABELS } from "../beads/bd";
+import { beads, CLAIM_SETTLE_MS, LABELS, type SyncOutcome } from "../beads/bd";
 import { isServerMode } from "../beads/board-mode";
 import { approveAndClaim } from "../beads/approve-claim";
-import { setAssigneeIfOwner } from "../beads/claim";
+import { ownerOf, setAssigneeIfOwner } from "../beads/claim";
 import { nudgeSync } from "../beads/sync-nudge";
+import type { Bead } from "../beads/types";
 import type { PickerPlanEntry } from "../board-picker-plan";
 import { resolveOperator } from "../operator";
 import { recordPickerStart } from "../picker-starts";
@@ -71,6 +73,8 @@ export interface PickerApplyInput {
   repoPath: string;
   /** The plan this pass decided, in rank order. Only its first entry is ever started. */
   entries: readonly PickerPlanEntry[];
+  /** The settle seam — production passes none. See {@link ClaimSettleDeps}. */
+  settle?: ClaimSettleDeps;
 }
 
 /**
@@ -109,9 +113,83 @@ function refreshFor(repoPath: string): (() => Promise<StartRefusal | undefined>)
       await beads.pull(repoPath);
       return undefined;
     } catch (e) {
-      const detail = e instanceof Error ? e.message : String(e);
-      return { stale: `the board could not be refreshed before claiming (${detail})` };
+      return { stale: `the board could not be refreshed before claiming (${errorText(e)})` };
     }
+  };
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+const sleepMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === "function") t.unref();
+  });
+
+/**
+ * The settle seam, declared structurally like `beads.claimVerified`'s own deps so a test can drive
+ * the cross-machine window without a remote to race against.
+ */
+export interface ClaimSettleDeps {
+  push?: (cwd: string) => Promise<SyncOutcome>;
+  pull?: (cwd: string) => Promise<unknown>;
+  show?: (cwd: string, id: string) => Promise<Bead>;
+  sleep?: (ms: number) => Promise<void>;
+  settleMs?: number;
+}
+
+/** Whether the reservation survived the remote's merge — see {@link settleClaim}. */
+type SettleVerdict = { held: true } | { lost: string } | { unverified: string };
+
+/**
+ * Prove the claim cross-machine BEFORE the enqueue — the settle half of the pickup protocol
+ * (`beads.claimVerified` steps 3-6), applied to this pass's own CAS (PR #218 review).
+ *
+ * The claim lock and the assignee CAS order THIS process only, and the pull that precedes them can
+ * itself lose a race: two pickers on two machines can both refresh, both find the target unclaimed,
+ * and both write. So a local `ok` is a proposal, not a claim — until the write has been published
+ * and read back through the remote's merge, where exactly one assignee survives. The enqueue is the
+ * irreversible half of a start (a second machine's run is not something a later pass can take back),
+ * so the proof has to come before it, not after.
+ *
+ * Skipped where there is nothing to settle against: a shared-server board is authoritative the
+ * moment it commits, and a not-wired embedded board has no second machine to race.
+ */
+async function settleClaim(
+  repoPath: string,
+  beadId: string,
+  owner: string,
+  deps: ClaimSettleDeps = {},
+): Promise<SettleVerdict> {
+  if (isServerMode(repoPath)) return { held: true };
+  const push = deps.push ?? beads.push;
+  const pull = deps.pull ?? beads.pull;
+  const show = deps.show ?? beads.show;
+  const sleep = deps.sleep ?? sleepMs;
+
+  let outcome: SyncOutcome;
+  try {
+    outcome = await push(repoPath);
+  } catch (e) {
+    return { unverified: `the claim could not be published before starting (${errorText(e)})` };
+  }
+  if (outcome !== "synced") return { held: true };
+
+  await sleep(deps.settleMs ?? CLAIM_SETTLE_MS);
+  let holder: string | undefined;
+  try {
+    await pull(repoPath);
+    holder = ownerOf(await show(repoPath, beadId));
+  } catch (e) {
+    return { unverified: `the claim could not be read back before starting (${errorText(e)})` };
+  }
+  if (holder === owner) return { held: true };
+  // A claim that did not survive the merge is not ours to unwind: the `approved` label merged too,
+  // and whoever holds the reservation now is the one whose decision that label belongs to.
+  return {
+    lost: holder ? `${holder} claimed it first` : "the claim did not survive the board merge",
   };
 }
 
@@ -159,6 +237,12 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   const top = entries[0];
   if (!top) return { skipped: { reason: "the plan ranked nothing to start" } };
 
+  // Publish this pass's writes on EVERY path that made one, not only the started one (PR #218
+  // review). A skip is not a no-op once the approval and the claim have landed: unpublished, they
+  // are invisible to the second machine, whose next pass then reads the target as free — the very
+  // double-start the refresh and the settle spend a round trip each to prevent.
+  const publish = () => nudgeSync({ id: projectId, repoPath }, "picker-apply");
+
   // This machine's identity, exactly as the approve route resolves it: the assignee a run's ownership
   // gate reads. Undefined only when no identity resolves at all, where the CAS is a verified no-op —
   // the target is approved and left unclaimed, which is what the approve route does there too.
@@ -199,12 +283,44 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
     const reason = "stale" in swap.refused ? swap.refused.stale : swap.refused.ineligible;
     return { skipped: { beadId: top.beadId, reason } };
   }
+  // The claim landed and the label did not. Left alone this is the worst state the pass can produce:
+  // an assignee with no approval and no run, which every later pass reads as "already claimed" and
+  // never re-picks. So the claim comes straight back off, and the target is startable again next
+  // cadence.
+  if ("approveFailed" in swap) {
+    await unwindStart(repoPath, top.beadId, operator, {
+      label: wroteLabel,
+      claim: swap.swap.wrote,
+    });
+    publish();
+    const reason = `the target could not be approved (${swap.approveFailed})`;
+    return { skipped: { beadId: top.beadId, reason } };
+  }
   // Lost the claim race. Abandoned cleanly and NOT retried: the winner holds the target, nothing was
   // written here (the label is contingent on this swap), and the next pass re-decides from a board
   // that now shows their claim.
   if (!swap.ok) {
     const holder = swap.owner ?? "another worker";
     return { skipped: { beadId: top.beadId, reason: `${holder} claimed it first` } };
+  }
+
+  // Settle the reservation across machines before the enqueue, not after: the local swap only
+  // ordered this process, and a run started on a claim that loses the merge is a second machine
+  // working the same target. Only a swap that actually WROTE is settled — a no-op swap took no
+  // reservation of its own to prove.
+  if (operator && swap.wrote) {
+    const settled = await settleClaim(repoPath, top.beadId, operator, input.settle);
+    if ("lost" in settled) {
+      publish();
+      return { skipped: { beadId: top.beadId, reason: settled.lost } };
+    }
+    if ("unverified" in settled) {
+      // Fail closed, like the pre-CAS refresh: a claim we cannot prove must not license a run, and
+      // the writes come off so the next pass re-decides against a target that is free again.
+      await unwindStart(repoPath, top.beadId, operator, { label: wroteLabel, claim: swap.wrote });
+      publish();
+      return { skipped: { beadId: top.beadId, reason: settled.unverified } };
+    }
   }
 
   // The idempotent enqueue: a run already covering this epic locally withholds an id rather than
@@ -216,12 +332,14 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   } catch (e) {
     console.error(`[picker-apply] could not enqueue a run for ${top.beadId}`, e);
     await unwindStart(repoPath, top.beadId, operator, { label: wroteLabel, claim: swap.wrote });
+    publish();
     return { skipped: { beadId: top.beadId, reason: "the run could not be enqueued" } };
   }
   if (!jobId) {
     // A run already covers the epic here — an overlapping pass, or a resumable job from a previous
     // one. The approval and the claim stand (they are what that run needs); no second note is
-    // written, because no second start happened.
+    // written, because no second start happened — but the writes still have to be published.
+    publish();
     return { skipped: { beadId: top.beadId, reason: "a run already covers this target" } };
   }
 
@@ -246,7 +364,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   }).catch((e) => console.error(`[picker-apply] could not log the start of ${top.beadId}`, e));
 
   // Publish the approval and the claim, exactly as the approve route does after its own write.
-  nudgeSync({ id: projectId, repoPath }, "picker-apply");
+  publish();
 
   return { started: { beadId: top.beadId, rank: top.rank, rule: top.rule, jobId } };
 }

@@ -11,7 +11,7 @@
  * not-yet-approved target and this caller then starts a run under somebody else's reservation. A
  * human hits that window once; overlapping picker passes would hit it every ten minutes.
  *
- * Two properties every caller inherits:
+ * Three properties every caller inherits:
  *
  *   • The label is CONTINGENT on the swap. A lost CAS writes nothing at all, so a failed claim can
  *     never leave an `approved` label behind for the next reader to act on.
@@ -19,6 +19,9 @@
  *     answered from a read anything could have moved since; whatever must still hold at the instant
  *     of the write is re-asked here, over a raw `loadAllIssues` (never the snapshot-backed refresh,
  *     whose last-good fallback is right for a view and wrong for a gate about to write).
+ *   • A half-written sequence is REPORTED, not thrown. The one order that can break is a won swap
+ *     followed by a refused label write, and it strands the target — so it comes back as
+ *     `approveFailed` carrying the swap, which is what lets a caller undo its own claim.
  *
  * What it does NOT do is make the swap atomic across machines: the lock is keyed on `repoPath` and
  * so serializes THIS process only (see ./claim). Cross-machine the guard is the CAS itself, which on
@@ -30,12 +33,23 @@ import { withClaimLock, type SwapResult } from "./claim";
 import { loadAllIssues } from "./issues";
 
 /**
- * The sequence's outcome: the swap's own verdict, the caller's refusal, or the bead being gone.
+ * The sequence's outcome: the swap's own verdict, the caller's refusal, the bead being gone, or the
+ * label write failing on top of a won swap.
  *
  * `vanished` is its own variant rather than a guard refusal because every caller has to handle it
  * and none of them can express it: the guard is only ever handed a bead that exists.
+ *
+ * `approveFailed` exists because a thrown label write is NOT the same failure as a lost swap, and an
+ * exception cannot tell them apart. The CAS has already moved the assignee by then, so the caller is
+ * holding a reservation it never approved — a target that reads as claimed to every later pass and
+ * to a human, with no approval and no run behind it. Reported as a value, carrying the swap, so the
+ * caller can take its own writes back (picker-apply's `unwindStart`) instead of stranding them.
  */
-export type ApproveClaimResult<R> = SwapResult | { refused: R } | { vanished: true };
+export type ApproveClaimResult<R> =
+  | SwapResult
+  | { refused: R }
+  | { vanished: true }
+  | { approveFailed: string; swap: Extract<SwapResult, { ok: true }> };
 
 export interface ApproveClaimInput<R> {
   repoPath: string;
@@ -78,8 +92,13 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     if (refused !== undefined) return { refused };
 
     const swap = await cas(input.expectedOwner, input.nextOwner, locked);
+    if (!swap.ok) return swap;
     // Contingent, never speculative: the label goes on only once the reservation is provably ours.
-    if (swap.ok) await beads.approve(repoPath, beadId);
+    try {
+      await beads.approve(repoPath, beadId);
+    } catch (e) {
+      return { approveFailed: e instanceof Error ? e.message : String(e), swap };
+    }
     return swap;
   });
 }

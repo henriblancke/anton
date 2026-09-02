@@ -15,8 +15,9 @@ import type { Bead } from "../beads/types";
 import * as schema from "../db/schema";
 import type { TestDb } from "../db/testing";
 import { makeProjectDb } from "@/lib/testing/project";
+import { nudgeSync } from "../beads/sync-nudge";
 import { listPickerStarts } from "../picker-starts";
-import { applyPickerPlan, POLICY_ACTOR } from "./picker-apply";
+import { applyPickerPlan, POLICY_ACTOR, type ClaimSettleDeps } from "./picker-apply";
 import type { Clock } from "./queue";
 
 const REPO = "/tmp/picker-apply";
@@ -65,6 +66,8 @@ function stubBd(): void {
     pulls += 1;
     if (pullFails) throw new Error("dolt remote unreachable");
   });
+  // A board with no remote: nothing to settle against, so the settle is a single push and out.
+  vi.spyOn(beads, "push").mockImplementation(async () => "not-wired");
   vi.spyOn(beads, "show").mockImplementation(async (_cwd, id) => {
     const b = board.current.get(id);
     if (!b) throw new Error(`no such bead ${id}`);
@@ -101,6 +104,7 @@ beforeEach(() => {
   pullFails = false;
   pulls = 0;
   t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: REPO });
+  vi.mocked(nudgeSync).mockClear();
   stubBd();
 });
 afterEach(() => {
@@ -110,12 +114,24 @@ afterEach(() => {
 });
 
 /** One apply pass over a plan whose top pick is `beadId`. */
-function apply(beadId: string, ranked = 1) {
+function apply(beadId: string, ranked = 1, settle?: ClaimSettleDeps) {
   const entries = [{ beadId, rank: 1, rule: "the work policy armed on this machine" }];
   for (let i = 2; i <= ranked; i += 1) {
     entries.push({ beadId: `filler-${i}`, rank: i, rule: "the work policy armed on this machine" });
   }
-  return applyPickerPlan({ db: t.db, clock, projectId: "p1", repoPath: REPO, entries });
+  return applyPickerPlan({
+    db: t.db,
+    clock,
+    projectId: "p1",
+    repoPath: REPO,
+    entries,
+    ...(settle ? { settle } : {}),
+  });
+}
+
+/** A wired board whose settle window costs nothing — the cross-machine race, without the wait. */
+function wired(over: ClaimSettleDeps = {}): ClaimSettleDeps {
+  return { push: async () => "synced", sleep: async () => {}, ...over };
 }
 
 /** Every execute-epic job this project holds, whatever its status. */
@@ -309,6 +325,108 @@ describe("applyPickerPlan", () => {
 
     expect(read("t1").labels).toContain(LABELS.approved);
     expect(read("t1").assignee).toBeUndefined();
+  });
+
+  it("takes its claim back when the approval itself fails", async () => {
+    // The sharpest strand: the CAS moved the assignee and the label write threw, so without an
+    // unwind the target reads as claimed to every later pass, with no approval and no run behind it.
+    put(bead("t1"));
+    vi.spyOn(beads, "tag").mockRejectedValue(new Error("bd update timed out"));
+
+    const outcome = await apply("t1");
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "could not be approved",
+    );
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
+    // The release still has to reach the other machines that can see the claim.
+    expect(nudgeSync).toHaveBeenCalled();
+  });
+
+  it("publishes the approval and the claim when a run already covers the target", async () => {
+    // The writes landed even though nothing started, and unpublished they are invisible to the
+    // machine whose next pass would then read the target as free.
+    put(bead("t1"));
+    await apply("t1");
+    board.current.get("t1")!.assignee = undefined;
+    vi.mocked(nudgeSync).mockClear();
+
+    await apply("t1");
+
+    expect(nudgeSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("enqueues nothing when the claim does not survive the board merge", async () => {
+    // The local CAS ordered this process only: two machines can both refresh, both find the target
+    // free and both write. Whoever loses the merge must not start a run on a claim it does not hold.
+    put(bead("t1"));
+
+    const outcome = await apply(
+      "t1",
+      1,
+      wired({
+        // The re-read after the settle window: the remote's merge kept the other machine's claim.
+        pull: async () => {
+          board.current.get("t1")!.assignee = "other-box";
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({
+      skipped: { beadId: "t1", reason: "other-box claimed it first" },
+    });
+    expect(await jobs()).toHaveLength(0);
+    expect(notes).toEqual([]);
+    // Not ours to unwind — the label merged too, and the reservation is the winner's now.
+    expect(read("t1").assignee).toBe("other-box");
+  });
+
+  it("starts nothing when the claim cannot be published, and takes its writes back", async () => {
+    // Fail closed, exactly like the pull that precedes the CAS: a claim no other machine can see is
+    // not a claim, so it must not license a run.
+    put(bead("t1"));
+
+    const outcome = await apply(
+      "t1",
+      1,
+      wired({
+        push: async () => {
+          throw new Error("dolt remote unreachable");
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({ skipped: { beadId: "t1" } });
+    expect((outcome as { skipped: { reason: string } }).skipped.reason).toContain(
+      "could not be published",
+    );
+    expect(read("t1").assignee).toBeUndefined();
+    expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    expect(await jobs()).toHaveLength(0);
+  });
+
+  it("starts the pick once the claim reads back as ours", async () => {
+    put(bead("t1"));
+
+    const outcome = await apply("t1", 1, wired());
+
+    expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+    expect(await jobs()).toHaveLength(1);
+  });
+
+  it("does not settle a claim it never wrote", async () => {
+    // A no-op swap (the target already reads as ours) took no reservation of its own, so there is
+    // nothing to prove and no settle window to pay for.
+    put(bead("t1", { assignee: "anton-box" }));
+    const push = vi.fn(async () => "synced" as const);
+
+    await apply("t1", 1, wired({ push }));
+
+    expect(push).not.toHaveBeenCalled();
   });
 
   it("starts nothing on an empty plan", async () => {

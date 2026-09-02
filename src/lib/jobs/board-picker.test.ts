@@ -90,6 +90,25 @@ function prActivity(number: number, state: string): PrActivity {
   return { number, state, url: `https://example.test/pull/${number}`, updatedAtMs: 0, isDraft: false };
 }
 
+/**
+ * A db that trips `controller` on the plan write — the one instant between the write's own signal
+ * gate and the start, which is the window an abort has to be re-checked in.
+ */
+function abortOnPlanWrite(db: TestDb["db"], controller: AbortController): TestDb["db"] {
+  return new Proxy(db, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop) as unknown;
+      if (typeof value !== "function") return value;
+      const fn = value as (...args: unknown[]) => unknown;
+      if (prop !== "insert") return fn.bind(target);
+      return (...args: unknown[]) => {
+        controller.abort();
+        return fn.apply(target, args);
+      };
+    },
+  }) as TestDb["db"];
+}
+
 function fakeCtx(over: Partial<JobContext> = {}): JobContext {
   return {
     jobId: "job-1",
@@ -255,6 +274,23 @@ describe("makeBoardPickerHandler", () => {
     );
 
     expect(beats).toEqual(["beat"]);
+  });
+
+  it("starts NOTHING when the abort lands after the plan is written", async () => {
+    // The plan write's own gate is not enough: `abortProject` aborts this pass AND deletes the
+    // project's queued rows, so a start that ran in the window after it would write `approved` and a
+    // claim to the real board and insert a job the teardown then trips over.
+    board.current = [bead("t1")];
+    arm(t, "apply");
+    const controller = new AbortController();
+
+    await expect(
+      makeBoardPickerHandler({ db: abortOnPlanWrite(t.db, controller), clock })(
+        fakeCtx({ signal: controller.signal }),
+      ),
+    ).rejects.toThrow();
+
+    expect(applyPickerPlan).not.toHaveBeenCalled();
   });
 
   it("writes NOTHING once the pass is cancelled", async () => {

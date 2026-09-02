@@ -7,7 +7,7 @@ import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { formatStructureViolations, structureGaps } from "@/lib/beads/structure";
 import { nudgeSync } from "@/lib/beads/sync-nudge";
-import { conflictBody, ownerOf, stealRefused } from "@/lib/beads/claim";
+import { conflictBody, ownerOf, setAssigneeIfOwner, stealRefused } from "@/lib/beads/claim";
 import { approveAndClaim } from "@/lib/beads/approve-claim";
 import { applyProposal, ProposalApplyError } from "@/lib/gardener/apply";
 import { isProposalBead } from "@/lib/gardener/detections";
@@ -622,6 +622,21 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
       );
     }
     return NextResponse.json({ error: refusal.notRunTarget }, { status: 422 });
+  }
+  // The claim landed and the label did not (PR #218 review). The CAS has already moved the assignee,
+  // so failing the request here would leave the target reserved by an approver who never approved
+  // it — claimed-looking work with no approval and no run. Hand the reservation back to whoever held
+  // it before, then report the failure the operator can retry.
+  if ("approveFailed" in swap) {
+    if (swap.swap.wrote) {
+      await setAssigneeIfOwner(project.repoPath, epicId, operator ?? owner, owner).catch((e) =>
+        console.error(`[approve] could not release the claim on ${epicId} after a failed approval`, e),
+      );
+    }
+    return NextResponse.json(
+      { error: `${epicId} could not be approved — nothing was changed. ${swap.approveFailed}` },
+      { status: 500 },
+    );
   }
   if (!swap.ok) return NextResponse.json(conflictBody(epicId, swap.owner), { status: 409 });
 
