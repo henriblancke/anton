@@ -27,8 +27,12 @@ import {
   type ClaimSettleDeps,
   type ConfirmStart,
   type PickerApplyInput,
+  type PickerHoldVerdict,
 } from "./picker-apply";
 import { enqueueExecuteEpicIfAbsent, type Clock } from "./queue";
+
+/** The flow brake answering "there is review bandwidth", off a verdict that retired no slot. */
+const CLEAR: PickerHoldVerdict = {};
 
 const REPO = "/tmp/picker-apply";
 const NOW = 1_800_000_000_000;
@@ -897,7 +901,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async () => {
           await freeze();
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -912,7 +916,7 @@ describe("applyPickerPlan", () => {
 
   describe("the flow brake behind the start", () => {
     const why = (outcome: unknown) => (outcome as { skipped: { reason: string } }).skipped.reason;
-    const FULL = "3 open PRs are waiting on review — this project pauses new work at 3";
+    const FULL = { hold: "3 open PRs are waiting on review — this project pauses new work at 3" };
 
     it("takes its writes back when the review queue fills while the claim settles", async () => {
       // The hold is derived, never latched, so the verdict the caller cleared this pass against goes
@@ -928,7 +932,7 @@ describe("applyPickerPlan", () => {
             full = true;
           },
         }),
-        { held: async () => (full ? FULL : undefined) },
+        { held: async () => (full ? FULL : CLEAR) },
       );
 
       expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
@@ -952,7 +956,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async (board) => {
           seen.push(board);
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -973,7 +977,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async () => {
           asked += 1;
-          return asked === 1 ? undefined : FULL;
+          return asked === 1 ? CLEAR : FULL;
         },
       });
 
@@ -995,7 +999,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async () => {
           board.current.get("t1")!.assignee = "other-box";
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1021,7 +1025,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked === 2) board.current.get("t1")!.assignee = "other-box";
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1048,7 +1052,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked === 2) put(inReview("t2", 41));
-          return asked >= 3 ? FULL : undefined;
+          return asked >= 3 ? FULL : CLEAR;
         },
       });
 
@@ -1073,7 +1077,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked === 2) put(inReview("t2", 41));
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1094,7 +1098,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked === 2) put(inReview("t2", 42));
-          return asked >= 3 ? FULL : undefined;
+          return asked >= 3 ? FULL : CLEAR;
         },
       });
 
@@ -1102,6 +1106,71 @@ describe("applyPickerPlan", () => {
       expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
       expect(why(outcome)).toContain("waiting on review");
       expect(await jobs()).toHaveLength(0);
+    });
+
+    it("re-asks the brake when a PR its verdict RETIRED is reopened", async () => {
+      // The third input, and the last one no board read can fault (PR #218 review): the verdict
+      // cleared this pass by dropping t2's CLOSED PR from the count, and a closed PR is deliberately
+      // left on the board — ref, stage and all. Reopening it refills the slot with the identical
+      // `(bead, PR)` pair on both sides of the fresh read, so `filledSince` sees nothing at all and
+      // only another confirmation can.
+      put(bead("t1"), inReview("t2", 41));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          return asked >= 3 ? FULL : { retired: ["t2#41"] };
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("waiting on review");
+      expect(await jobs()).toHaveLength(0);
+      expect(notes).toEqual([]);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
+    });
+
+    it("starts once a second verdict retires exactly the same slots", async () => {
+      // The other side of that reconciliation, and what makes it terminate: two verdicts retiring the
+      // same slots agree about the PR states under them, so the standing one is covered and the pass
+      // starts. Costs one extra confirmation, and only on a project whose queue is at the limit.
+      put(bead("t1"), inReview("t2", 41));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          return { retired: ["t2#41"] };
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ started: { beadId: "t1" } });
+      expect(await jobs()).toHaveLength(1);
+    });
+
+    it("stands down when the queue's own PRs keep changing state under the confirmation", async () => {
+      // Bounded like the other two halves, and worded for its own cause: PRs merging and reopening
+      // faster than they can be confirmed never converge, and a start cannot be taken back.
+      put(bead("t1"), inReview("t2", 41));
+      let asked = 0;
+
+      const outcome = await apply("t1", 1, wired(), {
+        held: async () => {
+          asked += 1;
+          return { retired: [`t2#4${asked}`] };
+        },
+      });
+
+      expect(asked).toBe(3);
+      expect(outcome).toMatchObject({ skipped: { beadId: "t1", wroteBoard: false } });
+      expect(why(outcome)).toContain("kept changing state");
+      expect(await jobs()).toHaveLength(0);
+      expect(read("t1").assignee).toBeUndefined();
+      expect(read("t1").labels ?? []).not.toContain(LABELS.approved);
     });
 
     it("re-asks the brake when the operator lowers the limit while the SECOND confirmation runs", async () => {
@@ -1116,7 +1185,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked === 2) setWipLimit(1);
-          return asked >= 3 ? FULL : undefined;
+          return asked >= 3 ? FULL : CLEAR;
         },
       });
 
@@ -1140,7 +1209,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked === 2) setWipLimit(9);
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1157,7 +1226,7 @@ describe("applyPickerPlan", () => {
       let limit = 3;
 
       const outcome = await apply("t1", 1, wired(), {
-        held: async () => undefined,
+        held: async () => CLEAR,
         wipLimit: async () => limit--,
       });
 
@@ -1194,7 +1263,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           asked += 1;
           if (asked >= 2) put(inReview(`t${asked}`, 40 + asked));
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1220,7 +1289,7 @@ describe("applyPickerPlan", () => {
             const b = board.current.get("t1")!;
             b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
           }
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1244,7 +1313,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async () => {
           board.current.get("t1")!.assignee = undefined;
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1267,7 +1336,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           const b = board.current.get("t1")!;
           b.labels = [...((b.labels as string[]) ?? []), LABELS.agentHuman];
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1288,7 +1357,7 @@ describe("applyPickerPlan", () => {
         held: async () => {
           const b = board.current.get("t1")!;
           b.labels = ((b.labels as string[]) ?? []).filter((l) => l !== LABELS.approved);
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1307,7 +1376,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async () => {
           arm({}, "shadow");
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1327,7 +1396,7 @@ describe("applyPickerPlan", () => {
       const outcome = await apply("t1", 1, wired(), {
         held: async () => {
           arm({ types: ["bug"] });
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1528,7 +1597,7 @@ describe("applyPickerPlan", () => {
         signal: controller.signal,
         held: async () => {
           controller.abort();
-          return undefined;
+          return CLEAR;
         },
       });
 
@@ -1710,10 +1779,10 @@ describe("pickerWipHold", () => {
       readPrActivity: open,
     });
 
-    const reason = await held([inReview("a", 11), inReview("b", 12), inReview("c", 13)]);
+    const { hold } = await held([inReview("a", 11), inReview("b", 12), inReview("c", 13)]);
 
-    expect(reason).toContain("pauses new work at 3");
-    expect(reason).toContain("#11, #12, #13");
+    expect(hold).toContain("pauses new work at 3");
+    expect(hold).toContain("#11, #12, #13");
   });
 
   it("clears the start while the operator still has review bandwidth", async () => {
@@ -1723,7 +1792,9 @@ describe("pickerWipHold", () => {
       readPrActivity: open,
     });
 
-    expect(await held([inReview("a", 11), inReview("b", 12)])).toBeUndefined();
+    // Under the limit the brake reads no PR at all, so the verdict rests on the board alone and
+    // retires nothing for the apply to reconcile.
+    expect(await held([inReview("a", 11), inReview("b", 12)])).toEqual({ retired: [] });
   });
 
   it("reads its own board when the caller has none to hand over", async () => {
@@ -1734,7 +1805,7 @@ describe("pickerWipHold", () => {
       readPrActivity: open,
     });
 
-    expect(await held()).toContain("pauses new work at 3");
+    expect((await held()).hold).toContain("pauses new work at 3");
   });
 
   it("fails closed when the queue cannot be read at all", async () => {
@@ -1743,6 +1814,6 @@ describe("pickerWipHold", () => {
     vi.mocked(loadAllIssues).mockRejectedValueOnce(new Error("bd is down"));
     const held = pickerWipHold(t.db, { projectId: "p1", repoPath: REPO, readPrActivity: open });
 
-    expect(await held()).toContain("could not be checked before starting");
+    expect((await held()).hold).toContain("could not be checked before starting");
   });
 });

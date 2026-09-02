@@ -79,48 +79,70 @@ function msOf(value: unknown): number | undefined {
  *
  * The prune keeps the NEWEST rows, by the same order the read below returns them, so what a reader
  * loses is always the oldest and never a row the page was about to show.
+ *
+ * Insert AND prune in one IMMEDIATE transaction (PR #218 review), the same way the veto settles its
+ * own race: two passes recording starts for one project can otherwise interleave, and a prune that
+ * read its keep-list before the other's insert would delete that newer row for being absent from a
+ * snapshot taken before it existed — silently losing the newest entry in the very log that exists to
+ * report the newest unattended start. Taking the write lock before the keep-list is read is what
+ * makes the delete judge a table nothing can have appended to.
  */
 export async function recordPickerStart(
   db: AntonDb,
   clock: Clock,
   input: RecordStartInput,
 ): Promise<void> {
-  await db.insert(schema.pickerStarts).values({
-    id: randomUUID(),
-    projectId: input.projectId,
-    beadId: input.beadId,
-    rank: input.rank,
-    ranked: input.ranked,
-    rule: input.rule,
-    jobId: input.jobId ?? null,
-    startedAt: secDate(clock.now()),
-  });
-  await prunePickerStarts(db, input.projectId);
+  const startedAt = secDate(clock.now());
+  db.transaction(
+    (tx) => {
+      tx.insert(schema.pickerStarts)
+        .values({
+          id: randomUUID(),
+          projectId: input.projectId,
+          beadId: input.beadId,
+          rank: input.rank,
+          ranked: input.ranked,
+          rule: input.rule,
+          jobId: input.jobId ?? null,
+          startedAt,
+        })
+        .run();
+      prunePickerStarts(tx, input.projectId);
+    },
+    { behavior: "immediate" },
+  );
 }
 
 /**
  * Drop everything past the retention window for one project.
  *
  * Scoped to the project, like the hygiene prune it mirrors: retention is per project, and a global
- * prune would let a busy board evict a quiet one's whole history.
+ * prune would let a busy board evict a quiet one's whole history. Runs inside its caller's
+ * transaction, so the keep-list it reads is the table the delete acts on.
  */
-async function prunePickerStarts(db: AntonDb, projectId: string): Promise<void> {
-  const kept = await db
+function prunePickerStarts(
+  tx: Pick<AntonDb, "select" | "delete">,
+  projectId: string,
+): void {
+  const kept = tx
     .select({ id: schema.pickerStarts.id })
     .from(schema.pickerStarts)
     .where(eq(schema.pickerStarts.projectId, projectId))
     .orderBy(desc(schema.pickerStarts.startedAt), NEWEST_FIRST)
-    .limit(PICKER_START_RETENTION);
+    .limit(PICKER_START_RETENTION)
+    .all();
   if (kept.length < PICKER_START_RETENTION) return;
-  await db.delete(schema.pickerStarts).where(
-    and(
-      eq(schema.pickerStarts.projectId, projectId),
-      notInArray(
-        schema.pickerStarts.id,
-        kept.map((row) => row.id),
+  tx.delete(schema.pickerStarts)
+    .where(
+      and(
+        eq(schema.pickerStarts.projectId, projectId),
+        notInArray(
+          schema.pickerStarts.id,
+          kept.map((row) => row.id),
+        ),
       ),
-    ),
-  );
+    )
+    .run();
 }
 
 /** This project's unattended starts, newest first. */

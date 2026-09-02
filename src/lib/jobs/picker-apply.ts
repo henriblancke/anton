@@ -55,7 +55,7 @@ import {
 } from "../projects";
 import { armedPickerPolicy } from "./picker-policy";
 import { ineligibility } from "./picker-targets";
-import { checkWipLimit, type ReadPrActivity } from "./picker-wip-hold";
+import { confirmWipQueue, type ReadPrActivity } from "./picker-wip-hold";
 import { inReviewTargets } from "./run-health";
 import {
   activeExecuteEpicId,
@@ -184,11 +184,24 @@ export type PickerStanceCheck = (target: Bead, board: Bead[]) => Promise<string 
 export type PickerDisarmCheck = () => Promise<string | undefined>;
 
 /**
- * Is the operator's review queue full right now? Answers with the hold's own copy, or undefined
- * while there is bandwidth — the third of the three brakes, asked in the same shape as the other
- * two. Takes the board to judge, so a caller holding a fresh one spends no second `bd list`.
+ * What the flow brake answered: the hold's own copy while the queue is full, and the slots the
+ * verdict took off the board's count to reach it (PR #218 review).
+ *
+ * The other two brakes answer with a bare reason; this one cannot, because a CLEARING verdict of its
+ * own rests on PR states no later board read can re-check. See {@link WipQueueVerdict}.
  */
-export type PickerHoldCheck = (board?: Bead[]) => Promise<string | undefined>;
+export interface PickerHoldVerdict {
+  hold?: string;
+  /** The retired slots, keyed as {@link slotKey} — empty whenever the verdict read no PR at all. */
+  retired?: readonly string[];
+}
+
+/**
+ * Is the operator's review queue full right now? Answers with the hold's own copy, or nothing while
+ * there is bandwidth — the third of the three brakes, asked in the same shape as the other two.
+ * Takes the board to judge, so a caller holding a fresh one spends no second `bd list`.
+ */
+export type PickerHoldCheck = (board?: Bead[]) => Promise<PickerHoldVerdict>;
 
 /**
  * Re-resolve the picker's stance and judge the target against it (PR #218 review).
@@ -276,16 +289,19 @@ export function pickerWipHold(
 ): PickerHoldCheck {
   return async (board) => {
     try {
-      const hold = await checkWipLimit(db, {
+      const { hold, retired } = await confirmWipQueue(db, {
         projectId: input.projectId,
         repoPath: input.repoPath,
         board: board ?? (await loadAllIssues(input.repoPath)),
         ...(input.signal ? { signal: input.signal } : {}),
         ...(input.readPrActivity ? { readPrActivity: input.readPrActivity } : {}),
       });
-      return hold ? describeWipHold(hold) : undefined;
+      return {
+        ...(hold ? { hold: describeWipHold(hold) } : {}),
+        retired: retired.map((slot) => slotKey(slot.beadId, slot.prNumber)),
+      };
     } catch (e) {
-      return `the review queue could not be checked before starting (${errorText(e)})`;
+      return { hold: `the review queue could not be checked before starting (${errorText(e)})` };
     }
   };
 }
@@ -305,7 +321,7 @@ export function pickerWipHold(
  */
 export type PickerWipLimitCheck = () => Promise<number | undefined>;
 
-/** {@link PickerWipLimitCheck} over this pass's own db — the settings read `checkWipLimit` makes. */
+/** {@link PickerWipLimitCheck} over this pass's own db — the settings read `confirmWipQueue` makes. */
 export function pickerWipLimit(db: AntonDb, projectId: string): PickerWipLimitCheck {
   return async () => {
     try {
@@ -578,11 +594,12 @@ async function stillStartable(
  * Has a run joined the review queue that a given verdict never judged? (PR #218 review)
  *
  * The flow brake's verdict is taken over one board and spent on a later one, with a `gh pr view` per
- * waiting PR in between — minutes, at that read's ceiling. Confirming can only SHRINK the queue: a
- * merged or closed PR drops out of the count and nothing joins it, because joining means a RUN
- * reaching `stage:in-review`, which only the board can show. So a later board whose in-review targets
- * are all ones the verdict already weighed cannot have filled a slot it cleared, and the verdict
- * stands. One it has never seen can, and only a fresh verdict can say whether it did.
+ * waiting PR in between — minutes, at that read's ceiling. Confirming can only shrink the queue by
+ * anything the BOARD shows: joining it means a run reaching `stage:in-review`, which only the board
+ * can show. So a later board whose in-review targets are all ones the verdict already weighed cannot
+ * have filled a slot it cleared this way, and the verdict stands. One it has never seen can, and only
+ * a fresh verdict can say whether it did. (A slot the verdict retired can refill with no board change
+ * at all; that half is reconciled by {@link sameRetired}.)
  *
  * Compared by (bead id, PR number) against the same `inReviewTargets` join the brake itself counts,
  * so the two cannot disagree about what occupies a slot. The PR number is half the identity (PR #218
@@ -592,9 +609,33 @@ async function stillStartable(
  * enqueue past the configured limit.
  */
 function filledSince(judged: Bead[], fresh: Bead[]): boolean {
-  const slotId = (slot: { bead: Bead; prNumber: number }) => `${slot.bead.id}#${slot.prNumber}`;
-  const weighed = new Set(inReviewTargets(judged).map(slotId));
-  return inReviewTargets(fresh).some((slot) => !weighed.has(slotId(slot)));
+  const weighed = new Set(inReviewTargets(judged).map((s) => slotKey(s.bead.id, s.prNumber)));
+  return inReviewTargets(fresh).some((s) => !weighed.has(slotKey(s.bead.id, s.prNumber)));
+}
+
+/** One review slot's identity, shared by the two reconciliations that compare slots across reads. */
+function slotKey(beadId: string, prNumber: number): string {
+  return `${beadId}#${prNumber}`;
+}
+
+/**
+ * Have the slots a verdict RETIRED changed under it? (PR #218 review)
+ *
+ * The board half of the reconciliation ({@link filledSince}) rests on confirming being able only to
+ * SHRINK the queue — true of a merge, which retires its bead off the board, and false of a CLOSE,
+ * which leaves the bead's stage and PR ref exactly where they were so a recovery re-run can find
+ * them. REOPENING such a PR refills the slot the verdict cleared the pass into, with no board change
+ * for the fresh read to catch and the same `(bead, PR)` pair on both sides.
+ *
+ * Nothing the board says can settle that, so it is settled the only way it can be: two consecutive
+ * verdicts retiring the same slots agree about the PR states underneath them, and a reopen shows up
+ * as the second verdict counting a slot the first did not — as a HOLD when it fills the limit, and
+ * as a shrunken retired set when it does not.
+ */
+function sameRetired(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const weighed = new Set(a);
+  return b.every((key) => weighed.has(key));
 }
 
 /**
@@ -923,7 +964,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // on the far side of that confirmation, for the slot it can itself age behind. See
   // {@link pickerWipHold}.
   const holding = await held(settledBoard);
-  if (holding) return standDown(holding);
+  if (holding.hold) return standDown(holding.hold);
 
   // THEN the board is re-read, because that confirmation is the one await left in this window that
   // can run for MINUTES and everything below it is judged against the board (PR #218 review): another
@@ -980,7 +1021,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // `stage:in-review` while the first call confirmed its PRs fills the very slot that call cleared
   // the pass into, and only a verdict taken on the far side of that confirmation can see it. Free
   // wherever the board still shows bandwidth — under the limit the hold spawns no `gh` at all (see
-  // {@link checkWipLimit}). Asked before the settings brakes for the same reason the first call is:
+  // {@link confirmWipQueue}). Asked before the settings brakes for the same reason the first call is:
   // they are the correctness half, and they get the last word.
   //
   // Its limit is snapshotted on the NEAR side, because the verdict resolves its own copy between
@@ -990,7 +1031,7 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   const judgedLimit = await wipLimit();
   if (judgedLimit === undefined) return standDown(LIMIT_UNREADABLE);
   const stillHolding = await held(gate.board);
-  if (stillHolding) return standDown(stillHolding);
+  if (stillHolding.hold) return standDown(stillHolding.hold);
 
   // And the board ONE more time, on the far side of that second confirmation (PR #218 review). It
   // can block for exactly as long as the first — a `gh pr view` per waiting PR — and a verdict it
@@ -1008,16 +1049,24 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   // extra `gh` at all. A queue filling faster than it can be confirmed never converges, so the pass
   // fails closed rather than spinning: the target is startable again next cadence.
   //
-  // The verdict's OTHER input is reconciled the same way (PR #218 review): the operator's limit is
-  // resolved when the brake is asked, so one lowered — or switched on from `0` — while those PRs
-  // were confirmed leaves a verdict no board read can fault, since no bead joined the queue. So the
-  // limit is carried beside the board and re-asked on the same terms. Costs one settings read per
-  // pass, and a limit nobody touched re-asks nothing at all.
+  // The verdict's OTHER TWO inputs are reconciled the same way, because neither is on the board
+  // either (PR #218 review). The operator's limit is resolved when the brake is asked, ahead of its
+  // `gh pr view` per waiting PR, so one lowered — or switched on from `0` — inside that confirmation
+  // leaves a verdict no board read can fault, since no bead joined the queue. And the slots the
+  // verdict RETIRED are PR states, not board state: a closed PR keeps its stage and its ref so a
+  // recovery re-run can find it, so reopening one refills a slot with the same `(bead, PR)` pair on
+  // both sides of the read. So both are carried beside the board and re-asked on the same terms — a
+  // verdict that retired nothing is covered by the fresh read alone, and one that retired a slot is
+  // covered once a second verdict retires exactly the same slots (see {@link sameRetired}). Costs one
+  // settings read per pass, and — on a project with review bandwidth, where the brake reads no PR at
+  // all — no extra `gh`.
   //
   // This is the LAST board read before the enqueue, and no blocking await sits between it and the
   // insert — only the local reads below.
   let judged = gate.board;
   let limit = judgedLimit;
+  let retired = stillHolding.retired ?? [];
+  let alreadyRetired: readonly string[] | undefined;
   let final: GateRead;
   for (let confirmations = 2; ; confirmations += 1) {
     const fresh = await refreshGate();
@@ -1032,16 +1081,23 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
         ? "the review limit kept changing while the queue was confirmed"
         : filledSince(judged, fresh.board)
           ? "the review queue kept filling while it was confirmed"
-          : undefined;
+          : // A verdict that retired nothing rests only on what this read just re-confirmed; one
+            // that retired a slot needs a second verdict to agree with it, and only reaches the
+            // stand-down below once those two keep disagreeing.
+            retired.length > 0 && !(alreadyRetired && sameRetired(alreadyRetired, retired))
+            ? "the review queue's own PRs kept changing state while it was confirmed"
+            : undefined;
     if (!drifted) {
       final = fresh;
       break;
     }
     if (confirmations >= FLOW_CONFIRMATION_LIMIT) return standDown(drifted);
     const refilled = await held(fresh.board);
-    if (refilled) return standDown(refilled);
+    if (refilled.hold) return standDown(refilled.hold);
     judged = fresh.board;
     limit = freshLimit;
+    alreadyRetired = retired;
+    retired = refilled.retired ?? [];
   }
   const { board: finalBoard, target } = final;
 
