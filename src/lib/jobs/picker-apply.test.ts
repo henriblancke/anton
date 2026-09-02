@@ -15,6 +15,7 @@ import type { Bead } from "../beads/types";
 import * as schema from "../db/schema";
 import type { TestDb } from "../db/testing";
 import { makeProjectDb } from "@/lib/testing/project";
+import { listPickerStarts } from "../picker-starts";
 import { applyPickerPlan, POLICY_ACTOR } from "./picker-apply";
 import type { Clock } from "./queue";
 
@@ -145,6 +146,34 @@ describe("applyPickerPlan", () => {
           "machine. Nobody approved this: this project's picker autonomy is set to apply.",
       },
     ]);
+  });
+
+  it("logs the start where the operator reads it, not only on the bead", async () => {
+    // anton-vfvg: the bead note answers a reader already looking at the bead; the Health page's
+    // decision log answers one who does not yet know anything happened.
+    put(bead("t1"));
+
+    const outcome = await apply("t1", 3);
+
+    const jobId = (outcome as { started: { jobId: string } }).started.jobId;
+    expect(await listPickerStarts(t.db, "p1")).toEqual([
+      {
+        beadId: "t1",
+        rank: 1,
+        ranked: 3,
+        rule: "the work policy armed on this machine",
+        jobId,
+        startedAtMs: NOW,
+      },
+    ]);
+  });
+
+  it("logs nothing when the pass started nothing", async () => {
+    put(bead("t1", { assignee: "henri" }));
+
+    await apply("t1");
+
+    expect(await listPickerStarts(t.db, "p1")).toEqual([]);
   });
 
   it("never takes a target a human claimed, and writes nothing when it finds one", async () => {

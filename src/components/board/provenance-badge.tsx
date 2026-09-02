@@ -9,8 +9,13 @@ import { MetaChip } from "@/components/atoms";
  * The mark every automated writer signs with. ONE glyph, so a card's provenance is scannable as a
  * class before it is read as a word — which is the whole reason three writers share a grammar
  * instead of each inventing an indicator (R3.7).
+ *
+ * Exported because the Health page's decision log signs its entries with the same mark from a Server
+ * Component, where this badge cannot go: it hands `Link` an `onClick` for the board cards it sits on
+ * top of, and a function prop does not cross the server boundary. The GLYPH is the part of the
+ * grammar that must not drift, so it is shared rather than retyped.
  */
-const MARK = "◈";
+export const PROVENANCE_MARK = "◈";
 
 /** How one writer introduces itself: the word after the mark, where it lands, and what it claims. */
 interface ProvenanceGrammar {
@@ -98,7 +103,7 @@ export function ProvenanceBadge({
       )}
     >
       <MetaChip className="transition-colors hover:border-ring/40 hover:text-foreground">
-        <span aria-hidden="true">{MARK}</span>
+        <span aria-hidden="true">{PROVENANCE_MARK}</span>
         {grammar.label}
       </MetaChip>
     </Link>

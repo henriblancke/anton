@@ -559,6 +559,14 @@ export async function pickerTrackRecord(
   return { accepted, declined: rows.length - accepted, settled: rows.length };
 }
 
+/** UI read path over the shared anton.db — the decision log's half of the verdict record. */
+export function latestPickerVerdicts(
+  projectId: string,
+  limit?: number,
+): Promise<PickerVerdictRow[]> {
+  return listPickerVerdicts(getDb(), projectId, limit);
+}
+
 /** This project's verdicts, newest first — the audit trail behind the counts above. */
 export async function listPickerVerdicts(
   db: AntonDb,

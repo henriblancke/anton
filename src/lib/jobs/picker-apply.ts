@@ -33,6 +33,7 @@ import { setAssigneeIfOwner } from "../beads/claim";
 import { nudgeSync } from "../beads/sync-nudge";
 import type { PickerPlanEntry } from "../board-picker-plan";
 import { resolveOperator } from "../operator";
+import { recordPickerStart } from "../picker-starts";
 import { ineligibility } from "./picker-targets";
 import { enqueueExecuteEpicIfAbsent, type AntonDb, type Clock } from "./queue";
 
@@ -230,6 +231,19 @@ export async function applyPickerPlan(input: PickerApplyInput): Promise<PickerAp
   await beads
     .note(repoPath, top.beadId, pickerStartNote(top, entries.length), POLICY_ACTOR)
     .catch((e) => console.error(`[picker-apply] could not note the start of ${top.beadId}`, e));
+
+  // The operator-facing half of the same record (anton-vfvg): the note answers a reader already
+  // looking at the bead, this answers one who does not yet know anything happened. Best-effort for
+  // the same reason as the note — the run exists either way, and losing the log entry must not be
+  // reported as a failed start.
+  await recordPickerStart(db, clock, {
+    projectId,
+    beadId: top.beadId,
+    rank: top.rank,
+    ranked: entries.length,
+    rule: top.rule,
+    jobId,
+  }).catch((e) => console.error(`[picker-apply] could not log the start of ${top.beadId}`, e));
 
   // Publish the approval and the claim, exactly as the approve route does after its own write.
   nudgeSync({ id: projectId, repoPath }, "picker-apply");

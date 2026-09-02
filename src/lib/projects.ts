@@ -1241,7 +1241,8 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
 /**
  * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
- * picker verdicts → hygiene → scan summaries → autopilot disarms → escalations → projects.
+ * picker verdicts → picker starts → hygiene → scan summaries → autopilot disarms → escalations →
+ * projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
   try {
@@ -1259,6 +1260,7 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
         .delete(schema.pickerVerdicts)
         .where(eq(schema.pickerVerdicts.projectId, projectId))
         .run();
+      tx.delete(schema.pickerStarts).where(eq(schema.pickerStarts.projectId, projectId)).run();
       tx.delete(schema.hygieneReports).where(eq(schema.hygieneReports.projectId, projectId)).run();
       tx.delete(schema.scanSummaries).where(eq(schema.scanSummaries.projectId, projectId)).run();
       // Before the escalations they point at, and before the project they reference: a project

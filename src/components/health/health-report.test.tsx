@@ -20,6 +20,7 @@ function health(over: Partial<ProjectHealth> = {}): ProjectHealth {
     scanHealth: undefined,
     trajectory: undefined,
     stoppedCount: 0,
+    pickerLog: [],
     ...over,
   };
 }
