@@ -70,11 +70,10 @@ const {
   undoCancelledTicketGates,
   HUMAN_GATE_ARMED_LABEL,
   liveArmedAsk,
-  NeedsHumanError,
   reconcileCancelledArmedPark,
   settleArmedAsk,
-  StrandedHumanGateError,
-} = await import("./execute-epic");
+} = await import("./execute-epic-human-gate");
+const { NeedsHumanError, StrandedHumanGateError } = await import("./execute-epic-errors");
 
 const REPO = "/tmp/anton";
 const TICKET = "t-1";
@@ -1480,6 +1479,34 @@ describe("preflightHumanTickets — classifying again after the arm's own board 
         `${MAX_HUMAN_TICKET_PASSES} arming passes`),
     );
     expect(gateCreateMock).toHaveBeenCalledTimes(MAX_HUMAN_TICKET_PASSES);
+  });
+
+  it("takes back a relabelled ticket's wait even on the pass that hands the run back", async () => {
+    // The budget refusal is a plain Error, so the retry re-enters at the top of the handler — where
+    // the readiness gate (step 0a-bis) parks on the very gate this pass left standing, long before
+    // any preflight could retire it. A wait for work an agent now runs would then need a person's
+    // `bd gate resolve` to ever come off the board.
+    const ids = Array.from({ length: MAX_HUMAN_TICKET_PASSES + 1 }, (_, i) => `t-${i}`);
+    const humanThrough = (n: number) => ids.map((id, i) => child(id, i <= n));
+    board = [target(), ...humanThrough(0)];
+    gateCreateMock.mockImplementation(async () => {
+      const n = gateCreateMock.mock.calls.length;
+      // The last arm also hands t-0 back to an agent: the final pass has a relabelled ticket to
+      // retire AND a newcomer that exhausts the budget.
+      const settled = humanThrough(n);
+      board = [target(), ...(n === MAX_HUMAN_TICKET_PASSES ? [child("t-0", false), ...settled.slice(1)] : settled)];
+      return `g-${n}`;
+    });
+
+    await expect(preflight(ids.map((id, i) => child(id, i === 0)))).rejects.toThrow(
+      /kept finding newly-labelled/,
+    );
+    expect(gateResolveMock).toHaveBeenCalledWith(
+      REPO,
+      "g-1", // t-0's wait, armed by the first pass
+      expect.stringContaining(`no longer labelled ${LABELS.agentHuman}`),
+    );
+    expect(untagMock).toHaveBeenCalledWith(REPO, "g-1", [HUMAN_GATE_ARMED_LABEL]);
   });
 
   it("hands the run back when a child is ATTACHED while its human tickets are gated", async () => {
