@@ -43,9 +43,37 @@ export interface BuildDrift {
   bootedAt: number | null;
 }
 
-/** This install's anton.db path — resolved exactly as `getDb` resolves it, so the record lands beside it. */
-function dbPath(): string {
-  return process.env.ANTON_DB ?? join(process.cwd(), "anton.db");
+function readCwd(): string | null {
+  try {
+    return process.cwd();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The runtime directory, captured while it still exists.
+ *
+ * `anton update` (scripts/install.sh) moves the live runtime dir aside and deletes it, so a server
+ * that booted from it is left with a cwd that no longer resolves — `process.cwd()` throws ENOENT
+ * from then on. That upgrade is precisely the drift this module reports, so it must survive it:
+ * holding the pathname keeps every later read pointed at the replacement that took its place.
+ */
+let appRootCache: string | null = readCwd();
+
+function appRoot(): string | null {
+  return (appRootCache ??= readCwd());
+}
+
+/**
+ * This install's anton.db path — resolved exactly as `getDb` resolves it, so the record lands beside
+ * it. Null only when the cwd was already gone before this module ever loaded and no `ANTON_DB` names
+ * the state dir; there is nothing left to read a record from in that case.
+ */
+function dbPath(): string | null {
+  if (process.env.ANTON_DB) return process.env.ANTON_DB;
+  const root = appRoot();
+  return root ? join(root, "anton.db") : null;
 }
 
 /**
@@ -69,7 +97,8 @@ let onDiskCache: { at: number; identity: BuildIdentity } | null = null;
 function onDiskIdentity(): BuildIdentity {
   const now = Date.now();
   if (onDiskCache && now - onDiskCache.at < ON_DISK_TTL_MS) return onDiskCache.identity;
-  const identity = readBuildIdentity(process.cwd()) as BuildIdentity;
+  const root = appRoot();
+  const identity = root ? (readBuildIdentity(root) as BuildIdentity) : { version: null, revision: null };
   onDiskCache = { at: now, identity };
   return identity;
 }
@@ -84,7 +113,8 @@ function onDiskIdentity(): BuildIdentity {
  */
 export function recordServerBuild(): void {
   bootedFrom = onDiskIdentity();
-  writeBuildRecord(buildRecordPath(dbPath()), bootedFrom);
+  const db = dbPath();
+  if (db) writeBuildRecord(buildRecordPath(db), bootedFrom);
 }
 
 /**
@@ -101,14 +131,16 @@ export function recordServerBuild(): void {
  * job — it has the pidfile to prove one is up.
  */
 export function serverBuildDrift(): BuildDrift | null {
-  const recordPath = buildRecordPath(dbPath());
-  const record = readBuildRecord(recordPath);
+  const db = dbPath();
+  const recordPath = db ? buildRecordPath(db) : null;
+  const record = recordPath ? readBuildRecord(recordPath) : null;
   if (!record && bootedFrom) {
     const verdict = compareBuild(bootedFrom, onDiskIdentity());
     return verdict.state === "current" ? null : ({ ...verdict, bootedAt: null } as BuildDrift);
   }
+  if (!recordPath) return null;
   return buildDrift({
-    appRoot: process.cwd(),
+    appRoot: appRoot(),
     recordPath,
     record,
     onDisk: onDiskIdentity(),

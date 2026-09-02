@@ -9,7 +9,8 @@
  * `anton-release.test.ts` — over the harness they all share, `anton.fixture.ts`.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
@@ -333,17 +334,46 @@ describe("anton doctor — stale server build", () => {
 
   afterEach(dirs.cleanup);
 
-  /** Point doctor's state dir at a temp dir and leave `record` there as the running server's stamp. */
-  async function runDoctorWith(record: object | null, { daemonPid }: { daemonPid?: number } = {}) {
+  const servers: Server[] = [];
+
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map((s) => new Promise((done) => s.close(done))));
+  });
+
+  /** Serve `body` on a free port, so doctor's liveness probe has something real to ask. */
+  async function serve(body: string): Promise<number> {
+    const server = createServer((_req, res) => res.end(body));
+    servers.push(server);
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    return (server.address() as { port: number }).port;
+  }
+
+  /**
+   * Point doctor's state dir at a temp dir and leave `record` there as the running server's stamp.
+   *
+   * The port is pinned per case because doctor now probes it: left to default, a suite run on the
+   * developer's own machine would find THEIR anton on 3000 and flip every "nothing is running" case.
+   */
+  async function runDoctorWith(
+    record: object | null,
+    { daemonPid, port = 1 }: { daemonPid?: number; port?: number } = {},
+  ) {
     const home = await dirs.make("anton-home-");
     const state = await dirs.make("anton-state-");
     if (record) writeFileSync(join(state, "server-build.json"), JSON.stringify(record));
     if (daemonPid) writeFileSync(join(state, "anton.pid"), String(daemonPid));
-    return spawnSync(process.execPath, [CLI, "doctor"], {
-      encoding: "utf8",
+    // Spawned ASYNCHRONOUSLY on purpose: doctor probes the port, and `spawnSync` would block this
+    // process's event loop — the very loop the stub server above answers from.
+    const child = spawn(process.execPath, [CLI, "doctor", "--port", String(port)], {
       cwd: await dirs.make("anton-cwd-"),
       env: { ...process.env, HOME: home, ANTON_DB: join(state, "anton.db"), ANTON_STATE_DIR: state },
     });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.resume();
+    await new Promise((done) => child.on("close", done));
+    return { stdout };
   }
 
   // The vitest process itself stands in for the running server: its pid is alive, which is the only
@@ -370,6 +400,23 @@ describe("anton doctor — stale server build", () => {
     const r = await runDoctorWith(null, { daemonPid: process.pid });
     expect(r.stdout).toContain("recorded no build identity");
     expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // A source checkout's `anton dev` / `anton start` writes no pidfile, so on the first upgrade past
+  // this change — an old server, no record, no daemon — the port is the only evidence anton has.
+  // Without it doctor calls that exact case "nothing running" and the stale server stays silent.
+  it("reports a source-mode server answering the port but leaving no record", async () => {
+    const r = await runDoctorWith(null, { port: await serve("<html><head><title>anton</title></head>") });
+    expect(r.stdout).toContain("recorded no build identity");
+    expect(r.stdout).toContain("Restart it to run the build on disk");
+  });
+
+  // Any dev server can hold the port. Claiming a stranger's is anton would send the operator to
+  // restart a server that was never up.
+  it("does not claim another app on the port is a stale anton", async () => {
+    const r = await runDoctorWith(null, { port: await serve("<html><head><title>grafana</title></head>") });
+    expect(r.stdout).toContain("no running server recorded");
+    expect(r.stdout).not.toContain("Restart it");
   });
 
   it("stays silent for a server started from the current checkout", async () => {

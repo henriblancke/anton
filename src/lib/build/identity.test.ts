@@ -16,13 +16,16 @@ import { join } from "node:path";
 import {
   BUILD_RECORD_FILE,
   buildDrift,
+  buildMatchesCheckout,
   buildRecordPath,
+  buildStampPath,
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
   readBuildIdentity,
   readBuildRecord,
   writeBuildRecord,
+  writeBuildStamp,
 } from "./identity.mjs";
 
 const RUNNING = { version: "0.4.0", revision: "a".repeat(40) };
@@ -145,6 +148,51 @@ describe("the record a running server leaves", () => {
     writeFileSync(join(dir, "junk.json"), "{not json");
     expect(readBuildRecord(join(dir, "junk.json"))).toBeNull();
     expect(readBuildRecord(join(dir, "absent.json"))).toBeNull();
+  });
+});
+
+/**
+ * The stamp on the COMPILED output. Everything else here compares the running process against the
+ * checkout; this compares the checkout against the artifact `next start` would actually serve —
+ * without it, a source start on a `.next` built at an older commit boots stamping the new commit and
+ * every drift surface reports a stale server as current.
+ */
+describe("buildMatchesCheckout", () => {
+  /** A checkout at `version`/`revision` whose `.next` was compiled from `builtFrom` (if given). */
+  function checkout(onDisk: { version: string; revision: string | null }, builtFrom?: object) {
+    const app = tempDir();
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: onDisk.version }));
+    mkdirSync(join(app, ".next"));
+    if (builtFrom) writeFileSync(buildStampPath(app), JSON.stringify(builtFrom));
+    return app;
+  }
+
+  it("accepts a build stamped with the checkout that is on disk", () => {
+    const app = checkout(RUNNING, RUNNING);
+    expect(buildMatchesCheckout(app, RUNNING)).toBe(true);
+  });
+
+  it("rejects a build compiled at another commit — the case `next start` cannot see", () => {
+    const app = checkout(RUNNING, { version: "0.4.0", revision: "b".repeat(40) });
+    expect(buildMatchesCheckout(app, RUNNING)).toBe(false);
+  });
+
+  it("rejects a build another release produced", () => {
+    const app = checkout(RUNNING, { version: "0.3.9", revision: RUNNING.revision });
+    expect(buildMatchesCheckout(app, RUNNING)).toBe(false);
+  });
+
+  // An unstamped `.next` is one anton cannot identify, and a build it cannot name is one it cannot
+  // claim is current — rebuilding costs a build, serving it costs the whole verdict.
+  it("rejects a build that carries no stamp at all", () => {
+    expect(buildMatchesCheckout(checkout(RUNNING), RUNNING)).toBe(false);
+  });
+
+  it("round-trips a fresh stamp, so the build it just made is accepted next start", () => {
+    const app = checkout(RUNNING);
+    expect(writeBuildStamp(app, RUNNING)).toBe(true);
+    expect(readBuildRecord(buildStampPath(app))).toMatchObject(RUNNING);
+    expect(buildMatchesCheckout(app, RUNNING)).toBe(true);
   });
 });
 

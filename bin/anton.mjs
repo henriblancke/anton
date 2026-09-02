@@ -63,10 +63,12 @@ import { buildStructureReport, formatStructureReport } from "../src/lib/beads/ti
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import {
   buildDrift,
+  buildMatchesCheckout,
   buildRecordPath,
   describeBuildIdentity,
   pidAlive,
   readBuildRecord,
+  writeBuildStamp,
 } from "../src/lib/build/identity.mjs";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -160,6 +162,23 @@ async function waitForReady(port, timeoutMs = 30000) {
     }
   }
   return false;
+}
+
+/**
+ * Is an anton server answering on `port`? The liveness probe for a SOURCE checkout (anton-pzfb):
+ * `anton dev` and source `anton start` run in a terminal and write no pidfile, so a server too old
+ * to have left a build record is otherwise invisible — and that first upgrade past this change is
+ * exactly the stale server doctor exists to name. Sniffing the title is what keeps the claim
+ * honest: any dev server can hold 3000, only anton's answers with anton's page.
+ */
+async function antonAnswering(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
+    if (!r.ok) return false;
+    return /<title>[^<]*anton/i.test(await r.text());
+  } catch {
+    return false;
+  }
 }
 
 const c = {
@@ -1102,10 +1121,13 @@ function staleSkills(skillsSrc = SKILLS_SRC, { claudeRoot = CLAUDE_ROOT, project
  * names the action and leaves it to the operator. The restart itself differs by install — a bundle
  * has a daemon to stop and start, a source checkout has whatever terminal `anton dev` is in.
  */
-function reportServerBuild(dbPath) {
+async function reportServerBuild(dbPath, args = []) {
   const recordPath = buildRecordPath(dbPath);
   const record = readBuildRecord(recordPath);
-  const drift = buildDrift({ appRoot: APP_ROOT, recordPath, serverRunning: !!runningPid() });
+  // One read, one verdict: re-reading the record inside buildDrift would let a restart between the
+  // two reads produce a verdict and a liveness check that describe different processes.
+  const serverRunning = !!runningPid() || (!record && (await antonAnswering(resolvePort(args) ?? "3000")));
+  const drift = buildDrift({ appRoot: APP_ROOT, recordPath, record, serverRunning });
   if (!drift) {
     // No drift means one of two things, and they are different claims — a matching build is a
     // check that PASSED, while a stopped server is a check with nothing to run against.
@@ -1113,8 +1135,8 @@ function reportServerBuild(dbPath) {
     if (running) {
       console.log(`  ${c.green("✓")} ${"server".padEnd(9)} ${c.green(`running the build on disk (${describeBuildIdentity(record)})`)}`);
     } else {
-      // Not "stopped": a source checkout's server leaves no pidfile, so all anton can honestly
-      // claim here is that nothing recorded a boot against this install.
+      // Not "stopped": nothing answered the port either, so all anton can honestly claim here is
+      // that nothing recorded a boot against this install.
       console.log(`  ${c.dim("·")} ${"server".padEnd(9)} ${c.dim("no running server recorded")}`);
     }
     return;
@@ -1131,7 +1153,7 @@ function reportServerBuild(dbPath) {
   );
 }
 
-function cmdDoctor() {
+async function cmdDoctor(args = []) {
   const ok = checkPrereqs();
   const stale = staleSkills();
   if (stale.length === 0) {
@@ -1167,7 +1189,7 @@ function cmdDoctor() {
   console.log(
     `  ${existsSync(dbPath) ? "✓" : c.yellow("·")} ${"anton.db".padEnd(9)} ${existsSync(dbPath) ? c.green(dbPath) : c.yellow("not created — run `anton setup`")}`,
   );
-  reportServerBuild(dbPath);
+  await reportServerBuild(dbPath, args);
   // Last, because it is the only check that leaves the machine: a board on a shared server that
   // nothing here can reach is as fatal as a missing tool, and doctor is where an operator looks first.
   // Gated on the tool check: probing a board with no usable bd would report an "unreachable server"
@@ -1835,11 +1857,24 @@ async function cmdStart(args) {
     return 1;
   }
 
+  // `next start` serves whatever `.next` holds, whichever commit produced it — so a checkout that
+  // moved since its last build would boot stamping the NEW commit while serving the old one, and
+  // every drift surface would then call a stale server current (anton-pzfb). Rebuild instead, which
+  // also makes "restart to run the build on disk" true advice for a source install. A bundle is
+  // exempt: it ships its own prebuilt .next and no toolchain to rebuild with.
   const built = existsSync(join(APP_ROOT, ".next"));
-  if (!built) {
-    console.log(c.dim("no build found — running `next build` first…"));
+  const staleBuild = built && !IS_BUNDLE && !buildMatchesCheckout(APP_ROOT);
+  if (!built || staleBuild) {
+    console.log(
+      c.dim(
+        staleBuild
+          ? "the build in .next is not this checkout — rebuilding so the server runs what is here…"
+          : "no build found — running `next build` first…",
+      ),
+    );
     const b = runLocal("next", ["build"]);
     if (b !== 0) return b;
+    if (!IS_BUNDLE) writeBuildStamp(APP_ROOT);
   }
   console.log(c.dim("anton start — starting Next.js server (runner + scheduler auto-start)…"));
   // In bundle mode the server's writable state — including the DB getDb() opens — must point at
@@ -1880,7 +1915,7 @@ function main(argv) {
     case "init":
       return cmdInit(rest);
     case "doctor":
-      return cmdDoctor();
+      return cmdDoctor(rest);
     case "board-check":
       return cmdBoardCheck(rest);
     case "server-mode":

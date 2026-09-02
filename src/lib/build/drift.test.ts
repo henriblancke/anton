@@ -24,6 +24,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   vi.doUnmock("./identity.mjs");
   process.env.ANTON_DB = realDb;
@@ -71,6 +72,28 @@ describe("recordServerBuild / serverBuildDrift", () => {
     recordServerBuild();
 
     expect(serverBuildDrift()).toBeNull();
+  });
+
+  // `anton update` replaces the runtime dir under the live server, so its cwd stops resolving and
+  // `process.cwd()` throws ENOENT from then on. That upgrade is the drift being reported, so a read
+  // taken while the directory still existed is what every later comparison has to run on — the
+  // alternative is a health page that 500s and a nightly pass that aborts on the one night it
+  // had something to say.
+  it("keeps reporting after the runtime dir it booted from is deleted", async () => {
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild();
+    const path = join(dir, "server-build.json");
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), version: "0.0.1" }));
+
+    vi.spyOn(process, "cwd").mockImplementation(() => {
+      throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), { code: "ENOENT" });
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000); // past the TTL, so the on-disk read is taken again
+
+    const drift = serverBuildDrift();
+    expect(drift?.state).toBe("outdated");
+    expect(drift?.running?.version).toBe("0.0.1");
   });
 
   it("says nothing in a process that never booted a server", async () => {

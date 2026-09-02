@@ -90,15 +90,20 @@ export function readBuildIdentity(appRoot) {
   return { version: readVersion(appRoot), revision: readRevision(appRoot) };
 }
 
-/** Record what this process booted from. Best-effort: a state dir anton can't write is not fatal. */
-export function writeBuildRecord(path, identity, { pid = process.pid, bootedAt = Date.now() } = {}) {
+/** Write one stamp. Best-effort: a directory anton can't write to is not fatal for either caller. */
+function writeStampFile(path, value) {
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify({ ...identity, pid, bootedAt }, null, 2)}\n`);
+    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
     return true;
   } catch {
     return false;
   }
+}
+
+/** Record what this process booted from. Best-effort: a state dir anton can't write is not fatal. */
+export function writeBuildRecord(path, identity, { pid = process.pid, bootedAt = Date.now() } = {}) {
+  return writeStampFile(path, { ...identity, pid, bootedAt });
 }
 
 /** The record a running server left, or null when there is none (or it is unreadable/malformed). */
@@ -109,6 +114,34 @@ export function readBuildRecord(path) {
   } catch {
     return null;
   }
+}
+
+/** The stamp a source build leaves inside the artifact it produced, naming the checkout it compiled. */
+export const BUILD_STAMP_FILE = "anton-build.json";
+
+/** Where that stamp lives: inside `.next`, so it is deleted with the build it describes. */
+export function buildStampPath(appRoot) {
+  return join(appRoot, ".next", BUILD_STAMP_FILE);
+}
+
+/** Stamp a fresh build with the checkout that produced it. Best-effort, like the boot record. */
+export function writeBuildStamp(appRoot, identity = readBuildIdentity(appRoot)) {
+  return writeStampFile(buildStampPath(appRoot), { ...identity, builtAt: Date.now() });
+}
+
+/**
+ * Can anton prove the compiled `.next` was built from the checkout on disk?
+ *
+ * `next start` serves whatever `.next` already holds — it never checks which commit produced it — so
+ * a checkout that moved after its last build boots as the NEW commit while serving the old one, and
+ * every drift surface then reports a stale server as current. An unstamped build is a no: a build
+ * anton cannot identify is one it cannot claim is current, and rebuilding is the cheap side of that
+ * bet (the alternative is serving code nobody can name).
+ */
+export function buildMatchesCheckout(appRoot, onDisk = readBuildIdentity(appRoot)) {
+  const stamp = readBuildRecord(buildStampPath(appRoot));
+  if (!stamp) return false;
+  return compareBuild(stamp, onDisk).state === "current";
 }
 
 /** Does this pid name a live process? Signal 0 is the existence check every pidfile reader uses. */
