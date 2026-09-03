@@ -586,15 +586,21 @@ function ignoredUnder(appRoot, pathspecs) {
  * `--exclude-standard` just hid.
  *
  * `.env*` is gitignored here (and by the template Next ships), so the untracked listing never sees
- * it — yet Next reads `.env`, `.env.local` and `.env.<mode>` at BUILD time and inlines every
- * `NEXT_PUBLIC_*` value into the bundle. Change one and the compiled build serves a value the
- * checkout no longer holds while both digests still match: `anton start` accepts the stale `.next`
- * and every drift surface calls the server current.
+ * it — yet `next build` reads `BUILD_ENV_FILES` and inlines every `NEXT_PUBLIC_*` value into the
+ * bundle. Change one and the compiled build serves a value the checkout no longer holds while both
+ * digests still match: `anton start` accepts the stale `.next` and every drift surface calls the
+ * server current.
  *
  * Asked for by name rather than by un-ignoring everything but `.next`/node_modules: anton.db, .dolt
  * and the session logs all live under the app root and are all ignored too, and folding those in
  * would re-digest the tree on every write — a permanent "restart the server" banner. Top level
  * only, because that is the only place Next looks; tracked env files are left to the diff.
+ *
+ * The PRODUCTION files only, not `.env.*` wholesale (PR #217 review) — the same list
+ * `skipsSourceEntry` names back into a git-less install's digest, so both shapes weigh the same
+ * inputs. `anton start` compiles in production mode, where Next never loads `.env.development` or
+ * `.env.test`; digesting them reported the running server modified and rebuilt it for
+ * configuration the artifact cannot contain.
  *
  * A read git could not answer is null, not an empty list (PR #217 review): the two say opposite
  * things. Empty means "no env file here", and a digest that treats a timed-out or lock-blocked git
@@ -602,7 +608,10 @@ function ignoredUnder(appRoot, pathspecs) {
  * reusing a `.next` compiled from the old value, the staleness this function exists to prevent.
  */
 function ignoredEnvFiles(appRoot) {
-  return ignoredUnder(appRoot, [".env", ".env.*"]);
+  return ignoredUnder(
+    appRoot,
+    BUILD_ENV_FILES.map((file) => `:(literal)${file}`),
+  );
 }
 
 /**

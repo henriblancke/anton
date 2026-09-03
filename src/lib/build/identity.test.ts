@@ -335,7 +335,15 @@ describe("readBuildIdentity", () => {
 
     // By content, like every other input: an edited value is a different build.
     writeFileSync(join(dir, ".env.production"), "NEXT_PUBLIC_API=https://two\n");
-    expect(readBuildIdentity(dir).worktree).not.toBe(first);
+    const edited = readBuildIdentity(dir).worktree;
+    expect(edited).not.toBe(first);
+
+    // The production files only, the same ones a git-less install's `source` digest names back in:
+    // `anton start` builds in production mode, where Next never loads `.env.development` — hashing
+    // it called the running server modified and rebuilt it for configuration the artifact cannot
+    // hold (PR #217 review).
+    writeFileSync(join(dir, ".env.development"), "NEXT_PUBLIC_API=https://dev\n");
+    expect(readBuildIdentity(dir).worktree).toBe(edited);
   });
 
   // A `textconv` filter is git's OTHER content conversion, documented apart from external diff
