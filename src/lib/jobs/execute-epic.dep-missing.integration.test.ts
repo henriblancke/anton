@@ -46,14 +46,28 @@ describeBd("execute-epic e2e — the dep-missing repair (real handler · real bd
   let clock: FakeClock;
   let ctx: ExecuteEpicSandbox;
   let projectId: string;
+  let shadowProjectId: string;
 
   beforeAll(async () => {
     ctx = await createExecuteEpicSandbox();
     ({ repo, binDir, tdb, clock } = ctx);
     // No verify gates, so what the run stops on is the zero-diff delivery gate and nothing else.
+    // ARMED at `apply`: drawing an edge is board state other runs read, and the shipped policy is
+    // `shadow`, so a project that wants the edge drawn has to say so (R5.3).
     projectId = insertProject(tdb.db, {
       slug: "sandbox-depmissing",
       name: "sandbox-depmissing",
+      repoPath: repo,
+      settingsJson: JSON.stringify({
+        reviewEnabled: false,
+        repairAutonomy: { "dep-missing": "apply" },
+      }),
+    });
+
+    // The same repo through a project that armed NOTHING — what every project gets on upgrade.
+    shadowProjectId = insertProject(tdb.db, {
+      slug: "sandbox-depmissing-shadow",
+      name: "sandbox-depmissing-shadow",
       repoPath: repo,
       settingsJson: JSON.stringify({ reviewEnabled: false }),
     });
@@ -189,6 +203,43 @@ process.exit(0);`),
       expect(refusal).toBeDefined();
       expect(refusal).toContain("holds no such bead");
       expect(refusal.split("\n")).toHaveLength(1);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("draws NO edge on a project that armed nothing — the shipped `shadow` default (R5.3)", async () => {
+    const prereq = await seedTarget("The unarmed schema migration");
+    const target = await seedTarget("Wire the unarmed page up");
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = blockedOnClaude("claude-depshadow", prereq);
+    try {
+      const jobId = await enqueueEpicJob(runner, {
+        projectId: shadowProjectId,
+        epicBeadId: target,
+      });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The block settles exactly as it did before auto-repair existed: poison park, blocked bead.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      const blocked = await beads.show(repo, target);
+      expect(blocked.status).toBe("blocked");
+
+      // No edge and no stamp — the board is as the run found it, and the target is held back by
+      // nothing anton wrote.
+      expect(await edgeExists(target, prereq)).toBe(false);
+      expect((blocked.labels ?? []).some((l) => l.startsWith("repair:"))).toBe(false);
+
+      // But the record IS there: the prerequisite anton resolved, and the edge it withheld.
+      const notes = parseTicketNotes(blocked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      const shadow = notes.find((t) => t.includes("did not repair this as `dep-missing`"))!;
+      expect(shadow).toBeDefined();
+      expect(shadow).toContain("`shadow`");
+      expect(shadow).toContain(prereq);
+      expect(shadow.split("\n")).toHaveLength(1);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }

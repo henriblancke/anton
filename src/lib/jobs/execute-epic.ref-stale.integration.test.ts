@@ -54,6 +54,7 @@ describeBd("execute-epic e2e — the ref-stale repair (real handler · real bd/g
   let clock: FakeClock;
   let ctx: ExecuteEpicSandbox;
   let projectId: string;
+  let shadowProjectId: string;
   /** A claude that exits cleanly and changes nothing — the zero-diff block the repair answers. */
   let noopClaude: string;
 
@@ -88,9 +89,22 @@ describeBd("execute-epic e2e — the ref-stale repair (real handler · real bd/g
     g(["push", "-q", "origin", "main"]);
 
     // No verify gates, so what the run stops on is the zero-diff delivery gate and nothing else.
+    // ARMED at `apply`: a repair is an unattended write, and the shipped policy is `shadow`, so a
+    // project that wants the rewrite has to say so (R5.3).
     projectId = insertProject(tdb.db, {
       slug: "sandbox-refstale",
       name: "sandbox-refstale",
+      repoPath: repo,
+      settingsJson: JSON.stringify({
+        reviewEnabled: false,
+        repairAutonomy: { "ref-stale": "apply" },
+      }),
+    });
+
+    // The same repo through a project that armed NOTHING — what every project gets on upgrade.
+    shadowProjectId = insertProject(tdb.db, {
+      slug: "sandbox-refstale-shadow",
+      name: "sandbox-refstale-shadow",
       repoPath: repo,
       settingsJson: JSON.stringify({ reviewEnabled: false }),
     });
@@ -253,6 +267,42 @@ process.exit(0);`),
       expect(refusal).toBeDefined();
       expect(refusal).toContain("deleted");
       expect(refusal.split("\n")).toHaveLength(1);
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("writes NOTHING on a project that armed nothing — the shipped `shadow` default (R5.3)", async () => {
+    const { epic, ticket, description } = await seedStaleEpic("Unarmed ref-stale epic");
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = noopClaude;
+    try {
+      const jobId = await enqueueEpicJob(runner, {
+        projectId: shadowProjectId,
+        epicBeadId: epic,
+      });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The block settles exactly as it did before auto-repair existed: poison park, blocked bead.
+      expect((await getJob(tdb.db, jobId))?.status).toBe("parked");
+      const blocked = await beads.show(repo, ticket);
+      expect(blocked.status).toBe("blocked");
+
+      // Not one byte of the bead moved, and no stamp — a shadow leaves the guard free, so arming
+      // the class later still gets its one repair.
+      expect(blocked.description).toBe(description);
+      expect((blocked.labels ?? []).some((l) => l.startsWith("repair:"))).toBe(false);
+
+      // But the record IS there: what `apply` would have written, in the repair's own words.
+      const notes = parseTicketNotes(blocked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      const shadow = notes.find((t) => t.includes("did not repair this as `ref-stale`"))!;
+      expect(shadow).toBeDefined();
+      expect(shadow).toContain("`shadow`");
+      expect(shadow).toContain(RESOLVED);
+      expect(shadow.split("\n")).toHaveLength(1);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }

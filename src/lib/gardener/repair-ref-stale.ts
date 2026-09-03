@@ -19,9 +19,10 @@
  * that merely MENTIONS a file (a citation is a repo-relative path with a directory and an extension,
  * not a sentence about a module), and symbols — only paths.
  *
- * The loop guard is repair.ts's, unchanged: {@link decideRepair} decides whether this bead may be
- * repaired for this class at all, and a second `ref-stale` block on a bead anton already repaired
- * escalates rather than repairing again (R5.6).
+ * The loop guard and the trust dial are both repair.ts's, unchanged: {@link decideRepair} decides
+ * whether this bead may be repaired for this class at all — a second `ref-stale` block on a bead
+ * anton already repaired escalates rather than repairing again (R5.6), and a project that has not
+ * armed the class gets the rewrite WORKED OUT and recorded rather than written (R5.3).
  */
 import { beads } from "../beads/bd";
 import { scanMarkdown } from "../beads/markdown";
@@ -35,6 +36,7 @@ import {
   type RepairAttempt,
   type RepairedBead,
 } from "./repair";
+import type { ProposalAutonomy } from "./autonomy";
 
 /** The class this module repairs. Named once so the guard, the stamp and the prose cannot drift. */
 const KLASS = "ref-stale" as const;
@@ -226,6 +228,12 @@ export interface PathRewrite {
 export type RefStaleOutcome =
   | { action: "none"; why: string }
   | { action: "repaired"; label: string; description: string; rewrites: PathRewrite[]; attempted: string }
+  /**
+   * Armed at `shadow`: the rewrite anton worked out and did NOT write. Carries the same fields the
+   * armed outcome does, minus the stamp — there is no label because nothing was stamped, and the
+   * caller must go on settling the block exactly as it would have without a repair.
+   */
+  | { action: "shadow"; description: string; rewrites: PathRewrite[]; attempted: string }
   | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt };
 
 /** The bead as this repair reads it — its labels and notes for the guard, its description to fix. */
@@ -256,8 +264,10 @@ export async function repairRefStale(args: {
   block: { reason?: string };
   /** Unix milliseconds, stamped on the repair label so the breaker can order failures against it. */
   now: number;
+  /** How far this project lets anton go with `ref-stale` (R5.3) — see repair-autonomy.ts. */
+  autonomy: ProposalAutonomy;
 }): Promise<RefStaleOutcome> {
-  const { repoPath, worktreePath, bead, block, now } = args;
+  const { repoPath, worktreePath, bead, block, now, autonomy } = args;
   const description = bead.description ?? "";
   const span = contextSpan(description);
   if (!span) return { action: "none", why: `${bead.id} states no \`## Context\` to check` };
@@ -277,7 +287,7 @@ export async function repairRefStale(args: {
     };
   }
 
-  const decision = decideRepair(bead, KLASS, block);
+  const decision = decideRepair(bead, KLASS, block, autonomy);
   if (decision.action === "escalate") return { ...decision };
 
   const unresolved = stale.filter((v) => v.state === "unresolved");
@@ -297,6 +307,13 @@ export async function repairRefStale(args: {
   const attempted = `rewrote ${bead.id}'s \`## Context\` pointer(s): ${rewrites
     .map((r) => `\`${r.from}\` → \`${r.to}\``)
     .join(", ")}`;
+
+  // Everything above is a READ — the tree, git's history, the bead's own prose — so the shadow is
+  // the armed answer with the two writes removed, not a second implementation that agrees with it
+  // until the day it doesn't.
+  if (decision.action === "shadow") {
+    return { action: "shadow", description: rewritten, rewrites, attempted };
+  }
 
   await beads.update(repoPath, bead.id, { description: rewritten }, bead.labels);
   const label = await recordRepair(repoPath, bead, KLASS, attempted, now);

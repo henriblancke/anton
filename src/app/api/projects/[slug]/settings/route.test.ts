@@ -830,6 +830,35 @@ describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
     expect((await res.json()).settings.proposalAutonomy).toBeUndefined();
     expect("proposalAutonomy" in persisted()).toBe(false);
   });
+
+  /**
+   * The REPAIR dial (R5.3) — the same boundary over the block classes. Its own key rather than an
+   * entry in `proposalAutonomy`, because a repair files no proposal and so can never build the
+   * settled-proposal record the earned floor weighs (gardener/repair-autonomy.ts).
+   */
+  it("takes a repair policy per class, merges it, and rejects what it cannot read", async () => {
+    const res = await PATCH(patchReq({ repairAutonomy: { "ref-stale": "apply" } }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.repairAutonomy).toEqual({ "ref-stale": "apply" });
+
+    const merged = await PATCH(patchReq({ repairAutonomy: { "dep-missing": "propose" } }), ctx("tmp"));
+    expect((await merged.json()).settings.repairAutonomy).toEqual({
+      "ref-stale": "apply",
+      "dep-missing": "propose",
+    });
+
+    for (const bad of [
+      { "class-from-the-future": "apply" }, // not a repair class
+      { "ref-stale": "armed" }, // not one of the three levels
+      { "ref-stale": true },
+      "apply",
+    ]) {
+      const bogus = await PATCH(patchReq({ repairAutonomy: bad }), ctx("tmp"));
+      expect(bogus.status).toBe(400);
+      expect((await bogus.json()).error).toMatch(/repairAutonomy/);
+    }
+    expect(persisted().repairAutonomy).toEqual({ "ref-stale": "apply", "dep-missing": "propose" });
+  });
 });
 
 /**

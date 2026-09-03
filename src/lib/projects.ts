@@ -24,6 +24,12 @@ import {
   type ProposalAutonomyPolicy,
 } from "./gardener/autonomy";
 import {
+  resolveRepairAutonomyPolicy,
+  type RepairAutonomyOverrides,
+  type RepairAutonomyPolicy,
+} from "./gardener/repair-autonomy";
+import { REPAIR_CLASSES } from "./gardener/repair";
+import {
   DEFAULT_SCAN_SEVERITY_POLICY,
   resolveScanSeverityPolicy,
   type ScanSeverityOverrides,
@@ -342,6 +348,17 @@ export interface ProjectSettings {
    */
   proposalAutonomy?: ProposalAutonomyOverrides;
   /**
+   * How far anton may go REPAIRING a blocked ticket, per block class (R5.3). Absent → the shipped
+   * {@link DEFAULT_REPAIR_AUTONOMY_POLICY} (`shadow` for the factual pair: the repair is worked out
+   * and recorded, and the block still goes to a human); a stored value need only carry the classes
+   * the operator moved.
+   *
+   * Its own policy rather than an entry in {@link proposalAutonomy}, because a repair is not a
+   * proposal — it files no bead, so it can never build the settled-proposal record the earned floor
+   * weighs. See gardener/repair-autonomy.ts.
+   */
+  repairAutonomy?: RepairAutonomyOverrides;
+  /**
    * The operator's standing answer to the cadence offer arming the board-picker makes (anton-3xa9,
    * design R7.1): true = keep product-master weekly, and never ask again. Absent = not yet asked.
    *
@@ -567,6 +584,26 @@ export const proposalAutonomySchema = z.partialRecord(
   z.enum(GARDENER_DETECTION_KINDS),
   z.enum(PROPOSAL_AUTONOMY_LEVELS),
 );
+
+/**
+ * Per-class repair autonomy as submitted (R5.3), the mirror of {@link proposalAutonomySchema}: keyed
+ * by the block classes the repair guard owns and valued by the same three levels, so a class added
+ * to `repair.ts` is accepted here the moment it exists. Strict about both halves — an unknown class
+ * or an unknown level 400s rather than persisting a policy the pass would silently ignore.
+ */
+export const repairAutonomySchema = z.partialRecord(
+  z.enum(REPAIR_CLASSES),
+  z.enum(PROPOSAL_AUTONOMY_LEVELS),
+);
+
+/**
+ * How far anton may go repairing each block class on this project — the shipped policy with the
+ * operator's overrides applied, never partial. The single seam the run reads, so "absent means the
+ * shipped default" cannot drift between the settings surface and the repair itself.
+ */
+export function resolveRepairAutonomy(settings: ProjectSettings): RepairAutonomyPolicy {
+  return resolveRepairAutonomyPolicy(settings.repairAutonomy);
+}
 
 /**
  * How far each detection kind's proposals may go for this project — the shipped policy with the
@@ -1008,6 +1045,10 @@ function mergeSettings(
     // the ones it didn't send. Setting a kind back to `propose` is an explicit value, not an absence.
     else if (k === "proposalAutonomy") {
       next.proposalAutonomy = { ...current.proposalAutonomy, ...(v as object) };
+    }
+    // Per CLASS, for the same reason.
+    else if (k === "repairAutonomy") {
+      next.repairAutonomy = { ...current.repairAutonomy, ...(v as object) };
     }
     else (next as Record<string, unknown>)[k] = v;
   }

@@ -22,11 +22,13 @@
  *     checked HERE rather than discovered as a write failure;
  *   • a parent/ancestor pair, which sequences through the hierarchy rather than through `blocks`.
  *
- * The loop guard is repair.ts's, unchanged: one repair per bead per class, and a second
- * `dep-missing` block on a bead anton already drew an edge for escalates (R5.6).
+ * The loop guard and the trust dial are both repair.ts's, unchanged: one repair per bead per class,
+ * so a second `dep-missing` block on a bead anton already drew an edge for escalates (R5.6) — and a
+ * project that has not armed the class gets the edge RESOLVED and recorded rather than drawn (R5.3).
  */
 import { beads, type Bead } from "../beads/bd";
 import { indexBoard, isOpenWork, type BoardIndex } from "./board-index";
+import type { ProposalAutonomy } from "./autonomy";
 import {
   decideRepair,
   recordRepair,
@@ -157,6 +159,12 @@ export function resolvePrereq(
  * yet, so retrying it now would burn an attempt proving the edge anton just drew.
  */
 export type DepMissingOutcome =
+  /**
+   * Armed at `shadow`: the prerequisite anton resolved and the edge it did NOT draw. No label,
+   * because nothing was stamped — and deliberately not `parked`, because nothing holds the target
+   * back, so the caller settles the block exactly as it would have without a repair.
+   */
+  | { action: "shadow"; blockerId: string; attempted: string }
   | {
       action: "parked";
       /** The repair stamp written on the target. */
@@ -189,6 +197,8 @@ export async function repairDepMissing(args: {
   block: { reason?: string };
   /** Unix milliseconds, stamped on the repair label so the breaker can order failures against it. */
   now: number;
+  /** How far this project lets anton go with `dep-missing` (R5.3) — see repair-autonomy.ts. */
+  autonomy: ProposalAutonomy;
   /**
    * The board the prerequisite is resolved against. Read fresh from bd when absent: the snapshot the
    * run dispatched from predates the session, and a prerequisite that closed meanwhile must not be
@@ -196,8 +206,8 @@ export async function repairDepMissing(args: {
    */
   board?: Bead[];
 }): Promise<DepMissingOutcome> {
-  const { repoPath, bead, block, now } = args;
-  const decision = decideRepair(bead, KLASS, block);
+  const { repoPath, bead, block, now, autonomy } = args;
+  const decision = decideRepair(bead, KLASS, block, autonomy);
   if (decision.action === "escalate") return { ...decision };
 
   const board = args.board ?? (await beads.list(repoPath, ["--status", "all"]));
@@ -217,6 +227,9 @@ export async function repairDepMissing(args: {
     `recorded \`${blockerId}\` as a blocker of ${bead.id} (bd link ${bead.id} ${blockerId} ` +
     `--type blocks), parking it until that lands — the agent reported: ` +
     `${block.reason?.trim() || "(no reason given)"}`;
+  // Resolving the prerequisite is a board READ, so the shadow is the armed answer minus the writes.
+  if (decision.action === "shadow") return { action: "shadow", blockerId, attempted };
+
   await beads.link(repoPath, bead.id, blockerId, "blocks");
   let label: string;
   try {

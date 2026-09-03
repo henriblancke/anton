@@ -233,6 +233,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(description),
         block: { reason: "src/moved.ts is not in the worktree" },
         now: T0,
+        autonomy: "apply",
       });
 
       expect(outcome).toMatchObject({
@@ -258,6 +259,53 @@ suite("ref-stale, against a real git history", () => {
       expect(noteMock.mock.calls[0]![2]).toContain(repairFingerprint(BEAD, "ref-stale"));
     });
 
+    it("armed at `shadow`: works the rewrite out and writes NOTHING (R5.3)", async () => {
+      const description = contract("touches: `src/moved.ts` and `src/here.ts`.");
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "shadow",
+      });
+
+      // The armed answer, minus the writes: the same description, so a week of shadow says what
+      // arming would actually have done rather than what a second implementation thinks it would.
+      expect(outcome).toMatchObject({
+        action: "shadow",
+        rewrites: [{ from: "src/moved.ts", to: "src/lib/renamed.ts" }],
+      });
+      expect(outcome.action === "shadow" && outcome.description).toBe(
+        description.replace("src/moved.ts", "src/lib/renamed.ts"),
+      );
+      expect(updateMock).not.toHaveBeenCalled();
+      // No stamp either: nothing happened to the bead, so the one repair the guard allows is still
+      // available when the operator arms the class.
+      expect(tagMock).not.toHaveBeenCalled();
+      expect(noteMock).not.toHaveBeenCalled();
+    });
+
+    it("armed at `propose`: establishes the class, then escalates without touching the bead", async () => {
+      const description = contract("touches: `src/moved.ts` and `src/here.ts`.");
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "propose",
+      });
+
+      // Staleness is still established first — an unarmed class must not turn every OTHER block on
+      // a healthy bead into a "ref-stale is not armed" escalation.
+      expect(outcome.action).toBe("escalate");
+      if (outcome.action !== "escalate") return;
+      expect(outcome.why).toContain("not armed to repair");
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
     it("rewrites every occurrence of a moved path, not only the first", async () => {
       const outcome = await repairRefStale({
         repoPath: repo,
@@ -265,6 +313,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(contract("`src/moved.ts` is read by the gate, and `src/moved.ts` alone.")),
         block: {},
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome.action).toBe("repaired");
       expect(outcome.action === "repaired" && outcome.description).not.toContain("src/moved.ts`");
@@ -277,6 +326,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(contract("touches `src/gone.ts`.")),
         block: { reason: "the file is not there" },
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome.action).toBe("escalate");
       expect(outcome.action === "escalate" && outcome.evidence.join(" ")).toContain("deleted");
@@ -291,6 +341,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(contract("touches `src/twice.ts`.")),
         block: {},
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome.action).toBe("escalate");
       expect(outcome.action === "escalate" && outcome.evidence.join(" ")).toContain(
@@ -306,6 +357,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(contract("touches `src/moved.ts` and `src/gone.ts`.")),
         block: {},
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome.action).toBe("escalate");
       expect(updateMock).not.toHaveBeenCalled();
@@ -318,6 +370,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(contract("touches `src/here.ts`.")),
         block: { reason: "the test runner is not installed" },
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome).toMatchObject({ action: "none" });
       expect(updateMock).not.toHaveBeenCalled();
@@ -331,6 +384,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead("## Goal\nShip it."),
         block: {},
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome).toMatchObject({ action: "none" });
     });
@@ -346,6 +400,7 @@ suite("ref-stale, against a real git history", () => {
         ),
         block: { reason: "still cannot find it" },
         now: T0 + 60_000,
+        autonomy: "apply",
       });
       expect(outcome.action).toBe("escalate");
       expect(outcome.action === "escalate" && outcome.evidence.join(" ")).toContain(
@@ -364,6 +419,7 @@ suite("ref-stale, against a real git history", () => {
         ]),
         block: {},
         now: T0,
+        autonomy: "apply",
       });
       expect(outcome.action).toBe("repaired");
     });
@@ -377,6 +433,7 @@ suite("ref-stale, against a real git history", () => {
         bead: bead(contract("touches `src/gone.ts`.")),
         block: {},
         now: T0,
+        autonomy: "apply",
       });
       const note = refusalNote(outcome as Extract<typeof outcome, { action: "escalate" }>);
       expect(note.split("\n")).toHaveLength(1);

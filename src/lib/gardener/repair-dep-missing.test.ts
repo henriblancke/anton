@@ -193,6 +193,7 @@ describe("repairDepMissing", () => {
       bead: bead(TARGET),
       block: block(`the schema ${PREREQ} adds has to land first`),
       now: T0,
+      autonomy: "apply",
     });
 
     expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ });
@@ -207,12 +208,49 @@ describe("repairDepMissing", () => {
     expect(written.split("\n")).toHaveLength(1);
   });
 
+  it("armed at `shadow`: resolves the prerequisite and draws NO edge (R5.3)", async () => {
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`the schema ${PREREQ} adds has to land first`),
+      now: T0,
+      autonomy: "shadow",
+    });
+
+    // The armed answer, minus the writes: the same blocker, so the record says what arming would
+    // actually have drawn.
+    expect(outcome).toMatchObject({ action: "shadow", blockerId: PREREQ });
+    expect(outcome.action === "shadow" && outcome.attempted).toContain(PREREQ);
+    expect(linkMock).not.toHaveBeenCalled();
+    // No stamp either: nothing holds the target back, so the one repair the guard allows is still
+    // available when the operator arms the class.
+    expect(tagMock).not.toHaveBeenCalled();
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
+  it("armed at `propose`: escalates before it even reads the board", async () => {
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`the schema ${PREREQ} adds has to land first`),
+      now: T0,
+      autonomy: "propose",
+    });
+
+    expect(outcome.action).toBe("escalate");
+    if (outcome.action !== "escalate") return;
+    expect(outcome.why).toContain("not armed to repair");
+    expect(linkMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
   it("creates nothing when the prerequisite is not on the board — it escalates", async () => {
     const outcome = await repairDepMissing({
       repoPath: REPO,
       bead: bead(TARGET),
       block: block("blocked on anton-ghost, which nobody filed"),
       now: T0,
+      autonomy: "apply",
     });
 
     expect(outcome.action).toBe("escalate");
@@ -229,6 +267,7 @@ describe("repairDepMissing", () => {
       bead: bead(TARGET),
       block: block(undefined),
       now: T0,
+      autonomy: "apply",
     });
     expect(outcome).toMatchObject({
       action: "escalate",
@@ -243,6 +282,7 @@ describe("repairDepMissing", () => {
       bead: bead(TARGET),
       block: block(`blocked on ${PREREQ}`),
       now: T0,
+      autonomy: "apply",
       board: board(),
     });
     expect(listMock).not.toHaveBeenCalled();
@@ -252,6 +292,7 @@ describe("repairDepMissing", () => {
       bead: bead(TARGET),
       block: block(`blocked on ${PREREQ}`),
       now: T0,
+      autonomy: "apply",
     });
     expect(listMock).toHaveBeenCalledWith(REPO, ["--status", "all"]);
   });
@@ -264,6 +305,7 @@ describe("repairDepMissing", () => {
       bead: bead(TARGET),
       block: block(`blocked on ${PREREQ}`),
       now: T0,
+      autonomy: "apply",
     });
 
     expect(linkMock).toHaveBeenCalledWith(REPO, TARGET, PREREQ, "blocks");
@@ -286,6 +328,7 @@ describe("repairDepMissing", () => {
       bead: bead(TARGET),
       block: block(`blocked on ${PREREQ}`),
       now: T0,
+      autonomy: "apply",
     });
 
     expect(outcome).toMatchObject({ action: "escalate" });
@@ -299,6 +342,7 @@ describe("repairDepMissing", () => {
       bead: alreadyRepaired(`recorded \`${PREREQ}\` as a blocker of ${TARGET}`),
       block: block(`still blocked on ${PREREQ}`),
       now: T0 + 60_000,
+      autonomy: "apply",
     });
 
     expect(outcome.action).toBe("escalate");
@@ -334,6 +378,7 @@ describe("reversing the edge", () => {
       bead: alreadyRepaired(),
       block: block(`blocked on ${PREREQ}`),
       now: T0 + 60_000,
+      autonomy: "apply",
     });
     expect(outcome.action).toBe("escalate");
     expect(linkMock).not.toHaveBeenCalled();

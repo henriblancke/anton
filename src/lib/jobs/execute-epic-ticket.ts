@@ -9,6 +9,7 @@
 import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { shadowNote } from "../gardener/repair";
 import {
   refusalNote as depRefusalNote,
   repairDepMissing,
@@ -21,6 +22,7 @@ import {
   sameWorktreeState,
   type WorktreeState,
 } from "../git/ops";
+import { resolveRepairAutonomy } from "../projects";
 import { updateRun } from "../runs";
 import {
   appendSessionLog,
@@ -469,6 +471,13 @@ type TicketRepair = RefStaleOutcome | DepMissingOutcome;
  * a pointer is provably stale and stays silent (`none`) everywhere else. That is strictly narrower
  * than trusting a self-reported class, so narrowing it to one would only lose repairs.
  *
+ * HOW FAR EITHER MAY GO is the project's call, not this function's (R5.3): each class carries its
+ * own autonomy level, and the guard consults it before anything is written (`decideRepair`). Shipped
+ * at `shadow`, so a project that has armed nothing gets the repair worked out and RECORDED — on the
+ * bead and in the session log — while the block escalates to a human exactly as it did before this
+ * feature existed. A shadowed repair is therefore not a repair: it leaves the ticket to the ordinary
+ * failure path below, which blocks the bead.
+ *
  * Best-effort by construction: a repair that throws must never mask the block the run is settling.
  * The block still stands; only the repair is lost.
  */
@@ -487,6 +496,7 @@ async function repairBlockedTicket(args: {
   if (!kinds.noDelivery && !kinds.agentBlocked) return undefined;
   const selfReport = args.progress.selfReport;
   const klass = selfReport?.outcome === "blocked" ? selfReport.klass : undefined;
+  const autonomy = resolveRepairAutonomy(run.settings);
   try {
     // Read the bead fresh: the snapshot this run dispatched from predates the session, and the
     // repair rewrites the description — or the edges — it is holding.
@@ -502,9 +512,12 @@ async function repairBlockedTicket(args: {
         bead: fresh,
         block,
         now: clock.now(),
+        autonomy: autonomy["dep-missing"],
       });
       if (outcome.action === "escalate") {
         await safe(() => beads.note(repo, ticket.id, depRefusalNote(outcome)));
+      } else if (outcome.action === "shadow") {
+        await safe(() => beads.note(repo, ticket.id, shadowNote("dep-missing", outcome.attempted)));
       }
       await appendSessionLog(
         session.logPath,
@@ -518,9 +531,12 @@ async function repairBlockedTicket(args: {
       bead: fresh,
       block,
       now: clock.now(),
+      autonomy: autonomy["ref-stale"],
     });
     if (outcome.action === "escalate") {
       await safe(() => beads.note(repo, ticket.id, refusalNote(outcome)));
+    } else if (outcome.action === "shadow") {
+      await safe(() => beads.note(repo, ticket.id, shadowNote("ref-stale", outcome.attempted)));
     }
     await appendSessionLog(session.logPath, `[repair:ref-stale] ${repairLogLine(outcome)}\n`).catch(
       () => {},
@@ -542,6 +558,10 @@ function repairLogLine(outcome: TicketRepair): string {
       return `repaired — ${outcome.attempted}`;
     case "parked":
       return `parked — ${outcome.attempted}`;
+    case "shadow":
+      // The one line an operator reads a week of shadow off, so it says what the write WOULD have
+      // been, not merely that one was withheld.
+      return `shadow (not armed to write) — would have: ${outcome.attempted}`;
     case "escalate":
       return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
     default:

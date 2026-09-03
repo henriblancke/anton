@@ -3,8 +3,13 @@
  * running overnight.
  *
  * A repair is anton acting on its own diagnosis of why a run blocked: a moved path rewritten, an
- * ordering nobody drew an edge for recorded. Two things have to be true before that can run
- * unattended, and neither is about whether any individual repair is correct:
+ * ordering nobody drew an edge for recorded. Three things have to be true before that can run
+ * unattended, and none of them is about whether any individual repair is correct:
+ *
+ *   • THE PROJECT MUST HAVE ARMED IT. A repair is an unattended write to the founder's board, so it
+ *     sits behind a per-class trust dial exactly as every other autonomous write does (R5.3) — see
+ *     repair-autonomy.ts. Shipped at `shadow`: anton works the repair out and records it, and the
+ *     block still goes to a human. Nothing writes to a board nobody armed.
  *
  *   • IT MUST NOT LOOP. A bead that blocks, gets repaired, and blocks the same way again is a
  *     diagnosis that did not hold. Repairing it a second time spends a night's quota re-fixing one
@@ -33,6 +38,7 @@ import { createHash } from "node:crypto";
 import { beads } from "../beads/bd";
 import { parseTicketNotes } from "../beads/notes";
 import type { FailureWeight, RunOutcome } from "../autopilot-failure-streak";
+import type { ProposalAutonomy } from "./autonomy";
 import { FINGERPRINT_HASH_LENGTH } from "./detections";
 
 /**
@@ -147,6 +153,23 @@ export function refusalNote(
   return `anton: did not repair this as \`${klass}\` — ${oneLine([refusal.why, ...refusal.evidence].join(" "))}`;
 }
 
+/**
+ * The note anton leaves when a class is armed at `shadow` — the repair it WITHHELD, in the same
+ * words the armed one would have recorded.
+ *
+ * Deliberately NOT {@link repairNote}: that one carries the fingerprint, and the fingerprint is the
+ * loop guard's suppression. A shadow writes no stamp (nothing happened to the bead, so nothing may
+ * stop a later armed repair from happening), which means it must not write a note that reads like
+ * one either — a bead whose blob claimed a repair the labels never recorded is the one way this
+ * record could lie.
+ */
+export function shadowNote(klass: RepairClass, attempted: string): string {
+  return (
+    `anton: did not repair this as \`${klass}\` — it is armed at \`shadow\`, which works the repair ` +
+    `out and writes nothing. What \`apply\` would have recorded: "${oneLine(attempted)}"`
+  );
+}
+
 const REPAIR_NOTE = new RegExp(
   `^anton: repaired \`(${REPAIR_NAMESPACE}:[a-z-]+:[0-9a-f]{${FINGERPRINT_HASH_LENGTH}})\` — (.+)$`,
 );
@@ -210,7 +233,10 @@ export function priorRepair(bead: RepairedBead, klass: RepairClass): RepairAttem
 }
 
 export type RepairDecision =
+  /** Armed: compute the fix and WRITE it. */
   | { action: "repair"; klass: RepairClass; fingerprint: string }
+  /** Armed at `shadow`: compute the fix, record what it would have been, write nothing. */
+  | { action: "shadow"; klass: RepairClass; fingerprint: string }
   | {
       action: "escalate";
       /** One line: why this block is not being repaired. The escalation's `reason`. */
@@ -222,17 +248,26 @@ export type RepairDecision =
     };
 
 /**
- * May anton repair this block, or does it escalate? The one gate every repair passes through.
+ * May anton repair this block, and how far may it go? The one gate every repair passes through.
  *
- * Escalating is the default, in both directions. An unrecognised class is escalated because the
- * guard cannot know what a repair for it would even mean (R5.2a), and a SECOND block of a class
- * anton already repaired is escalated because the repair is the thing that has been disproved — the
- * bead did not get better, and the next-cheapest correct action is a human reading it (R5.6).
+ * THREE checks, in this order, and escalating is the default at every one of them. An unrecognised
+ * class is escalated because the guard cannot know what a repair for it would even mean (R5.2a). A
+ * SECOND block of a class anton already repaired is escalated because the repair is the thing that
+ * has been disproved — the bead did not get better, and the next-cheapest correct action is a human
+ * reading it (R5.6). And a class this project has not ARMED is escalated because a repair is an
+ * unattended write to the founder's board (R5.3): the loop guard bounds how OFTEN anton writes, and
+ * only the autonomy level decides WHETHER it may.
+ *
+ * The autonomy check sits beside the loop guard rather than at the write, so every repair passes
+ * both or neither — including `shadow`, which is not exempt from the guard: re-describing a repair
+ * that has already been disproved is the same wrong answer with the writes taken out.
  */
 export function decideRepair(
   bead: RepairedBead,
   klass: string | undefined,
   block: { reason?: string },
+  /** How far this project lets anton go with this class — see gardener/repair-autonomy.ts. */
+  autonomy: ProposalAutonomy,
 ): RepairDecision {
   if (!isRepairClass(klass)) {
     return {
@@ -245,7 +280,21 @@ export function decideRepair(
   }
   const prior = priorRepair(bead, klass);
   if (!prior) {
-    return { action: "repair", klass, fingerprint: repairFingerprint(bead.id, klass) };
+    if (autonomy === "propose") {
+      return {
+        action: "escalate",
+        why:
+          `${bead.id} blocked as \`${klass}\`, and anton is not armed to repair that on this ` +
+          `project — it needs a human.`,
+        evidence: [
+          blockLine(block),
+          `\`${klass}\` repair is set to \`propose\` here, so anton wrote nothing to the board; ` +
+            `arm it at \`shadow\` to see what it would do, or at \`apply\` to let it run`,
+        ],
+      };
+    }
+    const fingerprint = repairFingerprint(bead.id, klass);
+    return { action: autonomy === "apply" ? "repair" : "shadow", klass, fingerprint };
   }
   return {
     action: "escalate",

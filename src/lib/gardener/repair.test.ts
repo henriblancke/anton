@@ -1,7 +1,9 @@
 /**
  * The auto-repair loop guard (anton-rys7 / R5.6, R5.8).
  *
- * Four claims, and each is a way an unattended repair pass could do real harm:
+ * Five claims, and each is a way an unattended repair pass could do real harm:
+ *   • NOTHING WRITES UNARMED. A class the project has not armed escalates without touching the
+ *     board, and a class armed at `shadow` records the move rather than making it (R5.3).
  *   • ONE REPAIR PER (BEAD, CLASS). The second identical block escalates instead of spending another
  *     run on a diagnosis that has already been disproved.
  *   • THE GUARD READS THE BOARD, NOT MEMORY. Everything it decides on is a label the bead carries, so
@@ -33,6 +35,7 @@ const {
   repairLabel,
   repairNote,
   repairedFailureWeight,
+  shadowNote,
 } = await import("./repair");
 
 const REPO = "/repo";
@@ -68,7 +71,7 @@ describe("the repairable classes", () => {
 
 describe("decideRepair", () => {
   it("repairs a class anton knows, on a bead nothing has been done to", () => {
-    const decision = decideRepair(bead(), "ref-stale", { reason: "src/a.ts is gone" });
+    const decision = decideRepair(bead(), "ref-stale", { reason: "src/a.ts is gone" }, "apply");
     expect(decision).toEqual({
       action: "repair",
       klass: "ref-stale",
@@ -78,7 +81,7 @@ describe("decideRepair", () => {
 
   it("escalates a class it does not repair rather than guessing at one", () => {
     for (const klass of ["env", "other", "ref", undefined]) {
-      const decision = decideRepair(bead(), klass, { reason: "toolchain will not install" });
+      const decision = decideRepair(bead(), klass, { reason: "toolchain will not install" }, "apply");
       expect(decision.action).toBe("escalate");
       if (decision.action !== "escalate") return;
       expect(decision.prior).toBeUndefined();
@@ -88,7 +91,7 @@ describe("decideRepair", () => {
 
   it("escalates the SECOND identical block instead of repairing again", () => {
     const subject = repaired("ref-stale", "rewrote the pointer src/a.ts → src/moved/a.ts");
-    const decision = decideRepair(subject, "ref-stale", { reason: "src/moved/a.ts is gone too" });
+    const decision = decideRepair(subject, "ref-stale", { reason: "src/moved/a.ts is gone too" }, "apply");
 
     expect(decision.action).toBe("escalate");
     if (decision.action !== "escalate") return;
@@ -98,7 +101,7 @@ describe("decideRepair", () => {
 
   it("carries what was attempted and why it did not help", () => {
     const subject = repaired("ref-stale", "rewrote the pointer src/a.ts → src/moved/a.ts");
-    const decision = decideRepair(subject, "ref-stale", { reason: "src/moved/a.ts is gone too" });
+    const decision = decideRepair(subject, "ref-stale", { reason: "src/moved/a.ts is gone too" }, "apply");
     if (decision.action !== "escalate") throw new Error("expected an escalation");
 
     const evidence = decision.evidence.join("\n");
@@ -109,7 +112,7 @@ describe("decideRepair", () => {
 
   it("still escalates when the note behind the repair is gone — the LABEL is the guard", () => {
     const subject = bead([repairLabel(BEAD, "ref-stale", T0)], "anton: run failed after 3 attempts");
-    const decision = decideRepair(subject, "ref-stale", { reason: "still stale" });
+    const decision = decideRepair(subject, "ref-stale", { reason: "still stale" }, "apply");
 
     expect(decision.action).toBe("escalate");
     if (decision.action !== "escalate") return;
@@ -118,11 +121,42 @@ describe("decideRepair", () => {
 
   it("is per (bead, class) — a different class on a repaired bead still repairs", () => {
     const subject = repaired("ref-stale", "rewrote the pointer");
-    expect(decideRepair(subject, "dep-missing", {}).action).toBe("repair");
+    expect(decideRepair(subject, "dep-missing", {}, "apply").action).toBe("repair");
+  });
+
+  it("escalates a class this project has not armed, and says how to arm it (R5.3)", () => {
+    const decision = decideRepair(bead(), "ref-stale", { reason: "src/a.ts is gone" }, "propose");
+
+    expect(decision.action).toBe("escalate");
+    if (decision.action !== "escalate") return;
+    expect(decision.prior).toBeUndefined();
+    expect(decision.why).toContain("not armed to repair");
+    const evidence = decision.evidence.join("\n");
+    expect(evidence).toContain("src/a.ts is gone");
+    expect(evidence).toContain("`propose`");
+    expect(evidence).toContain("`apply`");
+  });
+
+  it("shadows a class armed at `shadow` — the same identity, no write", () => {
+    const decision = decideRepair(bead(), "ref-stale", { reason: "src/a.ts is gone" }, "shadow");
+    expect(decision).toEqual({
+      action: "shadow",
+      klass: "ref-stale",
+      fingerprint: repairFingerprint(BEAD, "ref-stale"),
+    });
+  });
+
+  it("holds the loop guard against a SHADOW too — a disproved diagnosis is not re-described", () => {
+    const subject = repaired("ref-stale", "rewrote the pointer src/a.ts → src/moved/a.ts");
+    for (const level of ["shadow", "apply"] as const) {
+      expect(decideRepair(subject, "ref-stale", { reason: "still stale" }, level).action).toBe(
+        "escalate",
+      );
+    }
   });
 
   it("names the missing reason rather than printing nothing", () => {
-    const decision = decideRepair(repaired("dep-missing", "drew anton-b blocks anton-a"), "dep-missing", {});
+    const decision = decideRepair(repaired("dep-missing", "drew anton-b blocks anton-a"), "dep-missing", {}, "apply");
     if (decision.action !== "escalate") throw new Error("expected an escalation");
     expect(decision.evidence.join("\n")).toContain("no reason given");
   });
@@ -155,7 +189,19 @@ describe("the stamp on the bead", () => {
       at: T0,
       attempted: "drew anton-b blocks anton-a, parked anton-a",
     });
-    expect(decideRepair(reread, "dep-missing", { reason: "still blocked" }).action).toBe("escalate");
+    expect(decideRepair(reread, "dep-missing", { reason: "still blocked" }, "apply").action).toBe("escalate");
+  });
+
+  it("records a shadow WITHOUT the fingerprint — the guard must stay free for a real repair", () => {
+    const note = shadowNote("ref-stale", "rewrote src/a.ts → src/b.ts");
+
+    expect(note).toContain("did not repair this as `ref-stale`");
+    expect(note).toContain("`shadow`");
+    expect(note).toContain("rewrote src/a.ts → src/b.ts");
+    // The fingerprint is the suppression, and nothing happened — a shadow note that carried one
+    // would read back through `repairAttemptsOf` as a repair the labels never recorded.
+    expect(note).not.toContain(repairFingerprint(BEAD, "ref-stale"));
+    expect(note.split("\n")).toHaveLength(1);
   });
 
   it("flattens a multi-line reason so the notes blob stays one note per line", () => {
