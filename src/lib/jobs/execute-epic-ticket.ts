@@ -561,8 +561,12 @@ async function repairBlockedTicket(args: {
     );
     return outcome;
   } catch (failure) {
+    // The MODULE that ran and the block CLASS it ran on are two different facts (PR #223 review).
+    // Every non-`dep-missing` block falls through to `ref-stale`, so naming the class alone reads as
+    // if an `env` repair existed and threw, rather than that `ref-stale` refused an `env` block.
+    const repair = klass === "dep-missing" ? "dep-missing" : "ref-stale";
     console.error(
-      `[execute-epic] ${klass ?? "ref-stale"} repair failed for ${ticket.id}`,
+      `[execute-epic] ${repair} repair failed for ${ticket.id} (block class: ${klass ?? "unclassified"})`,
       failure,
     );
     return undefined;

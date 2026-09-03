@@ -7,12 +7,14 @@
  *
  *   • the path is in the tree, or it is not;
  *   • git recorded exactly one destination for it, or it did not;
- *   • that destination is in the tree, or it is not.
+ *   • that destination is in the tree, or it is not;
+ *   • what is in the tree there is what the rename put there, or it was recreated since.
  *
  * Refusing to guess is what keeps that true, so the module escalates on every reading that is not
- * one of those three yeses — a delete (including one a later rename sits beside), a name that has
+ * one of those four yeses — a delete (including one a later rename sits beside), a name that has
  * stood for two different files, a chain that runs past its bound, a destination that is itself
- * missing. A partial answer is not a repair: if
+ * missing, a destination some unrelated file took over after the rename. A partial answer is not a
+ * repair: if
  * ANY stale path fails to resolve, nothing is rewritten at all, because a bead half-corrected still
  * points somewhere wrong and the retry it would earn is a run spent proving that.
  *
@@ -176,6 +178,38 @@ async function inWorktree(worktreePath: string, path: string): Promise<boolean> 
 }
 
 /**
+ * Whether the file sitting at a rename's DESTINATION is the incarnation that rename produced — or an
+ * unrelated file that later took the name over (PR #223 review).
+ *
+ * The source's history cannot answer this. `src/a.ts` renamed to `src/b.ts`, `src/b.ts` deleted, and
+ * something else committed at `src/b.ts` still reads from `src/a.ts` as ONE clean rename: `--follow`
+ * walks BACKWARDS from a path's current life, so a removal after the rename is invisible from the
+ * name that moved. Read from the destination it is the only thing visible — the walk switches to the
+ * pre-rename name at the rename commit, so a removal of `src/b.ts` from BEFORE it (an older file
+ * that used to wear the name, which the rename legitimately replaced) is correctly not reported.
+ *
+ * Returns the refusal's reason, or `undefined` when the destination has stood for one file since.
+ */
+async function recreatedSinceRename(
+  worktreePath: string,
+  path: string,
+): Promise<string | undefined> {
+  let history: PathHistory;
+  try {
+    history = await readPathHistory(worktreePath, path);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    return `git history for \`${path}\` could not be read (${detail})`;
+  }
+  if (!history.deleted && history.renamedTo.length === 0) return undefined;
+  const how = history.deleted ? "deleted" : `renamed away to \`${history.renamedTo[0]}\``;
+  return (
+    `\`${path}\` was ${how} after the rename that put the bead's file there — whatever wears that ` +
+    `name now was committed afterwards, so it is not the file the bead pointed at`
+  );
+}
+
+/**
  * Check one cited path against the worktree and, when it is gone, follow it through git history.
  *
  * Both reads are the WORKTREE's, not the project checkout's: a worktree is a full git checkout on
@@ -252,7 +286,12 @@ export async function verifyCitedPath(worktreePath: string, path: string): Promi
     }
     trail.push(next);
     cur = next;
-    if (await inWorktree(worktreePath, cur)) return { path, state: "moved", to: cur, trail };
+    if (await inWorktree(worktreePath, cur)) {
+      const recreated = await recreatedSinceRename(worktreePath, cur);
+      return recreated === undefined
+        ? { path, state: "moved", to: cur, trail }
+        : { path, state: "unresolved", why: recreated };
+    }
   }
   return {
     path,

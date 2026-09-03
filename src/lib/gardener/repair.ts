@@ -418,7 +418,10 @@ export const FAILED_REPAIR_WEIGHT = 2;
  * BEAD: the run's target, the ticket its row names, and every child that committed its own work
  * inside a grouped run. A delivery recorded against the epic still does not spend a stamp on the
  * child it grouped, which is the conservative direction — a repair whose bead never delivered in its
- * own name goes on counting double.
+ * own name goes on counting double. Counted through the attempt's SETTLEMENT rather than its start
+ * (PR #223 review), because a ticket's delivery lands mid-run — its `execute` session settles `done`
+ * on its own commit, before the run-level review and PR steps — so a run that fails in one of those
+ * later steps has already had its repair proven by the delivery it made.
  *
  * A run with no recorded start is weighed plainly. Nothing can be ordered against it, and the fence
  * goes to the cheaper error: one more failure before the breaker fires, rather than a double weight
@@ -446,11 +449,18 @@ export function repairedFailureWeight(
   return (run: RunOutcome): number => {
     const startedAt = run.startedAt;
     if (startedAt === undefined) return 1;
+    // Deliveries are counted through the attempt's SETTLEMENT, not its start (PR #223 review): a
+    // repaired ticket commits — settling its own `execute` session `done` — before the run-level
+    // review and PR steps run, so a run that fails in one of those still carries a delivery that
+    // PROVED the repair. Bounding at the start would ignore it and go on weighing that failure
+    // double. Never earlier than the start, so a row whose settlement cannot be placed after its
+    // attempt only ever falls back to the old bound.
+    const through = Math.max(startedAt, run.settledAt ?? startedAt);
     const followsRepair = [run.epicBeadId, run.ticketBeadId].some((id) => {
       if (id === undefined) return false;
       const stamps = repairedAt.get(id);
       if (stamps === undefined) return false;
-      const spent = deliveredThrough(delivered.get(id), startedAt);
+      const spent = deliveredThrough(delivered.get(id), through);
       // `startedAt` is whole-second, so the attempt began somewhere in [startedAt, startedAt + 1).
       // Only a repair stamped before that window is ordered before the attempt beyond doubt — and
       // only one the bead has not delivered since is still evidence of anything.
@@ -469,17 +479,18 @@ export type BeadDeliveries = ReadonlyMap<string, readonly number[]>;
 
 /**
  * The instant a repair has to beat to still stand behind this attempt: the end of the newest
- * delivery second that could sit between the two, or 0 for a bead that has never delivered.
+ * delivery second at or before `bound` — the attempt's settlement — or 0 for a bead that has never
+ * delivered.
  *
  * Deliveries are whole-second like the run rows they come from, so one is taken as covering its
- * WHOLE second and one in the attempt's own start second is taken as possibly before it. Both
- * roundings send the ambiguous second to weight 1, the same cheaper error the repair's own fence
- * takes: a delivery that may have answered the repair is not evidence the repair failed.
+ * WHOLE second and one in the bound's own second is taken as possibly before it. Both roundings
+ * send the ambiguous second to weight 1, the same cheaper error the repair's own fence takes: a
+ * delivery that may have answered the repair is not evidence the repair failed.
  */
-function deliveredThrough(deliveries: readonly number[] | undefined, startedAt: number): number {
+function deliveredThrough(deliveries: readonly number[] | undefined, bound: number): number {
   let through = 0;
   for (const at of deliveries ?? []) {
-    if (at <= startedAt) through = Math.max(through, (at + 1) * 1000);
+    if (at <= bound) through = Math.max(through, (at + 1) * 1000);
   }
   return through;
 }

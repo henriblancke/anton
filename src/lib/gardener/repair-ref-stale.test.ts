@@ -193,7 +193,9 @@ suite("ref-stale, against a real git history", () => {
     // moved.ts → renamed once. hop.ts → renamed twice. gone.ts → deleted. twice.ts → the name has
     // stood for two different files, which is the ambiguity nothing can resolve. mixed.ts → deleted,
     // recreated by something unrelated, then renamed. rerun.ts → renamed to the SAME destination
-    // twice, which is that ambiguity wearing one name. here.ts → stays put.
+    // twice, which is that ambiguity wearing one name. here.ts → stays put. ousted.ts → renamed to a
+    // destination an unrelated file took over afterwards. replacer.ts → renamed onto a name whose
+    // older occupant was already gone, which is a clean rename and must stay one.
     write("src/moved.ts", "export const moved = 'a file long enough to pair on similarity';\n");
     write("src/hop.ts", "export const hop = 'another file long enough to pair on similarity';\n");
     write("src/gone.ts", "export const gone = 'a third file long enough to pair on similarity';\n");
@@ -201,6 +203,9 @@ suite("ref-stale, against a real git history", () => {
     write("src/mixed.ts", "export const mixed = 'a fifth file long enough to pair on similarity';\n");
     write("src/rerun.ts", "export const rerun = 'a sixth file long enough to pair on similarity';\n");
     write("src/here.ts", "export const here = 'still right where the bead says it is';\n");
+    write("src/ousted.ts", "export const ousted = 'a seventh file long enough to pair on it';\n");
+    write("src/replacer.ts", "export const replacer = 'an eighth file long enough to pair on it';\n");
+    write("src/legacy.ts", "export const legacy = 'the older file that used to wear that name';\n");
     g(["add", "-A"]);
     g(["commit", "-qm", "c1"]);
 
@@ -240,6 +245,24 @@ suite("ref-stale, against a real git history", () => {
     g(["commit", "-qm", "c13"]);
     g(["mv", "src/rerun.ts", "src/lib/rerun.ts"]);
     g(["commit", "-qm", "c14"]);
+
+    // The ambiguity the SOURCE's history cannot see: one clean rename, then the destination is
+    // removed and an unrelated file takes the name. Read from `src/ousted.ts` this is a rename to a
+    // path that is right there in the worktree.
+    g(["mv", "src/ousted.ts", "src/taken.ts"]);
+    g(["commit", "-qm", "c15"]);
+    g(["rm", "-q", "src/taken.ts"]);
+    g(["commit", "-qm", "c16"]);
+    write("src/taken.ts", "export const stranger = 'an unrelated file that took the name later';\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "c17"]);
+
+    // The same shape read backwards: the older `src/legacy.ts` is gone BEFORE the rename replaces
+    // it, so the destination has stood for one file ever since and the rename is followable.
+    g(["rm", "-q", "src/legacy.ts"]);
+    g(["commit", "-qm", "c18"]);
+    g(["mv", "src/replacer.ts", "src/legacy.ts"]);
+    g(["commit", "-qm", "c19"]);
   });
 
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -295,6 +318,19 @@ suite("ref-stale, against a real git history", () => {
       const verdict = await verifyCitedPath(repo, "src/rerun.ts");
       expect(verdict.state).toBe("unresolved");
       expect(verdict).toMatchObject({ why: expect.stringContaining("more than one file") });
+    });
+
+    it("refuses a rename whose destination an unrelated file took over afterwards", async () => {
+      const verdict = await verifyCitedPath(repo, "src/ousted.ts");
+      expect(verdict.state).toBe("unresolved");
+      expect(verdict).toMatchObject({ why: expect.stringContaining("committed afterwards") });
+    });
+
+    it("follows a rename that legitimately replaced an already-deleted name", async () => {
+      expect(await verifyCitedPath(repo, "src/replacer.ts")).toMatchObject({
+        state: "moved",
+        to: "src/legacy.ts",
+      });
     });
 
     it("refuses a path git has never heard of", async () => {

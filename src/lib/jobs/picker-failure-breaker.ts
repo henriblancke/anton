@@ -27,6 +27,7 @@ import {
   detectFailureStreak,
   failureStreakEvidence,
   verdictOf,
+  EVEN_WEIGHT,
   type FailureStreak,
   type FailureWeight,
   type RunOutcome,
@@ -212,6 +213,9 @@ async function repairWeigher(
   board: readonly Bead[],
 ): Promise<FailureWeight> {
   const repaired = repairedBeadIds(board);
+  // The common board carries no stamp at all, and answering it here skips the weigher's own re-scan
+  // as well as the delivery read (PR #223 review).
+  if (repaired.length === 0) return EVEN_WEIGHT;
   return repairedFailureWeight(board, await listDeliveriesByBead(db, projectId, repaired));
 }
 
@@ -264,6 +268,9 @@ async function readRunOutcomes(
         // the column existed fall back to it.
         ticketBeadId: run.ticketBeadId,
         startedAt: run.attemptStartedAt ?? startedAt,
+        // When this attempt SETTLED, read exactly as the re-arm fence reads it — the far end of the
+        // span a delivery may have landed inside (gardener/repair.ts).
+        settledAt: run.endedAt ?? run.updatedAt,
         status: run.status,
         error: run.error,
         // A newer row that somehow starts no later than this one is not a later attempt, so it

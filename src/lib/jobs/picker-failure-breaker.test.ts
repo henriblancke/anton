@@ -74,6 +74,22 @@ async function run(input: {
 }
 
 /**
+ * A ticket's own `execute` session, settled `done` `atMinutes` in — the delivery evidence a run row
+ * cannot carry, since a child commits while the run around it goes on to review and PR.
+ */
+async function deliveredSession(beadId: string, atMinutes: number): Promise<void> {
+  await t.db.insert(schema.sessions).values({
+    id: `s-${beadId}-${atMinutes}`,
+    projectId: PROJECT,
+    kind: "execute",
+    beadId,
+    status: "done",
+    startedAt: new Date(T0 + atMinutes * MINUTE),
+    endedAt: new Date(T0 + atMinutes * MINUTE),
+  });
+}
+
+/**
  * A job an operator force-stopped `atMinutes` in — the cancel the breaker must subtract. Returns
  * the job id, which is what a run written with `job` is matched on.
  */
@@ -559,6 +575,40 @@ describe("checkFailureStreak", () => {
       expect(outcome?.latched).toBe(true);
       expect(outcome?.streak.weight).toBe(3);
       expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r3", "r4"]);
+    });
+
+    it("spends the repair on a delivery the failing run itself made", async () => {
+      project();
+      // The retry did deliver the repaired ticket — its `execute` session settled `done` at minute
+      // 20, inside a run that started at 15 and settled at 25 — and the run failed afterwards in a
+      // review or PR step. Ordered against the run's START that delivery is invisible and the two
+      // runs weigh 3; ordered against its SETTLEMENT the repair is spent and they weigh 2.
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "failed", startedMinutes: 15, error: "review failed" });
+      await deliveredSession("anton-a", 20);
+
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [repairedBead("anton-a", 12)],
+        }),
+      ).toBeUndefined();
+    });
+
+    it("ignores a delivery from after the failing run settled", async () => {
+      project();
+      // The same two runs, with the delivery landing at minute 40 — well past r2's settlement at 25,
+      // so it belongs to some later attempt and answers nothing about this streak.
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "failed", startedMinutes: 15, error: "review failed" });
+      await deliveredSession("anton-a", 40);
+
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 12)],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
     });
 
     it("leaves a board with no repairs weighing every failure once", async () => {

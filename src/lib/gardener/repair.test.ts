@@ -311,13 +311,35 @@ describe("repairedFailureWeight", () => {
       expect(weigh(run({ startedAt: sec(T0) + 600 }))).toBe(FAILED_REPAIR_WEIGHT);
     });
 
-    it("ignores a delivery the attempt did not follow", () => {
-      // The bead delivered after this attempt began — a later run's evidence, not this one's.
+    it("ignores a delivery a run with no recorded settlement cannot be shown to contain", () => {
+      // Nothing places the delivery inside this attempt, so the bound falls back to its start.
       const weigh = repairedFailureWeight(
         [repaired("ref-stale", "rewrote the pointer")],
         deliveries(T0 + 900_000),
       );
-      expect(weigh(run({ startedAt: sec(T0) + 60 }))).toBe(FAILED_REPAIR_WEIGHT);
+      expect(weigh(run({ startedAt: sec(T0) + 60, settledAt: undefined }))).toBe(
+        FAILED_REPAIR_WEIGHT,
+      );
+    });
+
+    it("spends the repair on a delivery made DURING the failing run", () => {
+      // The retry delivered the repaired ticket — its `execute` session settled `done` — and the run
+      // then failed in a later review or PR step. The delivery proved the repair all the same.
+      const weigh = repairedFailureWeight(
+        [repaired("ref-stale", "rewrote the pointer")],
+        deliveries(T0 + 300_000),
+      );
+      expect(weigh(run({ startedAt: sec(T0) + 60, settledAt: sec(T0 + 600_000) }))).toBe(1);
+    });
+
+    it("ignores a delivery from after the run settled — a later run's evidence", () => {
+      const weigh = repairedFailureWeight(
+        [repaired("ref-stale", "rewrote the pointer")],
+        deliveries(T0 + 900_000),
+      );
+      expect(weigh(run({ startedAt: sec(T0) + 60, settledAt: sec(T0 + 600_000) }))).toBe(
+        FAILED_REPAIR_WEIGHT,
+      );
     });
 
     it("spends the repair on a delivery in the repair's own second, which may have followed it", () => {

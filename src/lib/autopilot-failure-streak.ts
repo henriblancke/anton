@@ -48,6 +48,13 @@ export interface RunOutcome {
    * repaired and the resume continues in place.
    */
   startedAt?: number;
+  /**
+   * Unix SECONDS this run SETTLED (`endedAt ?? updatedAt`, as the disarm fence reads it). Carried
+   * for the weigher alongside {@link startedAt}: a repaired ticket can commit and then have a later
+   * run-level step fail, so the deliveries that answer a repair are the ones before the run's
+   * failure, not only those before its start.
+   */
+  settledAt?: number;
 }
 
 /**
