@@ -55,6 +55,30 @@ export const DEFAULT_REPAIR_AUTONOMY_POLICY: RepairAutonomyPolicy = {
   oversized: "propose",
 };
 
+/**
+ * The classes anton actually HAS a repair for — the factual pair, and the only two
+ * `repairBlockedTicket` (jobs/execute-epic-ticket.ts) dispatches. The inventive pair have no
+ * implementation behind them, so no level above `propose` could ever be honoured for them.
+ *
+ * Named here rather than inferred from {@link DEFAULT_REPAIR_AUTONOMY_POLICY}: that the two sets
+ * coincide today is a property of the shipped defaults, not the fact being asserted. Mirrored
+ * client-side as `RepairClassSpec.blocked` (components/settings/settings-repair.ts) — keep in sync.
+ */
+export const ARMABLE_REPAIR_CLASSES = [
+  "ref-stale",
+  "dep-missing",
+] as const satisfies readonly RepairClass[];
+
+/**
+ * May this class be armed above `propose` at all? Asked at the SETTINGS boundary (projects.ts
+ * `repairAutonomySchema`), where an operator is present to see the rejection: storing
+ * `acceptance-missing: "apply"` would otherwise succeed, be ignored by every run, and read back as
+ * `propose` — a policy the board can never honour (PR #223 review).
+ */
+export function isArmableRepairClass(klass: RepairClass): boolean {
+  return (ARMABLE_REPAIR_CLASSES as readonly string[]).includes(klass);
+}
+
 function isAutonomy(value: unknown): value is ProposalAutonomy {
   return typeof value === "string" && (PROPOSAL_AUTONOMY_LEVELS as readonly string[]).includes(value);
 }

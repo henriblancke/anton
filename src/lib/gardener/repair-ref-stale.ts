@@ -451,6 +451,11 @@ async function stampRewrite(
  * Applied back-to-front — the spans and, within each, the citations — so each replacement's offsets
  * stay valid, and only at the offsets {@link citedPaths} actually validated: a bead whose prose
  * happens to contain the same characters outside a citation keeps them.
+ *
+ * A leading `./` the author wrote is carried onto the replacement (PR #223 review). `citedPaths`
+ * normalises it away and git reports the destination without one, so the naive swap turns
+ * `./src/a.ts` into `src/b.ts` — resolving identically, but changing the bead's formatting under a
+ * founder who has to read the result. The repair moves the pointer and nothing else.
  */
 function rewriteContexts(
   description: string,
@@ -464,8 +469,9 @@ function rewriteContexts(
     for (const citation of [...citations].sort((a, b) => b.index - a.index)) {
       const next = to.get(citation.path);
       if (!next) continue;
+      const written = citation.text.startsWith("./") ? `./${next}` : next;
       body =
-        body.slice(0, citation.index) + next + body.slice(citation.index + citation.text.length);
+        body.slice(0, citation.index) + written + body.slice(citation.index + citation.text.length);
     }
     out = out.slice(0, span.start) + body + out.slice(span.end);
   }

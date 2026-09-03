@@ -60,6 +60,11 @@ const blocks = (blocked: string, blocker: string) => ({
   depends_on_id: blocker,
   type: "blocks",
 });
+const conditionalBlocks = (blocked: string, blocker: string) => ({
+  issue_id: blocked,
+  depends_on_id: blocker,
+  type: "conditional-blocks",
+});
 const discoveredFrom = (discovered: string, source: string) => ({
   issue_id: discovered,
   depends_on_id: source,
@@ -179,6 +184,23 @@ describe("the prerequisite the agent named", () => {
     const cyclic = [
       bead(TARGET),
       bead(PREREQ, { dependencies: [blocks(PREREQ, "anton-mid")] } as Partial<Bead>),
+      bead("anton-mid", { dependencies: [blocks("anton-mid", TARGET)] } as Partial<Bead>),
+    ];
+    expect(resolvePrereq(indexBoard(cyclic), TARGET, `blocked on ${PREREQ}`)).toMatchObject({
+      state: "unresolved",
+      why: expect.stringContaining("cycle"),
+    });
+  });
+
+  // `conditional-blocks` holds work back exactly as `blocks` does (the measured matrix in
+  // docs/spikes/2026-07-28-bd-workflow-primitives.md), so a path reaching the target through one is
+  // a real cycle — reading it as safe would draw an edge bd rejects, or a park that never lifts.
+  it("refuses the cycle that closes through a `conditional-blocks` edge", () => {
+    const cyclic = [
+      bead(TARGET),
+      bead(PREREQ, {
+        dependencies: [conditionalBlocks(PREREQ, "anton-mid")],
+      } as Partial<Bead>),
       bead("anton-mid", { dependencies: [blocks("anton-mid", TARGET)] } as Partial<Bead>),
     ];
     expect(resolvePrereq(indexBoard(cyclic), TARGET, `blocked on ${PREREQ}`)).toMatchObject({

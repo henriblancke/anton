@@ -859,6 +859,27 @@ describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
     }
     expect(persisted().repairAutonomy).toEqual({ "ref-stale": "apply", "dep-missing": "propose" });
   });
+
+  /**
+   * A class with no repair behind it cannot be armed. `repairBlockedTicket` dispatches only the
+   * factual pair, so a stored `acceptance-missing: "apply"` would 200, be ignored by every run, and
+   * render back as `propose` — the one silence this boundary exists to refuse (PR #223 review).
+   */
+  it("refuses arming a class anton has no repair for, but still takes `propose`", async () => {
+    for (const klass of ["acceptance-missing", "oversized"]) {
+      for (const level of ["apply", "shadow"]) {
+        const armed = await PATCH(patchReq({ repairAutonomy: { [klass]: level } }), ctx("tmp"));
+        expect(armed.status).toBe(400);
+        expect((await armed.json()).error).toMatch(new RegExp(`repairAutonomy.*${klass}`));
+      }
+      const pinned = await PATCH(patchReq({ repairAutonomy: { [klass]: "propose" } }), ctx("tmp"));
+      expect(pinned.status).toBe(200);
+    }
+    expect(persisted().repairAutonomy).toEqual({
+      "acceptance-missing": "propose",
+      oversized: "propose",
+    });
+  });
 });
 
 /**

@@ -374,6 +374,25 @@ suite("ref-stale, against a real git history", () => {
       expect(noteMock.mock.calls[0]![2]).toContain(repairFingerprint(BEAD, "ref-stale"));
     });
 
+    // The repair moves the pointer and nothing else — including the `./` an author wrote, which
+    // `citedPaths` normalises away and git never reports back (PR #223 review).
+    it("keeps a `./` prefix the bead was written with", async () => {
+      const description = contract("touches: `./src/moved.ts` and `src/moved.ts`.");
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome).toMatchObject({ action: "repaired" });
+      expect(outcome.action === "repaired" && outcome.description).toBe(
+        contract("touches: `./src/lib/renamed.ts` and `src/lib/renamed.ts`."),
+      );
+    });
+
     it("rewrites a stale pointer in EVERY Context section, not just the first", async () => {
       const description = [
         "## Goal",

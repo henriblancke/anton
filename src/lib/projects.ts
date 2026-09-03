@@ -24,11 +24,12 @@ import {
   type ProposalAutonomyPolicy,
 } from "./gardener/autonomy";
 import {
+  isArmableRepairClass,
   resolveRepairAutonomyPolicy,
   type RepairAutonomyOverrides,
   type RepairAutonomyPolicy,
 } from "./gardener/repair-autonomy";
-import { REPAIR_CLASSES } from "./gardener/repair";
+import { REPAIR_CLASSES, type RepairClass } from "./gardener/repair";
 import {
   DEFAULT_SCAN_SEVERITY_POLICY,
   resolveScanSeverityPolicy,
@@ -590,11 +591,24 @@ export const proposalAutonomySchema = z.partialRecord(
  * by the block classes the repair guard owns and valued by the same three levels, so a class added
  * to `repair.ts` is accepted here the moment it exists. Strict about both halves — an unknown class
  * or an unknown level 400s rather than persisting a policy the pass would silently ignore.
+ *
+ * And strict about a third thing the proposal side has no equivalent of: a class anton has no
+ * repair FOR may only be `propose` (PR #223 review). Arming `acceptance-missing` or `oversized`
+ * would otherwise persist and 200, then be ignored by every run and read back as `propose` — a
+ * stored policy that can never be honoured, which is the silence this boundary exists to refuse.
  */
-export const repairAutonomySchema = z.partialRecord(
-  z.enum(REPAIR_CLASSES),
-  z.enum(PROPOSAL_AUTONOMY_LEVELS),
-);
+export const repairAutonomySchema = z
+  .partialRecord(z.enum(REPAIR_CLASSES), z.enum(PROPOSAL_AUTONOMY_LEVELS))
+  .superRefine((policy, ctx) => {
+    for (const [klass, level] of Object.entries(policy)) {
+      if (!level || level === "propose" || isArmableRepairClass(klass as RepairClass)) continue;
+      ctx.addIssue({
+        code: "custom",
+        path: [klass],
+        message: `anton has no \`${klass}\` repair, so it can only be \`propose\``,
+      });
+    }
+  });
 
 /**
  * How far anton may go repairing each block class on this project — the shipped policy with the
