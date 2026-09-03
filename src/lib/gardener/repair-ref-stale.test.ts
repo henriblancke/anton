@@ -105,6 +105,34 @@ describe("citedPaths", () => {
     const [cited] = citedPaths("see ./src/a.ts");
     expect(cited).toMatchObject({ path: "src/a.ts", text: "./src/a.ts" });
   });
+
+  // An import in a code sample wears a citation's shape while pointing at nothing in this tree, and
+  // reading it as a pointer escalated repairs that were otherwise mechanical (PR #223 review).
+  it("reads no citation inside a fenced code block", () => {
+    const cited = citedPaths(
+      [
+        "the shape to follow:",
+        "```ts",
+        'import { Foo } from "@types/node/globals.d.ts";',
+        "```",
+      ].join("\n"),
+    );
+    expect(cited).toEqual([]);
+  });
+
+  it("keeps offsets aimed at the source text across a fence", () => {
+    const text = ["```ts", "import './src/b.ts';", "```", "touches `src/a.ts`."].join("\n");
+    const [cited, ...rest] = citedPaths(text);
+    expect(rest).toEqual([]);
+    expect(cited).toMatchObject({ path: "src/a.ts", text: "src/a.ts" });
+    expect(text.slice(cited!.index, cited!.index + cited!.text.length)).toBe("src/a.ts");
+  });
+
+  it("measures CRLF separators, so a citation's offset survives them", () => {
+    const text = ["prose", "touches `src/a.ts`."].join("\r\n");
+    const [cited] = citedPaths(text);
+    expect(text.slice(cited!.index, cited!.index + cited!.text.length)).toBe("src/a.ts");
+  });
 });
 
 describe("contextSpans", () => {
@@ -411,6 +439,38 @@ suite("ref-stale, against a real git history", () => {
       expect(outcome).toMatchObject({ action: "repaired" });
       expect(outcome.action === "repaired" && outcome.description).toBe(
         contract("touches: `./src/lib/renamed.ts` and `src/lib/renamed.ts`."),
+      );
+    });
+
+    // A code sample is not a set of pointers at this repo: an import path that resolves nowhere here
+    // used to join the unresolved set and escalate an otherwise mechanical repair (PR #223 review).
+    it("follows the real pointer past a code sample citing a path this repo never had", async () => {
+      const description = contract(
+        [
+          "touches `src/moved.ts`. Written like:",
+          "",
+          "```ts",
+          'import { Foo } from "@types/node/globals.d.ts";',
+          'import { gone } from "./src/gone.ts";',
+          "```",
+        ].join("\n"),
+      );
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome).toMatchObject({
+        action: "repaired",
+        rewrites: [{ from: "src/moved.ts", to: "src/lib/renamed.ts" }],
+      });
+      // The sample comes back byte-identical — the repair moves the pointer and nothing else.
+      expect(outcome.action === "repaired" && outcome.description).toBe(
+        description.replace("src/moved.ts", "src/lib/renamed.ts"),
       );
     });
 

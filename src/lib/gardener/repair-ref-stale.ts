@@ -21,7 +21,8 @@
  *
  * What it rewrites is the `## Context` sections and nothing else. Out of scope by construction: prose
  * that merely MENTIONS a file (a citation is a repo-relative path with a directory and an extension,
- * not a sentence about a module), and symbols — only paths.
+ * not a sentence about a module), fenced code samples (an import in an example is not a pointer at
+ * this repo — see {@link citedPaths}), and symbols — only paths.
  *
  * The loop guard and the trust dial are both repair.ts's, unchanged: {@link decideRepair} decides
  * whether this bead may be repaired for this class at all — a second `ref-stale` block on a bead
@@ -30,7 +31,7 @@
  */
 import { beads } from "../beads/bd";
 import { isContractHeading } from "../beads/contract";
-import { scanMarkdown } from "../beads/markdown";
+import { scanMarkdown, type ScannedLine } from "../beads/markdown";
 import { readPathHistory, type PathHistory } from "../git/ops";
 import { access } from "node:fs/promises";
 import { join } from "node:path";
@@ -76,6 +77,24 @@ export interface PathCitation {
 }
 
 /**
+ * Every scanned line of `source` with the offset it starts at.
+ *
+ * The separator is MEASURED at each line rather than assumed to be one character (PR #223 review):
+ * {@link scanMarkdown} splits on `\r?\n` and hands back lines with the `\r` already gone, so a bead
+ * written with CRLF endings would drift every offset one byte earlier per line — truncating the tail
+ * of a Context span, and mis-aiming the rewrite of a citation inside it.
+ */
+function* scannedLines(source: string): Generator<{ line: ScannedLine; start: number; next: number }> {
+  let offset = 0;
+  for (const line of scanMarkdown(source)) {
+    const lineEnd = offset + line.text.length;
+    const next = lineEnd + (source.startsWith("\r\n", lineEnd) ? 2 : 1);
+    yield { line, start: offset, next };
+    offset = next;
+  }
+}
+
+/**
  * Every place the given text cites a path, in order — one entry per OCCURRENCE, so a Context that
  * names the same moved file twice can be rewritten in both places rather than half-corrected.
  *
@@ -83,20 +102,31 @@ export interface PathCitation {
  * boundary checks below actually validated, so nothing is re-found by a bare substring search that
  * would happily match `src/a.ts` inside `vendor/src/a.tsx`.
  *
+ * FENCED code is not prose about the repository and holds no citations (PR #223 review): an
+ * `import { Foo } from "@types/node/globals.d.ts"` in a Context code sample wears the shape of a
+ * repo-relative path while pointing at nothing in the tree, and reading it as a citation escalated
+ * the whole repair — refusing to follow a pointer that WAS mechanically followable, on the strength
+ * of a line the bead never claimed was a file here. Skipping the fence is also what keeps a rewrite
+ * out of a code sample the founder wrote to say something specific. Fences are read through
+ * {@link scanMarkdown}, the same scanner {@link contextSpans} sections by, so the two cannot drift.
+ *
  * A path that climbs out of the repository (`..`) or starts at the filesystem root is not a citation
  * this repair will touch: it names something outside the tree anton is allowed to reason about, and
  * "resolve it against the worktree" has no meaning there.
  */
 export function citedPaths(text: string): PathCitation[] {
   const out: PathCitation[] = [];
-  for (const match of text.matchAll(CITED_PATH)) {
-    const index = match.index ?? 0;
-    const before = index > 0 ? text[index - 1]! : "";
-    const after = text[index + match[0].length] ?? "";
-    if (NOT_A_CITATION_BOUNDARY.test(before) || CITATION_TAIL.test(after)) continue;
-    const path = match[0].replace(/^\.\//, "");
-    if (path.startsWith("/") || path.split("/").includes("..")) continue;
-    out.push({ path, text: match[0], index });
+  for (const { line, start } of scannedLines(text)) {
+    if (line.fenced) continue;
+    for (const match of line.text.matchAll(CITED_PATH)) {
+      const at = match.index ?? 0;
+      const before = at > 0 ? line.text[at - 1]! : "";
+      const after = line.text[at + match[0].length] ?? "";
+      if (NOT_A_CITATION_BOUNDARY.test(before) || CITATION_TAIL.test(after)) continue;
+      const path = match[0].replace(/^\.\//, "");
+      if (path.startsWith("/") || path.split("/").includes("..")) continue;
+      out.push({ path, text: match[0], index: start + at });
+    }
   }
   return out;
 }
@@ -128,34 +158,29 @@ export interface ContextSpan {
  * Fences and HTML comments are honoured through {@link scanMarkdown}, so a `## Context` quoted
  * inside a code block opens no section here, exactly as it opens none for the contract gate.
  *
- * The separator is MEASURED at each line rather than assumed to be one character (PR #223 review):
- * {@link scanMarkdown} splits on `\r?\n` and hands back lines with the `\r` already gone, so a bead
- * written with CRLF endings would drift the span one byte earlier per line — truncating the tail of
- * Context, and with it a stale citation the repair could otherwise have followed.
+ * Offsets come from {@link scannedLines}, which measures each line separator rather than assuming
+ * one byte (PR #223 review) — a CRLF bead would otherwise truncate the tail of Context, and with it
+ * a stale citation the repair could have followed.
  */
 export function contextSpans(description: string): ContextSpan[] {
   const spans: ContextSpan[] = [];
   let start: number | undefined;
   let depth = 0;
-  let offset = 0;
   const close = (end: number) => {
     const at = Math.max(start!, end);
     spans.push({ start: start!, end: at, body: description.slice(start!, at) });
     start = undefined;
   };
-  for (const line of scanMarkdown(description)) {
-    const lineEnd = offset + line.text.length;
-    const nextLine = lineEnd + (description.startsWith("\r\n", lineEnd) ? 2 : 1);
+  for (const { line, start: offset, next } of scannedLines(description)) {
     // A heading at the open section's depth or shallower closes it, as does any heading naming
     // another contract section however deeply nested — and either may open the next one, so two
     // adjacent `## Context` sections are two spans rather than one swallowing the other.
     const closes = line.heading && (line.heading.depth <= depth || isContractHeading(line.heading));
     if (start !== undefined && closes) close(offset);
     if (start === undefined && line.heading?.key === "context") {
-      start = Math.min(nextLine, description.length);
+      start = Math.min(next, description.length);
       depth = line.heading.depth;
     }
-    offset = nextLine;
   }
   if (start !== undefined) close(description.length);
   return spans;
