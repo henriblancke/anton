@@ -145,11 +145,13 @@ suite("ref-stale, against a real git history", () => {
     g(["config", "user.name", "anton-test"]);
 
     // moved.ts → renamed once. hop.ts → renamed twice. gone.ts → deleted. twice.ts → the name has
-    // stood for two different files, which is the ambiguity nothing can resolve. here.ts → stays put.
+    // stood for two different files, which is the ambiguity nothing can resolve. mixed.ts → deleted,
+    // recreated by something unrelated, then renamed. here.ts → stays put.
     write("src/moved.ts", "export const moved = 'a file long enough to pair on similarity';\n");
     write("src/hop.ts", "export const hop = 'another file long enough to pair on similarity';\n");
     write("src/gone.ts", "export const gone = 'a third file long enough to pair on similarity';\n");
     write("src/twice.ts", "export const twice = 'a fourth file long enough to pair on it';\n");
+    write("src/mixed.ts", "export const mixed = 'a fifth file long enough to pair on similarity';\n");
     write("src/here.ts", "export const here = 'still right where the bead says it is';\n");
     g(["add", "-A"]);
     g(["commit", "-qm", "c1"]);
@@ -173,6 +175,14 @@ suite("ref-stale, against a real git history", () => {
     g(["commit", "-qm", "c7"]);
     g(["mv", "src/twice.ts", "src/second.ts"]);
     g(["commit", "-qm", "c8"]);
+
+    g(["rm", "-q", "src/mixed.ts"]);
+    g(["commit", "-qm", "c9"]);
+    write("src/mixed.ts", "export const unrelated = 'a different file that took over the name';\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "c10"]);
+    g(["mv", "src/mixed.ts", "src/took-over.ts"]);
+    g(["commit", "-qm", "c11"]);
   });
 
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -216,6 +226,12 @@ suite("ref-stale, against a real git history", () => {
       const verdict = await verifyCitedPath(repo, "src/twice.ts");
       expect(verdict.state).toBe("unresolved");
       expect(verdict).toMatchObject({ why: expect.stringContaining("more than one file") });
+    });
+
+    it("refuses a path that was deleted AND renamed, rather than following the later file", async () => {
+      const verdict = await verifyCitedPath(repo, "src/mixed.ts");
+      expect(verdict.state).toBe("unresolved");
+      expect(verdict).toMatchObject({ why: expect.stringContaining("both deleted and renamed") });
     });
 
     it("refuses a path git has never heard of", async () => {

@@ -178,9 +178,11 @@ process.exit(0);`),
     const target = await seedTarget("Wire the exports page up");
     const runner = makeEpicRunner(ctx);
     const prev = process.env.ANTON_CLAUDE_BIN;
-    // A bead id nobody filed. The repair records ordering between beads that exist; it never
+    // A bead id nobody filed, minted with THIS board's prefix so it reads as a prerequisite that
+    // missed rather than as prose. The repair records ordering between beads that exist; it never
     // creates the missing work, so there is nothing here for it to point at.
-    process.env.ANTON_CLAUDE_BIN = blockedOnClaude("claude-depghost", "anton-ghost");
+    const ghost = `${target.split("-")[0]}-ghost`;
+    process.env.ANTON_CLAUDE_BIN = blockedOnClaude("claude-depghost", ghost);
     try {
       const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: target });
       expect(await tickToIdle(runner)).toBe(1);
@@ -191,10 +193,8 @@ process.exit(0);`),
       const blocked = await beads.show(repo, target);
       expect(blocked.status).toBe("blocked");
       expect((blocked.labels ?? []).some((l) => l.startsWith("repair:"))).toBe(false);
-      expect(await edgeExists(target, "anton-ghost")).toBe(false);
-      expect((await beads.list(repo, ["--status", "all"])).some((b) => b.id === "anton-ghost")).toBe(
-        false,
-      );
+      expect(await edgeExists(target, ghost)).toBe(false);
+      expect((await beads.list(repo, ["--status", "all"])).some((b) => b.id === ghost)).toBe(false);
 
       const notes = parseTicketNotes(blocked.notes)
         .filter((n) => n.source === "system")

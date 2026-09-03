@@ -123,6 +123,24 @@ describe("the prerequisite the agent named", () => {
     });
   });
 
+  it("refuses a real bead named beside one that missed — the miss may be the mistyped real one", () => {
+    const verdict = resolvePrereq(indexBoard(board()), TARGET, `blocked on ${PREREQ} and anton-zzzz`);
+    expect(verdict).toMatchObject({
+      state: "unresolved",
+      why: expect.stringContaining("which one the work is waiting on"),
+    });
+  });
+
+  it("reads hyphenated prose as prose, so a sentence around the one id still resolves", () => {
+    expect(
+      resolvePrereq(
+        indexBoard(board()),
+        TARGET,
+        `blocked on ${PREREQ} — a pre-existing type-check failure in the shared module`,
+      ),
+    ).toEqual({ state: "resolved", id: PREREQ });
+  });
+
   it("refuses to pick between two beads it names", () => {
     const verdict = resolvePrereq(
       indexBoard(board({}, [bead("anton-othr")])),

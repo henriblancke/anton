@@ -12,7 +12,8 @@
  * WHAT IT REFUSES, and each refusal is one way "draw the edge" would be a guess or an error:
  *
  *   • prose that names NO bead this board holds — the agent named an artifact, not work;
- *   • prose that names SEVERAL — which one it is waiting on is not something the reason answers;
+ *   • prose that names SEVERAL — which one it is waiting on is not something the reason answers,
+ *     and that holds whether or not the board happens to hold them all;
  *   • a prerequisite already CLOSED — it is not what stopped this run, and parking behind it would
  *     park forever;
  *   • an ordering the board ALREADY records — then the block is something else;
@@ -42,9 +43,9 @@ import {
 const KLASS = "dep-missing" as const;
 
 /**
- * bd ids as they appear in prose (`anton-qg4h`, `anton-287p.1`). Deliberately loose — MEMBERSHIP in
- * the board decides what is real (see {@link resolvePrereq}), so the pattern only has to be wide
- * enough not to miss one. The dotted suffix is part of the id: bd mints child ids that carry it, and
+ * bd ids as they appear in prose (`anton-qg4h`, `anton-287p.1`). Deliberately loose — the board's own
+ * id prefixes and then membership decide what is real (see {@link resolvePrereq}), so the pattern
+ * only has to be wide enough not to miss one. The dotted suffix is part of the id: bd mints child ids that carry it, and
  * a pattern that stopped at the dot would resolve `anton-287p.1` to its parent.
  */
 const ID_PATTERN = /\b[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)*\b/gi;
@@ -60,6 +61,31 @@ export function namedPrereqs(reason: string | undefined): string[] {
   const seen = new Set<string>();
   for (const match of reason.matchAll(ID_PATTERN)) seen.add(match[0].toLowerCase());
   return [...seen];
+}
+
+/** The bit before the dash — `anton` in `anton-qg4h`; empty for an id shaped like neither. */
+function idPrefix(id: string): string {
+  const dash = id.indexOf("-");
+  return dash > 0 ? id.slice(0, dash) : "";
+}
+
+/**
+ * The id prefixes this board actually mints, read off the snapshot rather than configured.
+ *
+ * Needed because {@link ID_PATTERN} is loose enough that ordinary hyphenated prose ("pre-existing",
+ * "one-line") reads as an id to it. Membership in the board used to be the whole filter, which was
+ * fine while it ran before any cardinality question — but cardinality is now decided FIRST (see
+ * {@link resolvePrereq}), and counting English words as named prerequisites would refuse every
+ * reason written in sentences. The prefix is the cheapest line between the two readings: a mistyped
+ * `anton-zzzz` is a bead id that missed, `pre-existing` was never one.
+ */
+function mintedPrefixes(index: BoardIndex): Set<string> {
+  const prefixes = new Set<string>();
+  for (const id of index.byId.keys()) {
+    const prefix = idPrefix(id);
+    if (prefix) prefixes.add(prefix);
+  }
+  return prefixes;
 }
 
 /** What the board answers for the prerequisite the agent named. */
@@ -81,7 +107,15 @@ export function resolvePrereq(
   reason: string | undefined,
 ): PrereqVerdict {
   const named = namedPrereqs(reason).filter((id) => id !== targetId);
-  if (named.length === 0) {
+  // CARDINALITY BEFORE MEMBERSHIP (PR #223 review). Narrowing to what the board holds first would
+  // read "needs anton-qg4h and anton-zzzz" as one unambiguous prerequisite by discarding the id that
+  // resolved to nothing — but a reason naming two ids is ambiguous whether or not both are real: the
+  // one that missed may be the mistyped form of the bead actually meant, and the ordering recorded
+  // would then be the wrong half of what the agent stated. The system prompt asks for exactly one id
+  // and sends anything else to a human; this is that rule, enforced.
+  const prefixes = mintedPrefixes(index);
+  const candidates = named.filter((id) => prefixes.has(idPrefix(id)));
+  if (candidates.length === 0) {
     return {
       state: "unresolved",
       why: reason
@@ -90,25 +124,24 @@ export function resolvePrereq(
         : `the agent named no prerequisite at all`,
     };
   }
-  const onBoard = named.filter((id) => index.byId.has(id));
-  if (onBoard.length === 0) {
+  if (candidates.length > 1) {
     return {
       state: "unresolved",
       why:
-        `${named.map((id) => `\`${id}\``).join(", ")} is named as the prerequisite but the board ` +
-        `holds no such bead — the repair records ordering only, so there is nothing to point at`,
+        `the reason names ${candidates.length} bead ids ` +
+        `(${candidates.map((id) => `\`${id}\``).join(", ")}) — which one the work is waiting on is ` +
+        `not something it answers, and anton will not pick one`,
     };
   }
-  if (onBoard.length > 1) {
+  const id = candidates[0]!;
+  if (!index.byId.has(id)) {
     return {
       state: "unresolved",
       why:
-        `the reason names ${onBoard.length} beads on the board ` +
-        `(${onBoard.map((id) => `\`${id}\``).join(", ")}) — which one the work is waiting on is not ` +
-        `something it answers, and anton will not pick one`,
+        `\`${id}\` is named as the prerequisite but the board holds no such bead — the repair ` +
+        `records ordering only, so there is nothing to point at`,
     };
   }
-  const id = onBoard[0]!;
   const prereq = index.byId.get(id)!;
   if (!isOpenWork(prereq)) {
     return {

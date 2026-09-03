@@ -10,8 +10,9 @@
  *   • that destination is in the tree, or it is not.
  *
  * Refusing to guess is what keeps that true, so the module escalates on every reading that is not
- * one of those three yeses — a delete, a name that has stood for two different files, a chain that
- * runs past its bound, a destination that is itself missing. A partial answer is not a repair: if
+ * one of those three yeses — a delete (including one a later rename sits beside), a name that has
+ * stood for two different files, a chain that runs past its bound, a destination that is itself
+ * missing. A partial answer is not a repair: if
  * ANY stale path fails to resolve, nothing is rewritten at all, because a bead half-corrected still
  * points somewhere wrong and the retry it would earn is a run spent proving that.
  *
@@ -187,6 +188,19 @@ export async function verifyCitedPath(worktreePath: string, path: string): Promi
           `\`${cur}\` has stood for more than one file — git records it renamed to ` +
           `${history.renamedTo.map((p) => `\`${p}\``).join(" and ")}, so which one the bead meant ` +
           `is not something history answers`,
+      };
+    }
+    if (history.deleted && history.renamedTo.length === 1) {
+      // Deleted AND renamed is the same ambiguity as two renames wearing one name: the path was
+      // removed outright, later recreated by something else, and it is that unrelated file the
+      // rename carries. Following it would rewrite the pointer to a file the bead never meant.
+      return {
+        path,
+        state: "unresolved",
+        why:
+          `\`${cur}\` was both deleted and renamed — git records it removed outright and, in another ` +
+          `commit, renamed to \`${history.renamedTo[0]}\`, so the name has stood for more than one ` +
+          `file and which one the bead meant is not something history answers`,
       };
     }
     if (history.renamedTo.length === 0) {
