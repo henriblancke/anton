@@ -894,7 +894,7 @@ const envDestructure = (source) => new RegExp(String.raw`\{([^{}]*)\}\s*(?::[^=]
  * The binding's own name is captured and the reads above are run against it too, so an alias costs
  * one extra pass rather than a blind spot.
  */
-const CONFIG_ENV_ALIAS = new RegExp(
+const ENV_ALIAS = new RegExp(
   String.raw`(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*${PROCESS_ENV}\b`,
   "g",
 );
@@ -928,21 +928,83 @@ const DESTRUCTURED_KEY = /(?:^|,)\s*(?:["'`]([^"'`]+)["'`]|([A-Za-z_$][\w$]*))/g
 function configEnvNames(appRoot) {
   const names = new Set();
   for (const file of NEXT_CONFIG_FILES) {
-    let text;
     try {
-      text = readFileSync(join(appRoot, file), "utf8");
-    } catch {
-      continue;
-    }
-    // An alias is an identifier by construction, so it carries no regex metacharacter into these.
-    const aliases = [...text.matchAll(CONFIG_ENV_ALIAS)].map(([, alias]) => String.raw`\b${alias}`);
-    for (const source of [PROCESS_ENV, ...aliases]) {
-      for (const [, dotted, indexed] of text.matchAll(envRead(source))) names.add(dotted ?? indexed);
-      for (const [, bindings] of text.matchAll(envDestructure(source)))
-        for (const [, quoted, bare] of bindings.matchAll(DESTRUCTURED_KEY)) names.add(quoted ?? bare);
-    }
+      envNamesIn(readFileSync(join(appRoot, file), "utf8"), names);
+    } catch {}
   }
   return names;
+}
+
+/** Every build-environment variable one file's text names, folded into `names`. */
+function envNamesIn(text, names) {
+  // An alias is an identifier by construction, so it carries no regex metacharacter into these.
+  const aliases = [...text.matchAll(ENV_ALIAS)].map(([, alias]) => String.raw`\b${alias}`);
+  for (const source of [PROCESS_ENV, ...aliases]) {
+    for (const [, dotted, indexed] of text.matchAll(envRead(source))) names.add(dotted ?? indexed);
+    for (const [, bindings] of text.matchAll(envDestructure(source)))
+      for (const [, quoted, bare] of bindings.matchAll(DESTRUCTURED_KEY)) names.add(quoted ?? bare);
+  }
+  return names;
+}
+
+/** Where Next resolves the App Router tree from — one of the two wins, and reading both costs nothing. */
+const APP_DIRECTORIES = ["app", "src/app"];
+
+/** The modules Next evaluates from that tree: a route file is JavaScript or TypeScript, never `.cjs`. */
+const ROUTE_SOURCE = /\.(?:m?[jt]sx?)$/;
+
+/**
+ * Ceiling on the route-tree scan. Generous against any real app dir, since the walk reads text
+ * rather than hashing it and a route tree is a fraction of a source tree.
+ */
+const MAX_ROUTE_ENTRIES = 4096;
+
+/**
+ * The build-environment variables the ROUTE TREE reads — the fourth route a value takes into the
+ * artifact (PR #217 review).
+ *
+ * Static generation EXECUTES application code: a prerendered Server Component or a
+ * `generateStaticParams` reading `process.env.BUILD_FLAVOR` bakes that value into the prerendered
+ * HTML and RSC payload. Nothing else here sees it — the variable wears no `NEXT_PUBLIC_` prefix,
+ * appears in no env file and is named in no config — so the stamp compared equal and
+ * `buildMatchesCheckout` reused a `.next` holding the previous value.
+ *
+ * Scoped to the route tree, and deliberately not to the whole application. Every module a route
+ * imports is build-evaluated too, but most of `src/` is server code read at RUNTIME: folding in
+ * every `ANTON_*` a library names would rebuild whenever a shell set one differently — a runner and
+ * an `ANTON_RUNNER=off` UI sharing an install would each rebuild over the other's `.next` on every
+ * start. So this narrows the hole the way `configEnvNames` does: a build input the digest cannot see
+ * belongs in a route file, the config, or behind a variable named in one.
+ *
+ * A symlinked directory is not entered — `isDirectory()` is false for the link itself — which is
+ * also what keeps the walk acyclic.
+ */
+function routeEnvNames(appRoot) {
+  const names = new Set();
+  const budget = { left: MAX_ROUTE_ENTRIES };
+  for (const dir of APP_DIRECTORIES) walkRoutes(join(appRoot, dir), budget, names);
+  return names;
+}
+
+function walkRoutes(dir, budget, names) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (budget.left <= 0) return;
+    budget.left -= 1;
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== "node_modules") walkRoutes(path, budget, names);
+    } else if (entry.isFile() && ROUTE_SOURCE.test(entry.name)) {
+      try {
+        envNamesIn(readFileSync(path, "utf8"), names);
+      } catch {}
+    }
+  }
 }
 
 /** The env files present at `appRoot`, as `[file, contents]` pairs — read once for both their routes. */
@@ -995,8 +1057,8 @@ function expandedEnvNames(files) {
  * digests for exactly that reason, which is what lets a drift VERDICT see an env-file edit too.
  *
  * The environment half stays scoped to the prefix plus whatever the files expand into one and
- * whatever the Next config reads: those are the variables that reach the artifact, and they are
- * stable per shell. Digesting the environment wholesale would fold in `PWD`, `TERM` and every
+ * whatever the Next config or the route tree reads: those are the variables that reach the artifact,
+ * and they are stable per shell. Digesting the environment wholesale would fold in `PWD`, `TERM` and every
  * per-invocation variable, and rebuild on each one.
  *
  * A `\0`-framed tag leads each entry because no path, name or value can contain one — so no pair of
@@ -1008,6 +1070,7 @@ function readEnvDigest(env, appRoot) {
   const inlined = new Set(Object.keys(env).filter((name) => name.startsWith(INLINED_ENV_PREFIX)));
   for (const name of expandedEnvNames(files)) inlined.add(name);
   for (const name of configEnvNames(appRoot)) inlined.add(name);
+  for (const name of routeEnvNames(appRoot)) inlined.add(name);
   const names = [...inlined].filter((name) => env[name] !== undefined).sort();
   if (!names.length && !files.length) return null;
   const digest = createHash("sha256");

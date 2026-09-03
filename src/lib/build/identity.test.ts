@@ -1181,6 +1181,56 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  // Static generation EXECUTES route code, so a prerendered page reading a variable bakes its value
+  // into the artifact while every file on disk stays put — and it wears no `NEXT_PUBLIC_` prefix, is
+  // in no env file and is named in no config, so nothing else in the identity sees it (PR #217 review).
+  it("digests a variable the route tree reads", () => {
+    const dir = app();
+    mkdirSync(join(dir, "src", "app"), { recursive: true });
+    writeFileSync(
+      join(dir, "src", "app", "page.tsx"),
+      "export default function Page() {\n  return <p>{process.env.BUILD_FLAVOR}</p>;\n}\n",
+    );
+    const first = readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env).not.toBe(first);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toBe(first);
+  });
+
+  // Next resolves the App Router at the root as readily as under `src/`, and a build-time read is a
+  // build-time read wherever the route file sits — including a nested route segment.
+  it("reads the route tree at the install root too", () => {
+    const dir = app();
+    mkdirSync(join(dir, "app", "projects", "[id]"), { recursive: true });
+    writeFileSync(
+      join(dir, "app", "projects", "[id]", "page.tsx"),
+      "export function generateStaticParams() {\n  return [{ id: process.env.BUILD_FLAVOR }];\n}\n",
+    );
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).not.toBe(
+      readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env,
+    );
+  });
+
+  // Same rule as an expanded env-file name: a variable a route names but the environment does not
+  // set compiles nothing in, so it must not rebuild on every unrelated shell.
+  it("names a route variable only where the environment sets one", () => {
+    const dir = app();
+    mkdirSync(join(dir, "src", "app"), { recursive: true });
+    writeFileSync(join(dir, "src", "app", "layout.tsx"), "export const F = process.env.BUILD_FLAVOR;\n");
+    expect(readBuildIdentity(dir, { PATH: "/usr/bin" }).env).toBe(null);
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // The scope stops at the route tree on purpose. Most of an app's server code reads its environment
+  // at RUNTIME, and folding those names in would rebuild whenever a shell set one differently — a
+  // runner and an `ANTON_RUNNER=off` UI sharing an install would each rebuild over the other's `.next`.
+  it("ignores a variable only a library module outside the route tree reads", () => {
+    const dir = app();
+    mkdirSync(join(dir, "src", "lib"), { recursive: true });
+    writeFileSync(join(dir, "src", "lib", "db.ts"), "export const db = process.env.ANTON_DB;\n");
+    expect(readBuildIdentity(dir, { ANTON_DB: "/one/anton.db" }).env).toBe(null);
+  });
+
   // Order is the shell's, not the build's: the same two values exported the other way round is the
   // same artifact, and rebuilding on it would be churn nobody can explain.
   it("does not depend on the order the shell exported them in", () => {
