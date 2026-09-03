@@ -335,7 +335,6 @@ describe("EpicBoard operator queue (anton-qfso.1)", () => {
 describe("EpicBoard unwatched parked work (anton-kh98)", () => {
   const parks: UnwatchedParks = {
     parkedCount: 13,
-    oldestSince: Math.floor((Date.now() - 7 * 24 * 3_600_000) / 1000),
     oldestAgeMs: 7 * 24 * 3_600_000,
     disarmed: ["run-health"],
   };

@@ -14,7 +14,7 @@
  * db-injectable (like runs/schedules) so tests share one connection; the UI read path uses the
  * shared anton.db.
  */
-import { and, eq, inArray } from "drizzle-orm";
+import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import type { ScheduledJobType } from "./schedules";
@@ -30,8 +30,6 @@ export type WatcherAutomation = (typeof WATCHER_AUTOMATIONS)[number];
 /** The count, the age, and which switch is off — everything the band needs and nothing more. */
 export interface UnwatchedParks {
   parkedCount: number;
-  /** Unix seconds the oldest park settled. */
-  oldestSince: number;
   /**
    * How long the oldest had waited when this was read (ms). Frozen at the read, like a run-health
    * finding's `ageMs`: the band renders inside a Client Component, so an age re-derived in the
@@ -51,19 +49,18 @@ export interface UnwatchedParks {
  * one more always-on ornament to learn to ignore.
  */
 export function unwatchedParks(input: {
-  /** Unix seconds each parked job settled at, in any order. */
-  parkedAt: number[];
+  parkedCount: number;
+  /** Unix seconds the oldest park settled, or null when nothing is parked. */
+  oldestParkedAt: number | null;
   disarmed: WatcherAutomation[];
   nowMs: number;
 }): UnwatchedParks | undefined {
   if (input.disarmed.length === 0) return undefined;
-  if (input.parkedAt.length === 0) return undefined;
-  const oldestSince = Math.min(...input.parkedAt);
+  if (input.parkedCount === 0 || input.oldestParkedAt === null) return undefined;
   return {
-    parkedCount: input.parkedAt.length,
-    oldestSince,
+    parkedCount: input.parkedCount,
     // Clamped: a job whose clock ran ahead of this read is 0s old, never negative.
-    oldestAgeMs: Math.max(0, input.nowMs - oldestSince * 1000),
+    oldestAgeMs: Math.max(0, input.nowMs - input.oldestParkedAt * 1000),
     disarmed: WATCHER_AUTOMATIONS.filter((type) => input.disarmed.includes(type)),
   };
 }
@@ -93,16 +90,15 @@ export async function disarmedWatchers(
   return WATCHER_AUTOMATIONS.filter((type) => !armed.has(type));
 }
 
-function toEpoch(value: unknown): number {
-  if (value instanceof Date) return Math.floor(value.getTime() / 1000);
-  return Number(value ?? 0);
-}
-
 /**
  * The project's unwatched parked work, or `undefined` when there is none to report. db-injectable.
  *
  * The parked jobs are only counted once the switches say nobody is watching — on a healthy project
- * this costs one indexed read of two schedule rows and stops there.
+ * this costs one indexed read of two schedule rows and stops there. When it does run, the count and
+ * the oldest stamp are aggregated in SQL over `jobs_project_parked_idx`: the disarmed state is the
+ * SHIPPED DEFAULT, so this query is on the board's render path for most installs, and a project
+ * keeps its finished jobs forever — materialising every parked row in JS would grow board latency
+ * with the install's whole history.
  */
 export async function projectUnwatchedParks(
   db: AntonDb,
@@ -111,13 +107,19 @@ export async function projectUnwatchedParks(
 ): Promise<UnwatchedParks | undefined> {
   const disarmed = await disarmedWatchers(db, projectId);
   if (disarmed.length === 0) return undefined;
-  const rows = await db
-    .select({ updatedAt: schema.jobs.updatedAt })
+  // `updatedAt` is stamped by the transition that parked the job, so its MIN IS when the longest
+  // wait began. Read as the raw unix seconds the column stores, bypassing the Date mapping a
+  // per-row select would apply.
+  const [row] = await db
+    .select({
+      parkedCount: count(),
+      oldestParkedAt: sql<number | null>`min(${schema.jobs.updatedAt})`,
+    })
     .from(schema.jobs)
     .where(and(eq(schema.jobs.projectId, projectId), eq(schema.jobs.status, "parked")));
-  // `updatedAt` is stamped by the transition that parked the job, so it IS when the wait began.
   return unwatchedParks({
-    parkedAt: rows.map((row) => toEpoch(row.updatedAt)),
+    parkedCount: row?.parkedCount ?? 0,
+    oldestParkedAt: row?.oldestParkedAt ?? null,
     disarmed,
     nowMs: clock.now(),
   });

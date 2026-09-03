@@ -6,6 +6,7 @@ import Link from "next/link";
 import { MetaChip } from "@/components/atoms";
 import { ArmWatcherButton } from "@/components/board/arm-watcher-button";
 import { stuckFor } from "@/components/board/escalation-age";
+import { buttonVariants } from "@/components/ui/button";
 import type { UnwatchedParks, WatcherAutomation } from "@/lib/types";
 
 /** What each half of detect → act stops happening when it is off. */
@@ -21,7 +22,12 @@ const DISARMED_CONSEQUENCE: Record<WatcherAutomation, string> = {
  */
 function disarmedSentence(disarmed: WatcherAutomation[]): string {
   const clauses = disarmed.map((type) => DISARMED_CONSEQUENCE[type]);
-  return `${clauses.join(", and ")} — these will not escalate on their own.`;
+  // One half off is one consequence, so the pronoun has to follow the count rather than assume both.
+  const consequence =
+    clauses.length === 1
+      ? "it will not escalate on its own"
+      : "these will not escalate on their own";
+  return `${clauses.join(", and ")} — ${consequence}.`;
 }
 
 /**
@@ -79,17 +85,21 @@ export function UnwatchedParksBand({
         <div className="flex min-w-0 flex-1 flex-col gap-1">
           <p className="text-xs font-medium text-foreground">{disarmedSentence(parks.disarmed)}</p>
           {/* No cadence named: the schedule row owns that, and copy here could disagree with the
-              cron that actually fires. */}
+              cron that actually fires. The auto-resume IS named, because the button below grants it:
+              an operator clicking "turn on the watcher" off copy that promised only detection would
+              be surprised by the next sweep spending quota. */}
           <p className="text-[11px] text-subtle">
-            Turning the watcher on starts the stall sweep on its schedule; what it finds is raised
-            here as a row you can resume or abandon.
+            Turning the watcher on starts the stall sweep on its schedule. It resumes the two
+            stalls it can prove are safe — a run whose usage limit has since reopened, and work
+            whose machine died holding the lease — and both spend quota when they resume. Everything
+            else is raised here as a row you can resume or abandon.
           </p>
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
           <Link
             href={`/projects/${slug}/jobs?status=parked`}
-            className="inline-flex h-6 items-center rounded-lg border border-border bg-card px-2.5 text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+            className={buttonVariants({ size: "xs", variant: "outline" })}
           >
             See parked jobs
           </Link>

@@ -27,16 +27,16 @@ const secondsAgo = (ms: number) => Math.floor((NOW - ms) / 1000);
 const BOTH: WatcherAutomation[] = ["run-health", "unstick"];
 
 describe("unwatchedParks", () => {
-  it("counts the parked jobs and ages the oldest of them", () => {
+  it("ages the oldest park the read found", () => {
     expect(
       unwatchedParks({
-        parkedAt: [secondsAgo(2 * HOUR), secondsAgo(7 * 24 * HOUR), secondsAgo(30 * HOUR)],
+        parkedCount: 3,
+        oldestParkedAt: secondsAgo(7 * 24 * HOUR),
         disarmed: ["run-health"],
         nowMs: NOW,
       }),
     ).toEqual({
       parkedCount: 3,
-      oldestSince: secondsAgo(7 * 24 * HOUR),
       oldestAgeMs: 7 * 24 * HOUR,
       disarmed: ["run-health"],
     });
@@ -46,19 +46,27 @@ describe("unwatchedParks", () => {
   // next sweep, and that row — not this band — is where it belongs.
   it("says nothing when the watcher is armed, however much is parked", () => {
     expect(
-      unwatchedParks({ parkedAt: [secondsAgo(9 * 24 * HOUR)], disarmed: [], nowMs: NOW }),
+      unwatchedParks({
+        parkedCount: 1,
+        oldestParkedAt: secondsAgo(9 * 24 * HOUR),
+        disarmed: [],
+        nowMs: NOW,
+      }),
     ).toBeUndefined();
   });
 
   it("says nothing when nothing is parked, however disarmed the watcher is", () => {
-    expect(unwatchedParks({ parkedAt: [], disarmed: BOTH, nowMs: NOW })).toBeUndefined();
+    expect(
+      unwatchedParks({ parkedCount: 0, oldestParkedAt: null, disarmed: BOTH, nowMs: NOW }),
+    ).toBeUndefined();
   });
 
   // What is off decides the sentence the band prints, so the order has to be the loop's order
   // (detect, then act) rather than whatever order the caller's rows came back in.
   it("reports the disarmed halves in detect → act order", () => {
     const signal = unwatchedParks({
-      parkedAt: [secondsAgo(HOUR)],
+      parkedCount: 1,
+      oldestParkedAt: secondsAgo(HOUR),
       disarmed: ["unstick", "run-health"],
       nowMs: NOW,
     });
@@ -67,7 +75,8 @@ describe("unwatchedParks", () => {
 
   it("never ages a park negatively when its stamp runs ahead of the read", () => {
     const signal = unwatchedParks({
-      parkedAt: [Math.floor(NOW / 1000) + 30],
+      parkedCount: 1,
+      oldestParkedAt: Math.floor(NOW / 1000) + 30,
       disarmed: BOTH,
       nowMs: NOW,
     });
@@ -110,7 +119,6 @@ describe("the project read", () => {
 
     expect(await projectUnwatchedParks(tdb.db, projectId, clock)).toEqual({
       parkedCount: 2,
-      oldestSince: secondsAgo(7 * 24 * HOUR),
       oldestAgeMs: 7 * 24 * HOUR,
       disarmed: BOTH,
     });

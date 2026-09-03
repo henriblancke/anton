@@ -29,7 +29,6 @@ const HOUR = 3_600_000;
 function parks(o: Partial<UnwatchedParks> = {}): UnwatchedParks {
   return {
     parkedCount: 13,
-    oldestSince: Math.floor((Date.now() - 7 * 24 * HOUR) / 1000),
     oldestAgeMs: 7 * 24 * HOUR,
     disarmed: ["run-health"],
     ...o,
@@ -65,13 +64,22 @@ describe("UnwatchedParksBand", () => {
   it("says what the disarmed half stops from happening", () => {
     renderBand(parks({ disarmed: ["run-health"] }));
     expect(screen.getByText(/no stall is ever detected/)).toBeTruthy();
-    expect(screen.getByText(/will not escalate on their own/)).toBeTruthy();
+    expect(screen.getByText(/it will not escalate on its own/)).toBeTruthy();
   });
 
-  it("names both halves when both are off", () => {
+  // Arming turns on a pass that RESUMES quota and dead-lease stalls, so the copy that sits above
+  // the button has to say so — a click off "detect and escalate" copy would spend quota unannounced.
+  it("names the auto-resume the arm button grants, not just the detection", () => {
+    renderBand(parks());
+    expect(screen.getByText(/usage limit has since reopened/)).toBeTruthy();
+    expect(screen.getByText(/spend quota when they resume/)).toBeTruthy();
+  });
+
+  it("names both halves when both are off, and pluralises with them", () => {
     renderBand(parks({ disarmed: ["run-health", "unstick"] }));
     const sentence = screen.getByText(/no stall is ever detected/);
     expect(sentence.textContent).toContain("nothing acts on what is detected");
+    expect(sentence.textContent).toContain("these will not escalate on their own");
   });
 
   it("says the sweep never acts on its findings when only the consumer is off", () => {

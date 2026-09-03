@@ -13,10 +13,15 @@ import type { WatcherAutomation } from "@/lib/types";
  * just learned their queue is unwatched fixes it here, rather than being sent to find two switches
  * in a settings panel they had no reason to open.
  *
- * One click, unlike {@link ReArmButton}'s confirm step: a re-arm hands the picker authority to
- * START work off a signal that said the work was getting worse, while this only turns on a
- * read-only sweep and the pass that files what it finds. Nothing here can begin or change work, and
- * the same switch in settings is one click too — a confirm on this one would just be theatre.
+ * This is not a read-only switch, and the copy around it says so. The unstick half auto-resumes the
+ * two stalls it can prove are safe — a park whose usage window has since reopened, and a bead whose
+ * lease died with its machine — so the next sweep after this click can requeue work and spend quota.
+ *
+ * Still one click, unlike {@link ReArmButton}'s confirm step. A re-arm hands the picker authority to
+ * START work the board never began; arming resumes work that was already approved and already
+ * running, at the point it stopped. And the same two switches are one click in settings — a confirm
+ * here would guard the shortcut while leaving the real switch open, which is theatre. What the
+ * authority IS gets stated instead, in the band's copy and in this button's tooltip.
  *
  * Arms every disarmed half in one gesture: detect → act is only useful whole, and an operator who
  * armed run-health and left unstick off would get reports nothing ever raises — the exact silence
@@ -49,7 +54,7 @@ export function ArmWatcherButton({
         if (!res.ok) throw new Error(body?.error ?? `Request failed (${res.status})`);
       }
       toast.success("Stall watcher on", {
-        description: "The next sweep raises what it finds here.",
+        description: "The next sweep resumes quota and dead-lease stalls, and raises the rest here.",
       });
       // The band is server-rendered off the schedule rows, so a refresh is what clears it.
       router.refresh();
@@ -62,13 +67,18 @@ export function ArmWatcherButton({
     }
   }
 
+  // Names the resume authority and not just the detection, matching the band's copy above it.
+  const title =
+    `Turn on ${disarmed.join(" and ")}: stalled work is detected, quota and dead-lease ` +
+    "stalls resume themselves, and everything else is raised here";
+
   return (
     <Button
       type="button"
       size="xs"
       variant="outline"
       disabled={pending}
-      title={`Turn on ${disarmed.join(" and ")} so stalled work is detected and escalated`}
+      title={title}
       onClick={() => void arm()}
     >
       <EyeIcon aria-hidden="true" />
