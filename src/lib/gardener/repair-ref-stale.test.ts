@@ -31,7 +31,7 @@ vi.mock("../beads/bd", async () => {
 });
 
 const { repairFingerprint, repairLabel, repairNote } = await import("./repair");
-const { citedPaths, contextSpan, refusalNote, repairRefStale, verifyCitedPath } = await import(
+const { citedPaths, contextSpans, refusalNote, repairRefStale, verifyCitedPath } = await import(
   "./repair-ref-stale"
 );
 
@@ -107,32 +107,57 @@ describe("citedPaths", () => {
   });
 });
 
-describe("contextSpan", () => {
+describe("contextSpans", () => {
   it("ends the section at the next heading of its own depth", () => {
-    const span = contextSpan(contract("touches `src/a.ts`."))!;
-    expect(span.body.trim()).toBe("touches `src/a.ts`.");
+    const [span, ...rest] = contextSpans(contract("touches `src/a.ts`."));
+    expect(rest).toEqual([]);
+    expect(span!.body.trim()).toBe("touches `src/a.ts`.");
   });
 
   it("keeps a deeper heading inside the section", () => {
-    const span = contextSpan(
+    const [span] = contextSpans(
       ["## Context", "prose", "### Files", "`src/a.ts`", "", "## Verify", "x"].join("\n"),
-    )!;
-    expect(span.body).toContain("### Files");
-    expect(span.body).not.toContain("## Verify");
+    );
+    expect(span!.body).toContain("### Files");
+    expect(span!.body).not.toContain("## Verify");
   });
 
   it("answers nothing for a bead that states no Context", () => {
-    expect(contextSpan("## Goal\nShip it.")).toBeUndefined();
+    expect(contextSpans("## Goal\nShip it.")).toEqual([]);
+  });
+
+  it("reads every repeated Context section, not just the first", () => {
+    const description = [
+      "## Context",
+      "first `src/a.ts`",
+      "",
+      "## Goal",
+      "ship `src/g.ts`",
+      "",
+      "## Context",
+      "second `src/b.ts`",
+      "",
+      "## Verify",
+      "x",
+    ].join("\n");
+    const spans = contextSpans(description);
+    expect(spans.map((s) => s.body.trim())).toEqual(["first `src/a.ts`", "second `src/b.ts`"]);
+    for (const span of spans) expect(description.slice(span.start, span.end)).toBe(span.body);
+  });
+
+  it("splits two adjacent Context headings rather than swallowing the second", () => {
+    const spans = contextSpans(["## Context", "first", "## Context", "second"].join("\n"));
+    expect(spans.map((s) => s.body.trim())).toEqual(["first", "second"]);
   });
 
   it("keeps its offsets on a CRLF description, so the tail of Context is not cut off", () => {
     const description = contract(
       ["first `src/a.ts`", "second `src/b.ts`", "last `src/c.ts`"].join("\n"),
     ).replace(/\n/g, "\r\n");
-    const span = contextSpan(description)!;
-    expect(description.slice(span.start, span.end)).toBe(span.body);
-    expect(span.body).toContain("last `src/c.ts`");
-    expect(span.body).not.toContain("## Verify");
+    const [span] = contextSpans(description);
+    expect(description.slice(span!.start, span!.end)).toBe(span!.body);
+    expect(span!.body).toContain("last `src/c.ts`");
+    expect(span!.body).not.toContain("## Verify");
   });
 });
 
@@ -300,6 +325,43 @@ suite("ref-stale, against a real git history", () => {
       // The stamp lands before the prose — the label is the suppression (repair.ts).
       expect(tagMock).toHaveBeenCalledWith(repo, BEAD, [repairLabel(BEAD, "ref-stale", T0)]);
       expect(noteMock.mock.calls[0]![2]).toContain(repairFingerprint(BEAD, "ref-stale"));
+    });
+
+    it("rewrites a stale pointer in EVERY Context section, not just the first", async () => {
+      const description = [
+        "## Goal",
+        "Ship the thing.",
+        "",
+        "## Context",
+        "touches `src/here.ts`.",
+        "",
+        "## Acceptance",
+        "- [ ] it works",
+        "",
+        "## Context",
+        "also touches `src/moved.ts` and `src/moved.ts` again.",
+        "",
+        "## Verify",
+        "unit tests",
+      ].join("\n");
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome).toMatchObject({
+        action: "repaired",
+        rewrites: [{ from: "src/moved.ts", to: "src/lib/renamed.ts" }],
+      });
+      // A citation only the LATER section carries is still spec: every occurrence is corrected and
+      // nothing else in the description moves.
+      expect(outcome.action === "repaired" && outcome.description).toBe(
+        description.replaceAll("src/moved.ts", "src/lib/renamed.ts"),
+      );
     });
 
     it("keeps a rewrite whose stamp failed, unstamped — the pointer is already correct", async () => {

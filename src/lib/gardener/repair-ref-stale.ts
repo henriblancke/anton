@@ -16,7 +16,7 @@
  * ANY stale path fails to resolve, nothing is rewritten at all, because a bead half-corrected still
  * points somewhere wrong and the retry it would earn is a run spent proving that.
  *
- * What it rewrites is the `## Context` section and nothing else. Out of scope by construction: prose
+ * What it rewrites is the `## Context` sections and nothing else. Out of scope by construction: prose
  * that merely MENTIONS a file (a citation is a repo-relative path with a directory and an extension,
  * not a sentence about a module), and symbols — only paths.
  *
@@ -97,7 +97,7 @@ export function citedPaths(text: string): PathCitation[] {
   return out;
 }
 
-/** The `## Context` section's slice of a description — where it starts, where it ends, what it says. */
+/** A `## Context` section's slice of a description — where it starts, where it ends, what it says. */
 export interface ContextSpan {
   start: number;
   end: number;
@@ -105,12 +105,18 @@ export interface ContextSpan {
 }
 
 /**
- * Locate the bead's `## Context` body inside its description, as offsets rather than text.
+ * Locate EVERY `## Context` body inside a description, in order, as offsets rather than text.
  *
  * Offsets, because this repair REWRITES in place: the surrounding contract (Goal, Acceptance,
  * Verify) has to come back byte-identical, and re-rendering a parsed description would quietly
- * reformat sections nobody asked anton to touch. The section runs to the next heading at its own
+ * reformat sections nobody asked anton to touch. Each section runs to the next heading at its own
  * depth or shallower — a `### Files` grouping beneath it is still Context.
+ *
+ * Every occurrence rather than the first (PR #223 review), because a repeated heading is not a
+ * malformed bead to this repair: the contract gate CONCATENATES repeated sections, so a citation
+ * under the second `## Context` is spec exactly as much as one under the first. Reading only the
+ * first would answer `none` on a bead whose later section is stale, or rewrite half of one that is
+ * stale in both and report the whole thing repaired.
  *
  * Fences and HTML comments are honoured through {@link scanMarkdown}, so a `## Context` quoted
  * inside a code block opens no section here, exactly as it opens none for the contract gate.
@@ -120,28 +126,30 @@ export interface ContextSpan {
  * written with CRLF endings would drift the span one byte earlier per line — truncating the tail of
  * Context, and with it a stale citation the repair could otherwise have followed.
  */
-export function contextSpan(description: string): ContextSpan | undefined {
-  const lines = scanMarkdown(description);
+export function contextSpans(description: string): ContextSpan[] {
+  const spans: ContextSpan[] = [];
   let start: number | undefined;
   let depth = 0;
   let offset = 0;
-  let end = description.length;
-  for (const line of lines) {
+  const close = (end: number) => {
+    const at = Math.max(start!, end);
+    spans.push({ start: start!, end: at, body: description.slice(start!, at) });
+    start = undefined;
+  };
+  for (const line of scanMarkdown(description)) {
     const lineEnd = offset + line.text.length;
     const nextLine = lineEnd + (description.startsWith("\r\n", lineEnd) ? 2 : 1);
-    if (start === undefined) {
-      if (line.heading?.key === "context") {
-        start = Math.min(nextLine, description.length);
-        depth = line.heading.depth;
-      }
-    } else if (line.heading && line.heading.depth <= depth) {
-      end = Math.max(start, offset);
-      break;
+    // A heading at the open section's depth or shallower closes it — and may open the next one, so
+    // two adjacent `## Context` sections are two spans rather than one swallowing the other.
+    if (start !== undefined && line.heading && line.heading.depth <= depth) close(offset);
+    if (start === undefined && line.heading?.key === "context") {
+      start = Math.min(nextLine, description.length);
+      depth = line.heading.depth;
     }
     offset = nextLine;
   }
-  if (start === undefined) return undefined;
-  return { start, end, body: description.slice(start, end) };
+  if (start !== undefined) close(description.length);
+  return spans;
 }
 
 /** What the worktree and git history answer for one cited path. */
@@ -308,10 +316,11 @@ export async function repairRefStale(args: {
 }): Promise<RefStaleOutcome> {
   const { repoPath, worktreePath, bead, block, now, autonomy } = args;
   const description = bead.description ?? "";
-  const span = contextSpan(description);
-  if (!span) return { action: "none", why: `${bead.id} states no \`## Context\` to check` };
+  const spans = contextSpans(description);
+  if (spans.length === 0) return { action: "none", why: `${bead.id} states no \`## Context\` to check` };
 
-  const citations = citedPaths(span.body);
+  const sections = spans.map((span) => ({ span, citations: citedPaths(span.body) }));
+  const citations = sections.flatMap((s) => s.citations);
   if (citations.length === 0) {
     return { action: "none", why: `${bead.id}'s \`## Context\` cites no file paths` };
   }
@@ -342,7 +351,7 @@ export async function repairRefStale(args: {
 
   const moved = stale.flatMap((v) => (v.state === "moved" ? [v] : []));
   const rewrites: PathRewrite[] = moved.map((v) => ({ from: v.path, to: v.to }));
-  const rewritten = rewriteContext(description, span, citations, rewrites);
+  const rewritten = rewriteContexts(description, sections, rewrites);
   const attempted = `rewrote ${bead.id}'s \`## Context\` pointer(s): ${rewrites
     .map((r) => `\`${r.from}\` → \`${r.to}\``)
     .join(", ")}`;
@@ -391,27 +400,31 @@ async function stampRewrite(
 }
 
 /**
- * Swap the moved pointers inside the Context span, leaving every other byte of the description alone.
+ * Swap the moved pointers inside every Context span, leaving all other bytes of the description
+ * alone.
  *
- * Applied back-to-front so each replacement's offsets stay valid, and only at the offsets
- * {@link citedPaths} actually validated — a bead whose prose happens to contain the same characters
- * outside a citation keeps them.
+ * Applied back-to-front — the spans and, within each, the citations — so each replacement's offsets
+ * stay valid, and only at the offsets {@link citedPaths} actually validated: a bead whose prose
+ * happens to contain the same characters outside a citation keeps them.
  */
-function rewriteContext(
+function rewriteContexts(
   description: string,
-  span: ContextSpan,
-  citations: PathCitation[],
+  sections: { span: ContextSpan; citations: PathCitation[] }[],
   rewrites: PathRewrite[],
 ): string {
   const to = new Map(rewrites.map((r) => [r.from, r.to]));
-  let body = span.body;
-  for (const citation of [...citations].sort((a, b) => b.index - a.index)) {
-    const next = to.get(citation.path);
-    if (!next) continue;
-    body =
-      body.slice(0, citation.index) + next + body.slice(citation.index + citation.text.length);
+  let out = description;
+  for (const { span, citations } of [...sections].sort((a, b) => b.span.start - a.span.start)) {
+    let body = span.body;
+    for (const citation of [...citations].sort((a, b) => b.index - a.index)) {
+      const next = to.get(citation.path);
+      if (!next) continue;
+      body =
+        body.slice(0, citation.index) + next + body.slice(citation.index + citation.text.length);
+    }
+    out = out.slice(0, span.start) + body + out.slice(span.end);
   }
-  return description.slice(0, span.start) + body + description.slice(span.end);
+  return out;
 }
 
 /**
