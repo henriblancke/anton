@@ -48,18 +48,21 @@ function disarmedSentence(disarmed: WatcherAutomation[]): string {
  * nothing is being asked of the founder's judgment. This is a blind spot — a state the install was
  * shipped in — and drawing it as a failure would teach the board's red to mean less.
  *
- * The age is the server's frozen reading rather than a live one, unlike the escalation strip's
- * hydration-deferred clock: this band is answered by a click that reloads the page, and a wait
- * already measured in hours or days does not change meaning while it is being read. The frozen
- * value is server data, so it is identical across the server render and hydration by construction.
+ * The age is a frozen reading rather than a live one, unlike the escalation strip's hydration-
+ * deferred clock: every read of this signal re-stamps it, and a wait already measured in hours or
+ * days does not change meaning while it is being read. The frozen value comes from the server on
+ * both sides of hydration, so the two renders agree by construction.
  */
 export function UnwatchedParksBand({
   slug,
   parks,
+  onArmed,
 }: {
   slug: string;
   /** Absent when the watcher is armed or nothing is parked — the band is silent in both cases. */
   parks?: UnwatchedParks;
+  /** Re-read the signal: the band is a read of the schedule rows the button just wrote. */
+  onArmed: () => void;
 }) {
   if (!parks) return null;
 
@@ -103,7 +106,7 @@ export function UnwatchedParksBand({
           >
             See parked jobs
           </Link>
-          <ArmWatcherButton slug={slug} disarmed={parks.disarmed} />
+          <ArmWatcherButton slug={slug} disarmed={parks.disarmed} onArmed={onArmed} />
         </div>
       </div>
     </section>

@@ -14,14 +14,15 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { UnwatchedParksBand } from "@/components/board/unwatched-parks-band";
 import type { UnwatchedParks } from "@/lib/types";
 
-const refresh = vi.fn();
-vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+/** The band's re-read of its own signal — what the arm button asks for once its writes settle. */
+const onArmed = vi.fn();
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
-  refresh.mockClear();
+  onArmed.mockClear();
 });
 
 const HOUR = 3_600_000;
@@ -36,7 +37,7 @@ function parks(o: Partial<UnwatchedParks> = {}): UnwatchedParks {
 }
 
 const renderBand = (value?: UnwatchedParks) =>
-  render(<UnwatchedParksBand slug="anton" parks={value} />);
+  render(<UnwatchedParksBand slug="anton" parks={value} onArmed={onArmed} />);
 
 const armButton = () => screen.getByRole("button", { name: /turn on the watcher/i });
 
@@ -112,8 +113,11 @@ describe("UnwatchedParksBand", () => {
     ]);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/projects/anton/schedules");
     expect(fetchMock.mock.calls[0][1]?.method).toBe("PATCH");
-    // The band is server data, so the refresh is what clears it.
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    // The band is a read of the rows just written, so a re-read is what clears it.
+    await waitFor(() => expect(onArmed).toHaveBeenCalled());
+    // And the click releases the button on the way out: a re-read that never lands must not leave
+    // the operator holding a dead switch on the band it was supposed to clear.
+    expect(armButton().hasAttribute("disabled")).toBe(false);
   });
 
   it("only turns on the half that is off", async () => {
@@ -140,7 +144,7 @@ describe("UnwatchedParksBand", () => {
     renderBand(parks());
     fireEvent.click(armButton());
 
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    await waitFor(() => expect(onArmed).toHaveBeenCalled());
     expect(armButton().hasAttribute("disabled")).toBe(false);
   });
 });

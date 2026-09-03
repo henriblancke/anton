@@ -372,6 +372,27 @@ describe("EpicBoard unwatched parked work (anton-kh98)", () => {
     render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
     expect(screen.queryByText("Parked work, unwatched")).toBeNull();
   });
+
+  // A job parks from a run happening elsewhere, so a board that only ever read this signal at page
+  // load would stay silent through exactly the hours work was stopped.
+  it("raises the band for work that parked after the board loaded", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url.includes("/unwatched-parks")
+          ? new Response(JSON.stringify({ parks }), { status: 200 })
+          : new Response(null, { status: 304 }),
+      ) as unknown as typeof fetch,
+    );
+
+    render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
+    expect(screen.queryByText("Parked work, unwatched")).toBeNull();
+
+    fireEvent(document, new Event("visibilitychange"));
+
+    await waitFor(() => expect(screen.getByText("Parked work, unwatched")).toBeTruthy());
+    expect(screen.getByText("13 parked jobs")).toBeTruthy();
+  });
 });
 
 /**

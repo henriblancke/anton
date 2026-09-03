@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { EyeIcon } from "lucide-react";
 
@@ -30,12 +29,14 @@ import type { WatcherAutomation } from "@/lib/types";
 export function ArmWatcherButton({
   slug,
   disarmed,
+  onArmed,
 }: {
   slug: string;
   /** The automations that are off — arming turns on exactly these. */
   disarmed: WatcherAutomation[];
+  /** Re-read the band's signal once the writes have settled, either way. */
+  onArmed: () => void;
 }) {
-  const router = useRouter();
   const [pending, setPending] = useState(false);
 
   async function arm() {
@@ -56,14 +57,15 @@ export function ArmWatcherButton({
       toast.success("Stall watcher on", {
         description: "The next sweep resumes quota and dead-lease stalls, and raises the rest here.",
       });
-      // The band is server-rendered off the schedule rows, so a refresh is what clears it.
-      router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to turn the watcher on");
+    } finally {
+      // Settled either way, so the button recovers even if the re-read below never lands — a click
+      // that leaves it disabled forever would strand the operator on the band it was meant to clear.
       setPending(false);
-      // A partial arm is a different band (one half left off) — re-read rather than keep showing
-      // the state this click started from.
-      router.refresh();
+      // The band is a read of the schedule rows this click wrote, and a partial arm is a DIFFERENT
+      // band (one half still off) — re-read rather than keep showing the state it started from.
+      onArmed();
     }
   }
 

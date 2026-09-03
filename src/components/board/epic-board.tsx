@@ -21,6 +21,7 @@ import { useBoardBreaker } from "@/components/board/use-board-breaker";
 import { useBoardDrag } from "@/components/board/use-board-drag";
 import { useBoardPoll } from "@/components/board/use-board-poll";
 import { useBoardView } from "@/components/board/use-board-view";
+import { useUnwatchedParks } from "@/components/board/use-unwatched-parks";
 import { useUpNextReorder } from "@/components/board/use-up-next-reorder";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import type { BoardSort } from "@/components/board/board-utils";
@@ -53,6 +54,9 @@ export function EpicBoard({
   /**
    * Parked work with nothing watching it (anton-kh98), server-rendered by the page. Absent — and so
    * silent — whenever the stall watcher is armed or nothing is parked; its presence IS the signal.
+   *
+   * The FIRST paint only: the board re-reads it on its own slower cadence, because both edges — a
+   * job parking, and the watcher being armed elsewhere — happen off this board entirely.
    */
   parks?: UnwatchedParks;
   /**
@@ -76,6 +80,7 @@ export function EpicBoard({
 
   const state = useBoardPoll(slug, initialBoard);
   const polledBreaker = useBoardBreaker(slug, breaker);
+  const unwatched = useUnwatchedParks(slug, parks);
   const view = useBoardView(state.board, sort, grouping);
   const reorder = useUpNextReorder(slug, state, view.upNext);
   const drag = useBoardDrag(slug, state, reorder);
@@ -109,7 +114,7 @@ export function EpicBoard({
       <BoardBreakerSlot slug={slug} polled={polledBreaker} streamed={breaker} />
       {/* Directly above the strip it explains: with the watcher off, the strip has no producer at
           all, so an empty strip means "nothing detected", not "nothing wrong". */}
-      <UnwatchedParksBand slug={slug} parks={parks} />
+      <UnwatchedParksBand slug={slug} parks={unwatched.parks} onArmed={unwatched.refresh} />
       {/* The one band that still needs a DECISION about a card below it, not just a look. Escalations
           come from the page's server render — they are answered by an action that reloads, not by a
           poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}
