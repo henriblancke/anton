@@ -574,6 +574,10 @@ describe("the daemon pidfile", () => {
       delete process.env.PORT;
     });
 
+    afterEach(() => {
+      delete process.env.PORT;
+    });
+
     it("is the one the daemon recorded when it started", async () => {
       const path = await pidFile();
       writePidFile(process.pid, path, "4100");
@@ -587,10 +591,26 @@ describe("the daemon pidfile", () => {
       expect(serverPort([], path)).toBe("3000");
     });
 
-    it("is the explicit flag wherever the caller gives one", async () => {
+    // A status line describes a process that is ALREADY running, so this invocation's own
+    // environment cannot outrank the record that process left: `PORT=4200 anton status` combined a
+    // validated daemon pid with a URL nothing was listening on — the very line the pid-scoped port
+    // record exists to prevent (PR #217 review).
+    it("is the recorded one even where this invocation names another port", async () => {
       const path = await pidFile();
       writePidFile(process.pid, path, "4100");
+      process.env.PORT = "4200";
+      expect(serverPort([], path)).toBe("4100");
+      expect(serverPort(["--port", "4300"], path)).toBe("4100");
+    });
+
+    // Only a pidfile written before the port was recorded there leaves the caller's environment as
+    // the best evidence available.
+    it("falls back to this invocation's port where a legacy record names none", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
       expect(serverPort(["--port", "4200"], path)).toBe("4200");
+      process.env.PORT = "4300";
+      expect(serverPort([], path)).toBe("4300");
     });
 
     it("is gone once the daemon's record is, rather than outliving the server", async () => {

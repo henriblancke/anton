@@ -45,7 +45,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 /** Short form of a commit sha in operator-facing copy — long enough to be unambiguous, short enough to read. */
 const SHORT_SHA = 7;
@@ -691,6 +691,10 @@ function hashEntry(path, budget, depth = 0) {
  * directory the walk started from — because the names a build writes and the names it compiles
  * overlap: `build/` at the root is output, while `src/lib/build/` is source (PR #217 review).
  *
+ * It is asked with the RESOLVED directory too, because the state a running anton writes is placed
+ * by configuration rather than by convention: `ANTON_DB` may name any directory in the tree, and
+ * only the containing path tells that database from a source file of the same name (PR #217 review).
+ *
  * Cycles are what a followed link makes possible — a directory linking back to its own ancestor
  * would recurse forever — so each directory is entered once per walk, keyed by its resolved path.
  */
@@ -702,7 +706,7 @@ function hashTree(hash, dir, budget, depth = 0) {
   }
   budget.seen.add(resolved);
   for (const name of readdirSync(dir).sort()) {
-    if (budget.skip?.(name, depth)) continue;
+    if (budget.skip?.(name, depth, resolved)) continue;
     if (budget.left <= 0) {
       budget.truncated = true;
       return;
@@ -808,8 +812,10 @@ const STATE_AT_ROOT = new Set([
  *
  * `node_modules` is skipped at every depth for the same reason as the state above: nested ones hold
  * dependencies too, and a dependency is never the source this install is judged on. What anton
- * itself writes — the database, its per-process build records — lands beside the install root, so it
- * is excluded there and nowhere else.
+ * itself writes — the database, its per-process build records — lands beside the install root by
+ * DEFAULT, so it is excluded there and nowhere else. Where configuration moves it (`ANTON_DB` naming
+ * a subdirectory), `runtimeStatePaths` excludes it wherever it actually resolves; these fixed names
+ * cannot, since only the containing path tells that state from source (PR #217 review).
  */
 function skipsSourceEntry(name, depth) {
   if (depth === 0 && BUILD_ENV_FILES.includes(name)) return false;
@@ -827,6 +833,65 @@ function skipsSourceEntry(name, depth) {
 }
 
 /**
+ * The runtime state a running anton writes INSIDE the install, when configuration puts it there —
+ * a map from resolved directory to the predicates naming the entries under it a source walk skips.
+ *
+ * `skipsSourceEntry` can only exclude state at the ROOT, because that is the only place its names
+ * are fixed. Every one of these paths is an operator's choice: `ANTON_DB=state/anton.db` on a
+ * git-less source install puts the database — and the per-process `server-build.<pid>.json` records
+ * `buildRecordPath` writes beside it — one level down, where the root rule never looks. The server
+ * writes its record at boot and every job writes the database, so the digest moved within seconds of
+ * the stamp it is compared against: doctor and the health page reported the running server modified
+ * forever, and every later `anton start` rebuilt an artifact that was already current (PR #217
+ * review). The sessions and scans roots are the same choice — `bundleStateEnv` redirects all three
+ * together — and churn the same way when they are pointed into the tree.
+ *
+ * Relative values resolve against `appRoot`, exactly as `antonDbOverride` resolves them, so both
+ * readers name one file. A path whose directory does not exist registers nothing: there is no entry
+ * for a walk to read there either.
+ */
+function runtimeStatePaths(appRoot, env) {
+  const byDir = new Map();
+  const exclude = (configured, matches) => {
+    const path = resolve(appRoot, configured);
+    let dir;
+    try {
+      dir = realpathSync(dirname(path));
+    } catch {
+      return;
+    }
+    const name = basename(path);
+    const existing = byDir.get(dir);
+    if (existing) existing.push((entry) => matches(entry, name));
+    else byDir.set(dir, [(entry) => matches(entry, name)]);
+  };
+
+  // The database, the `-wal`/`-shm` SQLite writes beside it, and the build records that share its
+  // directory — the one place `listBuildRecords` looks.
+  if (env?.ANTON_DB) {
+    exclude(env.ANTON_DB, (entry, name) => entry.startsWith(name) || BUILD_RECORD_NAME.test(entry));
+  }
+  for (const key of ["ANTON_SESSIONS_ROOT", "ANTON_SCANS_ROOT"]) {
+    if (env?.[key]) exclude(env[key], (entry, name) => entry === name);
+  }
+  return byDir;
+}
+
+/**
+ * What a source walk skips for this install: the fixed root names, plus whatever runtime state the
+ * environment has placed inside the tree.
+ */
+function sourceSkip(appRoot, env) {
+  const state = runtimeStatePaths(appRoot, env);
+  if (state.size === 0) return skipsSourceEntry;
+  return (name, depth, dir) => {
+    if (skipsSourceEntry(name, depth)) return true;
+    const matchers = state.get(dir);
+    return matchers !== undefined && matchers.some((matches) => matches(name));
+  };
+}
+
+/**
  * A digest of the source an install with no git holds — null when the tree could not be walked in
  * full.
  *
@@ -840,8 +905,8 @@ function skipsSourceEntry(name, depth) {
  * from the rebuild entirely — its RELEASE_VERSION identifies it exactly, and it ships no toolchain
  * to compile with.
  */
-function readSourceDigest(appRoot) {
-  const budget = { left: MAX_SOURCE_ENTRIES, seen: new Set(), truncated: false, skip: skipsSourceEntry };
+function readSourceDigest(appRoot, env = process.env) {
+  const budget = { left: MAX_SOURCE_ENTRIES, seen: new Set(), truncated: false, skip: sourceSkip(appRoot, env) };
   const digest = createHash("sha256");
   try {
     hashTree(digest, appRoot, budget);
@@ -1154,7 +1219,7 @@ export function readBuildIdentity(appRoot, env = process.env) {
     version: readVersion(appRoot),
     revision,
     worktree: revision && revision !== REVISION_UNREADABLE ? readWorktreeDigest(appRoot) : null,
-    source: revision === null && !isBundleInstall(appRoot) ? readSourceDigest(appRoot) : null,
+    source: revision === null && !isBundleInstall(appRoot) ? readSourceDigest(appRoot, env) : null,
     env: readEnvDigest(env, appRoot),
   };
 }

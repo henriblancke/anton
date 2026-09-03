@@ -291,9 +291,19 @@ function daemonPort(pidFile = PID_FILE) {
   }
 }
 
-/** Where the daemon is: an explicit flag/`PORT`, else the port it recorded when it started, else Next's default. */
+/**
+ * Where the daemon is: the port it recorded when it started, else this invocation's own flag/`PORT`,
+ * else Next's default.
+ *
+ * The RECORD outranks the caller's environment (PR #217 review). `resolvePort` answers for the
+ * process it is about to spawn, and it falls back to an ambient `PORT` — so consulting it first made
+ * `PORT=4200 anton status` print a validated daemon pid against `http://localhost:4200`, a URL
+ * nothing is listening on. That is the same wrong line the pid-scoped port record was added to
+ * prevent; status describes a process that is already running, and only its own record says where.
+ * The fallback is for a pidfile written before the port was recorded there, which names none.
+ */
 function serverPort(args, pidFile = PID_FILE) {
-  return resolvePort(args) ?? daemonPort(pidFile) ?? "3000";
+  return daemonPort(pidFile) ?? resolvePort(args) ?? "3000";
 }
 
 const c = {

@@ -879,6 +879,47 @@ describe("the source digest of an install no git can describe", () => {
     expect(readBuildIdentity(dir, {}).source).toBe(first);
   });
 
+  // The root skip only reaches state anton puts there by default. `ANTON_DB=state/anton.db` on a
+  // git-less install moves the database — and the per-process build records beside it — one level
+  // down, where that rule never looks: the server wrote its record at boot and every job wrote the
+  // database, so the on-disk digest left the stamp behind within seconds. Health and doctor called
+  // the server modified forever, and every `anton start` rebuilt an artifact already current
+  // (PR #217 review).
+  it("ignores the state a configured ANTON_DB places inside the tree", () => {
+    const dir = tarball();
+    const env = { ANTON_DB: join("state", "anton.db") };
+    mkdirSync(join(dir, "state"));
+    const first = readBuildIdentity(dir, env).source;
+    expect(first).toMatch(/^[0-9a-f]{12}$/);
+
+    writeFileSync(join(dir, "state", "anton.db"), "sqlite");
+    writeFileSync(join(dir, "state", "anton.db-wal"), "wal");
+    writeFileSync(join(dir, "state", buildRecordFile(process.pid)), "{}");
+    expect(readBuildIdentity(dir, env).source).toBe(first);
+
+    // Named entries, not the whole directory: ordinary source under that path is still build input.
+    writeFileSync(join(dir, "state", "schema.ts"), SOURCE);
+    expect(readBuildIdentity(dir, env).source).not.toBe(first);
+  });
+
+  // The other two roots `bundleStateEnv` redirects together churn the same way when an operator
+  // points them into the install: a session log is written on every run, a scan on every night.
+  it("ignores the session and scan roots wherever they are configured to live", () => {
+    const dir = tarball();
+    const env = { ANTON_SESSIONS_ROOT: join("var", "sessions"), ANTON_SCANS_ROOT: join("var", "scans") };
+    mkdirSync(join(dir, "var"));
+    const first = readBuildIdentity(dir, env).source;
+
+    mkdirSync(join(dir, "var", "sessions"));
+    writeFileSync(join(dir, "var", "sessions", "run.log"), "noise");
+    mkdirSync(join(dir, "var", "scans"));
+    writeFileSync(join(dir, "var", "scans", "scan.json"), "{}");
+    expect(readBuildIdentity(dir, env).source).toBe(first);
+
+    // An install that never configured them keeps reading those paths as the source they are.
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+  });
+
   // Those same names are ordinary source further down — anton's own drift modules live in
   // `src/lib/build/` — so excluding them by name at any depth made an edit to them invisible and let
   // a git-less install serve a `.next` compiled before it (PR #217 review).
