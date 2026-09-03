@@ -134,6 +134,13 @@ export function entropyOf(value: string): number {
  * Whether a literal reads as a real credential. The default answer is yes: only a value that is
  * positively human-written — a known-safe shape, no credential marker, word-like letters, and not
  * dense enough to be generated — is anything else.
+ *
+ * The residual case, accepted knowingly: a REAL credential a human chose as a lowercase word
+ * ("huntertwo") reads identically to a fixture's placeholder and loses its signal. Nothing textual
+ * separates them — `bd-env.test.ts:127`, one of the hits this exists to clear, assigns the bare
+ * word `"explicit"` — so a stricter positive marker would only trade this miss for a permanently
+ * critical health record. The drop is bounded instead: test paths only, and never silent —
+ * {@link describeSecretFilter} names every dropped line and value in the session log.
  */
 export function isCredentialShaped(value: string): boolean {
   if (CREDENTIAL_MARKERS.some((marker) => marker.test(value))) return true;
