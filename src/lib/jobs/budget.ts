@@ -180,6 +180,8 @@ interface Pace {
   aheadPace: boolean;
   havePace: boolean;
   weeklyResetMs: number;
+  /** Where the even pace-line sits at `now` (NaN without a weekly signal), for callers that project. */
+  expectedPct: number;
 }
 
 /**
@@ -191,13 +193,16 @@ interface Pace {
 function computePace(usage: ClaudeUsage, policy: BudgetPolicy, now: number): Pace {
   const weeklyResetMs = usage.weeklyResetAt ? Date.parse(usage.weeklyResetAt) : NaN;
   const havePace = !Number.isNaN(weeklyResetMs) && policy.weeklyTargetPct > 0;
-  if (!havePace) return { behindPace: false, aheadPace: false, havePace: false, weeklyResetMs };
+  if (!havePace) {
+    return { behindPace: false, aheadPace: false, havePace: false, weeklyResetMs, expectedPct: NaN };
+  }
   const expectedPct = policy.weeklyTargetPct * elapsedWeekFraction(now, weeklyResetMs, policy.weekMs);
   return {
     behindPace: usage.weeklyPct < expectedPct - policy.paceSlackPct,
     aheadPace: usage.weeklyPct > expectedPct + policy.paceSlackPct,
     havePace: true,
     weeklyResetMs,
+    expectedPct,
   };
 }
 
@@ -293,6 +298,113 @@ export function budgetGate(
   }
 
   return { admit: true };
+}
+
+/**
+ * How much quota the governor will still spend before each of its holds bites — the same thresholds
+ * {@link budgetGate} defers on, expressed as what's LEFT rather than as a yes/no (anton-vlom).
+ *
+ * It lives here, beside the gate, because the two must never disagree: a surface that computed its
+ * own idea of "remaining" would draw a budget line the governor does not keep. Both sides are
+ * reported (session and weekly) rather than the tighter one, because which binds depends on what
+ * the caller intends to spend it on, and the reason the operator is shown has to name the hold that
+ * actually stops the work.
+ *
+ * Fail-open, exactly like the gate: a null usage read returns `null` — "unknown", never zero. A
+ * caller that cannot read the meter must omit its claim rather than guess a limit the gate would
+ * not enforce.
+ */
+export interface BudgetHeadroom {
+  /** Session%-points still spendable before the tightest session-side hold trips. Never negative. */
+  sessionPct: number;
+  /** Which session-side hold bounds it: the hard floor, or the day window's reserve. */
+  sessionReason: Extract<DeferReason, "session-headroom" | "daytime-reserve">;
+  /** Weekly%-points still spendable before the weekly hold trips; null with no weekly signal. */
+  weeklyPct: number | null;
+  /** Which weekly hold bounds it: the cap, or the pace-line inside the throttle band. */
+  weeklyReason: Extract<DeferReason, "weekly-cap" | "weekly-on-track">;
+  /**
+   * Whether spending exactly {@link weeklyPct} already trips the hold. The cap and the throttle
+   * floor bite AT their threshold (`usage >= limit`); the pace-line bites only PAST it
+   * (`usage > ceiling`), so a caller that charged both inclusively would hold back one run the
+   * gate admits.
+   */
+  weeklyInclusive: boolean;
+  /**
+   * The daytime reserve is waived only while weekly usage is BEHIND pace, and a projection spends
+   * weekly budget — so the waiver expires partway down the queue (PR #212 review). Null whenever it
+   * is not in force: at night, without a weekly signal, on/ahead of pace, or with a reserve looser
+   * than the hard floor. Set, it says where the waived-but-tighter ceiling takes over.
+   */
+  reserveWaiver: {
+    /** Weekly%-points of projected burn the waiver survives; past that the reserve binds again. */
+    afterWeeklyPct: number;
+    /** Session%-points spendable in total once it does — the reserve's ceiling, ≤ `sessionPct`. */
+    sessionPct: number;
+  } | null;
+}
+
+export function budgetHeadroom(
+  usage: ClaudeUsage | null,
+  policy: BudgetPolicy,
+  now: number,
+): BudgetHeadroom | null {
+  if (!usage) return null;
+
+  const { behindPace, expectedPct, weeklyResetMs } = computePace(usage, policy, now);
+
+  // Session side. The daytime reserve is a *tighter* ceiling on the same meter, so inside the day
+  // window it — not the hard floor — is what the operator is about to run out of. Behind pace it
+  // is waived (work spills into the day), and an operator who set a reserve looser than the floor
+  // never sees it bind.
+  const hardFloor = 100 - policy.minSessionHeadroomPct;
+  const dayFloor = 100 - policy.daytimeReservePct;
+  const hour = localHour(now, policy.utcOffsetMinutes);
+  const inDayWindow = hour >= policy.dayStartHour && hour < policy.dayEndHour;
+  const reserveBinds = inDayWindow && dayFloor < hardFloor;
+  const reserveHolds = reserveBinds && !behindPace;
+  const sessionLimit = reserveHolds ? dayFloor : hardFloor;
+
+  // …and the waiver is not permanent. A caller PROJECTING a queue spends weekly budget as it walks,
+  // and once that burn catches usage up to the pace-line the gate stops waiving the reserve — so a
+  // projection that held the hard floor for the whole queue would call cards affordable the governor
+  // then defers at the reserve (PR #212 review). Report where the waiver runs out.
+  const reserveWaiver = reserveBinds && behindPace
+    ? {
+        afterWeeklyPct: Math.max(0, expectedPct - policy.paceSlackPct - usage.weeklyPct),
+        sessionPct: Math.max(0, dayFloor - usage.sessionPct),
+      }
+    : null;
+
+  // Weekly side, skipped entirely without a weekly signal — the same condition under which the gate
+  // itself skips the weekly ceiling, leaving pure idle-fill.
+  const cap = policy.weeklyTargetPct;
+  let weeklyPct: number | null = null;
+  let weeklyReason: BudgetHeadroom["weeklyReason"] = "weekly-cap";
+  let weeklyInclusive = true;
+  if (!Number.isNaN(weeklyResetMs) && cap > 0) {
+    // Below the throttle floor spending is free whatever the pace (idle-fill, anton-ld7j), so the
+    // pace-line only binds where it sits above that floor — and never above the cap.
+    const throttleFloor = cap - policy.throttleBandPct;
+    const paceCeiling = cap * elapsedWeekFraction(now, weeklyResetMs, policy.weekMs) + policy.paceSlackPct;
+    const weeklyLimit = Math.min(cap, Math.max(throttleFloor, paceCeiling));
+    const remaining = weeklyLimit - usage.weeklyPct;
+    weeklyReason = weeklyLimit < cap ? "weekly-on-track" : "weekly-cap";
+    // Which comparison the gate makes at the limit. Only the pace-line is exclusive, and only where
+    // it is what binds — a limit pinned to the cap or held up by the throttle floor defers AT it.
+    // Already over (`remaining` clamped to 0) is inclusive too: there is nothing left to spend.
+    weeklyInclusive = remaining <= 0 || weeklyLimit >= cap || paceCeiling < throttleFloor;
+    weeklyPct = Math.max(0, remaining);
+  }
+
+  return {
+    sessionPct: Math.max(0, sessionLimit - usage.sessionPct),
+    sessionReason: reserveHolds ? "daytime-reserve" : "session-headroom",
+    weeklyPct,
+    weeklyReason,
+    weeklyInclusive,
+    reserveWaiver,
+  };
 }
 
 // ── Pace-modulated prioritization (anton-k05r) ──────────────────────────────────────────────────

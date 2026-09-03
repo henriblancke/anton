@@ -10,6 +10,7 @@ import { useSyncExternalStore } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 import { STAGES, type Board, type Epic, type StandaloneItem, type Stage } from "@/lib/types";
+import { makeEpicRow } from "@/components/board/epic.fixture";
 import { TYPE_BADGE, boardEpicFilterHref } from "@/components/board/board-utils";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -76,6 +77,19 @@ vi.mock("@dnd-kit/core", () => ({
   }),
 }));
 vi.mock("@dnd-kit/modifiers", () => ({ restrictToWindowEdges: {} }));
+vi.mock("@dnd-kit/sortable", () => ({
+  SortableContext: ({ children }: { children: React.ReactNode }) => children,
+  verticalListSortingStrategy: {},
+  useSortable: () => ({
+    attributes: {},
+    listeners: {},
+    setNodeRef: () => {},
+    setActivatorNodeRef: () => {},
+    transform: null,
+    transition: undefined,
+    isDragging: false,
+  }),
+}));
 vi.mock("@dnd-kit/utilities", () => ({ CSS: { Translate: { toString: () => "" } } }));
 
 const { EpicBoard } = await import("@/components/board/epic-board");
@@ -83,28 +97,7 @@ const { EpicBoard } = await import("@/components/board/epic-board");
 const ONTOLOGY = { id: "anton-epc", title: "Ontology editing for curators", area: "ontology" };
 const RETRIEVAL = { id: "anton-ret", title: "Trustworthy retrieval", area: "knowledge" };
 
-function epic(id: string, over: Partial<Epic> = {}): Epic {
-  return {
-    id,
-    title: id,
-    type: "feature",
-    approved: false,
-    stage: "backlog",
-    assignee: null,
-    createdAt: "2026-07-20T00:00:00.000Z",
-    createdBy: null,
-    blockedBy: [],
-    ready: true,
-    childReadiness: "ready",
-    readyChildren: [],
-    blockedChildren: [],
-    rank: 0,
-    priority: 2,
-    abandoned: false,
-    tickets: [],
-    ...over,
-  };
-}
+const epic = makeEpicRow;
 
 /**
  * Three run targets — one under each product epic, one under none (the legacy card the transition
@@ -145,6 +138,7 @@ function fixture(): Board {
     version: "1:sync",
     columns,
     standalone: chips,
+    operatorQueue: [],
     sync: {
       state: "synced",
       lastSyncedAt: 1,

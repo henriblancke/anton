@@ -12,12 +12,11 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
 import { driveJob } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
-import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { makeReviewFixHandler } from "./review-fix";
 import { createRun, getRunById } from "../runs";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -50,7 +49,7 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
   let sandbox: string;
   let repo: string;
   let binDir: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let clock: FakeClock;
   let projectId: string;
   let epicId: string;
@@ -105,16 +104,9 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
     process.env.ANTON_SESSIONS_ROOT = join(sandbox, "sessions");
     process.env.FAKE_BRANCH = branch;
 
-    tdb = makeTestDb();
+    tdb = makeProjectDb({ repoPath: repo });
     clock = new FakeClock(1_700_000_000_000);
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    projectId = tdb.projectId;
     // An open run for the epic (as if execute-epic parked/left it) so we can assert finalization.
     runId = randomUUID();
     await createRun(tdb.db, clock, {

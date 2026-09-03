@@ -18,7 +18,6 @@
  * accepted an ask from gets `propose`, and this suite would prove nothing about the armed walk.
  */
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -34,18 +33,18 @@ import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
 import { beads, type Bead } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { appliedCloseReason } from "../gardener/apply";
 import { EARNED_AUTONOMY_BARS, earnedAutonomyOfKind } from "../gardener/autonomy";
 import { isProposalBead, proposalFingerprint } from "../gardener/detections";
 import { proposalTrackRecord } from "../gardener/track-record";
 import { makeGardenerHandler } from "./gardener";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 describeBd("gardener armed pass e2e (real handler · real bd)", () => {
   let repoDir: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   let restoreEnv: () => void;
   const clock: Clock = { now: () => Date.now() };
@@ -137,16 +136,11 @@ describeBd("gardener armed pass e2e (real handler · real bd)", () => {
       stdio: "ignore",
     });
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
+    tdb = makeProjectDb({
       repoPath: repo,
-      defaultBranch: "main",
       settingsJson: JSON.stringify({ proposalAutonomy: { "shipped-orphan": "apply" } }),
     });
+    projectId = tdb.projectId;
 
     await earnShippedOrphan();
 

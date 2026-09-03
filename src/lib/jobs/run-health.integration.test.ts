@@ -11,13 +11,13 @@ import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import { getRunHealthReport, type RunHealthFinding } from "../run-health";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { makeRunHealthHandler } from "./run-health";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const HOUR = 3_600_000;
 const NOW = 1_900_000_000_000;
@@ -36,7 +36,7 @@ function secDate(ms: number): Date {
 describeBd("run-health e2e (real handler · real bd)", () => {
   let bdRepo: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let clock: FakeClock;
   let projectId: string;
   /** stage:in-review + a PR ref — the stale-PR subject. */
@@ -123,16 +123,9 @@ describeBd("run-health e2e (real handler · real bd)", () => {
       reason: "the founder wants to see the design first",
     });
 
-    tdb = makeTestDb();
+    tdb = makeProjectDb({ repoPath: repo });
     clock = new FakeClock(NOW);
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    projectId = tdb.projectId;
   });
 
   beforeEach(async () => {

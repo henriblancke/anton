@@ -47,7 +47,7 @@ export function HealthReport({ slug, health }: { slug: string; health: ProjectHe
           <WorthALookSection slug={slug} items={health.worthALook} />
           <CodebaseSignalsSection scanHealth={health.scanHealth} />
           <HousekeepingSection items={health.housekeeping} />
-          <AppliedSection hygiene={health.hygiene} />
+          <AppliedSection slug={slug} hygiene={health.hygiene} pickerLog={health.pickerLog} />
         </div>
         <HealthRail slug={slug} health={health} />
       </div>

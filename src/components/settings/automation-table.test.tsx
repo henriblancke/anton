@@ -40,7 +40,8 @@ const AUTOMATIONS: AutomationSpec[] = [
   {
     id: "board-picker",
     label: "board-picker",
-    description: "ranks what could run next · records the plan · starts nothing yet",
+    description:
+      "ranks what could run next · records the plan · starts its top pick where you armed apply",
     group: "Board maintenance",
   },
   {
@@ -444,11 +445,19 @@ describe("the automation rows", () => {
     expect(screen.getByText("in progress · failed 7d ago")).toBeTruthy();
   });
 
-  // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
-  // and without saying so the row reads as a failure.
-  it("says which automations are idle because the one that feeds them is off", () => {
+  // unstick acts on run-health's findings. With the producer off it is not broken, it is inert —
+  // and without saying so the row reads as a healthy hourly automation (anton-kh98), which is
+  // precisely the belief that leaves parked work waiting for a week.
+  it("says an automation is a no-op while the one that feeds it is off", () => {
     renderTable({ "run-health": { enabled: false } });
-    expect(screen.getByText(/idle until run-health is on/)).toBeTruthy();
+    expect(screen.getByText(/a no-op until run-health is on/)).toBeTruthy();
+  });
+
+  // The row with no row of its own — a project predating the type — is the same claim: nothing
+  // feeds it, so it does nothing.
+  it("says an automation is a no-op when the one that feeds it has no schedule at all", () => {
+    renderTable({ "run-health": { enabled: null } });
+    expect(screen.getByText(/a no-op until run-health is on/)).toBeTruthy();
   });
 
   it("says which automations are fed once the one that feeds them is on", () => {
@@ -457,12 +466,12 @@ describe("the automation rows", () => {
   });
 
   it("says what the board-picker does and how often it would fire", () => {
-    // The pass decides only — it ranks the board and records the plan, and starts nothing. A row
-    // that promised a start would have an operator flip the switch and watch nothing happen, so the
-    // copy has to name the limit, not just the ambition.
+    // The row carries the ambition AND its condition: every armed project gets the ranking, only
+    // one armed to apply gets the unattended start. Copy that drops either half misleads an
+    // operator at the switch — about what will happen, or about what already is.
     renderTable();
     expect(screen.getByText(/ranks what could run next/)).toBeTruthy();
-    expect(screen.getByText(/starts nothing yet/)).toBeTruthy();
+    expect(screen.getByText(/starts its top pick where you armed apply/)).toBeTruthy();
     expect(cadenceButton("board-picker").textContent).toContain("Every 10 minutes");
   });
 

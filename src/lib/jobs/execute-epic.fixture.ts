@@ -13,8 +13,7 @@ import { expect } from "vitest";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { makeTestDb, type TestDb } from "../db/testing";
+import type { TestDb } from "../db/testing";
 import { beads } from "../beads/bd";
 import { formatHumanNote } from "../beads/notes";
 import * as schema from "../db/schema";
@@ -24,6 +23,7 @@ import { makeExecuteEpicHandler } from "./execute-epic";
 import { resetOperatorCache } from "../operator";
 import { makeBdRepo, saveEnv } from "@/lib/testing/integration";
 import { makeJobRunner } from "@/lib/testing/jobs";
+import { makeProjectDb } from "@/lib/testing/project";
 
 /** Fixed start-of-test wall clock. Reset before each case — see each suite's `beforeEach`. */
 export const BASE_TIME_MS = 1_700_000_000_000;
@@ -290,15 +290,8 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
   resetOperatorCache();
 
   // Test DB + project row.
-  const tdb = makeTestDb();
-  const clock = new FakeClock(BASE_TIME_MS);
-  const projectId = randomUUID();
-  await tdb.db.insert(schema.projects).values({
-    id: projectId,
-    slug: "sandbox",
-    name: "sandbox",
+  const tdb = makeProjectDb({
     repoPath: repo,
-    defaultBranch: "main",
     // testCommand asserts claude ran before tests → proves ordering claude→tests.
     // seedPrompt asserts the operator seed layers into the composed system prompt.
     settingsJson: JSON.stringify({
@@ -311,6 +304,8 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       reviewEnabled: false,
     }),
   });
+  const clock = new FakeClock(BASE_TIME_MS);
+  const projectId = tdb.projectId;
 
   return {
     sandbox,

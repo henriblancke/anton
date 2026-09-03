@@ -18,7 +18,6 @@
  *      defers the subject against real bd and settles the ask. The one pm kind that changes board
  *      state has to be proven end to end, not just through the mocked bd seam.
  */
-import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
@@ -28,17 +27,16 @@ import type { ClaudeResult } from "../claude/driver";
 import { contractGaps } from "../beads/contract";
 import { loadAllIssues } from "../beads/issues";
 import { resetIssueSnapshots } from "../beads/snapshot";
-import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { applyProposal } from "../gardener/apply";
 import { isProposalBead, proposalPlanOf } from "../gardener/detections";
 import { makeProductMasterHandler } from "./product-master";
 import type { Clock } from "./queue";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 describeBd("product-master pass e2e (real handler · real bd)", () => {
   let repoDir: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   const clock: Clock = { now: () => 1_700_000_000_000 };
   const nudge = vi.fn();
@@ -148,15 +146,8 @@ describeBd("product-master pass e2e (real handler · real bd)", () => {
     });
     await beads.reparent(repo, misfiled, wrongCard);
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
 
     before = await boardStatuses();
 

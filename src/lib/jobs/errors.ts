@@ -102,6 +102,85 @@ export function poisonBlockerIds(parkMessage: string): string[] | undefined {
 }
 
 /**
+ * How a needs-human park names the gate holding the run — and how it is read back. Global, because
+ * the clause is read from the TAIL: the agent's ask sits in front of it verbatim, and an ask that
+ * quotes this very sentence (asking a person to resolve a gate, say) would win a first-match parse
+ * and hand the sweeps a gate that was never armed for this run (PR #205 review).
+ */
+const PARKED_ON_GATE = /parked on human gate (\S+) until someone answers it/g;
+
+/**
+ * The LAST match of a global pattern, or undefined. `matchAll` iterates a clone, so the shared
+ * pattern's `lastIndex` never carries between calls.
+ */
+function lastMatch(pattern: RegExp, text: string): RegExpExecArray | undefined {
+  let last: RegExpExecArray | undefined;
+  for (const match of text.matchAll(pattern)) last = match as RegExpExecArray;
+  return last;
+}
+
+/**
+ * How that park names the OTHER open human gates on the target, when there are any. The ids are
+ * comma-separated and the sentence's period is a LOOKAHEAD, not part of the capture: bd ids may
+ * contain a period themselves (`anton-287p.1`), and a period-terminated capture would truncate every
+ * one of them — silently returning the wrong gate id to the sweeps that suppress on it.
+ */
+const PARKED_ALSO_HELD =
+  /it is also held by human gate\(s\) ([^\s,]+(?:,\s*[^\s,]+)*)(?=\.(?:\s|$))/;
+
+/**
+ * The clause a run's poison park uses to name the human gate it is waiting behind. Lives beside its
+ * parser for the same reason {@link blockedByPoison} does: that sentence is the ONLY durable record
+ * of WHICH gate a parked ask reached, and reworded in two places the two would drift silently.
+ *
+ * `held` — the open human gates on the target that anton did NOT arm — is named too, because
+ * answering anton's gate alone does not release the run (PR #205 review): the target stays blocked
+ * behind the person's own hold, and a park naming only the gate that just closed reads to the
+ * run-health sweep as a permanent failure the moment it is answered.
+ */
+export function parkedOnGateClause(gateId: string, held: string[] = []): string {
+  const base = `The run is parked on human gate ${gateId} until someone answers it.`;
+  return held.length > 0
+    ? `${base} Even then it is also held by human gate(s) ${held.join(", ")}.`
+    : base;
+}
+
+/**
+ * The human gate a needs-human park is waiting behind, or undefined when the message is some other
+ * poison. Matched anywhere in the text so a caller can pass the park reason with the runner's
+ * `poison:` prefix — or a report finding's prose — still attached.
+ *
+ * The run-health sweep reads it back to tell this stall from a permanent failure: a parked ask is
+ * ALREADY reported as its gate's own wait, so reporting the job too would raise a second escalation
+ * — calling a wait on a person an exhausted job — for the same pause.
+ */
+export function parkedAskGateId(parkMessage: string): string | undefined {
+  return lastMatch(PARKED_ON_GATE, parkMessage)?.[1];
+}
+
+/**
+ * EVERY human gate a needs-human park names — the one it armed, then the holds that keep the target
+ * blocked after that one is answered — or undefined when the message is some other poison.
+ *
+ * The list is what the sweep needs, not just the armed gate: while ANY of them is open the job is
+ * still one wait with the gate that reports it, and suppressing on the armed gate alone would
+ * re-raise the park as a permanent failure the moment anton's own gate is resolved ahead of the
+ * person's hold.
+ */
+export function parkedAskGateIds(parkMessage: string): string[] | undefined {
+  const armed = lastMatch(PARKED_ON_GATE, parkMessage);
+  if (!armed) return undefined;
+  // Only the text AFTER the armed clause: the holds are appended right behind it, so an ask that
+  // quotes a hold sentence of its own can't be read as this park's.
+  const tail = parkMessage.slice(armed.index + armed[0].length);
+  const held = (PARKED_ALSO_HELD.exec(tail)?.[1] ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  return [armed[1]!, ...held];
+}
+
+/**
  * This run cannot safely proceed because it can't prove it exclusively holds the epic's live
  * run-lease (anton-jz1). Two triggers, same recovery:
  *   1. Another machine already holds a live run-lease — a Force run started elsewhere is

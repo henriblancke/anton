@@ -684,6 +684,19 @@ describe("applyProposal — the writes, and the proposal's own settlement", () =
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
 
+  // The only way out of an unreadable proposal is a human editing the field that rotted, so the
+  // refusal has to name it — "no readable proposal move" alone leaves them re-deriving the hash by
+  // hand to find out which of eight fields the metadata disagrees with.
+  it("says WHICH field made the plan unreadable", async () => {
+    const edited = proposalFor(REPARENT, {
+      metadata: { gardener: { ...REPARENT, retireAs: "close" } },
+    });
+    await expect(apply(edited, [edited])).rejects.toMatchObject({
+      failure: "unusable",
+      message: expect.stringContaining("retireAs"),
+    });
+  });
+
   it("refuses a bead that is not a proposal, and one that already settled", async () => {
     const plain = bead("anton-x");
     await expect(apply(plain, [plain])).rejects.toThrow(/not a proposal bead/);

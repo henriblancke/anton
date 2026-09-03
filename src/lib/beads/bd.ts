@@ -25,6 +25,19 @@ import { doltSync, type SyncMode, type SyncOutcome } from "./sync-coalescer";
 export type { Bead, BeadComment, BeadDep } from "./types";
 import type { Bead } from "./types";
 
+// The dependency types anton may write, validated at the link seam because bd validates nothing
+// there (anton-igkb). Re-exported so callers reach the set through the same module as `link`.
+export { LINK_TYPES, assertLinkType, isLinkType, type LinkType } from "./link-types";
+import { assertLinkType, type LinkType } from "./link-types";
+
+/**
+ * The `agent:` VALUE that names no agent — the half {@link labelValueOf}(labels, "agent") returns,
+ * as distinct from the whole label {@link LABELS.agentHuman}. Exported because the routing
+ * chokepoints read the value, not the label: the active-agents allowlist compares agent ids, and
+ * `human` is not one anybody can enable.
+ */
+export const HUMAN_AGENT = "human";
+
 export const LABELS = {
   approved: "approved",
   stage: (s: "implementing" | "in-review") => `stage:${s}`,
@@ -36,6 +49,15 @@ export const LABELS = {
    * it — see beads.isAbandoned.
    */
   abandoned: "abandoned",
+  /**
+   * Work a run reserved but did NOT deliver (anton-67xj): a ticket skipped behind a timed-out one
+   * whose partial work was rolled back, or the timed-out ticket itself. Nothing from it is on the
+   * run's branch, so it is in no PR — which is exactly what merge finalization cannot see for
+   * itself: `bd` has no "this bead is not in that diff" fact, and a still-open child otherwise
+   * reads as one the run merely forgot to close. Cleared the moment a run dispatches the ticket
+   * again. See beads.isNotDelivered.
+   */
+  notDelivered: "not-delivered",
   /**
    * Cross-machine run-liveness lease (anton-jz1): `run-lease:<expiresAtEpochMs>[:<ownerRunId>]` on
    * the run target. Present + unexpired ⇒ a run is actively executing this epic on SOME machine, so
@@ -60,6 +82,14 @@ export const LABELS = {
    * comments beside it.
    */
   reviewScore: (score: number) => `review-score:${score}`,
+  /**
+   * The one `agent:` value that names no agent (anton-mv70): a person executes this bead — it needs
+   * a credential, an account, a purchase, a signature, or a taste call. Every other `agent:<id>`
+   * resolves to a specialist prompt, so a human bead left unmarked would dispatch to the DEFAULT
+   * agent and burn a run failing at work no agent can do. Written by shaping (skills/bd/SKILL.md),
+   * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
+   */
+  agentHuman: `agent:${HUMAN_AGENT}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
@@ -898,6 +928,18 @@ export interface Gate extends Bead {
   timeout?: number;
 }
 
+/**
+ * The `--reason` a gate was created with, read back off the gate bead. bd keeps no reason field: it
+ * folds the reason into the description it composes — `Ad-hoc gate blocking <bead>\n\nReason:
+ * <reason>` (measured on bd 1.1.2), verbatim and untruncated — so this is the only way to ask what a
+ * gate is waiting FOR. Undefined when the gate carries no reason.
+ */
+export function gateReason(gate: Bead): string | undefined {
+  const marker = "\nReason: ";
+  const at = (gate.description ?? "").indexOf(marker);
+  return at === -1 ? undefined : gate.description!.slice(at + marker.length);
+}
+
 export interface GateCreateOpts {
   /** Bead the gate blocks (required by bd). */
   blocks: string;
@@ -1624,13 +1666,22 @@ export function buildClaimableReadyArgs(): string[] {
  *     the claimable set can never disagree with what anton will actually execute. That is what
  *     keeps container epics (their features each run on their own) and child tickets (executed as
  *     part of their target's run, never distributed) out of the set.
+ *   - not {@link beads.isHumanWork} — `agent:human` names the one specialist anton does not have,
+ *     so a claimed human target would dispatch to the DEFAULT agent and burn a run failing at work
+ *     no agent can do. It is approved work waiting for a person, not backlog: leaving it in the set
+ *     is the hazard, leaving it on the board is the point.
+ *
+ * The human exclusion belongs here rather than in {@link buildClaimableReadyArgs}: bd's own
+ * `--exclude-label` would move it into the argv every external worker copies, where it could drift
+ * from this rule; the board read this narrowing already holds answers it for free.
  */
 function isClaimable(b: Bead, board: Bead[]): boolean {
   return (
     b.status === "open" &&
     beads.isApproved(b) &&
     !ownerOf(b) &&
-    beads.isRunTarget(b, board)
+    beads.isRunTarget(b, board) &&
+    !beads.isHumanWork(b)
   );
 }
 
@@ -1708,6 +1759,9 @@ export function staleClaimReason(bead: Bead, board: Bead[]): string | undefined 
   if (!beads.isApproved(bead)) return "approval was withdrawn while the claim settled";
   if (!beads.isRunTarget(bead, board)) {
     return "the target is no longer a run target (a container epic or a child ticket)";
+  }
+  if (beads.isHumanWork(bead)) {
+    return `the target was labelled ${LABELS.agentHuman} while the claim settled — a person executes it, no agent can`;
   }
   return undefined;
 }
@@ -1862,6 +1916,20 @@ function graphPlanError(err: unknown): string | undefined {
   }
 }
 
+/**
+ * Every issue type a run target can have. NECESSARY, not sufficient — the structural clauses in
+ * {@link beads.isRunTarget} still decide (a container epic and a parented task are both out) — but
+ * a type absent here can never be started, whatever its shape. Exported so anything that has to
+ * name the runnable vocabulary without a board in hand (the policy calibration fallback) reads it
+ * from the predicate rather than restating it: a `chore` fallback would propose work no pass can
+ * ever admit.
+ */
+export const RUN_TARGET_TYPES = ["feature", "epic", "task", "bug"] as const;
+export type RunTargetType = (typeof RUN_TARGET_TYPES)[number];
+
+const isRunTargetType = (t: string | undefined): t is RunTargetType =>
+  RUN_TARGET_TYPES.includes(t as RunTargetType);
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
@@ -1936,6 +2004,16 @@ export const beads = {
    */
   isMergeWaitGate: (b: Bead): b is Gate =>
     b.issue_type === "gate" && (b as Gate).await_type === "gh:pr",
+
+  /**
+   * A `human` gate — the wait anton arms on a run target whose agent reported `needs-human`
+   * (anton-287p). The opposite of the merge wait in every way that matters here: it IS a real
+   * blocker (epic-graph counts it, so nothing re-runs the target behind it), and NOTHING closes it
+   * on its own — `bd gate check` never evaluates it and gate-check's expiry pass skips it — so it
+   * ends only when a person runs `bd gate resolve`.
+   */
+  isHumanGate: (b: Bead): b is Gate =>
+    b.issue_type === "gate" && (b as Gate).await_type === "human",
 
   /**
    * Molecules whose gate has closed and whose next step is runnable — the gate-resume discovery
@@ -2113,8 +2191,21 @@ export const beads = {
   untag: (cwd: string, id: string, labels: string[]) =>
     bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
 
-  link: (cwd: string, a: string, b: string, type: string) =>
-    bdWrite(cwd, ["link", a, b, "--type", type]),
+  /**
+   * Write one dependency edge, `type` validated HERE because bd will not validate it (anton-igkb):
+   * `--type` is free text, and every value but `blocks`/`conditional-blocks` yields a non-blocking
+   * edge with no error — see {@link assertLinkType}. The runtime check backs the compile-time type:
+   * an edge type that arrives as data (a gardener plan, a JSON payload) never sees the type checker.
+   *
+   * `async` so a refused type REJECTS rather than throwing synchronously — every other verb here
+   * fails as a rejection, and a caller's `.catch()` must not be bypassed by where the failure came
+   * from. `exec` is injectable for tests, like {@link beads.cook}, which is what lets the guard be
+   * proven to reject BEFORE a spawn rather than after one.
+   */
+  link: async (cwd: string, a: string, b: string, type: LinkType, exec: BdExec = bdWrite) => {
+    assertLinkType(type);
+    return exec(cwd, ["link", a, b, "--type", type]);
+  },
 
   /**
    * Move a bead under a new parent (`bd update --parent`), or — with an empty `parentId` — detach
@@ -2453,6 +2544,9 @@ export const beads = {
   /** A bead a human abandoned (closed + `abandoned`) — closed, but explicitly NOT delivered. */
   isAbandoned: (b: Bead) => b.labels?.includes(LABELS.abandoned) ?? false,
 
+  /** A bead a run reserved but never delivered (see LABELS.notDelivered) — open, and in no PR. */
+  isNotDelivered: (b: Bead) => b.labels?.includes(LABELS.notDelivered) ?? false,
+
   setStatus: (cwd: string, id: string, status: string) =>
     bdWrite(cwd, ["update", id, "--status", status]),
 
@@ -2617,6 +2711,18 @@ export const beads = {
   // ── convenience: anton's stage/approval semantics, all in beads ──
   approve: (cwd: string, epicId: string) => beads.tag(cwd, epicId, [LABELS.approved]),
   isApproved: (b: Bead) => b.labels?.includes(LABELS.approved) ?? false,
+
+  /**
+   * Work a PERSON executes, not an agent (`agent:human`, see {@link LABELS.agentHuman}). Approved,
+   * shaped, real work — it just resolves to no specialist prompt, so anton must refuse it at every
+   * point where a bead turns into a dispatch rather than let it fall through to the default agent.
+   * Shared by {@link isClaimable} (it never enters the claimable set), execute-epic's run gate (a
+   * forced dispatch of a human TARGET is poisoned) and its per-ticket gate (a human TICKET inside an
+   * ordinary run is held behind a human gate at its own boundary), so the set anton picks from and
+   * the runner agree at every level of the tree.
+   */
+  isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
+
   isEpic: (b: Bead) => b.issue_type === "epic",
 
   /** The bead's parent id, from whichever field the bd read populated (`list` vs `show`). */
@@ -2653,6 +2759,7 @@ export const beads = {
    */
   isRunTarget: (b: Bead, board: Bead[]): boolean =>
     !isPipelineArtifact(b) &&
+    isRunTargetType(b.issue_type) &&
     (b.issue_type === "feature" ||
       (beads.isEpic(b) && !beads.isContainer(b, board)) ||
       ((b.issue_type === "task" || b.issue_type === "bug") && !beads.parentOf(b))),

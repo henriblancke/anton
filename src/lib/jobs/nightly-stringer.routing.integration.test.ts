@@ -14,16 +14,15 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
 import { driveJob, expectJobStatus } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, type Bead } from "../beads/bd";
 import { getLatestScanSummary } from "../scan-health";
 import { BOARD_CONTEXT_HEADING } from "../board-context";
 import * as schema from "../db/schema";
 import type { Clock } from "./queue";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const STORED_SCAN = fileURLToPath(new URL("./nightly-stringer.routing.scan.json", import.meta.url));
 
@@ -113,7 +112,7 @@ describeBd("nightly-stringer routing replay (real handler · real bd · stored s
   let bdRepo: BdRepo;
   let sandbox: string;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let clock: FakeClock;
   let projectId: string;
   let restoreEnv: () => void;
@@ -180,16 +179,9 @@ process.exit(0);`,
     process.env.FAKE_SCAN_FIXTURE = join(sandbox, "stored-scan.json");
     copyFileSync(STORED_SCAN, process.env.FAKE_SCAN_FIXTURE);
 
-    tdb = makeTestDb();
+    tdb = makeProjectDb({ repoPath: repo });
     clock = new FakeClock(1_700_000_000_000);
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    projectId = tdb.projectId;
 
     // ── the board the scan lands on ──
     epicId = await beads.create(repo, {

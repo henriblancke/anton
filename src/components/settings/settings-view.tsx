@@ -4,6 +4,11 @@ import type { ReactNode } from "react";
 
 import type { Project } from "@/lib/types";
 import { PageHeader } from "@/components/atoms";
+import {
+  PolicyDraftSection,
+  type PolicyCandidate,
+  type PolicyDraft,
+} from "@/components/settings/policy-draft-section";
 import { AgentsSection } from "@/components/settings/sections/agents-section";
 import { AutomationSection } from "@/components/settings/sections/automation-section";
 import { AutopilotSection } from "@/components/settings/sections/autopilot-section";
@@ -11,6 +16,10 @@ import { DangerSection } from "@/components/settings/sections/danger-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
 import { GeneralSection } from "@/components/settings/sections/general-section";
+import {
+  PickerAutonomySection,
+  type EarnedPicker,
+} from "@/components/settings/sections/picker-autonomy-section";
 import { PromptSection } from "@/components/settings/sections/prompt-section";
 import { ProposalsSection } from "@/components/settings/sections/proposals-section";
 import { ReviewFixSection } from "@/components/settings/sections/review-fix-section";
@@ -39,7 +48,14 @@ export function SettingsView({
   agents,
   bundledIds,
   labelVocabulary,
+  rankingCandidates,
+  issueTypes,
+  policyDraft,
+  policyCandidates,
+  policyNotStartable,
+  boardUnavailable,
   earned,
+  pickerEarned,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -56,10 +72,42 @@ export function SettingsView({
   /** The label namespaces this project's board actually uses — what value nominations pick from. */
   labelVocabulary: LabelNamespace[];
   /**
+   * The namespaces whose values read as a scale (`src/lib/policy/vocabulary`), so the work policy
+   * offers a hand-ranking only where an order could mean something.
+   */
+  rankingCandidates: string[];
+  /** The issue types this board actually uses — the type vocabulary the work policy is edited against. */
+  issueTypes: string[];
+  /**
+   * The policy calibration proposes at first arm (anton-c7iv), computed on the server off this
+   * project's own approval history. Passed in even when a policy is already stored: the panel picks
+   * which to render, and re-deriving it in the client would need a board read this module can't do.
+   */
+  policyDraft: PolicyDraft;
+  /**
+   * Every STARTABLE target on this board, projected to what the policy predicate reads (anton-qsr1).
+   * Passed whole so the panel's match count and per-bead "why not?" recompute in the browser as
+   * criteria change — a fetch per edit would make the count lag the control that explains it.
+   */
+  policyCandidates: PolicyCandidate[];
+  /** Open run targets refused before the policy, so the panel can explain its own denominator. */
+  policyNotStartable: number;
+  /**
+   * The board read failed, so everything derived from it above is empty by accident rather than by
+   * fact. The work policy panel refuses to arm off that.
+   */
+  boardUnavailable: boolean;
+  /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
    */
   earned: Record<string, EarnedKind>;
+  /**
+   * What this project's own releases and vetoes have earned the PICKER (anton-vkp9). Computed on the
+   * server off the verdict record the pass reads, so the control and the pass can never disagree
+   * about whether `apply` is available.
+   */
+  pickerEarned: EarnedPicker;
 }) {
   // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
   // lands where it says it will, a reload returns to the same place, and a link points at a section
@@ -111,6 +159,29 @@ export function SettingsView({
       <AutomationSection form={form} schedules={automationSchedules} defaultCrons={defaultCrons} />
     ),
     proposals: <ProposalsSection form={form} earned={earned} projectSlug={project.slug} />,
+    policy: (
+      <div className="flex flex-col gap-9">
+        <PolicyDraftSection
+          project={project}
+          draft={policyDraft}
+          stored={settings.pickerPolicy}
+          issueTypes={issueTypes}
+          labelVocabulary={labelVocabulary}
+          rankingCandidates={rankingCandidates}
+          candidates={policyCandidates}
+          notStartable={policyNotStartable}
+          boardUnavailable={boardUnavailable}
+        />
+        {/* The policy is what anton MAY start; this is whether it starts it. Two halves of one
+            question, so they sit in one panel rather than in two places an operator has to connect. */}
+        <PickerAutonomySection
+          slug={project.slug}
+          armed={settings.pickerPolicy !== undefined}
+          stored={settings.pickerAutonomy}
+          earned={pickerEarned}
+        />
+      </div>
+    ),
     danger: <DangerSection project={project} />,
   };
 

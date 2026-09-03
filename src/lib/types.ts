@@ -3,6 +3,7 @@
  * Stages/approval/PR are derived from beads (see DESIGN.md §2/§3), not stored in anton.db.
  */
 import type { ContractStatus } from "./beads/contract";
+import type { LinkType } from "./beads/link-types";
 import type { ChildReadiness } from "./epic-graph";
 import type { TicketNote } from "./beads/notes";
 import type { HygieneReport } from "./hygiene";
@@ -48,6 +49,11 @@ export type {
   EscalationView,
 } from "./escalations";
 export type { RunHealthFindingKind } from "./run-health";
+
+// The unwatched-park signal's shape (anton-kh98), re-exported type-only for the same reason: the
+// band is rendered under the board's client tree, and a value import of lib/unwatched-parks would
+// drag drizzle + better-sqlite3 into the browser bundle.
+export type { UnwatchedParks, WatcherAutomation } from "./unwatched-parks";
 
 // The rollup's per-run-target child readiness, re-exported type-only for the same reason: the board
 // card renders the verdict, and a value import of lib/epic-graph would drag lib/beads into the
@@ -224,12 +230,66 @@ export interface Epic {
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
   /**
+   * The operator VETOED this pick and anton is holding it until this instant (epoch ms, anton-jqvy).
+   * Machine-local pacing on anton's own queue — distinct from bd's `deferred` STATUS, which is shared
+   * board state a human has to undo. Absent means nothing is holding it.
+   *
+   * On the card rather than only in the recorded plan because a vetoed target must read as SET ASIDE
+   * rather than as gone: a card that silently stopped being offered would leave the operator
+   * wondering what they broke.
+   */
+  notNowUntil?: number;
+  /**
+   * Who put this card where it is, and why (anton-cqxd) — one entry per unattended writer that
+   * touched it. Empty/absent means nothing automated claims this bead. Never carried on a DONE card:
+   * provenance answers "should this run?", which a shipped target no longer asks.
+   */
+  provenance?: BeadProvenance[];
+  /**
    * The product epic this card sits under, when its parent is an `epic` bead — the grouping key for
    * the board's epic swimlanes (docs/design/2026-07-26-tier-and-linear-ux.md). Absent for a
    * top-level run target, which collects in the "No epic" lane.
    */
   epic?: EpicCrumb;
   tickets: Ticket[];
+}
+
+/**
+ * WHICH unattended writer put a bead where it is, and what to read to check the judgment
+ * (anton-cqxd / R3.7).
+ *
+ * ONE grammar for every writer, because there are three of them and they all write to the board with
+ * nobody watching: the board-picker admits a target under the standing policy, the product master
+ * proposes a move on it, and the repair passes rewrite one that came back blocked. Three bespoke
+ * indicators would make the board unreadable — the badge is always `◈ <writer>`, and what differs is
+ * the word and where it lands.
+ *
+ * `repaired` is RESERVED, not rendered: the kind exists so the repair passes extend this grammar
+ * instead of inventing a second one, and a surface renders nothing for a kind it has no wording for
+ * (see `provenance-badge.tsx`).
+ */
+export type ProvenanceKind = "policy" | "pm" | "repaired";
+
+export interface BeadProvenance {
+  kind: ProvenanceKind;
+  /**
+   * What the badge opens — a policy criterion key for `policy`, the proposal's bead id for `pm`.
+   * Absent is a real answer: a project whose policy narrows nothing this bead satisfies has no
+   * criterion to open at, and the badge falls back to the panel rather than to a broken link.
+   */
+  ref?: string;
+  /** What that writer decided, in its own words — the badge's tooltip, never its label. */
+  detail?: string;
+  /**
+   * `policy` only: the plan this mark came from no longer describes the board and policy it was
+   * decided over, so it is a record of a past pick rather than a current one.
+   *
+   * The badge renders either way — "who picked this, and under which rule" is history, and history
+   * does not expire. What the flag gates is the LIVE affordance derived from the same mark: a stale
+   * pick keeps its plain `Approve` rather than `[Release]`, which claims this is the target anton
+   * would start next (`isPickerPick`, board-utils.ts).
+   */
+  stale?: boolean;
 }
 
 /**
@@ -268,6 +328,36 @@ export interface StandaloneItem {
   deferred: boolean;
   /** Abandoned (closed + `abandoned` label, anton-6xj0) — a won't-do outcome, never a delivery. */
   abandoned: boolean;
+  /** Held out of the picker's plan by an operator veto, exactly as on a card (Epic.notNowUntil). */
+  notNowUntil?: number;
+  /** Who put this chip where it is, exactly as on a card (Epic.provenance). */
+  provenance?: BeadProvenance[];
+}
+
+/**
+ * One target in the board-picker's recorded plan, as the Up Next lane reads it (anton-t9m4 / R3.1).
+ *
+ * The plan is this machine's projection over Backlog, never a bead state — so an entry carries the
+ * ranking's own facts (where it stood, what it frees) rather than pointing at a stage. `priority`
+ * and `type` ride along because the lane heads BOTH card kinds with one meta row, and a standalone
+ * chip carries no priority of its own.
+ */
+export interface UpNextEntry {
+  beadId: string;
+  /** 1-based position in the ranked plan. */
+  rank: number;
+  /** bd priority (0=critical … 4=lowest); absent when the bead carries none. */
+  priority?: number;
+  type: IssueType;
+  /** How many still-waiting beads finishing this target transitively unblocks (beads/rank.ts). */
+  unblocks: number;
+  /**
+   * The bead's `created_at`, the ranking's age tiebreak — "" when bd reported none, exactly as
+   * `RankedTarget.createdAt`. Carried so a drag inside the lane can ask whether the order it wants
+   * is one the priority channel can actually establish, rather than writing a priority the next
+   * pass's tiebreak quietly overrules.
+   */
+  createdAt: string;
 }
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
@@ -293,6 +383,36 @@ export interface SyncStatusView {
   stalledForMs: number | null;
 }
 
+/**
+ * One bead on the operator's own queue (anton-qfso.1) — approved, open, `agent:human` work anton
+ * hands back rather than dispatches. Built by `operatorQueue` (lib/operator-queue.ts) off the board
+ * snapshot, so the row carries everything it takes to decide whether to act now: what the ask is,
+ * how long it has been waiting, and which run it holds up.
+ */
+export interface OperatorQueueItem {
+  id: string;
+  title: string;
+  /** The bead's "## Goal" — what the person is actually being asked for. Absent when unstated. */
+  goal?: string;
+  stage: Stage;
+  risk?: string; // from risk:<x>
+  size?: string; // from size:<x>
+  /** ISO timestamp the ask was filed, from the raw bead's created_at. Drives the queue's order. */
+  createdAt: string;
+  /**
+   * The run this ticket rides on. ABSENT on a run target, which is not held up by the work — it IS
+   * the work, and no agent will ever start it.
+   */
+  runTarget?: { id: string; title: string };
+  /**
+   * Whether a run actually reaches this ticket and holds on it. Only meaningful alongside
+   * `runTarget`, and FALSE when that target is itself `agent:human`: execute-epic poisons such a
+   * target before it dispatches a single child, so no gate is ever armed under it and there is no
+   * held run to resume (PR #214 review).
+   */
+  holdsRun?: boolean;
+}
+
 export interface Board {
   projectSlug: string;
   /** Monotonic issue-snapshot version used for change-aware refreshes. */
@@ -301,6 +421,29 @@ export interface Board {
   columns: Record<Stage, Epic[]>;
   /** Standalone (parentless) tasks/bugs grouped by stage, rendered as chips at each column's foot. */
   standalone: Record<Stage, StandaloneItem[]>;
+  /**
+   * Approved work that is the OPERATOR's, not an agent's (anton-qfso.1) — derived from the same
+   * snapshot as the cards, so it costs no read of its own and refreshes on the same poll. Empty
+   * means there is none, which the queue renders as nothing at all.
+   */
+  operatorQueue: OperatorQueueItem[];
+  /**
+   * The board-picker's recorded plan, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole
+   * input. The lane resolves each entry against the BACKLOG column and takes those cards out of it,
+   * so a bead never renders twice.
+   *
+   * ABSENT, never empty, whenever there is no projection to show: the picker is disarmed for this
+   * project, or it has never run here. An empty lane titled "Up Next" would read as "anton has
+   * nothing to start" on a board where the pass simply isn't running.
+   */
+  upNext?: UpNextEntry[];
+  /**
+   * The GENERATION of the plan {@link upNext} was projected from — carried so a verdict can name the
+   * decision the operator actually looked at (PR #212 review). A veto posted from a tab a later pass
+   * has overtaken sends this id, and the server records no pick rather than one the operator was
+   * never shown. Absent exactly when the lane is.
+   */
+  upNextPlanId?: string;
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
   /**
@@ -413,8 +556,27 @@ export interface MoveRequest {
   toStage: Stage;
 }
 
+/**
+ * What an approval did about the run it normally starts, answered alongside `jobId` (PR #212).
+ *
+ * A missing `jobId` means several different things, and only one of them is a problem: the enqueues
+ * withhold an id on purpose when a run already covers the target. A client that reads every missing
+ * id as a failure tells the operator to retry work that is already running.
+ *
+ * - `started`  — a run is enqueued on this machine; `jobId` names it.
+ * - `elsewhere`— the shared board shows a live run for this target on ANOTHER machine, so nothing was
+ *                enqueued here (anton-jz1). The work is covered; the board is what is behind.
+ * - `covered`  — a take-over found this instance already holds a job for the target, so it reused it
+ *                rather than shadowing it with a duplicate.
+ * - `none`     — this request was never going to start anything (a pure take-over of a blocked target).
+ * - `failed`   — the enqueue threw. The approval stands, so approving again retries it.
+ */
+export type ApprovalRunOutcome = "started" | "elsewhere" | "covered" | "none" | "failed";
+
 // ── Epic detail + dependency graph ──
-export type DepType = "parent-child" | "blocks" | "related" | "discovered-from";
+// One definition of the allowed edge types, owned by the seam that validates every write of them
+// (lib/beads/link-types). Type-only, so nothing of lib/beads reaches the browser bundle.
+export type DepType = LinkType;
 export interface DepEdge {
   from: string;
   to: string;

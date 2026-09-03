@@ -1,25 +1,28 @@
-import { GitPullRequestIcon } from "lucide-react";
-
 import type { StandaloneItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { CopyButton } from "@/components/ui/copy-button";
-import { AbandonedChip, BlockedChip, MetaChip, PrLink, RiskChip, SnoozedChip } from "@/components/atoms";
+import {
+  AbandonedChip,
+  BlockedChip,
+  MetaChip,
+  PrChip,
+  RiskChip,
+  SnoozedChip,
+  WorkingPulse,
+  prLabel,
+} from "@/components/atoms";
 import { ReviewScoreChip } from "@/components/review-score";
+import { NotNowChip } from "@/components/board/not-now-chip";
 import { TYPE_TEXT, agentDotClass } from "@/components/board/board-utils";
 import { TypeBadge, TypeIcon } from "@/components/board/type-language";
 import { ContractChip } from "@/components/board/contract-mark";
+import { ProvenanceBadges } from "@/components/board/provenance-badge";
 
 /**
  * The read-only rows of a standalone chip. Both sit above the chip's full-bleed open trigger, so
  * each takes `hasOverlay` and stops eating pointer events for it — the few controls that must stay
  * clickable (PR link, copy) opt back in individually.
  */
-
-/** Short PR label from a bead external-ref: `gh-218` / a URL ending in `/218` → `#218`. */
-export function prLabel(ref: string): string {
-  const m = /(\d+)\s*$/.exec(ref);
-  return m ? `#${m[1]}` : ref;
-}
 
 /** Title line: type icon, unread marker, title, and the run's PR or its live "working" pulse. */
 export function ChipHeader({ item, hasOverlay }: { item: StandaloneItem; hasOverlay: boolean }) {
@@ -37,30 +40,29 @@ export function ChipHeader({ item, hasOverlay }: { item: StandaloneItem; hasOver
         {item.title}
       </h4>
       {item.prRef && (
-        <PrLink href={item.prUrl} className={item.prUrl ? "pointer-events-auto" : undefined}>
-          {/* An abandoned item is closed (stage `done`) but nothing merged — never green-tint its PR. */}
-          <MetaChip tone={item.stage === "done" && !item.abandoned ? "done" : "pr"}>
-            <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-            {prLabel(item.prRef)}
-          </MetaChip>
-        </PrLink>
+        // An abandoned item is closed (stage `done`) but nothing merged — never green-tint its PR.
+        <PrChip
+          href={item.prUrl}
+          tone={item.stage === "done" && !item.abandoned ? "done" : "pr"}
+          className={item.prUrl ? "pointer-events-auto" : undefined}
+        >
+          {prLabel(item.prRef)}
+        </PrChip>
       )}
-      {item.stage === "implementing" && !item.prRef && (
-        <span className="inline-flex shrink-0 items-center gap-1 text-[10px] text-stage-implementing">
-          <span className="size-1.5 rounded-full bg-stage-implementing anton-pulse" aria-hidden="true" />
-          working
-        </span>
-      )}
+      {item.stage === "implementing" && !item.prRef && <WorkingPulse className="shrink-0" />}
     </div>
   );
 }
 
 /** Badge row: what this item is, who runs it, and every condition holding it back. */
 export function ChipMeta({
+  slug,
   item,
   deferred,
   hasOverlay,
 }: {
+  /** Project slug — the provenance badges link out to this project's evidence. */
+  slug: string;
   item: StandaloneItem;
   /** Snooze as the chip currently shows it — the optimistic value, not always `item.deferred`. */
   deferred: boolean;
@@ -77,6 +79,8 @@ export function ChipMeta({
       <CopyButton value={item.id} label="ticket id" className="pointer-events-auto font-mono text-[10px]">
         {item.id}
       </CopyButton>
+      {/* Same grammar as the epic card's: an epic-of-one is still a card anton picked (anton-cqxd). */}
+      <ProvenanceBadges slug={slug} beadId={item.id} provenance={item.provenance} />
       {item.agent && <MetaChip dotClass={agentDotClass(item.agent)}>{item.agent}</MetaChip>}
       {item.risk && <RiskChip risk={item.risk} />}
       {/* Renders only once a review has actually scored this target (anton-tprv). */}
@@ -86,6 +90,9 @@ export function ChipMeta({
       {item.stage !== "done" && <ContractChip contract={item.contract} />}
       {item.abandoned && <AbandonedChip />}
       {deferred && <SnoozedChip />}
+      {/* Vetoed, not vanished (anton-jqvy) — and its own chip, because a bounded hold anton lifts
+          itself is not the same thing as the snooze a human has to undo. */}
+      {item.notNowUntil !== undefined && <NotNowChip untilMs={item.notNowUntil} />}
     </div>
   );
 }

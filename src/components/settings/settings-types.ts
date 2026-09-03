@@ -2,6 +2,8 @@ import type {
   ScheduleLastRun,
   SchedulePendingStatus,
 } from "@/components/settings/automation-table";
+import type { Policy } from "@/components/settings/policy-draft-section";
+import type { PickerAutonomy } from "@/lib/policy/types";
 
 /**
  * The shapes the settings form works in. Every one of them is MIRRORED from a server type rather
@@ -78,6 +80,16 @@ export interface EditableSettings {
   };
   /** Nominated value labels (anton-prng), highest tier first. Absent/empty = rank on age alone. */
   valueLabels?: string[];
+  /** The armed work policy (anton-c7iv). Absent = never armed, which is what makes the panel
+   *  propose a calibrated draft instead of an empty form. */
+  pickerPolicy?: Policy;
+  /**
+   * How far the picker may go with the plan it decides (anton-vkp9). Absent = never chosen, which an
+   * armed project reads back as `shadow`. What is STORED, not what the pass resolves: both floors —
+   * an armed policy, and a record that has earned it — are re-applied where it is rendered, so a
+   * level the pass would refuse is never drawn as the one in force.
+   */
+  pickerAutonomy?: PickerAutonomy;
   /** The operator declined the daily product-master offer (anton-3xa9); absent = not yet asked. */
   keepProductMasterWeekly?: boolean;
   /**

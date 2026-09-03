@@ -145,6 +145,46 @@ describe("decideBoardPickerPlan", () => {
     expect(plan.stamp.beadCount).toBe(1);
   });
 
+  it("leaves a vetoed target out of the plan, and says the OPERATOR held it", () => {
+    // R3.9: `✕ not now` defers that target and nothing else — the rest of the plan is unchanged, and
+    // the exclusion names the veto rather than whatever rule would otherwise have spoken.
+    const until = OBSERVED + 3_600_000;
+    const plan = decideBoardPickerPlan({
+      board: [bead("t1", { priority: 0 }), bead("t2", { priority: 1 })],
+      policy: ADMIT_ALL_POLICY,
+      runtime: { observedAtMs: OBSERVED, deferrals: new Map([["t1", until]]) },
+    });
+
+    expect(plan.entries.map((e) => e.beadId)).toEqual(["t2"]);
+    expect(plan.entries[0].rank).toBe(1);
+    const held = plan.exclusions.find((e) => e.beadId === "t1");
+    expect(held?.reason).toBe("deferred");
+    expect(held?.detail).toContain(new Date(until).toISOString());
+  });
+
+  it("reads a veto as the operator's answer, not the policy's — deferred outranks policy", () => {
+    // The two are different answers to "why not this one?", and only one of them is the operator's.
+    const refuseAll: PickerPolicy = { admits: () => ({ admitted: false, detail: "no" }) };
+    const plan = decideBoardPickerPlan({
+      board: [bead("t1")],
+      policy: refuseAll,
+      runtime: { observedAtMs: OBSERVED, deferrals: new Map([["t1", OBSERVED + 1000]]) },
+    });
+
+    expect(plan.exclusions).toHaveLength(1);
+    expect(plan.exclusions[0].reason).toBe("deferred");
+  });
+
+  it("offers a target again once its window has closed — the caller passes only live holds", () => {
+    const plan = decideBoardPickerPlan({
+      board: [bead("t1")],
+      policy: ADMIT_ALL_POLICY,
+      runtime: { observedAtMs: OBSERVED, deferrals: new Map() },
+    });
+
+    expect(plan.entries.map((e) => e.beadId)).toEqual(["t1"]);
+  });
+
   it("never shells out — the decision costs no bd call", () => {
     decide([bead("t1"), bead("t2", { issue_type: "feature" })]);
     expect(spawned).not.toHaveBeenCalled();

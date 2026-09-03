@@ -7,15 +7,20 @@ it short. This is *what this business is* — not a backlog (that's beads) and n
 ## What it is
 anton is a local, single-user app that turns an idea — or a finding from scanning your code —
 into work that ships itself. You describe what you want; anton **shapes** it into an epic with
-concrete tickets and sets it aside for your OK. Once you **approve**, it runs each ticket
+concrete tickets and sets it aside for your OK. **Approval** is the founder's gate, and it is
+authored once: arm a standing policy — written in your repo's own labels — and anton's
+deterministic picker approves and starts the work that falls inside it, showing its hand in Up
+Next first so you can veto a target before it runs. Approving a single target by hand stays
+available, and disarming returns every start to your click. From there each ticket runs
 autonomously: isolated git worktree → drives `claude` to write the code → runs your tests →
 opens a PR → then **auto review-fixes** the PR until comments and CI are clean. The loop:
-`shape → approve → autonomous run → PR → auto review-fix`.
+`shape → approve (a standing policy, or one target) → autonomous run → PR → auto review-fix`.
 
 ## Who it's for (ICP)
-A solo developer/founder who wants work to ship autonomously while staying in control at
-exactly two gates — approving the epic and merging the PR. Runs entirely on their own machine
-(nothing to sign up for, nothing leaves the box); reached as an open local tool, not a service.
+A solo developer/founder who wants work to ship autonomously while staying in control of two
+things — what anton may start (a standing approval policy they author and can disarm, or a
+per-epic approval) and merging the PR. Runs entirely on their own machine (nothing to sign up
+for, nothing leaves the box); reached as an open local tool, not a service.
 The one exception is **opt-in and self-hosted**: a project can point its board at a shared Dolt
 server *the team runs* so a small team works one real-time board instead of push/pull syncing
 (DESIGN.md §3a). Still no vendor, no account, no anton service — the default stays fully local.
@@ -24,7 +29,7 @@ server *the team runs* so a small team works one real-time board instead of push
 Local, not deployed — it drives your existing `claude`, `git`, `gh`, `bd`, and `stringer`, so
 there's no hosted runtime and nothing leaves your machine except what you deliberately point it
 at (the opt-in team Dolt server above, which is yours). Epic-first and approval-gated: the
-founder decides what ships, anton owns everything in between. It doesn't stop at the PR — it
+founder authors the boundary, anton owns everything inside it. It doesn't stop at the PR — it
 keeps working the PR (review comments + red CI) until it's mergeable, which is the part most
 "AI writes a PR" tools drop.
 
@@ -33,7 +38,11 @@ keeps working the PR (review comments + red CI) until it's mergeable, which is t
   serverless. It's a local Next.js server by design; the opt-in team board server is *your*
   infrastructure, not anton becoming a service.
 - Not the work source of truth — beads owns epics/tickets/stage/PR links; anton never forks that.
-- Not auto-merging — approve and merge stay human decisions.
+- Not auto-merging — merge stays a human decision, including under an armed policy.
+- Not an LLM picking the work — selection and ranking are deterministic code, so a start is
+  explainable and costs nothing.
+- Not a shared policy — a standing approval is armed per project; there is no cross-project or
+  global arming.
 
 ## Success signals
 - Approved epics reach an open, green, review-clean PR with no human touch between approve and merge.

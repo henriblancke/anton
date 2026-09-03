@@ -23,7 +23,6 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
 import { makeJobRunner } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { resetIssueSnapshots } from "../beads/snapshot";
@@ -33,6 +32,7 @@ import { createRun, getRunById } from "../runs";
 import { getJob, systemClock, type JobRow } from "./queue";
 import { makeGateCheckHandler } from "./gate-check";
 import { makeReviewFixHandler } from "./review-fix";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 const IN_REVIEW = LABELS.stage("in-review");
 
@@ -47,7 +47,7 @@ interface Target {
 describeBd("PR-merge gate e2e (real handlers · real bd/git · fake gh)", () => {
   let bdRepo: BdRepo;
   let repo: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   let restoreEnv: () => void;
 
@@ -180,15 +180,8 @@ process.exit(0);
     process.env.FAKE_BRANCH_8 = closed.branch;
     process.env.FAKE_BRANCH_9 = unreadable.branch;
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
     // The merged target's run, still open — finalization must settle it.
     mergedRunId = randomUUID();
     await createRun(tdb.db, systemClock, {

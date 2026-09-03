@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { EARNED_AUTONOMY_BARS, PICKER_AUTONOMY_TIER } from "./gardener/autonomy";
 
 let workDir: string;
 let dbFile: string;
@@ -19,9 +20,11 @@ let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudget
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
 let DEFAULT_PROJECT_BUDGET_POLICY: typeof import("./projects").DEFAULT_PROJECT_BUDGET_POLICY;
 let updateProjectSettings: typeof import("./projects").updateProjectSettings;
+let getProjectSettingsBySlug: typeof import("./projects").getProjectSettingsBySlug;
 let isBudgetAwareEnabledAnywhere: typeof import("./projects").isBudgetAwareEnabledAnywhere;
 let resolveValueLabels: typeof import("./projects").resolveValueLabels;
 let valueLabelsSchema: typeof import("./projects").valueLabelsSchema;
+let resolvePickerAutonomy: typeof import("./projects").resolvePickerAutonomy;
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "anton-projects-test-"));
@@ -50,9 +53,11 @@ beforeAll(async () => {
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
   DEFAULT_PROJECT_BUDGET_POLICY = mod.DEFAULT_PROJECT_BUDGET_POLICY;
   updateProjectSettings = mod.updateProjectSettings;
+  getProjectSettingsBySlug = mod.getProjectSettingsBySlug;
   isBudgetAwareEnabledAnywhere = mod.isBudgetAwareEnabledAnywhere;
   resolveValueLabels = mod.resolveValueLabels;
   valueLabelsSchema = mod.valueLabelsSchema;
+  resolvePickerAutonomy = mod.resolvePickerAutonomy;
 });
 
 afterAll(() => {
@@ -392,6 +397,29 @@ describe("updateProjectSettings runHealth deep-merge", () => {
   });
 });
 
+/**
+ * Every settings writer rewrites the WHOLE settingsJson blob, and the settings page has several of
+ * them in flight independently — the global Save, the automation table, the work-policy panel. A
+ * read-modify-write that is not atomic loses one of them silently: both requests report success and
+ * the later write erases the earlier one's keys.
+ */
+describe("updateProjectSettings is atomic against a concurrent write", () => {
+  it("keeps both patches when two saves are in flight at once", async () => {
+    const created = await addProject({
+      name: "Concurrent Save",
+      repoPath: makeRepoDir("concurrent-save"),
+    });
+    // Started together, deliberately: this is the settings page with one PATCH per section.
+    await Promise.all([
+      updateProjectSettings(created.slug, { model: "claude-sonnet-5" }),
+      updateProjectSettings(created.slug, { pickerPolicy: { types: ["bug"] } }),
+    ]);
+    const settings = await getProjectSettingsBySlug(created.slug);
+    expect(settings.model).toBe("claude-sonnet-5");
+    expect(settings.pickerPolicy).toEqual({ types: ["bug"] });
+  });
+});
+
 describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
   it("is false when no project has budget-aware execution on (the default)", async () => {
     const created = await addProject({ name: "Budget Off", repoPath: makeRepoDir("budget-off") });
@@ -404,5 +432,57 @@ describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
     const created = await addProject({ name: "Budget On", repoPath: makeRepoDir("budget-on") });
     await updateProjectSettings(created.slug, { budgetAware: true });
     expect(await isBudgetAwareEnabledAnywhere()).toBe(true);
+  });
+});
+
+describe("resolvePickerAutonomy (anton-qlci, anton-vkp9)", () => {
+  const BAR = EARNED_AUTONOMY_BARS[PICKER_AUTONOMY_TIER];
+  /** A record that has earned `apply`: a full window of picks, every one of them released. */
+  const EARNED = { settled: BAR.minSettled, accepted: BAR.minSettled };
+  /** What every project starts on — no pick answered either way. */
+  const NO_RECORD = { settled: 0, accepted: 0 };
+
+  it("defaults to propose unarmed and shadow armed — apply is never a default", () => {
+    expect(resolvePickerAutonomy({}, EARNED)).toBe("propose");
+    expect(resolvePickerAutonomy({ pickerPolicy: { types: ["bug"] } }, EARNED)).toBe("shadow");
+  });
+
+  it("honours a stored level on an armed project whose record supports it", () => {
+    const armed = { pickerPolicy: { types: ["bug"] } };
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" }, EARNED)).toBe("propose");
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "apply" }, EARNED)).toBe("apply");
+  });
+
+  it("floors apply to shadow when no policy is armed", () => {
+    // The structural default admits every claimable run target, so apply there is autopilot with no
+    // approval in it — an operator who clears their policy lands back in shadow rather than wide open.
+    expect(resolvePickerAutonomy({ pickerAutonomy: "apply" }, EARNED)).toBe("shadow");
+  });
+
+  it("floors apply to shadow until the record has earned it, whatever the setting says", () => {
+    // The second gate (anton-vkp9): an armed policy says what anton MAY start, and only the
+    // operator's own releases say whether its picks have been worth starting.
+    const armed = { pickerPolicy: { types: ["bug"] }, pickerAutonomy: "apply" as const };
+    expect(resolvePickerAutonomy(armed, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy(armed, { settled: BAR.minSettled - 1, accepted: BAR.minSettled - 1 })).toBe(
+      "shadow",
+    );
+    expect(resolvePickerAutonomy(armed, EARNED)).toBe("apply");
+  });
+
+  it("returns an armed picker to shadow once its record degrades", () => {
+    // Re-asked every pass and never latched, so a project that stops clearing the bar stops starting
+    // work on its own — and lands in shadow, the one level where the record can be earned back.
+    const armed = { pickerPolicy: { types: ["bug"] }, pickerAutonomy: "apply" as const };
+    expect(resolvePickerAutonomy(armed, EARNED)).toBe("apply");
+    expect(
+      resolvePickerAutonomy(armed, { settled: BAR.minSettled, accepted: BAR.minSettled - 3 }),
+    ).toBe("shadow");
+  });
+
+  it("never floors the levels below apply — shadow is where the record is made", () => {
+    const armed = { pickerPolicy: { types: ["bug"] } };
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "shadow" }, NO_RECORD)).toBe("shadow");
+    expect(resolvePickerAutonomy({ ...armed, pickerAutonomy: "propose" }, NO_RECORD)).toBe("propose");
   });
 });

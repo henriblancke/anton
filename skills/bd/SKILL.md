@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 9eaee75e8c3f
+version: 1679a0761618
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -107,11 +107,31 @@ under it. **Never re-type an existing bead to "migrate" it.**
 | `domain:` | `eng`, `marketing`, `bizdev`, `research`, `ops`            | cross-domain classification |
 | `area:`   | project-local product surfaces (`ingest`, `billing`, …); open vocabulary | **epic tier only**, exactly one; the roadmap's Area column and Linear project routing key on it. A different axis from `domain:` — which company function owns the work vs. which product surface it advances |
 | `risk:`   | `low`, `high`                                              | `high` = security / schema / auth / payments / migrations / infra |
-| `agent:`  | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, … or omitted | which specialist fits |
+| `agent:`  | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, … or `human`; or omitted | which specialist fits; `human` names the one specialist anton does not have — see below |
 | `size:`   | `S`, `M`, `L`                                              | sanity check; `L` on a ticket is a smell — split it |
 | `source:` | `stringer`, `gardener`, or omitted                         | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup, and gardener proposals `gardener:<class>:<hash>` (an open or declined fingerprint stops the patrol re-asking) |
 
 (Model routing is the executor's concern — shaping does not set a `model:` label.)
+
+### `agent:human` — work no agent can finish
+
+One question decides it, and shaping can answer it from the bead alone:
+
+> **Can an agent complete this end to end, or does it need a credential, an account, a purchase, a
+> signature, or a taste call?**
+
+Any of those five and the bead is `agent:human`: register the domain, sign the DPA, buy the plan,
+pick the pricing tier, click through a third-party dashboard, judge which of two designs is better.
+The point is honesty about who does the work, not a lower bar — a human bead is shaped to the same
+contract and approved by the same gate as any other.
+
+What changes is routing. Every other `agent:` value resolves to a specialist prompt file; `human`
+resolves to none, so a human bead left unmarked would dispatch to the DEFAULT agent and flail at
+work no agent can do. That is why the value exists and why the exclusion below is explicit: a
+`agent:human` bead never enters the claimable set (§1 of `.beads/PRIME.md`), and inside a run it
+becomes a human gate at its boundary rather than a step an agent improvises around — the run does
+every ticket that does not depend on it, then parks on that gate. Resolving the gate is the whole
+answer: anton closes the ticket and runs the rest.
 
 ## Dependency edges
 
@@ -372,8 +392,19 @@ bd ready --label approved --unassigned --json --limit 0
 
 Then narrow the pool to **run targets** (the run-target rule above) against one full board read
 (`bd list --status all --json --limit 0`, which carries parentage and `blocks` edges), keeping only
-beads that are `open`, carry `approved`, and have no assignee. Rank what survives — the order is
-total and deterministic, so two machines agree on what is next:
+beads that are `open`, carry `approved`, have no assignee, and are **not labelled `agent:human`**.
+
+**Human work is excluded, and it is not a bug that it sits there.** `agent:human` marks a bead no
+agent can complete end to end — it needs a credential, an account, a purchase, a signature, or a
+taste call. Every other `agent:` value resolves to a specialist prompt; `human` resolves to none, so
+a human bead left in the set would dispatch to the DEFAULT agent and burn a run failing at work no
+agent can do. It is approved, real, and waiting for a person — not backlog, not unshaped.
+
+The exclusion belongs to this narrowing step, **not** to the pool query: bd's own `--exclude-label`
+flag would move it into the argv and drift from the one flag set every worker and anton share.
+Whatever holds the board already reads it for parentage, so the label costs nothing to check here.
+
+Rank what survives — the order is total and deterministic, so two machines agree on what is next:
 
 1. **priority**, P0 first (a bead with none sorts last);
 2. then **unblocking value** — how many open beads it transitively unblocks via `blocks` edges, most

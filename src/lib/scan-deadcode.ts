@@ -688,16 +688,70 @@ function blankAll(line: string): string {
 const SHELL_FILE = /\.(?:sh|bash|zsh)$/i;
 
 /**
- * A heredoc opener and the word ending it — `<<EOF`, `<<-'EOF'`, `<< "EOF"`. `<<<` is a here-STRING
- * and opens nothing, and `<<=` is a shift-assign: both are kept out. The guard runs on BOTH sides,
- * because without the lookbehind `<<<EOF` still matches at its second `<` — the engine simply
- * starts one character later — and a here-string would then blank the rest of the script.
- *
- * The quoted spellings are what a script uses to keep the payload literal; the bare one still
- * expands. Which of the two was written decides how much of the payload is inert, so the quoted
- * groups are kept apart from the bare one. Both end at a line holding the word alone.
+ * Where a heredoc redirection begins — a `<<` that is neither the `<<<` of a here-string nor the
+ * `<<=` of a shift-assign. The guard runs on BOTH sides, because without the lookbehind `<<<EOF`
+ * still matches at its second `<` — the engine simply starts one character later — and a
+ * here-string would then blank the rest of the script.
  */
-const HEREDOC_OPEN = /(?<!<)<<-?(?!<|=)\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))/g;
+const HEREDOC_ARROW = /(?<!<)<<(-?)(?!<|=)/g;
+
+/** What ends a shell word: whitespace, a redirection, or an operator. */
+const WORD_END = /[\s;&|<>()]/;
+
+/**
+ * The delimiter word a heredoc opener names, read the way the shell reads it, and whether any part
+ * of it was quoted.
+ *
+ * A delimiter is an ordinary shell WORD, so it may be assembled from quoted and unquoted pieces:
+ * `<<'E'OF`, `<<"E"OF` and `<<\EOF` all end at a line reading `EOF` (anton-23xe). Reading only the
+ * first piece leaves a terminator that never matches, which blanks the rest of the script; and a
+ * spelling matched not at all leaves the payload read as executable, which invents a caller and
+ * deletes a true finding — the worse of the two.
+ *
+ * Quoting ANY piece makes the whole payload literal, which is why one flag covers the word.
+ */
+function heredocWord(line: string, from: number): { word: string; quoted: boolean; end: number } {
+  let word = "";
+  let quoted = false;
+  let at = from;
+  while (at < line.length && !WORD_END.test(line[at] as string)) {
+    const char = line[at];
+    if (char === "'" || char === '"') {
+      let close = at + 1;
+      while (close < line.length && line[close] !== char) close += char === '"' && line[close] === "\\" ? 2 : 1;
+      // An unclosed quote is not a delimiter anton can trust; naming none leaves the payload read
+      // as code, which is what every line of this script already is.
+      if (close >= line.length) return { word: "", quoted, end: line.length };
+      word += line.slice(at + 1, close);
+      quoted = true;
+      at = close + 1;
+    } else if (char === "\\") {
+      if (at + 1 >= line.length) return { word: "", quoted, end: line.length };
+      word += line[at + 1];
+      quoted = true;
+      at += 2;
+    } else {
+      word += char;
+      at += 1;
+    }
+  }
+  return { word, quoted, end: at };
+}
+
+/** Every heredoc a line opens, in the order their payloads follow. */
+function heredocOpeners(line: string): { word: string; dash: boolean; quoted: boolean }[] {
+  const found: { word: string; dash: boolean; quoted: boolean }[] = [];
+  HEREDOC_ARROW.lastIndex = 0;
+  for (let m = HEREDOC_ARROW.exec(line); m; m = HEREDOC_ARROW.exec(line)) {
+    let at = m.index + m[0].length;
+    while (line[at] === " " || line[at] === "\t") at += 1;
+    const { word, quoted, end } = heredocWord(line, at);
+    if (!word) continue;
+    found.push({ word, dash: m[1] === "-", quoted });
+    HEREDOC_ARROW.lastIndex = Math.max(end, HEREDOC_ARROW.lastIndex);
+  }
+  return found;
+}
 
 /**
  * One payload line of an EXPANDING heredoc, with everything but its command substitutions blanked.
@@ -774,12 +828,7 @@ function maskHeredocs(text: string): string {
         // substitutions running, and those are code however the rest of the payload reads.
         return open.quoted ? blankAll(line) : unmaskedSubstitutions(line);
       }
-      HEREDOC_OPEN.lastIndex = 0;
-      for (let m = HEREDOC_OPEN.exec(line); m; m = HEREDOC_OPEN.exec(line)) {
-        const quoted = m[1] !== undefined || m[2] !== undefined;
-        const word = m[1] ?? m[2] ?? m[3];
-        if (word) pending.push({ word, dash: m[0].startsWith("<<-"), quoted });
-      }
+      pending.push(...heredocOpeners(line));
       return line;
     })
     .join("\n");

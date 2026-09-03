@@ -83,6 +83,10 @@ export const SECTIONS = [
     group: "On a schedule",
     dirtyKeys: ["proposalAutonomy"],
   },
+  // Self-contained: the policy panel owns its own accept/save (like the danger zone's prune
+  // command), because "nothing is applied until you accept" reads as a deliberate act, not as one
+  // more field folded into a shared Save bar.
+  { id: "policy", label: "Work policy", group: "On a schedule", dirtyKeys: [] },
   { id: "danger", label: "Danger zone", group: "Irreversible", dirtyKeys: [] },
 ] as const;
 

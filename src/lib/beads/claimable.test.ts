@@ -84,6 +84,41 @@ describe("rankClaimableTargets — the set", () => {
     expect(ids(rankClaimableTargets(board, board))).toEqual(["f2"]);
   });
 
+  it("drops an agent:human target — no agent can do it, at any priority", () => {
+    // anton-mv70: `agent:human` resolves to no specialist prompt, so a claimed human target would
+    // dispatch to the DEFAULT agent. Asserted at P0 and with no priority at all: the exclusion is a
+    // property of the label, never of where the bead would have ranked.
+    const board = [
+      bead({ id: "f1", issue_type: "feature", priority: 0, labels: ["approved", "agent:human"] }),
+      bead({ id: "t2", issue_type: "task", labels: ["approved", "agent:human"] }),
+      bead({ id: "e3", issue_type: "epic", priority: 1, labels: ["approved", "agent:human"] }),
+      bead({ id: "f4", issue_type: "feature", priority: 2, labels: ["approved", "agent:nextjs"] }),
+    ];
+
+    expect(ids(rankClaimableTargets(board, board))).toEqual(["f4"]);
+  });
+
+  it("leaves the ranking of every other target untouched when human work is on the board", () => {
+    // The label removes its own bead and changes nothing else — same order, same unblocks counts.
+    const others = [
+      bead({ id: "f1", issue_type: "feature", priority: 1, created_at: "2026-01-01T00:00:00Z" }),
+      bead({ id: "f2", issue_type: "feature", priority: 0, created_at: "2026-02-01T00:00:00Z" }),
+      bead({ id: "t3", issue_type: "task", priority: 1, created_at: "2026-03-01T00:00:00Z" }),
+    ];
+    const human = bead({
+      id: "h1",
+      issue_type: "feature",
+      priority: 0,
+      created_at: "2026-01-01T00:00:00Z",
+      labels: ["approved", "agent:human"],
+    });
+
+    const without = rankClaimableTargets(others, others);
+    const withHuman = rankClaimableTargets([...others, human], [...others, human]);
+
+    expect(withHuman).toEqual(without);
+  });
+
   it("drops anything not open — closed, in_progress and deferred are nobody's free work", () => {
     const board = [
       bead({ id: "f1", issue_type: "feature", status: "closed" }),

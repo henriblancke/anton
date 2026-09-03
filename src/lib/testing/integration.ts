@@ -19,6 +19,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe } from "vitest";
 import { applyMigrationsTo } from "@/lib/db/testing";
+import type { Project } from "@/lib/types";
 
 // ── binary probes + suite selector ──
 
@@ -240,6 +241,30 @@ export function makeFileDb(): FileDb {
       if (prevDb === undefined) delete process.env.ANTON_DB;
       else process.env.ANTON_DB = prevDb;
     },
+  };
+}
+
+// ── project fixture ──
+
+/**
+ * The `Project` a real-bd suite arranges around: a throwaway {@link makeBdRepo} repo, addressed as
+ * slug `tmp`. Every such suite used to inline this literal, so a new `Project` field (or a changed
+ * default) meant a dozen identical edits and any missed one left a suite exercising a subtly
+ * different project.
+ *
+ * `overrides` exists for the handful of suites that assert on a field — the abandon routes match
+ * the project id handed to `cancelRunForTarget`, so they pin `id`.
+ */
+export function tmpProject(repoPath: string, overrides: Partial<Project> = {}): Project {
+  return {
+    id: "x",
+    slug: "tmp",
+    name: "tmp",
+    repoPath,
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+    ...overrides,
   };
 }
 

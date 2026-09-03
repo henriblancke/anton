@@ -25,6 +25,8 @@ import {
   REVIEW_MIN_SCORE_RANGE,
   budgetPolicySchema,
   formulaVariantsSchema,
+  pickerAutonomySchema,
+  pickerPolicySchema,
   proposalAutonomySchema,
   runHealthThresholdsSchema,
   scanSeverityPolicySchema,
@@ -159,7 +161,8 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
 
     // Policy blobs. Each parsed partial is deep-merged into the stored policy by
     // updateProjectSettings, so a client that exposes one knob never wipes the others —
-    // except valueLabels, replaced wholesale because its ORDER is the band order.
+    // except valueLabels (replaced wholesale because its ORDER is the band order) and
+    // pickerPolicy (below).
     settingsField("budgetPolicy", schemaValue(budgetPolicySchema, messageDetail("out of range"))),
     settingsField(
       "formulaVariants",
@@ -173,6 +176,18 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField(
       "valueLabels",
       schemaValue(valueLabelsSchema, messageDetail("invalid label"), { clearOnEmptyArray: true }),
+    ),
+
+    // Cleared, the project goes back to NEVER ARMED: the panel proposes a fresh calibrated draft
+    // and the picker starts nothing until one is accepted. Otherwise replaced WHOLESALE, never
+    // merged — dropping a criterion is how a policy is widened, and a merge would make that edit
+    // silently impossible.
+    settingsField("pickerPolicy", schemaValue(pickerPolicySchema, pathDetail)),
+    // Cleared, the project falls back to the level its policy implies — never to `apply`, which is
+    // only ever an explicit choice (see resolvePickerAutonomy).
+    settingsField(
+      "pickerAutonomy",
+      schemaValue(pickerAutonomySchema, messageDetail("unsupported level")),
     ),
   ];
 }

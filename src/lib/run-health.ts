@@ -57,6 +57,12 @@ export interface RunHealthFinding {
    * a run target (pipeline plumbing, or a gate hung on a bead the board no longer carries).
    */
   targetBeadId?: string;
+  /**
+   * The ticket that RAISED the ask (`needs-human`) — where an answer goes, since the gate carries
+   * nothing back to the resumed session and its notes are what that session reads. Absent on a gate
+   * a person hung by hand, which names no asking ticket.
+   */
+  askBeadId?: string;
 }
 
 export interface RunHealthReport {

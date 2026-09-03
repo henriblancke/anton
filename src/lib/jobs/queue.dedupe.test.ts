@@ -21,16 +21,14 @@ import {
   systemClock,
   toMs,
 } from "./queue";
+import { insertProject } from "@/lib/testing/project";
 
 let t: TestDb;
 beforeEach(() => {
   t = makeTestDb();
   // Seed project rows so the jobs.project_id FK is satisfied.
   for (const id of ["p1", "p2"]) {
-    t.db
-      .insert(schema.projects)
-      .values({ id, slug: id, name: id, repoPath: `/tmp/${id}` })
-      .run();
+    insertProject(t.db, { id, slug: id, name: id, repoPath: `/tmp/${id}` });
   }
 });
 afterEach(() => t.close());

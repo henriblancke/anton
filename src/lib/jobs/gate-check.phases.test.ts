@@ -8,10 +8,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
-import { makeTestDb, type TestDb } from "../db/testing";
+import type { TestDb } from "../db/testing";
 import { LABELS, type Bead, type Gate, type GateCheckResult } from "../beads/bd";
 import type { Clock } from "./queue";
 import type { JobContext } from "./runner";
+import { makeProjectDb } from "@/lib/testing/project";
 
 const gateListMock = vi.fn<(repo: string, opts?: { all?: boolean }) => Promise<Gate[]>>();
 const gateCheckMock =
@@ -59,11 +60,7 @@ let t: TestDb;
 let pass: PassContext;
 
 beforeEach(() => {
-  t = makeTestDb();
-  t.db
-    .insert(schema.projects)
-    .values({ id: "p1", slug: "p1", name: "p1", repoPath: REPO })
-    .run();
+  t = makeProjectDb({ id: "p1", slug: "p1", name: "p1", repoPath: REPO });
   pass = { db: t.db, clock, projectId: "p1", repo: REPO };
   gateListMock.mockReset().mockResolvedValue([]);
   gateCheckMock

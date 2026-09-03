@@ -7,7 +7,7 @@ import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
+import { describeBd, makeBdRepo, tmpProject, type BdRepo } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { resetIssueSnapshots } from "./beads/snapshot";
 import { deleteEpic, getEpicDetail, updateEpic } from "./epic-detail";
@@ -38,15 +38,7 @@ describeBd("epic-detail integration (real bd)", () => {
   beforeAll(() => {
     bdRepo = makeBdRepo();
     repo = bdRepo.repo;
-    project = {
-      id: "x",
-      slug: "tmp",
-      name: "tmp",
-      repoPath: repo,
-      defaultBranch: "main",
-      hasBeads: true,
-      createdAt: 0,
-    };
+    project = tmpProject(repo);
   });
 
   afterAll(() => {

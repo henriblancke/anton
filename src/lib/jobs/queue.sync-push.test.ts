@@ -12,15 +12,13 @@ import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { enqueueSyncPushDeduped, getJob, reschedule, resumeJob, systemClock } from "./queue";
+import { insertProject } from "@/lib/testing/project";
 
 let t: TestDb;
 beforeEach(() => {
   t = makeTestDb();
   for (const id of ["p1", "p2"]) {
-    t.db
-      .insert(schema.projects)
-      .values({ id, slug: id, name: id, repoPath: `/tmp/${id}` })
-      .run();
+    insertProject(t.db, { id, slug: id, name: id, repoPath: `/tmp/${id}` });
   }
 });
 afterEach(() => t.close());

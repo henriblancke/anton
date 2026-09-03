@@ -17,6 +17,7 @@ import {
   seedDefaultSchedules,
   updateSchedule,
 } from "../schedules";
+import { insertProject } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -28,14 +29,8 @@ class FakeClock implements Clock {
   }
 }
 
-async function seedProject(tdb: TestDb, id = "p1"): Promise<string> {
-  await tdb.db.insert(schema.projects).values({
-    id,
-    slug: id,
-    name: id,
-    repoPath: `/tmp/${id}`,
-  });
-  return id;
+function seedProject(tdb: TestDb, id = "p1"): string {
+  return insertProject(tdb.db, { id, slug: id, name: id, repoPath: `/tmp/${id}` });
 }
 
 function jobsFor(tdb: TestDb, projectId: string) {
@@ -51,7 +46,7 @@ describe("Scheduler.tickOnce", () => {
   beforeEach(async () => {
     tdb = makeTestDb();
     clock = new FakeClock(base);
-    await seedProject(tdb);
+    seedProject(tdb);
   });
 
   it("enqueues a due schedule and advances lastRun/nextRun", async () => {
@@ -259,7 +254,7 @@ describe("Scheduler.tickOnce", () => {
     // The upgrade path: seeding runs only while inserting a project and no migration adds schedule
     // rows, so without this an installed project never gets a new automation — enabling run-health
     // would leave unstick unscheduled and its reports would pile up with nothing acting on them.
-    await seedProject(tdb, "p2");
+    seedProject(tdb, "p2");
     await createSchedule(tdb.db, clock, {
       projectId: "p1",
       type: "review-fix",

@@ -13,15 +13,14 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { driveJob } from "@/lib/testing/jobs";
-import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 import { makeNightlyStringerHandler } from "./nightly-stringer";
+import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 function has(cmd: string): boolean {
   try {
@@ -46,7 +45,7 @@ suite("nightly-stringer scans the tree that shipped (real git · fake stringer)"
   let repo: string;
   let bare: string;
   let other: string;
-  let tdb: TestDb;
+  let tdb: TestProjectDb;
   let projectId: string;
   let scanLog: string;
   const saved: Record<string, string | undefined> = {};
@@ -137,15 +136,8 @@ process.exit(0);`,
     process.env.ANTON_SCANS_ROOT = join(sandbox, "scans");
     process.env.FAKE_STRINGER_LOG = scanLog;
 
-    tdb = makeTestDb();
-    projectId = randomUUID();
-    await tdb.db.insert(schema.projects).values({
-      id: projectId,
-      slug: "sandbox",
-      name: "sandbox",
-      repoPath: repo,
-      defaultBranch: "main",
-    });
+    tdb = makeProjectDb({ repoPath: repo });
+    projectId = tdb.projectId;
   });
 
   afterEach(() => {

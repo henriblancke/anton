@@ -89,10 +89,20 @@ export function runTargetAbove(board: Bead[], startId: string): Bead | undefined
  * the clauses {@link isResumableTarget} and {@link undispatchableReason} share. Approval is the
  * load-bearing one: discovery comes from the board, so a gate someone hung on unapproved work must
  * never turn into a run — the founder decides what executes, and a gate closing is not that
- * decision. The rest is hygiene: finished or abandoned work isn't resumed.
+ * decision.
+ *
+ * `agent:human` is refused for the same reason it is refused everywhere a bead becomes a dispatch
+ * (PR #213 review): a person executes that work, so execute-epic poisons the run the moment it sees
+ * the label. Resuming one — whether a gate closed on its own or a founder answered it by hand —
+ * only converts approved work waiting for a person into a parked job waiting for a human to clear
+ * it. Holding it here leaves it on the board, which is the point. The rest is hygiene: finished or
+ * abandoned work isn't resumed.
  */
 function unrunnableReason(target: Bead): string | undefined {
   if (!beads.isApproved(target)) return "it is not approved";
+  if (beads.isHumanWork(target)) {
+    return `it is labelled ${LABELS.agentHuman} — a person executes it, not an agent`;
+  }
   if (beads.isAbandoned(target)) return "it was abandoned";
   if (target.status === "closed") return "it is closed";
   return undefined;

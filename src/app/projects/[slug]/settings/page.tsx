@@ -3,9 +3,17 @@ import { notFound } from "next/navigation";
 import { getProjectBySlug, getProjectSettingsBySlug } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
-import { earnedAutonomyOfKind, emptyTrackRecord } from "@/lib/gardener/autonomy";
+import { discoverVocabulary } from "@/lib/policy/vocabulary";
+import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
+import { policyCandidates } from "@/lib/policy/candidates";
+import {
+  earnedAutonomyOfKind,
+  earnedPickerAutonomy,
+  emptyTrackRecord,
+} from "@/lib/gardener/autonomy";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
 import { proposalTrackRecord } from "@/lib/gardener/track-record";
+import { latestPickerTrackRecord } from "@/lib/picker-veto";
 import { bundledAgentIds, discoverAgents } from "@/lib/agents-discovery";
 import { DEFAULT_SCHEDULES, listSchedules } from "@/lib/schedules";
 import { loadBaseSystemPrompt } from "@/lib/claude/system-prompt";
@@ -48,12 +56,36 @@ export default async function ProjectSettingsPage({
   // from this project's own namespaces rather than from labels anton assumed. Read alongside the
   // agents (the snapshot is usually warm from the board) and fail-soft: a board anton can't read
   // leaves the picker empty, where the editor still takes a typed label.
-  const [agents, bundledIds, beads] = await Promise.all([
+  const [agents, bundledIds, board] = await Promise.all([
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
-    allIssues(project.repoPath, { blockOnPendingWrite: false }).catch(() => []),
+    // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
+    // no work look identical downstream, and the work policy panel must not let an operator arm a
+    // fallback policy fitted to a read failure.
+    allIssues(project.repoPath, { blockOnPendingWrite: false }).then(
+      (issues) => ({ issues, ok: true }),
+      () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
+    ),
   ]);
+  const beads = board.issues;
   const labelVocabulary = boardLabelVocabulary(beads);
+  // Which of those namespaces read as a SCALE (anton-g631) — the only ones the policy editor offers a
+  // hand-ranking on, since "rank these" means nothing on a `team:` or `component:`.
+  const rankingCandidates = discoverVocabulary(beads)
+    .namespaces.filter((n) => n.rankingCandidate)
+    .map((n) => n.namespace);
+  // What first arm proposes (anton-c7iv): the policy this project's OWN approvals would have
+  // matched, so the panel is never a blank form and never speaks a vocabulary this board doesn't.
+  // Pure over the snapshot already read above — no extra board call — and inert: the draft is only
+  // rendered, never stored, until the operator accepts it.
+  const policyDraft = calibratePolicy(beads);
+  const issueTypes = boardIssueTypes(beads);
+  // Every STARTABLE run target, flattened to what the predicate reads, so the editor's match count
+  // and its per-bead "why not?" answer in the browser as the operator edits (anton-qsr1). Startable
+  // is the picker's own gate, so the panel counts the set a policy actually chooses from; the rest
+  // of the open run targets arrive as a count the panel explains. Off the same snapshot — no extra
+  // board call.
+  const { candidates, notStartable } = policyCandidates(beads);
 
   // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
   // arming needs, and the one no setting lifts. Derived here rather than in the form because the
@@ -70,6 +102,24 @@ export default async function ProjectSettingsPage({
     }),
   );
 
+  // And what this project's own picks have earned the PICKER (anton-vkp9) — the same floor, over the
+  // operator's releases and vetoes instead of over a kind's proposals. Read from anton.db rather than
+  // the board, and handed down as plain counts for the same reason: the control must reach the pass's
+  // verdict from the pass's numbers, and a store that will not answer locks `apply` rather than
+  // opening it.
+  const pickerRecord = await latestPickerTrackRecord(project.id).catch(() => ({
+    accepted: 0,
+    declined: 0,
+    settled: 0,
+  }));
+  const picker = earnedPickerAutonomy(pickerRecord);
+  const pickerEarned = {
+    accepted: picker.accepted,
+    settled: picker.settled,
+    eligible: picker.eligible,
+    ...(picker.reason ? { reason: picker.reason } : {}),
+  };
+
   return (
     <SettingsView
       project={project}
@@ -80,7 +130,14 @@ export default async function ProjectSettingsPage({
       agents={agents}
       bundledIds={bundledIds}
       labelVocabulary={labelVocabulary}
+      rankingCandidates={rankingCandidates}
+      issueTypes={issueTypes}
+      policyDraft={policyDraft}
+      policyCandidates={candidates}
+      policyNotStartable={notStartable}
+      boardUnavailable={!board.ok}
       earned={earned}
+      pickerEarned={pickerEarned}
     />
   );
 }

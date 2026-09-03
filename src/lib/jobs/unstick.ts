@@ -52,7 +52,7 @@ import {
   toEscalationView,
   type EscalationRow,
 } from "../escalations";
-import { poisonBlockerIds, PoisonError } from "./errors";
+import { parkedAskGateId, parkedAskGateIds, poisonBlockerIds, PoisonError } from "./errors";
 import {
   activeExecuteEpicId,
   activeExecuteEpicKeys,
@@ -232,142 +232,234 @@ export function usageWindowEnd(
 /**
  * Decide what to do about one finding, against live state. Pure — every input is explicit — so the
  * safety rules are testable without a runner, a board, or a clock.
+ *
+ * The judgment itself lives in one named classifier per finding KIND, each independently testable:
+ * every stuck-shape the pass recognises is decided in its own function, so teaching it a new one is
+ * a new entry in {@link CLASSIFIERS} rather than another branch in a block nobody can hold in their
+ * head.
  */
-export function classifyFinding(
+export function classifyFinding(finding: RunHealthFinding, ctx: UnstickContext): UnstickVerdict {
+  // Own keys only: report JSON is deserialized without validation, so an inherited
+  // `Object.prototype` name ("toString", "constructor") would resolve to a truthy prototype method
+  // and throw mid-sweep instead of escalating.
+  const classify = Object.hasOwn(CLASSIFIERS, finding.kind) ? CLASSIFIERS[finding.kind] : undefined;
+  // A kind with no classifier is a stall nobody taught the pass to judge — a human decides it.
+  return classify ? classify(finding, ctx) : escalate(finding.reason);
+}
+
+/** One kind's judgment: live state in, verdict out, no I/O. */
+type FindingClassifier = (finding: RunHealthFinding, ctx: UnstickContext) => UnstickVerdict;
+
+/** The stuck-shapes this pass recognises, one classifier each. */
+const CLASSIFIERS: Partial<Record<RunHealthFinding["kind"], FindingClassifier>> = {
+  "parked-run": classifyParkedRun,
+  "dead-lease": classifyDeadLease,
+  "stale-pr": classifyStalePr,
+  "exhausted-job": classifyExhaustedJob,
+  "needs-human": classifyNeedsHuman,
+};
+
+/** Whether a live (queued or running) execute-epic job on THIS machine already owns the epic. */
+function ownedByLiveJob(ctx: UnstickContext, epicBeadId: string): boolean {
+  return ctx.activeEpicKeys.has(`${ctx.projectId}::${epicBeadId}`);
+}
+
+/** A park execute-epic recorded because Claude's quota ran out — the one stall that is just a wait. */
+function isQuotaPark(run: RunRow): boolean {
+  return run.error?.trim() === USAGE_LIMIT_PARK;
+}
+
+/**
+ * STUCK SHAPE: a run execute-epic parked and never came back to.
+ *
+ * Only a quota park is ever resumable, and only once its window has passed; every other park is a
+ * judgment call. The report is a candidate list, so a run no longer in the parked set was resumed,
+ * failed, or finished since the sweep — acting on that stale claim would be acting on a ghost.
+ */
+export function classifyParkedRun(
   finding: RunHealthFinding,
   ctx: UnstickContext,
 ): UnstickVerdict {
-  const ownedByLiveJob = (epicBeadId: string) =>
-    ctx.activeEpicKeys.has(`${ctx.projectId}::${epicBeadId}`);
+  const run = finding.runId ? ctx.parkedRuns.get(finding.runId) : undefined;
+  if (!run) return hold("the run is no longer parked");
+  return (
+    parkedRunStandDown(run, ctx) ??
+    (isQuotaPark(run) ? classifyQuotaPark(run, ctx) : classifyNonQuotaPark(finding, run, ctx))
+  );
+}
 
-  switch (finding.kind) {
-    case "parked-run": {
-      const run = finding.runId ? ctx.parkedRuns.get(finding.runId) : undefined;
-      // The report is a candidate list: a run that is no longer parked was resumed, failed, or
-      // finished since the sweep, and acting on the stale claim would be acting on a ghost.
-      if (!run) return hold("the run is no longer parked");
-      if (ownedByLiveJob(run.epicBeadId)) return hold("a live job already owns this run");
-      // A settled epic's parked run row simply never caught up — an abandon raised from an
-      // `exhausted-job` escalation closes the bead but has no run id to settle, and a deletion
-      // settles nothing at all. Either way the run has no epic left to act on (see
-      // {@link epicSettled}), and this is the only check standing between a deleted epic and a
-      // resume that parks straight back on `bead ... not found`.
-      const settled = epicSettled(ctx, run.epicBeadId);
-      if (settled) return hold(settled);
-      // An operator who cancelled this epic's job said stop, and the run row stays parked whatever
-      // the park reason — so the finding outlives the cancel on every branch below, not just the
-      // quota one. On a usage-limit park this is the only thing standing between the cancel and the
-      // window's expiry re-enqueuing it; on any other park it is what stops the pass asking the
-      // founder to re-decide a stop they already made, every hour, forever.
-      if (ctx.epicCancelled(run.epicBeadId)) {
-        return hold("this epic's latest job was cancelled by an operator");
-      }
-      if (run.error?.trim() !== USAGE_LIMIT_PARK) {
-        // Jobs are machine-local, so nothing above rules out another machine having picked this
-        // epic back up since the park. Escalating then puts Resume/Abandon in front of the founder
-        // for work that is executing elsewhere, and the abandon closes the bead underneath it.
-        // Only a CONFIRMED foreign lease holds: unlike the resume below, an untrusted board still
-        // escalates — a missed escalation strands the stall, a redundant one costs a glance.
-        const contested = ctx.boardFresh ? leaseStandDown(ctx, run.epicBeadId, run.id) : undefined;
-        if (contested) return contested;
-        return escalate(finding.reason);
-      }
-      const reopensAt = ctx.usageWindowEndsAt(run.epicBeadId);
-      if (reopensAt !== undefined && reopensAt > ctx.nowMs) {
-        return hold(`the usage window reopens at ${new Date(reopensAt).toISOString()}`);
-      }
-      // Jobs are machine-local, so `activeEpicKeys` above only rules out a run THIS machine owns.
-      // The lease is what rules out one another machine picked up while this run sat parked.
-      const contested = leaseStandDown(ctx, run.epicBeadId, run.id);
-      if (contested) return contested;
-      return {
-        disposition: "resume",
-        why: "parked on usage-limit and the quota window has passed",
-        epicBeadId: run.epicBeadId,
-      };
-    }
-
-    case "dead-lease": {
-      const bead = finding.beadId ? ctx.board.get(finding.beadId) : undefined;
-      // A bead that vanished or closed between the sweep and now has settled its own way.
-      if (!bead) return hold("the bead is gone from the board");
-      if (bead.status === "closed") return hold("the bead has since closed");
-      if (ownedByLiveJob(bead.id)) return hold("a live job already owns this run");
-      // Same operator-said-stop rule as the parked-run path. A cancel clears the JOB, not the bead's
-      // run-lease label — a process that dies (or fails its `clearRunLease`/sync) after terminalizing
-      // the row leaves the lease behind to expire, and this finding is what it decays into. Resuming
-      // it would reverse the cancel, and `resumeEpic` can't catch that: cancelled jobs are outside
-      // its covering set, so it would enqueue a fresh one.
-      if (ctx.epicCancelled(bead.id)) {
-        return hold("this epic's latest job was cancelled by an operator");
-      }
-      // The finding's whole premise is an EXPIRED lease a dying owner left behind. A bead carrying no
-      // lease at all had it cleared — the owning run settled and swept its own label — so there is no
-      // dead run to revive, and re-enqueuing would start fresh work nobody asked for. The report is a
-      // candidate list, so the predicate that raised it has to still hold against the pulled bead.
-      const expiry = beads.runLeaseExpiry(bead);
-      if (expiry === undefined) {
-        return hold("the run-lease has since been cleared");
-      }
-      // A lease that is live NOW belongs to a machine that picked the work back up after the sweep
-      // saw it expired — resuming here would double-run the epic, the one thing the lease exists to
-      // prevent. That is a foreign holder, so this pass stands down entirely.
-      const contested = leaseStandDown(ctx, bead.id);
-      if (contested) return contested;
-      // Presence alone is a weaker bar than the detector's `expiry + grace <= now`, and the grace is
-      // the whole allowance for a refresh that ran late or a clock that skews. A lease that lapsed
-      // moments ago — a REPLACEMENT one, taken after the sweep by a machine now missing a heartbeat —
-      // reads as uncontested above while its ticket may still be executing. Wait out the same window
-      // the detector would have.
-      if (expiry + ctx.deadLeaseGraceMs > ctx.nowMs) {
-        return hold("the run-lease expired inside the dead-lease grace window");
-      }
-      return {
-        disposition: "resume",
-        why: "the run-lease expired with no foreign holder",
-        epicBeadId: bead.id,
-      };
-    }
-
-    // stale-pr and exhausted-job are never auto-actionable: a PR nobody reviewed needs a reviewer,
-    // and a job that spent its whole retry budget already proved retrying doesn't fix it. They are
-    // still re-checked first, for the same reason the two resumable kinds are — the report is a
-    // candidate list. A PR merged since the sweep would otherwise be escalated as idle, and a
-    // resumed job would be escalated as exhausted, where "abandon" then cancels live work.
-    case "stale-pr":
-      return ctx.stillStuck(finding)
-        ? escalate(finding.reason)
-        : hold("the PR has since merged, closed, or been picked back up");
-
-    case "exhausted-job":
-      // Same settled-epic rule as the parked-run path, and for the same loop: an abandon closes the
-      // bead FIRST and only then cancels the job, so a failed cancel leaves a parked job under a
-      // closed — or since-deleted — epic. Re-escalating that offers a "resume" that re-poisons on
-      // the missing bead and an "abandon" whose `abandonTicket` now throws, settling the escalation
-      // without settling the job — forever. Only an execute-epic finding carries an epic bead id;
-      // the job-only kinds skip this and settle through `actOnJob`.
-      if (finding.beadId) {
-        const settled = epicSettled(ctx, finding.beadId);
-        if (settled) return hold(settled);
-      }
-      return ctx.stillStuck(finding)
-        ? escalate(finding.reason)
-        : hold("the job has since been resumed or settled");
-
-    // A wait BY DESIGN — and the one stall a person ends without touching anton at all (`bd gate
-    // resolve`, or answering a different escalation on the same gate). The sweep runs on the hour and
-    // this pass at :10, so a gate answered inside that gap would otherwise raise "Waiting on you" for
-    // a wait that already ended. The mirror case — a gate answered AFTER the row was raised, which
-    // this hold can never see because later reports omit the finding entirely — is retired by
-    // {@link settleEndedGateWaits}.
-    case "needs-human":
-      return ctx.stillStuck(finding)
-        ? escalate(finding.reason)
-        : hold("the gate has since been resolved or removed");
-
-    default:
-      return escalate(finding.reason);
+/**
+ * Why this parked run is nobody's to act on this pass, or undefined while it is still a live stall.
+ * Applies to a park of ANY reason, quota or not:
+ *
+ *   • a live job on this machine already owns the run;
+ *   • the epic settled off-board — an abandon raised from an `exhausted-job` escalation closes the
+ *     bead but has no run id to settle, and a deletion settles nothing at all, so the parked row
+ *     simply never caught up. This is the only check standing between a deleted epic and a resume
+ *     that parks straight back on `bead ... not found` (see {@link epicSettled});
+ *   • an operator cancelled the epic's job, which is them saying stop. On a usage-limit park this is
+ *     the only thing standing between the cancel and the window's expiry re-enqueuing it; on any
+ *     other park it is what stops the pass asking the founder to re-decide a stop they already made,
+ *     every hour, forever.
+ */
+function parkedRunStandDown(run: RunRow, ctx: UnstickContext): UnstickVerdict | undefined {
+  if (ownedByLiveJob(ctx, run.epicBeadId)) return hold("a live job already owns this run");
+  const settled = epicSettled(ctx, run.epicBeadId);
+  if (settled) return hold(settled);
+  if (ctx.epicCancelled(run.epicBeadId)) {
+    return hold("this epic's latest job was cancelled by an operator");
   }
+  return undefined;
+}
+
+/**
+ * STUCK SHAPE: a park that was never a wait — an agent failure, a poisoned job, a blocked start.
+ * Retrying is exactly what already failed, so it goes to a human carrying its evidence.
+ *
+ * Jobs are machine-local, so nothing before this rules out another machine having picked the epic
+ * back up since the park. Escalating then puts Resume/Abandon in front of the founder for work that
+ * is executing elsewhere, and the abandon closes the bead underneath it. Only a CONFIRMED foreign
+ * lease holds: unlike a quota resume, an untrusted board still escalates — a missed escalation
+ * strands the stall, a redundant one costs a glance.
+ */
+export function classifyNonQuotaPark(
+  finding: RunHealthFinding,
+  run: RunRow,
+  ctx: UnstickContext,
+): UnstickVerdict {
+  const contested = ctx.boardFresh ? leaseStandDown(ctx, run.epicBeadId, run.id) : undefined;
+  return contested ?? escalate(finding.reason);
+}
+
+/**
+ * STUCK SHAPE: a run parked on `usage-limit` — a wait, not a failure. Resumable once the quota
+ * window it was waiting for has passed and no other machine picked the epic up meanwhile.
+ *
+ * `activeEpicKeys` only rules out a run THIS machine owns; the run-lease is what rules out one
+ * another machine took while this run sat parked.
+ */
+export function classifyQuotaPark(run: RunRow, ctx: UnstickContext): UnstickVerdict {
+  const reopensAt = ctx.usageWindowEndsAt(run.epicBeadId);
+  if (reopensAt !== undefined && reopensAt > ctx.nowMs) {
+    return hold(`the usage window reopens at ${new Date(reopensAt).toISOString()}`);
+  }
+  return (
+    leaseStandDown(ctx, run.epicBeadId, run.id) ?? {
+      disposition: "resume",
+      why: "parked on usage-limit and the quota window has passed",
+      epicBeadId: run.epicBeadId,
+    }
+  );
+}
+
+/**
+ * STUCK SHAPE: a bead still holding an EXPIRED run-lease — the machine executing it died. Resumable
+ * when nothing has since picked it back up, the one restart that needs no human at all.
+ */
+export function classifyDeadLease(
+  finding: RunHealthFinding,
+  ctx: UnstickContext,
+): UnstickVerdict {
+  const bead = finding.beadId ? ctx.board.get(finding.beadId) : undefined;
+  // A bead that vanished between the sweep and now settled its own way.
+  if (!bead) return hold("the bead is gone from the board");
+  return (
+    deadLeaseTargetStandDown(bead, ctx) ??
+    expiredLeaseStandDown(bead, ctx) ?? {
+      disposition: "resume",
+      why: "the run-lease expired with no foreign holder",
+      epicBeadId: bead.id,
+    }
+  );
+}
+
+/**
+ * Why the bead a dead lease sits on is not ours to revive, or undefined while it is still live work.
+ * A closed bead settled its own way; the cancel is the same operator-said-stop rule the parked-run
+ * path applies. A cancel clears the JOB, not the bead's run-lease label — a process that dies (or
+ * fails its `clearRunLease`/sync) after terminalizing the row leaves the lease behind to expire, and
+ * this finding is what it decays into. Resuming would reverse the cancel, and `resumeEpic` can't
+ * catch that: cancelled jobs are outside its covering set, so it would enqueue a fresh one.
+ */
+function deadLeaseTargetStandDown(bead: Bead, ctx: UnstickContext): UnstickVerdict | undefined {
+  if (bead.status === "closed") return hold("the bead has since closed");
+  if (ownedByLiveJob(ctx, bead.id)) return hold("a live job already owns this run");
+  if (ctx.epicCancelled(bead.id)) {
+    return hold("this epic's latest job was cancelled by an operator");
+  }
+  return undefined;
+}
+
+/**
+ * Why the lease itself doesn't justify a revive, or undefined when it is a genuine dead one:
+ *
+ *   • NO LEASE AT ALL — the owning run settled and swept its own label, so there is no dead run to
+ *     revive and re-enqueuing would start fresh work nobody asked for. The finding's whole premise
+ *     is an expired lease a dying owner left behind, so the predicate that raised it has to still
+ *     hold against the pulled bead.
+ *   • LIVE NOW — a machine picked the work back up after the sweep saw it expired; resuming would
+ *     double-run the epic, the one thing the lease exists to prevent.
+ *   • INSIDE THE GRACE — presence alone is a weaker bar than the detector's `expiry + grace <= now`,
+ *     and the grace is the whole allowance for a refresh that ran late or a clock that skews. A
+ *     REPLACEMENT lease taken after the sweep by a machine now missing a heartbeat reads as
+ *     uncontested while its ticket may still be executing. Wait out the detector's own window.
+ */
+function expiredLeaseStandDown(bead: Bead, ctx: UnstickContext): UnstickVerdict | undefined {
+  const expiry = beads.runLeaseExpiry(bead);
+  if (expiry === undefined) return hold("the run-lease has since been cleared");
+  const contested = leaseStandDown(ctx, bead.id);
+  if (contested) return contested;
+  return expiry + ctx.deadLeaseGraceMs > ctx.nowMs
+    ? hold("the run-lease expired inside the dead-lease grace window")
+    : undefined;
+}
+
+/**
+ * STUCK SHAPE: a PR nobody reviewed. Never auto-actionable — a PR nobody reviewed needs a reviewer —
+ * but re-checked first, because the report is a candidate list: a PR merged since the sweep would
+ * otherwise be escalated as idle.
+ */
+export function classifyStalePr(finding: RunHealthFinding, ctx: UnstickContext): UnstickVerdict {
+  return ctx.stillStuck(finding)
+    ? escalate(finding.reason)
+    : hold("the PR has since merged, closed, or been picked back up");
+}
+
+/**
+ * STUCK SHAPE: a job that spent its whole retry budget. Never auto-actionable — retrying already
+ * proved it doesn't fix it — and re-checked first, because a job resumed since the sweep would
+ * otherwise be escalated as exhausted, where "abandon" then cancels live work.
+ *
+ * The settled-epic rule is the parked-run path's, and for the same loop: an abandon closes the bead
+ * FIRST and only then cancels the job, so a failed cancel leaves a parked job under a closed — or
+ * since-deleted — epic. Re-escalating that offers a "resume" that re-poisons on the missing bead and
+ * an "abandon" whose `abandonTicket` now throws, settling the escalation without settling the job —
+ * forever. Only an execute-epic finding carries an epic bead id; the job-only kinds skip this and
+ * settle through `actOnJob`.
+ */
+export function classifyExhaustedJob(
+  finding: RunHealthFinding,
+  ctx: UnstickContext,
+): UnstickVerdict {
+  const settled = finding.beadId ? epicSettled(ctx, finding.beadId) : undefined;
+  if (settled) return hold(settled);
+  return ctx.stillStuck(finding)
+    ? escalate(finding.reason)
+    : hold("the job has since been resumed or settled");
+}
+
+/**
+ * STUCK SHAPE: a run waiting on a person — a wait BY DESIGN, and the one stall a person ends without
+ * touching anton at all (`bd gate resolve`, or answering a different escalation on the same gate).
+ * The sweep runs on the hour and this pass at :10, so a gate answered inside that gap would
+ * otherwise raise "Waiting on you" for a wait that already ended. The mirror case — a gate answered
+ * AFTER the row was raised, which this hold can never see because later reports omit the finding
+ * entirely — is retired by {@link settleEndedGateWaits}.
+ */
+export function classifyNeedsHuman(finding: RunHealthFinding, ctx: UnstickContext): UnstickVerdict {
+  return ctx.stillStuck(finding)
+    ? escalate(finding.reason)
+    : hold("the gate has since been resolved or removed");
 }
 
 /**
@@ -437,12 +529,15 @@ export async function resumeEpic(
  */
 export function escalationNote(finding: RunHealthFinding, escalationId: string): string {
   const reason = finding.reason.replace(/\s+/g, " ").trim();
+  // This note lands on the RUN TARGET, so an ask has to name the ticket it came from: the resumed
+  // session reads its steering off that ticket's own notes, and one left here reaches no dispatch.
+  const answer = finding.askBeadId ? ` Answer on ${finding.askBeadId}, as a note.` : "";
   // The escalation id is stamped in because bd notes are append-only with no dedupe: if the note
   // lands but `markEscalationNoted` doesn't, the next pass writes it again, and the token is what
   // tells a human reading the bead that the two entries are one escalation rather than two stalls.
   return (
-    `anton: escalated a ${finding.kind} [${escalationId.slice(0, 8)}] — ${reason}. Nothing will ` +
-    `retry this automatically; resume or abandon it from the anton board.`
+    `anton: escalated a ${finding.kind} [${escalationId.slice(0, 8)}] — ${reason}.${answer} ` +
+    `Nothing will retry this automatically; resume or abandon it from the anton board.`
   );
 }
 
@@ -460,6 +555,24 @@ export interface UnstickSummary {
   settled: number;
 }
 
+/** What one pass is run over: a project's repo, plus the runner handles it reports progress through. */
+export interface UnstickPassOpts {
+  projectId: string;
+  repoPath: string;
+  heartbeat?: () => Promise<void>;
+  /** The job's abort signal, so a cancelled/timed-out pass kills its in-flight `gh` child too. */
+  signal?: AbortSignal;
+}
+
+/** {@link UnstickPassOpts} with the optional handles resolved, as every phase below reads them. */
+interface PassInputs {
+  projectId: string;
+  repoPath: string;
+  readPrActivity: NonNullable<UnstickDeps["readPrActivity"]>;
+  heartbeat: () => Promise<void>;
+  signal?: AbortSignal;
+}
+
 /**
  * Run one unstick pass over the project's latest run-health report. Exported separately from the
  * handler so it can be driven directly with an injected clock/db.
@@ -469,65 +582,168 @@ export interface UnstickSummary {
  */
 export async function unstickPass(
   deps: { db: AntonDb; clock: Clock; readPrActivity?: UnstickDeps["readPrActivity"] },
-  opts: {
-    projectId: string;
-    repoPath: string;
-    heartbeat?: () => Promise<void>;
-    /** The job's abort signal, so a cancelled/timed-out pass kills its in-flight `gh` child too. */
-    signal?: AbortSignal;
-  },
+  opts: UnstickPassOpts,
 ): Promise<UnstickSummary> {
   const { db, clock } = deps;
-  const readPrActivity = deps.readPrActivity ?? getPrActivity;
   const { projectId, repoPath } = opts;
-  const heartbeat = opts.heartbeat ?? (async () => {});
   const summary: UnstickSummary = { findings: 0, resumed: 0, escalated: 0, held: 0, settled: 0 };
 
   const report = await getRunHealthReport(db, projectId);
   const findings = report?.findings ?? [];
   summary.findings = findings.length;
 
-  // An open escalation OUTLIVES the report that raised it: once the stall ends the sweep simply
-  // stops reporting the finding, so the loop below — which only ever visits findings in the CURRENT
-  // report — never sees it again, and the row keeps claiming a stall that is over. Reconciling those
-  // is why an empty report is not yet an idle pass: it is precisely the report an ended stall
-  // produces. No report at all means the run-health sweep has never run here (it ships off by
-  // default), and with no open row either there is nothing to act on: not an error, just an idle
-  // pass.
-  //
-  // Candidates are the rows the current report no longer carries. A row still reported is either a
-  // genuine stall or one the loop below re-raises anyway, so retiring it here would churn it
-  // settle-raise every pass.
-  const openRows = await listOpenEscalations(db, projectId);
-  const reportedKeys = new Set(findings.map((f) => f.key));
-  const orphanRows = openRows.filter((row) => !reportedKeys.has(row.findingKey));
-  // A gate wait is the one kind reconciled whether or not the report still carries it: the gate list
-  // answers "is anybody still waiting" outright, and the panel offers no Dismiss on a `needs-human`
-  // row, so nothing else can retire one.
-  const gateWaits = openRows.filter((row) => row.kind === "needs-human");
-  // The special case one kind over: an `exhausted-job` row raised for a job that poison-parked ON a
-  // human gate, back before the sweep deduped the two halves of that one wait
-  // (`withoutGateBlockedJobs`). Suppression retires the FINDING, never the row it already raised, and
-  // the job itself is still legitimately parked — so only the blocker list can tell this row is a
-  // duplicate of the gate's own wait.
-  const blockedJobWaits = orphanRows.filter(
-    (row) => row.kind === "exhausted-job" && poisonBlockerIds(row.reason) !== undefined,
-  );
-  // The general retirement, one live re-check per kind (see {@link settleEndedStalls}). Gate-blocked
-  // rows stay in this set on purpose rather than being carved out: the gate path above retires one
-  // only while a gate still owns its whole wait, so this is the fallback for the job itself ending
-  // (resumed, vanished, or blocked by an ordinary prerequisite too) — without it those rows would
-  // have no re-check at all. Rows the gate path just settled are dropped below, not re-read.
-  const endedStalls = orphanRows.filter((row) => row.kind !== "needs-human");
-  if (findings.length === 0 && gateWaits.length === 0 && endedStalls.length === 0) {
+  // No report at all means the run-health sweep has never run here (it ships off by default), and
+  // with nothing open to reconcile there is nothing to act on: not an error, just an idle pass.
+  const pending = partitionOpenEscalations(await listOpenEscalations(db, projectId), findings);
+  if (findings.length === 0 && pending.gateWaits.length === 0 && pending.endedStalls.length === 0) {
     return summary;
   }
 
-  // Pull BEFORE reading the board, exactly as the runner's `liveRunCheck` does: the local Dolt
-  // working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
-  // moments ago is invisible without this — and a resume judged against that stale snapshot would
-  // re-run work someone else currently owns. A pull failure doesn't fail the pass (the escalation
-  // half needs no shared state); it marks the board untrusted so the lease-gated resumes stand down.
+  const inputs: PassInputs = {
+    projectId,
+    repoPath,
+    readPrActivity: deps.readPrActivity ?? getPrActivity,
+    heartbeat: opts.heartbeat ?? (async () => {}),
+    signal: opts.signal,
+  };
+  const state = await buildPassState(db, clock, inputs, findings);
+
+  // Retirement runs BEFORE the finding loop, and in this order: the gate list answers every gate
+  // wait at once, and a row the gate path retires needs no second live re-read to reach the same
+  // verdict.
+  summary.settled = await reconcileGateWaits(db, clock, repoPath, findings, pending, state);
+  summary.settled += await reconcileOrphanStalls(db, clock, repoPath, pending, state.live);
+  await recheckLiveFindings(db, findings, state);
+
+  const actor: FindingActor = {
+    db,
+    clock,
+    projectId,
+    repoPath,
+    ctx: state.ctx,
+    heartbeat: inputs.heartbeat,
+  };
+  const acted = await actOnFindings(findings, actor, inputs.signal);
+  summary.resumed = acted.resumed;
+  summary.escalated = acted.escalated;
+  summary.held = acted.held;
+  return summary;
+}
+
+/**
+ * Carry out every finding's verdict and tally what each one moved, then push the bd notes written
+ * along the way — so the board-native record of an escalation reaches teammates rather than living
+ * only in this machine's Dolt working set.
+ *
+ * A mid-loop abort is safe by construction: both verbs are idempotent, so everything already done
+ * stands and the next pass picks up exactly where this one left off. The push is logged, never
+ * thrown — a sync failure must not fail a pass whose resumes and escalations already landed locally.
+ */
+async function actOnFindings(
+  findings: RunHealthFinding[],
+  actor: FindingActor,
+  signal?: AbortSignal,
+): Promise<Pick<UnstickSummary, "resumed" | "escalated" | "held">> {
+  const tally = { resumed: 0, escalated: 0, held: 0 };
+  let wroteBeads = false;
+  for (const finding of findings) {
+    // Stop acting the moment the job is cancelled or times out.
+    signal?.throwIfAborted();
+    const { action, wroteBead } = await actOnFinding(finding, actor);
+    tally[action] += 1;
+    wroteBeads = wroteBead || wroteBeads;
+  }
+  if (wroteBeads) {
+    await beads
+      .sync(actor.repoPath)
+      .catch((e) => console.error(`[unstick] beads dolt sync failed for ${actor.projectId}`, e));
+  }
+  return tally;
+}
+
+/** The open escalation rows one pass reconciles, split by which live re-check can retire each. */
+export interface PendingEscalations {
+  /**
+   * Every open gate wait, reported or not: the gate list answers "is anybody still waiting"
+   * outright, and the panel offers no Dismiss on a `needs-human` row, so nothing else can retire one.
+   */
+  gateWaits: EscalationRow[];
+  /**
+   * Orphaned `exhausted-job` rows that are a human gate's wait wearing a second face — a job that
+   * refused to start behind someone else's gate, or one that ARMED its own for an ask, raised back
+   * before the sweep deduped the two halves of that one wait (`withoutGateBlockedJobs`).
+   * Suppression retires the FINDING, never the row it already raised, and the job itself is still
+   * legitimately parked — so only the gate id in the park message can tell this row is a duplicate.
+   */
+  blockedJobWaits: EscalationRow[];
+  /**
+   * Every other orphan, retired only on its own kind's live evidence (see {@link settleEndedStalls}).
+   * Gate-blocked rows stay in this set on purpose rather than being carved out: the gate path
+   * retires one only while a gate still owns its whole wait, so this is the fallback for the job
+   * itself ending — without it those rows would have no re-check at all.
+   */
+  endedStalls: EscalationRow[];
+}
+
+/**
+ * Split the project's open escalations into the sets one pass reconciles.
+ *
+ * An open escalation OUTLIVES the report that raised it: once the stall ends the sweep simply stops
+ * reporting the finding, so the finding loop — which only ever visits findings in the CURRENT
+ * report — never sees it again, and the row keeps claiming a stall that is over. That is why an
+ * empty report is not yet an idle pass: it is precisely the report an ended stall produces.
+ *
+ * ORPHANS ONLY, for everything but a gate wait. A row the current report still carries is either a
+ * genuine stall or one the finding loop re-raises anyway, so retiring it here would churn it
+ * settle-raise every pass. Absence makes a row a CANDIDATE; only its kind's live evidence retires it.
+ */
+export function partitionOpenEscalations(
+  openRows: EscalationRow[],
+  findings: RunHealthFinding[],
+): PendingEscalations {
+  const reportedKeys = new Set(findings.map((f) => f.key));
+  const orphanRows = openRows.filter((row) => !reportedKeys.has(row.findingKey));
+  return {
+    gateWaits: openRows.filter((row) => row.kind === "needs-human"),
+    blockedJobWaits: orphanRows.filter(
+      (row) =>
+        row.kind === "exhausted-job" &&
+        (poisonBlockerIds(row.reason) !== undefined || parkedAskGateId(row.reason) !== undefined),
+    ),
+    endedStalls: orphanRows.filter((row) => row.kind !== "needs-human"),
+  };
+}
+
+/**
+ * The live state one pass judges against: the classifier's context, the shared re-check bar, and the
+ * memo the async re-checks write through so the classifier itself stays pure.
+ */
+interface PassState {
+  ctx: UnstickContext;
+  live: LiveRecheck;
+  /** Per-finding re-check verdicts, read back through {@link UnstickContext.stillStuck}. */
+  stillStuck: Map<string, boolean>;
+}
+
+/**
+ * Read every live handle the pass judges against, once.
+ *
+ * The board read is preceded by a PULL, exactly as the runner's `liveRunCheck` does: the local Dolt
+ * working set trails the shared remote by a sync heartbeat, so a run-lease another machine renewed
+ * moments ago is invisible without it — and a resume judged against that stale snapshot would re-run
+ * work someone else currently owns. A pull failure doesn't fail the pass (the escalation half needs
+ * no shared state); it marks the board untrusted so the lease-gated resumes stand down.
+ *
+ * Thresholds come from the project's own settings so every re-check applies the SAME bar the sweep
+ * did — a re-check on a different bar is a second, undeclared policy.
+ */
+async function buildPassState(
+  db: AntonDb,
+  clock: Clock,
+  inputs: PassInputs,
+  findings: RunHealthFinding[],
+): Promise<PassState> {
+  const { projectId, repoPath } = inputs;
   let boardFresh = true;
   await beads.pull(repoPath).catch((e) => {
     boardFresh = false;
@@ -537,8 +753,6 @@ export async function unstickPass(
     );
   });
 
-  // The thresholds come from the project's own settings so every re-check below applies the SAME bar
-  // the sweep did — a re-check on a different bar is a second, undeclared policy.
   const [board, activeEpicKeys, parkedRunRows, settings] = await Promise.all([
     beads.list(repoPath, ["--status", "all"]),
     activeExecuteEpicKeys(db),
@@ -546,11 +760,8 @@ export async function unstickPass(
     getProjectSettings(db, projectId),
   ]);
   const thresholds = resolveRunHealthThresholds(settings);
+  const latestJobs = await primeLatestJobs(db, projectId, findings, parkedRunRows);
 
-  // One job read per epic at most, memoized: several findings can point at the same epic. The row
-  // answers both job-side questions — when the quota window reopens, and whether it was cancelled.
-  const latestJobs = new Map<string, JobRow | undefined>();
-  // Per-finding re-check verdicts for the two kinds with no live handle in the context below.
   const stillStuck = new Map<string, boolean>();
   const ctx: UnstickContext = {
     projectId,
@@ -566,124 +777,204 @@ export async function unstickPass(
     // report's word stands.
     stillStuck: (finding) => stillStuck.get(finding.key) ?? true,
   };
+  return {
+    ctx,
+    stillStuck,
+    // The re-checks the classifier and the retirement share, spelled once: a row can never be
+    // retired on a different bar than the one its finding was raised on.
+    live: {
+      ctx,
+      repoPath,
+      readPrActivity: inputs.readPrActivity,
+      stalePrThresholdMs: thresholds.stalePrHours * 3_600_000,
+      maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
+      heartbeat: inputs.heartbeat,
+      signal: inputs.signal,
+    },
+  };
+}
 
-  // Prime the memo before classifying: the job-backed lookups are synchronous so the classifier
-  // stays pure, which means the async job reads have to happen up front. An epic the memo never
-  // learned about reads as "not cancelled", so every path that consults `epicCancelled` must prime.
-  const primeLatestJob = async (epicBeadId: string) => {
+/**
+ * The latest execute-epic job per epic, at most one read each: several findings can point at the
+ * same epic, and the row answers both job-side questions — when the quota window reopens, and
+ * whether an operator cancelled it.
+ *
+ * Primed up front because the context's job-backed lookups are synchronous, which is what keeps the
+ * classifier pure. An epic the memo never learned about reads as "not cancelled", so every path that
+ * consults `epicCancelled` must be primed here: every parked run whatever its reason, and every dead
+ * lease, where the bead IS the epic.
+ */
+async function primeLatestJobs(
+  db: AntonDb,
+  projectId: string,
+  findings: RunHealthFinding[],
+  parkedRunRows: RunRow[],
+): Promise<Map<string, JobRow | undefined>> {
+  const latestJobs = new Map<string, JobRow | undefined>();
+  const prime = async (epicBeadId: string) => {
     if (latestJobs.has(epicBeadId)) return;
     latestJobs.set(epicBeadId, await latestExecuteEpicJob(db, projectId, epicBeadId));
   };
-  // Every parked run, not just the quota parks: the cancellation guard now applies to a park of any
-  // reason, and an epic the memo never learned about reads as "not cancelled".
   for (const run of parkedRunRows) {
-    await primeLatestJob(run.epicBeadId);
+    await prime(run.epicBeadId);
   }
-  // A dead lease reads the same row for its cancellation guard; there the bead IS the epic.
   for (const finding of findings) {
-    if (finding.kind === "dead-lease" && finding.beadId) await primeLatestJob(finding.beadId);
+    if (finding.kind === "dead-lease" && finding.beadId) await prime(finding.beadId);
   }
+  return latestJobs;
+}
 
-  // Same reason again, but ONE read for every gate finding: `gate list` answers all of them at once,
-  // and gate beads are absent from the ordinary board read above (see the sweep's own two reads).
-  // The same read answers both halves of a gate wait's lifecycle — whether to raise one, and whether
-  // an already-raised one is still waiting on anybody.
+/**
+ * Let ONE gate-list read answer both halves of a gate wait's lifecycle: whether each `needs-human`
+ * finding is still waiting on somebody (recorded for the classifier), and whether an already-raised
+ * wait has since been answered (retired here). Gate beads are absent from the ordinary board read,
+ * so this is a read of its own — one per pass, not one per finding. Returns how many waits it
+ * retired.
+ */
+async function reconcileGateWaits(
+  db: AntonDb,
+  clock: Clock,
+  repoPath: string,
+  findings: RunHealthFinding[],
+  pending: PendingEscalations,
+  state: PassState,
+): Promise<number> {
   const gateFindings = findings.filter((f) => f.kind === "needs-human");
-  if (gateFindings.length > 0 || gateWaits.length > 0) {
-    const openGates = await readOpenGates(repoPath);
-    for (const finding of gateFindings) {
-      stillStuck.set(finding.key, gateStillOpen(finding.gateId, openGates, board, ctx.nowMs));
-    }
-    summary.settled = await settleEndedGateWaits(db, clock, gateWaits, {
-      openGates,
-      board,
-      nowMs: ctx.nowMs,
-    });
-    await heartbeat();
+  if (gateFindings.length === 0 && pending.gateWaits.length === 0) return 0;
+  const openGates = await readOpenGates(repoPath);
+  const { nowMs } = state.ctx;
+  const board = [...state.ctx.board.values()];
+  for (const finding of gateFindings) {
+    state.stillStuck.set(finding.key, gateStillOpen(finding.gateId, openGates, board, nowMs));
   }
+  const settled = await settleEndedGateWaits(db, clock, pending.gateWaits, {
+    openGates,
+    board,
+    nowMs,
+  });
+  await state.live.heartbeat();
+  return settled;
+}
 
-  let gateBlockedSettled: ReadonlySet<string> = new Set();
-  if (blockedJobWaits.length > 0) {
-    gateBlockedSettled = await settleGateBlockedJobWaits(db, clock, repoPath, blockedJobWaits);
-    summary.settled += gateBlockedSettled.size;
-    await heartbeat();
+/**
+ * Retire the orphaned rows whose stall is over, and report how many. The gate-blocked duplicates go
+ * first — one full-gate-list read decides all of them — and what they retire is dropped from the
+ * general per-kind re-check rather than being re-read to the same verdict.
+ */
+async function reconcileOrphanStalls(
+  db: AntonDb,
+  clock: Clock,
+  repoPath: string,
+  pending: PendingEscalations,
+  live: LiveRecheck,
+): Promise<number> {
+  let gateBlocked: ReadonlySet<string> = new Set();
+  if (pending.blockedJobWaits.length > 0) {
+    gateBlocked = await settleGateBlockedJobWaits(db, clock, repoPath, pending.blockedJobWaits);
+    await live.heartbeat();
   }
+  const unsettled = pending.endedStalls.filter((row) => !gateBlocked.has(row.id));
+  if (unsettled.length === 0) return gateBlocked.size;
+  return gateBlocked.size + (await settleEndedStalls(db, clock, unsettled, live));
+}
 
-  // The re-checks the classifier and the retirement share, spelled once: a row can never be retired
-  // on a different bar than the one its finding was raised on.
-  const live: LiveRecheck = {
-    ctx,
-    repoPath,
-    readPrActivity,
-    stalePrThresholdMs: thresholds.stalePrHours * 3_600_000,
-    maxAttempts: settings.maxRetries ?? DEFAULT_MAX_RETRIES,
-    heartbeat,
-    signal: opts.signal,
-  };
-
-  // A row the gate path already retired needs no second live re-read to reach the same verdict.
-  const unsettledStalls = endedStalls.filter((row) => !gateBlockedSettled.has(row.id));
-  if (unsettledStalls.length > 0) {
-    summary.settled += await settleEndedStalls(db, clock, unsettledStalls, live);
-  }
-
-  // Same reason, one gh/job read per stale-pr / exhausted-job finding.
+/**
+ * Record the live re-checks the classifier cannot make itself — one `gh` read per `stale-pr`, one
+ * job read per `exhausted-job`. They happen here, up front, so the judgment stays synchronous and
+ * pure (see {@link UnstickContext.stillStuck}).
+ */
+async function recheckLiveFindings(
+  db: AntonDb,
+  findings: RunHealthFinding[],
+  state: PassState,
+): Promise<void> {
   for (const finding of findings) {
     if (finding.kind === "stale-pr") {
-      stillStuck.set(finding.key, await stalePrStillStuck(finding, live));
-      await heartbeat();
+      state.stillStuck.set(finding.key, await stalePrStillStuck(finding, state.live));
+      await state.live.heartbeat();
     } else if (finding.kind === "exhausted-job") {
-      stillStuck.set(finding.key, await exhaustedJobStillStuck(db, finding, live));
+      state.stillStuck.set(finding.key, await exhaustedJobStillStuck(db, finding, state.live));
     }
   }
+}
 
-  let wroteBeads = false;
-  for (const finding of findings) {
-    // Stop acting the moment the job is cancelled or times out. Everything already done stands —
-    // both verbs are idempotent, so the next pass picks up exactly where this one left off.
-    opts.signal?.throwIfAborted();
-    const verdict = classifyFinding(finding, ctx);
-    if (verdict.disposition === "hold") {
-      summary.held += 1;
-      continue;
-    }
+/** Everything acting on one finding needs, gathered once so the per-finding step stays small. */
+interface FindingActor {
+  db: AntonDb;
+  clock: Clock;
+  projectId: string;
+  repoPath: string;
+  ctx: UnstickContext;
+  heartbeat: () => Promise<void>;
+}
 
-    if (verdict.disposition === "resume" && verdict.epicBeadId) {
-      const outcome = await resumeEpic(db, clock, projectId, verdict.epicBeadId);
-      if (outcome === "resumed-job" || outcome === "enqueued") {
-        summary.resumed += 1;
-        console.log(
-          `[unstick] ${outcome} ${verdict.epicBeadId} (${finding.key}): ${verdict.why}`,
-        );
-      } else {
-        // Nothing was restarted: either a prior pass (or an operator) already did it — the
-        // idempotent path — or an operator cancelled the epic's job after this pass classified it.
-        summary.held += 1;
-      }
-      await heartbeat();
-      continue;
-    }
+/** Which of {@link UnstickSummary}'s counters one finding moved — the names are its own keys. */
+type FindingAction = "resumed" | "escalated" | "held";
 
-    const { escalation, created } = await raiseEscalation(db, clock, {
-      projectId,
-      finding,
-      epicBeadId: epicBeadIdFor(finding, ctx),
-    });
-    if (created) summary.escalated += 1;
-    else summary.held += 1;
-    wroteBeads = (await writeEscalationNote(repoPath, escalation, finding, db, clock)) || wroteBeads;
-    await heartbeat();
+interface FindingOutcome {
+  action: FindingAction;
+  /** Whether a bd note actually landed, so the pass knows a push is owed. */
+  wroteBead: boolean;
+}
+
+/** Carry out one finding's verdict. Holding is the pass deciding not to act, so it touches nothing. */
+async function actOnFinding(
+  finding: RunHealthFinding,
+  actor: FindingActor,
+): Promise<FindingOutcome> {
+  const verdict = classifyFinding(finding, actor.ctx);
+  if (verdict.disposition === "hold") return { action: "held", wroteBead: false };
+  if (verdict.disposition === "resume" && verdict.epicBeadId) {
+    const action = await resumeForFinding(finding, verdict, verdict.epicBeadId, actor);
+    return { action, wroteBead: false };
   }
+  return escalateFinding(finding, actor);
+}
 
-  // Every note above is a beads write; push it so the board-native record reaches teammates rather
-  // than living only in this machine's Dolt working set. Logged, never thrown: a push failure must
-  // not fail a pass whose resumes and escalations already landed locally.
-  if (wroteBeads) {
-    await beads
-      .sync(repoPath)
-      .catch((e) => console.error(`[unstick] beads dolt sync failed for ${projectId}`, e));
+/**
+ * Restart the epic a resume verdict names. Nothing restarted counts as HELD, not as a failure:
+ * either a prior pass (or an operator) already did it — the idempotent path that makes an hourly
+ * cron a no-op over an unchanged stall — or an operator cancelled the epic's job after this pass
+ * classified it.
+ */
+async function resumeForFinding(
+  finding: RunHealthFinding,
+  verdict: UnstickVerdict,
+  epicBeadId: string,
+  actor: FindingActor,
+): Promise<FindingAction> {
+  const outcome = await resumeEpic(actor.db, actor.clock, actor.projectId, epicBeadId);
+  const restarted = outcome === "resumed-job" || outcome === "enqueued";
+  if (restarted) {
+    console.log(`[unstick] ${outcome} ${epicBeadId} (${finding.key}): ${verdict.why}`);
   }
-  return summary;
+  await actor.heartbeat();
+  return restarted ? "resumed" : "held";
+}
+
+/**
+ * Raise the finding on the board with its evidence, and note it on the target bead. A row that
+ * already existed converges on `escalations_open_unique` rather than counting twice — the same
+ * idempotence the resume path has.
+ */
+async function escalateFinding(
+  finding: RunHealthFinding,
+  actor: FindingActor,
+): Promise<FindingOutcome> {
+  const { escalation, created } = await raiseEscalation(actor.db, actor.clock, {
+    projectId: actor.projectId,
+    finding,
+    epicBeadId: epicBeadIdFor(finding, actor.ctx),
+  });
+  const wroteBead = await writeEscalationNote(
+    actor.repoPath,
+    escalation,
+    finding,
+    actor.db,
+    actor.clock,
+  );
+  await actor.heartbeat();
+  return { action: created ? "escalated" : "held", wroteBead };
 }
 
 /**
@@ -796,46 +1087,58 @@ interface LiveRecheck {
 }
 
 /**
- * Does a `stale-pr` finding still hold? Re-read through the sweep's OWN detector, so the two can
- * never drift on what "idle" means: a PR that merged, closed, or was touched since the report is no
- * longer stalled, and escalating it would ask a founder to judge work that already moved.
+ * Has the bead a `stale-pr` finding hangs on already settled off-board? Two shapes of settled, one
+ * meaning — the same rule {@link epicSettled} applies to the other kinds: a CLOSED target ended
+ * deliberately, and so did a DELETED one, since the pass lists every status and a bead missing from
+ * a pulled board was removed rather than filtered. Escalating either offers an abandon that throws
+ * on the gone bead and a note that fails to write, so the same finding comes back every sweep.
+ *
+ * Only counts on a FRESH board: a closed or absent bead read off a stale local mirror is not
+ * evidence the work is done.
+ */
+function prTargetSettled(finding: Pick<RunHealthFinding, "beadId">, ctx: UnstickContext): boolean {
+  if (!ctx.boardFresh || !finding.beadId) return false;
+  const bead = ctx.board.get(finding.beadId);
+  return !bead || bead.status === "closed";
+}
+
+/**
+ * Is the PR itself still idle? Re-read through the sweep's OWN detector, so the two can never drift
+ * on what "idle" means.
  *
  * Fails OPEN — an unreadable PR keeps the finding — because a missed escalation strands the stall
- * the sweep exists to surface, while a redundant one costs a glance. The bead check only counts on a
- * FRESH board: a closed or absent bead read off a stale local mirror is not evidence the work is
- * done.
+ * the sweep exists to surface, while a redundant one costs a glance. An abort is not an unreadable
+ * PR: the pass itself is being stopped, so failing open there would escalate on behalf of a
+ * cancelled job. Let it propagate and settle the job instead.
+ */
+async function prStillIdle(beadId: string, prNumber: number, live: LiveRecheck): Promise<boolean> {
+  try {
+    const activity = await live.readPrActivity(live.repoPath, prNumber, live.signal);
+    return (
+      detectStalePrs([{ beadId, activity }], live.ctx.nowMs, live.stalePrThresholdMs).length > 0
+    );
+  } catch (e) {
+    live.signal?.throwIfAborted();
+    console.error(
+      `[unstick] could not re-read PR #${prNumber} for ${beadId}; escalating on the report's word`,
+      e,
+    );
+    return true;
+  }
+}
+
+/**
+ * Does a `stale-pr` finding still hold? A PR that merged, closed, or was touched since the report is
+ * no longer stalled, and escalating it would ask a founder to judge work that already moved. A
+ * finding naming no PR or no bead has nothing left to re-read, so the report's word stands.
  */
 async function stalePrStillStuck(
   finding: Pick<RunHealthFinding, "beadId" | "prNumber">,
   live: LiveRecheck,
 ): Promise<boolean> {
-  const { ctx } = live;
-  // Two shapes of settled, one meaning — the same rule {@link epicSettled} applies to the other
-  // kinds: a CLOSED target ended deliberately, and so did a DELETED one, since the pass lists every
-  // status and a bead missing from a pulled board was removed rather than filtered. Escalating
-  // either offers an abandon that throws on the gone bead and a note that fails to write, so the
-  // same finding comes back every sweep.
-  const bead = finding.beadId ? ctx.board.get(finding.beadId) : undefined;
-  if (ctx.boardFresh && finding.beadId && (!bead || bead.status === "closed")) {
-    return false;
-  }
+  if (prTargetSettled(finding, live.ctx)) return false;
   if (finding.prNumber === undefined || !finding.beadId) return true;
-  try {
-    const activity = await live.readPrActivity(live.repoPath, finding.prNumber, live.signal);
-    return (
-      detectStalePrs([{ beadId: finding.beadId, activity }], ctx.nowMs, live.stalePrThresholdMs)
-        .length > 0
-    );
-  } catch (e) {
-    // An abort is not an unreadable PR — the pass itself is being stopped, so failing open here
-    // would escalate on behalf of a cancelled job. Let it propagate and settle the job instead.
-    live.signal?.throwIfAborted();
-    console.error(
-      `[unstick] could not re-read PR #${finding.prNumber} for ${finding.beadId}; escalating on the report's word`,
-      e,
-    );
-    return true;
-  }
+  return prStillIdle(finding.beadId, finding.prNumber, live);
 }
 
 /**
@@ -944,13 +1247,14 @@ async function readHumanGateIds(repoPath: string): Promise<Set<string> | undefin
 /**
  * Retire the `exhausted-job` rows that are a human gate's wait wearing a second face.
  *
- * A gate hung on work whose job was already queued poison-parks that job on the gate, and a sweep
- * from before the dedupe (`withoutGateBlockedJobs`) raised BOTH halves as escalations. Suppression
- * only stops the finding being reported again — the row it already raised is now invisible to every
- * re-check the pass makes, so it sits on the board forever as a "Retries spent" failure carrying an
- * Abandon that would cancel work the gate is merely waiting on.
+ * Two shapes reach here: a gate hung on work whose job was already queued poison-parks that job on
+ * the gate, and a run that ARMED a human gate for its own ask parks on the gate it just made. Either
+ * way a sweep from before the dedupe (`withoutGateBlockedJobs`) raised BOTH halves as escalations.
+ * Suppression only stops the finding being reported again — the row it already raised is now
+ * invisible to every re-check the pass makes, so it sits on the board forever as a "Retries spent"
+ * failure carrying an Abandon that would cancel work the gate is merely waiting on.
  *
- * Settled when EVERY blocker the park names is a human gate, which covers both ends of the gate's
+ * Settled when EVERY gate the park names is a human gate, which covers both ends of the gate's
  * life: while it is open the `needs-human` row carries the wait, and once it is answered the wait is
  * over and gate-check resumes the job. A job also held by an ordinary prerequisite is left alone —
  * that outlives the gate, and nothing else would surface it. So is a job still parked after its gate
@@ -972,7 +1276,11 @@ async function settleGateBlockedJobWaits(
   const humanGateIds = await readHumanGateIds(repoPath);
   if (!humanGateIds) return settled;
   for (const wait of waits) {
-    const blockers = poisonBlockerIds(wait.reason);
+    // An armed ask names the gate it armed plus the holds that outlive it; a blocked park names
+    // every bead that held the run, and only a set that is ALL human gates is the gate's wait
+    // wearing a second face.
+    const parkedOn = parkedAskGateIds(wait.reason);
+    const blockers = parkedOn ?? poisonBlockerIds(wait.reason);
     if (!blockers?.every((id) => humanGateIds.has(id))) continue;
     if (!(await settleEscalation(db, clock, wait.id, "dismissed"))) continue;
     settled.add(wait.id);

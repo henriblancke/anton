@@ -9,6 +9,7 @@ import { eq } from "drizzle-orm";
 import { makeTestDb, type TestDb } from "../db/testing";
 import * as schema from "../db/schema";
 import { cancelJob, getJob, park, resumeJob, systemClock } from "./queue";
+import { insertProject } from "@/lib/testing/project";
 
 let t: TestDb;
 beforeEach(() => {
@@ -27,6 +28,15 @@ function seed(id: string, status: string, opts: { leaseExpiresAt?: Date; runAt?:
       leaseExpiresAt: opts.leaseExpiresAt ?? null,
       attempts: 1,
     })
+    .run();
+}
+
+/** A payload on a seeded row — the execute-epic shape the bypass flag rides in. */
+function setPayload(id: string, payload: Record<string, unknown>) {
+  t.db
+    .update(schema.jobs)
+    .set({ payloadJson: JSON.stringify(payload) })
+    .where(eq(schema.jobs.id, id))
     .run();
 }
 
@@ -83,23 +93,95 @@ describe("park", () => {
 });
 
 describe("resumeJob — the boolean is the CAS, not the read", () => {
-  it("reports false when a cancel takes the row between the read and the guarded UPDATE", async () => {
-    // The window `resumeJob`'s status guard exists to close: the row still reads `parked` when the
-    // job is loaded, and an operator cancels before the UPDATE lands. The WHERE then matches nothing.
-    // Returning true there would let `resumeEpic` report `resumed-job` and skip its cancellation
-    // re-read, so the escalation panel would claim it restarted a job that is still cancelled.
+  it("reports false when a cancel takes the row before the resume's transaction opens", async () => {
+    // The window `resumeJob`'s status guard exists to close: the row read `parked` when the caller
+    // decided to resume it, and an operator cancels before the write lands. Returning true there
+    // would let `resumeEpic` report `resumed-job` and skip its cancellation re-read, so the
+    // escalation panel would claim it restarted a job that is still cancelled.
     seed("raced-job", "parked");
-    const update = t.db.update.bind(t.db);
-    vi.spyOn(t.db, "update").mockImplementationOnce((table) => {
-      update(schema.jobs)
+    const transaction = t.db.transaction.bind(t.db);
+    vi.spyOn(t.db, "transaction").mockImplementationOnce(((fn: never) => {
+      t.db
+        .update(schema.jobs)
         .set({ status: "cancelled", lastError: "cancelled by operator" })
         .where(eq(schema.jobs.id, "raced-job"))
         .run();
-      return update(table);
-    });
+      return transaction(fn);
+    }) as typeof t.db.transaction);
 
     expect(await resumeJob(t.db, systemClock, "raced-job")).toBe(false);
     expect((await getJob(t.db, "raced-job"))?.status).toBe("cancelled");
+  });
+
+  it("asks the caller's project veto in the same step as the write (PR #218)", async () => {
+    // The project-teardown barrier, handed down from the runner: it is crossed INSIDE the resume's
+    // transaction, so a delete that raised it cannot have a parked row revived behind its sweep.
+    // The row is left exactly as it was — teardown deletes it, nothing re-queues it.
+    const projectId = insertProject(t.db);
+    seed("doomed-job", "parked");
+    t.db
+      .update(schema.jobs)
+      .set({ projectId })
+      .where(eq(schema.jobs.id, "doomed-job"))
+      .run();
+
+    const seen: string[] = [];
+    const refused = await resumeJob(t.db, systemClock, "doomed-job", {
+      refuseProject: (projectId) => {
+        seen.push(projectId);
+        // Asked with the row in hand: the read that proved it resumable is in this transaction too.
+        expect(t.db.select().from(schema.jobs).where(eq(schema.jobs.id, "doomed-job")).all()[0]
+          ?.status).toBe("parked");
+        return true;
+      },
+    });
+
+    expect(refused).toBe(false);
+    expect(seen).toEqual([projectId]);
+    expect((await getJob(t.db, "doomed-job"))?.status).toBe("parked");
+  });
+
+  it("strips the operator's run-now flag when the caller resumes as a policy start (PR #218)", async () => {
+    seed("bypass-job", "parked");
+    setPayload("bypass-job", { projectId: "p1", epicBeadId: "e1", bypassBudget: true });
+
+    expect(await resumeJob(t.db, systemClock, "bypass-job", { stripBypassBudget: true })).toBe(true);
+
+    const job = await getJob(t.db, "bypass-job");
+    expect(job?.status).toBe("queued");
+    // json_remove, so everything else the payload carries survives the strip.
+    expect(JSON.parse(job!.payloadJson!) as Record<string, unknown>).toEqual({
+      projectId: "p1",
+      epicBeadId: "e1",
+    });
+  });
+
+  it("keeps the run-now flag when a manual resume takes the row first (PR #218)", async () => {
+    // The race the strip has to be atomic against: an operator resumes their parked "Approve & run"
+    // job between the picker's read and its write. The picker's CAS loses — and because the payload
+    // edit rides in that same statement, the operator's run keeps the bypass they asked for instead
+    // of being silently paced.
+    seed("contested-job", "parked");
+    setPayload("contested-job", { projectId: "p1", epicBeadId: "e1", bypassBudget: true });
+    const transaction = t.db.transaction.bind(t.db);
+    vi.spyOn(t.db, "transaction").mockImplementationOnce(((fn: never) => {
+      t.db
+        .update(schema.jobs)
+        .set({ status: "queued", attempts: 0 })
+        .where(eq(schema.jobs.id, "contested-job"))
+        .run();
+      return transaction(fn);
+    }) as typeof t.db.transaction);
+
+    expect(await resumeJob(t.db, systemClock, "contested-job", { stripBypassBudget: true })).toBe(
+      false,
+    );
+
+    const job = await getJob(t.db, "contested-job");
+    expect(job?.status).toBe("queued");
+    expect(
+      (JSON.parse(job!.payloadJson!) as Record<string, unknown>).bypassBudget,
+    ).toBe(true);
   });
 
   it("still reports true for the resume it actually performed", async () => {

@@ -44,7 +44,9 @@ export function BoardColumn({
   const isEmpty = epics.length === 0 && standalone.length === 0;
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-col gap-3">
+    // The lane this column IS, by name — the same key the Up Next lane carries, so "which lane holds
+    // this card?" has one answer across a board whose lanes are not all stages (anton-t9m4).
+    <div data-lane={STAGE_LABELS[stage]} className="flex min-h-0 min-w-0 flex-col gap-3">
       {/* The lane strip's headings are visual only — one per grid track, outside every lane — so a
           lane's column carries its stage for assistive tech, which can't read column alignment. */}
       {lane && !isEmpty && <h3 className="sr-only">{STAGE_LABELS[stage]}</h3>}

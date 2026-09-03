@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { PageHeader } from "@/components/atoms";
+import { PageHeader, PrChip, WorkingPulse, prLabel } from "@/components/atoms";
 
 // Listed token by token, not as one literal, so a search for the bar's class string still finds
 // the single component that owns it rather than this pin.
@@ -49,5 +49,55 @@ describe("PageHeader", () => {
         '</div><span class="ml-auto">unsaved in 2 sections</span></header>',
       ),
     );
+  });
+});
+
+describe("prLabel", () => {
+  it("shortens a bead external-ref to its PR number", () => {
+    expect(prLabel("gh-218")).toBe("#218");
+    expect(prLabel("https://github.com/o/r/pull/42")).toBe("#42");
+  });
+
+  it("falls back to the raw ref when no trailing number is there to shorten", () => {
+    expect(prLabel("gh-main")).toBe("gh-main");
+  });
+});
+
+describe("PrChip", () => {
+  it("links a known PR out to a new tab and tints it as under review", () => {
+    const html = renderToStaticMarkup(
+      <PrChip href="https://github.com/o/r/pull/218">{prLabel("gh-218")}</PrChip>,
+    );
+    expect(html).toContain('href="https://github.com/o/r/pull/218"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain("text-stage-in-review");
+    expect(html).toContain("#218");
+    expect(html).toContain("<svg"); // the pull-request glyph
+  });
+
+  it("stays inert — no link at all — when the ref maps to no url", () => {
+    const html = renderToStaticMarkup(<PrChip>{prLabel("gh-218")}</PrChip>);
+    expect(html).not.toContain("<a");
+    expect(html).toContain("#218");
+  });
+
+  it("tints a merged PR as done and drops the glyph where the label already says so", () => {
+    const html = renderToStaticMarkup(
+      <PrChip href="https://x/1" tone="done" icon={false}>
+        merged #1
+      </PrChip>,
+    );
+    expect(html).toContain("text-stage-done");
+    expect(html).toContain("merged #1");
+    expect(html).not.toContain("<svg");
+  });
+});
+
+describe("WorkingPulse", () => {
+  it("says a run is moving right now, in the implementing hue", () => {
+    const html = renderToStaticMarkup(<WorkingPulse />);
+    expect(html).toContain("working");
+    expect(html).toContain("anton-pulse");
+    expect(html).toContain("text-stage-implementing");
   });
 });

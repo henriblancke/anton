@@ -2,18 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { makeStandaloneItem } from "@/components/board/standalone-item.fixture";
-import { ChipHeader, ChipMeta, prLabel } from "@/components/board/standalone-chip-parts";
-
-describe("prLabel", () => {
-  it("shortens a bead external-ref to its PR number", () => {
-    expect(prLabel("gh-218")).toBe("#218");
-    expect(prLabel("https://github.com/o/r/pull/42")).toBe("#42");
-  });
-
-  it("falls back to the raw ref when no trailing number is there to shorten", () => {
-    expect(prLabel("gh-main")).toBe("gh-main");
-  });
-});
+import { ChipHeader, ChipMeta } from "@/components/board/standalone-chip-parts";
 
 describe("ChipHeader", () => {
   it("goes inert under the chip's open trigger but keeps a linked PR clickable", () => {
@@ -70,6 +59,7 @@ describe("ChipMeta", () => {
   it("carries the type, id, agent and risk of the item", () => {
     const html = renderToStaticMarkup(
       <ChipMeta
+        slug="anton"
         item={makeStandaloneItem({ agent: "nextjs", risk: "high" })}
         deferred={false}
         hasOverlay
@@ -83,12 +73,12 @@ describe("ChipMeta", () => {
 
   it("shows blockers only in the backlog, where they still hold a run back", () => {
     const blocked = makeStandaloneItem({ ready: false, blockedBy: ["t-9"] });
-    expect(renderToStaticMarkup(<ChipMeta item={blocked} deferred={false} hasOverlay />)).toContain(
+    expect(renderToStaticMarkup(<ChipMeta slug="anton" item={blocked} deferred={false} hasOverlay />)).toContain(
       "blocked by t-9",
     );
     expect(
       renderToStaticMarkup(
-        <ChipMeta item={{ ...blocked, stage: "implementing" }} deferred={false} hasOverlay />,
+        <ChipMeta slug="anton" item={{ ...blocked, stage: "implementing" }} deferred={false} hasOverlay />,
       ),
     ).not.toContain("blocked by t-9");
   });
@@ -96,8 +86,57 @@ describe("ChipMeta", () => {
   it("renders the snoozed chip from the passed (optimistic) value, not the item's own flag", () => {
     // The chip flips the moment the operator snoozes; `item.deferred` only catches up on the next poll.
     const html = renderToStaticMarkup(
-      <ChipMeta item={makeStandaloneItem({ deferred: false })} deferred hasOverlay />,
+      <ChipMeta slug="anton" item={makeStandaloneItem({ deferred: false })} deferred hasOverlay />,
     );
     expect(html).toContain("snoozed");
+  });
+});
+
+describe("ChipMeta — a vetoed target", () => {
+  const UNTIL = Date.now() + 5 * 60 * 60 * 1000;
+
+  it("draws the picker's bounded hold as its own chip, beside bd's snooze", () => {
+    // Two different things: `snoozed` is shared board state a human undoes, `not now` is anton's own
+    // machine-local hold that expires. One chip for both would conflate them.
+    const html = renderToStaticMarkup(
+      <ChipMeta slug="anton" item={makeStandaloneItem({ notNowUntil: UNTIL })} deferred hasOverlay={false} />,
+    );
+    expect(html).toContain("not now");
+    expect(html).toContain("snoozed");
+  });
+
+  it("says nothing about a target nobody vetoed", () => {
+    const html = renderToStaticMarkup(
+      <ChipMeta slug="anton" item={makeStandaloneItem()} deferred={false} hasOverlay={false} />,
+    );
+    expect(html).not.toContain("not now");
+  });
+});
+
+/**
+ * An epic-of-one is still a card anton picked, so it carries the same provenance grammar the epic
+ * card does (anton-cqxd) — one badge vocabulary across every surface a bead renders on.
+ */
+describe("ChipMeta provenance", () => {
+  it("marks the writer that put this chip here and links at its evidence", () => {
+    const html = renderToStaticMarkup(
+      <ChipMeta
+        slug="anton"
+        item={makeStandaloneItem({ provenance: [{ kind: "pm", ref: "anton-9", detail: "oversized" }] })}
+        deferred={false}
+        hasOverlay
+      />,
+    );
+
+    expect(html).toContain("◈");
+    expect(html).toContain("PM");
+    expect(html).toContain("/projects/anton/epics/anton-9");
+  });
+
+  it("says nothing about a chip no unattended writer touched", () => {
+    const html = renderToStaticMarkup(
+      <ChipMeta slug="anton" item={makeStandaloneItem()} deferred={false} hasOverlay />,
+    );
+    expect(html).not.toContain("◈");
   });
 });

@@ -109,6 +109,8 @@ export async function releaseRunResources(args: {
   foreign?: boolean;
   /** The run stopped leaving uncommitted work a human was told to clear from this checkout. */
   holdsPartialWork?: boolean;
+  /** The run stopped behind a live human gate whose resolution resumes it in this checkout. */
+  awaitsHumanGate?: boolean;
 }): Promise<ReapEntry> {
   const entry = await releaseRunWorktree({
     repoPath: args.repoPath,
@@ -119,6 +121,7 @@ export async function releaseRunResources(args: {
       status: args.status,
       foreign: args.foreign,
       holdsPartialWork: args.holdsPartialWork,
+      awaitsHumanGate: args.awaitsHumanGate,
     },
     isBeadSettled: async () => (await beads.show(args.repoPath, args.beadId)).status === "closed",
     // Read under the branch lock, immediately before deletion: a bead reopened while this run

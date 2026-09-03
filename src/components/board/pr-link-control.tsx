@@ -2,10 +2,9 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { GitPullRequestIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { MetaChip, PrLink } from "@/components/atoms";
+import { PrChip } from "@/components/atoms";
 
 /**
  * Manually link (or relink) a GitHub PR to a run target — epic or standalone task/bug — from the
@@ -64,14 +63,7 @@ export function PrLinkControl({
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {prRef && (
-        <PrLink href={prUrl}>
-          <MetaChip tone="pr">
-            <GitPullRequestIcon className="size-2.5" aria-hidden="true" />
-            {prUrl ? "PR" : prRef}
-          </MetaChip>
-        </PrLink>
-      )}
+      {prRef && <PrChip href={prUrl}>{prUrl ? "PR" : prRef}</PrChip>}
       <input
         value={value}
         onChange={(e) => setValue(e.target.value)}

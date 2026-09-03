@@ -1,35 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { Bead } from "@/lib/beads/types";
 import { contractStatusOf } from "@/lib/beads/contract";
-import type { Epic } from "@/lib/types";
 import { EpicCard } from "@/components/board/epic-card";
+import { makeEpic } from "@/components/board/epic.fixture";
 
-function makeEpic(over: Partial<Epic> = {}): Epic {
-  const ready = over.ready ?? true;
-  return {
-    id: "anton-1",
-    title: "Resumable crawl checkpoints",
-    type: "feature",
-    approved: false,
-    stage: "backlog",
-    assignee: null,
-    createdAt: "2026-07-20T00:00:00.000Z",
-    createdBy: null,
-    blockedBy: [],
-    ready,
-    // Mirrors toEpic's own fallback: a fixture that says only `ready: false` means fully blocked.
-    childReadiness: ready ? "ready" : "blocked",
-    readyChildren: [],
-    blockedChildren: [],
-    rank: 0,
-    priority: 2,
-    abandoned: false,
-    tickets: [],
-    ...over,
-  };
-}
+// `[Release]` is the card's one interactive leaf that needs a router (it re-reads the lane after a
+// lost claim race); these cases render to static markup, where no App Router is mounted.
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }) }));
 
 describe("EpicCard type language", () => {
   it("presents a feature card as a feature, not an epic", () => {
@@ -193,5 +172,183 @@ describe("EpicCard review score (anton-tprv)", () => {
       <EpicCard slug="anton" epic={makeEpic({ reviewScore: 0 })} />,
     );
     expect(html).toContain("review 0/10");
+  });
+});
+
+/**
+ * The rows the card was split into (anton-ol8f) — the shell, the PR/working header, the progress
+ * bar and the done outcome now live in epic-card-parts.tsx. Pinned here because the decomposition
+ * is only a refactor as long as each stage keeps rendering exactly what it rendered before it.
+ */
+describe("EpicCard rows per stage", () => {
+  it("shows a merged PR on a done card as a done-tinted chip, glyph-free", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ stage: "done", prRef: "gh-218", prUrl: "https://github.com/o/r/pull/218" })}
+      />,
+    );
+    expect(html).toContain("merged #218");
+    expect(html).toContain("text-stage-done");
+    expect(html).toContain('href="https://github.com/o/r/pull/218"');
+  });
+
+  it("reads an abandoned card as won't-do rather than delivered", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ stage: "done", abandoned: true })} />,
+    );
+    expect(html).toContain("abandoned");
+    expect(html).toContain("line-through");
+    expect(html).not.toContain("complete");
+  });
+
+  it("carries the in-review PR into the live card's header", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ stage: "in-review", prRef: "gh-218", prUrl: "https://x/218" })}
+      />,
+    );
+    expect(html).toContain("#218");
+    expect(html).not.toContain("working");
+  });
+
+  it("says a PR-less implementing run is working right now", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ stage: "implementing" })} />,
+    );
+    expect(html).toContain("working");
+    expect(html).toContain("anton-pulse");
+    // The stage rail is the other half of the active-stage cue.
+    expect(html).toContain("--stage-implementing");
+  });
+
+  it("drops the card link and the backlog controls on the drag overlay", () => {
+    const html = renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} overlay />);
+    expect(html).not.toContain("Open feature");
+    expect(html).not.toContain(">Approve<");
+    expect(html).toContain("rotate-1");
+  });
+});
+
+/**
+ * A pick the operator vetoed stays on the board, drawn as set aside (anton-jqvy). A card that simply
+ * stopped being offered would leave the operator wondering what they broke.
+ */
+describe("EpicCard — a vetoed target", () => {
+  const UNTIL = Date.now() + 5 * 60 * 60 * 1000;
+
+  it("shows the hold and how long is left on it", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ notNowUntil: UNTIL })} />,
+    );
+    expect(html).toContain("not now");
+    expect(html).toContain("Resumable crawl checkpoints");
+  });
+
+  it("says nothing about a target nobody vetoed", () => {
+    expect(renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />)).not.toContain(
+      "not now",
+    );
+  });
+});
+
+/**
+ * Provenance badges (anton-cqxd / R3.7) ride on the CARD, not on one lane: an operator scanning
+ * Backlog or Implementing must be able to answer "which subsystem put this here?" without opening
+ * anything.
+ */
+describe("EpicCard provenance", () => {
+  it("marks the picker's pick and links at the rule that admitted it", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({
+          provenance: [{ kind: "policy", ref: "labels:severity", detail: "the armed policy" }],
+        })}
+      />,
+    );
+
+    expect(html).toContain("◈");
+    expect(html).toContain("policy");
+    expect(html).toContain("criterion=labels%3Aseverity");
+    // The card's own bead, so the panel opens at THIS bead's evaluated criteria.
+    expect(html).toContain("bead=anton-1");
+  });
+
+  it("marks a product-master proposal and links at the proposal itself", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ provenance: [{ kind: "pm", ref: "anton-9", detail: "low-value" }] })}
+      />,
+    );
+
+    expect(html).toContain("PM");
+    expect(html).toContain("/projects/anton/epics/anton-9");
+  });
+
+  it("says nothing about a card no unattended writer touched", () => {
+    expect(renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />)).not.toContain("◈");
+  });
+
+  it("never badges a done card — provenance answers whether to RUN this, and it has run", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ stage: "done", provenance: [{ kind: "policy", ref: "types" }] })}
+      />,
+    );
+
+    expect(html).not.toContain("◈");
+    expect(html).not.toContain("criterion=types");
+  });
+});
+
+/**
+ * `[Release]` (anton-d2h6 / R3.5). While the picker only proposes — nothing starts unattended — a
+ * card it chose is started by hand, from the card, with the same approval every other target gets.
+ */
+describe("EpicCard — releasing a pick", () => {
+  const pick = { kind: "policy" as const, ref: "labels:domain", detail: "the armed policy" };
+
+  it("offers Release on a card the picker chose, in place of the plain Approve", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ provenance: [pick] })} />,
+    );
+    expect(html).toContain(">Release<");
+    expect(html).not.toContain(">Approve<");
+  });
+
+  it("keeps the plain Approve on a card the picker never chose", () => {
+    const html = renderToStaticMarkup(<EpicCard slug="anton" epic={makeEpic()} />);
+    expect(html).toContain(">Approve<");
+    expect(html).not.toContain(">Release<");
+  });
+
+  it("keeps Queue beside Release on a budget-aware project — pacing is still a choice", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ provenance: [pick] })} budgetAware />,
+    );
+    expect(html).toContain(">Queue<");
+    expect(html).toContain(">Release<");
+  });
+
+  it("withholds Release from a target the operator set aside — the veto already declined that start", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard
+        slug="anton"
+        epic={makeEpic({ provenance: [pick], notNowUntil: Date.now() + 60_000 })}
+      />,
+    );
+    expect(html).not.toContain(">Release<");
+    expect(html).toContain(">Approve<");
+  });
+
+  it("withholds Release where approval itself is withheld — a blocked target starts no run", () => {
+    const html = renderToStaticMarkup(
+      <EpicCard slug="anton" epic={makeEpic({ ready: false, provenance: [pick] })} />,
+    );
+    expect(html).not.toContain(">Release<");
   });
 });

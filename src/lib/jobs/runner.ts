@@ -562,11 +562,20 @@ export class JobRunner {
    * on the next tick. The recovery path for a job that exhausted its retries (or hit a permanent
    * error a human has since resolved). Resolves true if a parked job was resumed, false otherwise.
    * The manual-resume UI (anton's separate ticket) drives this; parking is no longer terminal.
+   *
+   * `stripBypassBudget` marks the caller as an UNATTENDED resume (the picker), so the operator's
+   * "run now" flag is dropped in the same CAS that un-parks the row — see `resumeJob`.
    */
-  async resume(jobId: string): Promise<boolean> {
-    const job = await getJob(this.db, jobId);
-    if (job?.projectId && this.quiescedProjects.has(job.projectId)) return false;
-    return resumeJob(this.db, this.clock, jobId);
+  async resume(jobId: string, opts?: { stripBypassBudget?: boolean }): Promise<boolean> {
+    // The barrier is crossed INSIDE the resume's own transaction, not read here first (PR #218
+    // review): `quiesceProject` raises the flag and then sweeps the project's active rows, and a
+    // resume that passed a check here would still flip the parked row to `queued` behind that sweep
+    // — leaving teardown's leftover guard to fail the project delete over a row revived after it.
+    // `resumeJob` asks this in the same synchronous step as the status write, so there is no window.
+    return resumeJob(this.db, this.clock, jobId, {
+      refuseProject: (projectId) => this.quiescedProjects.has(projectId),
+      ...(opts?.stripBypassBudget ? { stripBypassBudget: true } : {}),
+    });
   }
 
   /**

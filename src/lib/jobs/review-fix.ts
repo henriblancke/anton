@@ -8,7 +8,8 @@
  * fixing review feedback the epic + its remaining open tickets move to done, `stage:in-review` is
  * cleared, and the merged branch/worktree + run row are cleaned up. A PR merely CLOSED (not merged)
  * is left alone. Living here — rather than in a new job type — means every existing project gets
- * merge finalization on its next poll without re-seeding schedules.
+ * merge finalization on its next poll without re-seeding schedules. What that finalization DOES is
+ * review-fix-finalize.ts; this module decides when it runs (anton-qeir).
  *
  * HOW A MERGE IS LEARNED changed in anton-k0kj; what is DONE about it did not. execute-epic arms a
  * `gh:pr` gate on the target when it opens the PR, gate-check settles every merge wait in the
@@ -29,9 +30,15 @@
  * `stage:in-review` so a later sweep no longer treats the epic as in-review (never finalized twice).
  */
 import { existsSync } from "node:fs";
-import { beads, LABELS, type BatchOp, type Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { runClaude } from "../claude/driver";
-import { branchAheadOfRemote, commitAll, fetchOrigin, mergeIntoCurrent, pushBranch } from "../git/ops";
+import {
+  branchAheadOfRemote,
+  commitAll,
+  fetchOrigin,
+  mergeIntoCurrent,
+  pushBranch,
+} from "../git/ops";
 import {
   ANTON_MARK,
   classifyReview,
@@ -45,13 +52,11 @@ import {
   threadsNeedingAttention,
   type Actionable,
   type PrReview,
+  type ReviewThread,
 } from "../git/pr";
 import {
   createWorktree,
-  findWorktree,
-  removeWorktree,
   withWorktreeClaim,
-  worktreePathFor,
   type Worktree,
 } from "../git/worktree";
 import { resolveOperator } from "../operator";
@@ -62,10 +67,16 @@ import {
   type ProjectSettings,
 } from "../projects";
 import { runVerifyGates } from "./shell";
-import { findOpenRunForEpic, updateRun } from "../runs";
+import { findOpenRunForEpic } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
-import { buildReviewFixPrompt, parseThreadReport, type ThreadOutcome } from "./review-fix-context";
+import {
+  buildReviewFixPrompt,
+  parseThreadReport,
+  type ThreadOutcome,
+} from "./review-fix-context";
+import { IN_REVIEW, safe } from "./review-fix-board";
+import { finalizeMergedEpic } from "./review-fix-finalize";
 import { isUsageLimitError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -74,6 +85,12 @@ import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
 // The per-thread report parser is a review-fix protocol concern; re-export so existing importers
 // (and unit tests) can keep reaching it via this module.
 export { parseThreadReport, type ThreadOutcome } from "./review-fix-context";
+// Merge finalization moved to its own module (anton-qeir); it is still reached through here.
+export {
+  finalizeMergedEpic,
+  type FinalizeMergedEpicArgs,
+} from "./review-fix-finalize";
+export { undeliveredAtMerge } from "./review-fix-delivery";
 
 export interface ReviewFixPayload {
   projectId: string;
@@ -87,8 +104,6 @@ export interface ReviewFixDeps {
   clock?: Clock;
   branchPrefix?: string;
 }
-
-const IN_REVIEW = LABELS.stage("in-review");
 
 /** Handlers get no logger from the runner; fall back to console so swallowed errors are visible. */
 const consoleLog: RunnerLogger = {
@@ -108,7 +123,10 @@ const consoleLog: RunnerLogger = {
  * is undefined only in the degenerate case where even $USER is unset; then nothing but unclaimed
  * epics match, so an anton that genuinely can't name itself never races a claimed PR.
  */
-export function ownedByOperator(b: Bead, operator: string | undefined): boolean {
+export function ownedByOperator(
+  b: Bead,
+  operator: string | undefined,
+): boolean {
   const assignee = (b.assignee ?? undefined)?.trim() || undefined;
   if (!assignee) return true; // unclaimed — free to take
   return assignee === operator; // claimed-by-me; a different operator's claim is excluded
@@ -169,62 +187,91 @@ export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
   const db = deps.db;
   const clock = deps.clock ?? systemClock;
   const branchPrefix = deps.branchPrefix ?? "anton";
+  return (ctx: JobContext) => sweepInReview({ db, clock, branchPrefix, ctx });
+}
 
-  return async function reviewFix(ctx: JobContext): Promise<JobEffect> {
-    const { projectId, epicBeadId } = ctx.payload as ReviewFixPayload;
-    const project = await getProjectById(db, projectId);
-    if (!project) throw new PoisonError(`project ${projectId} not found`);
-    const repo = project.repoPath;
-    const settings = await getProjectSettings(db, projectId);
+/** One sweep: every in-review PR this operator owns, once. */
+async function sweepInReview(args: {
+  db: AntonDb;
+  clock: Clock;
+  branchPrefix: string;
+  ctx: JobContext;
+}): Promise<JobEffect> {
+  const { db, clock, branchPrefix, ctx } = args;
+  const { projectId, epicBeadId } = ctx.payload as ReviewFixPayload;
+  const project = await getProjectById(db, projectId);
+  if (!project) throw new PoisonError(`project ${projectId} not found`);
+  const repo = project.repoPath;
+  const settings = await getProjectSettings(db, projectId);
 
-    const all = await beads.list(repo, ["--status", "all"]);
-    // Scope the sweep to epics this operator owns (anton-zoh): unclaimed or claimed-by-me, so a
-    // shared board doesn't have two antons racing the same in-review PR. A targeted epicBeadId
-    // (single-epic run) bypasses ownership — the operator explicitly asked for that epic. Identity
-    // comes from the same resolveOperator that execute-epic claims with, so "mine" matches the claim.
-    const operator = await resolveOperator();
-    const epics = inReviewEpics(all, { operator, epicBeadId });
-    if (epics.length === 0) return { changed: false, note: "nothing in review" };
+  const all = await beads.list(repo, ["--status", "all"]);
+  // Scope the sweep to epics this operator owns (anton-zoh): unclaimed or claimed-by-me, so a
+  // shared board doesn't have two antons racing the same in-review PR. A targeted epicBeadId
+  // (single-epic run) bypasses ownership — the operator explicitly asked for that epic. Identity
+  // comes from the same resolveOperator that execute-epic claims with, so "mine" matches the claim.
+  const operator = await resolveOperator();
+  const epics = inReviewEpics(all, { operator, epicBeadId });
+  if (epics.length === 0) return { changed: false, note: "nothing in review" };
 
-    // Sweep each in-review PR. One epic's failure shouldn't abort the others, but a usage limit
-    // must propagate so the runner backs the WHOLE job off (you can't retry an exhausted quota).
-    let lastError: unknown;
-    for (const epic of epics) {
-      await ctx.heartbeat();
-      try {
-        await handleEpic({
-          db,
-          clock,
-          ctx,
-          repo,
-          projectId,
-          epic,
-          settings,
-          branchPrefix,
-          baseBranch: settings.baseBranch ?? project.defaultBranch,
-          all,
-        });
-      } catch (e) {
-        if (isUsageLimitError(e)) throw e; // stop the sweep; runner reschedules past the reset.
-        lastError = e;
-        consoleLog.error(`epic ${epic.id} (PR fix) failed; continuing sweep`, e);
-      }
+  const failure = await fixEachEpic({
+    db,
+    clock,
+    ctx,
+    repo,
+    projectId,
+    settings,
+    branchPrefix,
+    baseBranch: settings.baseBranch ?? project.defaultBranch,
+    epics,
+    all,
+  });
+
+  // The claude sessions above may have written beads (notes, bd remember); push them.
+  // Logged, not thrown — a sync hiccup must not shadow (or fabricate) a sweep failure.
+  await beads
+    .sync(repo)
+    .catch((e) =>
+      consoleLog.error("beads dolt sync failed after review-fix sweep", e),
+    );
+
+  // Surface a non-quota failure so the job retries/parks — but only after trying every epic.
+  if (failure) throw failure;
+
+  // Sweeping a PR is the effect, whether or not the review had anything actionable on it: the
+  // count is what an operator checks the poll against. A sweep of zero epics returned above.
+  return { changed: true, note: `swept ${epics.length} PR(s) in review` };
+}
+
+/**
+ * Fix every epic in the sweep, answering the failure the job must surface (undefined when all of
+ * them came through). One epic's failure shouldn't abort the others, but a usage limit must
+ * propagate so the runner backs the WHOLE job off — you can't retry an exhausted quota.
+ */
+async function fixEachEpic(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+  repo: string;
+  projectId: string;
+  settings: ProjectSettings;
+  branchPrefix: string;
+  baseBranch: string | undefined;
+  epics: Bead[];
+  all: Bead[];
+}): Promise<Error | undefined> {
+  let lastError: unknown;
+  for (const epic of args.epics) {
+    await args.ctx.heartbeat();
+    try {
+      await handleEpic({ ...args, epic });
+    } catch (e) {
+      if (isUsageLimitError(e)) throw e; // stop the sweep; runner reschedules past the reset.
+      lastError = e;
+      consoleLog.error(`epic ${epic.id} (PR fix) failed; continuing sweep`, e);
     }
-    // The claude sessions above may have written beads (notes, bd remember); push them.
-    // Logged, not thrown — a sync hiccup must not shadow (or fabricate) a sweep failure.
-    await beads
-      .sync(repo)
-      .catch((e) => consoleLog.error("beads dolt sync failed after review-fix sweep", e));
-
-    // Surface a non-quota failure so the job retries/parks — but only after trying every epic.
-    if (lastError) {
-      throw lastError instanceof Error ? lastError : new Error(String(lastError));
-    }
-
-    // Sweeping a PR is the effect, whether or not the review had anything actionable on it: the
-    // count is what an operator checks the poll against. A sweep of zero epics returned above.
-    return { changed: true, note: `swept ${epics.length} PR(s) in review` };
-  };
+  }
+  if (lastError === undefined) return undefined;
+  return lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 async function handleEpic(args: {
@@ -240,7 +287,18 @@ async function handleEpic(args: {
   baseBranch: string | undefined;
   all: Bead[];
 }): Promise<void> {
-  const { db, clock, ctx, repo, projectId, epic, settings, branchPrefix, baseBranch, all } = args;
+  const {
+    db,
+    clock,
+    ctx,
+    repo,
+    projectId,
+    epic,
+    settings,
+    branchPrefix,
+    baseBranch,
+    all,
+  } = args;
   const number = prNumberFromRef(beads.getPrRef(epic));
   if (number === undefined) return;
 
@@ -261,6 +319,7 @@ async function handleEpic(args: {
       epic,
       children: runTickets(all, epic.id),
       branch,
+      all,
     });
     return;
   }
@@ -274,11 +333,34 @@ async function handleEpic(args: {
   // the commit and push behind it.
   const claimOwner = claimOwnerFor(ctx.jobId);
   await withWorktreeClaim(repo, branch, claimOwner, async () => {
-    // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the PR),
-    // sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts } = await prepareFixWorktree({ ctx, repo, branch, settings, baseBranch, pr, number, claimOwner });
+    // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
+    // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
+    const { worktree, conflicts } = await prepareFixWorktree({
+      ctx,
+      repo,
+      branch,
+      settings,
+      baseBranch,
+      pr,
+      number,
+      claimOwner,
+    });
 
-    await runFixSession({ db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number });
+    await runFixSession({
+      db,
+      clock,
+      ctx,
+      repo,
+      projectId,
+      epic,
+      settings,
+      worktree,
+      pr,
+      verdict,
+      conflicts,
+      branch,
+      number,
+    });
   });
 }
 
@@ -300,7 +382,8 @@ async function prepareFixWorktree(args: {
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
 }): Promise<{ worktree: Worktree; conflicts: string[] }> {
-  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } = args;
+  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } =
+    args;
 
   const worktree = await createWorktree({
     repoPath: repo,
@@ -319,20 +402,33 @@ async function prepareFixWorktree(args: {
   }
   await ctx.heartbeat();
 
-  await safe(() => fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]));
-  await safe(() => mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }));
+  await safe(() =>
+    fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
+  );
+  await safe(() =>
+    mergeIntoCurrent(worktree.path, `origin/${branch}`, { ffOnly: true }),
+  );
 
-  let conflicts: string[] = [];
-  if (pr.mergeable === "CONFLICTING" && baseBranch) {
-    try {
-      const merge = await mergeIntoCurrent(worktree.path, `origin/${baseBranch}`);
-      conflicts = merge.conflicts; // clean auto-merge → a merge commit is pushed below
-    } catch (e) {
-      consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
-    }
-  }
+  const conflicts = await premergeBase(worktree.path, pr, baseBranch, number);
   await ctx.heartbeat();
   return { worktree, conflicts };
+}
+
+/** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
+async function premergeBase(
+  worktreePath: string,
+  pr: PrReview,
+  baseBranch: string | undefined,
+  number: number,
+): Promise<string[]> {
+  if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
+  try {
+    const merge = await mergeIntoCurrent(worktreePath, `origin/${baseBranch}`);
+    return merge.conflicts; // clean auto-merge → a merge commit is pushed below
+  } catch (e) {
+    consoleLog.error(`PR #${number}: merging origin/${baseBranch} failed`, e);
+    return [];
+  }
 }
 
 /**
@@ -355,7 +451,21 @@ async function runFixSession(args: {
   branch: string;
   number: number;
 }): Promise<void> {
-  const { db, clock, ctx, repo, projectId, epic, settings, worktree, pr, verdict, conflicts, branch, number } = args;
+  const {
+    db,
+    clock,
+    ctx,
+    repo,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    verdict,
+    conflicts,
+    branch,
+    number,
+  } = args;
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
@@ -370,7 +480,10 @@ async function runFixSession(args: {
   ctx.report({ sessionId, cwd: worktree.path });
 
   try {
-    await appendSessionLog(logPath, `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`);
+    await appendSessionLog(
+      logPath,
+      `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
+    );
 
     const { prompt, appendSystemPrompt } = await buildReviewFixPrompt({
       epic,
@@ -391,12 +504,20 @@ async function runFixSession(args: {
       onEvent,
     });
     if (!result.ok) {
-      throw new Error(`claude reported an error resolving PR #${number}: ${result.text ?? "unknown"}`);
+      throw new Error(
+        `claude reported an error resolving PR #${number}: ${result.text ?? "unknown"}`,
+      );
     }
 
     await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
 
-    const pushed = await commitAndPushFix(repo, worktree.path, epic.id, branch, number);
+    const pushed = await commitAndPushFix(
+      repo,
+      worktree.path,
+      epic.id,
+      branch,
+      number,
+    );
 
     await applyThreadOutcomes({
       repo,
@@ -409,12 +530,21 @@ async function runFixSession(args: {
     });
 
     if (!pushed) {
-      await appendSessionLog(logPath, `[review-fix] no changes produced; leaving PR #${number} as-is\n`);
+      await appendSessionLog(
+        logPath,
+        `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
+      );
       await endSession(db, clock, sessionId, "done");
       return;
     }
 
-    await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
+    await notifyReReview({
+      repo,
+      number,
+      pr,
+      reasons: verdict.reasons,
+      signal: ctx.signal,
+    });
     await endSession(db, clock, sessionId, "done");
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
@@ -438,7 +568,8 @@ async function runTestGate(
     cwd,
     signal,
     logPath,
-    (gate, code) => `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
+    (gate, code) =>
+      `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
   );
 }
 
@@ -455,10 +586,21 @@ async function commitAndPushFix(
   branch: string,
   number: number,
 ): Promise<boolean> {
-  const { committed } = await commitAll(worktreePath, `${epicId}: address review feedback (PR #${number})`);
+  const { committed } = await commitAll(
+    worktreePath,
+    `${epicId}: address review feedback (PR #${number})`,
+  );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   if (pushed) await pushBranch(repo, branch);
   return pushed;
+}
+
+/** What one reported thread's reply is written against. */
+interface ThreadReplyArgs {
+  repo: string;
+  number: number;
+  signal: AbortSignal;
+  logPath: string;
 }
 
 /**
@@ -476,21 +618,43 @@ async function applyThreadOutcomes(args: {
   signal: AbortSignal;
   logPath: string;
 }): Promise<void> {
-  const { repo, number, pr, report, pushed, signal, logPath } = args;
-  const waiting = threadsNeedingAttention(pr);
-  for (const item of report) {
+  const waiting = threadsNeedingAttention(args.pr);
+  for (const item of args.report) {
     const thread = waiting.find((t) => t.id === item.id);
     const anchor = thread?.comments[0];
     if (!thread || !anchor) continue;
-    if (item.outcome === "fixed" && !pushed) continue;
-    const note = item.reply?.trim() || (item.outcome === "fixed" ? "addressed in the latest push" : "left as-is");
-    await safe(() => replyToReviewComment(repo, number, anchor.id, `${ANTON_MARK} ${note}`, signal));
-    if (item.outcome === "fixed") {
-      await safe(() => resolveReviewThread(repo, thread.id, signal));
-    }
-    await appendSessionLog(logPath, `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`);
+    if (fabricatedFix(item, args.pushed)) continue;
+    await recordThreadOutcome(args, thread, anchor.id, item);
   }
 }
+
+/** A "fixed" claim with nothing pushed behind it — left untouched rather than answered. */
+const fabricatedFix = (item: ThreadOutcome, pushed: boolean): boolean =>
+  item.outcome === "fixed" && !pushed;
+
+/** Reply on the thread, resolve it when the fix landed, and log what was said. */
+async function recordThreadOutcome(
+  args: ThreadReplyArgs,
+  thread: ReviewThread,
+  anchorId: number,
+  item: ThreadOutcome,
+): Promise<void> {
+  const { repo, number, signal, logPath } = args;
+  const note = item.reply?.trim() || defaultReply(item.outcome);
+  await safe(() =>
+    replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
+  );
+  if (item.outcome === "fixed")
+    await safe(() => resolveReviewThread(repo, thread.id, signal));
+  await appendSessionLog(
+    logPath,
+    `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
+  );
+}
+
+/** What anton says on a thread claude reported without a reply of its own. */
+const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
+  outcome === "fixed" ? "addressed in the latest push" : "left as-is";
 
 /** Post the PR-level "pushed a fix, please re-review" comment and re-request the change reviewers. */
 async function notifyReReview(args: {
@@ -509,136 +673,7 @@ async function notifyReReview(args: {
       signal,
     ),
   );
-  await safe(() => reRequestReview(repo, number, reviewersRequestingChanges(pr), signal));
-}
-
-// ── merge finalization (anton-ner.5) ──
-
-/** A child whose commit is on the branch — `in_progress` included, see {@link undeliveredAtMerge}. */
-const DELIVERED_AT_MERGE = new Set(["closed", "in_progress"]);
-
-/**
- * Delivery evidence: a status that means a commit landed, and no won't-do decision on top of it.
- * An abandoned child is closed but explicitly undelivered (execute-epic drops it from `live` for
- * the same reason), so it carries no mechanism for the tickets behind it.
- */
-const deliveredAtMerge = (b: Bead | undefined): boolean =>
-  !!b && DELIVERED_AT_MERGE.has(b.status) && !beads.isAbandoned(b);
-
-/**
- * The children a merged target must NOT close — the tickets its run deliberately left for a human
- * (anton-67xj.1). A merge says the branch shipped, not that every ticket under the target ran, and
- * closing one that never ran turns the bd note it carries into a pointer at work the board now
- * reads as delivered.
- *
- * Two shapes, one rule. A ticket the run BLOCKED says so in its status — its budget ran out and its
- * work was rolled back (anton-t1mo), or it delivered nothing / self-reported blocked. Two narrower
- * sub-shapes — a timeout that fired after the commit, and a post-commit failure — do leave work on
- * the branch; they are held back for the same reason all the same, because their note asks a human
- * to review and close by hand, not because nothing landed. A ticket that merely WAITS on a blocked
- * one was never dispatched (anton-67xj) and stays `open` so the board keeps offering it, so nothing
- * but the `blocks` edge distinguishes it from an ordinary open child. Hence the transitive closure
- * over the run's own `blocks` edges.
- *
- * A DELIVERED dependent stops the walk. Its commit is on the branch whatever its blocker did — the
- * run carries on past a timeout, so a ticket behind one still gets dispatched — and the tickets
- * behind IT have the mechanism they were written against. Delivery is `closed`, or `in_progress`:
- * a child's close write is best-effort (execute-epic), so a transient bd failure leaves a ticket
- * that committed claimed and mid-stage. Reading that bookkeeping failure as "never ran" would
- * strand shipped work open, when the merge is precisely what repairs it. An ABANDONED child is the
- * exception (deliveredAtMerge): closed on a human's won't-do, with no commit behind it, so the walk
- * passes straight through to whatever waited on it.
- */
-export function undeliveredAtMerge(children: Bead[]): Set<string> {
-  const byId = new Map(children.map((c) => [c.id, c]));
-  const keep = new Set(children.filter((c) => c.status === "blocked").map((c) => c.id));
-  // blocker id → the run's own tickets waiting on it; edges leaving the run are another gate's
-  // business (a ticket held on an outside blocker was never in this run's dispatch set).
-  const dependents = new Map<string, string[]>();
-  for (const e of beads.edgesOf(children)) {
-    if (e.type !== "blocks" || !byId.has(e.from) || !byId.has(e.to)) continue;
-    dependents.set(e.to, [...(dependents.get(e.to) ?? []), e.from]);
-  }
-  const queue = [...keep];
-  while (queue.length) {
-    for (const dependent of dependents.get(queue.shift()!) ?? []) {
-      if (keep.has(dependent) || deliveredAtMerge(byId.get(dependent))) continue;
-      keep.add(dependent); // never revisited, so a cycle terminates
-      queue.push(dependent);
-    }
-  }
-  return keep;
-}
-
-/**
- * Finalize an epic whose PR merged: close the epic + the child tickets it delivered, drop the
- * `stage:in-review` label, remove the merged branch + its worktree, and finalize the run row.
- *
- * Idempotent by construction. Dropping `stage:in-review` (only once every close succeeds) means the
- * next review-fix sweep no longer treats the epic as in-review (inReviewEpics filters it out), so it
- * is never finalized twice; if a close fails transiently the label is left in place and the epic is
- * re-selected next sweep to retry. Every step here is individually safe to repeat — already-closed
- * beads are skipped, removeWorktree
- * is a no-op when the worktree/branch are already gone (execute-epic removes the worktree at PR
- * open, so it is usually already gone by merge time), and an already-finalized run leaves no open
- * run to touch.
- */
-export async function finalizeMergedEpic(args: {
-  db: AntonDb;
-  clock: Clock;
-  repo: string;
-  projectId: string;
-  epic: Bead;
-  /**
-   * The run target's whole ticket subtree (runTickets), carrying its inline `blocks` edges. Open
-   * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
-   */
-  children: Bead[];
-  /** The merged PR's head branch — the local branch + worktree to clean up. */
-  branch: string;
-}): Promise<void> {
-  const { db, clock, repo, projectId, epic, children, branch } = args;
-
-  // 1. Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
-  //    first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
-  //    half-closed unit no reader can interpret. Only drop the in-review stage once that
-  //    transaction lands — a transient failure (swallowed by `safe`) must leave the label in place
-  //    so the next review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than
-  //    orphaning a still-open ticket/epic behind a run already marked done.
-  //    The target itself always closes — its PR merged — but the children its run never delivered
-  //    are held back (undeliveredAtMerge), or the board loses the work a human still has to run.
-  const undelivered = undeliveredAtMerge(children);
-  const stillOpen = new Map(
-    [...children.filter((b) => !undelivered.has(b.id)), epic]
-      .filter((b) => b.status !== "closed")
-      .map((b) => [b.id, b]),
-  ); // by id: a leaf run target is its own ticket, so it can appear on both sides
-  const closed = await safe(() =>
-    beads.batch(repo, [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id }))),
+  await safe(() =>
+    reRequestReview(repo, number, reviewersRequestingChanges(pr), signal),
   );
-  if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
-
-  // 2. Remove the merged branch and its worktree. If the worktree is already gone (the common case),
-  //    removeWorktree still prunes and deletes the local branch off a synthetic descriptor.
-  const wt: Worktree =
-    (await findWorktree(repo, branch)) ??
-    { path: worktreePathFor(repo, branch), branch, baseBranch: branch, repoPath: repo };
-  await safe(() => removeWorktree(wt, { deleteBranch: true }));
-
-  // 3. Finalize the run row if one is still open (a run already marked done at PR-open is left as-is).
-  const run = await findOpenRunForEpic(db, projectId, epic.id);
-  if (run) await updateRun(db, clock, run.id, { status: "done", endedAt: clock.now(), error: null });
-}
-
-// ── helpers ──
-
-/** Run a best-effort side effect, swallowing failures. Returns true iff `fn` completed. */
-async function safe(fn: () => Promise<unknown>): Promise<boolean> {
-  try {
-    await fn();
-    return true;
-  } catch {
-    // best-effort
-    return false;
-  }
 }

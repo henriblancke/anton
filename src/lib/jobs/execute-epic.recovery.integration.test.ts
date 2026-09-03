@@ -164,6 +164,39 @@ process.exit(0);`,
     ).toBeUndefined();
   });
 
+  it("refuses a forced dispatch of an agent:human target, terminally and by name", async () => {
+    // anton-mv70: the claimable set already excludes `agent:human`, but a Force run (or a job queued
+    // before the label landed) can still reach the handler. Routing it would hand a credential /
+    // purchase / taste call to the DEFAULT agent, so the run must park on the FIRST attempt —
+    // no retry budget is spent on work no agent can do.
+    const humanId = createTicket(repo, {
+      title: "Register the production domain",
+      type: "task",
+      labels: ["agent:human"],
+    });
+    await beads.approve(repo, humanId);
+
+    const runner = makeEpicRunner(ctx);
+
+    process.env.ANTON_CLAUDE_BIN = successClaude;
+    const jobId = await driveEpicRun(runner, { projectId, epicBeadId: humanId });
+
+    const job = await expectJobStatus(tdb.db, jobId, "parked");
+    expect(job.lastError).toContain(humanId);
+    expect(job.lastError).toContain("agent:human");
+    expect(job.lastError).toMatch(/person executes/i);
+    // Terminal, not a retry: poison parks immediately instead of burning `maxAttempts`.
+    expect(job.attempts).toBe(1);
+    // Pre-flight gate: no run row, no claim, no agent session, and the bead is left for its person.
+    expect(
+      (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === humanId),
+    ).toBeUndefined();
+    expect(await tdb.db.select().from(schema.sessions)).toHaveLength(0);
+    const bead = await beads.show(repo, humanId);
+    expect(bead.status).not.toBe("closed");
+    expect(bead.assignee ?? null).toBeNull();
+  });
+
   it("poison-parks a CONTAINER epic — one with feature children — naming why, and never starts a run", async () => {
     // anton-s67y: an epic stops being a run target the moment a feature lands under it. Running it
     // would mean one job opening a PR per feature, which is exactly what the per-feature run/approval

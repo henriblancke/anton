@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+
+// `[Release]` re-reads the lane through the router after a lost claim race; these cases render to
+// static markup, where no App Router is mounted.
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }) }));
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { contractStatusOf } from "@/lib/beads/contract";
@@ -15,7 +19,9 @@ const approval = (over: Partial<StandaloneApproval> = {}): StandaloneApproval =>
   approved: false,
   deferred: false,
   running: false,
+  locked: false,
   approveRun: vi.fn(),
+  setApproved: vi.fn(),
   setDeferred: vi.fn(),
   ...over,
 });
@@ -59,7 +65,7 @@ describe("canOfferRun", () => {
 describe("ApproveRunAction", () => {
   it("renders a single Approve & run button when the project is not budget-aware", () => {
     const html = renderToStaticMarkup(
-      <ApproveRunAction item={makeStandaloneItem()} budgetAware={false} approval={approval()} />,
+      <ApproveRunAction slug="anton" item={makeStandaloneItem()} budgetAware={false} approval={approval()} />,
     );
     expect(html).toContain("Approve &amp; run");
     expect(html).not.toContain("Queue");
@@ -67,7 +73,7 @@ describe("ApproveRunAction", () => {
 
   it("splits into Queue and Approve when the project is budget-aware", () => {
     const html = renderToStaticMarkup(
-      <ApproveRunAction item={makeStandaloneItem()} budgetAware approval={approval()} />,
+      <ApproveRunAction slug="anton" item={makeStandaloneItem()} budgetAware approval={approval()} />,
     );
     expect(html).toContain("Queue");
     expect(html).toContain(">Approve<");
@@ -77,6 +83,7 @@ describe("ApproveRunAction", () => {
   it("disables both budget-aware buttons while an approve is in flight", () => {
     const html = renderToStaticMarkup(
       <ApproveRunAction
+        slug="anton"
         item={makeStandaloneItem()}
         budgetAware
         approval={approval({ running: true })}
@@ -91,6 +98,7 @@ describe("ApproveRunAction", () => {
   it("says the run is starting while a plain approve is in flight", () => {
     const html = renderToStaticMarkup(
       <ApproveRunAction
+        slug="anton"
         item={makeStandaloneItem()}
         budgetAware={false}
         approval={approval({ running: true })}
@@ -102,6 +110,7 @@ describe("ApproveRunAction", () => {
   it("keeps the affordance in place but inert when the contract blocks the run", () => {
     const html = renderToStaticMarkup(
       <ApproveRunAction
+        slug="anton"
         item={makeStandaloneItem({ contract: contractOf({ description: SHAPED }) })}
         budgetAware
         approval={approval()}
@@ -118,6 +127,7 @@ describe("ApproveRunAction", () => {
     expect(
       renderToStaticMarkup(
         <ApproveRunAction
+          slug="anton"
           item={makeStandaloneItem()}
           budgetAware
           approval={approval({ approved: true })}
@@ -168,5 +178,48 @@ describe("ChipBacklogActions", () => {
       />,
     );
     expect(html).toContain('aria-label="Un-snooze"');
+  });
+});
+
+/**
+ * A standalone chip is a run target like any other, so the picker can choose one — and a pick is
+ * started with `[Release]` (anton-d2h6 / R3.5), not the plain approve.
+ */
+describe("ApproveRunAction — releasing a pick", () => {
+  const picked = makeStandaloneItem({
+    provenance: [{ kind: "policy", ref: "types", detail: "the armed policy" }],
+  });
+
+  it("offers Release in place of Approve & run", () => {
+    const html = renderToStaticMarkup(
+      <ApproveRunAction slug="anton" item={picked} budgetAware={false} approval={approval()} />,
+    );
+    expect(html).toContain(">Release<");
+    expect(html).not.toContain("Approve &amp; run");
+  });
+
+  it("keeps Queue beside it on a budget-aware project", () => {
+    const html = renderToStaticMarkup(
+      <ApproveRunAction slug="anton" item={picked} budgetAware approval={approval()} />,
+    );
+    expect(html).toContain(">Queue<");
+    expect(html).toContain(">Release<");
+    expect(html).not.toContain(">Approve<");
+  });
+
+  it("withholds it from a pick the operator set aside", () => {
+    const html = renderToStaticMarkup(
+      <ApproveRunAction
+        slug="anton"
+        item={makeStandaloneItem({
+          provenance: picked.provenance,
+          notNowUntil: Date.now() + 60_000,
+        })}
+        budgetAware={false}
+        approval={approval()}
+      />,
+    );
+    expect(html).not.toContain(">Release<");
+    expect(html).toContain("Approve &amp; run");
   });
 });
