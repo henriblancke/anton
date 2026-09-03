@@ -195,7 +195,9 @@ suite("ref-stale, against a real git history", () => {
     // recreated by something unrelated, then renamed. rerun.ts → renamed to the SAME destination
     // twice, which is that ambiguity wearing one name. here.ts → stays put. ousted.ts → renamed to a
     // destination an unrelated file took over afterwards. replacer.ts → renamed onto a name whose
-    // older occupant was already gone, which is a clean rename and must stay one.
+    // older occupant was already gone, which is a clean rename and must stay one. reborn.ts →
+    // renamed away, then an unrelated file committed back at the old name, so the CITATION is in
+    // the worktree while the file it named is not.
     write("src/moved.ts", "export const moved = 'a file long enough to pair on similarity';\n");
     write("src/hop.ts", "export const hop = 'another file long enough to pair on similarity';\n");
     write("src/gone.ts", "export const gone = 'a third file long enough to pair on similarity';\n");
@@ -206,6 +208,7 @@ suite("ref-stale, against a real git history", () => {
     write("src/ousted.ts", "export const ousted = 'a seventh file long enough to pair on it';\n");
     write("src/replacer.ts", "export const replacer = 'an eighth file long enough to pair on it';\n");
     write("src/legacy.ts", "export const legacy = 'the older file that used to wear that name';\n");
+    write("src/reborn.ts", "export const reborn = 'a ninth file long enough to pair on similarity';\n");
     g(["add", "-A"]);
     g(["commit", "-qm", "c1"]);
 
@@ -263,6 +266,14 @@ suite("ref-stale, against a real git history", () => {
     g(["commit", "-qm", "c18"]);
     g(["mv", "src/replacer.ts", "src/legacy.ts"]);
     g(["commit", "-qm", "c19"]);
+
+    // The reincarnation read from the SOURCE side: the name the bead cites is occupied again, by
+    // something with no relation to what the bead pointed at.
+    g(["mv", "src/reborn.ts", "src/relocated.ts"]);
+    g(["commit", "-qm", "c20"]);
+    write("src/reborn.ts", "export const impostor = 'a later file that took an old name over';\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "c21"]);
   });
 
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -330,6 +341,16 @@ suite("ref-stale, against a real git history", () => {
       expect(await verifyCitedPath(repo, "src/replacer.ts")).toMatchObject({
         state: "moved",
         to: "src/legacy.ts",
+      });
+    });
+
+    // Presence is a claim about the TREE, deliberately — vetting every present citation's history
+    // here would escalate blocks that have nothing to do with paths. `repairRefStale` asks the
+    // reincarnation question, and only once a repair is in play (PR #223 review).
+    it("reports a recreated citation as present — the reincarnation check is the repair's", async () => {
+      expect(await verifyCitedPath(repo, "src/reborn.ts")).toEqual({
+        path: "src/reborn.ts",
+        state: "present",
       });
     });
 
@@ -566,6 +587,41 @@ suite("ref-stale, against a real git history", () => {
         autonomy: "apply",
       });
       expect(outcome.action).toBe("escalate");
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    // The half-repair the worktree check alone would allow (PR #223 review): `src/reborn.ts` is
+    // right there, so it passes as resolved, `src/moved.ts` is rewritten, the bead is stamped
+    // repaired — and the retry it earns still points at whatever took the old name over.
+    it("escalates a present citation whose own file moved away, instead of half-repairing", async () => {
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(contract("touches `src/moved.ts` and `src/reborn.ts`.")),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+      expect(outcome.action).toBe("escalate");
+      const evidence = outcome.action === "escalate" ? outcome.evidence.join(" ") : "";
+      expect(evidence).toContain("src/reborn.ts");
+      expect(evidence).toContain("committed afterwards");
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    // The other half of that decision: a reincarnated citation on its own is not a `ref-stale`
+    // block, so an unrelated block on the bead settles exactly as it did before.
+    it("answers `none` for a reincarnated citation when nothing else is stale", async () => {
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(contract("touches `src/reborn.ts`.")),
+        block: { reason: "the test runner is not installed" },
+        now: T0,
+        autonomy: "apply",
+      });
+      expect(outcome).toMatchObject({ action: "none" });
       expect(updateMock).not.toHaveBeenCalled();
     });
 

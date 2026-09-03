@@ -8,15 +8,16 @@
  *   • the path is in the tree, or it is not;
  *   • git recorded exactly one destination for it, or it did not;
  *   • that destination is in the tree, or it is not;
- *   • what is in the tree there is what the rename put there, or it was recreated since.
+ *   • what is in the tree at either end is the file the bead meant, or it was recreated since.
  *
  * Refusing to guess is what keeps that true, so the module escalates on every reading that is not
- * one of those four yeses — a delete (including one a later rename sits beside), a name that has
- * stood for two different files, a chain that runs past its bound, a destination that is itself
- * missing, a destination some unrelated file took over after the rename. A partial answer is not a
- * repair: if
- * ANY stale path fails to resolve, nothing is rewritten at all, because a bead half-corrected still
- * points somewhere wrong and the retry it would earn is a run spent proving that.
+ * one of those yeses — a delete (including one a later rename sits beside), a name that has stood
+ * for two different files, a chain that runs past its bound, a destination that is itself missing, a
+ * destination some unrelated file took over after the rename, a still-present citation whose own
+ * file moved away and left the name to a stranger (PR #223 review). A partial answer is not a
+ * repair: if ANY cited path fails to resolve, nothing is rewritten at all, because a bead
+ * half-corrected still points somewhere wrong and the retry it would earn is a run spent proving
+ * that.
  *
  * What it rewrites is the `## Context` sections and nothing else. Out of scope by construction: prose
  * that merely MENTIONS a file (a citation is a repo-relative path with a directory and an extension,
@@ -178,15 +179,42 @@ async function inWorktree(worktreePath: string, path: string): Promise<boolean> 
 }
 
 /**
+ * What git records happening to the file that USED to wear `path` — read from the incarnation living
+ * there now.
+ *
+ * `--follow` walks BACKWARDS from a path's current life, so where the walk starts decides what it
+ * can see: a removal BEFORE the current file took the name is reported (the walk keeps the name
+ * across a plain re-add), and one before a RENAME brought the file in is not (the walk switches to
+ * the pre-rename name at that commit). Both readings are what the callers below need — the second is
+ * why a rename that legitimately replaced an already-deleted name stays followable.
+ *
+ * `undefined` means the name has stood for one file since. An unreadable history is neither answer:
+ * it is anton failing to check, and is carried back as `unreadable` rather than as "nothing
+ * happened".
+ */
+async function removalSince(
+  worktreePath: string,
+  path: string,
+): Promise<{ how: string } | { unreadable: string } | undefined> {
+  let history: PathHistory;
+  try {
+    history = await readPathHistory(worktreePath, path);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    return { unreadable: `git history for \`${path}\` could not be read (${detail})` };
+  }
+  if (!history.deleted && history.renamedTo.length === 0) return undefined;
+  return { how: history.deleted ? "deleted" : `renamed away to \`${history.renamedTo[0]}\`` };
+}
+
+/**
  * Whether the file sitting at a rename's DESTINATION is the incarnation that rename produced — or an
  * unrelated file that later took the name over (PR #223 review).
  *
  * The source's history cannot answer this. `src/a.ts` renamed to `src/b.ts`, `src/b.ts` deleted, and
- * something else committed at `src/b.ts` still reads from `src/a.ts` as ONE clean rename: `--follow`
- * walks BACKWARDS from a path's current life, so a removal after the rename is invisible from the
- * name that moved. Read from the destination it is the only thing visible — the walk switches to the
- * pre-rename name at the rename commit, so a removal of `src/b.ts` from BEFORE it (an older file
- * that used to wear the name, which the rename legitimately replaced) is correctly not reported.
+ * something else committed at `src/b.ts` still reads from `src/a.ts` as ONE clean rename: a removal
+ * after the rename is invisible from the name that moved. Read from the destination it is the only
+ * thing visible — see {@link removalSince}.
  *
  * Returns the refusal's reason, or `undefined` when the destination has stood for one file since.
  */
@@ -194,18 +222,38 @@ async function recreatedSinceRename(
   worktreePath: string,
   path: string,
 ): Promise<string | undefined> {
-  let history: PathHistory;
-  try {
-    history = await readPathHistory(worktreePath, path);
-  } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e);
-    return `git history for \`${path}\` could not be read (${detail})`;
-  }
-  if (!history.deleted && history.renamedTo.length === 0) return undefined;
-  const how = history.deleted ? "deleted" : `renamed away to \`${history.renamedTo[0]}\``;
+  const removal = await removalSince(worktreePath, path);
+  if (removal === undefined) return undefined;
+  if ("unreadable" in removal) return removal.unreadable;
   return (
-    `\`${path}\` was ${how} after the rename that put the bead's file there — whatever wears that ` +
-    `name now was committed afterwards, so it is not the file the bead pointed at`
+    `\`${path}\` was ${removal.how} after the rename that put the bead's file there — whatever wears ` +
+    `that name now was committed afterwards, so it is not the file the bead pointed at`
+  );
+}
+
+/**
+ * The same reincarnation read on the SOURCE side: whether a cited path that IS in the worktree holds
+ * the file the bead pointed at, or one that took the name over after the original moved away (PR
+ * #223 review).
+ *
+ * Being in the tree is not on its own an answer. A bead written before `src/a.ts` was renamed to
+ * `src/b.ts` cites a name an unrelated file was later committed at, and reading only the worktree
+ * calls that pointer good — so a Context that ALSO cites something followable would be rewritten,
+ * stamped repaired and retried with `src/a.ts` still aimed at the wrong file. `--follow` reports the
+ * rename away, because a plain re-add does not switch the name the walk is following.
+ *
+ * Returns the refusal's reason, or `undefined` when the citation still names its own file.
+ */
+async function recreatedAtCitedPath(
+  worktreePath: string,
+  path: string,
+): Promise<string | undefined> {
+  const removal = await removalSince(worktreePath, path);
+  if (removal === undefined) return undefined;
+  if ("unreadable" in removal) return removal.unreadable;
+  return (
+    `\`${path}\` is in the worktree, but git records the file that wore that name ${removal.how} — ` +
+    `what sits there now was committed afterwards, so it is not the file the bead pointed at`
   );
 }
 
@@ -222,6 +270,9 @@ async function recreatedSinceRename(
  * branch here that returns a best guess.
  */
 export async function verifyCitedPath(worktreePath: string, path: string): Promise<PathVerdict> {
+  // `present` is a claim about the TREE and nothing more. Whether what sits there is the file the
+  // bead meant is {@link recreatedAtCitedPath}'s question, and {@link repairRefStale} asks it only
+  // once a repair is actually in play — see the vetting there (PR #223 review).
   if (await inWorktree(worktreePath, path)) return { path, state: "present" };
   const trail = [path];
   let cur = path;
@@ -383,13 +434,30 @@ export async function repairRefStale(args: {
   const decision = decideRepair(bead, KLASS, block, autonomy);
   if (decision.action === "escalate") return { ...decision };
 
-  const unresolved = stale.filter((v) => v.state === "unresolved");
+  // A path that is in the tree is only a good pointer if the file THERE is the one the bead meant,
+  // and that is a history read — vetted here rather than in `verifyCitedPath` so it costs nothing,
+  // and escalates nothing, on a bead whose block turned out not to be `ref-stale` at all. Once
+  // something IS stale the vetting is load-bearing: a repair that rewrote the followable pointer and
+  // left a reincarnated one alone would stamp the bead repaired and earn it a retry still aimed at
+  // the wrong file (PR #223 review).
+  const present = verdicts.flatMap((v) => (v.state === "present" ? [v.path] : []));
+  const reincarnated = await Promise.all(
+    present.map(async (path) => {
+      const why = await recreatedAtCitedPath(worktreePath, path);
+      return why === undefined ? [] : [{ path, why }];
+    }),
+  );
+
+  const unresolved = [
+    ...stale.flatMap((v) => (v.state === "unresolved" ? [v] : [])),
+    ...reincarnated.flat(),
+  ];
   if (unresolved.length > 0) {
     return {
       action: "escalate",
       why:
-        `${bead.id} cites ${unresolved.length} path(s) that are not in the worktree and that git ` +
-        `history does not resolve — anton will not guess a replacement, so this needs a human.`,
+        `${bead.id} cites ${unresolved.length} path(s) that git history does not resolve to the file ` +
+        `the bead meant — anton will not guess a replacement, so this needs a human.`,
       evidence: unresolved.map((v) => `\`${v.path}\`: ${v.why}`),
     };
   }
