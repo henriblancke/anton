@@ -71,27 +71,52 @@ const CREDENTIAL_MARKERS: readonly RegExp[] = [
 ];
 
 /**
- * The two spellings a human uses for a stand-in value: lowercase words joined by `-`/`_`/`.`
- * ("shared-account-secret"), and the SCREAMING_SNAKE env var name that sits beside one when the key
- * itself is quoted. A real credential is neither — it carries digits, mixed case, or `/+=` — so
- * anything outside these shapes is treated as credential-shaped and keeps its signal.
+ * The one spelling a human uses for a stand-in value: lowercase words joined by `-`/`_`/`.`
+ * ("shared-account-secret"). A real credential is not — it carries digits, mixed case, or `/+=` —
+ * so anything outside this shape is treated as credential-shaped and keeps its signal.
  *
- * SCREAMING_SNAKE requires an underscore on purpose: `AKIAIOSFODNN7EXAMPLE` is uppercase and
- * digit-bearing, and a rule that let it through would drop a real AWS key.
+ * SCREAMING_SNAKE is deliberately NOT a placeholder shape. {@link valuesOn} extracts the VALUE on
+ * the right-hand side, never the env var name on the left, so the only thing such a rule could
+ * clear is a value that is itself uppercase — `"SEED_DB_PASS1"` and, one character away, a real
+ * generated token.
  */
-const PLACEHOLDER_SHAPES: readonly RegExp[] = [
-  /^[a-z]+(?:[-_.][a-z]+)*$/,
-  /^[A-Z]+(?:_[A-Z0-9]+)+$/,
-];
+const PLACEHOLDER_SHAPE = /^[a-z]+(?:[-_.][a-z]+)*$/;
 
 /**
- * Where a random blob stops reading as English. Measured: the four known fixture values top out at
- * 3.46 bits/char over 21 characters, while a random lowercase string of that length runs above 4.
- * Length-gated because entropy over a handful of characters says nothing — "planar" scores 2.6 and
- * so does any six-character key.
+ * Whether the letters read as something a human typed rather than something a generator emitted.
+ *
+ * Bits-per-character alone cannot answer this, which the first cut of this filter assumed it could:
+ * over 20-character lowercase samples a random blob averages 3.68 bits/char while placeholder
+ * phrases like "local-development-password" reach 3.77, so no floor separates the two populations.
+ * Vowel structure does — English runs ~40% vowels against a random alphabet's 19% (5 of 26), and it
+ * needs no length gate, so a SHORT generated blob is caught too.
  */
-const ENTROPY_MIN_LENGTH = 20;
-const ENTROPY_FLOOR = 3.6;
+const VOWEL = /[aeiouy]/;
+const VOWELS = /[aeiouy]/g;
+/** Longer than any English cluster ("passphrase" carries five in `ssphr`). */
+const CONSONANT_RUN = /[^aeiouy]{6,}/;
+const VOWEL_RATIO_FLOOR = 0.25; // "password" sits exactly here; below it is not a word.
+/** Under this, the ratio is noise — one letter either way swings it past any threshold. */
+const RATIO_MIN_LETTERS = 4;
+
+export function looksWritten(value: string): boolean {
+  const segments = value.split(/[-_.]/);
+  for (const segment of segments) {
+    if (segment.length >= RATIO_MIN_LETTERS && !VOWEL.test(segment)) return false;
+    if (CONSONANT_RUN.test(segment)) return false;
+  }
+  const letters = segments.join("");
+  if (letters.length < RATIO_MIN_LETTERS) return true;
+  return (letters.match(VOWELS)?.length ?? 0) / letters.length >= VOWEL_RATIO_FLOOR;
+}
+
+/**
+ * Density backstop for the blobs that happen to fall in a word's vowel range. Ungated by length on
+ * purpose: a value shorter than 16 characters cannot reach this floor at all (entropy caps at
+ * log2(length)), so the rule is self-limiting where a length gate would be an exemption. Measured:
+ * the known fixtures top out at 3.46 and the densest plausible placeholder phrase at 3.78.
+ */
+const ENTROPY_FLOOR = 4.0;
 
 /** Shannon entropy in bits per character — how much a value looks like it was generated. */
 export function entropyOf(value: string): number {
@@ -107,13 +132,14 @@ export function entropyOf(value: string): number {
 
 /**
  * Whether a literal reads as a real credential. The default answer is yes: only a value that is
- * positively human-written — a known-safe shape, no credential marker, and not dense enough to be
- * generated — is anything else.
+ * positively human-written — a known-safe shape, no credential marker, word-like letters, and not
+ * dense enough to be generated — is anything else.
  */
 export function isCredentialShaped(value: string): boolean {
   if (CREDENTIAL_MARKERS.some((marker) => marker.test(value))) return true;
-  if (!PLACEHOLDER_SHAPES.some((shape) => shape.test(value))) return true;
-  return value.length >= ENTROPY_MIN_LENGTH && entropyOf(value) >= ENTROPY_FLOOR;
+  if (!PLACEHOLDER_SHAPE.test(value)) return true;
+  if (!looksWritten(value)) return true;
+  return entropyOf(value) >= ENTROPY_FLOOR;
 }
 
 /** Quoted string literals, in all three JS spellings plus the single-quoted forms other stacks use. */

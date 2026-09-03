@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
 import { describeDuplicationFilter, filterDuplicationSignals } from "./scan-duplication";
-import { describeSecretFilter } from "./scan-secrets";
+import { describeSecretFilter, entropyOf } from "./scan-secrets";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
@@ -781,7 +781,8 @@ describe("scan", () => {
     it("drops the four known fixtures and leaves every real secret at critical", async () => {
       const repo = fixtureRepo({
         // A generated blob pasted into a test file — exactly what this filter must never clear.
-        "src/lib/keys.test.ts": atLines({ 8: `  const token = "Zx9Kq2mW7pL4vT8nR1sY6uH3dJ0aB5cE";` }),
+        // The repo's own gitleaks gate reads it the same way, hence the inline allow.
+        "src/lib/keys.test.ts": atLines({ 8: `  const token = "Zx9Kq2mW7pL4vT8nR1sY6uH3dJ0aB5cE";` }), // gitleaks:allow
         // ...and the same mistake in shipped source.
         "src/lib/client.ts": atLines({ 12: `const AWS_KEY = "AKIAIOSFODNN7EXAMPLE";` }),
       });
@@ -838,25 +839,53 @@ describe("scan", () => {
 
     // The narrow half of the rule: a test-file path is never enough on its own, because a test file
     // is exactly where a live key gets pasted by accident.
-    it("keeps a PEM, a token prefix, or a high-entropy value even inside a test file", async () => {
+    it("keeps a PEM, a token prefix, or a generated-looking value even inside a test file", async () => {
       const repo = writeRepo({
         "src/a.test.ts": atLines({ 3: `  const key = "-----BEGIN RSA PRIVATE KEY-----";` }),
         "src/b.test.ts": atLines({ 3: `  const gitlab = "glpat-secret";` }),
         "src/c.test.ts": atLines({ 3: `  const openai = "sk-test";` }),
-        // Lowercase and dash-free, so only its density says it was generated rather than written.
+        // Lowercase and dash-free, so only the way it reads says it was generated, not written.
         "src/d.test.ts": atLines({ 3: `  const blob = "xkqjvbzmwphdlrgtnsfy";` }),
+        // One character shorter — the length a bits/char floor would have had to exempt, since
+        // entropy caps at log2(length). Nothing about this value gets safer at 19 characters.
+        "src/e.test.ts": atLines({ 3: `  const short = "xkqjvbzmwphdlrgtnsf";` }),
+        // An uppercase VALUE, not the env var name on the left: a seed constant and a generated
+        // token are one character apart, so the filter reads neither as a placeholder.
+        "src/f.test.ts": atLines({ 3: `  const seed = "SEED_DB_PASS1";` }),
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         secret("src/a.test.ts", 3),
         secret("src/b.test.ts", 3),
         secret("src/c.test.ts", 3),
         secret("src/d.test.ts", 3),
+        secret("src/e.test.ts", 3),
+        secret("src/f.test.ts", 3),
       ]);
 
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
-      expect(result.signals).toHaveLength(4);
+      expect(result.signals).toHaveLength(6);
       expect(result.secrets.dropped).toEqual([]);
+    });
+
+    // The calibration itself, machine-checked rather than commented: "local-development-password"
+    // scores 3.77 bits/char — above the mean of a random 20-char lowercase blob — so a filter that
+    // separated placeholders from credentials by density alone would keep it and drop the blob.
+    it("drops a wordy placeholder that outscores a random blob on bits per character", async () => {
+      const repo = writeRepo({
+        "src/g.test.ts": atLines({ 5: `  const password = "local-development-password";` }),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        secret("src/g.test.ts", 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not a coincidence worth re-deriving by hand: the value clears the bits/char floor a
+      // density-only filter would have to use, and is dropped anyway.
+      expect(entropyOf("local-development-password")).toBeGreaterThan(3.6);
+      expect(result.signals).toEqual([]);
+      expect(result.secrets.dropped).toMatchObject([{ path: "src/g.test.ts", line: 5 }]);
     });
 
     // Conservative by construction: everything the filter cannot positively prove is fixture noise
