@@ -43,22 +43,36 @@ async function main() {
   console.log(`Auditing dependency types across ${repos.length} board(s)`);
   console.log(`Allowed: ${LINK_TYPES.join(", ")}\n`);
 
-  let unexplained = 0;
+  let inert = 0;
+  let blocking = 0;
   for (const cwd of repos) {
     // `--status all`: a stray edge on a closed bead is still a stray edge, and bd's default list
     // shows only open ones.
     const strays = auditLinkTypes(beads.edgesOf(await beads.list(cwd, ["--status", "all"])));
-    unexplained += unexplainedEdges(strays).length;
+    const open = unexplainedEdges(strays);
+    inert += open.filter((s) => !s.blocking).length;
+    blocking += open.filter((s) => s.blocking).length;
     console.log(`${cwd}: ${strays.length} edge(s) outside the allowed set`);
     for (const s of strays) {
-      const why = s.writtenBy ? `expected — written by ${s.writtenBy}` : "UNEXPLAINED — non-blocking";
+      const why = s.writtenBy
+        ? `expected — written by ${s.writtenBy}`
+        : s.blocking
+          ? "UNEXPLAINED — blocks, but not in anton's spelling"
+          : "UNEXPLAINED — non-blocking";
       console.log(`  ${s.from} -> ${s.to}  type=${s.type}  (${why})`);
     }
   }
 
-  if (unexplained > 0) {
-    console.log(`\n${unexplained} unexplained edge(s). Each is non-blocking: confirm that is what`);
-    console.log(`was meant, and rewrite any that was supposed to order work as \`blocks\`.`);
+  if (inert + blocking > 0) {
+    console.log(`\n${inert + blocking} unexplained edge(s).`);
+    if (inert > 0) {
+      console.log(`  ${inert} order nothing: confirm that is what was meant, and rewrite any that`);
+      console.log(`  was supposed to order work as \`blocks\`.`);
+    }
+    if (blocking > 0) {
+      console.log(`  ${blocking} DO order work under a spelling anton does not write; rewrite them`);
+      console.log(`  as \`blocks\` so the board carries one spelling for ordering.`);
+    }
     process.exit(1);
   }
   console.log("\nNo unexplained edge types on any board.");

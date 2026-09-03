@@ -58,6 +58,14 @@ const NON_LINK_WRITERS: Record<string, string> = {
   supersedes: "bd supersede (beads.supersede)",
 };
 
+/**
+ * Types outside {@link LINK_TYPES} that still order work. `conditional-blocks` is excluded from the
+ * allowed set because it is a second spelling, NOT because it is inert — it blocks identically to
+ * `blocks`. An audit that lumped it in with the no-ops would tell an operator the board has less
+ * ordering than it does, which is the opposite of the mistake this audit exists to surface.
+ */
+const BLOCKING_NON_LINK_TYPES = new Set(["conditional-blocks"]);
+
 /** One board edge whose type anton's own seam would not write. */
 export interface StrayEdge {
   from: string;
@@ -65,6 +73,8 @@ export interface StrayEdge {
   type: string;
   /** The bd command that legitimately writes this type; absent when nothing anton runs writes it. */
   writtenBy?: string;
+  /** Set when the type orders work despite being outside {@link LINK_TYPES}. */
+  blocking?: true;
 }
 
 /**
@@ -73,14 +83,20 @@ export interface StrayEdge {
  * without a board.
  *
  * An edge with no `writtenBy` is the finding that matters: nothing anton runs writes that type, so it
- * is either a hand-added edge or a silent no-op left by a call site that predates this guard.
+ * is either a hand-added edge or a silent no-op left by a call site that predates this guard. The
+ * `blocking` flag separates the two shapes that finding takes — a stray that orders nothing from one
+ * that orders work under a spelling anton does not read for.
  */
 export function auditLinkTypes(
   edges: Array<{ from: string; to: string; type: string }>,
 ): StrayEdge[] {
   return edges
     .filter((e) => !isLinkType(e.type))
-    .map((e) => ({ ...e, ...(NON_LINK_WRITERS[e.type] ? { writtenBy: NON_LINK_WRITERS[e.type] } : {}) }));
+    .map((e) => ({
+      ...e,
+      ...(NON_LINK_WRITERS[e.type] ? { writtenBy: NON_LINK_WRITERS[e.type] } : {}),
+      ...(BLOCKING_NON_LINK_TYPES.has(e.type) ? { blocking: true as const } : {}),
+    }));
 }
 
 /** The strays nothing anton runs explains — what an operator has to look at. */

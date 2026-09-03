@@ -1469,7 +1469,7 @@ describe("beads.link validates --type at the seam (anton-igkb)", () => {
     expect(calls).toEqual([]); // never reached bd
   });
 
-  it("throws on the no-op types bd stores happily", async () => {
+  it("rejects the no-op aliases, the empty string, and wrong-case spellings bd itself would also reject", async () => {
     const { calls, exec } = recordingExec("");
     for (const t of ["waits-for", "conditional-blocks", "", "Blocks"]) {
       await expect(beads.link("/repo", "a-1", "a-2", t as LinkType, exec)).rejects.toThrow(

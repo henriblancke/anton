@@ -28,7 +28,7 @@ describe("assertLinkType (anton-igkb)", () => {
     expect(() => assertLinkType("conditional-blocks")).toThrow(/refusing dependency type/);
   });
 
-  it("rejects the empty string and whitespace bd would take as a type", () => {
+  it("rejects the empty string (which bd itself also rejects) and the case/whitespace variants bd would take", () => {
     expect(() => assertLinkType("")).toThrow(/refusing dependency type/);
     expect(() => assertLinkType(" blocks")).toThrow(/refusing dependency type/);
     expect(() => assertLinkType("BLOCKS")).toThrow(/refusing dependency type/);
@@ -57,6 +57,16 @@ describe("auditLinkTypes (anton-igkb)", () => {
       { from: "a-1", to: "a-2", type: "waits-for" },
       { from: "a-1", to: "a-2", type: "blocsk" },
     ]);
+    expect(unexplainedEdges(strays)).toHaveLength(2);
+  });
+
+  it("flags a `conditional-blocks` stray as blocking — it orders work, it is just not our spelling", () => {
+    const strays = auditLinkTypes([edge("conditional-blocks"), edge("waits-for")]);
+    expect(strays).toEqual([
+      { from: "a-1", to: "a-2", type: "conditional-blocks", blocking: true },
+      { from: "a-1", to: "a-2", type: "waits-for" },
+    ]);
+    // Both are unexplained — the flag separates "orders nothing" from "orders work we can't read".
     expect(unexplainedEdges(strays)).toHaveLength(2);
   });
 
