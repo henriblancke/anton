@@ -134,8 +134,27 @@ function parseEdges(source: string): RawEdge[] {
 
 /** A `"@/*": ["./src/*"]`-shaped tsconfig path mapping, the only form anton resolves. */
 export interface AliasRule {
+  /** What a specifier must start with — the whole pattern when the rule is `exact`. */
   prefix: string;
   targets: string[];
+  /**
+   * Whether `prefix` is the WHOLE specifier. tsc reads a pattern without a `*` as a mapping of one
+   * module and no other — `"@/ui/widget": ["./apps/web/ui/special.ts"]` — and dropping it leaves
+   * the specifier to the path-tail fallback, which reads `@/ui/widget` as an unrelated package's
+   * same-named module, inventing a caller and deleting a true finding (anton-23xe).
+   */
+  exact?: boolean;
+}
+
+/**
+ * What a rule's targets stand in for in `spec` — `""` for an exact rule, the tail behind the
+ * prefix for a wildcard one — and undefined when the rule does not claim the specifier. An exact
+ * rule claims the specifier it names and nothing beneath it: `@/ui/widgetry` is not the module
+ * `"@/ui/widget"` maps, and matching it by prefix would send the import somewhere tsc never does.
+ */
+export function aliasRemainder(rule: AliasRule, spec: string): string | undefined {
+  if (rule.exact) return spec === rule.prefix ? "" : undefined;
+  return spec.startsWith(rule.prefix) ? spec.slice(rule.prefix.length) : undefined;
 }
 
 /** As much of a tsconfig as a path mapping is read out of. */
@@ -232,11 +251,20 @@ function rulesOf(dir: string, options: TsConfig["compilerOptions"]): AliasRule[]
   const base = options?.baseUrl ?? ".";
   const rules: AliasRule[] = [];
   for (const [pattern, targets] of Object.entries(paths)) {
-    if (!pattern.endsWith("/*")) continue;
+    if (pattern.endsWith("/*")) {
+      const mapped = targets
+        .filter((target) => target.endsWith("/*"))
+        .map((target) => normalize(join(dir, base, target.slice(0, -2))));
+      if (mapped.length > 0) rules.push({ prefix: pattern.slice(0, -1), targets: mapped });
+      continue;
+    }
+    // A pattern with no substitution names one module outright, and its targets name files rather
+    // than directories — nothing is appended to them.
+    if (pattern.includes("*")) continue;
     const mapped = targets
-      .filter((target) => target.endsWith("/*"))
-      .map((target) => normalize(join(dir, base, target.slice(0, -2))));
-    if (mapped.length > 0) rules.push({ prefix: pattern.slice(0, -1), targets: mapped });
+      .filter((target) => !target.includes("*"))
+      .map((target) => normalize(join(dir, base, target)));
+    if (mapped.length > 0) rules.push({ prefix: pattern, targets: mapped, exact: true });
   }
   return rules;
 }
@@ -274,7 +302,16 @@ function extendsTargets(dir: string, spec: unknown): string[] {
 async function aliasesOf(repoPath: string, file: string, depth: number): Promise<AliasRule[]> {
   if (depth <= 0) return [];
   const config = await readConfig(repoPath, file);
-  if (!config) return [];
+  return config ? aliasesFrom(repoPath, file, config, depth) : [];
+}
+
+/** The mapping a config already read supplies — `aliasesOf` past the read. */
+async function aliasesFrom(
+  repoPath: string,
+  file: string,
+  config: TsConfig,
+  depth: number,
+): Promise<AliasRule[]> {
   const dir = normalize(dirname(file));
   const own = rulesOf(dir, config.compilerOptions);
   if (own.length > 0) return own;
@@ -307,11 +344,32 @@ async function aliasesOf(repoPath: string, file: string, depth: number): Promise
  * true finding.
  */
 export async function readAliases(repoPath: string, dir = "."): Promise<AliasRule[]> {
+  return (await readDirAliases(repoPath, dir)).rules;
+}
+
+/** What a directory's own config says about aliases. */
+export interface DirAliases {
+  /** The mapping it publishes, its `extends` chain included; empty when it publishes none. */
+  rules: AliasRule[];
+  /**
+   * Whether the directory holds a config at all. A project is bounded by its own config: tsc
+   * resolves `paths` from the config governing the file and never from an ancestor DIRECTORY's, so
+   * a lookup climbing past one applies a mapping the compiler doesn't (anton-23xe).
+   */
+  governed: boolean;
+}
+
+/** `readAliases`, with whether a config governs `dir` at all — the boundary a lookup stops at. */
+export async function readDirAliases(repoPath: string, dir = "."): Promise<DirAliases> {
+  let governed = false;
   for (const name of CONFIG_NAMES) {
-    const rules = await aliasesOf(repoPath, join(dir, name), EXTENDS_DEPTH);
-    if (rules.length > 0) return rules;
+    const config = await readConfig(repoPath, join(dir, name));
+    if (!config) continue;
+    governed = true;
+    const rules = await aliasesFrom(repoPath, join(dir, name), config, EXTENDS_DEPTH);
+    if (rules.length > 0) return { rules, governed };
   }
-  return [];
+  return { rules: [], governed };
 }
 
 /** A repo-relative path that stays inside the repo; undefined for anything that escapes it. */
@@ -372,9 +430,10 @@ async function resolveFile(state: GraphState, base: string): Promise<string | un
 /** Where a `@/…`-style specifier lands, or undefined when no alias rule claims it. */
 async function resolveAlias(state: GraphState, spec: string): Promise<string | undefined> {
   for (const rule of state.aliases) {
-    if (!spec.startsWith(rule.prefix)) continue;
+    const rest = aliasRemainder(rule, spec);
+    if (rest === undefined) continue;
     for (const target of rule.targets) {
-      const file = await resolveFile(state, normalize(join(target, spec.slice(rule.prefix.length))));
+      const file = await resolveFile(state, normalize(join(target, rest)));
       if (file) return file;
     }
   }

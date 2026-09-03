@@ -25,7 +25,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
-import { readAliases, type AliasRule } from "./scan-coupling";
+import { aliasRemainder, readDirAliases, type AliasRule } from "./scan-coupling";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -1832,12 +1832,17 @@ function jsxTags(line: string): { net: number; remainder: string; after: number 
  * Where the tag open above ends on this line, and the attribute quote it still leaves open. Quoted
  * values are walked rather than scanned for, so `title="a > b"` does not close the tag on the `>`
  * it shows a reader, and a value that wraps is known to be still open on the line under it.
+ *
+ * A backslash is an ordinary character here. A static prop's value is quoted the way HTML quotes
+ * one — JSX gives it no escapes at all — so reading `title="C:\"` as an escaped quote leaves the
+ * attribute open, hands the rest of the line to it as rendered text, and the call standing there
+ * stops counting as a caller, leaving a false finding (anton-23xe). The interpolations, where a
+ * backslash IS an escape, are blanked before this runs.
  */
 function jsxTagEnd(text: string, quote?: string): { at: number; quote?: string } {
   for (let at = 0; at < text.length; at += 1) {
     const char = text[at];
-    if (char === "\\") at += 1;
-    else if (quote !== undefined) {
+    if (quote !== undefined) {
       if (char === quote) quote = undefined;
     } else if (QUOTE.test(char)) quote = char;
     else if (char === ">") return { at };
@@ -2192,15 +2197,22 @@ interface MaskedCode {
   aliases: AliasBinding[];
 }
 
-/** `X as Y` — how ESM and Python both spell a renamed binding. */
-const AS_ALIAS = /\b([A-Za-z_$][\w$]*)[ \t]+as[ \t]+([A-Za-z_$][\w$]*)/g;
+/**
+ * `X as Y` — how ESM and Python both spell a renamed binding. The separators admit a line break
+ * because a formatter wraps a long binding list wherever it fits, `Widget` on one line and `as
+ * Renamed` on the next; matching a line at a time blanks the imported name without putting it
+ * back, and the call spelled `Renamed` beside it then matches nothing, leaving a live symbol
+ * reported dead (anton-23xe). Only the statement's own span is ever searched, so the break crossed
+ * is always one inside it.
+ */
+const AS_ALIAS = /\b([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g;
 
 /** `{ X: Y }` — how a CommonJS destructuring pattern spells the same rename. */
-const KEY_ALIAS = /\b([A-Za-z_$][\w$]*)[ \t]*:[ \t]*([A-Za-z_$][\w$]*)/g;
+const KEY_ALIAS = /\b([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)/g;
 
 /**
  * The renamed bindings written between `from` and `to`, read off the statement before it is
- * blanked. The span is walked line by line so a binding list wrapped over several of them is read
+ * blanked. The span is joined before it is matched so a binding wrapped across lines is read
  * whole, and each name is recorded where it sits — offsets the mask preserves, so the name can be
  * put back exactly where a hit found it.
  */
@@ -2210,17 +2222,26 @@ function aliasBindings(
   to: { line: number; at: number },
   pattern: RegExp,
 ): AliasBinding[] {
-  const found: AliasBinding[] = [];
+  // Each line's segment, with where it begins in the joined span and the column it begins at in
+  // the source — the two offsets a match index is read back through.
+  const lines: { line: number; offset: number; start: number }[] = [];
+  let span = "";
   for (let line = from.line; line <= to.line; line += 1) {
     const text = code[line] ?? "";
     const start = line === from.line ? from.at : 0;
-    const segment = text.slice(start, line === to.line ? to.at : text.length);
-    pattern.lastIndex = 0;
-    for (let match = pattern.exec(segment); match; match = pattern.exec(segment)) {
-      const [, name, local] = match;
-      if (name === undefined || local === undefined) continue;
-      found.push({ line, at: start + match.index, name, local });
-    }
+    lines.push({ line, offset: span.length, start });
+    span += `${text.slice(start, line === to.line ? to.at : text.length)}\n`;
+  }
+  const found: AliasBinding[] = [];
+  pattern.lastIndex = 0;
+  for (let match = pattern.exec(span); match; match = pattern.exec(span)) {
+    const [, name, local] = match;
+    const index = match.index;
+    if (name === undefined || local === undefined) continue;
+    // An identifier never spans a break, so the name sits whole on the line its match opened.
+    const at = lines.findLast((entry) => entry.offset <= index);
+    if (!at) continue;
+    found.push({ line: at.line, at: at.start + index - at.offset, name, local });
   }
   return found;
 }
@@ -2309,6 +2330,30 @@ const REQUIRE_HEAD = /(?:^|;)[ \t]*(?:const|let|var)\b/g;
 const REQUIRE_CALL = /^[ \t]*require[ \t]*\([ \t]*['"]/;
 
 /**
+ * Whether the initializer starting at `at` on `line` is a `require` of a quoted module specifier,
+ * followed across the break a formatter puts after the `=`: `const { Widget } =` with
+ * `require('./widget')` under it takes the same stale binding the one-line form does. Reading only
+ * the rest of the `=` line rejects it, leaves the binding unmasked, and lets a module that merely
+ * still requires the symbol read as its own caller — deleting a true finding (anton-23xe).
+ *
+ * Only blank lines are crossed. Anything else is the initializer itself, and a `=` whose value is
+ * not a `require` binds a value rather than a module.
+ */
+function requireFollows(
+  code: readonly string[],
+  from: number,
+  line: number,
+  at: number,
+): boolean {
+  for (let index = line; index < code.length && index - from <= IMPORT_SPAN_LINES; index += 1) {
+    const text = (code[index] ?? "").slice(index === line ? at : 0);
+    if (!text.trim()) continue;
+    return REQUIRE_CALL.test(text);
+  }
+  return false;
+}
+
+/**
  * Where the binding of the declaration opened at `at` on line `from` ends: at the `=` that starts
  * its initializer, and only when that initializer is a `require` of a quoted module specifier.
  * Undefined for every other declaration — `const total = count + 1` binds a value, not a module,
@@ -2332,7 +2377,7 @@ function requireBindingEnd(
       else if (char === "}" || char === ")" || char === "]") depth -= 1;
       else if (char === ";") return undefined;
       else if (char === "=" && depth <= 0)
-        return REQUIRE_CALL.test(text.slice(index + 1)) ? { line, at: index } : undefined;
+        return requireFollows(code, from, line, index + 1) ? { line, at: index } : undefined;
     }
     if (depth <= 0) return undefined;
   }
@@ -2835,6 +2880,12 @@ const NO_ALIASES: readonly AliasRule[] = [];
  * specifier's tail, and reads `@/ui/widget` as the same-named module of an unrelated package —
  * inventing a caller and deleting a true finding.
  *
+ * The walk stops at the nearest config whether or not it publishes a mapping, because that config
+ * is the project boundary: tsc inherits `paths` through `extends` alone and never from an ancestor
+ * DIRECTORY, so an app declaring none resolves `@/widget` as a package rather than through the
+ * root's `@/* -> src/*` (anton-23xe). Climbing past it would name the root's `src/widget` and
+ * invent a caller for it.
+ *
  * Every directory walked is cached, negative answers included, so a package's config is read once
  * however many of its files import.
  */
@@ -2852,9 +2903,9 @@ async function aliasesGoverning(
       break;
     }
     walked.push(dir);
-    const found = await readAliases(repoPath, dir);
-    if (found.length > 0) {
-      rules = found;
+    const found = await readDirAliases(repoPath, dir);
+    if (found.governed) {
+      rules = found.rules;
       break;
     }
     // The repo root answers last: above it there is no config of this project's to read.
@@ -2875,23 +2926,24 @@ async function aliasesGoverning(
  * module is read as a caller of the broad one too, inventing a caller and deleting a true finding.
  *
  * Rules tie only when the same pattern is declared twice, and then they are equally specific, so
- * both answer — as they already would have.
+ * both answer — as they already would have. A pattern with no `*` claims its whole specifier, so
+ * it is the most specific rule any import can match.
  */
 function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
-  let claiming: AliasRule[] = [];
+  let claiming: { rule: AliasRule; rest: string }[] = [];
   let longest = -1;
   for (const rule of aliases) {
-    if (!spec.startsWith(rule.prefix) || rule.prefix.length < longest) continue;
+    const rest = aliasRemainder(rule, spec);
+    if (rest === undefined || rule.prefix.length < longest) continue;
     if (rule.prefix.length > longest) {
       longest = rule.prefix.length;
       claiming = [];
     }
-    claiming.push(rule);
+    claiming.push({ rule, rest });
   }
   const mapped: string[] = [];
-  for (const rule of claiming)
-    for (const target of rule.targets)
-      mapped.push(posix(normalize(join(target, spec.slice(rule.prefix.length)))));
+  for (const { rule, rest } of claiming)
+    for (const target of rule.targets) mapped.push(posix(normalize(join(target, rest))));
   return mapped;
 }
 

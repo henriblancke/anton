@@ -14,11 +14,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ScanSignal } from "./scan-severity";
 import {
+  aliasRemainder,
   filterCouplingSignals,
   importGraph,
   judgeCycle,
   judgeFanOut,
   readAliases,
+  readDirAliases,
   type Graph,
 } from "./scan-coupling";
 
@@ -236,6 +238,50 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src"] }]);
+  });
+
+  // A pattern with no `*` maps one module outright and tsc honours it. Skipped, the specifier falls
+  // to the path tail, which binds an unrelated package's same-named module. Its targets name files,
+  // so nothing is appended to them.
+  it("reads an exact mapping beside a wildcard one", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { "@/*": ["./src/*"], "@/ui/widget": ["./vendor/special.ts"] },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", targets: ["src"] },
+      { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true },
+    ]);
+  });
+
+  // An exact rule claims the specifier it names and nothing beneath it: `@/ui/widgetry` is not the
+  // module `"@/ui/widget"` maps, and matching it by prefix would send the import where tsc never
+  // does — inventing an edge, and with it a caller.
+  it("claims only the specifier an exact mapping names", async () => {
+    const rule = { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true };
+
+    expect(aliasRemainder(rule, "@/ui/widget")).toBe("");
+    expect(aliasRemainder(rule, "@/ui/widgetry")).toBeUndefined();
+    expect(aliasRemainder({ prefix: "@/", targets: ["src"] }, "@/ui/widget")).toBe("ui/widget");
+  });
+});
+
+describe("readDirAliases", () => {
+  // A project is bounded by its own config: tsc inherits `paths` through `extends` and never from
+  // an ancestor directory, so a lookup has to know a config exists even when it publishes no
+  // mapping. Reading "no rules" as "no config" climbs past it and applies a mapping tsc doesn't.
+  it("reports a config that publishes no mapping as governing its directory", async () => {
+    const repo = writeRepo({
+      "apps/app/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+    });
+
+    expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
+    expect(await readDirAliases(repo, "apps")).toEqual({ rules: [], governed: false });
   });
 });
 
