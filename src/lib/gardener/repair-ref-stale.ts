@@ -110,6 +110,14 @@ function* scannedLines(source: string): Generator<{ line: ScannedLine; start: nu
  * out of a code sample the founder wrote to say something specific. Fences are read through
  * {@link scanMarkdown}, the same scanner {@link contextSpans} sections by, so the two cannot drift.
  *
+ * HTML COMMENTS hold no citations either, for the same reason and with a sharper failure (PR #223
+ * review): a `<!-- old reference: src/old.ts -->` left in a Context template renders nothing at all,
+ * so following it rewrites text no reader can see — the bead is stamped repaired and retried with
+ * every pointer the founder can actually read still stale — and failing to follow it escalates a
+ * bead whose visible pointers were all fine. Lines are read through {@link ScannedLine.masked},
+ * which blanks the commented spans while keeping the line's own offsets, so a rewrite still lands on
+ * the bytes it validated.
+ *
  * A path that climbs out of the repository (`..`) or starts at the filesystem root is not a citation
  * this repair will touch: it names something outside the tree anton is allowed to reason about, and
  * "resolve it against the worktree" has no meaning there.
@@ -118,10 +126,10 @@ export function citedPaths(text: string): PathCitation[] {
   const out: PathCitation[] = [];
   for (const { line, start } of scannedLines(text)) {
     if (line.fenced) continue;
-    for (const match of line.text.matchAll(CITED_PATH)) {
+    for (const match of line.masked.matchAll(CITED_PATH)) {
       const at = match.index ?? 0;
-      const before = at > 0 ? line.text[at - 1]! : "";
-      const after = line.text[at + match[0].length] ?? "";
+      const before = at > 0 ? line.masked[at - 1]! : "";
+      const after = line.masked[at + match[0].length] ?? "";
       if (NOT_A_CITATION_BOUNDARY.test(before) || CITATION_TAIL.test(after)) continue;
       const path = match[0].replace(/^\.\//, "");
       if (path.startsWith("/") || path.split("/").includes("..")) continue;

@@ -128,6 +128,23 @@ describe("citedPaths", () => {
     expect(text.slice(cited!.index, cited!.index + cited!.text.length)).toBe("src/a.ts");
   });
 
+  // A path left in an HTML comment renders nowhere, so following it would rewrite text no reader can
+  // see — and refusing to follow it would escalate a bead whose visible pointers are all fine (PR
+  // #223 review).
+  it("reads no citation inside an HTML comment", () => {
+    expect(citedPaths("prose <!-- old reference: src/old.ts --> more")).toEqual([]);
+    expect(citedPaths(["<!-- was", "`src/old.ts`", "-->"].join("\n"))).toEqual([]);
+    expect(citedPaths("prose <!-- src/old.ts")).toEqual([]);
+  });
+
+  it("keeps offsets aimed at the source text across an HTML comment", () => {
+    const text = "<!-- was `src/old.ts` --> now `src/a.ts`.";
+    const [cited, ...rest] = citedPaths(text);
+    expect(rest).toEqual([]);
+    expect(cited).toMatchObject({ path: "src/a.ts", text: "src/a.ts" });
+    expect(text.slice(cited!.index, cited!.index + cited!.text.length)).toBe("src/a.ts");
+  });
+
   it("measures CRLF separators, so a citation's offset survives them", () => {
     const text = ["prose", "touches `src/a.ts`."].join("\r\n");
     const [cited] = citedPaths(text);
@@ -472,6 +489,48 @@ suite("ref-stale, against a real git history", () => {
       expect(outcome.action === "repaired" && outcome.description).toBe(
         description.replace("src/moved.ts", "src/lib/renamed.ts"),
       );
+    });
+
+    // A commented-out pointer renders nowhere, so reading it escalated a mechanical repair on the
+    // strength of a line no one can see — and following it would have rewritten one (PR #223 review).
+    it("follows the real pointer past a path hidden in an HTML comment", async () => {
+      const description = contract(
+        [
+          "touches `src/moved.ts`.",
+          "<!-- old reference: `src/gone.ts` — kept for the archaeology -->",
+        ].join("\n"),
+      );
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome).toMatchObject({
+        action: "repaired",
+        rewrites: [{ from: "src/moved.ts", to: "src/lib/renamed.ts" }],
+      });
+      // The comment comes back byte-identical — the repair rewrites what the bead RENDERS.
+      expect(outcome.action === "repaired" && outcome.description).toBe(
+        description.replace("touches `src/moved.ts`", "touches `src/lib/renamed.ts`"),
+      );
+    });
+
+    it("answers `none` when the only stale path is one an HTML comment hides", async () => {
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(contract("touches `src/here.ts`. <!-- was `src/moved.ts` -->")),
+        block: { reason: "something else is wrong" },
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome).toMatchObject({ action: "none" });
+      expect(updateMock).not.toHaveBeenCalled();
     });
 
     it("rewrites a stale pointer in EVERY Context section, not just the first", async () => {
