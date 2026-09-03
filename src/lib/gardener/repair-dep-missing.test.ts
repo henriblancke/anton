@@ -195,6 +195,35 @@ describe("the prerequisite the agent named", () => {
     });
   });
 
+  // bd spends a directed pair on the FIRST edge written over it, whatever the type — so a pair
+  // already carrying one of the types this repair does not index by name would take the `blocks`
+  // write and fail it, parking a ticket on an ordering that was never recorded.
+  it.each(["conditional-blocks", "related"])(
+    "refuses a pair already spent on a `%s` edge",
+    (type) => {
+      const occupied = board({
+        dependencies: [{ issue_id: TARGET, depends_on_id: PREREQ, type }],
+      } as Partial<Bead>);
+      expect(resolvePrereq(indexBoard(occupied), TARGET, `blocked on ${PREREQ}`)).toMatchObject({
+        state: "unresolved",
+        why: expect.stringContaining(`\`${type}\` edge`),
+      });
+    },
+  );
+
+  it("still resolves when the pair is spent in the OTHER direction — that is a different pair", () => {
+    const reversed = [
+      bead(TARGET),
+      bead(PREREQ, {
+        dependencies: [{ issue_id: PREREQ, depends_on_id: TARGET, type: "related" }],
+      } as Partial<Bead>),
+    ];
+    expect(resolvePrereq(indexBoard(reversed), TARGET, `blocked on ${PREREQ}`)).toEqual({
+      state: "resolved",
+      id: PREREQ,
+    });
+  });
+
   it("refuses a parent/child pair, which sequences through the hierarchy", () => {
     const parented = board({ parent: PREREQ } as Partial<Bead>);
     expect(resolvePrereq(indexBoard(parented), TARGET, `blocked on ${PREREQ}`)).toMatchObject({

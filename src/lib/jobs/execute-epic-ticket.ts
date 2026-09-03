@@ -479,7 +479,12 @@ type TicketRepair = RefStaleOutcome | DepMissingOutcome;
  * `ref-stale` keeps running on EVERY other block, class or none. Its trigger is evidence rather than
  * the agent's word — the bead's cited paths are checked against the worktree, so it fires only where
  * a pointer is provably stale and stays silent (`none`) everywhere else. That is strictly narrower
- * than trusting a self-reported class, so narrowing it to one would only lose repairs.
+ * than trusting a self-reported class, so narrowing it to one would only lose repairs. The cost is
+ * an audit trail that can read oddly (PR #223 review): a bead blocked on, say, `env` that ALSO
+ * cites a moved path gets its pointer fixed and stamped `repair:ref-stale`, on a run whose block was
+ * something else. The stamp is honest about what anton did — it rewrote a genuinely stale pointer —
+ * and the loop guard still holds, because the next block finds that stamp and escalates rather than
+ * repairing again.
  *
  * HOW FAR EITHER MAY GO is the project's call, not this function's (R5.3): each class carries its
  * own autonomy level, and the guard consults it before anything is written (`decideRepair`). Shipped
@@ -577,7 +582,9 @@ function repairLogLine(outcome: TicketRepair): string {
       return `shadow (not armed to write) — would have: ${outcome.attempted}`;
     case "escalate":
       return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
-    default:
+    // Named rather than left to `default`, so a future outcome shape without a `why` is a type error
+    // HERE instead of an `undefined` in the log line (PR #223 review).
+    case "none":
       return `no repair — ${outcome.why}`;
   }
 }

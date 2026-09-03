@@ -182,6 +182,21 @@ export function resolvePrereq(
         `hierarchy, not through a \`blocks\` edge`,
     };
   }
+  // LAST, so every pair type worth its own words above keeps them (PR #223 review). bd's one-edge-
+  // per-directed-pair rule is not special to `blocks` and `discovered-from`: a pair already spent on
+  // `conditional-blocks` or `related` refuses the write just the same, and resolving anyway would
+  // hand the caller a `parked` outcome whose edge silently failed — a ticket left blocked with a
+  // repair stamp claiming it was ordered.
+  const occupied = index.recordsEdge(targetId, id);
+  if (occupied) {
+    return {
+      state: "unresolved",
+      why:
+        `the board already records a \`${occupied}\` edge from ${targetId} to \`${id}\`, and bd ` +
+        `holds one edge per directed pair — it refuses a \`blocks\` edge over it (anton-wsap), so ` +
+        `the ordering cannot be written without dropping what the pair already says`,
+    };
+  }
   return { state: "resolved", id };
 }
 

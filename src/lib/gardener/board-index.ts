@@ -61,6 +61,14 @@ export interface BoardIndex {
    * it, so a pair already carrying provenance can never also carry ordering.
    */
   recordsDiscovery(discoveredId: string, sourceId: string): boolean;
+  /**
+   * The type of the edge the board records FROM `fromId` TO `toId`, if the directed pair carries one
+   * at all. The catch-all behind {@link recordsBlocker} and {@link recordsDiscovery}: bd's one-edge-
+   * per-directed-pair rule applies to EVERY type it accepts, not just the three indexed by name, so
+   * a pair already carrying `conditional-blocks` or `related` refuses a `blocks` write exactly as a
+   * provenance pair does (PR #223 review). Asked last, so the named types keep their own refusals.
+   */
+  recordsEdge(fromId: string, toId: string): string | undefined;
   /** Is `ancestorId` this bead, or anywhere on its parent chain? Cycle-guarded. */
   isAncestor(ancestorId: string, id: string): boolean;
   /** An epic that groups run targets rather than being one (`beads.isContainer`, board-wide). */
@@ -90,7 +98,12 @@ export function indexBoard(all: Bead[]): BoardIndex {
   // `bd link <discovered> <source> --type discovered-from` writes (from = the bead that was found,
   // to = the work it was found while doing).
   const discoveries = new Set<string>();
+  // Every directed pair the board has spent, whatever the type — the question a write has to ask
+  // before it draws a new edge over one.
+  const edgeTypes = new Map<string, string>();
   for (const edge of beads.edgesOf(all)) {
+    const pair = directedKey(edge.from, edge.to);
+    if (!edgeTypes.has(pair)) edgeTypes.set(pair, edge.type);
     if (edge.type === "blocks") {
       blocks.add(pairKey(edge.from, edge.to));
       const known = blockers.get(edge.from);
@@ -142,6 +155,7 @@ export function indexBoard(all: Bead[]): BoardIndex {
     recordsSupersedes: (id, replacementId) => supersedes.has(directedKey(id, replacementId)),
     recordsDiscovery: (discoveredId, sourceId) =>
       discoveries.has(directedKey(discoveredId, sourceId)),
+    recordsEdge: (fromId, toId) => edgeTypes.get(directedKey(fromId, toId)),
     isAncestor: (ancestorId, id) => {
       const seen = new Set<string>();
       let current: string | undefined = id;
