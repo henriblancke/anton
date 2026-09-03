@@ -12,6 +12,7 @@ import { appendSessionLog } from "../sessions";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
 import { describeDuplicationFilter } from "../scan-duplication";
+import { describeSecretFilter } from "../scan-secrets";
 import { summarizeSignals, type ScanCounts } from "../scan-health";
 import {
   describeCollectorFailure,
@@ -135,6 +136,12 @@ async function reportScanDiagnostics(
   // duplication collector that found nothing.
   const duplicationLine = describeDuplicationFilter(result.duplication);
   if (duplicationLine) await appendSessionLog(logPath, `[stringer] ${duplicationLine}\n`);
+
+  // Committed-secret signals over test fixtures (anton-r016). The loudest of the four: this is the
+  // one class that must never be filtered silently, so a dropped secret is logged with the line and
+  // the value that cleared it.
+  const secretsLine = describeSecretFilter(result.secrets);
+  if (secretsLine) await appendSessionLog(logPath, `[stringer] ${secretsLine}\n`);
 }
 
 /**

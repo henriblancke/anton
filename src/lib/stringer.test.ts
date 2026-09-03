@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
 import { describeDuplicationFilter, filterDuplicationSignals } from "./scan-duplication";
+import { describeSecretFilter } from "./scan-secrets";
 import {
   DEFAULT_SCAN_EXCLUDES,
   STRINGER_BIN_ENV,
@@ -721,6 +722,165 @@ describe("scan", () => {
     });
   });
 
+
+  // anton-r016: `githygiene`'s secret detector matches on the SHAPE of an assignment — a name
+  // holding "PASSWORD" with a string on the right — so every fake credential in anton's own test
+  // setup reads as a leak. The 2026-08-29 scan raised four, all CRITICAL, all confirmed fake; they
+  // recurred nightly, so the health record's critical count never reached zero and the one class
+  // that must never be ignored became the one triage had learned to ignore.
+  describe("committed-secret signals over test fixtures", () => {
+    /** A source tree — no git, since nothing here is a claim about the index. */
+    function writeRepo(files: Record<string, string>): string {
+      const repo = join(dir, "secret-repo");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      return repo;
+    }
+
+    /** A file whose given 1-based lines hold the given text, so a signal can name a real line. */
+    function atLines(entries: Record<number, string>): string {
+      const last = Math.max(...Object.keys(entries).map(Number));
+      return `${Array.from({ length: last }, (_, i) => entries[i + 1] ?? "").join("\n")}\n`;
+    }
+
+    /** stringer 1.8.3's own phrasing for a generic-secret hit — no value, just a path and a line. */
+    const secret = (path: string, line: number) => ({
+      Source: "githygiene",
+      Kind: "committed-secret",
+      FilePath: path,
+      Line: line,
+      Title: `Possible generic secret in ${path}:${line}`,
+      Tags: ["git-hygiene", "security", "secret"],
+    });
+
+    /** The four hits of the 2026-08-29 scan, at the lines and with the values it flagged. */
+    const KNOWN_FIXTURES: Record<string, Record<number, string>> = {
+      "bin/anton.test.ts": { 255: `      BEADS_DOLT_PASSWORD: "shared-account-secret",` },
+      "src/lib/beads/bd-env.test.ts": {
+        62: `  BEADS_DOLT_PASSWORD: "shared-secret",`,
+        127: `    const env = buildBdEnv(serverRepo("planar", "trammel"), { BEADS_DOLT_PASSWORD: "explicit" }, {`,
+      },
+      "src/lib/beads/config-modes.test.ts": { 738: `    BEADS_DOLT_PASSWORD: "project-a-secret",` },
+    };
+
+    const KNOWN_HITS = [
+      secret("bin/anton.test.ts", 255),
+      secret("src/lib/beads/bd-env.test.ts", 62),
+      secret("src/lib/beads/bd-env.test.ts", 127),
+      secret("src/lib/beads/config-modes.test.ts", 738),
+    ];
+
+    function fixtureRepo(extra: Record<string, string> = {}): string {
+      const files: Record<string, string> = {};
+      for (const [path, lines] of Object.entries(KNOWN_FIXTURES)) files[path] = atLines(lines);
+      return writeRepo({ ...files, ...extra });
+    }
+
+    it("drops the four known fixtures and leaves every real secret at critical", async () => {
+      const repo = fixtureRepo({
+        // A generated blob pasted into a test file — exactly what this filter must never clear.
+        "src/lib/keys.test.ts": atLines({ 8: `  const token = "Zx9Kq2mW7pL4vT8nR1sY6uH3dJ0aB5cE";` }),
+        // ...and the same mistake in shipped source.
+        "src/lib/client.ts": atLines({ 12: `const AWS_KEY = "AKIAIOSFODNN7EXAMPLE";` }),
+      });
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [
+          ...KNOWN_HITS,
+          secret("src/lib/keys.test.ts", 8),
+          secret("src/lib/client.ts", 12),
+        ],
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      expect(result.signals).toMatchObject([
+        { FilePath: "src/lib/keys.test.ts", AntonSeverity: "critical", AntonClass: "security" },
+        { FilePath: "src/lib/client.ts", AntonSeverity: "critical", AntonClass: "security" },
+      ]);
+      expect(result.secrets.dropped).toEqual([
+        {
+          path: "bin/anton.test.ts",
+          line: 255,
+          kind: "committed-secret",
+          reason: `a test fixture assigning "shared-account-secret"`,
+        },
+        {
+          path: "src/lib/beads/bd-env.test.ts",
+          line: 62,
+          kind: "committed-secret",
+          reason: `a test fixture assigning "shared-secret"`,
+        },
+        {
+          path: "src/lib/beads/bd-env.test.ts",
+          line: 127,
+          kind: "committed-secret",
+          reason: `a test fixture assigning "planar", "trammel", "explicit"`,
+        },
+        {
+          path: "src/lib/beads/config-modes.test.ts",
+          line: 738,
+          kind: "committed-secret",
+          reason: `a test fixture assigning "project-a-secret"`,
+        },
+      ]);
+      // Same set on both sides of the seam: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as {
+        signals: { FilePath: string }[];
+      };
+      expect(written.signals.map((s) => s.FilePath)).toEqual([
+        "src/lib/keys.test.ts",
+        "src/lib/client.ts",
+      ]);
+    });
+
+    // The narrow half of the rule: a test-file path is never enough on its own, because a test file
+    // is exactly where a live key gets pasted by accident.
+    it("keeps a PEM, a token prefix, or a high-entropy value even inside a test file", async () => {
+      const repo = writeRepo({
+        "src/a.test.ts": atLines({ 3: `  const key = "-----BEGIN RSA PRIVATE KEY-----";` }),
+        "src/b.test.ts": atLines({ 3: `  const gitlab = "glpat-secret";` }),
+        "src/c.test.ts": atLines({ 3: `  const openai = "sk-test";` }),
+        // Lowercase and dash-free, so only its density says it was generated rather than written.
+        "src/d.test.ts": atLines({ 3: `  const blob = "xkqjvbzmwphdlrgtnsfy";` }),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        secret("src/a.test.ts", 3),
+        secret("src/b.test.ts", 3),
+        secret("src/c.test.ts", 3),
+        secret("src/d.test.ts", 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(4);
+      expect(result.secrets.dropped).toEqual([]);
+    });
+
+    // Conservative by construction: everything the filter cannot positively prove is fixture noise
+    // rides through. Over-filtering makes anton go quiet about a leaked key.
+    it("drops nothing it cannot prove — non-test paths, other kinds, unreadable lines", async () => {
+      const repo = writeRepo({
+        "src/app.ts": atLines({ 4: `const password = "shared-secret";` }),
+        "src/e.test.ts": atLines({ 4: `  const password = "shared-secret";`, 9: `  callIt();` }),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        secret("src/app.ts", 4), // a placeholder value, but not a test file
+        { ...secret("src/e.test.ts", 4), Kind: "large-binary", Tags: ["git-hygiene"] }, // not a secret claim
+        { ...secret("src/e.test.ts", 4), Line: 0 }, // the collector named no line
+        secret("src/e.test.ts", 9), // the line holds no literal to judge
+        secret("src/gone.test.ts", 4), // no such file
+        secret("../outside.test.ts", 4), // escapes the repo
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(6);
+      expect(result.secrets.dropped).toEqual([]);
+    });
+  });
 
   // anton-yvx9: the `coupling` collector builds its import graph from the source text, so an
   // `import type` — erased by the compiler, with no runtime edge — weighs exactly as much as a value
@@ -4150,6 +4310,39 @@ describe("describeUntrackedFilter", () => {
     expect(line).toContain("dropped 3 signal(s) about 2 path(s)");
     expect(line).toContain("config/.env (critical committed-secret, medium large-binary)");
     expect(line).toContain("anton.db (medium large-binary)");
+  });
+});
+
+describe("describeSecretFilter", () => {
+  const drop = (path: string, line: number, value: string) => ({
+    path,
+    line,
+    kind: "committed-secret",
+    reason: `a test fixture assigning ${JSON.stringify(value)}`,
+  });
+
+  // A silently filtered secret is indistinguishable from a repo that has none, so the count leads
+  // and every entry carries the line and the value that cleared it.
+  it("names the line and the value behind every drop", () => {
+    const line = describeSecretFilter({
+      dropped: [
+        drop("bin/anton.test.ts", 255, "shared-account-secret"),
+        drop("src/lib/beads/bd-env.test.ts", 62, "shared-secret"),
+      ],
+    });
+
+    expect(line).toContain("dropped 2 committed-secret signal(s) over test fixtures");
+    expect(line).toContain(
+      `bin/anton.test.ts:255 (committed-secret — a test fixture assigning "shared-account-secret")`,
+    );
+    expect(line).toContain("src/lib/beads/bd-env.test.ts:62");
+
+    const many = describeSecretFilter({
+      dropped: Array.from({ length: 12 }, (_, i) => drop(`f${i}.test.ts`, i, "fake-secret")),
+    });
+    expect(many).toContain("(+2 more)");
+
+    expect(describeSecretFilter({ dropped: [] })).toBeUndefined();
   });
 });
 

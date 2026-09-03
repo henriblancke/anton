@@ -51,6 +51,7 @@ vi.mock("../stringer", async (importOriginal) => {
       duplication: {
         dropped: [{ path: "src/doc.ts", kind: "code-clone", reason: "6 comment line(s)" }],
       },
+      secrets: { dropped: [] },
       deltaState: { before: "state-1", after: "state-2" },
       restoreBaseline: () => scanned.restoreBaseline(),
     }),

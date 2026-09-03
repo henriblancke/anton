@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
 import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
+import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
 
 const execFileAsync = promisify(execFile);
@@ -183,6 +184,11 @@ export interface ScanResult {
    * signals whose reported block holds no executable statement (see {@link filterDuplicationSignals}).
    */
   duplication: DuplicationFilter;
+  /**
+   * What the fixture filter removed from `signals` before anyone counted them — the committed-secret
+   * signals whose flagged line holds a test placeholder (see {@link filterSecretSignals}).
+   */
+  secrets: SecretFilter;
   /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
   deltaState: DeltaState;
   /**
@@ -592,7 +598,8 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
  *
  * It is also the one seam where a signal can still be dropped from BOTH readers at once — see
- * {@link dropUntrackedSignals}, {@link filterCouplingSignals} and {@link filterDuplicationSignals}.
+ * {@link dropUntrackedSignals}, {@link filterSecretSignals}, {@link filterCouplingSignals} and
+ * {@link filterDuplicationSignals}.
  */
 async function readAnnotatedSignals(
   scanFile: string,
@@ -602,6 +609,7 @@ async function readAnnotatedSignals(
   untracked: UntrackedFilter;
   coupling: CouplingFilter;
   duplication: DuplicationFilter;
+  secrets: SecretFilter;
 }> {
   let parsed: unknown;
   try {
@@ -633,15 +641,18 @@ async function readAnnotatedSignals(
   }
 
   const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
+  // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
+  // should never be paid for a finding the index already contradicted.
+  const { kept: unfaked, secrets } = await filterSecretSignals(repoPath, tracked);
   // Coupling last: it reads the source of the modules a signal names, so it should never be paid for
   // a finding the index already contradicted.
-  const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, tracked);
+  const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, unfaked);
   // Same reason, same order: reading the source at a reported clone window is only worth paying for
   // a finding the index hasn't already contradicted.
   const { kept, duplication } = await filterDuplicationSignals(repoPath, coupled);
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
-  return { signals: kept, untracked, coupling, duplication };
+  return { signals: kept, untracked, coupling, duplication, secrets };
 }
 
 /**
@@ -724,6 +735,7 @@ export async function scan(opts: {
     untracked: read.untracked,
     coupling: read.coupling,
     duplication: read.duplication,
+    secrets: read.secrets,
     deltaState: {
       ...(before ? { before } : {}),
       ...(after ? { after } : {}),
