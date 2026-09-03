@@ -49,6 +49,11 @@ export type {
 } from "./escalations";
 export type { RunHealthFindingKind } from "./run-health";
 
+// The unwatched-park signal's shape (anton-kh98), re-exported type-only for the same reason: the
+// band is rendered under the board's client tree, and a value import of lib/unwatched-parks would
+// drag drizzle + better-sqlite3 into the browser bundle.
+export type { UnwatchedParks, WatcherAutomation } from "./unwatched-parks";
+
 // The rollup's per-run-target child readiness, re-exported type-only for the same reason: the board
 // card renders the verdict, and a value import of lib/epic-graph would drag lib/beads into the
 // browser bundle.

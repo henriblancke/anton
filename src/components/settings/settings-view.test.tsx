@@ -824,11 +824,12 @@ describe("SettingsView automation table (anton-ue90.4 / anton-ue90.5)", () => {
     }
   });
 
-  it("says which automations are idle because the one that feeds them is off", () => {
-    // unstick acts on run-health's findings, and both ship disabled. Without this the operator reads
-    // a healthy no-op as a failure.
+  it("says the unstick row is a no-op while run-health is off", () => {
+    // unstick acts on run-health's findings and IS armed by default, so the row an operator reads
+    // as "hourly, healthy" is doing nothing at all (anton-kh98). The panel has to name the
+    // dependency, or the switch that would fix it is the one switch nobody knows to look at.
     renderView({}, [], stringer());
-    expect(screen.getByText(/idle until run-health is on/)).toBeTruthy();
+    expect(screen.getByText(/a no-op until run-health is on/)).toBeTruthy();
   });
 
   it("PATCHes a cadence built from the frequency picker, with no cron typed", async () => {
