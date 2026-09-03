@@ -26,12 +26,23 @@ describe("assertLinkType (anton-igkb)", () => {
 
   it("rejects conditional-blocks: it blocks, but it is a second spelling of `blocks`", () => {
     expect(() => assertLinkType("conditional-blocks")).toThrow(/refusing dependency type/);
+    // Says it BLOCKS — the no-op story would send the caller after a bug they do not have.
+    expect(() => assertLinkType("conditional-blocks")).toThrow(/BLOCKING edge/);
+    expect(() => assertLinkType("conditional-blocks")).not.toThrow(/NON-BLOCKING/);
+  });
+
+  it("rejects `supersedes` as bd's own write, not as a would-be no-op edge", () => {
+    expect(() => assertLinkType("supersedes")).toThrow(/bd supersede/);
+    expect(() => assertLinkType("supersedes")).not.toThrow(/NON-BLOCKING/);
   });
 
   it("rejects the empty string (which bd itself also rejects) and the case/whitespace variants bd would take", () => {
     expect(() => assertLinkType("")).toThrow(/refusing dependency type/);
-    expect(() => assertLinkType(" blocks")).toThrow(/refusing dependency type/);
-    expect(() => assertLinkType("BLOCKS")).toThrow(/refusing dependency type/);
+    // bd errors on an empty type, so claiming it would write anything is false.
+    expect(() => assertLinkType("")).toThrow(/rejects an empty type/);
+    expect(() => assertLinkType("")).not.toThrow(/NON-BLOCKING/);
+    expect(() => assertLinkType(" blocks")).toThrow(/NON-BLOCKING/);
+    expect(() => assertLinkType("BLOCKS")).toThrow(/NON-BLOCKING/);
   });
 
   it("names the allowed set in the error, so the fix is in the message", () => {

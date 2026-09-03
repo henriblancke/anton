@@ -37,19 +37,6 @@ export function isLinkType(type: string): type is LinkType {
 }
 
 /**
- * Refuse anything outside {@link LINK_TYPES} before it reaches bd. Throws rather than falling back to
- * `blocks`: a caller that asked for a type anton does not write is wrong about what it is writing,
- * and quietly correcting it would hide exactly the bug this guard exists to surface.
- */
-export function assertLinkType(type: string): asserts type is LinkType {
-  if (isLinkType(type)) return;
-  throw new Error(
-    `bd link: refusing dependency type ${JSON.stringify(type)} — bd accepts any string here and ` +
-      `would silently write a NON-BLOCKING edge. Allowed: ${LINK_TYPES.join(", ")}.`,
-  );
-}
-
-/**
  * Types that reach the board without passing through {@link LINK_TYPES}, mapped to the write that
  * puts them there. bd creates these itself, so an audit that reported them as suspicious would
  * report a permanent false positive — they are listed, not hidden, so the distinction stays visible.
@@ -65,6 +52,34 @@ const NON_LINK_WRITERS: Record<string, string> = {
  * ordering than it does, which is the opposite of the mistake this audit exists to surface.
  */
 const BLOCKING_NON_LINK_TYPES = new Set(["conditional-blocks"]);
+
+/**
+ * Why THIS type is refused. The silent-no-op story is true of the typo case only — telling a caller
+ * who passed `conditional-blocks` (which blocks) or `""` (which bd rejects) that bd would quietly
+ * write a dead edge sends them after a bug they do not have.
+ */
+function rejectionReason(type: string): string {
+  if (type === "") return "bd rejects an empty type outright";
+  if (BLOCKING_NON_LINK_TYPES.has(type)) {
+    return "bd would write a BLOCKING edge under a spelling anton does not read for — use `blocks`";
+  }
+  const writtenBy = NON_LINK_WRITERS[type];
+  if (writtenBy) return `bd writes this type itself, via ${writtenBy} — never through a link`;
+  return "bd accepts any string here and would silently write a NON-BLOCKING edge";
+}
+
+/**
+ * Refuse anything outside {@link LINK_TYPES} before it reaches bd. Throws rather than falling back to
+ * `blocks`: a caller that asked for a type anton does not write is wrong about what it is writing,
+ * and quietly correcting it would hide exactly the bug this guard exists to surface.
+ */
+export function assertLinkType(type: string): asserts type is LinkType {
+  if (isLinkType(type)) return;
+  throw new Error(
+    `bd link: refusing dependency type ${JSON.stringify(type)} — ${rejectionReason(type)}. ` +
+      `Allowed: ${LINK_TYPES.join(", ")}.`,
+  );
+}
 
 /** One board edge whose type anton's own seam would not write. */
 export interface StrayEdge {
