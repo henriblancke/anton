@@ -827,9 +827,25 @@ function skipsSourceEntry(name, depth) {
       (STATE_AT_ROOT.has(name) ||
         name.startsWith(".env") ||
         OUTPUT_AT_ROOT.has(name) ||
-        name.startsWith("anton.db") ||
+        isDatabaseEntry(name, DEFAULT_DB_NAME) ||
         BUILD_RECORD_NAME.test(name)))
   );
+}
+
+/** Where `bundleStateEnv` puts the database when nothing has moved it. */
+const DEFAULT_DB_NAME = "anton.db";
+
+/** What SQLite writes beside a database file. Everything else sharing that prefix is somebody's source. */
+const SQLITE_SIDECARS = ["-wal", "-shm", "-journal"];
+
+/**
+ * Is this entry the database or one of its sidecars? Matched by NAME, never by prefix (PR #217
+ * review): a prefix test also swallowed a sibling `anton.db-client.ts`, and a build input excluded
+ * from `source` is one whose edit moves no digest — leaving `buildMatchesCheckout` to hand back a
+ * `.next` compiled before it.
+ */
+function isDatabaseEntry(entry, name) {
+  return entry === name || SQLITE_SIDECARS.some((suffix) => entry === name + suffix);
 }
 
 /**
@@ -847,34 +863,60 @@ function skipsSourceEntry(name, depth) {
  * together — and churn the same way when they are pointed into the tree.
  *
  * Relative values resolve against `appRoot`, exactly as `antonDbOverride` resolves them, so both
- * readers name one file. A path whose directory does not exist registers nothing: there is no entry
- * for a walk to read there either.
+ * readers name one file. Registration does NOT depend on the directory existing yet, and the
+ * DIRECTORIES between the install root and a configured path are reported alongside the predicates
+ * (PR #217 review). A path one level down that nothing has created — `ANTON_SESSIONS_ROOT=var/
+ * sessions` on a fresh install — used to register nothing at all; the first run then created the
+ * whole hierarchy, and while the leaf was excluded from that point on, its brand-new PARENT entered
+ * the digest and reported the running server modified. `holdsOnlyState` is what closes that: an
+ * ancestor holding nothing a walk reads weighs the same whether or not it is there.
+ *
+ * Each predicate is registered under the directory's lexical path AND its resolved one, because the
+ * walk asks with whatever `realpathSync` gave it: the lexical key is the one that survives a
+ * directory that does not exist yet, and the resolved key is the one that matches when a link in
+ * the tree points state somewhere else.
  */
 function runtimeStatePaths(appRoot, env) {
   const byDir = new Map();
+  const ancestors = new Set();
+  let root;
+  try {
+    root = realpathSync(appRoot);
+  } catch {
+    return { byDir, ancestors };
+  }
   const exclude = (configured, matches) => {
-    const path = resolve(appRoot, configured);
-    let dir;
-    try {
-      dir = realpathSync(dirname(path));
-    } catch {
-      return;
-    }
+    const path = resolve(root, configured);
+    // State an operator put OUTSIDE the install is state no source walk ever reaches.
+    if (!path.startsWith(root + sep)) return;
+    const dir = dirname(path);
     const name = basename(path);
-    const existing = byDir.get(dir);
-    if (existing) existing.push((entry) => matches(entry, name));
-    else byDir.set(dir, [(entry) => matches(entry, name)]);
+    for (const key of pathKeys(dir)) {
+      const existing = byDir.get(key);
+      if (existing) existing.push((entry) => matches(entry, name));
+      else byDir.set(key, [(entry) => matches(entry, name)]);
+    }
+    for (let at = dir; at !== root; at = dirname(at)) for (const key of pathKeys(at)) ancestors.add(key);
   };
 
-  // The database, the `-wal`/`-shm` SQLite writes beside it, and the build records that share its
+  // The database, the sidecars SQLite writes beside it, and the build records that share its
   // directory — the one place `listBuildRecords` looks.
   if (env?.ANTON_DB) {
-    exclude(env.ANTON_DB, (entry, name) => entry.startsWith(name) || BUILD_RECORD_NAME.test(entry));
+    exclude(env.ANTON_DB, (entry, name) => isDatabaseEntry(entry, name) || BUILD_RECORD_NAME.test(entry));
   }
   for (const key of ["ANTON_SESSIONS_ROOT", "ANTON_SCANS_ROOT"]) {
     if (env?.[key]) exclude(env[key], (entry, name) => entry === name);
   }
-  return byDir;
+  return { byDir, ancestors };
+}
+
+/** A directory as both readers of it spell it: lexically, and resolved — where it exists to resolve. */
+function pathKeys(dir) {
+  const keys = new Set([dir]);
+  try {
+    keys.add(realpathSync(dir));
+  } catch {}
+  return keys;
 }
 
 /**
@@ -882,13 +924,37 @@ function runtimeStatePaths(appRoot, env) {
  * environment has placed inside the tree.
  */
 function sourceSkip(appRoot, env) {
-  const state = runtimeStatePaths(appRoot, env);
-  if (state.size === 0) return skipsSourceEntry;
-  return (name, depth, dir) => {
+  const { byDir, ancestors } = runtimeStatePaths(appRoot, env);
+  if (byDir.size === 0) return skipsSourceEntry;
+  const skip = (name, depth, dir) => {
     if (skipsSourceEntry(name, depth)) return true;
-    const matchers = state.get(dir);
-    return matchers !== undefined && matchers.some((matches) => matches(name));
+    const matchers = byDir.get(dir);
+    if (matchers !== undefined && matchers.some((matches) => matches(name))) return true;
+    const path = join(dir, name);
+    return ancestors.has(path) && holdsOnlyState(path, skip, depth + 1);
   };
+  return skip;
+}
+
+/**
+ * Does this directory on the way to a configured state path hold nothing a source walk reads?
+ *
+ * Only then is it skipped, so an ancestor weighs the same before and after a run creates it — which
+ * is the whole point — while the same directory holding real source stays an input. `ANTON_DB=state/
+ * anton.db` beside a `state/schema.ts` is exactly that: the database and its sidecars are skipped,
+ * the module is not, and `state` therefore counts.
+ *
+ * An empty directory holds nothing either, so it reads the same as one that is not there yet.
+ * Unreadable is not "nothing" — a directory a walk cannot list is one whose contents cannot be
+ * vouched for, and `readSourceDigest` folds that in as the fact it is.
+ */
+function holdsOnlyState(dir, skip, depth) {
+  try {
+    const resolved = realpathSync(dir);
+    return readdirSync(dir).every((entry) => skip(entry, depth, resolved));
+  } catch {
+    return false;
+  }
 }
 
 /**

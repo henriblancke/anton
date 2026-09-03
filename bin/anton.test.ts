@@ -18,7 +18,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, wr
 import {
   agentsFromArgs,
   cmdStop,
-  daemonExited,
+  daemonState,
   ensureFreshBuild,
   lifecycleVerdict,
   nextArgs,
@@ -504,35 +504,43 @@ describe("the daemon pidfile", () => {
   });
 
   /**
-   * What `anton stop` acts on. `runningPid` going quiet is not the daemon exiting: a birth time
-   * that cannot be reread mid-wait leaves a live daemon unnameable, and stop reading that as death
-   * would drop its SIGKILL and delete the pidfile — stranding a server no later stop can find
-   * (PR #217 review).
+   * What `anton stop` acts on, in both directions. `runningPid` going quiet is not the daemon
+   * exiting: a birth time that cannot be reread mid-wait leaves a live daemon unnameable, and stop
+   * reading that as death would drop its SIGKILL and delete the pidfile — stranding a server no
+   * later stop can find. Nor is "not gone" proof the pid is still the daemon's: the same silence
+   * over a pid the OS has since reused would aim that SIGKILL at a stranger (PR #217 review). So
+   * the unverifiable case answers neither.
    */
   describe("proving the daemon gone", () => {
-    it("is not proven by a pid that is merely unverifiable", async () => {
+    it("proves neither for a pid that is merely unverifiable", async () => {
       const path = await pidFile();
       writePidFile(process.pid, path);
-      expect(daemonExited(path, () => null)).toBe(false);
+      expect(daemonState(process.pid, path, () => null)).toBe("unproven");
       expect(existsSync(path)).toBe(true); // and so the file `anton stop` needs is still there
     });
 
-    it("is not proven while the recorded process is still the one running", async () => {
+    it("proves neither once the pidfile names some other daemon", async () => {
       const path = await pidFile();
       writePidFile(process.pid, path);
-      expect(daemonExited(path)).toBe(false);
+      expect(daemonState(process.pid + 1, path)).toBe("unproven");
+    });
+
+    it("is running while the recorded process is still the one stop signalled", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(daemonState(process.pid, path)).toBe("running");
     });
 
     it("is proven by a dead pid, by a reused one, and by a file that is gone", async () => {
       const path = await pidFile();
       const dead = spawnSync("node", ["-e", "process.exit(0)"]);
       writeFileSync(path, `${dead.pid}\n`);
-      expect(daemonExited(path)).toBe(true);
+      expect(daemonState(dead.pid, path)).toBe("exited");
 
       writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
-      expect(daemonExited(path)).toBe(true);
+      expect(daemonState(process.pid, path)).toBe("exited");
 
-      expect(daemonExited(join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);
+      expect(daemonState(process.pid, join(await dirs.make("anton-state-"), "absent.pid"))).toBe("exited");
     });
   });
 

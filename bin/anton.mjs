@@ -222,7 +222,7 @@ function runningPid(pidFile = PID_FILE) {
  * in the shared reader: this is the process that owns the daemon's lifecycle, while a request path
  * asking the same question must not delete state under it.
  *
- * Both seams are injectable for the reason `daemonExited`'s are: an unverifiable birth time cannot
+ * Both seams are injectable for the reason `daemonState`'s are: an unverifiable birth time cannot
  * be staged over a real process.
  */
 function lifecycleVerdict(pidFile = PID_FILE, startedAtNow = processStartedAt) {
@@ -234,21 +234,33 @@ function lifecycleVerdict(pidFile = PID_FILE, startedAtNow = processStartedAt) {
 }
 
 /**
- * Has the daemon PROVEN gone? True only where the pidfile is stale — the recorded process is dead,
- * or the pid now names something born after it — or where the file is no longer there at all.
+ * What one read PROVES about the daemon `anton stop` is signalling — the two proofs that gate its
+ * wait, off a single snapshot:
  *
- * `runningPid` returning null is NOT that proof (PR #217 review). A stamped pid whose birth time
- * cannot be reread answers null while the daemon may be perfectly alive, and `cmdStop` reading that
- * as death would skip the rest of its wait and its SIGKILL and then delete the pidfile — leaving a
- * live daemon no later `anton stop` can find. So death is asserted, never inferred from silence.
+ *   "running"  — the pidfile still names THIS pid and its birth stamp matches. The only state in
+ *                which escalating to SIGKILL signals the daemon and not a stranger.
+ *   "exited"   — the file is stale (the recorded process is dead, or the pid now names something
+ *                born after it) or no longer there at all. The only state in which stop may drop
+ *                the pidfile and report success.
+ *   "unproven" — alive but unverifiable, or a file that now names a different daemon. Neither
+ *                proof holds, so nothing is signalled and nothing is deleted.
+ *
+ * Both halves are asserted, never inferred from the other's silence (PR #217 review). A stamped pid
+ * whose birth time cannot be reread names nobody: reading that as death would skip the rest of the
+ * wait, drop the SIGKILL and delete the pidfile, leaving a live daemon no later `anton stop` can
+ * find — and reading it as life would send SIGKILL to whatever process now holds the number.
  *
  * Both seams are injectable for the reason `runningPid`'s path is: an unverifiable birth time
  * cannot be staged over a real process.
+ *
+ * @param {number} pid the pid stop is acting on, as the opening read named it
+ * @returns {"running"|"exited"|"unproven"}
  */
-function daemonExited(pidFile = PID_FILE, startedAtNow = processStartedAt) {
-  const { pid, stale } = pidFileVerdict(pidFile, startedAtNow);
-  if (pid !== null) return false;
-  return stale || !existsSync(pidFile);
+function daemonState(pid, pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid: live, stale } = pidFileVerdict(pidFile, startedAtNow);
+  if (live === pid) return "running";
+  if (live === null && (stale || !existsSync(pidFile))) return "exited";
+  return "unproven";
 }
 
 /** Say why a lifecycle command refused to act, and what makes it safe to retry. */
@@ -848,12 +860,18 @@ async function startDaemon(args) {
  * "not running" with rc 0 is a stop that never sent a signal — the lifecycle commands downstream
  * then take that success as proof the port is free. An unverifiable daemon is a retryable failure.
  *
- * Every step after it waits on `daemonExited` rather than on `runningPid` going quiet, and the
- * pidfile is deleted only once that proves the daemon dead (PR #217 review): a birth-time read that
- * fails mid-wait makes a live daemon unnameable, and treating that as its exit would drop the
- * SIGKILL and then remove the one record of the process still holding the port. Keeping the file
- * leaves it for the next `anton stop` to find; the operator is told rather than shown a green tick
- * over a server that never stopped.
+ * Every step after it reads the same tri-state verdict, and the pidfile is deleted only once one of
+ * them proves the daemon dead (PR #217 review). Death is never inferred from silence: a birth-time
+ * read that fails mid-wait makes a live daemon unnameable, and treating that as its exit would drop
+ * the SIGKILL and then remove the one record of the process still holding the port.
+ *
+ * The ESCALATION is gated on the opposite proof (PR #217 review). "Not proven gone" is not proof
+ * the pid is still anton's: a daemon that exits during the grace period frees its number, and if
+ * the OS hands it to something else while the birth-time reader is unavailable — or answers in a
+ * spelling this stamp cannot be compared against — the verdict goes unverifiable, and a SIGKILL on
+ * "not exited" would land on that stranger. So the kill is sent only while the recorded birth stamp
+ * still PROVES the pid is the daemon; anything else is reported and left alone, which is the same
+ * trade every other lifecycle command here makes.
  *
  * Both seams are injectable so the unverifiable branch can be exercised over a fixture — it returns
  * before any signal — matching the other pidfile readers here.
@@ -872,15 +890,24 @@ async function cmdStop(pidFile = PID_FILE, startedAtNow = processStartedAt) {
     return 0;
   }
   try { process.kill(pid, "SIGTERM"); } catch {}
-  const exited = () => daemonExited(pidFile, startedAtNow);
-  for (let i = 0; i < 20 && !exited(); i++) await sleep(150); // up to ~3s grace
-  if (!exited()) {
-    try { process.kill(pid, "SIGKILL"); } catch {}
-    for (let i = 0; i < 10 && !exited(); i++) await sleep(100); // let the kill land
+  // One read per poll, so the proof that gates the signal and the proof that ends the wait cannot
+  // disagree about a process table that moved between them.
+  let state = daemonState(pid, pidFile, startedAtNow);
+  for (let i = 0; i < 20 && state !== "exited"; i++) {
+    await sleep(150); // up to ~3s grace
+    state = daemonState(pid, pidFile, startedAtNow);
   }
-  if (!exited()) {
+  if (state === "running") {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+    for (let i = 0; i < 10 && state !== "exited"; i++) {
+      await sleep(100); // let the kill land
+      state = daemonState(pid, pidFile, startedAtNow);
+    }
+  }
+  if (state !== "exited") {
     console.log(c.yellow(`could not confirm anton stopped (pid ${pid})`) + c.dim(` — keeping ${pidFile}`));
-    console.log(c.dim("  Its birth time could not be reread, so the pid may not be anton's. Re-run `anton stop`."));
+    console.log(c.dim("  Its birth time could not be reread, so the pid may not be anton's — anton will not"));
+    console.log(c.dim("  SIGKILL a process it cannot prove is its own. Re-run `anton stop`."));
     return 1;
   }
   try { unlinkSync(pidFile); } catch {}
@@ -2270,7 +2297,7 @@ export {
   unstampedServers,
   procfsListeningEndpoints,
   runningPid,
-  daemonExited,
+  daemonState,
   lifecycleVerdict,
   cmdStop,
   stoppedFor,

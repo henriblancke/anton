@@ -902,6 +902,28 @@ describe("the source digest of an install no git can describe", () => {
     expect(readBuildIdentity(dir, env).source).not.toBe(first);
   });
 
+  // The database and the sidecars SQLite writes beside it, not everything sharing their prefix
+  // (PR #217 review). A sibling module was excluded from `source` by the same rule, so editing it
+  // moved no digest and `buildMatchesCheckout` handed back a `.next` compiled before it.
+  it("reads a module that merely shares the database's name prefix as the build input it is", () => {
+    const dir = tarball();
+    const env = { ANTON_DB: join("state", "anton.db") };
+    mkdirSync(join(dir, "state"));
+    const client = join(dir, "state", "anton.db-client.ts");
+    writeFileSync(client, SOURCE);
+    const first = readBuildIdentity(dir, env).source;
+
+    writeFileSync(client, SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir, env).source).not.toBe(first);
+
+    // Same rule at the install root, where the default database lives.
+    const atRoot = join(dir, "anton.db-client.ts");
+    writeFileSync(atRoot, SOURCE);
+    const rooted = readBuildIdentity(dir, {}).source;
+    writeFileSync(atRoot, SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir, {}).source).not.toBe(rooted);
+  });
+
   // The other two roots `bundleStateEnv` redirects together churn the same way when an operator
   // points them into the install: a session log is written on every run, a scan on every night.
   it("ignores the session and scan roots wherever they are configured to live", () => {
@@ -918,6 +940,25 @@ describe("the source digest of an install no git can describe", () => {
 
     // An install that never configured them keeps reading those paths as the source they are.
     expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+  });
+
+  // A configured root the install has not created YET (PR #217 review). The exclusion used to be
+  // registered only where the containing directory already existed, so the first run created the
+  // whole hierarchy and its brand-new parent entered the digest — reporting the running server
+  // modified and making the next `anton start` rebuild an artifact that was already current.
+  it("ignores a configured state root whose parent directories do not exist yet", () => {
+    const dir = tarball();
+    const env = { ANTON_SESSIONS_ROOT: join("var", "run", "sessions") };
+    const first = readBuildIdentity(dir, env).source;
+
+    mkdirSync(join(dir, "var", "run", "sessions"), { recursive: true });
+    writeFileSync(join(dir, "var", "run", "sessions", "run.log"), "noise");
+    expect(readBuildIdentity(dir, env).source).toBe(first);
+
+    // Only while those directories hold nothing else: real source appearing beside the state is
+    // build input, and the parent holding it counts again.
+    writeFileSync(join(dir, "var", "run", "helper.ts"), SOURCE);
+    expect(readBuildIdentity(dir, env).source).not.toBe(first);
   });
 
   // Those same names are ordinary source further down — anton's own drift modules live in
