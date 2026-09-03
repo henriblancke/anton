@@ -29,6 +29,7 @@ import {
   openPullRequest,
   pullRequestState,
   readFileAtRev,
+  readPathHistory,
   readWorktreeState,
   resolveFreshBase,
   resolveMergeBase,
@@ -344,6 +345,50 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+});
+
+suite("readPathHistory (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const commit = (msg: string) => {
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", msg]);
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-pathhist-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    commit("init");
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("resolves a single rename to its destination", async () => {
+    writeFileSync(join(repo, "old.ts"), "export const x = 1;\n".repeat(20));
+    commit("add old.ts");
+    g(["mv", "old.ts", "new.ts"]);
+    commit("rename old.ts -> new.ts");
+
+    expect(await readPathHistory(repo, "old.ts")).toEqual({ renamedTo: ["new.ts"], deleted: false });
+  });
+
+  it("reports a removal with no rename paired to it as deleted", async () => {
+    writeFileSync(join(repo, "gone.ts"), "export const gone = true;\n");
+    commit("add gone.ts");
+    g(["rm", "-q", "gone.ts"]);
+    commit("remove gone.ts");
+
+    expect(await readPathHistory(repo, "gone.ts")).toEqual({ renamedTo: [], deleted: true });
   });
 });
 

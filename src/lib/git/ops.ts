@@ -552,19 +552,26 @@ export async function readPathHistory(repoPath: string, path: string): Promise<P
     .filter(Boolean)
     .slice(0, MAX_PATH_REMOVALS);
 
+  // Read in parallel, but keep the newest-first ORDER of the results: `renamedTo` is ordered
+  // history, and the caller reads its first entry as the most recent destination.
+  const statuses = await Promise.all(
+    removals.map((sha) =>
+      git(repoPath, [
+        "-c",
+        "core.quotePath=false",
+        "show",
+        "--name-status",
+        "--format=",
+        "--find-renames",
+        "--no-color",
+        sha,
+      ]),
+    ),
+  );
+
   const renamedTo: string[] = [];
   let deleted = false;
-  for (const sha of removals) {
-    const status = await git(repoPath, [
-      "-c",
-      "core.quotePath=false",
-      "show",
-      "--name-status",
-      "--format=",
-      "--find-renames",
-      "--no-color",
-      sha,
-    ]);
+  for (const status of statuses) {
     // A merge commit prints no name-status at all, so it contributes neither a rename nor a
     // delete — history the caller reads as unfollowable, which is the honest answer.
     for (const line of status.split("\n")) {
