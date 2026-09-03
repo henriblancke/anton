@@ -297,6 +297,46 @@ describe("repairDepMissing", () => {
     expect(listMock).toHaveBeenCalledWith(REPO, ["--status", "all"]);
   });
 
+  it("still resolves the prerequisite on a bd that rejects `--status all`", async () => {
+    // The flag is unsupported on some bd versions and this read's failure is swallowed by the
+    // caller's outer catch — so a direct `bd list --status all` would make every armed repair
+    // silently escalate there. `loadAllIssues` merges the open and closed listings instead.
+    listMock.mockImplementation(async (_repo, extra) => {
+      if (extra?.includes("all")) throw new Error("unknown flag: --status all");
+      return extra?.includes("closed") ? [] : board();
+    });
+
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+    });
+
+    expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ });
+    expect(linkMock).toHaveBeenCalledWith(REPO, TARGET, PREREQ, "blocks");
+  });
+
+  it("KEEPS the edge when only the repair's note fails — the stamp is what the guard reads", async () => {
+    noteMock.mockRejectedValueOnce(new Error("bd note: database is locked"));
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+    });
+
+    // Rolling back here would remove the edge while leaving the suppression label behind, so every
+    // later `dep-missing` block on this bead is refused as a repair whose edge no longer exists.
+    expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ });
+    expect(unlinkMock).not.toHaveBeenCalled();
+    quiet.mockRestore();
+  });
+
   it("takes the edge back when the repair cannot be recorded", async () => {
     tagMock.mockRejectedValueOnce(new Error("bd update: database is locked"));
 

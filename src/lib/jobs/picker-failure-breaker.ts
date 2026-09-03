@@ -241,9 +241,12 @@ async function readRunOutcomes(
         id: run.id,
         epicBeadId: run.epicBeadId,
         // The bead a repair would have acted on inside a grouped run, and when this attempt began —
-        // the two facts the repair weigher orders a failure against (gardener/repair.ts).
+        // the two facts the repair weigher orders a failure against (gardener/repair.ts). The
+        // ATTEMPT's start, not the row's: a parked run resumes in place, so the row's `startedAt`
+        // would place a post-resume failure before the repair that parked it. Rows written before
+        // the column existed fall back to it.
         ticketBeadId: run.ticketBeadId,
-        startedAt,
+        startedAt: run.attemptStartedAt ?? startedAt,
         status: run.status,
         error: run.error,
         // A newer row that somehow starts no later than this one is not a later attempt, so it

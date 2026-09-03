@@ -27,6 +27,7 @@
  * project that has not armed the class gets the edge RESOLVED and recorded rather than drawn (R5.3).
  */
 import { beads, type Bead } from "../beads/bd";
+import { loadAllIssues } from "../beads/issues";
 import { indexBoard, isOpenWork, type BoardIndex } from "./board-index";
 import type { ProposalAutonomy } from "./autonomy";
 import {
@@ -176,6 +177,22 @@ export type DepMissingOutcome =
   | { action: "escalate"; why: string; evidence: string[]; prior?: RepairAttempt };
 
 /**
+ * The whole-board read the prerequisite is resolved against — through `loadAllIssues` rather than a
+ * bare `bd list --status all` (PR #223 review), for the reason `readWholeBoard` states in
+ * apply-steps.ts: that flag is unsupported on some bd versions, and a read that throws here is
+ * swallowed by the caller's outer catch and settles as an ordinary escalation. On such a bd every
+ * armed `dep-missing` repair would silently never run. `loadAllIssues` falls back to merging the
+ * open and closed listings instead.
+ *
+ * GATE-COMPLETE, like every other board read that decides a WRITE: bd omits gate beads from the
+ * ordinary listing while carrying the `blocks` edge a gate puts on the bead it gates, and this read
+ * is what tells a prerequisite that is genuinely open from one that is already settled.
+ */
+function readBoard(repoPath: string): Promise<Bead[]> {
+  return loadAllIssues(repoPath, { strictGates: true });
+}
+
+/**
  * Draw the edge, park the target, record the repair — or refuse.
  *
  * ORDER, and it is the opposite of `ref-stale`'s. There, staleness is checked before the loop guard
@@ -200,9 +217,9 @@ export async function repairDepMissing(args: {
   /** How far this project lets anton go with `dep-missing` (R5.3) — see repair-autonomy.ts. */
   autonomy: ProposalAutonomy;
   /**
-   * The board the prerequisite is resolved against. Read fresh from bd when absent: the snapshot the
-   * run dispatched from predates the session, and a prerequisite that closed meanwhile must not be
-   * parked behind.
+   * The board the prerequisite is resolved against. Read fresh when absent ({@link readBoard}): the
+   * snapshot the run dispatched from predates the session, and a prerequisite that closed meanwhile
+   * must not be parked behind.
    */
   board?: Bead[];
 }): Promise<DepMissingOutcome> {
@@ -210,7 +227,7 @@ export async function repairDepMissing(args: {
   const decision = decideRepair(bead, KLASS, block, autonomy);
   if (decision.action === "escalate") return { ...decision };
 
-  const board = args.board ?? (await beads.list(repoPath, ["--status", "all"]));
+  const board = args.board ?? (await readBoard(repoPath));
   const verdict = resolvePrereq(indexBoard(board), bead.id, block.reason);
   if (verdict.state === "unresolved") {
     return {

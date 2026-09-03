@@ -46,6 +46,14 @@ export interface RunSummary {
 /** Full run summary including its lease/error/pipeline, for the run meta grid. */
 export interface RunDetail extends RunSummary {
   leaseExpiresAt?: number;
+  /**
+   * When the CURRENT attempt on this row began (anton-tebf) — `startedAt` on a fresh run, the
+   * resume instant on a row a resume picked back up. The repair weigher orders a failure against
+   * this rather than `startedAt`, because a parked run resumes IN PLACE and its post-resume failure
+   * would otherwise read as predating the repair that parked it. Absent on rows written before the
+   * column existed.
+   */
+  attemptStartedAt?: number;
   error?: string;
   /**
    * The execute-epic job behind this attempt (anton-rgso) — how the failure breaker tells an

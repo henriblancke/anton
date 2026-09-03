@@ -84,6 +84,7 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
   return {
     ...toSummary(row),
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
+    attemptStartedAt: toEpoch(row.attemptStartedAt),
     error: row.error ?? undefined,
     jobId: row.jobId ?? undefined,
     reviewScore: row.reviewScore ?? undefined,
@@ -148,6 +149,7 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     agentTag: input.agentTag,
     status: input.status ?? "running",
     startedAt: secDate(nowMs),
+    attemptStartedAt: secDate(nowMs),
     updatedAt: secDate(nowMs),
     writeSeq: nextWriteSeq(),
   });
@@ -170,6 +172,8 @@ export type RunPatch = Partial<{
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
+  /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
+  attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
 }>;
 
@@ -185,7 +189,7 @@ export async function updateRun(
     writeSeq: nextWriteSeq(),
   };
   for (const [k, v] of Object.entries(patch)) {
-    if (k === "endedAt" && typeof v === "number") set.endedAt = secDate(v);
+    if ((k === "endedAt" || k === "attemptStartedAt") && typeof v === "number") set[k] = secDate(v);
     else set[k] = v;
   }
   await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));

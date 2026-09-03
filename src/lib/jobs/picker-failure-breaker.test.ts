@@ -42,18 +42,21 @@ function project(settings: Record<string, unknown> = {}): void {
 /**
  * A run that started `startedMinutes` in and settled ten minutes later. `job` names the job behind
  * it — omitted for a row written before that column existed, which is what pins the legacy join.
+ * `attemptMinutes` is when the attempt that settled it BEGAN: given only for a row a resume picked
+ * back up, and omitted (⇒ null, falling back to `startedAt`) for the same legacy reason.
  */
 async function run(input: {
   id: string;
   epic: string;
   status: string;
   startedMinutes: number;
+  attemptMinutes?: number;
   error?: string;
   ticket?: string;
   job?: string;
 }): Promise<void> {
   const startedAt = new Date(T0 + input.startedMinutes * MINUTE);
-  const endedAt = new Date(T0 + (input.startedMinutes + 10) * MINUTE);
+  const endedAt = new Date(T0 + ((input.attemptMinutes ?? input.startedMinutes) + 10) * MINUTE);
   await t.db.insert(schema.runs).values({
     id: input.id,
     projectId: PROJECT,
@@ -63,6 +66,8 @@ async function run(input: {
     status: input.status,
     error: input.error,
     startedAt,
+    attemptStartedAt:
+      input.attemptMinutes === undefined ? null : new Date(T0 + input.attemptMinutes * MINUTE),
     endedAt,
     updatedAt: endedAt,
   });
@@ -471,6 +476,29 @@ describe("checkFailureStreak", () => {
       expect(outcome?.latched).toBe(true);
       expect(outcome?.streak.weight).toBe(3);
       expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
+    });
+
+    it("prices a RESUMED attempt's failure against the repair that parked it", async () => {
+      project();
+      // What a `dep-missing` repair leaves behind: it parks the run behind the edge it drew, and
+      // the blocker-completion resume reuses that same row. The row started before the repair; the
+      // attempt that failed began after it, and that is the one being weighed.
+      await run({
+        id: "r1",
+        epic: "anton-a",
+        status: "failed",
+        startedMinutes: 0,
+        attemptMinutes: 20,
+        error: "blocked: dep-missing",
+      });
+      await run({ id: "r2", epic: "anton-b", status: "failed", startedMinutes: 35, error: "boom" });
+
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 12), bead("anton-b")],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
     });
 
     it("does not count the block that provoked the repair double", async () => {

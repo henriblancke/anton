@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `attempt_started_at` integer;

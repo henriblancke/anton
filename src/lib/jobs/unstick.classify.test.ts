@@ -66,6 +66,7 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     leaseExpiresAt: null,
     error: "usage-limit",
     startedAt: new Date(NOW - 4 * HOUR),
+    attemptStartedAt: new Date(NOW - 4 * HOUR),
     endedAt: null,
     updatedAt: new Date(NOW - HOUR),
     writeSeq: 1,

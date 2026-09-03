@@ -456,10 +456,20 @@ type TicketRepair = RefStaleOutcome | DepMissingOutcome;
  * invent nothing: a pointer rewritten to what it already meant, and an ordering that already exists
  * in reality written down.
  *
- * Runs on the two block kinds that mean "the agent could not do the work": a zero-diff run, and one
- * the agent itself declared incomplete. It never runs on a post-commit failure (the code landed; the
- * bead's pointers are not what stopped it), on an ask (that is a person's to answer), or on a
- * usage-limit park (not a failure at all).
+ * Runs on the two block kinds that mean "the agent could not do the work": a zero-diff run
+ * ({@link NoDeliveryError}), and one the agent itself declared incomplete
+ * ({@link BlockedByAgentError}). It runs on no other failure — not on an ask (that is a person's to
+ * answer), not on a usage-limit park (not a failure at all), and not on any step failure that is
+ * neither of those two: a run that fell over in review, commit or PR stopped on something the
+ * bead's pointers and edges cannot explain.
+ *
+ * COMMITTED WORK IS NOT EXCLUDED, and that is deliberate (PR #223 review). `BlockedByAgentError` is
+ * raised precisely when the tree DID commit and the agent still reported `blocked` — a partial
+ * change plus an honest "this is not done". The block is the agent's own report, so what the repairs
+ * answer is unchanged by the diff: a `dep-missing` report naming a prerequisite still means the rest
+ * of the work cannot start until it lands, and a cited path that has moved is still stale whether or
+ * not something was committed against the old one. What the commit changes is the ticket's fate, and
+ * that is settled elsewhere — the bead is blocked for a human either way.
  *
  * WHICH REPAIR RUNS is decided by the agent's classified report (anton-ie05 / R5.1), and only
  * `dep-missing` needs it: no fact about the bead can tell anton that other work has to land first,
@@ -498,6 +508,9 @@ async function repairBlockedTicket(args: {
   const klass = selfReport?.outcome === "blocked" ? selfReport.klass : undefined;
   const autonomy = resolveRepairAutonomy(run.settings);
   try {
+    // One instant for whichever repair runs — the arms are mutually exclusive, and the stamp is
+    // what the breaker orders a later failure against.
+    const now = clock.now();
     // Read the bead fresh: the snapshot this run dispatched from predates the session, and the
     // repair rewrites the description — or the edges — it is holding.
     const fresh = await beads.show(repo, ticket.id);
@@ -511,7 +524,7 @@ async function repairBlockedTicket(args: {
         repoPath: repo,
         bead: fresh,
         block,
-        now: clock.now(),
+        now,
         autonomy: autonomy["dep-missing"],
       });
       if (outcome.action === "escalate") {
@@ -530,7 +543,7 @@ async function repairBlockedTicket(args: {
       worktreePath,
       bead: fresh,
       block,
-      now: clock.now(),
+      now,
       autonomy: autonomy["ref-stale"],
     });
     if (outcome.action === "escalate") {

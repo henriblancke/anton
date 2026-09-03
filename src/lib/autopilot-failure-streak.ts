@@ -41,9 +41,11 @@ export interface RunOutcome {
    */
   ticketBeadId?: string;
   /**
-   * Unix SECONDS the run started. Carried for the weigher alone: "a failed repair" is a failure that
-   * came AFTER one, and without an instant to order against, the block that provoked the repair
-   * counts as its failure too.
+   * Unix SECONDS this ATTEMPT started — the run's start, or its most recent resume for a row a
+   * resume reused. Carried for the weigher alone: "a failed repair" is a failure that came AFTER
+   * one, and without an instant to order against, the block that provoked the repair counts as its
+   * failure too. The attempt rather than the row, because a `dep-missing` repair parks the run it
+   * repaired and the resume continues in place.
    */
   startedAt?: number;
 }

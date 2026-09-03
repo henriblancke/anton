@@ -176,6 +176,28 @@ describe("the stamp on the bead", () => {
     expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(noteMock.mock.invocationCallOrder[0]!);
   });
 
+  it("keeps a stamped repair when only its note fails to write", async () => {
+    // The label is already durable at that point, so rejecting would hand the caller a failed
+    // outcome it rolls back — leaving the bead suppressed for a repair that no longer exists.
+    noteMock.mockRejectedValueOnce(new Error("bd note: database is locked"));
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const label = await recordRepair(REPO, bead(), "dep-missing", "drew anton-b blocks anton-a", T0);
+
+    expect(label).toBe(repairLabel(BEAD, "dep-missing", T0));
+    expect(tagMock).toHaveBeenCalledWith(REPO, BEAD, [label]);
+    expect(quiet).toHaveBeenCalled();
+    quiet.mockRestore();
+  });
+
+  it("still rejects when the STAMP itself fails — nothing suppressed, so nothing to keep", async () => {
+    tagMock.mockRejectedValueOnce(new Error("bd tag: database is locked"));
+    await expect(recordRepair(REPO, bead(), "dep-missing", "drew the edge", T0)).rejects.toThrow(
+      "bd tag",
+    );
+    expect(noteMock).not.toHaveBeenCalled();
+  });
+
   it("survives the round trip through the board — a later pass reads it back and escalates", async () => {
     await recordRepair(REPO, bead(), "dep-missing", "drew anton-b blocks anton-a, parked anton-a", T0);
     const [, , labels] = tagMock.mock.calls[0]!;

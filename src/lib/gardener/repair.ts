@@ -327,6 +327,14 @@ function blockLine(block: { reason?: string }): string {
  * two writes, the bead is left carrying a repair anton will not repeat, and the escalation that
  * follows a second block says the reasoning was not recorded rather than offering a second repair.
  * Writing the prose first would leave the opposite gap — a bead with a story and no guard.
+ *
+ * Which is exactly why the note is BEST-EFFORT once the stamp lands (PR #223 review). A stamped
+ * repair has happened: rejecting here over the prose would hand the caller a failed outcome it then
+ * rolls back — `dep-missing` removes the edge it just drew, `ref-stale` leaves the corrected bead
+ * blocked — while the suppression label stays durable and refuses every later attempt as a repair
+ * already made. The same half-written bead the crash leaves, but reached deliberately. The failure
+ * is logged and the label returned; the escalation that follows a second block already knows how to
+ * say the reasoning was not recorded.
  */
 export async function recordRepair(
   repoPath: string,
@@ -337,7 +345,11 @@ export async function recordRepair(
 ): Promise<string> {
   const label = repairLabel(bead.id, klass, atMs);
   await beads.tag(repoPath, bead.id, [label]);
-  await beads.note(repoPath, bead.id, repairNote(repairFingerprint(bead.id, klass), attempted));
+  try {
+    await beads.note(repoPath, bead.id, repairNote(repairFingerprint(bead.id, klass), attempted));
+  } catch (e) {
+    console.error(`[repair] ${bead.id} stamped \`${label}\` but its note could not be written`, e);
+  }
   return label;
 }
 
@@ -355,12 +367,24 @@ export const FAILED_REPAIR_WEIGHT = 2;
  * The breaker's weighing hook, built from the board the pass already read.
  *
  * A failed run counts double when the work it carried — the run target or the ticket it stopped
- * inside — carries a repair stamped BEFORE the run started. Both ends of that matter:
+ * inside — carries a repair stamped BEFORE the run's ATTEMPT began. All three of those matter:
  *
  *   • Before, so the block that PROVOKED the repair is not counted as its failure. It was an honest
  *     park; the repair had not happened yet.
  *   • The ticket as well as the target, because a repair acts on the bead that blocked, and inside a
  *     grouped run that is a child, not the epic the run row names.
+ *   • The ATTEMPT rather than the row, because a `dep-missing` repair parks the run behind the edge
+ *     it drew and the blocker-completion resume reuses that same row (PR #223 review). Ordered
+ *     against the row's original start, the resumed attempt's failure would fall BEFORE the repair
+ *     that provoked the park and weigh 1 — defeating the rule for the whole prerequisite path. The
+ *     run's `startedAt` is therefore the attempt's start, rewritten on resume (jobs/runs.ts).
+ *
+ * The stamp is read per BEAD, not per (bead, class): any repair that preceded the attempt makes the
+ * failure count double, even one for a different class. Deliberate, and the conservative reading of
+ * R5.8 — a repair that left the bead failing for some other reason did not unblock it either, and
+ * pricing that by class would need the run row to record which class the failure was, which it does
+ * not. The EARLIEST stamp per bead is the one compared, since the question is only whether any
+ * repair preceded the attempt.
  *
  * A run with no recorded start is weighed plainly. Nothing can be ordered against it, and the fence
  * goes to the cheaper error: one more failure before the breaker fires, rather than a double weight
