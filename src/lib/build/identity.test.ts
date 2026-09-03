@@ -942,10 +942,43 @@ describe("the source digest of an install no git can describe", () => {
     expect(onDisk.source).not.toBe(running.source);
     expect(compareBuild(running, onDisk).state).toBe("modified");
 
-    // Named one by one, not `.env*` wholesale: only these reach a production build, and every other
-    // dot-entry at the root is state anton rewrites while it runs.
+    // Named one by one, not `.env*` wholesale: only these reach a production build, and the other
+    // modes hold per-developer values that would rebuild it for nothing.
     writeFileSync(join(dir, ".env.development"), "NEXT_PUBLIC_URL=dev\n");
     expect(readBuildIdentity(dir, {}).source).toBe(onDisk.source);
+  });
+
+  // A dot-name at the root is not state by virtue of the dot: `next.config.mjs` importing
+  // `./.build-flavor.mjs` compiles that module in, and skipping every root dot-entry left the digest
+  // put while the artifact changed (PR #217 review). Only the names a running anton and its
+  // toolchain rewrite are skipped, one by one.
+  it("walks a root dot-file the build compiles from, and still skips the state beside it", () => {
+    const dir = tarball();
+    const flavor = join(dir, ".build-flavor.mjs");
+    writeFileSync(flavor, "export default 'one';\n");
+    const first = readBuildIdentity(dir, {}).source;
+
+    writeFileSync(flavor, "export default 'two';\n");
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+    writeFileSync(flavor, "export default 'one';\n");
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+
+    // Tracked dot-trees are source too — a checkout digests them, so a git-less install must.
+    mkdirSync(join(dir, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(dir, ".github", "workflows", "ci.yml"), "on: push\n");
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+    rmSync(join(dir, ".github"), { recursive: true });
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+
+    // What a running anton writes is what stays out: the board rewrites `.dolt` on every command,
+    // and `.claude` holds whole isolation worktrees.
+    mkdirSync(join(dir, ".dolt"));
+    writeFileSync(join(dir, ".dolt", "manifest"), "churn");
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "session.json"), "{}");
+    mkdirSync(join(dir, ".beads"));
+    writeFileSync(join(dir, ".beads", "issues.jsonl"), "{}");
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
   });
 
   it("is not read where git can answer, nor for a bundle that needs no rebuild", () => {
@@ -1116,6 +1149,21 @@ describe("the build-time environment in an identity", () => {
       "const env = process.env;\nconst { BUILD_FLAVOR } = env;\nexport default { env: { F: BUILD_FLAVOR } };\n",
     );
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).not.toBe(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env);
+  });
+
+  // `process.env?.BUILD_FLAVOR` is the same read with an optional chain in it, and compiles the same
+  // value in — a pattern stopping at the `?` recorded nothing and let `ensureFreshBuild` reuse an
+  // artifact built with the old configuration (PR #217 review).
+  it("reads a variable the config takes through an optional chain", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.mjs"),
+      'const env = process?.env;\nexport default { env: { F: process.env?.BUILD_FLAVOR, A: process.env?.["ANALYZE"], M: env?.MODE } };\n',
+    );
+    const base = { BUILD_FLAVOR: "one", ANALYZE: "0", MODE: "fast" };
+    expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, MODE: "slow" }).env).not.toBe(readBuildIdentity(dir, base).env);
   });
 
   it("reads the same variable through an indexed access", () => {

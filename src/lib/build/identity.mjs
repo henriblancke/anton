@@ -749,25 +749,53 @@ const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production
 const STATE_AT_ANY_DEPTH = new Set([".git", ".next", ".DS_Store"]);
 
 /**
+ * The dot-named state a running anton and its toolchain rewrite beside the code, named one by one
+ * rather than skipped as "every root dot-entry" (PR #217 review). Each is written by something other
+ * than an edit — the board's database on every `bd` command, `.anton`/`.stringer` on every run,
+ * `.claude` on every agent session (and it holds whole isolation worktrees), the tool caches on
+ * every build — so a digest reading them would move without the source moving.
+ *
+ * A dot-name that is NOT on this list is ordinary source: `.build-flavor.mjs` imported by
+ * `next.config.mjs`, `.github/`, `.husky/`, `.product/`. The blanket skip hid every one of them, so
+ * editing one left `readBuildIdentity().source` unchanged and `buildMatchesCheckout` reused a
+ * `.next` compiled from the previous configuration. A checkout has no such hole — those files are
+ * tracked, so the worktree digest reads them — and this is what matches a git-less install to it.
+ */
+const STATE_AT_ROOT = new Set([
+  ".anton",
+  ".beads",
+  ".beads-credential-key",
+  ".dolt",
+  ".stringer",
+  ".claude",
+  ".vercel",
+  ".turbo",
+  ".swc",
+  ".cache",
+  ".eslintcache",
+]);
+
+/**
  * Is this entry outside the source a build compiles from? `depth` is 0 for the entries of the
  * install root itself.
  *
- * The dot-skip is ROOT-level, plus the handful of names above (PR #217 review). What a running anton
- * rewrites is dot-named — `.next`, `.git`, `.anton`, `.beads`, `.dolt` — and every one of them lives
- * at the install root, so skipping dot-entries at every depth bought nothing there and hid real
- * build inputs further down: a `next.config.mjs` importing `./src/.config/flavor.mjs` compiles that
- * module's contents into the artifact while the digest stayed put, and `buildMatchesCheckout`
- * accepted the `.next` compiled before the edit. This repo ships such a tree itself
- * (`skills/setup/templates/.product`, `.beads`).
+ * State is skipped by NAME and at the ROOT (PR #217 review). Both halves were once broader and both
+ * hid real build inputs: excluding a name at every depth made an edit to this repo's own
+ * `src/lib/build/` invisible, and excluding every root dot-entry hid a config's `./.build-flavor.mjs`
+ * and its `.github/` alike. What a running anton rewrites is dot-named AND lives at the install root,
+ * which is exactly what `STATE_AT_ROOT` lists; a dot-named directory below it is source (this repo
+ * ships `skills/setup/templates/.product` itself).
  *
- * The env files a production build LOADS are the one exception to the root skip, named individually
- * (PR #217 review). `readEnvDigest` carries them too, but that field answers freshness only —
- * `compareBuild` never weighs it, because its other half is the reading shell's own environment. So
- * a git-less install editing `.env.local` under a running server moved nothing a VERDICT reads: the
- * dot-skip hid the file from `source`, and both doctor and the health page called the server current
- * while a `NEXT_PUBLIC_*` value it no longer holds stayed live in the served bundle. A checkout never
- * had that hole — `ignoredEnvFiles` folds the same files into the worktree digest, which is compared
- * — so naming them here is what makes a git-less install's evidence match.
+ * `.env*` is the one family still skipped wholesale at the root, minus the files a production build
+ * LOADS, which are named back in (PR #217 review). `readEnvDigest` carries those too, but that field
+ * answers freshness only — `compareBuild` never weighs it, because its other half is the reading
+ * shell's own environment. So a git-less install editing `.env.local` under a running server moved
+ * nothing a VERDICT reads: the dot-skip hid the file from `source`, and both doctor and the health
+ * page called the server current while a `NEXT_PUBLIC_*` value it no longer holds stayed live in the
+ * served bundle. A checkout never had that hole — `ignoredEnvFiles` folds the same files into the
+ * worktree digest, which is compared — so naming them here is what makes a git-less install's
+ * evidence match. The other `.env.<mode>` files reach no production build at all, and hold
+ * per-developer values that would rebuild it for nothing.
  *
  * `node_modules` is skipped at every depth for the same reason as the state above: nested ones hold
  * dependencies too, and a dependency is never the source this install is judged on. What anton
@@ -781,7 +809,8 @@ function skipsSourceEntry(name, depth) {
     name.endsWith(".tsbuildinfo") ||
     STATE_AT_ANY_DEPTH.has(name) ||
     (depth === 0 &&
-      (name.startsWith(".") ||
+      (STATE_AT_ROOT.has(name) ||
+        name.startsWith(".env") ||
         OUTPUT_AT_ROOT.has(name) ||
         name.startsWith("anton.db") ||
         BUILD_RECORD_NAME.test(name)))
@@ -833,15 +862,23 @@ const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
  */
 const NEXT_CONFIG_FILES = ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.mts"];
 
-/** How `process.env` itself is spelled — the source every read below hangs off. */
-const PROCESS_ENV = String.raw`process\s*\.\s*env`;
+/**
+ * How `process.env` itself is spelled — the source every read below hangs off, with the optional
+ * chain `process?.env` spelled too (PR #217 review): it is valid, it compiles the same value in, and
+ * a pattern stopping at the `?` records nothing for it.
+ */
+const PROCESS_ENV = String.raw`process\s*\??\.\s*env`;
 
 /** A quoted key, in any of the three string delimiters: the `["NAME"]` half of an env read. */
 const QUOTED_KEY = "[\"'`]([^\"'`]+)[\"'`]";
 
-/** One read off `source`: `source.NAME` or `source["NAME"]`. */
+/**
+ * One read off `source`: `source.NAME` or `source["NAME"]`, each in its optional-chained spelling
+ * too — `source?.NAME`, `source?.["NAME"]` (PR #217 review). Reading a variable through `?.` has the
+ * same build-time effect as reading it directly, so a name it spells has to be recorded the same.
+ */
 const envRead = (source) =>
-  new RegExp(`${source}\\s*(?:\\.\\s*([A-Za-z_$][\\w$]*)|\\[\\s*${QUOTED_KEY}\\s*\\])`, "g");
+  new RegExp(`${source}\\s*(?:\\??\\.\\s*([A-Za-z_$][\\w$]*)|(?:\\?\\.)?\\s*\\[\\s*${QUOTED_KEY}\\s*\\])`, "g");
 
 /**
  * The bindings of a destructured read — `const { BUILD_FLAVOR } = process.env` — which names a
@@ -857,7 +894,10 @@ const envDestructure = (source) => new RegExp(String.raw`\{([^{}]*)\}\s*(?::[^=]
  * The binding's own name is captured and the reads above are run against it too, so an alias costs
  * one extra pass rather than a blind spot.
  */
-const CONFIG_ENV_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*process\s*\.\s*env\b/g;
+const CONFIG_ENV_ALIAS = new RegExp(
+  String.raw`(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*${PROCESS_ENV}\b`,
+  "g",
+);
 
 /**
  * One bound name in that pattern: whatever sits in KEY position — at the start or after a comma —
