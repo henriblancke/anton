@@ -23,7 +23,6 @@
 import { beads } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import {
-  EVEN_WEIGHT,
   describeFailureStreak,
   detectFailureStreak,
   failureStreakEvidence,
@@ -38,6 +37,7 @@ import {
   lastReArmAt,
   settledAfterReArm,
 } from "../autopilot-disarm";
+import { repairedFailureWeight } from "../gardener/repair";
 import { isActiveRun } from "@/components/runs/run-view-utils";
 import { getProjectSettings, resolveFailureBreaker } from "../projects";
 import { listRecentRunOutcomes, type RunDetail } from "../runs";
@@ -141,7 +141,11 @@ export interface FailureBreakerInput {
   projectId: string;
   /** The board the pass just read — how an abandoned target is recognised, at no extra `bd` call. */
   board: readonly Bead[];
-  /** Absent → every failure counts once. The seam a failed auto-repair later counts double through. */
+  /**
+   * How a failed run is priced against the threshold. Absent → {@link repairedFailureWeight} over
+   * `board`, which is the live rule: a failure that followed an auto-repair counts double (R5.8).
+   * Passed explicitly only by tests pinning the arithmetic itself.
+   */
   weigh?: FailureWeight;
 }
 
@@ -176,7 +180,7 @@ export async function checkFailureStreak(
   if (!config || disarmed) return undefined;
 
   const since = await lastReArmAt(db, projectId);
-  const weigh = input.weigh ?? EVEN_WEIGHT;
+  const weigh = input.weigh ?? repairedFailureWeight(input.board);
   const outcomes = await readRunOutcomes(db, projectId, input.board, {
     threshold: config.threshold,
     weigh,
@@ -236,6 +240,10 @@ async function readRunOutcomes(
       const outcome: RunOutcome = {
         id: run.id,
         epicBeadId: run.epicBeadId,
+        // The bead a repair would have acted on inside a grouped run, and when this attempt began —
+        // the two facts the repair weigher orders a failure against (gardener/repair.ts).
+        ticketBeadId: run.ticketBeadId,
+        startedAt,
         status: run.status,
         error: run.error,
         // A newer row that somehow starts no later than this one is not a later attempt, so it

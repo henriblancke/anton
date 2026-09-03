@@ -18,6 +18,7 @@ import {
 import { listOpenEscalations, toEscalationView } from "../escalations";
 import type { Bead } from "../beads/types";
 import type { Clock } from "./queue";
+import { repairLabel } from "../gardener/repair";
 import { checkFailureStreak } from "./picker-failure-breaker";
 import { insertProject } from "@/lib/testing/project";
 
@@ -87,6 +88,11 @@ async function cancelledJob(epic: string, atMinutes: number): Promise<string> {
 
 function bead(id: string, labels: string[] = []): Bead {
   return { id, title: id, status: "closed", labels };
+}
+
+/** The bead as an auto-repair leaves it: the guard stamp, made `minutes` into the window. */
+function repairedBead(id: string, minutes: number): Bead {
+  return { id, title: id, status: "open", labels: [repairLabel(id, "ref-stale", T0 + minutes * MINUTE)] };
 }
 
 /** Three failing runs, ten minutes apart — a streak at the default threshold. */
@@ -434,6 +440,82 @@ describe("checkFailureStreak", () => {
     const again = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
     expect(again?.latched).toBe(true);
     expect(again?.streak.runs.map((r) => r.id)).toEqual(["r4", "r5", "r6"]);
+  });
+
+  /**
+   * The R5.8 half of the loop guard, end to end over real run rows: a run that failed AFTER anton
+   * repaired its bead is two failures, not one, so the breaker reaches the operator's threshold in
+   * fewer runs than a streak of honest parks would take.
+   */
+  describe("after an auto-repair", () => {
+    /** The block, then the failure that followed the repair — two runs on one bead. */
+    async function blockThenFailAgain(): Promise<void> {
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "failed", startedMinutes: 15, error: "blocked: ref-stale" });
+    }
+
+    it("trips the breaker sooner than the same two failures unrepaired", async () => {
+      project();
+      await blockThenFailAgain();
+
+      // Two failures at the default threshold of 3: not yet a broken environment.
+      expect(
+        await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [bead("anton-a")] }),
+      ).toBeUndefined();
+
+      // The same two runs, with anton's repair stamped between them.
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 12)],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+      expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r1", "r2"]);
+    });
+
+    it("does not count the block that provoked the repair double", async () => {
+      project();
+      await blockThenFailAgain();
+
+      // Repaired AFTER both runs — nothing in this streak followed it, so nothing weighs double.
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [repairedBead("anton-a", 90)],
+        }),
+      ).toBeUndefined();
+    });
+
+    it("prices a repair made on the TICKET a grouped run stopped inside", async () => {
+      project();
+      await run({ id: "r1", epic: "anton-epic", status: "failed", startedMinutes: 0, error: "boom" });
+      await run({
+        id: "r2",
+        epic: "anton-epic",
+        ticket: "anton-t1",
+        status: "failed",
+        startedMinutes: 15,
+        error: "boom",
+      });
+
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [bead("anton-epic"), repairedBead("anton-t1", 12)],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+    });
+
+    it("leaves a board with no repairs weighing every failure once", async () => {
+      project();
+      await blockThenFailAgain();
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [bead("anton-a"), repairedBead("anton-unrelated", 12)],
+        }),
+      ).toBeUndefined();
+    });
   });
 
   it("counts a failure double under the caller's weigher", async () => {
