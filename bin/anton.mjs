@@ -173,23 +173,49 @@ function writePidFile(pid, pidFile = PID_FILE) {
  * crashed without clearing its pidfile leaves a pid the OS reuses, and signal 0 alone would then
  * report an unrelated process as anton's server (PR #217).
  *
- * Only a file that read PROVES stale is deleted (PR #217 review). A stamped pid whose birth time
- * cannot be reread names nobody either, but deleting it would strand a daemon that is merely
- * unverifiable this second — `anton stop` could then never find it again.
- *
- * Clearing what that read rejects belongs HERE and not in the shared reader: this is the process
- * that owns the daemon's lifecycle, while a request path asking the same question must not delete
- * state under it.
+ * Only the pid half of the verdict, for readers that have nothing irreversible to do with the
+ * answer (`status` lines, doctor's server sweep). A command that ACTS on the daemon takes the whole
+ * snapshot from `lifecycleVerdict` instead — silence here is not proof that nothing is running.
  *
  * The path is injectable so the reuse case can be exercised over a fixture, matching the other
  * seams here (`staleSkills`, `unstampedServers`); every caller passes nothing and gets the real one.
  */
 function runningPid(pidFile = PID_FILE) {
-  const { pid, stale } = pidFileVerdict(pidFile);
+  return lifecycleVerdict(pidFile).pid;
+}
+
+/**
+ * One pidfile read for one lifecycle decision: `pid` while the recorded daemon is provably the one
+ * running, and `unverifiable` naming the pid this machine cannot prove either way — the daemon, or
+ * the stranger the OS handed its number to.
+ *
+ * `pid` alone answers null in both the stopped case and the unverifiable one, which every lifecycle
+ * command would otherwise read as proof that nothing is running: `start` spawns a duplicate and
+ * overwrites the live daemon's pidfile (leaving the original unmanageable, while the duplicate dies
+ * on the occupied port), `update` swaps the runtime out from under it and `uninstall` deletes it.
+ * None of those are recoverable by the next read that works, so they refuse to act rather than
+ * guess.
+ *
+ * Both fields come off ONE snapshot for the same reason (PR #217 review). Asking for the
+ * unverifiable pid and then for the running one reads the process table twice, and a birth time
+ * that resolves on the first read and fails on the second clears the pre-flight and then answers
+ * null — landing on exactly the destructive branch the pre-flight exists to prevent.
+ *
+ * Only a file the read PROVES stale is cleared. A stamped pid whose birth time cannot be reread
+ * names nobody either, but deleting it would strand a daemon that is merely unverifiable this
+ * second — `anton stop` could then never find it again. And the clearing belongs here rather than
+ * in the shared reader: this is the process that owns the daemon's lifecycle, while a request path
+ * asking the same question must not delete state under it.
+ *
+ * Both seams are injectable for the reason `daemonExited`'s are: an unverifiable birth time cannot
+ * be staged over a real process.
+ */
+function lifecycleVerdict(pidFile = PID_FILE, startedAtNow = processStartedAt) {
+  const { pid, stale, unverifiable } = pidFileVerdict(pidFile, startedAtNow);
   if (stale) {
     try { unlinkSync(pidFile); } catch {}
   }
-  return pid;
+  return { pid, unverifiable };
 }
 
 /**
@@ -208,23 +234,6 @@ function daemonExited(pidFile = PID_FILE, startedAtNow = processStartedAt) {
   const { pid, stale } = pidFileVerdict(pidFile, startedAtNow);
   if (pid !== null) return false;
   return stale || !existsSync(pidFile);
-}
-
-/**
- * The pid a pidfile names that this machine cannot prove either way — the daemon, or the stranger
- * the OS handed its number to. Null whenever the read settled it (PR #217 review).
- *
- * `runningPid` answers null here, which every lifecycle command below would otherwise read as proof
- * that nothing is running: `start` spawns a duplicate and overwrites the live daemon's pidfile
- * (leaving the original unmanageable, while the duplicate dies on the occupied port), `update` swaps
- * the runtime out from under it and `uninstall` deletes it. None of those are recoverable by the
- * next read that works, so they refuse to act rather than guess.
- *
- * The seam is injectable for the reason `daemonExited`'s is: an unverifiable birth time cannot be
- * staged over a real process.
- */
-function unverifiableDaemon(pidFile = PID_FILE, startedAtNow = processStartedAt) {
-  return pidFileVerdict(pidFile, startedAtNow).unverifiable;
 }
 
 /** Say why a lifecycle command refused to act, and what makes it safe to retry. */
@@ -758,12 +767,11 @@ function ensureMigrated(opts = {}) {
 
 /** Daemonize `next start` from the bundle, redirecting output to the persistent state log dir. */
 async function startDaemon(args) {
-  const unverifiable = unverifiableDaemon();
+  const { pid: running, unverifiable } = lifecycleVerdict();
   if (unverifiable) {
     reportUnverifiableDaemon(unverifiable, "start");
     return 1;
   }
-  const running = runningPid();
   const port = resolvePort(args) ?? "3000";
   if (running) {
     console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${port}`));
@@ -878,7 +886,7 @@ async function cmdStop(pidFile = PID_FILE, startedAtNow = processStartedAt) {
  * `update` and `uninstall` used to discard `cmdStop`'s result: a stop that could NOT confirm the
  * daemon dead returns 1 and deliberately keeps the pidfile, and running on past that swaps the
  * runtime out from under a live server, or deletes it (with `--purge`, its state too). The
- * pre-flight `unverifiableDaemon` check both commands make cannot cover this — the failure happens
+ * pre-flight `lifecycleVerdict` check both commands make cannot cover this — the failure happens
  * later, in stop's own polling loop.
  */
 async function stoppedFor(action, pidFile = PID_FILE, startedAtNow = processStartedAt) {
@@ -890,8 +898,7 @@ async function stoppedFor(action, pidFile = PID_FILE, startedAtNow = processStar
 
 /** Print install/runtime/state paths and whether the daemon is running. */
 function cmdStatus(args) {
-  const pid = runningPid();
-  const unverifiable = pid ? null : unverifiableDaemon();
+  const { pid, unverifiable } = lifecycleVerdict();
   const port = serverPort(args, resolveAntonDb());
   console.log(c.bold("anton status"));
   console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
@@ -1020,13 +1027,13 @@ async function cmdUpdate() {
     return 1;
   }
 
-  const unverifiable = unverifiableDaemon();
+  const { pid: livePid, unverifiable } = lifecycleVerdict();
   if (unverifiable) {
     reportUnverifiableDaemon(unverifiable, "update");
     rmSync(tmp, { recursive: true, force: true });
     return 1;
   }
-  const wasRunning = !!runningPid();
+  const wasRunning = !!livePid;
   if (wasRunning && !(await stoppedFor("update"))) {
     rmSync(tmp, { recursive: true, force: true });
     return 1;
@@ -1055,12 +1062,12 @@ async function cmdUninstall(args = []) {
     console.log(c.yellow("`anton uninstall` applies to an installed bundle only."));
     return 1;
   }
-  const unverifiable = unverifiableDaemon();
+  const { pid: livePid, unverifiable } = lifecycleVerdict();
   if (unverifiable) {
     reportUnverifiableDaemon(unverifiable, "uninstall");
     return 1;
   }
-  if (runningPid() && !(await stoppedFor("uninstall"))) return 1;
+  if (livePid && !(await stoppedFor("uninstall"))) return 1;
   rmSync(INSTALL_ROOT, { recursive: true, force: true });
   try { unlinkSync(BIN_LINK); } catch {}
   if (args.includes("--purge")) {
@@ -2257,7 +2264,7 @@ export {
   procfsListeningEndpoints,
   runningPid,
   daemonExited,
-  unverifiableDaemon,
+  lifecycleVerdict,
   cmdStop,
   stoppedFor,
   writePidFile,

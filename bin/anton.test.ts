@@ -20,16 +20,18 @@ import {
   cmdStop,
   daemonExited,
   ensureFreshBuild,
+  lifecycleVerdict,
   nextArgs,
   procfsListeningEndpoints,
   resolveAntonDb,
   resolvePort,
   runningPid,
   stoppedFor,
-  unverifiableDaemon,
   unstampedServers,
   writePidFile,
 } from "./anton.mjs";
+
+import { processStartedAt } from "../src/lib/build/identity.mjs";
 
 import { CLI, REPO_ROOT, run, seedOtherRelease, tempDirs, writeFakeBd } from "./anton.fixture";
 
@@ -445,30 +447,52 @@ describe("the daemon pidfile", () => {
 
   /**
    * What `anton start`, `anton update` and `anton uninstall` act on (PR #217 review). Those three
-   * read `runningPid`'s silence as "nothing is running" and then do something irreversible to a
-   * daemon that may be alive — spawn a duplicate over its pidfile, swap the runtime under it, delete
-   * it. So the unverifiable case is reported as its own state and they abort instead.
+   * read a null pid as "nothing is running" and then do something irreversible to a daemon that may
+   * be alive — spawn a duplicate over its pidfile, swap the runtime under it, delete it. So the
+   * unverifiable case is reported as its own state and they abort instead.
    */
   describe("a daemon that cannot be verified either way", () => {
     it("names the recorded pid so a lifecycle command can refuse to act", async () => {
       const path = await pidFile();
       writePidFile(process.pid, path);
-      expect(unverifiableDaemon(path, () => null)).toBe(process.pid);
+      expect(lifecycleVerdict(path, () => null)).toEqual({ pid: null, unverifiable: process.pid });
     });
 
     it("names nobody once the read settles it — live, reused, dead, or absent", async () => {
       const path = await pidFile();
       writePidFile(process.pid, path);
-      expect(unverifiableDaemon(path)).toBeNull();
+      expect(lifecycleVerdict(path).unverifiable).toBeNull();
 
       writeFileSync(path, `${process.pid}\na process that has exited\n`);
-      expect(unverifiableDaemon(path)).toBeNull();
+      expect(lifecycleVerdict(path).unverifiable).toBeNull();
 
       const dead = spawnSync("node", ["-e", "process.exit(0)"]);
       writeFileSync(path, `${dead.pid}\n`);
-      expect(unverifiableDaemon(path)).toBeNull();
+      expect(lifecycleVerdict(path).unverifiable).toBeNull();
 
-      expect(unverifiableDaemon(join(await dirs.make("anton-state-"), "absent.pid"))).toBeNull();
+      expect(lifecycleVerdict(join(await dirs.make("anton-state-"), "absent.pid")).unverifiable).toBeNull();
+    });
+
+    /**
+     * The two fields have to be ONE read (PR #217 review). Split across two, a birth time that
+     * resolves once and fails the next second clears the pre-flight and then reports no daemon —
+     * and `update` swaps the runtime out from under the live server it just decided was absent.
+     */
+    it("answers both halves of the decision from a single birth-time read", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      const reads: number[] = [];
+      // Resolves for the pre-flight, fails for anything asking a second time.
+      const flaky = (pid: number) => {
+        reads.push(pid);
+        return reads.length === 1 ? processStartedAt(pid) : null;
+      };
+
+      const verdict = lifecycleVerdict(path, flaky);
+
+      expect(reads).toHaveLength(1);
+      expect(verdict).toEqual({ pid: process.pid, unverifiable: null });
+      expect(existsSync(path)).toBe(true);
     });
   });
 
