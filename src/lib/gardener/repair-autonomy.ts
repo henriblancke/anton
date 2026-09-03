@@ -42,6 +42,8 @@ export type RepairAutonomyOverrides = Partial<RepairAutonomyPolicy>;
  * is not "armed to write", and a project that upgrades into this feature must not wake up to anton
  * having rewritten its beads. Shadow is what makes arming them an informed act rather than a leap:
  * a week of records says what `apply` would have done, on this board, in the repair's own words.
+ * Those records are a note on the ticket and a line in the run's log: the dial gates the FIX, never
+ * anton's account of it — a repair files no bead, so there is nowhere else that account could live.
  *
  * The INVENTIVE pair (R5.5) ships at `propose` — anton has no repair for them yet, and a class with
  * no implementation must not read as merely unarmed.

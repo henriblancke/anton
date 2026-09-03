@@ -9,7 +9,9 @@
  *
  * The levels also mean something slightly different on this side, which is why the hints are written
  * out rather than reused: at `propose` a repair is not filed anywhere, it is ESCALATED — the run
- * parks and asks a human.
+ * parks and asks a human. And the dial gates the FIX, not the account of it: at every level anton
+ * leaves one note on the ticket saying what it repaired, refused, or would have done, because a
+ * repair files no bead and that note is the only record a founder can read (see the legend below).
  *
  * Mirrored from src/lib/gardener/repair-autonomy.ts rather than imported: this module tree is
  * client-side, and importing the pass's code to get four strings would drag the board reader,
@@ -23,7 +25,7 @@ export type RepairAutonomy = ProposalAutonomy;
 /** What each level means for a REPAIR — not for a proposal. See the module header. */
 export const REPAIR_LEVEL_HINT: Record<RepairAutonomy, string> = {
   propose: "escalates · the run parks and a human is asked",
-  shadow: "works the fix out and notes what it WOULD have written · the board is untouched",
+  shadow: "works the fix out and writes no fix · a note on the bead says what it would have done",
   apply: "writes the fix to the bead unattended and the run carries on",
 };
 

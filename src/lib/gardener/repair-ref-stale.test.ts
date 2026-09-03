@@ -302,6 +302,41 @@ suite("ref-stale, against a real git history", () => {
       expect(noteMock.mock.calls[0]![2]).toContain(repairFingerprint(BEAD, "ref-stale"));
     });
 
+    it("keeps a rewrite whose stamp failed, unstamped — the pointer is already correct", async () => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      tagMock.mockRejectedValueOnce(new Error("bd tag exploded"));
+      const description = contract("touches: `src/moved.ts` and `src/here.ts`.");
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(description),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+      errors.mockRestore();
+
+      // The fix landed, so the outcome is `repaired` and the ticket is re-queued. Rejecting instead
+      // would block a bead anton had already corrected, and no later pass would find it again —
+      // every path resolves now, so the next `ref-stale` check answers `none`.
+      expect(outcome).toMatchObject({
+        action: "repaired",
+        rewrites: [{ from: "src/moved.ts", to: "src/lib/renamed.ts" }],
+      });
+      expect(outcome.action === "repaired" && outcome.label).toBeUndefined();
+      expect(updateMock).toHaveBeenCalledWith(
+        repo,
+        BEAD,
+        { description: description.replace("src/moved.ts", "src/lib/renamed.ts") },
+        [],
+      );
+      // The bead says it is unstamped rather than carrying a silently rewritten description — and
+      // carries no fingerprint, because nothing suppresses a later repair of this class.
+      const note = noteMock.mock.calls.at(-1)![2];
+      expect(note).toContain("could not stamp it");
+      expect(note).not.toContain(repairFingerprint(BEAD, "ref-stale"));
+    });
+
     it("armed at `shadow`: works the rewrite out and writes NOTHING (R5.3)", async () => {
       const description = contract("touches: `src/moved.ts` and `src/here.ts`.");
       const outcome = await repairRefStale({

@@ -34,6 +34,7 @@ import {
   decideRepair,
   recordRepair,
   refusalNote as refusal,
+  unstampedNote,
   type RepairAttempt,
   type RepairedBead,
 } from "./repair";
@@ -260,7 +261,11 @@ export interface PathRewrite {
  */
 export type RefStaleOutcome =
   | { action: "none"; why: string }
-  | { action: "repaired"; label: string; description: string; rewrites: PathRewrite[]; attempted: string }
+  /**
+   * The rewrite landed. `label` is absent only when the stamp that follows it failed — the fix
+   * stands unstamped rather than being taken back; see {@link stampRewrite}.
+   */
+  | { action: "repaired"; label?: string; description: string; rewrites: PathRewrite[]; attempted: string }
   /**
    * Armed at `shadow`: the rewrite anton worked out and did NOT write. Carries the same fields the
    * armed outcome does, minus the stamp — there is no label because nothing was stamped, and the
@@ -285,7 +290,8 @@ export interface RefStaleBead extends RepairedBead {
  * The WRITE order is repair.ts's: the description, then the stamp. A crash between them leaves a
  * bead that is correct and unstamped — it can be repaired again, which is the survivable direction.
  * The reverse would leave a bead stamped for a repair that never landed and no second attempt
- * allowed.
+ * allowed. A stamp that FAILS rather than crashing is settled the same way, deliberately — see
+ * {@link stampRewrite}.
  */
 export async function repairRefStale(args: {
   /** Where bd writes go — the project's beads workspace. */
@@ -349,8 +355,39 @@ export async function repairRefStale(args: {
   }
 
   await beads.update(repoPath, bead.id, { description: rewritten }, bead.labels);
-  const label = await recordRepair(repoPath, bead, KLASS, attempted, now);
-  return { action: "repaired", label, description: rewritten, rewrites, attempted };
+  const label = await stampRewrite(repoPath, bead, attempted, now);
+  return { action: "repaired", ...(label ? { label } : {}), description: rewritten, rewrites, attempted };
+}
+
+/**
+ * Stamp a rewrite that has ALREADY landed — and keep the repair when the stamp is what failed.
+ *
+ * The opposite of `dep-missing`'s answer to the same window ({@link revertPrereqEdge}), because the
+ * two writes are not the same kind of thing. An unrecorded `blocks` edge holds other work back with
+ * nothing on the board explaining it, so that repair takes its edge back; a rewritten pointer is
+ * simply CORRECT — taking it back would restore a path that points nowhere and block the ticket on
+ * a fact anton had already resolved. So the rewrite stands and the ticket is re-queued (PR #223
+ * review). Rejecting here instead would settle the block with the bead already fixed, and the fix
+ * would never be found again: the next pass sees every path present and answers `none`.
+ *
+ * What the missing stamp costs is the breaker's double weight on a later failure (R5.8), not the
+ * loop guard (R5.6) — for that same reason a second `ref-stale` pass over this bead answers `none`
+ * whether or not a label suppresses it. The note is best-effort, and says the fix landed unstamped
+ * so a human reading the bead is not left with a silently rewritten description.
+ */
+async function stampRewrite(
+  repoPath: string,
+  bead: RefStaleBead,
+  attempted: string,
+  now: number,
+): Promise<string | undefined> {
+  try {
+    return await recordRepair(repoPath, bead, KLASS, attempted, now);
+  } catch (e) {
+    console.error(`[repair] ${bead.id} was rewritten but its repair could not be stamped`, e);
+    await beads.note(repoPath, bead.id, unstampedNote(KLASS, attempted)).catch(() => {});
+    return undefined;
+  }
 }
 
 /**

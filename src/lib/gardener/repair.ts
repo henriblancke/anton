@@ -9,7 +9,12 @@
  *   • THE PROJECT MUST HAVE ARMED IT. A repair is an unattended write to the founder's board, so it
  *     sits behind a per-class trust dial exactly as every other autonomous write does (R5.3) — see
  *     repair-autonomy.ts. Shipped at `shadow`: anton works the repair out and records it, and the
- *     block still goes to a human. Nothing writes to a board nobody armed.
+ *     block still goes to a human. What the dial gates is the FIX — no bead anton was not armed to
+ *     repair is repaired. The record of what it would have done is a note beside the block, at every
+ *     level, exactly as a refusal is (PR #223 review): a repair files no proposal bead, so the
+ *     ticket's own blob and the run's log are the only place that account can live, and an operator
+ *     reading a week of shadow before arming `apply` is reading it there. A note states; it changes
+ *     no description, no edge, and no state a picker reads.
  *
  *   • IT MUST NOT LOOP. A bead that blocks, gets repaired, and blocks the same way again is a
  *     diagnosis that did not hold. Repairing it a second time spends a night's quota re-fixing one
@@ -166,7 +171,23 @@ export function refusalNote(
 export function shadowNote(klass: RepairClass, attempted: string): string {
   return (
     `anton: did not repair this as \`${klass}\` — it is armed at \`shadow\`, which works the repair ` +
-    `out and writes nothing. What \`apply\` would have recorded: "${oneLine(attempted)}"`
+    `out and writes no fix. What \`apply\` would have recorded: "${oneLine(attempted)}"`
+  );
+}
+
+/**
+ * The note anton leaves when a repair LANDED but its stamp did not — the third record beside
+ * {@link repairNote} and {@link shadowNote}, and it exists because those two can never say this.
+ *
+ * Deliberately carries no fingerprint, for {@link shadowNote}'s reason inverted: nothing suppresses
+ * a later repair of this class, so nothing on the blob may read back through
+ * {@link repairAttemptsOf} as if something did. The bead's own prose is the only place the fix is
+ * recorded at all, so the note says plainly that the guard is not armed for it.
+ */
+export function unstampedNote(klass: RepairClass, attempted: string): string {
+  return (
+    `anton: repaired this as \`${klass}\` but could not stamp it — the fix stands and nothing on ` +
+    `this bead suppresses a later \`${klass}\` repair of it. What was done: "${oneLine(attempted)}"`
   );
 }
 
