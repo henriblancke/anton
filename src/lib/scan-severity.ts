@@ -63,8 +63,13 @@ export interface ScanSignal {
   tags?: string[] | null;
 }
 
-/** Anything that reads as a leaked credential, wherever it was found. */
-const SECRET_PATTERN = /secret|credential|password|private[-_]?key|api[-_]?key/i;
+/**
+ * Anything that reads as a leaked credential, wherever it was found. Exported so the fixture-secret
+ * filter (lib/scan-secrets) selects exactly the signals this file classes as `security` — two
+ * readings of "is this a secret" that drifted apart would leave the filter clearing signals the
+ * health record never counted as secrets, or missing the ones it did.
+ */
+export const SECRET_PATTERN = /secret|credential|password|private[-_]?key|api[-_]?key/i;
 
 /** Which class each stringer collector reports on (`stringer collectors list`). */
 const CLASS_BY_COLLECTOR: Record<string, SignalClass> = {

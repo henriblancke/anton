@@ -1,0 +1,1 @@
+CREATE INDEX `jobs_project_parked_idx` ON `jobs` (`project_id`,`updated_at`) WHERE "jobs"."status" = 'parked';

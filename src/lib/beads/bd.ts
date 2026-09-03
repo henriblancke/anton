@@ -25,6 +25,11 @@ import { doltSync, type SyncMode, type SyncOutcome } from "./sync-coalescer";
 export type { Bead, BeadComment, BeadDep } from "./types";
 import type { Bead } from "./types";
 
+// The dependency types anton may write, validated at the link seam because bd validates nothing
+// there (anton-igkb). Re-exported so callers reach the set through the same module as `link`.
+export { LINK_TYPES, assertLinkType, isLinkType, type LinkType } from "./link-types";
+import { assertLinkType, type LinkType } from "./link-types";
+
 /**
  * The `agent:` VALUE that names no agent — the half {@link labelValueOf}(labels, "agent") returns,
  * as distinct from the whole label {@link LABELS.agentHuman}. Exported because the routing
@@ -2186,8 +2191,21 @@ export const beads = {
   untag: (cwd: string, id: string, labels: string[]) =>
     bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
 
-  link: (cwd: string, a: string, b: string, type: string) =>
-    bdWrite(cwd, ["link", a, b, "--type", type]),
+  /**
+   * Write one dependency edge, `type` validated HERE because bd will not validate it (anton-igkb):
+   * `--type` is free text, and every value but `blocks`/`conditional-blocks` yields a non-blocking
+   * edge with no error — see {@link assertLinkType}. The runtime check backs the compile-time type:
+   * an edge type that arrives as data (a gardener plan, a JSON payload) never sees the type checker.
+   *
+   * `async` so a refused type REJECTS rather than throwing synchronously — every other verb here
+   * fails as a rejection, and a caller's `.catch()` must not be bypassed by where the failure came
+   * from. `exec` is injectable for tests, like {@link beads.cook}, which is what lets the guard be
+   * proven to reject BEFORE a spawn rather than after one.
+   */
+  link: async (cwd: string, a: string, b: string, type: LinkType, exec: BdExec = bdWrite) => {
+    assertLinkType(type);
+    return exec(cwd, ["link", a, b, "--type", type]);
+  },
 
   /**
    * Take a dependency edge back — the exact undo of {@link beads.link}, which is why the argument

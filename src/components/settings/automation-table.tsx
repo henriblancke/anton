@@ -87,6 +87,11 @@ export interface AutomationSpec {
    * The automation whose output this one consumes. `unstick` acts on what `run-health` finds and
    * `gate-check` on gates other jobs open, so with that producer off they are not broken, they are
    * idle — and the row has to say which, or an operator reads a healthy no-op as a failure.
+   *
+   * "a no-op until X is on" and not "idle until X is on" (anton-kh98): the row is read by an
+   * operator deciding whether their stalls are watched, and `unstick` being ON and hourly is
+   * exactly what makes them believe so. "Idle" describes a moment; a no-op is what the automation
+   * IS for as long as its producer is off, which is the fact that decides the question.
    */
   dependsOn?: string;
   /** Which group it belongs to, so a list of rows reads as three concerns. */
@@ -369,7 +374,7 @@ function AutomationTableRow({
                 <span className={producerOn ? "text-subtle" : "text-risk-med"}>
                   {producerOn
                     ? ` · fed by ${automation.dependsOn}`
-                    : ` · idle until ${automation.dependsOn} is on`}
+                    : ` · a no-op until ${automation.dependsOn} is on`}
                 </span>
               ) : null}
             </span>

@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "8116e46e-dd03-404a-af78-b28b8a2ffdf5",
-  "prevId": "58dca277-e69a-4b04-a9fe-477b47f7afc5",
+  "id": "c9b49030-43d6-48bd-8887-1c1ffd63e7a8",
+  "prevId": "8116e46e-dd03-404a-af78-b28b8a2ffdf5",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -1151,6 +1151,13 @@
         },
         "started_at": {
           "name": "started_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "attempt_started_at": {
+          "name": "attempt_started_at",
           "type": "integer",
           "primaryKey": false,
           "notNull": false,

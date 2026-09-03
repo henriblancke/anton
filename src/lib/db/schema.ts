@@ -135,6 +135,13 @@ export const jobs = sqliteTable(
     uniqueIndex("jobs_active_sync_push_unique")
       .on(table.projectId)
       .where(sql`${table.type} = 'sync-push' and ${table.status} = 'queued'`),
+    // Serves the unwatched-park read (anton-kh98), which runs on every board render of a project
+    // whose stall watcher is disarmed — the shipped default. Partial on 'parked' so it stays tiny
+    // next to a jobs table that keeps every finished job for the life of the project, and carries
+    // updated_at so the count and the MIN age are both answered from the index alone.
+    index("jobs_project_parked_idx")
+      .on(table.projectId, table.updatedAt)
+      .where(sql`${table.status} = 'parked'`),
   ],
 );
 
