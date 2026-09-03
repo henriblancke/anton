@@ -127,7 +127,9 @@ exactly as written, followed by ` — ` and your one-line reason:
 - `ref-stale` — the ticket points at a file, path, or symbol that has moved or no longer exists.
   Name the pointer as the ticket writes it.
 - `dep-missing` — the work needs something another ticket has to land first, and no edge says so.
-  Name the ticket or the artifact you are waiting on.
+  Name the **bead id** you are waiting on (`anton-abcd`) — anton draws the ordering edge from the id
+  and can draw nothing from a description. Name exactly one: it records the ordering you state, it
+  never files the missing work, so a reason that names no id, or several, goes to a human instead.
 - `acceptance-missing` — the acceptance criteria are absent, contradictory, or not verifiable as
   written.
 - `oversized` — the ticket is too large to land as one coherent change.

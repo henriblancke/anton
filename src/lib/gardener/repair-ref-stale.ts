@@ -28,7 +28,13 @@ import { scanMarkdown } from "../beads/markdown";
 import { readPathHistory, type PathHistory } from "../git/ops";
 import { access } from "node:fs/promises";
 import { join } from "node:path";
-import { decideRepair, recordRepair, type RepairAttempt, type RepairedBead } from "./repair";
+import {
+  decideRepair,
+  recordRepair,
+  refusalNote as refusal,
+  type RepairAttempt,
+  type RepairedBead,
+} from "./repair";
 
 /** The class this module repairs. Named once so the guard, the stamp and the prose cannot drift. */
 const KLASS = "ref-stale" as const;
@@ -322,20 +328,9 @@ function rewriteContext(
 }
 
 /**
- * The note anton leaves when it REFUSED a repair — the other half of the record repair.ts writes for
- * a repair it made.
- *
- * A block that escalates already parks the run for a human; what they arrive to without this is a
- * bead that says the agent stopped and nothing about the pointer anton checked. One line, because
- * the notes blob is line-delimited (beads/notes.ts).
+ * The note anton leaves when it REFUSED a `ref-stale` repair — the class bound to the shared
+ * formatter ({@link refusal}), so every repair's refusal reads the same way on a bead.
  */
 export function refusalNote(outcome: Extract<RefStaleOutcome, { action: "escalate" }>): string {
-  const body = [outcome.why, ...outcome.evidence].join(" ").replace(/\s+/g, " ").trim();
-  const capped =
-    body.length > REFUSAL_NOTE_CHARS ? `${body.slice(0, REFUSAL_NOTE_CHARS).trimEnd()}…` : body;
-  return `anton: did not repair this as \`${KLASS}\` — ${capped}`;
+  return refusal(KLASS, outcome);
 }
-
-/** How much of a refusal's case one note may carry — enough to judge from, bounded like every other
- * machine note on the blob. The run's error and session log still hold the whole of it. */
-const REFUSAL_NOTE_CHARS = 400;

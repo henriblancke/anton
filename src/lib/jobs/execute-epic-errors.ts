@@ -4,7 +4,7 @@
  * the row status off them, the ticket loop absorbs exactly one, the runner classifies the poison
  * ones — so they live together rather than beside the code that happens to throw them.
  */
-import { parkedOnGateClause, PoisonEpic } from "./errors";
+import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
 
 /**
  * The run ran every ticket it could and the rest are held by a prerequisite outside it (anton-1two).
@@ -82,6 +82,38 @@ export class RepairedBlockError extends Error {
         (block instanceof Error ? block.message : String(block)),
     );
     this.name = "RepairedBlockError";
+  }
+}
+
+/**
+ * The block anton answered by DRAWING THE EDGE it was missing (anton-qg4h / R5.4): the ticket needs
+ * another bead to land first, so the ordering is recorded and the run parks behind it.
+ *
+ * A {@link BlockedTailError}, which is precisely what this now is — a run holding work that waits on
+ * a prerequisite outside it — and that inheritance is the whole behaviour: the RUN row parks rather
+ * than failing, so the resume continues in this same row and worktree once the blocker lands, and
+ * the JOB parks rather than retrying. The contrast with {@link RepairedBlockError} is deliberate: a
+ * rewritten pointer earns an immediate retry because the bead is now correct, while an ordering
+ * earns a WAIT — retrying now would spend an attempt proving the edge anton just drew.
+ *
+ * Phrased through {@link blockedByPoison} so the blocker id is readable back out of the park message
+ * by the run-health sweep, exactly as it is for a run that was already blocked when it started.
+ */
+export class ParkedOnPrereqError extends BlockedTailError {
+  constructor(
+    readonly ticketId: string,
+    /** The prerequisite the new edge points at. */
+    readonly blockerId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** The block this repair answered — kept so the park still states what stopped the run. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${blockedByPoison(ticketId, [blockerId]).message} — anton drew that edge itself after the ` +
+        `agent reported \`dep-missing\`: ${attempted}. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
   }
 }
 

@@ -2190,6 +2190,18 @@ export const beads = {
     bdWrite(cwd, ["link", a, b, "--type", type]),
 
   /**
+   * Take a dependency edge back — the exact undo of {@link beads.link}, which is why the argument
+   * order is identical: `bd link a b` and `bd dep remove a b` both read "a depends on b".
+   *
+   * bd holds ONE edge per directed pair whatever its type (anton-wsap), so this removes whichever
+   * edge that pair carries rather than only a `blocks` one — a caller that wants a specific type
+   * gone must know it is the one there. The one write that makes an anton-drawn ordering reversible
+   * (gardener/repair-dep-missing.ts): an edge nothing can un-draw is a board fact anton may not
+   * record on its own judgement.
+   */
+  unlink: (cwd: string, a: string, b: string) => bdWrite(cwd, ["dep", "remove", a, b]),
+
+  /**
    * Move a bead under a new parent (`bd update --parent`), or — with an empty `parentId` — detach
    * it entirely, which is bd's own clear-the-field form and therefore the undo of a re-parent that
    * has to be rolled back (see gardener/apply.ts). One write per bead: bd's batch grammar has no

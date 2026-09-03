@@ -131,6 +131,22 @@ function oneLine(text: string): string {
   return flat.length > REPAIR_NOTE_CHARS ? `${flat.slice(0, REPAIR_NOTE_CHARS).trimEnd()}…` : flat;
 }
 
+/**
+ * The note anton leaves when it REFUSED a repair — the other half of the record {@link recordRepair}
+ * writes for one it made.
+ *
+ * A block that escalates already parks the run for a human; what they arrive to without this is a
+ * bead that says the agent stopped and nothing about what anton checked before handing it over. One
+ * line and one cap, shared by every repair class, because the notes blob is line-delimited
+ * (beads/notes.ts) and a class-specific formatter is how two refusals start reading differently.
+ */
+export function refusalNote(
+  klass: RepairClass,
+  refusal: { why: string; evidence: readonly string[] },
+): string {
+  return `anton: did not repair this as \`${klass}\` — ${oneLine([refusal.why, ...refusal.evidence].join(" "))}`;
+}
+
 const REPAIR_NOTE = new RegExp(
   `^anton: repaired \`(${REPAIR_NAMESPACE}:[a-z-]+:[0-9a-f]{${FINGERPRINT_HASH_LENGTH}})\` — (.+)$`,
 );
