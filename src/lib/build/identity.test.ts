@@ -893,6 +893,31 @@ describe("the source digest of an install no git can describe", () => {
     expect(readBuildIdentity(dir, {}).source).toBe(first);
   });
 
+  // Same shape one level over: what a running anton rewrites is dot-named AND lives at the root, so
+  // skipping dot-entries at every depth only hid real build inputs — a config importing
+  // `./src/.config/flavor.mjs` compiled that module while the digest stayed put (PR #217 review).
+  it("walks a dot-named source directory below the install root", () => {
+    const dir = tarball();
+    mkdirSync(join(dir, "src", ".config"));
+    const nested = join(dir, "src", ".config", "flavor.mjs");
+    writeFileSync(nested, SOURCE);
+    const first = readBuildIdentity(dir, {}).source;
+
+    writeFileSync(nested, SOURCE.replace("1", "2"));
+    expect(readBuildIdentity(dir, {}).source).not.toBe(first);
+    writeFileSync(nested, SOURCE);
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+
+    // The names that are state wherever they sit stay out at depth too: a vendored submodule carries
+    // its own `.git`, a nested app its own `.next`, and Finder writes `.DS_Store` anywhere.
+    mkdirSync(join(dir, "src", ".git"));
+    writeFileSync(join(dir, "src", ".git", "index"), "churn");
+    mkdirSync(join(dir, "src", ".next"));
+    writeFileSync(join(dir, "src", ".next", "build-manifest.json"), "{}");
+    writeFileSync(join(dir, "src", ".DS_Store"), "finder");
+    expect(readBuildIdentity(dir, {}).source).toBe(first);
+  });
+
   // `readEnvDigest` hashes these files too, but only freshness reads that field — a drift VERDICT
   // cannot weigh one whose other half is the reading shell's own environment. So while the dot-skip
   // hid them, a git-less install could edit `.env.local` under a running server, go on serving the

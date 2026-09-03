@@ -741,36 +741,50 @@ const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist", "server-port
 const BUILD_ENV_FILES = [".env.production.local", ".env.local", ".env.production", ".env"];
 
 /**
+ * What no walk enters at ANY depth, dot-named because that is what these are. `.git` is rewritten by
+ * every git command — and a vendored submodule carries one of its own, well below the root — `.next`
+ * names build output wherever a build puts it, and `.DS_Store` is written by a Finder window
+ * anywhere at all. A digest reading one of them would move on its own.
+ */
+const STATE_AT_ANY_DEPTH = new Set([".git", ".next", ".DS_Store"]);
+
+/**
  * Is this entry outside the source a build compiles from? `depth` is 0 for the entries of the
  * install root itself.
  *
- * Dot-entries go wholesale, and that is this digest's deliberate edge — the trade
- * `readWorktreeDigest` already makes over ignored files. `.next`, `.git`, `.anton`, `.beads` and
- * `.dolt` all live there and every one is rewritten while anton runs, so a digest that read them
- * would move on its own and put a permanent restart banner in front of an operator with nothing to
- * restart for.
+ * The dot-skip is ROOT-level, plus the handful of names above (PR #217 review). What a running anton
+ * rewrites is dot-named — `.next`, `.git`, `.anton`, `.beads`, `.dolt` — and every one of them lives
+ * at the install root, so skipping dot-entries at every depth bought nothing there and hid real
+ * build inputs further down: a `next.config.mjs` importing `./src/.config/flavor.mjs` compiles that
+ * module's contents into the artifact while the digest stayed put, and `buildMatchesCheckout`
+ * accepted the `.next` compiled before the edit. This repo ships such a tree itself
+ * (`skills/setup/templates/.product`, `.beads`).
  *
- * The env files a production build LOADS are the one exception, named individually (PR #217
- * review). `readEnvDigest` carries them too, but that field answers freshness only — `compareBuild`
- * never weighs it, because its other half is the reading shell's own environment. So a git-less
- * install editing `.env.local` under a running server moved nothing a VERDICT reads: the dot-skip
- * hid the file from `source`, and both doctor and the health page called the server current while a
- * `NEXT_PUBLIC_*` value it no longer holds stayed live in the served bundle. A checkout never had
- * that hole — `ignoredEnvFiles` folds the same files into the worktree digest, which is compared —
- * so naming them here is what makes a git-less install's evidence match.
+ * The env files a production build LOADS are the one exception to the root skip, named individually
+ * (PR #217 review). `readEnvDigest` carries them too, but that field answers freshness only —
+ * `compareBuild` never weighs it, because its other half is the reading shell's own environment. So
+ * a git-less install editing `.env.local` under a running server moved nothing a VERDICT reads: the
+ * dot-skip hid the file from `source`, and both doctor and the health page called the server current
+ * while a `NEXT_PUBLIC_*` value it no longer holds stayed live in the served bundle. A checkout never
+ * had that hole — `ignoredEnvFiles` folds the same files into the worktree digest, which is compared
+ * — so naming them here is what makes a git-less install's evidence match.
  *
- * `node_modules` is the one name skipped at every depth: nested ones hold dependencies too, and a
- * dependency is never the source this install is judged on. What anton itself writes — the
- * database, its per-process build records — lands beside the install root, so it is excluded there
- * and nowhere else.
+ * `node_modules` is skipped at every depth for the same reason as the state above: nested ones hold
+ * dependencies too, and a dependency is never the source this install is judged on. What anton
+ * itself writes — the database, its per-process build records — lands beside the install root, so it
+ * is excluded there and nowhere else.
  */
 function skipsSourceEntry(name, depth) {
   if (depth === 0 && BUILD_ENV_FILES.includes(name)) return false;
   return (
-    name.startsWith(".") ||
     name === "node_modules" ||
     name.endsWith(".tsbuildinfo") ||
-    (depth === 0 && (OUTPUT_AT_ROOT.has(name) || name.startsWith("anton.db") || BUILD_RECORD_NAME.test(name)))
+    STATE_AT_ANY_DEPTH.has(name) ||
+    (depth === 0 &&
+      (name.startsWith(".") ||
+        OUTPUT_AT_ROOT.has(name) ||
+        name.startsWith("anton.db") ||
+        BUILD_RECORD_NAME.test(name)))
   );
 }
 
