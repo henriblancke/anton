@@ -9,6 +9,7 @@
 import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
+import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
 import {
   readWorktreeState,
   restoreWorktreeState,
@@ -28,6 +29,7 @@ import {
   CancelledAskError,
   NeedsHumanError,
   NoDeliveryError,
+  RepairedBlockError,
   TicketTimeoutError,
   WorktreeDirtyError,
 } from "./execute-epic-errors";
@@ -420,8 +422,83 @@ async function settleFailedTicket(args: {
   }
   await settleTicketTimeout({ run, ticket, session, baseline, progress, timeoutMs, ranOutOfTime });
   await settleAbortedTicket({ run, ticket, session, e });
-  await releaseFailedTicket({ run, ticket, session, progress, e, kinds });
+  // Attempted only AFTER the abort path has had its say: a ticket someone killed or abandoned is
+  // settled by whoever stopped it, and repairing its bead would write to a board a human is deciding
+  // on. Before the release, because what the repair answers decides whether this bead is left
+  // `blocked` for a person or `open` for the retry it just earned.
+  const repair = await repairBlockedTicket({ run, ticket, session, progress, e, kinds });
+  await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
+  // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
+  // the runner's own attempts, behind its own backoff and the picker's brakes. The block it replaces
+  // would have parked the run outright.
+  if (repair?.action === "repaired") throw new RepairedBlockError(ticket.id, repair.attempted, e);
   throw e;
+}
+
+/**
+ * The FACTUAL repair pass on a blocked ticket (anton-fzas / R5.4) — today, `ref-stale` alone.
+ *
+ * Runs on the two block kinds that mean "the agent could not do the work": a zero-diff run, and one
+ * the agent itself declared incomplete. It never runs on a post-commit failure (the code landed; the
+ * bead's pointers are not what stopped it), on an ask (that is a person's to answer), or on a
+ * usage-limit park (not a failure at all).
+ *
+ * The TRIGGER is evidence, not the agent's word. The repair checks the bead's cited paths against
+ * the worktree itself, so it fires only where a pointer is provably stale and stays silent — `none`
+ * — everywhere else, including on a bead whose block was something entirely different. That is
+ * strictly narrower than trusting a self-reported class, and it is what makes the pass safe to run
+ * on every block until the classified result contract lands (anton-ie05 / R5.1).
+ *
+ * Best-effort by construction: a repair that throws must never mask the block the run is settling.
+ * The block still stands; only the repair is lost.
+ */
+async function repairBlockedTicket(args: {
+  run: Omit<StepContext, "tickets">;
+  ticket: Bead;
+  session: Awaited<ReturnType<typeof startJobSession>>;
+  progress: TicketProgress;
+  e: unknown;
+  kinds: TicketFailureKinds;
+}): Promise<RefStaleOutcome | undefined> {
+  const { run, ticket, session, e, kinds } = args;
+  const { clock, worktreePath } = run;
+  const repo = run.repoPath;
+  if (isUsageLimitError(e) || kinds.needsHuman) return undefined;
+  if (!kinds.noDelivery && !kinds.agentBlocked) return undefined;
+  try {
+    // Read the bead fresh: the snapshot this run dispatched from predates the session, and the
+    // repair rewrites the description it is holding.
+    const fresh = await beads.show(repo, ticket.id);
+    const outcome = await repairRefStale({
+      repoPath: repo,
+      worktreePath,
+      bead: fresh,
+      block: { reason: args.progress.selfReport?.reason ?? (e instanceof Error ? e.message : undefined) },
+      now: clock.now(),
+    });
+    if (outcome.action === "escalate") {
+      await safe(() => beads.note(repo, ticket.id, refusalNote(outcome)));
+    }
+    await appendSessionLog(session.logPath, `[repair:ref-stale] ${repairLogLine(outcome)}\n`).catch(
+      () => {},
+    );
+    return outcome;
+  } catch (failure) {
+    console.error(`[execute-epic] ref-stale repair failed for ${ticket.id}`, failure);
+    return undefined;
+  }
+}
+
+/** One line of the repair's own account, for the session log. */
+function repairLogLine(outcome: RefStaleOutcome): string {
+  switch (outcome.action) {
+    case "repaired":
+      return `repaired — ${outcome.attempted}`;
+    case "escalate":
+      return `escalated — ${[outcome.why, ...outcome.evidence].join(" ")}`;
+    default:
+      return `no repair — ${outcome.why}`;
+  }
 }
 
 /**
@@ -650,6 +727,8 @@ async function releaseFailedTicket(args: {
   progress: TicketProgress;
   e: unknown;
   kinds: TicketFailureKinds;
+  /** What the factual repair pass answered, when it ran — see {@link repairBlockedTicket}. */
+  repair?: RefStaleOutcome;
 }): Promise<void> {
   const { run, ticket, session, e } = args;
   const { worktreePath } = run;
@@ -657,8 +736,13 @@ async function releaseFailedTicket(args: {
   const { sessionId } = session;
   const { committed, selfReport } = args.progress;
   const { noDelivery, agentBlocked, needsHuman } = args.kinds;
+  // A REPAIRED bead is not a human-review state, it is work with one retry coming (R5.10) — and
+  // `blocked` is a status bd refuses to claim, so blocking it here would kill that retry on its own
+  // first step. Left `open` like every other re-queued ticket; the repair's own note and stamp are
+  // what carry the account, not the status.
+  const repaired = args.repair?.action === "repaired";
   if (!isUsageLimitError(e)) {
-    if ((committed || noDelivery || agentBlocked) && !needsHuman) {
+    if ((committed || noDelivery || agentBlocked) && !needsHuman && !repaired) {
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       // The tip this ticket's work landed on — the operator's route from the note straight to the
       // diff. Best-effort and only when something was committed: an unreadable worktree costs the

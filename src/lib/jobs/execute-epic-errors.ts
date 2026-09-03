@@ -53,6 +53,39 @@ export class BlockedByAgentError extends Error {
 }
 
 /**
+ * A block anton REPAIRED, so the run retries instead of parking (anton-fzas / R5.10).
+ *
+ * Thrown in place of the poison the block would otherwise have raised — {@link NoDeliveryError} or
+ * {@link BlockedByAgentError} — and deliberately NOT poison itself. That single difference is the
+ * whole mechanism: a plain error goes back through the runner's ordinary retry budget and backoff,
+ * so the repaired bead re-enters the queue exactly like any other retried work, behind the same
+ * brakes, with no special standing. There is no bypass to review because there is no bypass.
+ *
+ * "Retried ONCE" is not counted here and must not be: the repair stamp on the bead is what bounds it
+ * (R5.6). A second block of the same class finds a bead anton has already repaired, the guard
+ * (`gardener/repair.ts` `decideRepair`) escalates instead of repairing, and the run parks on the
+ * poison it would have parked on the first time — so the retry happens at most once per bead per class no matter how many
+ * attempts the runner's budget allows.
+ */
+export class RepairedBlockError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** The block this repair answered — kept so the run's error still states what stopped it. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${ticketId} blocked, and anton repaired it: ${attempted}. The run failed so the ticket goes ` +
+        `back through the queue for one retry against the corrected bead; a second block of the ` +
+        `same kind will park it for a human instead. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
+    this.name = "RepairedBlockError";
+  }
+}
+
+/**
  * The agent reported `ANTON-RESULT: needs-human — <ask>` (anton-287p): it stopped because only a
  * person can take the next step, not because it hit a broken state. Distinct from
  * {@link BlockedByAgentError} in what it COSTS the operator — a block is a defect to diagnose, an ask

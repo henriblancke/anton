@@ -492,6 +492,93 @@ export async function worktreeHasCommitFor(
   return subjects.split("\n").some((s) => s.startsWith(prefix));
 }
 
+/**
+ * What git's history says became of `path` on this branch — the raw read behind the `ref-stale`
+ * repair (anton-fzas / R5.4). It reports; it does not judge. Whether a single destination is a
+ * rename anton may follow, or a pointer it must refuse to guess at, is
+ * `gardener/repair-ref-stale.ts`'s call.
+ */
+export interface PathHistory {
+  /**
+   * Every DISTINCT path this one was renamed to, newest commit first. More than one means the name
+   * has stood for more than one file over the branch's life — history the caller cannot resolve.
+   */
+  renamedTo: string[];
+  /** A commit removed the path with no rename paired to the removal. */
+  deleted: boolean;
+}
+
+/** How far back the removal scan reads. A path removed more times than this is not a clean rename. */
+const MAX_PATH_REMOVALS = 20;
+
+/** `R<score>\told\tnew` / `D\told` — the only two name-status verbs this read cares about. */
+const RENAME_STATUS = /^R\d*\t([^\t]+)\t([^\t]+)$/;
+const DELETE_STATUS = /^D\t([^\t]+)$/;
+
+/**
+ * Follow a path that is gone from the tree to wherever git recorded it going.
+ *
+ * TWO commands, because pathspec filtering DISABLES git's rename detection: under `-- <path>` the
+ * SOURCE side of a rename is reported as a plain `D` and the destination never appears at all. So
+ * the pathspec is used only to find the commits where the path disappeared — cheap, and exactly the
+ * candidate set — and each of those is re-diffed WITHOUT a pathspec, where `--find-renames` pairs
+ * the delete with its add.
+ *
+ * `--follow` is what carries the read past a path's own earlier renames, which is why the scan is
+ * ordered newest-first and bounded: a hot path removed a dozen times over is not the mechanical
+ * rename this exists to resolve.
+ *
+ * `core.quotePath=false` because git C-quotes a non-ASCII path by default (`"src/caf\303\251.ts"`),
+ * and a quoted entry no longer splits on a literal tab — the parse would hand back a path that
+ * exists nowhere. `:(literal)` for the same class of reason as {@link readFileAtRev}: a pathspec is
+ * PARSED before it is matched, so a cited path that opens with pathspec magic would fail the
+ * command outright rather than simply not resolving.
+ */
+export async function readPathHistory(repoPath: string, path: string): Promise<PathHistory> {
+  const removals = (
+    await git(repoPath, [
+      "-c",
+      "core.quotePath=false",
+      "log",
+      "--follow",
+      "--format=%H",
+      "--diff-filter=D",
+      "--",
+      `:(literal)${path}`,
+    ])
+  )
+    .split("\n")
+    .map((sha) => sha.trim())
+    .filter(Boolean)
+    .slice(0, MAX_PATH_REMOVALS);
+
+  const renamedTo: string[] = [];
+  let deleted = false;
+  for (const sha of removals) {
+    const status = await git(repoPath, [
+      "-c",
+      "core.quotePath=false",
+      "show",
+      "--name-status",
+      "--format=",
+      "--find-renames",
+      "--no-color",
+      sha,
+    ]);
+    // A merge commit prints no name-status at all, so it contributes neither a rename nor a
+    // delete — history the caller reads as unfollowable, which is the honest answer.
+    for (const line of status.split("\n")) {
+      const rename = RENAME_STATUS.exec(line);
+      if (rename && rename[1] === path) {
+        if (!renamedTo.includes(rename[2]!)) renamedTo.push(rename[2]!);
+        continue;
+      }
+      if (DELETE_STATUS.exec(line)?.[1] === path) deleted = true;
+    }
+  }
+  return { renamedTo, deleted };
+}
+
 /** A branch's change set against its base: the changed paths plus the (possibly truncated) patch. */
 export interface BranchDiff {
   /**
