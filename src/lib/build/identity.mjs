@@ -833,8 +833,15 @@ const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
  */
 const NEXT_CONFIG_FILES = ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.mts"];
 
-/** One `process.env` read in a config file: `process.env.NAME` or `process.env["NAME"]`. */
-const CONFIG_ENV_READ = /process\.env\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/g;
+/** How `process.env` itself is spelled — the source every read below hangs off. */
+const PROCESS_ENV = String.raw`process\s*\.\s*env`;
+
+/** A quoted key, in any of the three string delimiters: the `["NAME"]` half of an env read. */
+const QUOTED_KEY = "[\"'`]([^\"'`]+)[\"'`]";
+
+/** One read off `source`: `source.NAME` or `source["NAME"]`. */
+const envRead = (source) =>
+  new RegExp(`${source}\\s*(?:\\.\\s*([A-Za-z_$][\\w$]*)|\\[\\s*${QUOTED_KEY}\\s*\\])`, "g");
 
 /**
  * The bindings of a destructured read — `const { BUILD_FLAVOR } = process.env` — which names a
@@ -842,7 +849,15 @@ const CONFIG_ENV_READ = /process\.env\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^
  * captured and the names picked out of it separately, since a binding may be renamed, defaulted or
  * quoted.
  */
-const CONFIG_ENV_DESTRUCTURE = /\{([^{}]*)\}\s*(?::[^=]+)?=\s*process\s*\.\s*env\b/g;
+const envDestructure = (source) => new RegExp(String.raw`\{([^{}]*)\}\s*(?::[^=]+)?=\s*${source}\b`, "g");
+
+/**
+ * A local standing in for the whole environment — `const env = process.env` — through which
+ * `env.BUILD_FLAVOR` names a variable no pattern anchored on `process.env` can see (PR #217 review).
+ * The binding's own name is captured and the reads above are run against it too, so an alias costs
+ * one extra pass rather than a blind spot.
+ */
+const CONFIG_ENV_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*process\s*\.\s*env\b/g;
 
 /**
  * One bound name in that pattern: whatever sits in KEY position — at the start or after a comma —
@@ -879,9 +894,13 @@ function configEnvNames(appRoot) {
     } catch {
       continue;
     }
-    for (const [, dotted, indexed] of text.matchAll(CONFIG_ENV_READ)) names.add(dotted ?? indexed);
-    for (const [, bindings] of text.matchAll(CONFIG_ENV_DESTRUCTURE))
-      for (const [, quoted, bare] of bindings.matchAll(DESTRUCTURED_KEY)) names.add(quoted ?? bare);
+    // An alias is an identifier by construction, so it carries no regex metacharacter into these.
+    const aliases = [...text.matchAll(CONFIG_ENV_ALIAS)].map(([, alias]) => String.raw`\b${alias}`);
+    for (const source of [PROCESS_ENV, ...aliases]) {
+      for (const [, dotted, indexed] of text.matchAll(envRead(source))) names.add(dotted ?? indexed);
+      for (const [, bindings] of text.matchAll(envDestructure(source)))
+        for (const [, quoted, bare] of bindings.matchAll(DESTRUCTURED_KEY)) names.add(quoted ?? bare);
+    }
   }
   return names;
 }
@@ -1226,6 +1245,14 @@ const BIRTH_STAMP_ENV = { TZ: "UTC", LC_ALL: "C" };
  * "different process" about the process itself — `runningPid` would delete a live server's pidfile
  * and `recordAlive` would reject its record, letting a second daemon start over a first anton can
  * no longer stop.
+ *
+ * Each stamp is PREFIXED with the reader that produced it (PR #217 review), because the two readers
+ * speak different languages: procfs answers `4212345` clock ticks since boot, `ps` a formatted date.
+ * A daemon stamped from procfs whose `/proc/<pid>/stat` read later fails — a remounted procfs,
+ * `hidepid` — falls through to `ps` here, and an untagged comparison would read the two spellings of
+ * the SAME birth time as proof of pid reuse: the live daemon's pidfile deleted, `update` and
+ * `uninstall --purge` free to move the runtime under a server still serving from it. The tag makes
+ * that case answerable as what it is — not comparable, hence unproven (see `birthStampVerdict`).
  */
 export function processStartedAt(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -1234,7 +1261,7 @@ export function processStartedAt(pid) {
     // itself contain spaces, so the split has to start after its closing paren.
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const started = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
-    if (/^\d+$/.test(started ?? "")) return started;
+    if (/^\d+$/.test(started ?? "")) return `proc:${started}`;
   } catch {}
   const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
     encoding: "utf8",
@@ -1242,7 +1269,38 @@ export function processStartedAt(pid) {
     env: { ...process.env, ...BIRTH_STAMP_ENV },
   });
   const out = r.status === 0 && !r.error ? (r.stdout ?? "").trim() : "";
-  return out || null;
+  return out ? `ps:${out}` : null;
+}
+
+/** The readers `processStartedAt` tags its stamps with — the only prefixes that name a source. */
+const BIRTH_STAMP_SOURCES = new Set(["proc", "ps"]);
+
+/**
+ * Which reader produced a stamp, or null for one that names none — a pidfile written by an earlier
+ * anton, or a test fixture. An unknown source compares only with another unknown one.
+ */
+function birthStampSource(stamp) {
+  const tag = stamp.slice(0, stamp.indexOf(":"));
+  return BIRTH_STAMP_SOURCES.has(tag) ? tag : null;
+}
+
+/**
+ * What a stamp read NOW says about a stored one: `"same"` process, a `"different"` one, or
+ * `"unknown"` — the two cannot be compared at all, so nothing is proven either way.
+ *
+ * `unknown` covers both ways a recheck comes up empty (PR #217 review): the read failed outright, or
+ * it answered from the OTHER reader, whose spelling of the same birth time differs by construction.
+ * Callers fail closed on it — the pid names nobody — but must not treat it as proof of death, since
+ * deleting the record or pidfile of a live server is the one outcome here that cannot be undone.
+ *
+ * @param {string} stored
+ * @param {string|null} now
+ * @returns {"same"|"different"|"unknown"}
+ */
+export function birthStampVerdict(stored, now) {
+  if (now === null) return "unknown";
+  if (now === stored) return "same";
+  return birthStampSource(stored) === birthStampSource(now) ? "different" : "unknown";
 }
 
 /**
@@ -1258,7 +1316,8 @@ export function processStartedAt(pid) {
  * A record with no birth stamp (one this machine could not read at boot) still counts as alive on
  * the pid alone: an absence is not evidence, and the pid check is exactly as good as it ever was.
  *
- * A record that HAS one and cannot be rechecked is the opposite case and fails closed, exactly as
+ * A record that HAS one and cannot be rechecked — the read failed, or it came back from the other
+ * birth-time reader, whose stamps do not compare — is the opposite case and fails closed, exactly as
  * the daemon pidfile does (see `pidFileVerdict`): the stamp exists because this machine could read
  * birth times at boot, so a lookup failing now leaves a reused pid indistinguishable from the live
  * one, and vouching for it attributes an unrelated process to anton — a drift surface then reports
@@ -1288,9 +1347,12 @@ export function recordAlive(record, startedAt = processStartedAt) {
 export function recordVerdict(record, startedAt = processStartedAt) {
   if (!record || !pidAlive(record.pid)) return { alive: false, stale: true };
   if (!record.startedAt) return { alive: true, stale: false };
-  const now = startedAt(/** @type {number} */ (record.pid));
-  if (now === record.startedAt) return { alive: true, stale: false };
-  return { alive: false, stale: now !== null };
+  const verdict = birthStampVerdict(
+    /** @type {string} */ (record.startedAt),
+    startedAt(/** @type {number} */ (record.pid)),
+  );
+  if (verdict === "same") return { alive: true, stale: false };
+  return { alive: false, stale: verdict === "different" };
 }
 
 /**

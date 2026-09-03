@@ -412,6 +412,12 @@ describe("the daemon pidfile", () => {
 
   const pidFile = async () => join(await dirs.make("anton-state-"), "anton.pid");
 
+  // A stamp from THIS machine's birth-time reader naming some other process — the reuse case. The
+  // reader's tag has to be the local one: a stamp from the OTHER reader is not comparable, and so
+  // proves nothing either way (PR #217 review).
+  const reusedStamp = () =>
+    `${(processStartedAt(process.pid) ?? "ps:").split(":", 1)[0]}:a process that has exited`;
+
   it("answers with the pid it recorded while that process is the one running", async () => {
     const path = await pidFile();
     writePidFile(process.pid, path);
@@ -423,7 +429,7 @@ describe("the daemon pidfile", () => {
   // stop` at a stranger.
   it("does not answer with a live pid that is no longer the process it recorded", async () => {
     const path = await pidFile();
-    writeFileSync(path, `${process.pid}\na process that has exited\n`);
+    writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
     expect(runningPid(path)).toBeNull();
     expect(existsSync(path)).toBe(false);
   });
@@ -463,7 +469,7 @@ describe("the daemon pidfile", () => {
       writePidFile(process.pid, path);
       expect(lifecycleVerdict(path).unverifiable).toBeNull();
 
-      writeFileSync(path, `${process.pid}\na process that has exited\n`);
+      writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
       expect(lifecycleVerdict(path).unverifiable).toBeNull();
 
       const dead = spawnSync("node", ["-e", "process.exit(0)"]);
@@ -522,7 +528,7 @@ describe("the daemon pidfile", () => {
       writeFileSync(path, `${dead.pid}\n`);
       expect(daemonExited(path)).toBe(true);
 
-      writeFileSync(path, `${process.pid}\na process that has exited\n`);
+      writeFileSync(path, `${process.pid}\n${reusedStamp()}\n`);
       expect(daemonExited(path)).toBe(true);
 
       expect(daemonExited(join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);

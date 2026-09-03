@@ -42,6 +42,11 @@ import {
 
 const RUNNING = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
 
+// A stamp from THIS machine's birth-time reader naming some other process — the reuse case. The
+// reader's tag has to be the local one: a stamp from the OTHER reader is not comparable, and so
+// proves nothing either way (PR #217 review).
+const reusedStamp = () => `${(processStartedAt(process.pid) ?? "ps:").split(":", 1)[0]}:some other process`;
+
 const dirs: string[] = [];
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "anton-build-"));
@@ -1088,6 +1093,31 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
   });
 
+  // `const env = process.env` puts the whole environment behind a local, and every read through it
+  // is invisible to a pattern anchored on `process.env` — the config compiles a different artifact
+  // and the digest never moves (PR #217 review).
+  it("reads a variable the config takes through an alias of process.env", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.ts"),
+      "const env = process.env;\nexport default { env: { FLAVOR: env.BUILD_FLAVOR, A: env[\"ANALYZE\"] } };\n",
+    );
+    const base = { BUILD_FLAVOR: "one", ANALYZE: "0" };
+    expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
+  });
+
+  // The two routes compose: an alias may itself be destructured, which names a variable at two
+  // removes from anything spelling `process.env`.
+  it("reads a variable destructured out of an alias of process.env", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.mjs"),
+      "const env = process.env;\nconst { BUILD_FLAVOR } = env;\nexport default { env: { F: BUILD_FLAVOR } };\n",
+    );
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).not.toBe(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env);
+  });
+
   it("reads the same variable through an indexed access", () => {
     const dir = app();
     writeFileSync(join(dir, "next.config.mjs"), 'export default { env: { F: process.env["BUILD_FLAVOR"] } };\n');
@@ -1331,7 +1361,7 @@ describe("the record a running server leaves", () => {
     const startedAt = processStartedAt(process.pid);
     expect(startedAt).toEqual(expect.any(String));
     expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt })).toBe(true);
-    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: "a different process" })).toBe(false);
+    expect(recordAlive({ ...RUNNING, pid: process.pid, startedAt: reusedStamp() })).toBe(false);
   });
 
   // `ps -o lstart=` prints a FORMATTED date, so an uncanonicalized read makes the same live process
@@ -1380,6 +1410,22 @@ describe("the record a running server leaves", () => {
     expect(recordVerdict(unverifiable, () => null)).toEqual({ alive: false, stale: false });
     expect(recordVerdict(unverifiable, () => "born-now")).toEqual({ alive: false, stale: true });
     expect(recordVerdict(unverifiable, () => "born-then")).toEqual({ alive: true, stale: false });
+  });
+
+  // The two birth-time readers spell the same instant differently — procfs in clock ticks, `ps` as a
+  // formatted date — so a daemon stamped from procfs whose later `/proc/<pid>/stat` read fails falls
+  // through to `ps` and compares unequal against ITSELF. Reading that as pid reuse deletes a live
+  // server's record and lets `update` move the runtime under it (PR #217 review).
+  it("treats a stamp from the other birth-time reader as unproven, not as a different process", () => {
+    const fromProcfs = { ...RUNNING, pid: process.pid, startedAt: "proc:4212345" };
+    expect(recordVerdict(fromProcfs, () => "ps:Wed Sep  2 07:16:57 2026")).toEqual({ alive: false, stale: false });
+    // Within one reader the comparison still proves reuse — the tag narrows nothing else.
+    expect(recordVerdict(fromProcfs, () => "proc:9999999")).toEqual({ alive: false, stale: true });
+    expect(recordVerdict(fromProcfs, () => "proc:4212345")).toEqual({ alive: true, stale: false });
+  });
+
+  it("tags the birth stamp it reads with the reader that produced it", () => {
+    expect(processStartedAt(process.pid)).toMatch(/^(proc|ps):/);
   });
 
   // The prune is the only writer here, so it stands on the STALE half: a record kept one boot too
@@ -1580,7 +1626,7 @@ describe("buildDrift", () => {
   it("goes quiet when the pid is alive but belongs to a different process now", () => {
     const paths = install(
       { version: "0.4.0" },
-      { version: "0.3.9", revision: null, pid: process.pid, bootedAt: 1, startedAt: "some other process" },
+      { version: "0.3.9", revision: null, pid: process.pid, bootedAt: 1, startedAt: reusedStamp() },
     );
     expect(buildDrift(paths)).toBeNull();
   });

@@ -128,6 +128,22 @@ describe("the daemon pidfile verdict", () => {
     });
   });
 
+  // Same silence for a stamp the recheck can only answer in the OTHER reader's spelling: procfs
+  // counts clock ticks, `ps` prints a date, and reading one against the other as proof of reuse
+  // deletes the pidfile of a live daemon `update` and `uninstall --purge` then walk over.
+  it("names nobody when the recheck answers from a different birth-time reader", () => {
+    expect(pidFileVerdict(stamped("proc:4212345"), () => "ps:Wed Sep  2 07:16:57 2026")).toEqual({
+      pid: null,
+      stale: false,
+      unverifiable: process.pid,
+    });
+    expect(pidFileVerdict(stamped("proc:4212345"), () => "proc:9999999")).toEqual({
+      pid: null,
+      stale: true,
+      unverifiable: null,
+    });
+  });
+
   // A pidfile written before the stamp existed never claimed one, so there is nothing to revalidate.
   it("still answers on the pid alone for a file that carries no stamp", () => {
     const path = stamped("");

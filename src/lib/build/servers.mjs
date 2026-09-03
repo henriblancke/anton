@@ -20,7 +20,7 @@ import { readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 
-import { processStartedAt, sameDirectory } from "./identity.mjs";
+import { birthStampVerdict, processStartedAt, sameDirectory } from "./identity.mjs";
 
 /**
  * Every TCP socket LISTENING on this machine, as `{ pid, port }` — `[]` when nothing is, null when
@@ -306,7 +306,8 @@ export function antonPidFile(stateDir = process.env.ANTON_STATE_DIR ?? join(home
  * `anton stop`, which signals a stranger. So the birth stamp on line two has to match too.
  *
  * A STAMPED pid the birth-time read cannot recheck — an unreadable procfs, a `ps` that failed or
- * timed out — is not answered with either (PR #217 review). The stamp is there because this machine
+ * timed out, or a procfs stamp the fallback can only answer in `ps`'s own spelling — is not answered
+ * with either (PR #217 review). The stamp is there because this machine
  * could read birth times when the daemon started, so a lookup failing now leaves the reuse case
  * indistinguishable from the live one, and answering would hand `anton stop` a pid it goes on to
  * SIGTERM and SIGKILL. Killing a stranger is the one outcome here that damages something outside
@@ -348,10 +349,11 @@ export function pidFileVerdict(pidFile, startedAtNow = processStartedAt) {
     return { pid: null, stale: true, unverifiable: null };
   }
   if (!startedAt) return { pid, stale: false, unverifiable: null };
-  const now = startedAtNow(pid);
-  if (now === startedAt) return { pid, stale: false, unverifiable: null };
-  // The birth-time read failed: this pid is alive, and nothing here can say whether it is the
-  // daemon or the stranger the OS handed the number to.
-  if (now === null) return { pid: null, stale: false, unverifiable: pid };
+  const verdict = birthStampVerdict(startedAt, startedAtNow(pid));
+  if (verdict === "same") return { pid, stale: false, unverifiable: null };
+  // The birth-time read failed, or answered from the other reader in a spelling this stamp cannot
+  // be compared against: this pid is alive, and nothing here can say whether it is the daemon or
+  // the stranger the OS handed the number to.
+  if (verdict === "unknown") return { pid: null, stale: false, unverifiable: pid };
   return { pid: null, stale: true, unverifiable: null };
 }
