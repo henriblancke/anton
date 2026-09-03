@@ -34,6 +34,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** A read left in flight, so a later one can be made to land first. */
+function deferred() {
+  let settle!: (res: Response) => void;
+  const promise = new Promise<Response>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+}
+
+/** Let an already-resolved fetch walk its `res.json()` await chain into state. */
+const flush = () => act(async () => void (await new Promise((r) => setTimeout(r, 0))));
+
 /** The poll's own trigger: returning to the tab reads immediately, without waiting out a beat. */
 async function pollNow() {
   await act(async () => {
@@ -97,6 +109,45 @@ describe("useUnwatchedParks", () => {
 
     await waitFor(() => expect(result.current.parks).toBeUndefined());
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The poll and the arm button read the same endpoint at once. If the pre-arm answer lands last it
+  // would put the warning back on a watcher that is now armed — a switch that visibly undid itself.
+  it("ignores a read the arm button's refresh has already superseded", async () => {
+    const inFlight = deferred();
+    fetchMock.mockReturnValueOnce(inFlight.promise).mockResolvedValue(answer(null));
+
+    const { result } = renderHook(() => useUnwatchedParks("tmp", parks()));
+    await pollNow();
+
+    await act(async () => {
+      result.current.refresh();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.parks).toBeUndefined());
+
+    inFlight.settle(answer(parks({ parkedCount: 9 })));
+    await flush();
+
+    expect(result.current.parks).toBeUndefined();
+  });
+
+  // Same staleness the other way round: the page re-rendered with a newer read than the one out.
+  it("ignores a read a fresher server prop has already superseded", async () => {
+    const inFlight = deferred();
+    fetchMock.mockReturnValue(inFlight.promise);
+
+    const { result, rerender } = renderHook(
+      ({ server }: { server?: UnwatchedParks }) => useUnwatchedParks("tmp", server),
+      { initialProps: { server: parks() as UnwatchedParks | undefined } },
+    );
+    await pollNow();
+
+    rerender({ server: undefined });
+    inFlight.settle(answer(parks({ parkedCount: 9 })));
+    await flush();
+
+    expect(result.current.parks).toBeUndefined();
   });
 
   // Clearing the band on a blip would tell the operator their queue is watched when it is not.

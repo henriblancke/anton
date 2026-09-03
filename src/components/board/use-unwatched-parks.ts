@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { UnwatchedParks } from "@/lib/types";
 import { useVisiblePoll } from "@/components/board/use-visible-poll";
@@ -40,18 +40,30 @@ export function useUnwatchedParks(slug: string, server?: UnwatchedParks): Unwatc
   // paint the superseded band once before dropping it. Compared by VALUE, not identity — a server
   // prop is a fresh object on every page render, and identity here would restart this render.
   const [lastServer, setLastServer] = useState(server);
+  // Two reads can be in flight at once — the minute poll and the arm button's own refresh — and they
+  // can land out of order. Only the newest answer this hook has asked for may write: a pre-arm
+  // response landing after the click would otherwise restore the warning the click just cleared, and
+  // leave it up for another minute.
+  const generation = useRef(0);
   if (!sameSignal(server, lastServer)) {
     setLastServer(server);
     setPolled(null);
   }
 
+  // A re-rendered page outranks every read that was already out — same staleness, other direction.
+  useEffect(() => {
+    generation.current += 1;
+  }, [lastServer]);
+
   const read = useCallback(
     async (signal?: AbortSignal) => {
+      const issued = (generation.current += 1);
       try {
         const res = await fetch(`/api/projects/${slug}/unwatched-parks`);
         if (!res.ok) return;
         const data = (await res.json()) as { parks: UnwatchedParks | null };
-        if (!signal?.aborted) setPolled({ value: data.parks ?? undefined });
+        if (issued === generation.current && !signal?.aborted)
+          setPolled({ value: data.parks ?? undefined });
       } catch {
         // A failed read keeps the band that is up. Clearing it on a network blip would tell the
         // operator their queue is watched when it is not — the one error this band must not make.
