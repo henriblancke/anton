@@ -731,7 +731,7 @@ export const MAX_SOURCE_ENTRIES = 16384;
  * these very modules — so excluding every directory called `build` left an edit to them invisible,
  * and a git-less install could serve a `.next` compiled before it.
  */
-const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist", "server-port"]);
+const OUTPUT_AT_ROOT = new Set(["coverage", "out", "build", "dist"]);
 
 /**
  * The env files `next build` loads in production — the mode `anton start` compiles in. Each one
@@ -954,10 +954,27 @@ const APP_DIRECTORIES = ["app", "src/app"];
 const ROUTE_SOURCE = /\.(?:m?[jt]sx?)$/;
 
 /**
+ * `env` for a build environment anton could only read PART of — the route scan ran past its ceiling,
+ * so some build-evaluated route file went unread. A literal, so it can never collide with a digest.
+ *
+ * Kept apart from every real value for the reason `REVISION_UNREADABLE` is: two partial reads agree
+ * with each other and prove nothing, so `sameCheckout` refuses this one on either side rather than
+ * let a scan that stopped early vouch for an artifact.
+ */
+export const ENV_UNPROVABLE = "unprovable";
+
+/**
  * Ceiling on the route-tree scan. Generous against any real app dir, since the walk reads text
  * rather than hashing it and a route tree is a fraction of a source tree.
+ *
+ * Hitting it abandons the environment digest rather than truncating it (PR #217 review), exactly as
+ * `MAX_LINKED_ENTRIES` abandons a worktree read: a scan that stopped at a cutoff names the same
+ * variables however the routes past it change, so a statically generated page reading
+ * `BUILD_FLAVOR` beyond the cutoff would leave the digest identical and `buildMatchesCheckout` would
+ * hand back the `.next` compiled with the previous value. `ENV_UNPROVABLE` is the honest answer — it
+ * forces the rebuild, where a partial scan silently vouches for a stale build.
  */
-const MAX_ROUTE_ENTRIES = 4096;
+export const MAX_ROUTE_ENTRIES = 4096;
 
 /**
  * The build-environment variables the ROUTE TREE reads — the fourth route a value takes into the
@@ -981,9 +998,9 @@ const MAX_ROUTE_ENTRIES = 4096;
  */
 function routeEnvNames(appRoot) {
   const names = new Set();
-  const budget = { left: MAX_ROUTE_ENTRIES };
+  const budget = { left: MAX_ROUTE_ENTRIES, truncated: false };
   for (const dir of APP_DIRECTORIES) walkRoutes(join(appRoot, dir), budget, names);
-  return names;
+  return { names, truncated: budget.truncated };
 }
 
 function walkRoutes(dir, budget, names) {
@@ -994,7 +1011,10 @@ function walkRoutes(dir, budget, names) {
     return;
   }
   for (const entry of entries) {
-    if (budget.left <= 0) return;
+    if (budget.left <= 0) {
+      budget.truncated = true;
+      return;
+    }
     budget.left -= 1;
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -1064,13 +1084,20 @@ function expandedEnvNames(files) {
  * A `\0`-framed tag leads each entry because no path, name or value can contain one — so no pair of
  * files or variables can digest into the same bytes as another, and a file cannot digest as a
  * variable that happens to spell its name.
+ *
+ * A route scan that ran past its ceiling answers `ENV_UNPROVABLE` instead of a digest of the part it
+ * managed to read: the names it did not reach are exactly the ones a partial answer would hide.
  */
 function readEnvDigest(env, appRoot) {
+  // A scan that stopped at its ceiling read an unknown part of the route tree, so no set of names
+  // stands for this environment and no digest built from one may be compared (see MAX_ROUTE_ENTRIES).
+  const routes = routeEnvNames(appRoot);
+  if (routes.truncated) return ENV_UNPROVABLE;
   const files = readEnvFiles(appRoot);
   const inlined = new Set(Object.keys(env).filter((name) => name.startsWith(INLINED_ENV_PREFIX)));
   for (const name of expandedEnvNames(files)) inlined.add(name);
   for (const name of configEnvNames(appRoot)) inlined.add(name);
-  for (const name of routeEnvNames(appRoot)) inlined.add(name);
+  for (const name of routes.names) inlined.add(name);
   const names = [...inlined].filter((name) => env[name] !== undefined).sort();
   if (!names.length && !files.length) return null;
   const digest = createHash("sha256");
@@ -1534,6 +1561,10 @@ export function compareBuild(running, onDisk) {
  *   unreadable) is the same trap one step earlier: two failures agree, and the tarball rule below
  *   would then accept the artifact on version alone while an edit made during the compile goes
  *   unseen — and every later start under the same failure reuses that `.next`.
+ * - A build environment NEITHER read could establish (`ENV_UNPROVABLE` — the route scan ran past
+ *   `MAX_ROUTE_ENTRIES`) is that trap again on the one field an env change moves: both reads name
+ *   the same unknown, while a statically generated route past the scan's cutoff may have baked a
+ *   different value into `.next`.
  *
  * Either way `ensureFreshBuild` builds again and, if the reads never resolve, refuses to start —
  * which is the honest end, since nothing can then say what `.next` holds. An install with no git at
@@ -1565,6 +1596,7 @@ export function sameCheckout(a, b) {
     return false;
   }
   if (a.revision === REVISION_UNREADABLE || b.revision === REVISION_UNREADABLE) return false;
+  if (a.env === ENV_UNPROVABLE || b.env === ENV_UNPROVABLE) return false;
   return b.revision ? (b.worktree ?? null) !== null : (b.source ?? null) !== null;
 }
 

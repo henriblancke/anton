@@ -325,6 +325,10 @@ export function antonPidFile(stateDir = process.env.ANTON_STATE_DIR ?? join(home
  * birth time at all — still answers on the pid alone: an absence is not evidence, and that is
  * exactly the check this always was.
  *
+ * Only those two lines are read. What the CLI writes past them — the port that daemon listens on
+ * (`writePidFile` in bin/anton.mjs) — is the launcher's own note about the same process, and adding
+ * to it costs this reader nothing.
+ *
  * Read-only, so a request path can ask: clearing what this rejects is the CLI's call, not a
  * reader's (see `runningPid` in bin/anton.mjs).
  *

@@ -152,17 +152,32 @@ function compareVersions(a, b) {
 }
 
 /**
- * Write the daemon pidfile: the pid on the first line, the pid's birth stamp on the second.
+ * Write the daemon pidfile: the pid on the first line, the pid's birth stamp on the second, and the
+ * port that daemon listens on — when the caller knows it — on the third.
  *
  * The stamp is what `runningPid` needs to tell THIS daemon from whatever the OS later hands the
- * same number — the same protection build records already carry (see `recordAlive`). Two lines
- * rather than JSON because every reader of a pidfile, anton's or an operator's, expects to find a
- * pid on line one; a machine that cannot say when a process was born writes that line alone.
+ * same number — the same protection build records already carry (see `recordAlive`). Lines rather
+ * than JSON because every reader of a pidfile, anton's or an operator's, expects to find a pid on
+ * line one; a machine that cannot say when a process was born writes an empty second line, so the
+ * port keeps its place.
+ *
+ * The port lives HERE, in the daemon's own record, rather than in a file one per install (PR #217
+ * review). A shared note is written by whatever started last: `anton start --foreground --port 4100`
+ * beside a running daemon overwrote it, and `anton status` — which takes its pid from this file —
+ * then printed the daemon's pid against the foreground server's URL, and went on printing it after
+ * that process exited. Recorded with the pid, the port is the port of the process being reported,
+ * and it is deleted with the pidfile when the daemon stops.
+ *
+ * `pidFileVerdict` reads the first two lines only, so a third costs its readers nothing.
+ *
+ * @param {number} pid
+ * @param {string} [pidFile]
+ * @param {string|number|null} [port] the port that daemon listens on, where the caller knows it
  */
-function writePidFile(pid, pidFile = PID_FILE) {
+function writePidFile(pid, pidFile = PID_FILE, port = null) {
   mkdirSync(dirname(pidFile), { recursive: true });
-  const startedAt = processStartedAt(pid);
-  writeFileSync(pidFile, startedAt ? `${pid}\n${startedAt}\n` : `${pid}\n`);
+  const startedAt = processStartedAt(pid) ?? "";
+  writeFileSync(pidFile, port === null ? `${pid}\n${startedAt}\n` : `${pid}\n${startedAt}\n${port}\n`);
 }
 
 /**
@@ -260,41 +275,25 @@ async function waitForReady(port, timeoutMs = 30000) {
 }
 
 
-/** The launcher's note of the port it last started this install's server on. Sits beside anton.db. */
-const SERVER_PORT_FILE = "server-port";
-
-function serverPortPath(dbPath) {
-  return join(dirname(dbPath), SERVER_PORT_FILE);
-}
-
 /**
- * Remember the port `dev`/`start` is launching on, so a LATER invocation (`anton status`) can name
- * the URL this install's server is actually on rather than assume 3000.
+ * The port the daemon named in `pidFile` was started on, or null where that record names none — a
+ * pidfile written before the port was recorded there, or one written by a start that never knew it.
  *
- * Beside anton.db, because that is the one directory this install resolves identically in both
- * modes; the global state dir is shared with every other anton on the box, and a port read from
- * there would name someone else's server. Best-effort, and a stale note costs nothing.
+ * Only `startDaemon` records a port, and only for the process this file names: a foreground `anton
+ * start` or `anton dev` writes no pidfile, so it cannot overwrite the daemon's URL with its own.
  */
-function recordServerPort(dbPath, port) {
+function daemonPort(pidFile = PID_FILE) {
   try {
-    mkdirSync(dirname(dbPath), { recursive: true });
-    writeFileSync(serverPortPath(dbPath), `${port}\n`);
-  } catch {}
-}
-
-/** The port this install's server was last started on, or null when nothing recorded one. */
-function recordedServerPort(dbPath) {
-  try {
-    const port = readFileSync(serverPortPath(dbPath), "utf8").trim();
+    const port = (readFileSync(pidFile, "utf8").split("\n")[2] ?? "").trim();
     return /^\d+$/.test(port) ? port : null;
   } catch {
     return null;
   }
 }
 
-/** Where the server is: an explicit flag/`PORT`, else the port `dev`/`start` last recorded, else Next's default. */
-function serverPort(args, dbPath) {
-  return resolvePort(args) ?? recordedServerPort(dbPath) ?? "3000";
+/** Where the daemon is: an explicit flag/`PORT`, else the port it recorded when it started, else Next's default. */
+function serverPort(args, pidFile = PID_FILE) {
+  return resolvePort(args) ?? daemonPort(pidFile) ?? "3000";
 }
 
 const c = {
@@ -774,7 +773,8 @@ async function startDaemon(args) {
   }
   const port = resolvePort(args) ?? "3000";
   if (running) {
-    console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${port}`));
+    // The daemon's own port, not the one this invocation asked for: it is already up somewhere else.
+    console.log(c.yellow("anton is already running") + c.dim(` (pid ${running}) → http://localhost:${daemonPort() ?? port}`));
     return 0;
   }
 
@@ -792,7 +792,6 @@ async function startDaemon(args) {
     return 1;
   }
 
-  recordServerPort(stateEnv.ANTON_DB, port);
   mkdirSync(LOG_DIR, { recursive: true });
   const out = openSync(join(LOG_DIR, "stdout.log"), "a");
   const err = openSync(join(LOG_DIR, "stderr.log"), "a");
@@ -819,7 +818,7 @@ async function startDaemon(args) {
     },
   });
   child.unref();
-  writePidFile(child.pid);
+  writePidFile(child.pid, PID_FILE, port);
   console.log(c.dim(`anton starting (pid ${child.pid})…`));
 
   const ready = await waitForReady(port);
@@ -899,7 +898,7 @@ async function stoppedFor(action, pidFile = PID_FILE, startedAtNow = processStar
 /** Print install/runtime/state paths and whether the daemon is running. */
 function cmdStatus(args) {
   const { pid, unverifiable } = lifecycleVerdict();
-  const port = serverPort(args, resolveAntonDb());
+  const port = serverPort(args);
   console.log(c.bold("anton status"));
   console.log(`  version   ${bundleVersion() ?? c.dim("(source checkout)")}`);
   console.log(`  runtime   ${APP_ROOT}`);
@@ -2065,7 +2064,6 @@ async function cmdServerMode(args = []) {
 
 function cmdDev(args) {
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
-  recordServerPort(resolveAntonDb(), resolvePort(args) ?? "3000");
   return runLocal("next", nextArgs("dev", args));
 }
 
@@ -2169,7 +2167,6 @@ async function cmdStart(args) {
   // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
   // rather than falling back to a stray anton.db under the cwd. Source checkouts resolve their own DB.
   const serverEnv = IS_BUNDLE ? bundleStateEnv() : {};
-  recordServerPort(serverEnv.ANTON_DB ?? resolveAntonDb(), resolvePort(args) ?? "3000");
   return runLocal("next", nextArgs("start", args), serverEnv);
 }
 
@@ -2268,6 +2265,7 @@ export {
   cmdStop,
   stoppedFor,
   writePidFile,
+  serverPort,
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,

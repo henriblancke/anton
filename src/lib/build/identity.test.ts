@@ -22,10 +22,12 @@ import {
   compareBuild,
   describeBuildDrift,
   describeBuildIdentity,
+  ENV_UNPROVABLE,
   isBundleInstall,
   listBuildRecords,
   liveBuildRecords,
   MAX_LINKED_ENTRIES,
+  MAX_ROUTE_ENTRIES,
   MAX_SOURCE_ENTRIES,
   processStartedAt,
   pruneBuildRecords,
@@ -845,10 +847,10 @@ describe("the source digest of an install no git can describe", () => {
     expect(readBuildIdentity(dir, {}).source).toBe(first);
   });
 
-  // The digest has to be a fact about the CODE. anton writes its database, one record per running
-  // server and its port note beside its own source, and Next rewrites `.next` on every build — a
-  // digest that read any of them would move on its own, and a restart banner with no release behind
-  // it is one nobody reads.
+  // The digest has to be a fact about the CODE. anton writes its database and one record per running
+  // server beside its own source, and Next rewrites `.next` on every build — a digest that read any
+  // of them would move on its own, and a restart banner with no release behind it is one nobody
+  // reads.
   it("ignores build output, dependencies and the state a running anton writes beside its code", () => {
     const dir = tarball();
     const first = readBuildIdentity(dir, {}).source;
@@ -856,7 +858,6 @@ describe("the source digest of an install no git can describe", () => {
     writeFileSync(join(dir, "anton.db"), "sqlite");
     writeFileSync(join(dir, "anton.db-wal"), "wal");
     writeFileSync(join(dir, buildRecordFile(process.pid)), "{}");
-    writeFileSync(join(dir, "server-port"), "3000");
     writeFileSync(join(dir, "tsconfig.tsbuildinfo"), "{}");
     mkdirSync(join(dir, ".anton"));
     writeFileSync(join(dir, ".anton", "session.log"), "noise");
@@ -1231,6 +1232,28 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { ANTON_DB: "/one/anton.db" }).env).toBe(null);
   });
 
+  // Same rule as every other walk here: a route tree anton could only read part of is one it
+  // rebuilds rather than vouches for. A scan that stopped at its ceiling names the same variables
+  // however the routes past the cutoff change, so a prerendered page reading one beyond it would
+  // leave the digest identical and `buildMatchesCheckout` would reuse the artifact built with the
+  // old value (PR #217 review).
+  it("cannot name the environment of a route tree too large to scan whole", () => {
+    const dir = app();
+    const routes = join(dir, "src", "app");
+    mkdirSync(routes, { recursive: true });
+    for (let i = 0; i <= MAX_ROUTE_ENTRIES; i++) writeFileSync(join(routes, `p${String(i).padStart(6, "0")}.tsx`), "");
+    const shell = { BUILD_FLAVOR: "one" };
+    const identity = readBuildIdentity(dir, shell);
+    expect(identity.env).toBe(ENV_UNPROVABLE);
+
+    // And two reads that both come up unprovable agree on nothing: the build is compiled again
+    // rather than accepted.
+    expect(sameCheckout(identity, readBuildIdentity(dir, shell))).toBe(false);
+    mkdirSync(join(dir, ".next"));
+    writeBuildStamp(dir, identity);
+    expect(buildMatchesCheckout(dir, readBuildIdentity(dir, shell))).toBe(false);
+  });
+
   // Order is the shell's, not the build's: the same two values exported the other way round is the
   // same artifact, and rebuilding on it would be churn nobody can explain.
   it("does not depend on the order the shell exported them in", () => {
@@ -1389,13 +1412,6 @@ describe("the record a running server leaves", () => {
   // and a boot timestamp staged by the next routine `git add -A`.
   it("carries a name this repo ignores, so a boot never dirties the checkout", () => {
     const ignored = spawnSync("git", ["check-ignore", "-q", buildRecordFile(process.pid)], { cwd: process.cwd() });
-    expect(ignored.status).toBe(0);
-  });
-
-  // Same hazard, same fix: the launcher's port note also lands at the repo root on a source
-  // checkout, where an unignored name would enter the worktree digest and invalidate every build.
-  it("keeps the launcher's port note out of the checkout too", () => {
-    const ignored = spawnSync("git", ["check-ignore", "-q", "server-port"], { cwd: process.cwd() });
     expect(ignored.status).toBe(0);
   });
 

@@ -13,7 +13,7 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 
 import {
   agentsFromArgs,
@@ -26,6 +26,7 @@ import {
   resolveAntonDb,
   resolvePort,
   runningPid,
+  serverPort,
   stoppedFor,
   unstampedServers,
   writePidFile,
@@ -558,6 +559,45 @@ describe("the daemon pidfile", () => {
       expect(await stoppedFor("update", path, () => null)).toBe(false);
 
       expect(await stoppedFor("uninstall", join(await dirs.make("anton-state-"), "absent.pid"))).toBe(true);
+    });
+  });
+
+  /**
+   * The URL `anton status` prints belongs to the pid it just named. The port used to live in one
+   * note per install, which whatever started LAST overwrote: `anton start --foreground --port 4100`
+   * beside a running daemon made status print the daemon's pid against the foreground server's URL,
+   * and go on printing it after that process exited (PR #217 review). Recorded on the pidfile, the
+   * port is the port of the process being reported, and it is gone when that record is.
+   */
+  describe("the port a status line names", () => {
+    beforeEach(() => {
+      delete process.env.PORT;
+    });
+
+    it("is the one the daemon recorded when it started", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path, "4100");
+      expect(serverPort([], path)).toBe("4100");
+      expect(runningPid(path)).toBe(process.pid); // and the record still proves whose port it is
+    });
+
+    it("is Next's default where the record names no port", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path);
+      expect(serverPort([], path)).toBe("3000");
+    });
+
+    it("is the explicit flag wherever the caller gives one", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path, "4100");
+      expect(serverPort(["--port", "4200"], path)).toBe("4200");
+    });
+
+    it("is gone once the daemon's record is, rather than outliving the server", async () => {
+      const path = await pidFile();
+      writePidFile(process.pid, path, "4100");
+      rmSync(path);
+      expect(serverPort([], path)).toBe("3000");
     });
   });
 });
