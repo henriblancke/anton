@@ -414,10 +414,11 @@ export const FAILED_REPAIR_WEIGHT = 2;
  * and only a repair stamped since the bead last delivered still stands behind one. Deliveries are
  * evidence the board cannot carry and the breaker's own window does not reach — a delivery ends the
  * streak, so it lies outside it by construction — which is why they are handed in from the run rows
- * (runs.ts `listDeliveriesByBead`) rather than derived here. Keyed exactly as the repair is, by the
- * two beads a run carried: a delivery recorded against the epic does not spend a stamp on the child
- * it grouped, which is the conservative direction — a repair whose bead never delivered in its own
- * name goes on counting double.
+ * (runs.ts `listDeliveriesByBead`) rather than derived here. Keyed exactly as the repair is, per
+ * BEAD: the run's target, the ticket its row names, and every child that committed its own work
+ * inside a grouped run. A delivery recorded against the epic still does not spend a stamp on the
+ * child it grouped, which is the conservative direction — a repair whose bead never delivered in its
+ * own name goes on counting double.
  *
  * A run with no recorded start is weighed plainly. Nothing can be ordered against it, and the fence
  * goes to the cheaper error: one more failure before the breaker fires, rather than a double weight

@@ -402,6 +402,19 @@ const EPIC_KEYS: ReadonlySet<string> = new Set([...OUTCOME_KEYS, ...SUCCESS_KEYS
  * headings applicable to the bead's tier may terminate a deeper section (see {@link sectionsOf}). */
 const CONTRACT_KEYS: ReadonlySet<string> = new Set([...TICKET_KEYS, ...EPIC_KEYS]);
 
+/**
+ * Does this heading name a contract section — any tier's? For a reader OUTSIDE the gate that must
+ * end a section exactly where {@link sectionOccurrences} does, at any depth: the `ref-stale` repair
+ * rewrites `## Context` and nothing else, and a `### Verify` nested under it is Verify's content to
+ * the gate (gardener/repair-ref-stale.ts).
+ *
+ * Merged rather than tiered for {@link sectionBody}'s reason — such a caller holds text, not a bead,
+ * so it has no tier to narrow by. The divergence is one-directional and harmless here: stopping at
+ * another tier's alias ends a section EARLIER than the gate would, so a reader rewrites less of a
+ * description than the gate calls Context, never more.
+ */
+export const isContractHeading = (heading: Heading): boolean => CONTRACT_KEYS.has(heading.key);
+
 /** The heading set {@link sectionsOf} sections a bead of this tier by. Exempt reads as ticket — the
  * same non-epic default {@link acceptanceKeysOf} and {@link goalKeysOf} apply. */
 const contractKeysOf = (tier: ContractTier): ReadonlySet<string> =>
@@ -842,8 +855,9 @@ export function contractOrderGaps(bead: Bead): ContractSection[] {
 }
 
 /** One section the form question asks about: where the description carries it, or `undefined` when
- * it does not. `at` is the ordinal of the LAST section OCCURRENCE supplying an authored body — the
- * preamble is -1. */
+ * it does not. `at` is the ordinal of the LAST section OCCURRENCE supplying an authored body — or
+ * -1 for the preamble, the home that sits ahead of every heading and so is only the last one when
+ * no heading carries the section at all. */
 interface FormPlacement {
   section: ContractSection;
   at: number | undefined;
@@ -864,6 +878,12 @@ interface FormPlacement {
  *
  * A section repeated back-to-back still reads ordered, and should: its content is contiguous and
  * sits where the contract puts it — nothing has to MOVE, which is the only repair this gap asks for.
+ *
+ * The preamble is the LAST home considered, not a short-circuit (PR #223 review). It sits ahead of
+ * every heading, so an epic that states its outcome in the opening line AND authors a `## Outcome`
+ * after its Success Criteria carries that section last, not first — placing it at -1 on the strength
+ * of the preamble alone reported that description ordered while its contract content continues past
+ * the rubric, the one arrangement this exists to catch.
  */
 function formPlacements(bead: Bead): FormPlacement[] {
   if (!isContractJudged(bead)) return [];
@@ -872,11 +892,13 @@ function formPlacements(bead: Bead): FormPlacement[] {
   const description = typeof bead.description === "string" ? bead.description : "";
   const found = sectionOccurrences(description, contractKeysOf(tier));
   const rules = tier === "epic" ? EPIC_FORM_RULES : TICKET_FORM_RULES;
+  const preamble = isAuthoredBody(preambleOf(description));
   return rules.map((rule) => {
-    // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first.
-    if (rule.preamble && isAuthoredBody(preambleOf(description))) return { section: rule.section, at: -1 };
     const at = found.findLastIndex((s) => rule.keys.includes(s.key) && isAuthoredBody(s.body));
-    return { section: rule.section, at: at === -1 ? undefined : at };
+    if (at !== -1) return { section: rule.section, at };
+    // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first —
+    // and only when no LATER heading carries the section too.
+    return { section: rule.section, at: rule.preamble && preamble ? -1 : undefined };
   });
 }
 

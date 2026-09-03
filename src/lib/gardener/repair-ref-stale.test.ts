@@ -122,6 +122,17 @@ describe("contextSpans", () => {
     expect(span!.body).not.toContain("## Verify");
   });
 
+  it("stops at a DEEPER heading that names another contract section", () => {
+    // The gate reads `### Verify` as Verify's own content however deeply it is nested, so a span
+    // running past it would rewrite a citation belonging to a section this repair never touches.
+    const [span, ...rest] = contextSpans(
+      ["## Context", "prose `src/a.ts`", "### Verify", "`src/b.ts` passes"].join("\n"),
+    );
+    expect(rest).toEqual([]);
+    expect(span!.body).toContain("`src/a.ts`");
+    expect(span!.body).not.toContain("`src/b.ts`");
+  });
+
   it("answers nothing for a bead that states no Context", () => {
     expect(contextSpans("## Goal\nShip it.")).toEqual([]);
   });

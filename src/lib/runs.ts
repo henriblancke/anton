@@ -344,14 +344,23 @@ export async function listRecentRunOutcomes(
 }
 
 /**
- * When work carrying each of these beads DELIVERED — every `done` run naming the bead as its target
- * or as the ticket it stopped inside, in unix SECONDS, unordered.
+ * When work carrying each of these beads DELIVERED — in unix SECONDS, unordered.
  *
  * Read for the repair weigher alone (gardener/repair.ts): a repair's double weight lasts only until
  * the repaired bead next delivers, and a delivery that old is behind the streak the breaker walks —
- * it is not in the run window and no board read remembers it. Keyed the same two ways the weigher
- * looks a repair up, so the delivery evidence and the repair evidence can never disagree about which
- * bead a run carried.
+ * it is not in the run window and no board read remembers it.
+ *
+ * TWO sources, because the run row cannot name every bead a run delivered (PR #223 review). It
+ * carries one `ticketBeadId`, and a grouped run OVERWRITES it per child (jobs/execute-epic-ticket.ts
+ * `openTicketSession`) — so on the rows alone a repaired child that succeeded, followed by any other
+ * child, leaves no delivery at all, and its stamp goes on weighing later unrelated failures double
+ * until the breaker disarms the picker early. So the rows answer for the run's TARGET and its final
+ * ticket, and each ticket's own `execute` session — opened per child and settled `done` only once
+ * that child's work committed — answers for the rest.
+ *
+ * A ticket session settles `done` on its own commit, whatever becomes of the run around it: the
+ * repair the child carried was PROVEN by that landing, which is the whole test this evidence exists
+ * to apply.
  *
  * Bounded by the ids handed in — the beads that actually carry a repair stamp — so an unrepaired
  * board costs no query at all.
@@ -364,6 +373,8 @@ export async function listDeliveriesByBead(
   const out = new Map<string, number[]>();
   if (beadIds.length === 0) return out;
   const ids = [...new Set(beadIds)];
+  const wanted = new Set(ids);
+  const record = (id: string, at: number) => out.set(id, [...(out.get(id) ?? []), at]);
   const rows = await db
     .select({
       epicBeadId: schema.runs.epicBeadId,
@@ -379,7 +390,6 @@ export async function listDeliveriesByBead(
         or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
       ),
     );
-  const wanted = new Set(ids);
   for (const row of rows) {
     // A settled row's `updatedAt` is when it settled — the fallback for rows written before
     // `endedAt` was recorded, exactly as the breakers' own fence reads them.
@@ -387,8 +397,28 @@ export async function listDeliveriesByBead(
     if (at === undefined) continue;
     for (const id of [row.epicBeadId, row.ticketBeadId]) {
       if (id === null || !wanted.has(id)) continue;
-      out.set(id, [...(out.get(id) ?? []), at]);
+      record(id, at);
     }
+  }
+
+  const ticketRows = await db
+    .select({ beadId: schema.sessions.beadId, endedAt: schema.sessions.endedAt })
+    .from(schema.sessions)
+    .where(
+      and(
+        eq(schema.sessions.projectId, projectId),
+        eq(schema.sessions.kind, "execute"),
+        eq(schema.sessions.status, "done"),
+        inArray(schema.sessions.beadId, ids),
+      ),
+    );
+  for (const row of ticketRows) {
+    // `endedAt` is written with the `done` status in one update (sessions.ts `endSession`), so a
+    // row without one is not a delivery this read can place in time — and a delivery it cannot
+    // place is not one it may spend a repair stamp on.
+    const at = toEpoch(row.endedAt);
+    if (at === undefined || row.beadId === null) continue;
+    record(row.beadId, at);
   }
   return out;
 }

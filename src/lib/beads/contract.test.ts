@@ -1103,6 +1103,19 @@ describe("contractOrderGaps (the form's order question)", () => {
     expect(contractOrderGaps(epic({ description: "It is shareable.\n\n## Success Criteria\n- [ ] x" }))).toEqual([]);
   });
 
+  it("still reads an epic's LATER authored Outcome, where the preamble also states one", () => {
+    // The preamble is a home, not a short-circuit: the outcome is restated under `## Outcome` after
+    // the rubric, so contract content continues past Success Criteria. Placing the section at -1 on
+    // the preamble alone reported this description as ordered.
+    const continued = epic({
+      description: [FULL_EPIC_DESCRIPTION.replace("## Outcome\n", ""), "", "## Outcome", "Reports leave the app."].join(
+        "\n",
+      ),
+    });
+    expect(contractFormGaps(continued)).toEqual([]);
+    expect(contractOrderGaps(continued)).toEqual(["Success Criteria"]);
+  });
+
   it("judges an epic on its own two sections, in its own order", () => {
     const inverted = epic({
       description: reorder(FULL_EPIC_DESCRIPTION, ["Success Criteria", "Outcome"]),

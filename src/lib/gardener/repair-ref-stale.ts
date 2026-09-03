@@ -26,6 +26,7 @@
  * armed the class gets the rewrite WORKED OUT and recorded rather than written (R5.3).
  */
 import { beads } from "../beads/bd";
+import { isContractHeading } from "../beads/contract";
 import { scanMarkdown } from "../beads/markdown";
 import { readPathHistory, type PathHistory } from "../git/ops";
 import { access } from "node:fs/promises";
@@ -110,7 +111,10 @@ export interface ContextSpan {
  * Offsets, because this repair REWRITES in place: the surrounding contract (Goal, Acceptance,
  * Verify) has to come back byte-identical, and re-rendering a parsed description would quietly
  * reformat sections nobody asked anton to touch. Each section runs to the next heading at its own
- * depth or shallower — a `### Files` grouping beneath it is still Context.
+ * depth or shallower — a `### Files` grouping beneath it is still Context — or to a heading naming
+ * another contract section at ANY depth (PR #223 review): the gate reads a `### Verify` written under
+ * `## Context` as Verify's own content ({@link isContractHeading}), so a span that swallowed it would
+ * rewrite citations belonging to a section this repair promises never to touch.
  *
  * Every occurrence rather than the first (PR #223 review), because a repeated heading is not a
  * malformed bead to this repair: the contract gate CONCATENATES repeated sections, so a citation
@@ -139,9 +143,11 @@ export function contextSpans(description: string): ContextSpan[] {
   for (const line of scanMarkdown(description)) {
     const lineEnd = offset + line.text.length;
     const nextLine = lineEnd + (description.startsWith("\r\n", lineEnd) ? 2 : 1);
-    // A heading at the open section's depth or shallower closes it — and may open the next one, so
-    // two adjacent `## Context` sections are two spans rather than one swallowing the other.
-    if (start !== undefined && line.heading && line.heading.depth <= depth) close(offset);
+    // A heading at the open section's depth or shallower closes it, as does any heading naming
+    // another contract section however deeply nested — and either may open the next one, so two
+    // adjacent `## Context` sections are two spans rather than one swallowing the other.
+    const closes = line.heading && (line.heading.depth <= depth || isContractHeading(line.heading));
+    if (start !== undefined && closes) close(offset);
     if (start === undefined && line.heading?.key === "context") {
       start = Math.min(nextLine, description.length);
       depth = line.heading.depth;
