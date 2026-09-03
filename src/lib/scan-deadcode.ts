@@ -65,6 +65,19 @@ const UNUSED_TITLE = /^\s*unused\s+[\w-]+\s*:\s*([A-Za-z_$][\w$]*)/i;
 const PROSE_FILE = /\.(?:md|markdown|txt|rst|adoc|org)$/i;
 
 /**
+ * Files that are DATA by construction. JSON has no call syntax at all: a `"Widget"` in a fixture, a
+ * snapshot, a locale bundle or a lockfile is a string, and reading it as a caller deletes a true
+ * finding (anton-23xe). The unknown-language path cannot save it — that grammar leaves quoted
+ * strings intact on purpose, since in a language anton tracks no rules for a quote means something
+ * else as often.
+ *
+ * A manifest naming a symbol some loader resolves at runtime is the case this gives up: it is no
+ * longer credited as a caller, so the signal stands and gets triaged. That is the direction this
+ * filter errs in, and the direction the current reading gets backwards.
+ */
+const DATA_FILE = /\.(?:json|jsonc|json5)$/i;
+
+/**
  * A line opening with a comment marker in *some* language, for a file whose language anton has no
  * grammar for below. It is the union across languages, so a marker one language doesn't share is
  * still read as prose — `;` is a Lisp comment and an ASI guard, and without knowing the file this
@@ -669,6 +682,55 @@ const MDX_FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 /** The whole line replaced by spaces — same length, so a hit's offsets still line up. */
 function blankAll(line: string): string {
   return " ".repeat(line.length);
+}
+
+/** Shell scripts, whose heredoc payloads are data the interpreter never runs as code. */
+const SHELL_FILE = /\.(?:sh|bash|zsh)$/i;
+
+/**
+ * A heredoc opener and the word ending it — `<<EOF`, `<<-'EOF'`, `<< "EOF"`. `<<<` is a here-STRING
+ * and opens nothing, and `<<=` is a shift-assign: both are kept out. The guard runs on BOTH sides,
+ * because without the lookbehind `<<<EOF` still matches at its second `<` — the engine simply
+ * starts one character later — and a here-string would then blank the rest of the script.
+ *
+ * The quoted spellings are what a script uses to keep the payload literal, and the bare one is the
+ * expanding form — both end at a line holding the word alone.
+ */
+const HEREDOC_OPEN = /(?<!<)<<-?(?!<|=)\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))/g;
+
+/**
+ * A shell script with its heredoc payloads blanked. `cat <<'EOF'` followed by `Widget()` writes a
+ * file; it does not call the symbol, and reading that payload as code invents a caller and deletes
+ * a true finding (anton-23xe). Scripts that scaffold source or emit documentation are exactly where
+ * a symbol's name shows up inside one.
+ *
+ * The opener's own line stays code — it is a real command, and a call beside the `<<` runs. Only
+ * the payload and its terminator are blanked, and blanking preserves the line count because every
+ * reference here is judged by line index against the raw text.
+ *
+ * A script may open more than one heredoc on a line (`cmd <<A <<B`), and their payloads follow in
+ * the order the openers were written, so the pending words are held as a queue. `<<-` strips
+ * leading TABS from the terminator, which is the only indentation the form allows.
+ */
+function maskHeredocs(text: string): string {
+  const pending: { word: string; dash: boolean }[] = [];
+  return text
+    .split("\n")
+    .map((line) => {
+      const open = pending[0];
+      if (open) {
+        const terminator = open.dash ? line.replace(/^\t+/, "") : line;
+        if (terminator === open.word) pending.shift();
+        return blankAll(line);
+      }
+      HEREDOC_OPEN.lastIndex = 0;
+      for (let m = HEREDOC_OPEN.exec(line); m; m = HEREDOC_OPEN.exec(line)) {
+        const word = m[1] ?? m[2] ?? m[3];
+        if (word) pending.push({ word, dash: m[0].startsWith("<<-") });
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 /** The index just past the run of backticks starting at `at`. */
@@ -1977,7 +2039,7 @@ function candidateHits(stdout: string): CandidateHits {
     const textStart = record.indexOf("\0", pathEnd + 1);
     if (textStart < 0) continue;
     const file = normalize(record.slice(0, pathEnd));
-    if (PROSE_FILE.test(file)) continue;
+    if (PROSE_FILE.test(file) || DATA_FILE.test(file)) continue;
     if (!commentSyntaxOf(file) && COMMENT_LINE.test(record.slice(textStart + 1).trimStart()))
       continue;
     const line = Number(record.slice(pathEnd + 1, textStart));
@@ -2448,7 +2510,10 @@ async function maskFile(
   const text = await readFile(join(repoPath, file), { encoding: "utf8", signal: abort });
   // MDX's markdown — its fences and code spans — is blanked before the JSX comment grammar runs,
   // so a `/*` or `//` shown inside an example can't open a comment across the program.
-  const code = maskComments(isMdx ? maskMdxProse(text) : text, syntax);
+  const code = maskComments(
+    isMdx ? maskMdxProse(text) : SHELL_FILE.test(file) ? maskHeredocs(text) : text,
+    syntax,
+  );
   const raw = text.split("\n");
   const markup = isMarkup ? markupProgram(code, file) : undefined;
   const open = isMdx ? mdxOpenLines(code, raw) : undefined;

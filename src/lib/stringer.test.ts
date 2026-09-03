@@ -2111,6 +2111,56 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("src/legacy/notes.rb");
     });
 
+    // JSON has no call syntax at all, and the unknown-language grammar leaves quoted strings
+    // intact on purpose, so a `"neverCalled"` in a fixture or a locale bundle read as a caller and
+    // deleted a finding that was right.
+    it("does not count a name in a JSON file, and still counts a real caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "fixtures/locale.json": JSON.stringify({ label: "neverCalled", tip: "neverCalled ran" }),
+        "src/lib/caller.ts": "import { neverCalled } from './orphan';\nneverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("fixtures/locale.json");
+    });
+
+    // A heredoc payload is data the shell writes out, not code it runs. A script that scaffolds
+    // source is exactly where a symbol's name lands inside one, and reading that payload as
+    // executable invented a caller and deleted a finding that was right.
+    it("does not count a name inside a shell heredoc, and still counts a shell caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/scaffold.sh":
+          "cat <<'EOF' > generated.ts\nneverCalled();\nEOF\necho done\n",
+        // The dash form strips leading tabs from its terminator, and the payload is still data.
+        "scripts/indented.sh": "cat <<-EOF > other.ts\n\tneverCalled();\n\tEOF\necho done\n",
+        "scripts/run.sh": "node -e \"require('./orphan').neverCalled()\"\n",
+        // `<<<` is a here-STRING and opens no payload. Without a guard on the left of the `<<`,
+        // the opener still matches at its second `<` and blanks the rest of the script.
+        "scripts/herestring.sh": "grep -q ok <<<EOF\nneverCalled\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/run.sh");
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/herestring.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/scaffold.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/indented.sh");
+    });
+
     // MDX is a program: a component imported and rendered only from a docs page has a real caller,
     // and discounting the whole file as prose leaves that component reported dead every night. Its
     // markdown body still is prose, so only the shapes MDX executes may count.
