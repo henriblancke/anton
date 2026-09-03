@@ -852,6 +852,11 @@ describe("scan", () => {
         // An uppercase VALUE, not the env var name on the left: a seed constant and a generated
         // token are one character apart, so the filter reads neither as a placeholder.
         "src/f.test.ts": atLines({ 3: `  const seed = "SEED_DB_PASS1";` }),
+        // A generated blob that lands INSIDE a word's vowel range (0.35) with no six-consonant run
+        // and 3.92 bits/char — every summary statistic reads it as written. Only its letter pairs
+        // (`gq`, `qc`, `yk`, `hv`) say otherwise, and roughly a quarter of random 20-character
+        // blobs look like this one, so it is the population the filter must not clear.
+        "src/h.test.ts": atLines({ 3: `  const blob = "agqcrawykynuwdrhveoz";` }), // gitleaks:allow
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         secret("src/a.test.ts", 3),
@@ -860,12 +865,45 @@ describe("scan", () => {
         secret("src/d.test.ts", 3),
         secret("src/e.test.ts", 3),
         secret("src/f.test.ts", 3),
+        secret("src/h.test.ts", 3),
       ]);
 
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
-      expect(result.signals).toHaveLength(6);
+      expect(result.signals).toHaveLength(7);
       expect(result.secrets.dropped).toEqual([]);
+    });
+
+    // A quoted key is a NAME, not a value. Reading it as one made the SCREAMING_SNAKE on the left
+    // credential-shaped, so every JSON/YAML/Python-spelled fixture kept its critical signal — the
+    // exact class this filter exists to clear, surviving on punctuation.
+    it("judges a quoted mapping entry by its value, not by the key naming it", async () => {
+      const repo = writeRepo({
+        "tests/fixtures/env.test.ts": atLines({
+          3: `  "BEADS_DOLT_PASSWORD": "shared-secret",`,
+          // ...and the value still has to stand on its own: a key cannot vouch for a real token.
+          4: `  "BEADS_DOLT_PASSWORD": "glpat-abcdefghijklmnop",`,
+          // A ternary is not a mapping entry, so its left branch stays a value under judgement.
+          5: `  const key = live ? "AKIAIOSFODNN7EXAMPLE" : "shared-secret";`,
+        }),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        secret("tests/fixtures/env.test.ts", 3),
+        secret("tests/fixtures/env.test.ts", 4),
+        secret("tests/fixtures/env.test.ts", 5),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Line: 4 }, { Line: 5 }]);
+      expect(result.secrets.dropped).toEqual([
+        {
+          path: "tests/fixtures/env.test.ts",
+          line: 3,
+          kind: "committed-secret",
+          reason: `a test fixture assigning "shared-secret"`,
+        },
+      ]);
     });
 
     // The calibration itself, machine-checked rather than commented: "local-development-password"

@@ -85,11 +85,17 @@ const PLACEHOLDER_SHAPE = /^[a-z]+(?:[-_.][a-z]+)*$/;
 /**
  * Whether the letters read as something a human typed rather than something a generator emitted.
  *
- * Bits-per-character alone cannot answer this, which the first cut of this filter assumed it could:
- * over 20-character lowercase samples a random blob averages 3.68 bits/char while placeholder
- * phrases like "local-development-password" reach 3.77, so no floor separates the two populations.
- * Vowel structure does — English runs ~40% vowels against a random alphabet's 19% (5 of 26), and it
- * needs no length gate, so a SHORT generated blob is caught too.
+ * No summary statistic answers this on its own, and both of the obvious ones have already been
+ * tried here. Bits per character cannot: over 20-character lowercase samples a random blob averages
+ * 3.68 bits/char while "local-development-password" reaches 3.77. Vowel counting cannot either: a
+ * random alphabet runs 23% vowels against English's ~40%, but the SPREAD swamps the gap, so roughly
+ * a quarter of random 20-character blobs land in a word's vowel range — `agqcrawykynuwdrhveoz` sits
+ * at 0.35 with no long consonant run and 3.92 bits/char, and every threshold above reads it as a
+ * placeholder.
+ *
+ * What separates them is which letters sit NEXT to each other. English is a small set of legal
+ * pairs; a generator draws uniformly and produces `gq`, `qc`, `yk`, `hv`. So the positive test is
+ * {@link ENGLISH_BIGRAMS}, and the vowel rules stay as the cheap first cut they always were.
  */
 const VOWEL = /[aeiouy]/;
 const VOWELS = /[aeiouy]/g;
@@ -99,11 +105,57 @@ const VOWEL_RATIO_FLOOR = 0.25; // "password" sits exactly here; below it is not
 /** Under this, the ratio is noise — one letter either way swings it past any threshold. */
 const RATIO_MIN_LETTERS = 4;
 
+/**
+ * The letter pairs carrying 98.5% of the bigram mass in `/usr/share/dict/words` (235k words, pairs
+ * taken in frequency order until the cumulative share crosses the threshold). Spelled out because
+ * there is no shorter way to state what English looks like — and because a table can be re-derived
+ * and checked, where a hand-tuned threshold cannot.
+ */
+const ENGLISH_BIGRAMS = new Set(
+  (
+    "ab ac ad ae af ag ah ai ak al am an ap ar as at au av aw ax ay az ba bb be bi bl bo br bs bu " +
+    "ca cc ce ch ci ck cl co cr ct cu cy da dd de dg di dl dn do dr ds du dy ea eb ec ed ee ef eg " +
+    "eh ei el em en eo ep eq er es et eu ev ew ex ey fa fe ff fi fl fo fr ft fu fy ga ge gg gh gi " +
+    "gl gm gn go gr gu gy ha he hi hl hm hn ho hr ht hu hy ia ib ic id ie if ig ik il im in io ip " +
+    "ir is it iu iv iz ja je jo ju ka ke ki kl ko la lc ld le lf lg li ll lm ln lo lp ls lt lu lv " +
+    "ly ma mb me mi mm mn mo mp mu my na nb nc nd ne nf ng nh ni nk nl nm nn no np nr ns nt nu nv " +
+    "nw ny oa ob oc od oe of og oh oi ok ol om on oo op or os ot ou ov ow ox oy pa pe ph pi pl po " +
+    "pp pr ps pt pu py qu ra rb rc rd re rf rg rh ri rk rl rm rn ro rp rr rs rt ru rv rw ry sa sc " +
+    "se sh si sk sl sm sn so sp sq ss st su sw sy ta tc te th ti tl tm to tr ts tt tu tw ty ua ub " +
+    "uc ud ue uf ug ui ul um un uo up ur us ut va ve vi vo wa we wh wi wn wo xa xe xi xo xp xt xy " +
+    "ya yc yd ye yg yi yl ym yn yo yp yr ys yt za ze zi zo"
+  ).split(" "),
+);
+
+/**
+ * How English a segment's letter pairs are. Measured: the weakest word in the known fixture corpus
+ * is "project" at 0.83 (`oj` is rare), while a random 20-character blob averages 0.47.
+ */
+const BIGRAM_FLOOR = 0.75;
+/** Under five letters a segment offers three pairs or fewer — too coarse to carry a verdict. */
+const BIGRAM_MIN_LETTERS = 5;
+/**
+ * Longer than any word in the fixture corpus ("development", 11). An unbroken lowercase run past
+ * this is not a word however English its pairs read, and a human writing a long placeholder
+ * separates it ("local-development-password"). A concatenated one costs a triaged bead.
+ */
+const SEGMENT_MAX_LETTERS = 12;
+
+function bigramFit(segment: string): number {
+  let english = 0;
+  for (let i = 0; i < segment.length - 1; i += 1) {
+    if (ENGLISH_BIGRAMS.has(segment.slice(i, i + 2))) english += 1;
+  }
+  return english / (segment.length - 1);
+}
+
 export function looksWritten(value: string): boolean {
   const segments = value.split(/[-_.]/);
   for (const segment of segments) {
+    if (segment.length > SEGMENT_MAX_LETTERS) return false;
     if (segment.length >= RATIO_MIN_LETTERS && !VOWEL.test(segment)) return false;
     if (CONSONANT_RUN.test(segment)) return false;
+    if (segment.length >= BIGRAM_MIN_LETTERS && bigramFit(segment) < BIGRAM_FLOOR) return false;
   }
   const letters = segments.join("");
   if (letters.length < RATIO_MIN_LETTERS) return true;
@@ -160,15 +212,32 @@ const QUOTED = [
 const BARE_ASSIGNMENT = /^\s*(?:export\s+)?[A-Za-z_][\w.-]*\s*[:=]\s*([^\s#'"`,]+)\s*,?\s*$/;
 
 /**
+ * A quoted literal that a `:` turns into a mapping key — how JSON, YAML and Python fixtures spell
+ * `"BEADS_DOLT_PASSWORD": "shared-secret"`. The key is a NAME, and reading it as a value made the
+ * whole line credential-shaped on the SCREAMING_SNAKE alone, so the fixture kept its signal.
+ *
+ * Anchored on the left to a line start, `{` or `,` — where a mapping entry can actually begin — so
+ * a ternary's `cond ? "sk-live-…" : ""` stays a value the filter has to clear on its own merits.
+ */
+const MAPPING_KEY_LEFT = /(?:^|[{,])\s*$/;
+const MAPPING_KEY_RIGHT = /^\s*:/;
+
+/**
  * Every value the flagged line could be talking about. Both spellings are collected rather than
  * guessed between: the detector matched somewhere on this line, and a filter that picked the wrong
- * literal would clear a signal it never actually read.
+ * literal would clear a signal it never actually read. Only a quoted mapping KEY is skipped — it
+ * names the value rather than being one, and no detector ever meant it.
  */
 export function valuesOn(line: string): string[] {
   const values: string[] = [];
   for (const pattern of QUOTED) {
-    for (const [, body] of line.matchAll(pattern)) {
-      if (body) values.push(body);
+    for (const match of line.matchAll(pattern)) {
+      const body = match[1];
+      if (!body) continue;
+      const left = line.slice(0, match.index);
+      const right = line.slice(match.index + match[0].length);
+      if (MAPPING_KEY_LEFT.test(left) && MAPPING_KEY_RIGHT.test(right)) continue;
+      values.push(body);
     }
   }
   if (values.length === 0) {
