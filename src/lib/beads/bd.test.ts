@@ -12,11 +12,13 @@ import {
   isMissingBeadError,
   isNotWiredOutput,
   LABELS,
+  LINK_TYPES,
   parseCookedFormula,
   runDoltSync,
   SYNC_STALL_MS,
   unclaimableStatus,
   type Bead,
+  type LinkType,
 } from "./bd";
 import { refreshIssueSnapshot, resetIssueSnapshots } from "./snapshot";
 import { createDoltSync } from "./sync-coalescer";
@@ -1452,5 +1454,38 @@ describe("the bd seam takes cwd explicitly (anton-brdg)", () => {
   it("bd.ts never calls process.cwd() — every verb is told which repo it acts on", () => {
     const src = readFileSync(join(process.cwd(), "src/lib/beads/bd.ts"), "utf8");
     expect(src).not.toContain("process.cwd()");
+  });
+});
+
+describe("beads.link validates --type at the seam (anton-igkb)", () => {
+  // bd accepts ANY non-empty string for --type and writes a non-blocking edge for all but
+  // `blocks`/`conditional-blocks`, reporting nothing. So the seam has to reject before the spawn —
+  // once bd has the argv, the mistake is already on the board and round-trips through export.
+  it("throws on a bogus type WITHOUT spawning bd", async () => {
+    const { calls, exec } = recordingExec("");
+    await expect(
+      beads.link("/repo", "a-1", "a-2", "totally-bogus-type" as LinkType, exec),
+    ).rejects.toThrow(/refusing dependency type "totally-bogus-type"/);
+    expect(calls).toEqual([]); // never reached bd
+  });
+
+  it("throws on the no-op types bd stores happily", async () => {
+    const { calls, exec } = recordingExec("");
+    for (const t of ["waits-for", "conditional-blocks", "", "Blocks"]) {
+      await expect(beads.link("/repo", "a-1", "a-2", t as LinkType, exec)).rejects.toThrow(
+        /refusing dependency type/,
+      );
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it("passes every allowed type through, in the cwd it was given", async () => {
+    for (const type of LINK_TYPES) {
+      const { calls, exec } = recordingExec("");
+      await beads.link("/repos/other", "a-1", "a-2", type, exec);
+      expect(calls).toEqual([
+        { cwd: "/repos/other", args: ["link", "a-1", "a-2", "--type", type] },
+      ]);
+    }
   });
 });
