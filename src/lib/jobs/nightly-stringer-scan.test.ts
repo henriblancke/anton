@@ -51,6 +51,16 @@ vi.mock("../stringer", async (importOriginal) => {
       duplication: {
         dropped: [{ path: "src/doc.ts", kind: "code-clone", reason: "6 comment line(s)" }],
       },
+      secrets: {
+        dropped: [
+          {
+            path: "src/lib/beads/bd-env.test.ts",
+            line: 62,
+            kind: "committed-secret",
+            reason: `a test fixture assigning "shared-secret"`,
+          },
+        ],
+      },
       deltaState: { before: "state-1", after: "state-2" },
       restoreBaseline: () => scanned.restoreBaseline(),
     }),
@@ -140,4 +150,8 @@ it("reports what the scan lost when the log is writable", async () => {
   // The duplication filter can remove most of a scan; silence would read as a collector that
   // found nothing (anton-vb2h).
   expect(log).toContain("dropped 1 duplication signal(s)");
+  // A suppressed secret is the one drop that must never be silent (anton-r016): the log line is
+  // the only place the drop and the value that cleared it still exist.
+  expect(log).toContain("dropped 1 committed-secret signal(s)");
+  expect(log).toContain(`src/lib/beads/bd-env.test.ts:62`);
 });
