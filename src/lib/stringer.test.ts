@@ -1606,6 +1606,63 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.js");
     });
 
+    // Overlapping patterns are how a monorepo carves an exception out of a broad alias, and tsc
+    // resolves the import through the longest matching prefix alone. Expanding every rule that
+    // matches lets `@/special/widget` name the broad target too, so a caller of the real module
+    // reads as a caller of the unrelated one — inventing a caller and deleting a finding that was
+    // right.
+    it("resolves an alias through the most specific `paths` rule, not every matching one", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@/*": ["./apps/web/src/*"], "@/special/*": ["./packages/special/*"] },
+          },
+        }),
+        // What the broad rule would reach if both patterns expanded — nothing imports it.
+        "apps/web/src/special/widget.ts": "export default function Broad() {\n  return null;\n}\n",
+        "packages/special/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/special/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("apps/web/src/special/widget.ts", "Broad"),
+        unused("packages/special/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Broad" }]);
+      // Not vacuous: the specific rule still resolves the module it does name, so the caller that
+      // binds THAT default under another name is found.
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/page.ts");
+    });
+
+    // `import { default as Renamed }` is the list spelling of a default import — the mirror of the
+    // `export { Widget as default }` already read on the export side. The caller writes the
+    // original symbol nowhere, so a pattern that rejects the leading brace reports a live symbol
+    // dead.
+    it("counts a default import written as `{ default as Renamed }`", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/lib/page.ts":
+          "import { default as Renamed } from './widget';\nexport const page = () => Renamed();\n",
+        // Not vacuous: a default export nothing imports is still reported.
+        "src/lib/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget"),
+        unused("src/lib/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
     // `export default interface Widget {}` stands a keyword where the name usually does. A reader
     // consuming only `function` and `class` takes `interface` for the exported name, reads the
     // module as declaring no default at all, and never resolves the binding its caller took — and

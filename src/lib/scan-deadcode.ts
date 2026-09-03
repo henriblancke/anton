@@ -2699,16 +2699,33 @@ async function aliasesGoverning(
 }
 
 /**
- * Where the `paths` mapping governing the importer sends `spec` — every target the rules claiming
- * its prefix expand to, and nothing when no rule claims it.
+ * Where the `paths` mapping governing the importer sends `spec` — the targets of the MOST SPECIFIC
+ * rule claiming its prefix, and nothing when no rule claims it.
+ *
+ * Overlapping patterns are how a monorepo carves an exception out of a broad alias — `"@/*":
+ * ["apps/web/src/*"]` beside `"@/special/*": ["packages/special/*"]` — and tsc resolves such an
+ * import through the longest matching prefix alone (anton-23xe). Expanding every rule that matches
+ * lets `@/special/widget` name `apps/web/src/special/widget` as well, so a caller of the real
+ * module is read as a caller of the broad one too, inventing a caller and deleting a true finding.
+ *
+ * Rules tie only when the same pattern is declared twice, and then they are equally specific, so
+ * both answer — as they already would have.
  */
 function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
-  const mapped: string[] = [];
+  let claiming: AliasRule[] = [];
+  let longest = -1;
   for (const rule of aliases) {
-    if (!spec.startsWith(rule.prefix)) continue;
+    if (!spec.startsWith(rule.prefix) || rule.prefix.length < longest) continue;
+    if (rule.prefix.length > longest) {
+      longest = rule.prefix.length;
+      claiming = [];
+    }
+    claiming.push(rule);
+  }
+  const mapped: string[] = [];
+  for (const rule of claiming)
     for (const target of rule.targets)
       mapped.push(posix(normalize(join(target, spec.slice(rule.prefix.length)))));
-  }
   return mapped;
 }
 
@@ -2842,6 +2859,18 @@ function defaultExportOf(program: readonly string[], symbol: string): DefaultExp
 const DEFAULT_IMPORT =
   /(?:^|[;{}])\s*import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*(?:,[^'"]*)?\bfrom\s*['"]([^'"]+)['"]/gm;
 
+/**
+ * `import { default as Renamed } from './widget'` — the list spelling of a default import, and the
+ * exact mirror of the `export { Widget as default }` this module already reads on the export side
+ * (anton-23xe). It binds the default as plainly as the bare form, and the caller writes the
+ * original symbol nowhere, so leaving it out reports a live symbol dead.
+ *
+ * The list body admits only what an import list is spelled with, so it cannot reach past the
+ * statement's own `}` for a `default as` belonging to another one.
+ */
+const DEFAULT_LIST_IMPORT =
+  /(?:^|[;{}])\s*import\s+(?:type\s+)?\{[\w$,\s]*?\bdefault\s+as\s+([A-Za-z_$][\w$]*)[\w$,\s]*\}\s*from\s*['"]([^'"]+)['"]/gm;
+
 /** `const Renamed = require('./widget')` — CommonJS binding the whole module, default and all. */
 const DEFAULT_REQUIRE =
   /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]/gm;
@@ -2868,6 +2897,7 @@ function defaultBindingsOf(
     }
   };
   collect(DEFAULT_IMPORT, () => true);
+  collect(DEFAULT_LIST_IMPORT, () => true);
   // A `require` hands back the module object, which is the default value only where the module
   // assigned `module.exports` outright. Requiring an ESM module yields a namespace whose `.default`
   // holds the symbol, and the property beside it is a mention grep already reads.
