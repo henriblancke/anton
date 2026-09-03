@@ -3,6 +3,7 @@
  * Stages/approval/PR are derived from beads (see DESIGN.md §2/§3), not stored in anton.db.
  */
 import type { ContractStatus } from "./beads/contract";
+import type { LinkType } from "./beads/link-types";
 import type { ChildReadiness } from "./epic-graph";
 import type { TicketNote } from "./beads/notes";
 import type { HygieneReport } from "./hygiene";
@@ -573,7 +574,9 @@ export interface MoveRequest {
 export type ApprovalRunOutcome = "started" | "elsewhere" | "covered" | "none" | "failed";
 
 // ── Epic detail + dependency graph ──
-export type DepType = "parent-child" | "blocks" | "related" | "discovered-from";
+// One definition of the allowed edge types, owned by the seam that validates every write of them
+// (lib/beads/link-types). Type-only, so nothing of lib/beads reaches the browser bundle.
+export type DepType = LinkType;
 export interface DepEdge {
   from: string;
   to: string;
