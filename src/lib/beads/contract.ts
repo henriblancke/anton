@@ -851,16 +851,19 @@ export function contractFormGaps(bead: Bead): ContractSection[] {
 export function contractOrderGaps(bead: Bead): ContractSection[] {
   const placed = formPlacements(bead).filter((p) => p.at !== undefined);
   const ordered = longestOrderedRun(placed.map((p) => p.at as number));
-  return placed.filter((_, i) => !ordered.has(i)).map((p) => p.section);
+  return placed.filter((p, i) => p.split || !ordered.has(i)).map((p) => p.section);
 }
 
 /** One section the form question asks about: where the description carries it, or `undefined` when
  * it does not. `at` is the ordinal of the LAST section OCCURRENCE supplying an authored body — or
  * -1 for the preamble, the home that sits ahead of every heading and so is only the last one when
- * no heading carries the section at all. */
+ * no heading carries the section at all. `split` marks the section whose authored copies do not sit
+ * together, whatever `at` says: another section's body was written between them, so this one's
+ * content has to be consolidated before any position can describe it. */
 interface FormPlacement {
   section: ContractSection;
   at: number | undefined;
+  split: boolean;
 }
 
 /**
@@ -878,6 +881,10 @@ interface FormPlacement {
  *
  * A section repeated back-to-back still reads ordered, and should: its content is contiguous and
  * sits where the contract puts it — nothing has to MOVE, which is the only repair this gap asks for.
+ * A section whose copies are SPLIT by another section's body is the opposite case and is faulted on
+ * that alone (PR #223 review): criteria written ahead of `## Goal` and continued under the canonical
+ * `## Acceptance` place the section last and so read ordered, while the early copy — contract
+ * content all the same — still sits out of sequence and has to move down to join the rest.
  *
  * The preamble is the LAST home considered, not a short-circuit (PR #223 review). It sits ahead of
  * every heading, so an epic that states its outcome in the opening line AND authors a `## Outcome`
@@ -891,14 +898,19 @@ function formPlacements(bead: Bead): FormPlacement[] {
 
   const description = typeof bead.description === "string" ? bead.description : "";
   const found = sectionOccurrences(description, contractKeysOf(tier));
+  const authored = found.flatMap((s, at) => (isAuthoredBody(s.body) ? [at] : []));
   const rules = tier === "epic" ? EPIC_FORM_RULES : TICKET_FORM_RULES;
   const preamble = isAuthoredBody(preambleOf(description));
   return rules.map((rule) => {
-    const at = found.findLastIndex((s) => rule.keys.includes(s.key) && isAuthoredBody(s.body));
-    if (at !== -1) return { section: rule.section, at };
+    const copies = authored.filter((at) => rule.keys.includes(found[at].key));
+    if (copies.length > 0) {
+      const at = copies[copies.length - 1];
+      const split = authored.some((o) => o > copies[0] && o < at && !copies.includes(o));
+      return { section: rule.section, at, split };
+    }
     // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first —
     // and only when no LATER heading carries the section too.
-    return { section: rule.section, at: rule.preamble && preamble ? -1 : undefined };
+    return { section: rule.section, at: rule.preamble && preamble ? -1 : undefined, split: false };
   });
 }
 

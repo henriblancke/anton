@@ -1084,6 +1084,22 @@ describe("contractOrderGaps (the form's order question)", () => {
     expect(contractOrderGaps(continued)).toEqual(["Acceptance"]);
   });
 
+  it("faults a section authored BOTH ahead of its canonical place and at it", () => {
+    // Criteria written before `## Goal` and continued under the canonical heading: the LAST copy
+    // reads in sequence, so placing the section there alone called this description ordered — while
+    // the early copy, contract content all the same, still has to move down to join the rest.
+    const split = ticket({
+      description: [
+        "## Acceptance Criteria",
+        "- [ ] the report opens in Excel",
+        "",
+        FULL_DESCRIPTION,
+      ].join("\n"),
+    });
+    expect(contractFormGaps(split)).toEqual([]);
+    expect(contractOrderGaps(split)).toEqual(["Acceptance"]);
+  });
+
   it("reads a section repeated back-to-back as ordered — its content moves nowhere", () => {
     const doubled = ticket({
       description: reorder(FULL_DESCRIPTION, [
