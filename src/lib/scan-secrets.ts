@@ -95,7 +95,9 @@ const PLACEHOLDER_SHAPE = /^[a-z]+(?:[-_.][a-z]+)*$/;
  *
  * What separates them is which letters sit NEXT to each other. English is a small set of legal
  * pairs; a generator draws uniformly and produces `gq`, `qc`, `yk`, `hv`. So the positive test is
- * {@link ENGLISH_BIGRAMS}, and the vowel rules stay as the cheap first cut they always were.
+ * {@link ENGLISH_BIGRAMS} backed by {@link ENGLISH_TRIGRAMS} — pairs are permissive enough that a
+ * short blob can pass them by chance — and the vowel rules stay the cheap first cut they always
+ * were.
  */
 const VOWEL = /[aeiouy]/;
 const VOWELS = /[aeiouy]/g;
@@ -134,6 +136,72 @@ const ENGLISH_BIGRAMS = new Set(
 const BIGRAM_FLOOR = 0.75;
 /** Under five letters a segment offers three pairs or fewer — too coarse to carry a verdict. */
 const BIGRAM_MIN_LETTERS = 5;
+
+/**
+ * The letter TRIPLES carrying 90% of the trigram mass in the same corpus, grouped by the first two
+ * letters they share — `abilosu` spells `abi abl abo abs abu`, and the flat set is 2034 entries.
+ *
+ * Pairs alone do not finish the job, and the gap is not academic. {@link ENGLISH_BIGRAMS} admits
+ * 328 of the 676 possible pairs, so a generated blob draws a legal pair about half the time and
+ * roughly one in twenty random 12-letter blobs reads as English on pairs — `uegufnhryoes` scores
+ * 0.91 there, and every other rule here passes it too. Triples are far sparser: it scores 0.30.
+ *
+ * This carries the whole verdict for short values. {@link ENTROPY_FLOOR} is unreachable below 16
+ * characters, so between 5 and 12 letters nothing else stands between a generated credential and a
+ * cleared signal.
+ */
+const ENGLISH_TRIGRAMS = new Set(
+  (
+    "ababeilorsu acacehikortuy adadeimorv aeanor afft agaeginoru aidlnrst akaei alabcdegiklmnopstuvy " +
+    "amabeimopy anacdegiklnostu apaehiloprst aqu arabcdegiklmnoprsty asacehimopstu atacehiortuy " +
+    "aucdglnrst avaeio awa axi aya azio babclnrst bbeil beacdglnrst biacdlnorst blaeiouy boalnorstu " +
+    "braeiou bst bulnrst cabcdlmnprstu ccaeiou ceadlmnoprst chaeilnortuy ciacdeflnoprst ckeils " +
+    "claeiou coabcdegilmnprstuv craeiouy ctaeioruy culmprst cyacst dabcelmnrt ddeil deacdflmnprstv " +
+    "dge diabcdefglmnopstuvz dleiy dne docglmnprstuw draeio duclrs dylns eabcdeklmnrstv ebaeioru " +
+    "ecaehiklortu edaegilnoru eedlnprt efaefilou egaeioru eheo eidgnst eladeilmotuy emabeiopu " +
+    "enacdegilnostuyz eocglmnprstu epaehilortu equ erabcdefghilmnoprstuvwy esacehimopqstu " +
+    "etaehiortuy eucdmrst evaeio ewaeio exaceiopt eye faclnrst feaclnrs ffeil fiabcdelnrs flaeiou " +
+    "folor fraeio fte fulnrs gablmnrst geadlmnorst ggeil ght giaclnost glaeiouy gma gnaeio golnrstu " +
+    "graeiou guaeilrs gyn habcegilmnprstu heacdeilmnoprstx hiabcdelnoprstz hleioy hmae hnei " +
+    "hobcdgilmnoprstu hraeioy hteh humnrs hydlmoprst iabclmnrst ibaeilru icaehiklorstu idadeiou " +
+    "iedlnrst ifefiloty igaeghimnoru iid ike iladeiloty imabeimop inacdefgiknostuv iocdglmnprstu " +
+    "ipaehilopst iqu iracdeiort isacehimopst itacehiortuy iums ivaeio izaeo jac jec kabr kedelnrt " +
+    "kilnst kle kno labcdegimnprstuvy lcao ldei leabcdegilmnoprstuvwx lgi liabcdefgkmnopstvz " +
+    "llaeiouy lmaio lne loabcdgimnoprstuw lphi ltaeiru lucdemnrst lvae lycmpst mabcdgiklnrst " +
+    "mbaeiloru meacdglmnrst miacdlmnprstz mmaeiou mni mocdgilmnoprstu mpaehilort mulnrst mycor " +
+    "nabcdegilmnprstu nbe ncaehilortuy ndaeiloruy neacdeglmnoprstuxy nfaeiloru ngaeilnorsu nhaeo " +
+    "niacdefglmnopstuz nkei nleiy nmaeo nnaeio nobcdgilmnprstuvw npaer nqu nre nsacehioptu " +
+    "ntaehiloru nuclmrst nvei nwa nym oacdnrt obabeilors ocacehiklortuy odaeiouy oelnt off " +
+    "ogaegilnoruy ohey oicdlns oke oladeilotuy omabeimnopy onacdefgilmnoprstuvy oodfklmnpst " +
+    "opaehiloprstuy oqu orabcdeghiklmnoprsty osaceimopstuy otaehiorty oucglnrst ovaei oweln oxiy ozo " +
+    "pacgilnprst peacdlnrst phaeilortuy piacdeglnprst plaeiou pne pocdgilmnprstu ppeilor praeio " +
+    "pseiy ptaeiou pulnrst pyr quaei rabcdefgilmnprstuvwy rbaeio rcaehiou rdaeio " +
+    "reabcdefghilmnoprstvw rfeu rgaeio rhaeioy riabcdefglmnopstuvz rke rlaeiy rmaeio rnaeio " +
+    "roabcdefgilmnoprstuvwx rpaehior rraehiouy rsaehiotu rtaehioru rubcdlmnpst rvaei rwo rynopst " +
+    "sabcgilmnprtu scaehiloru seacdeilmnprstux shaeilnor siabcdfglmnopstv skei slaeioy smaio snae " +
+    "soclmnprtu spaehilor squ ssaeilnou staehiloruy suabclmnprs swaei syclmn tabcgilmnprstux tch " +
+    "teacdeglmnoprst tfu thaeilmoruy tiabcdefglmnoprstvz tleiy tmae tne tobcdgilmnoprstux traeiouy " +
+    "ttaeilo tuabdlmnrst twai tylpr uadlnrt ubabceilst ucacehikot udadeio uenrs uff ugagh uidlnst " +
+    "ulaeilnopstu umabeimop unabcdefghiklmnoprstvw uou upelprt urabceginorstu usacehilnst utaehiorst " +
+    "vabglnrst vedlnrs viacdlnorst voclr vul walnrsty weadelr whei wilnst womor xan xics xpe xter " +
+    "xyl yalnr ycehlo ydr yelr ygo yins ylaeilo ymaeop ynacegio yonp ypehot yraeio ysit ytehio zabt " +
+    "zedr zin zono"
+  )
+    .split(" ")
+    .flatMap((group) => [...group.slice(2)].map((last) => group.slice(0, 2) + last)),
+);
+
+/**
+ * How English a segment's letter triples are. Measured: the weakest word in the known fixture
+ * corpus is "project" sitting exactly on this floor, while random lowercase blobs clear it 2.9% of
+ * the time at six letters and 0.6% at twelve — against 8.5% and 4.7% for the bigram test alone. The
+ * cost is a handful of real words that now read as generated ("fixture", "sqlite"); each one keeps
+ * its signal and costs a triaged bead, which is the cheap direction.
+ */
+const TRIGRAM_FLOOR = 0.6;
+/** Under six letters a segment offers three triples or fewer — too coarse to carry a verdict. */
+const TRIGRAM_MIN_LETTERS = 6;
+
 /**
  * Longer than any word in the fixture corpus ("development", 11). An unbroken lowercase run past
  * this is not a word however English its pairs read, and a human writing a long placeholder
@@ -141,12 +209,14 @@ const BIGRAM_MIN_LETTERS = 5;
  */
 const SEGMENT_MAX_LETTERS = 12;
 
-function bigramFit(segment: string): number {
+/** The share of a segment's `size`-letter windows the table recognises. */
+function ngramFit(segment: string, size: number, table: ReadonlySet<string>): number {
+  const windows = segment.length - size + 1;
   let english = 0;
-  for (let i = 0; i < segment.length - 1; i += 1) {
-    if (ENGLISH_BIGRAMS.has(segment.slice(i, i + 2))) english += 1;
+  for (let i = 0; i < windows; i += 1) {
+    if (table.has(segment.slice(i, i + size))) english += 1;
   }
-  return english / (segment.length - 1);
+  return english / windows;
 }
 
 export function looksWritten(value: string): boolean {
@@ -155,7 +225,13 @@ export function looksWritten(value: string): boolean {
     if (segment.length > SEGMENT_MAX_LETTERS) return false;
     if (segment.length >= RATIO_MIN_LETTERS && !VOWEL.test(segment)) return false;
     if (CONSONANT_RUN.test(segment)) return false;
-    if (segment.length >= BIGRAM_MIN_LETTERS && bigramFit(segment) < BIGRAM_FLOOR) return false;
+    if (segment.length >= BIGRAM_MIN_LETTERS && ngramFit(segment, 2, ENGLISH_BIGRAMS) < BIGRAM_FLOOR)
+      return false;
+    if (
+      segment.length >= TRIGRAM_MIN_LETTERS &&
+      ngramFit(segment, 3, ENGLISH_TRIGRAMS) < TRIGRAM_FLOOR
+    )
+      return false;
   }
   const letters = segments.join("");
   if (letters.length < RATIO_MIN_LETTERS) return true;
@@ -191,8 +267,11 @@ export function entropyOf(value: string): number {
  * ("huntertwo") reads identically to a fixture's placeholder and loses its signal. Nothing textual
  * separates them — `bd-env.test.ts:127`, one of the hits this exists to clear, assigns the bare
  * word `"explicit"` — so a stricter positive marker would only trade this miss for a permanently
- * critical health record. The drop is bounded instead: test paths only, and never silent —
- * {@link describeSecretFilter} names every dropped line and value in the session log.
+ * critical health record. A GENERATED credential is a different claim and is held to it: below 16
+ * characters {@link ENTROPY_FLOOR} cannot speak, so {@link ENGLISH_TRIGRAMS} carries that range,
+ * where the whole rule clears 1.3% of random 8-letter blobs and 0.5% of 12-letter ones. The drop is bounded either way: test paths
+ * only, and never silent — {@link describeSecretFilter} names every dropped line and value in the
+ * session log.
  */
 export function isCredentialShaped(value: string): boolean {
   if (CREDENTIAL_MARKERS.some((marker) => marker.test(value))) return true;
@@ -208,8 +287,14 @@ const QUOTED = [
   /`((?:[^`\\]|\\.)*)`/g,
 ] as const;
 
-/** An unquoted right-hand side, as a `.env` / YAML / shell export line spells it. */
-const BARE_ASSIGNMENT = /^\s*(?:export\s+)?[A-Za-z_][\w.-]*\s*[:=]\s*([^\s#'"`,]+)\s*,?\s*$/;
+/**
+ * An unquoted right-hand side, as a `.env` / YAML / shell export line spells it, with the trailing
+ * comment those files carry — `PASSWORD=shared-secret # fixture only`. The comment must be preceded
+ * by whitespace, which is also the only place `.env` treats `#` as one: `PASSWORD=a#b` stays a value
+ * this pattern cannot read, so the signal survives rather than being cleared on the `a` alone.
+ */
+const BARE_ASSIGNMENT =
+  /^\s*(?:export\s+)?[A-Za-z_][\w.-]*\s*[:=]\s*([^\s#'"`,]+)\s*,?(?:\s+(?:#|\/\/).*)?\s*$/;
 
 /**
  * A quoted literal that a `:` turns into a mapping key — how JSON, YAML and Python fixtures spell

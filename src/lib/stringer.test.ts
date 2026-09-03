@@ -857,6 +857,10 @@ describe("scan", () => {
         // (`gq`, `qc`, `yk`, `hv`) say otherwise, and roughly a quarter of random 20-character
         // blobs look like this one, so it is the population the filter must not clear.
         "src/h.test.ts": atLines({ 3: `  const blob = "agqcrawykynuwdrhveoz";` }), // gitleaks:allow
+        // Twelve lowercase characters, which is where a bits/char floor goes blind entirely —
+        // entropy caps at log2(12) = 3.58, under any floor a 20-character blob has to clear. Its
+        // letter PAIRS read as English (0.91, above "project"); only its triples give it away.
+        "src/i.test.ts": atLines({ 3: `  const blob = "uegufnhryoes";` }), // gitleaks:allow
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         secret("src/a.test.ts", 3),
@@ -866,12 +870,41 @@ describe("scan", () => {
         secret("src/e.test.ts", 3),
         secret("src/f.test.ts", 3),
         secret("src/h.test.ts", 3),
+        secret("src/i.test.ts", 3),
       ]);
 
       const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
 
-      expect(result.signals).toHaveLength(7);
+      expect(result.signals).toHaveLength(8);
       expect(result.secrets.dropped).toEqual([]);
+    });
+
+    // A `.env` or YAML fixture usually says WHY it is fake on the same line. The end-anchored bare
+    // assignment read the comment as part of the value, found no value at all, and left the fixture
+    // firing critical every night — the exact class this filter exists to clear.
+    it("reads a bare fixture value that carries a trailing comment", async () => {
+      const repo = writeRepo({
+        "tests/fixtures/.env.test": atLines({
+          1: `BEADS_DOLT_PASSWORD=shared-secret # fixture only, not a real credential`,
+          2: `  password: shared-secret  # same in YAML`,
+          // ...and `#` only opens a comment after whitespace, as dotenv reads it. Glued to the
+          // value it is part of the value, which this pattern cannot extract — so the signal stays.
+          3: `BEADS_DOLT_PASSWORD=shared#secret`,
+        }),
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        secret("tests/fixtures/.env.test", 1),
+        secret("tests/fixtures/.env.test", 2),
+        secret("tests/fixtures/.env.test", 3),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Line: 3 }]);
+      expect(result.secrets.dropped).toMatchObject([
+        { line: 1, reason: `a test fixture assigning "shared-secret"` },
+        { line: 2, reason: `a test fixture assigning "shared-secret"` },
+      ]);
     });
 
     // A quoted key is a NAME, not a value. Reading it as one made the SCREAMING_SNAKE on the left
