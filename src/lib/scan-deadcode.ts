@@ -693,10 +693,56 @@ const SHELL_FILE = /\.(?:sh|bash|zsh)$/i;
  * because without the lookbehind `<<<EOF` still matches at its second `<` — the engine simply
  * starts one character later — and a here-string would then blank the rest of the script.
  *
- * The quoted spellings are what a script uses to keep the payload literal, and the bare one is the
- * expanding form — both end at a line holding the word alone.
+ * The quoted spellings are what a script uses to keep the payload literal; the bare one still
+ * expands. Which of the two was written decides how much of the payload is inert, so the quoted
+ * groups are kept apart from the bare one. Both end at a line holding the word alone.
  */
 const HEREDOC_OPEN = /(?<!<)<<-?(?!<|=)\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))/g;
+
+/**
+ * One payload line of an EXPANDING heredoc, with everything but its command substitutions blanked.
+ * A bare-delimiter heredoc is not inert: the shell runs `$(…)` and a backquoted span while it
+ * writes the payload out, so `cat <<EOF` over `$(Widget)` really does call the symbol, and blanking
+ * the line wholesale hides that caller and leaves a false finding standing (anton-23xe).
+ *
+ * Everything outside a substitution is text the shell only copies, so it is blanked exactly as a
+ * quoted payload is. `\$(` is escaped and expands to nothing, and `${name}` is a parameter — a
+ * value, not a call — so neither opens a span. Nesting is counted, because `$(a $(b))` closes on
+ * its second `)` and stopping at the first would blank the tail of the outer command.
+ */
+function unmaskedSubstitutions(line: string): string {
+  const out = blankAll(line).split("");
+  let depth = 0;
+  for (let at = 0; at < line.length; at += 1) {
+    if (line[at] === "\\") {
+      if (depth > 0) out[at] = line[at];
+      at += 1;
+      if (depth > 0 && at < line.length) out[at] = line[at];
+      continue;
+    }
+    if (depth === 0 && line[at] === "$" && line[at + 1] === "(") {
+      depth = 1;
+      at += 1;
+      continue;
+    }
+    if (depth === 0 && line[at] === "`") {
+      // A backquoted span does not nest, so it runs to the next backquote.
+      const close = line.indexOf("`", at + 1);
+      const end = close === -1 ? line.length : close;
+      for (let i = at + 1; i < end; i += 1) out[i] = line[i];
+      at = end;
+      continue;
+    }
+    if (depth === 0) continue;
+    if (line[at] === "(") depth += 1;
+    else if (line[at] === ")") {
+      depth -= 1;
+      if (depth === 0) continue;
+    }
+    out[at] = line[at];
+  }
+  return out.join("");
+}
 
 /**
  * A shell script with its heredoc payloads blanked. `cat <<'EOF'` followed by `Widget()` writes a
@@ -713,20 +759,26 @@ const HEREDOC_OPEN = /(?<!<)<<-?(?!<|=)\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z_]\w*))
  * leading TABS from the terminator, which is the only indentation the form allows.
  */
 function maskHeredocs(text: string): string {
-  const pending: { word: string; dash: boolean }[] = [];
+  const pending: { word: string; dash: boolean; quoted: boolean }[] = [];
   return text
     .split("\n")
     .map((line) => {
       const open = pending[0];
       if (open) {
         const terminator = open.dash ? line.replace(/^\t+/, "") : line;
-        if (terminator === open.word) pending.shift();
-        return blankAll(line);
+        if (terminator === open.word) {
+          pending.shift();
+          return blankAll(line);
+        }
+        // A quoted delimiter makes the whole payload literal; a bare one leaves its command
+        // substitutions running, and those are code however the rest of the payload reads.
+        return open.quoted ? blankAll(line) : unmaskedSubstitutions(line);
       }
       HEREDOC_OPEN.lastIndex = 0;
       for (let m = HEREDOC_OPEN.exec(line); m; m = HEREDOC_OPEN.exec(line)) {
+        const quoted = m[1] !== undefined || m[2] !== undefined;
         const word = m[1] ?? m[2] ?? m[3];
-        if (word) pending.push({ word, dash: m[0].startsWith("<<-") });
+        if (word) pending.push({ word, dash: m[0].startsWith("<<-"), quoted });
       }
       return line;
     })

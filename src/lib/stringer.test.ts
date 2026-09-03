@@ -2146,6 +2146,9 @@ describe("scan", () => {
         // `<<<` is a here-STRING and opens no payload. Without a guard on the left of the `<<`,
         // the opener still matches at its second `<` and blanks the rest of the script.
         "scripts/herestring.sh": "grep -q ok <<<EOF\nneverCalled\n",
+        // A BARE delimiter still expands: the shell runs `$(...)` while writing the payload, so
+        // this is a real caller and blanking it would hide one.
+        "scripts/expand.sh": "cat <<EOF > gen.ts\n$(neverCalled)\nEOF\n",
       });
       process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
         unused("src/lib/orphan.ts", "neverCalled"),
@@ -2157,8 +2160,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
       expect(result.deadcode.dropped[0].reason).toContain("scripts/run.sh");
       expect(result.deadcode.dropped[0].reason).toContain("scripts/herestring.sh");
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/expand.sh");
       expect(result.deadcode.dropped[0].reason).not.toContain("scripts/scaffold.sh");
       expect(result.deadcode.dropped[0].reason).not.toContain("scripts/indented.sh");
+    });
+
+    // Quoting the delimiter is what makes a payload inert. The same `$(neverCalled)` that runs
+    // under `<<EOF` is literal text under `<<'EOF'`, so the two cannot be masked the same way:
+    // blanking both hides a real caller, blanking neither invents one.
+    it("counts a substitution in a bare heredoc and not the same text in a quoted one", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/literal.sh": "cat <<'EOF' > a.ts\n$(neverCalled)\nEOF\n",
+        "scripts/expanding.sh": "cat <<EOF > b.ts\n$(neverCalled)\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/expanding.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/literal.sh");
     });
 
     // MDX is a program: a component imported and rendered only from a docs page has a real caller,
