@@ -5,6 +5,7 @@ import {
   acceptanceBody,
   contractFormGaps,
   contractGaps,
+  contractOrderGaps,
   formatContractGaps,
   isContractJudged,
   isContractReadable,
@@ -19,18 +20,20 @@ import {
 /** The stamps bd puts on every issue it returns — what marks a bead as actually read (not projected). */
 const STAMPS = { created_at: "2026-07-28T00:00:00Z", updated_at: "2026-07-28T00:00:00Z" };
 
+/** A ticket description in the contract's own order, minus the rubric: like most of the board, this
+ * fixture's acceptance lives only in bd's field. */
 const DESCRIPTION = [
   "## Goal",
   "Ship the thing.",
+  "",
+  "## Context",
+  "touches: src/lib/beads/contract.ts",
   "",
   "## Out of scope",
   "- not the other thing",
   "",
   "## Verify",
   "- unit test covers it",
-  "",
-  "## Context",
-  "touches: src/lib/beads/contract.ts",
 ].join("\n");
 
 /** A fully contract-complete ticket; overrides carve pieces out of it. */
@@ -877,9 +880,33 @@ describe("contractGaps + formatContractGaps (the gates' shared input, anton-j9zs
   });
 });
 
+/** The rubric written into a description in the contract's own position — after Goal, ahead of
+ * Context (skills/bd/SKILL.md). The ticket fixture deliberately lacks it. */
+function withRubric(description: string, heading = "## Acceptance Criteria"): string {
+  const at = description.indexOf("## Context");
+  expect(at).toBeGreaterThanOrEqual(0);
+  return `${description.slice(0, at)}${heading}\n- [ ] it works\n\n${description.slice(at)}`;
+}
+
+/** The same sections, re-emitted in the given order — how order drift is staged. */
+function reorder(description: string, headings: string[]): string {
+  return headings
+    .map((h) => {
+      const lines = description.split("\n");
+      const start = lines.findIndex((l) => l.trim().toLowerCase() === `## ${h.toLowerCase()}`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const rest = lines.slice(start + 1);
+      const end = rest.findIndex((l) => l.startsWith("## "));
+      return [lines[start], ...(end === -1 ? rest : rest.slice(0, end))].join("\n").trim();
+    })
+    .join("\n\n");
+}
+
+/** The ticket fixture's description plus the Acceptance heading it deliberately lacks — all five
+ * sections, in the contract's order. */
+const FULL_DESCRIPTION = withRubric(DESCRIPTION);
+
 describe("contractFormGaps (the form question, separate from the run gate)", () => {
-  /** The ticket fixture's description plus the Acceptance heading it deliberately lacks. */
-  const FULL_DESCRIPTION = `${DESCRIPTION}\n\n## Acceptance Criteria\n- [ ] it works`;
 
   /** An epic carrying both of its sections in the description. */
   const FULL_EPIC_DESCRIPTION = [
@@ -895,7 +922,7 @@ describe("contractFormGaps (the form question, separate from the run gate)", () 
   });
 
   it("accepts the bare `## Acceptance` spelling older beads still carry", () => {
-    const older = ticket({ description: `${DESCRIPTION}\n\n## Acceptance\n- [ ] it works` });
+    const older = ticket({ description: withRubric(DESCRIPTION, "## Acceptance") });
     expect(contractFormGaps(older)).toEqual([]);
   });
 
@@ -937,10 +964,10 @@ describe("contractFormGaps (the form question, separate from the run gate)", () 
         "TODO — the tests that prove this landed, and which to add",
       ].join("\n"),
     });
-    // The gate's own reporting order, so the two read the same way side by side.
+    // The contract's own order, so the report reads as the description should have been written.
     expect(contractFormGaps(cooked)).toEqual([
-      "Acceptance",
       "Goal",
+      "Acceptance",
       "Context",
       "Out of scope",
       "Verify",
@@ -967,5 +994,90 @@ describe("contractFormGaps (the form question, separate from the run gate)", () 
     const shallow: Bead = { id: "anton-p", title: "projection", status: "open", issue_type: "task" };
     expect(contractFormGaps(shallow)).toEqual([]);
     expect(contractFormGaps(ticket({ issue_type: "learning", description: "" }))).toEqual([]);
+  });
+});
+
+// The form's other half (anton-um80): the contract states an ORDER — Goal → Acceptance Criteria →
+// Context → Out of scope → Verify (skills/bd/SKILL.md) — and presence alone reads all five shuffled
+// as conformant. Reported apart from the missing sections because the repairs differ: author an
+// absent section, move a misplaced one.
+describe("contractOrderGaps (the form's order question)", () => {
+  const FULL_EPIC_DESCRIPTION = [
+    "## Outcome",
+    "Reports are shareable outside the app.",
+    "",
+    "## Success Criteria",
+    "- [ ] every report leaves the app in a customer-openable format",
+  ].join("\n");
+
+  it("reports nothing for a description carrying the five in the contract's order", () => {
+    expect(contractOrderGaps(ticket({ description: FULL_DESCRIPTION }))).toEqual([]);
+  });
+
+  it("reads all five shuffled as drift, where presence alone reads them as conformant", () => {
+    const shuffled = ticket({
+      description: reorder(FULL_DESCRIPTION, [
+        "Verify",
+        "Out of scope",
+        "Context",
+        "Acceptance Criteria",
+        "Goal",
+      ]),
+    });
+    expect(contractFormGaps(shuffled)).toEqual([]);
+    expect(contractOrderGaps(shuffled)).toEqual([
+      "Acceptance",
+      "Context",
+      "Out of scope",
+      "Verify",
+    ]);
+  });
+
+  it("names only the section that moved, not everything it stepped over", () => {
+    // Exactly what `bd create --context` produces: a trailing `## Context` after `## Verify`.
+    const appended = ticket({
+      description: reorder(FULL_DESCRIPTION, [
+        "Goal",
+        "Acceptance Criteria",
+        "Out of scope",
+        "Verify",
+        "Context",
+      ]),
+    });
+    expect(contractOrderGaps(appended)).toEqual(["Context"]);
+  });
+
+  it("is silent about a section the description does not carry — that gap is the presence one's", () => {
+    const noContext = ticket({ description: withoutSection(FULL_DESCRIPTION, "Context") });
+    expect(contractFormGaps(noContext)).toEqual(["Context"]);
+    expect(contractOrderGaps(noContext)).toEqual([]);
+  });
+
+  it("accepts an epic's outcome written as a bare preamble line, ahead of every heading", () => {
+    expect(contractOrderGaps(epic({ description: FULL_EPIC_DESCRIPTION }))).toEqual([]);
+    expect(contractOrderGaps(epic({ description: "It is shareable.\n\n## Success Criteria\n- [ ] x" }))).toEqual([]);
+  });
+
+  it("judges an epic on its own two sections, in its own order", () => {
+    const inverted = epic({
+      description: reorder(FULL_EPIC_DESCRIPTION, ["Success Criteria", "Outcome"]),
+    });
+    expect(contractFormGaps(inverted)).toEqual([]);
+    expect(contractOrderGaps(inverted)).toEqual(["Success Criteria"]);
+  });
+
+  it("faults neither an exempt type nor a bead no bd read produced", () => {
+    const shallow: Bead = { id: "anton-p", title: "projection", status: "open", issue_type: "task" };
+    expect(contractOrderGaps(shallow)).toEqual([]);
+    expect(contractOrderGaps(ticket({ issue_type: "learning", description: "" }))).toEqual([]);
+  });
+
+  // The order question is the FORM's, not the gate's: approve and the run gate read the sections
+  // wherever they sit, and widening the form judgement must not narrow what runs.
+  it("leaves the run gate blind to order, exactly as before", () => {
+    const shuffled = ticket({
+      description: reorder(FULL_DESCRIPTION, ["Verify", "Context", "Acceptance Criteria", "Goal", "Out of scope"]),
+    });
+    expect(validateBeadContract(shuffled)).toEqual([]);
   });
 });

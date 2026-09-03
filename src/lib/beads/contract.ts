@@ -745,12 +745,21 @@ interface FormRule {
   preamble?: boolean;
 }
 
-/** A ticket's five, in {@link validateBeadContract}'s own reporting order. Derived from
- * {@link TICKET_RULES} so a section added to the gate cannot go unasked here. */
-const TICKET_FORM_RULES: readonly FormRule[] = [
-  { section: "Acceptance", keys: ACCEPTANCE_KEYS },
-  ...TICKET_RULES.map(({ section, keys }) => ({ section, keys })),
-];
+/**
+ * A ticket's five, in the order the CONTRACT states them — Goal → Acceptance Criteria → Context →
+ * Out of scope → Verify, "all five, in that order" (skills/bd/SKILL.md). This list is the order
+ * judgement's only definition of the sequence as well as the presence judgement's reporting order,
+ * so the two cannot disagree about what the contract's order is.
+ *
+ * Derived from {@link TICKET_RULES}, whose four already sit in that order around the rubric, so a
+ * section added to the gate cannot go unasked here. The rubric is the one section that list does
+ * not carry — it is blocking, and judged separately — and the contract seats it after Goal.
+ */
+const TICKET_FORM_RULES: readonly FormRule[] = TICKET_RULES.flatMap(({ section, keys }) =>
+  section === "Goal"
+    ? [{ section, keys }, { section: "Acceptance" as ContractSection, keys: ACCEPTANCE_KEYS }]
+    : [{ section, keys }],
+);
 
 /** An epic's two. The `area:` label is not a description section, so the form question is silent
  * on it — that gap is the gate's to report. */
@@ -778,23 +787,84 @@ const EPIC_FORM_RULES: readonly FormRule[] = [
  * for the same reason the gate treats it so ({@link stateOf}) — a heading cooked and never authored
  * carries no contract.
  *
+ * Presence only: each section's body is judged on its own, so a description carrying all five in a
+ * noncanonical order reports nothing here. That is {@link contractOrderGaps}' question.
+ *
  * Denominator note: an empty result means "carries the form" only for a bead
  * {@link isContractJudged} accepts. A rate must divide by that, exactly as the contract rate does.
  */
 export function contractFormGaps(bead: Bead): ContractSection[] {
+  return formPlacements(bead)
+    .filter((p) => p.at === undefined)
+    .map((p) => p.section);
+}
+
+/**
+ * Which contract sections this bead's description carries OUT OF the contract's order — empty when
+ * the sections it does carry read in sequence, and for a bead no tier judges.
+ *
+ * The form's other half (anton-um80). {@link contractFormGaps} asks presence alone, judging each
+ * section's body independently, so a description holding all five shuffled reported no gap at all —
+ * and shuffling is where the drift actually is: at shaping time 18 of 535 beads board-wide carried
+ * the canonical order, against 21 of 138 for presence. `bd create --context` produces it on its
+ * own, appending a trailing `## Context` after `## Verify` (skills/bd/SKILL.md).
+ *
+ * Reported SEPARATELY from the missing sections rather than merged into them, because the repairs
+ * differ: an absent section must be AUTHORED, a misplaced one only MOVED. Sections the description
+ * lacks are not judged here — they have no position, and {@link contractFormGaps} already names
+ * them.
+ *
+ * Never blocking and never in an exit code, exactly as the presence gap is.
+ */
+export function contractOrderGaps(bead: Bead): ContractSection[] {
+  const placed = formPlacements(bead).filter((p) => p.at !== undefined);
+  const ordered = longestOrderedRun(placed.map((p) => p.at as number));
+  return placed.filter((_, i) => !ordered.has(i)).map((p) => p.section);
+}
+
+/** One section the form question asks about: where the description carries it, or `undefined` when
+ * it does not. `at` is the heading's ordinal among the sections found — the preamble is -1. */
+interface FormPlacement {
+  section: ContractSection;
+  at: number | undefined;
+}
+
+/**
+ * Every section this bead's tier owes, in the contract's order, each with the place the description
+ * carries it. One parse serving both form questions, so presence and order can never read the same
+ * description two different ways.
+ */
+function formPlacements(bead: Bead): FormPlacement[] {
   if (!isContractJudged(bead)) return [];
   const tier = tierOf(bead);
 
   const description = typeof bead.description === "string" ? bead.description : "";
   const sections = sectionsOf(description, contractKeysOf(tier));
+  const found = [...sections.keys()];
   const rules = tier === "epic" ? EPIC_FORM_RULES : TICKET_FORM_RULES;
-  return rules
-    .filter((rule) => {
-      const bodies = [
-        ...(rule.preamble ? [preambleOf(description)] : []),
-        ...rule.keys.map((k) => sections.get(k) ?? ""),
-      ];
-      return stateOf(bodies) !== "written";
-    })
-    .map((rule) => rule.section);
+  return rules.map((rule) => {
+    // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first.
+    if (rule.preamble && isAuthoredBody(preambleOf(description))) return { section: rule.section, at: -1 };
+    const key = rule.keys.find((k) => isAuthoredBody(sections.get(k)));
+    return { section: rule.section, at: key === undefined ? undefined : found.indexOf(key) };
+  });
+}
+
+/**
+ * The indices of a longest strictly increasing run through `positions` — the sections already
+ * sitting in the contract's order. Everything outside it is what must move, so one displaced
+ * section names itself rather than every section it stepped over.
+ *
+ * Ties keep the earliest such run, so two readings of one board report the same sections.
+ */
+function longestOrderedRun(positions: number[]): Set<number> {
+  const runs: number[][] = [];
+  for (let i = 0; i < positions.length; i++) {
+    let longest: number[] = [];
+    for (let j = 0; j < i; j++) {
+      if (positions[j] < positions[i] && runs[j].length > longest.length) longest = runs[j];
+    }
+    runs[i] = [...longest, i];
+  }
+  return new Set(runs.reduce((a, b) => (b.length > a.length ? b : a), []));
 }
