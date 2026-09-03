@@ -404,8 +404,20 @@ export const FAILED_REPAIR_WEIGHT = 2;
  * failure count double, even one for a different class. Deliberate, and the conservative reading of
  * R5.8 — a repair that left the bead failing for some other reason did not unblock it either, and
  * pricing that by class would need the run row to record which class the failure was, which it does
- * not. The EARLIEST stamp per bead is the one compared, since the question is only whether any
- * repair preceded the attempt.
+ * not.
+ *
+ * A DELIVERY SPENDS THE REPAIRS BEHIND IT (PR #223 review). A stamp is durable — it is the loop
+ * guard's suppression, and nothing takes it off the bead — so without a bound, work that was
+ * repaired, then delivered, then reopened for rework (rework-modes.ts) would weigh every later
+ * failure double forever, on the strength of a repair the intervening delivery PROVED. The failure
+ * streak that provoked the repair ended when the work landed; a failure after that is a new story,
+ * and only a repair stamped since the bead last delivered still stands behind one. Deliveries are
+ * evidence the board cannot carry and the breaker's own window does not reach — a delivery ends the
+ * streak, so it lies outside it by construction — which is why they are handed in from the run rows
+ * (runs.ts `listDeliveriesByBead`) rather than derived here. Keyed exactly as the repair is, by the
+ * two beads a run carried: a delivery recorded against the epic does not spend a stamp on the child
+ * it grouped, which is the conservative direction — a repair whose bead never delivered in its own
+ * name goes on counting double.
  *
  * A run with no recorded start is weighed plainly. Nothing can be ordered against it, and the fence
  * goes to the cheaper error: one more failure before the breaker fires, rather than a double weight
@@ -418,24 +430,63 @@ export const FAILED_REPAIR_WEIGHT = 2;
  * accepting a tie instead put the ambiguous second on the expensive side, where the block that
  * provoked the repair could count as its failure.
  */
-export function repairedFailureWeight(board: readonly RepairedBead[]): FailureWeight {
-  const repairedAt = new Map<string, number>();
+export function repairedFailureWeight(
+  board: readonly RepairedBead[],
+  delivered: BeadDeliveries = new Map(),
+): FailureWeight {
+  const repairedAt = new Map<string, number[]>();
   for (const bead of board) {
-    for (const attempt of repairAttemptsOf(bead)) {
-      const earliest = repairedAt.get(bead.id);
-      if (earliest === undefined || attempt.at < earliest) repairedAt.set(bead.id, attempt.at);
-    }
+    // Every stamp, not just the earliest: a repair made SINCE the bead last delivered still counts
+    // even where an older one has been spent, so the bound has to be applied per stamp.
+    const stamps = repairAttemptsOf(bead).map((a) => a.at);
+    if (stamps.length > 0) repairedAt.set(bead.id, stamps);
   }
   if (repairedAt.size === 0) return () => 1;
   return (run: RunOutcome): number => {
     const startedAt = run.startedAt;
     if (startedAt === undefined) return 1;
     const followsRepair = [run.epicBeadId, run.ticketBeadId].some((id) => {
-      const at = id === undefined ? undefined : repairedAt.get(id);
+      if (id === undefined) return false;
+      const stamps = repairedAt.get(id);
+      if (stamps === undefined) return false;
+      const spent = deliveredThrough(delivered.get(id), startedAt);
       // `startedAt` is whole-second, so the attempt began somewhere in [startedAt, startedAt + 1).
-      // Only a repair stamped before that window is ordered before the attempt beyond doubt.
-      return at !== undefined && at < startedAt * 1000;
+      // Only a repair stamped before that window is ordered before the attempt beyond doubt — and
+      // only one the bead has not delivered since is still evidence of anything.
+      return stamps.some((at) => at < startedAt * 1000 && at >= spent);
     });
     return followsRepair ? FAILED_REPAIR_WEIGHT : 1;
   };
+}
+
+/**
+ * When work carrying a bead delivered, in unix SECONDS, by bead id — the run rows' units, read by
+ * runs.ts `listDeliveriesByBead`. Unordered; an empty map is a caller that has no delivery evidence,
+ * which weighs exactly as this rule did before deliveries bounded it.
+ */
+export type BeadDeliveries = ReadonlyMap<string, readonly number[]>;
+
+/**
+ * The instant a repair has to beat to still stand behind this attempt: the end of the newest
+ * delivery second that could sit between the two, or 0 for a bead that has never delivered.
+ *
+ * Deliveries are whole-second like the run rows they come from, so one is taken as covering its
+ * WHOLE second and one in the attempt's own start second is taken as possibly before it. Both
+ * roundings send the ambiguous second to weight 1, the same cheaper error the repair's own fence
+ * takes: a delivery that may have answered the repair is not evidence the repair failed.
+ */
+function deliveredThrough(deliveries: readonly number[] | undefined, startedAt: number): number {
+  let through = 0;
+  for (const at of deliveries ?? []) {
+    if (at <= startedAt) through = Math.max(through, (at + 1) * 1000);
+  }
+  return through;
+}
+
+/**
+ * The beads on this board carrying a repair stamp — whose delivery history the weigher needs, and
+ * nobody else's. An empty result is the ordinary case and saves the read entirely.
+ */
+export function repairedBeadIds(board: readonly RepairedBead[]): string[] {
+  return board.filter((bead) => repairAttemptsOf(bead).length > 0).map((bead) => bead.id);
 }

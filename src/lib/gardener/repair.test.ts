@@ -288,4 +288,54 @@ describe("repairedFailureWeight", () => {
   it("leaves an unrepaired board weighing every failure once", () => {
     expect(repairedFailureWeight([bead(["domain:eng"])])(run())).toBe(1);
   });
+
+  describe("once the repaired bead has DELIVERED", () => {
+    /** Seconds, as the run rows carry them. */
+    const sec = (ms: number) => Math.floor(ms / 1000);
+    const deliveries = (...at: number[]) => new Map([[BEAD, at.map(sec)]]);
+
+    it("stops weighing a failure double — the delivery answered the repair", () => {
+      // Repaired at T0, delivered a minute later, reopened for rework and failed again. The
+      // intervening delivery proved the repair; the rework failure is a new story.
+      const weigh = repairedFailureWeight(
+        [repaired("ref-stale", "rewrote the pointer")],
+        deliveries(T0 + 60_000),
+      );
+      expect(weigh(run({ startedAt: sec(T0) + 600 }))).toBe(1);
+    });
+
+    it("still counts a repair stamped SINCE that delivery", () => {
+      const bead = repaired("ref-stale", "rewrote the pointer");
+      bead.labels.push(repairLabel(BEAD, "dep-missing", T0 + 120_000));
+      const weigh = repairedFailureWeight([bead], deliveries(T0 + 60_000));
+      expect(weigh(run({ startedAt: sec(T0) + 600 }))).toBe(FAILED_REPAIR_WEIGHT);
+    });
+
+    it("ignores a delivery the attempt did not follow", () => {
+      // The bead delivered after this attempt began — a later run's evidence, not this one's.
+      const weigh = repairedFailureWeight(
+        [repaired("ref-stale", "rewrote the pointer")],
+        deliveries(T0 + 900_000),
+      );
+      expect(weigh(run({ startedAt: sec(T0) + 60 }))).toBe(FAILED_REPAIR_WEIGHT);
+    });
+
+    it("spends the repair on a delivery in the repair's own second, which may have followed it", () => {
+      // Whole-second delivery, millisecond stamp: the delivery could have come after the repair, so
+      // the ambiguous second goes to weight 1 — the same cheaper error the repair's fence takes.
+      const weigh = repairedFailureWeight(
+        [repaired("ref-stale", "rewrote the pointer", T0 + 400)],
+        deliveries(T0),
+      );
+      expect(weigh(run({ startedAt: sec(T0) + 600 }))).toBe(1);
+    });
+
+    it("says nothing about a different bead's deliveries", () => {
+      const weigh = repairedFailureWeight(
+        [repaired("ref-stale", "rewrote the pointer")],
+        new Map([["anton-other", [sec(T0 + 60_000)]]]),
+      );
+      expect(weigh(run({ startedAt: sec(T0) + 600 }))).toBe(FAILED_REPAIR_WEIGHT);
+    });
+  });
 });

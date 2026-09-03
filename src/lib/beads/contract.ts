@@ -842,7 +842,7 @@ export function contractOrderGaps(bead: Bead): ContractSection[] {
 }
 
 /** One section the form question asks about: where the description carries it, or `undefined` when
- * it does not. `at` is the ordinal of the section OCCURRENCE that supplies the authored body — the
+ * it does not. `at` is the ordinal of the LAST section OCCURRENCE supplying an authored body — the
  * preamble is -1. */
 interface FormPlacement {
   section: ContractSection;
@@ -854,11 +854,16 @@ interface FormPlacement {
  * carries it. One parse serving both form questions, so presence and order can never read the same
  * description two different ways.
  *
- * Placed by OCCURRENCE, not by key (PR #223 review): a repeated heading concatenates in
- * {@link sectionsOf}, so a canonical early `## Acceptance` holding nothing but the formula's TODO
- * and a second, authored `## Acceptance` written after `## Verify` would read as authored AT THE
- * EARLY POSITION — the one arrangement {@link contractOrderGaps} exists to catch, reported as
- * ordered. The position that counts is the one the authored body actually sits at.
+ * Placed by OCCURRENCE, not by key, and by the LAST occurrence that carries an authored body (PR
+ * #223 review). A repeated heading concatenates in {@link sectionsOf}, so EVERY authored copy is
+ * contract content and the position that has to read in order is where that content ends. Reading
+ * the first copy would call two arrangements ordered that are not: a canonical early `## Acceptance`
+ * holding nothing but the formula's TODO with the criteria authored after `## Verify`, and a
+ * canonical one whose criteria CONTINUE under a second authored `## Acceptance` after it. Both are
+ * the arrangement {@link contractOrderGaps} exists to catch.
+ *
+ * A section repeated back-to-back still reads ordered, and should: its content is contiguous and
+ * sits where the contract puts it — nothing has to MOVE, which is the only repair this gap asks for.
  */
 function formPlacements(bead: Bead): FormPlacement[] {
   if (!isContractJudged(bead)) return [];
@@ -870,7 +875,7 @@ function formPlacements(bead: Bead): FormPlacement[] {
   return rules.map((rule) => {
     // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first.
     if (rule.preamble && isAuthoredBody(preambleOf(description))) return { section: rule.section, at: -1 };
-    const at = found.findIndex((s) => rule.keys.includes(s.key) && isAuthoredBody(s.body));
+    const at = found.findLastIndex((s) => rule.keys.includes(s.key) && isAuthoredBody(s.body));
     return { section: rule.section, at: at === -1 ? undefined : at };
   });
 }

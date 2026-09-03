@@ -534,6 +534,33 @@ describe("checkFailureStreak", () => {
       expect(outcome?.streak.weight).toBe(3);
     });
 
+    it("stops weighing the repair once the bead has DELIVERED", async () => {
+      project();
+      // The block, the repair at minute 12, the delivery that proved it — then the ticket is
+      // reopened for rework (rework-modes.ts) and fails again. The rework failure is a new story:
+      // the streak behind it ended when the work landed.
+      await run({ id: "r1", epic: "anton-a", status: "failed", startedMinutes: 0, error: "blocked: ref-stale" });
+      await run({ id: "r2", epic: "anton-a", status: "done", startedMinutes: 15 });
+      await run({ id: "r3", epic: "anton-a", status: "failed", startedMinutes: 30, error: "boom" });
+      await run({ id: "r4", epic: "anton-b", status: "failed", startedMinutes: 45, error: "boom" });
+
+      expect(
+        await checkFailureStreak(t.db, clock, {
+          projectId: PROJECT,
+          board: [repairedBead("anton-a", 12), bead("anton-b")],
+        }),
+      ).toBeUndefined();
+
+      // The same runs with the repair stamped AFTER the delivery: that one is still unanswered.
+      const outcome = await checkFailureStreak(t.db, clock, {
+        projectId: PROJECT,
+        board: [repairedBead("anton-a", 27), bead("anton-b")],
+      });
+      expect(outcome?.latched).toBe(true);
+      expect(outcome?.streak.weight).toBe(3);
+      expect(outcome?.streak.runs.map((r) => r.id)).toEqual(["r3", "r4"]);
+    });
+
     it("leaves a board with no repairs weighing every failure once", async () => {
       project();
       await blockThenFailAgain();

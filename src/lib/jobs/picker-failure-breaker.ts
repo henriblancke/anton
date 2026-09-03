@@ -37,10 +37,10 @@ import {
   lastReArmAt,
   settledAfterReArm,
 } from "../autopilot-disarm";
-import { repairedFailureWeight } from "../gardener/repair";
+import { repairedBeadIds, repairedFailureWeight } from "../gardener/repair";
 import { isActiveRun } from "@/components/runs/run-view-utils";
 import { getProjectSettings, resolveFailureBreaker } from "../projects";
-import { listRecentRunOutcomes, type RunDetail } from "../runs";
+import { listDeliveriesByBead, listRecentRunOutcomes, type RunDetail } from "../runs";
 import { cancelledExecuteEpicJobs, type AntonDb, type CancelledJob, type Clock } from "./queue";
 
 /**
@@ -142,9 +142,9 @@ export interface FailureBreakerInput {
   /** The board the pass just read — how an abandoned target is recognised, at no extra `bd` call. */
   board: readonly Bead[];
   /**
-   * How a failed run is priced against the threshold. Absent → {@link repairedFailureWeight} over
-   * `board`, which is the live rule: a failure that followed an auto-repair counts double (R5.8).
-   * Passed explicitly only by tests pinning the arithmetic itself.
+   * How a failed run is priced against the threshold. Absent → {@link repairWeigher} over `board`,
+   * which is the live rule: a failure that followed an auto-repair counts double (R5.8), until the
+   * repaired bead delivers. Passed explicitly only by tests pinning the arithmetic itself.
    */
   weigh?: FailureWeight;
 }
@@ -180,7 +180,7 @@ export async function checkFailureStreak(
   if (!config || disarmed) return undefined;
 
   const since = await lastReArmAt(db, projectId);
-  const weigh = input.weigh ?? repairedFailureWeight(input.board);
+  const weigh = input.weigh ?? (await repairWeigher(db, projectId, input.board));
   const outcomes = await readRunOutcomes(db, projectId, input.board, {
     threshold: config.threshold,
     weigh,
@@ -196,6 +196,23 @@ export async function checkFailureStreak(
     evidence: failureStreakEvidence(streak),
   });
   return { streak, latched: created, disarmId: disarm.id };
+}
+
+/**
+ * The live weighing rule: a failure that followed an auto-repair counts double (R5.8), for as long
+ * as the repair stands unanswered.
+ *
+ * The stamps come off the board the pass already read; the deliveries that SPEND them cannot, so
+ * they are read from the run rows — and only for the beads a stamp actually names, which is normally
+ * none of them and no query at all (gardener/repair.ts `repairedFailureWeight`).
+ */
+async function repairWeigher(
+  db: AntonDb,
+  projectId: string,
+  board: readonly Bead[],
+): Promise<FailureWeight> {
+  const repaired = repairedBeadIds(board);
+  return repairedFailureWeight(board, await listDeliveriesByBead(db, projectId, repaired));
 }
 
 /**

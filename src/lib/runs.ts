@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
@@ -341,6 +341,56 @@ export async function listRecentRunOutcomes(
   offset = 0,
 ): Promise<RunDetail[]> {
   return (await recentRunRows(db, projectId, limit, offset)).map(toDetail);
+}
+
+/**
+ * When work carrying each of these beads DELIVERED — every `done` run naming the bead as its target
+ * or as the ticket it stopped inside, in unix SECONDS, unordered.
+ *
+ * Read for the repair weigher alone (gardener/repair.ts): a repair's double weight lasts only until
+ * the repaired bead next delivers, and a delivery that old is behind the streak the breaker walks —
+ * it is not in the run window and no board read remembers it. Keyed the same two ways the weigher
+ * looks a repair up, so the delivery evidence and the repair evidence can never disagree about which
+ * bead a run carried.
+ *
+ * Bounded by the ids handed in — the beads that actually carry a repair stamp — so an unrepaired
+ * board costs no query at all.
+ */
+export async function listDeliveriesByBead(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<Map<string, number[]>> {
+  const out = new Map<string, number[]>();
+  if (beadIds.length === 0) return out;
+  const ids = [...new Set(beadIds)];
+  const rows = await db
+    .select({
+      epicBeadId: schema.runs.epicBeadId,
+      ticketBeadId: schema.runs.ticketBeadId,
+      endedAt: schema.runs.endedAt,
+      updatedAt: schema.runs.updatedAt,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.status, "done"),
+        or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
+      ),
+    );
+  const wanted = new Set(ids);
+  for (const row of rows) {
+    // A settled row's `updatedAt` is when it settled — the fallback for rows written before
+    // `endedAt` was recorded, exactly as the breakers' own fence reads them.
+    const at = toEpoch(row.endedAt) ?? toEpoch(row.updatedAt);
+    if (at === undefined) continue;
+    for (const id of [row.epicBeadId, row.ticketBeadId]) {
+      if (id === null || !wanted.has(id)) continue;
+      out.set(id, [...(out.get(id) ?? []), at]);
+    }
+  }
+  return out;
 }
 
 /**

@@ -11,7 +11,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
-import { createRun, findRunFormulaForBranch, listRecentRunOutcomes, updateRun } from "./runs";
+import {
+  createRun,
+  findRunFormulaForBranch,
+  listDeliveriesByBead,
+  listRecentRunOutcomes,
+  updateRun,
+} from "./runs";
 import type { Clock } from "./jobs/queue";
 
 let t: TestDb;
@@ -40,6 +46,8 @@ interface SeedRun {
   epicBeadId?: string;
   projectId?: string;
   startedAt?: number;
+  endedAt?: number;
+  ticketBeadId?: string;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -51,7 +59,9 @@ async function seed(run: SeedRun): Promise<void> {
     status: run.status,
     formula: run.formula,
     formulaVariant: run.formulaVariant,
+    ticketBeadId: run.ticketBeadId,
     startedAt: new Date(run.startedAt ?? run.updatedAt),
+    endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
   });
 }
@@ -170,5 +180,55 @@ describe("listRecentRunOutcomes", () => {
     ]);
     // And the `limit` boundary takes the same row every time rather than an arbitrary one.
     expect((await listRecentRunOutcomes(t.db, PROJECT, 1)).map((r) => r.id)).toEqual(["second"]);
+  });
+});
+
+/**
+ * The delivery evidence the repair weigher bounds itself with (gardener/repair.ts): a repair only
+ * weighs a later failure double until the bead it was made on next DELIVERS, and a delivery that old
+ * is behind the streak window the breaker walks.
+ */
+describe("listDeliveriesByBead", () => {
+  const SETTLED = 1_800_000_000_000;
+  const sec = (ms: number) => Math.floor(ms / 1000);
+
+  it("names every delivery of a bead, as target and as the ticket a run stopped inside", async () => {
+    await seed({ id: "d1", status: "done", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({
+      id: "d2",
+      status: "done",
+      updatedAt: SETTLED + 60_000,
+      endedAt: SETTLED + 60_000,
+      epicBeadId: "anton-epic",
+      ticketBeadId: EPIC,
+    });
+
+    const deliveries = await listDeliveriesByBead(t.db, PROJECT, [EPIC]);
+
+    expect([...(deliveries.get(EPIC) ?? [])].sort()).toEqual([sec(SETTLED), sec(SETTLED + 60_000)]);
+  });
+
+  it("counts only runs that DELIVERED, for the beads asked about", async () => {
+    await seed({ id: "failed", status: "failed", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({ id: "parked", status: "parked", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({
+      id: "other-bead",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-zzz",
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
+    // No ids, no query: an unrepaired board asks nothing of the runs table.
+    expect(await listDeliveriesByBead(t.db, PROJECT, [])).toEqual(new Map());
+  });
+
+  it("reads a row written before `endedAt` existed at the time it settled", async () => {
+    await seed({ id: "legacy", status: "done", updatedAt: SETTLED });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
+      new Map([[EPIC, [sec(SETTLED)]]]),
+    );
   });
 });

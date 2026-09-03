@@ -1071,6 +1071,33 @@ describe("contractOrderGaps (the form's order question)", () => {
     expect(contractOrderGaps(late)).toEqual(["Acceptance"]);
   });
 
+  it("faults a section CONTINUED after Verify, where both copies are authored", () => {
+    // The canonical five read in order and the early Acceptance is authored — but more criteria
+    // were written under a second heading after Verify, and `sectionsOf` counts them as contract.
+    // Placing the section at its first copy would report this description as ordered.
+    const continued = ticket({
+      description: [FULL_DESCRIPTION, "## Acceptance Criteria", "- [ ] the report opens in Excel"].join(
+        "\n\n",
+      ),
+    });
+    expect(contractFormGaps(continued)).toEqual([]);
+    expect(contractOrderGaps(continued)).toEqual(["Acceptance"]);
+  });
+
+  it("reads a section repeated back-to-back as ordered — its content moves nowhere", () => {
+    const doubled = ticket({
+      description: reorder(FULL_DESCRIPTION, [
+        "Goal",
+        "Acceptance Criteria",
+        "Acceptance Criteria",
+        "Context",
+        "Out of scope",
+        "Verify",
+      ]),
+    });
+    expect(contractOrderGaps(doubled)).toEqual([]);
+  });
+
   it("accepts an epic's outcome written as a bare preamble line, ahead of every heading", () => {
     expect(contractOrderGaps(epic({ description: FULL_EPIC_DESCRIPTION }))).toEqual([]);
     expect(contractOrderGaps(epic({ description: "It is shareable.\n\n## Success Criteria\n- [ ] x" }))).toEqual([]);
