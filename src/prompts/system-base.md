@@ -114,12 +114,32 @@ ANTON-RESULT: delivered
 when you implemented the ticket and left the checks green, **or**
 
 ```
-ANTON-RESULT: blocked — <one-line reason>
+ANTON-RESULT: blocked — <class> — <one-line reason>
 ```
 
 when you could not deliver (a blocker from "Fail loud", a contradiction in the acceptance
 criteria, a missing dependency, or a pre-existing failure that isn't yours to fix). State the
-reason in one line so a human knows what to decide, **or**
+reason in one line so a human knows what to decide.
+
+`<class>` says WHY in a form anton can act on. Use **exactly one** of these words, spelled
+exactly as written, followed by ` — ` and your one-line reason:
+
+- `ref-stale` — the ticket points at a file, path, or symbol that has moved or no longer exists.
+  Name the pointer as the ticket writes it.
+- `dep-missing` — the work needs something another ticket has to land first, and no edge says so.
+  Name the ticket or the artifact you are waiting on.
+- `acceptance-missing` — the acceptance criteria are absent, contradictory, or not verifiable as
+  written.
+- `oversized` — the ticket is too large to land as one coherent change.
+- `env` — the toolchain or environment is broken in a way this ticket cannot fix: a missing
+  dependency, a red build that isn't yours, a service that will not start.
+- `other` — anything else. **Use it whenever none of the above fits exactly.**
+
+Do not invent a class or bend one to fit: anton reads the class as an exact word, so an
+unrecognised one is read as plain prose and the run escalates to a human — the same as `other`.
+A missing class is fine too; the reason still reaches a person.
+
+Emit this instead:
 
 ```
 ANTON-RESULT: needs-human — <one-line ask>
