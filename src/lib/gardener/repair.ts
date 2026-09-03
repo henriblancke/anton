@@ -389,6 +389,13 @@ export const FAILED_REPAIR_WEIGHT = 2;
  * A run with no recorded start is weighed plainly. Nothing can be ordered against it, and the fence
  * goes to the cheaper error: one more failure before the breaker fires, rather than a double weight
  * on a run that may well have predated the repair.
+ *
+ * The two instants are not the same PRECISION — the run's start is stored whole-second, the repair
+ * stamp keeps milliseconds — so a repair inside the run's own start second cannot be ordered against
+ * it at all, and it is weighed by the same fence: the repair must be strictly earlier than the
+ * EARLIEST instant the attempt could have started (PR #223 review). Rounding the repair down and
+ * accepting a tie instead put the ambiguous second on the expensive side, where the block that
+ * provoked the repair could count as its failure.
  */
 export function repairedFailureWeight(board: readonly RepairedBead[]): FailureWeight {
   const repairedAt = new Map<string, number>();
@@ -404,9 +411,9 @@ export function repairedFailureWeight(board: readonly RepairedBead[]): FailureWe
     if (startedAt === undefined) return 1;
     const followsRepair = [run.epicBeadId, run.ticketBeadId].some((id) => {
       const at = id === undefined ? undefined : repairedAt.get(id);
-      // Both stamps are whole-second in practice (the run's is; the repair's is floored to compare),
-      // and a tie is a repair the run necessarily started after — so a tie counts double.
-      return at !== undefined && Math.floor(at / 1000) <= startedAt;
+      // `startedAt` is whole-second, so the attempt began somewhere in [startedAt, startedAt + 1).
+      // Only a repair stamped before that window is ordered before the attempt beyond doubt.
+      return at !== undefined && at < startedAt * 1000;
     });
     return followsRepair ? FAILED_REPAIR_WEIGHT : 1;
   };

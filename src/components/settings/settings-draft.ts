@@ -19,6 +19,11 @@ import {
   type EarnedKind,
   type ProposalAutonomy,
 } from "@/components/settings/settings-autonomy";
+import {
+  REPAIR_CLASSES,
+  resolveRepairAutonomy,
+  type RepairAutonomy,
+} from "@/components/settings/settings-repair";
 import type {
   DiscoveredAgent,
   EditableSettings,
@@ -69,6 +74,9 @@ export interface SettingsDraft {
   valueLabelRows: ValueLabelRow[];
   /** Per-kind proposal autonomy (anton-nbyy), held RESOLVED — "absent" is not a level. */
   proposalAutonomy: Record<string, ProposalAutonomy>;
+  /** Per-class repair autonomy (R5.3), held RESOLVED for the same reason — and its shipped level is
+   *  `shadow` for the factual pair, so "absent" is not even `propose` here. */
+  repairAutonomy: Record<string, RepairAutonomy>;
 }
 
 /**
@@ -119,6 +127,7 @@ export function draftFromSettings(
     variantRows: (settings.formulaVariants ?? []).map((v, i) => ({ id: `v${i}`, ...v })),
     valueLabelRows: (settings.valueLabels ?? []).map((label, i) => ({ id: `vl${i}`, label })),
     proposalAutonomy: resolveProposalAutonomy(settings.proposalAutonomy, earned),
+    repairAutonomy: resolveRepairAutonomy(settings.repairAutonomy),
   };
 }
 
@@ -127,7 +136,7 @@ export function draftFromSettings(
  *
  * A table rather than a hand-written comparison per key: the save bar names the SECTION an edit
  * lives in, so every field has to belong to exactly one key, and a field added to the draft without
- * a home here would be saved but never announced as unsaved. Lists and the autonomy policy are
+ * a home here would be saved but never announced as unsaved. Lists and the two autonomy policies are
  * compared by their own rules below and are deliberately absent.
  */
 const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
@@ -200,6 +209,11 @@ export function dirtyFields(
     // raw maps would read the shipped default as an edit on every render.
     proposalAutonomy: AUTONOMY_KINDS.some(
       (kind) => draft.proposalAutonomy[kind.id] !== saved.proposalAutonomy[kind.id],
+    ),
+    // Resolved on both sides for the same reason, and it matters more here: the shipped level is
+    // `shadow` for the factual pair, so a raw comparison would read an untouched project as edited.
+    repairAutonomy: REPAIR_CLASSES.some(
+      (klass) => draft.repairAutonomy[klass.id] !== saved.repairAutonomy[klass.id],
     ),
   };
 }
@@ -278,6 +292,9 @@ export function settingsPatchBody(
     // omissions: the server merges per kind, so an omitted kind keeps whatever it held — which is
     // how disarming one would silently fail to persist.
     proposalAutonomy: draft.proposalAutonomy,
+    // Every class this build renders, at its resolved level — explicit entries, not omissions, for
+    // the reason above: the server merges per class, so an omitted one keeps whatever it held.
+    repairAutonomy: draft.repairAutonomy,
   };
 }
 

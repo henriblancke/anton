@@ -504,6 +504,13 @@ export interface PathHistory {
    * has stood for more than one file over the branch's life — history the caller cannot resolve.
    */
   renamedTo: string[];
+  /**
+   * How many commits renamed the path AWAY — the occurrences behind `renamedTo`, before the
+   * de-duplication (PR #223 review). Two renames to the SAME destination is not one rename: the
+   * path had to be recreated in between, so the name has stood for two files exactly as two
+   * distinct destinations would mean, and only the count says so.
+   */
+  renames: number;
   /** A commit removed the path with no rename paired to the removal. */
   deleted: boolean;
 }
@@ -570,6 +577,7 @@ export async function readPathHistory(repoPath: string, path: string): Promise<P
   );
 
   const renamedTo: string[] = [];
+  let renames = 0;
   let deleted = false;
   for (const status of statuses) {
     // A merge commit prints no name-status at all, so it contributes neither a rename nor a
@@ -577,13 +585,14 @@ export async function readPathHistory(repoPath: string, path: string): Promise<P
     for (const line of status.split("\n")) {
       const rename = RENAME_STATUS.exec(line);
       if (rename && rename[1] === path) {
+        renames++;
         if (!renamedTo.includes(rename[2]!)) renamedTo.push(rename[2]!);
         continue;
       }
       if (DELETE_STATUS.exec(line)?.[1] === path) deleted = true;
     }
   }
-  return { renamedTo, deleted };
+  return { renamedTo, renames, deleted };
 }
 
 /** A branch's change set against its base: the changed paths plus the (possibly truncated) patch. */

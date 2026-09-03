@@ -9,6 +9,7 @@ import { toast } from "sonner";
 
 import { SettingsView } from "@/components/settings/settings-view";
 import { GARDENER_DETECTION_KINDS } from "@/lib/gardener/detections";
+import { REPAIR_CLASSES } from "@/lib/gardener/repair";
 import type { Project } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -2142,6 +2143,80 @@ describe("SettingsView product-master cadence offer (anton-3xa9)", () => {
     renderView({}, [], coupledSchedules({ pm: { enabled: false } }));
     arm();
     expect(offer()).toBeNull();
+  });
+});
+
+describe("SettingsView repair autonomy (R5.3)", () => {
+  showing("repairs");
+
+  const choice = (klass: string, level: string) =>
+    screen.getByRole("radio", { name: `${klass} · ${level}` }) as HTMLInputElement;
+
+  it("renders each class at its SHIPPED level — the factual pair at shadow, not propose", () => {
+    renderView({});
+    for (const klass of ["ref-stale", "dep-missing"]) {
+      expect(choice(klass, "shadow").checked).toBe(true);
+      expect(choice(klass, "propose").checked).toBe(false);
+    }
+    for (const klass of ["acceptance-missing", "oversized"]) {
+      expect(choice(klass, "propose").checked).toBe(true);
+    }
+  });
+
+  it("renders exactly the classes the repair guard knows about", () => {
+    // A hand-maintained mirror of REPAIR_CLASSES (this module never imports server code), asserted
+    // against the real list: a class with no row ships as a policy the operator cannot reach — the
+    // exact hole this panel was added to close.
+    renderView({});
+    const rendered = screen
+      .getAllByRole("radio")
+      .map((r) => r.getAttribute("aria-label")?.split(" · ")[0])
+      .filter((klass, i, all) => all.indexOf(klass) === i);
+    expect(rendered.sort()).toEqual([...REPAIR_CLASSES].sort());
+  });
+
+  it("offers apply from the first day — a repair builds no record to earn it with", () => {
+    renderView({});
+    expect(choice("ref-stale", "apply").disabled).toBe(false);
+  });
+
+  it("pins a class anton has no repair for, and says why rather than hiding it", () => {
+    renderView({});
+    for (const level of ["propose", "shadow", "apply"]) {
+      expect(choice("oversized", level).disabled).toBe(true);
+    }
+    expect(screen.getByText(/a split writes new contracts/)).toBeTruthy();
+  });
+
+  it("seeds from the stored policy, and floors a level it cannot read to the shipped one", () => {
+    renderView({ repairAutonomy: { "ref-stale": "apply", "dep-missing": "nonsense" } });
+    expect(choice("ref-stale", "apply").checked).toBe(true);
+    expect(choice("dep-missing", "shadow").checked).toBe(true);
+  });
+
+  it("arms a class and PATCHes every class explicitly on Save (round-trip out)", async () => {
+    const fetchMock = stubFetch();
+    renderView({});
+
+    fireEvent.click(choice("ref-stale", "apply"));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.repairAutonomy["ref-stale"]).toBe("apply");
+    expect(body.repairAutonomy["dep-missing"]).toBe("shadow");
+    expect(Object.keys(body.repairAutonomy).sort()).toEqual([...REPAIR_CLASSES].sort());
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+  });
+
+  it("reads the shipped policy as clean, not as an unsaved edit on every render", () => {
+    // The shipped level is `shadow` for the factual pair, so a raw comparison against a baseline
+    // that stores only overrides would light the save bar the moment the page opens.
+    renderView({});
+    expect((screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(choice("ref-stale", "apply"));
+    expect((screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement).disabled).toBe(false);
+    // And the save bar names the section it lives in, so the edit is findable from any panel.
+    expect(screen.getByText("repair autonomy")).toBeTruthy();
   });
 });
 

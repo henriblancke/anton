@@ -1053,6 +1053,24 @@ describe("contractOrderGaps (the form's order question)", () => {
     expect(contractOrderGaps(noContext)).toEqual([]);
   });
 
+  it("places a repeated heading at the copy that carries the content, not at the empty first one", () => {
+    // The canonical `## Acceptance Criteria` holds nothing but the formula's prompt; the criteria
+    // were authored under a second heading after Verify. The bodies concatenate, so reading the
+    // aggregate at the FIRST heading's position would call this ordered.
+    const late = ticket({
+      description: [
+        reorder(FULL_DESCRIPTION, ["Goal", "Context", "Out of scope", "Verify"]).replace(
+          "## Context",
+          "## Acceptance Criteria\n- [ ] TODO — a concrete, checkable statement of done\n\n## Context",
+        ),
+        "## Acceptance Criteria",
+        "- [ ] the report opens in Excel",
+      ].join("\n\n"),
+    });
+    expect(contractFormGaps(late)).toEqual([]);
+    expect(contractOrderGaps(late)).toEqual(["Acceptance"]);
+  });
+
   it("accepts an epic's outcome written as a bare preamble line, ahead of every heading", () => {
     expect(contractOrderGaps(epic({ description: FULL_EPIC_DESCRIPTION }))).toEqual([]);
     expect(contractOrderGaps(epic({ description: "It is shareable.\n\n## Success Criteria\n- [ ] x" }))).toEqual([]);

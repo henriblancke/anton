@@ -268,6 +268,13 @@ describe("repairedFailureWeight", () => {
     expect(weigh(run({ startedAt: Math.floor(T0 / 1000) - 600 }))).toBe(1);
   });
 
+  it("weighs a repair stamped inside the attempt's own start second once", () => {
+    // The run's start is stored whole-second and the stamp keeps milliseconds, so a repair anywhere
+    // in that second could equally have come after the attempt began — it is not evidence.
+    const weigh = repairedFailureWeight([repaired("ref-stale", "rewrote the pointer", T0 + 900)]);
+    expect(weigh(run({ startedAt: Math.floor(T0 / 1000) }))).toBe(1);
+  });
+
   it("finds the repair on the TICKET a grouped run stopped inside", () => {
     const weigh = repairedFailureWeight([repaired("ref-stale", "rewrote the pointer")]);
     expect(weigh(run({ epicBeadId: "anton-epic", ticketBeadId: BEAD }))).toBe(FAILED_REPAIR_WEIGHT);

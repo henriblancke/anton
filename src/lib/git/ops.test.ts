@@ -379,7 +379,11 @@ suite("readPathHistory (real git)", () => {
     g(["mv", "old.ts", "new.ts"]);
     commit("rename old.ts -> new.ts");
 
-    expect(await readPathHistory(repo, "old.ts")).toEqual({ renamedTo: ["new.ts"], deleted: false });
+    expect(await readPathHistory(repo, "old.ts")).toEqual({
+      renamedTo: ["new.ts"],
+      renames: 1,
+      deleted: false,
+    });
   });
 
   it("reports a removal with no rename paired to it as deleted", async () => {
@@ -388,7 +392,30 @@ suite("readPathHistory (real git)", () => {
     g(["rm", "-q", "gone.ts"]);
     commit("remove gone.ts");
 
-    expect(await readPathHistory(repo, "gone.ts")).toEqual({ renamedTo: [], deleted: true });
+    expect(await readPathHistory(repo, "gone.ts")).toEqual({
+      renamedTo: [],
+      renames: 0,
+      deleted: true,
+    });
+  });
+
+  it("counts a path renamed to the same destination twice as two renames", async () => {
+    // The destination is deleted and the source recreated in between, so both removals read
+    // `R old.ts new.ts` — one destination, two unrelated incarnations of the same name.
+    writeFileSync(join(repo, "old.ts"), "export const x = 1;\n".repeat(20));
+    commit("add old.ts");
+    g(["mv", "old.ts", "new.ts"]);
+    commit("rename old.ts -> new.ts (first)");
+    g(["rm", "-q", "new.ts"]);
+    writeFileSync(join(repo, "old.ts"), "export const y = 2;\n".repeat(20));
+    commit("drop new.ts, recreate old.ts");
+    g(["mv", "old.ts", "new.ts"]);
+    commit("rename old.ts -> new.ts (second)");
+
+    expect(await readPathHistory(repo, "old.ts")).toMatchObject({
+      renamedTo: ["new.ts"],
+      renames: 2,
+    });
   });
 });
 

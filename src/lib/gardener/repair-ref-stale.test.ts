@@ -124,6 +124,16 @@ describe("contextSpan", () => {
   it("answers nothing for a bead that states no Context", () => {
     expect(contextSpan("## Goal\nShip it.")).toBeUndefined();
   });
+
+  it("keeps its offsets on a CRLF description, so the tail of Context is not cut off", () => {
+    const description = contract(
+      ["first `src/a.ts`", "second `src/b.ts`", "last `src/c.ts`"].join("\n"),
+    ).replace(/\n/g, "\r\n");
+    const span = contextSpan(description)!;
+    expect(description.slice(span.start, span.end)).toBe(span.body);
+    expect(span.body).toContain("last `src/c.ts`");
+    expect(span.body).not.toContain("## Verify");
+  });
 });
 
 suite("ref-stale, against a real git history", () => {
@@ -146,12 +156,14 @@ suite("ref-stale, against a real git history", () => {
 
     // moved.ts → renamed once. hop.ts → renamed twice. gone.ts → deleted. twice.ts → the name has
     // stood for two different files, which is the ambiguity nothing can resolve. mixed.ts → deleted,
-    // recreated by something unrelated, then renamed. here.ts → stays put.
+    // recreated by something unrelated, then renamed. rerun.ts → renamed to the SAME destination
+    // twice, which is that ambiguity wearing one name. here.ts → stays put.
     write("src/moved.ts", "export const moved = 'a file long enough to pair on similarity';\n");
     write("src/hop.ts", "export const hop = 'another file long enough to pair on similarity';\n");
     write("src/gone.ts", "export const gone = 'a third file long enough to pair on similarity';\n");
     write("src/twice.ts", "export const twice = 'a fourth file long enough to pair on it';\n");
     write("src/mixed.ts", "export const mixed = 'a fifth file long enough to pair on similarity';\n");
+    write("src/rerun.ts", "export const rerun = 'a sixth file long enough to pair on similarity';\n");
     write("src/here.ts", "export const here = 'still right where the bead says it is';\n");
     g(["add", "-A"]);
     g(["commit", "-qm", "c1"]);
@@ -183,6 +195,15 @@ suite("ref-stale, against a real git history", () => {
     g(["commit", "-qm", "c10"]);
     g(["mv", "src/mixed.ts", "src/took-over.ts"]);
     g(["commit", "-qm", "c11"]);
+
+    g(["mv", "src/rerun.ts", "src/lib/rerun.ts"]);
+    g(["commit", "-qm", "c12"]);
+    g(["rm", "-q", "src/lib/rerun.ts"]);
+    write("src/rerun.ts", "export const different = 'nothing to do with what used to live here';\n");
+    g(["add", "-A"]);
+    g(["commit", "-qm", "c13"]);
+    g(["mv", "src/rerun.ts", "src/lib/rerun.ts"]);
+    g(["commit", "-qm", "c14"]);
   });
 
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -232,6 +253,12 @@ suite("ref-stale, against a real git history", () => {
       const verdict = await verifyCitedPath(repo, "src/mixed.ts");
       expect(verdict.state).toBe("unresolved");
       expect(verdict).toMatchObject({ why: expect.stringContaining("both deleted and renamed") });
+    });
+
+    it("refuses a name renamed to the same destination twice, however it deduplicates", async () => {
+      const verdict = await verifyCitedPath(repo, "src/rerun.ts");
+      expect(verdict.state).toBe("unresolved");
+      expect(verdict).toMatchObject({ why: expect.stringContaining("more than one file") });
     });
 
     it("refuses a path git has never heard of", async () => {

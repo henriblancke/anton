@@ -129,15 +129,17 @@ interface OpenSection {
 const opensSection = (open: OpenSection | undefined, heading: Heading, keys: ReadonlySet<string>) =>
   !open || heading.depth <= open.depth || keys.has(heading.key);
 
-/** File a finished section under its key. A repeated heading concatenates rather than replaces. */
-function fileSection(out: Map<string, string>, section: OpenSection | undefined): void {
-  if (!section) return;
-  const text = [out.get(section.key), section.body.join("\n").trim()].filter(Boolean).join("\n");
-  out.set(section.key, text);
+/** One heading and the body under it, as WRITTEN — a repeated heading yields one entry per
+ * occurrence, in document order, so a reader that needs WHERE a section is finds the occurrence
+ * rather than the aggregate. */
+interface SectionOccurrence {
+  key: string;
+  body: string;
 }
 
 /**
- * Section bodies of a description, keyed by slugged heading. A repeated heading concatenates.
+ * Every section a description opens, in document order — the one parse {@link sectionsOf} and
+ * {@link formPlacements} both read.
  *
  * A section runs until a heading that starts ANOTHER section: one of `keys` at any depth, or any
  * heading at the current section's level or shallower. A DEEPER heading that names no contract
@@ -153,16 +155,33 @@ function fileSection(out: Map<string, string>, section: OpenSection | undefined)
  * Depth alone can't decide it: descriptions that open with a `# Title` put every `## Goal` below it,
  * and folding those in would lose the contract entirely. A contract heading always opens its section.
  */
-function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
-  const out = new Map<string, string>();
+function sectionOccurrences(description: string, keys: ReadonlySet<string>): SectionOccurrence[] {
+  const out: SectionOccurrence[] = [];
   let open: OpenSection | undefined;
+  const close = () => {
+    if (open) out.push({ key: open.key, body: open.body.join("\n").trim() });
+  };
   for (const { text, heading } of scanMarkdown(description)) {
     if (heading && opensSection(open, heading, keys)) {
-      fileSection(out, open);
+      close();
       open = { key: heading.key, depth: heading.depth, body: [] };
     } else open?.body.push(text);
   }
-  fileSection(out, open);
+  close();
+  return out;
+}
+
+/**
+ * Section bodies of a description, keyed by slugged heading. A repeated heading concatenates — the
+ * whole of what a bead says under one name, for every reader that asks WHAT a section holds. A
+ * reader that also needs where it sits must go to {@link sectionOccurrences}: the aggregate has one
+ * position, and it is the first heading's whether or not that is the copy carrying the content.
+ */
+function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const { key, body } of sectionOccurrences(description, keys)) {
+    out.set(key, [out.get(key), body].filter(Boolean).join("\n"));
+  }
   return out;
 }
 
@@ -823,7 +842,8 @@ export function contractOrderGaps(bead: Bead): ContractSection[] {
 }
 
 /** One section the form question asks about: where the description carries it, or `undefined` when
- * it does not. `at` is the heading's ordinal among the sections found — the preamble is -1. */
+ * it does not. `at` is the ordinal of the section OCCURRENCE that supplies the authored body — the
+ * preamble is -1. */
 interface FormPlacement {
   section: ContractSection;
   at: number | undefined;
@@ -833,20 +853,25 @@ interface FormPlacement {
  * Every section this bead's tier owes, in the contract's order, each with the place the description
  * carries it. One parse serving both form questions, so presence and order can never read the same
  * description two different ways.
+ *
+ * Placed by OCCURRENCE, not by key (PR #223 review): a repeated heading concatenates in
+ * {@link sectionsOf}, so a canonical early `## Acceptance` holding nothing but the formula's TODO
+ * and a second, authored `## Acceptance` written after `## Verify` would read as authored AT THE
+ * EARLY POSITION — the one arrangement {@link contractOrderGaps} exists to catch, reported as
+ * ordered. The position that counts is the one the authored body actually sits at.
  */
 function formPlacements(bead: Bead): FormPlacement[] {
   if (!isContractJudged(bead)) return [];
   const tier = tierOf(bead);
 
   const description = typeof bead.description === "string" ? bead.description : "";
-  const sections = sectionsOf(description, contractKeysOf(tier));
-  const found = [...sections.keys()];
+  const found = sectionOccurrences(description, contractKeysOf(tier));
   const rules = tier === "epic" ? EPIC_FORM_RULES : TICKET_FORM_RULES;
   return rules.map((rule) => {
     // The preamble sits ahead of every heading, so an epic's bare outcome line is placed first.
     if (rule.preamble && isAuthoredBody(preambleOf(description))) return { section: rule.section, at: -1 };
-    const key = rule.keys.find((k) => isAuthoredBody(sections.get(k)));
-    return { section: rule.section, at: key === undefined ? undefined : found.indexOf(key) };
+    const at = found.findIndex((s) => rule.keys.includes(s.key) && isAuthoredBody(s.body));
+    return { section: rule.section, at: at === -1 ? undefined : at };
   });
 }
 

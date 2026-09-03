@@ -113,6 +113,11 @@ export interface ContextSpan {
  *
  * Fences and HTML comments are honoured through {@link scanMarkdown}, so a `## Context` quoted
  * inside a code block opens no section here, exactly as it opens none for the contract gate.
+ *
+ * The separator is MEASURED at each line rather than assumed to be one character (PR #223 review):
+ * {@link scanMarkdown} splits on `\r?\n` and hands back lines with the `\r` already gone, so a bead
+ * written with CRLF endings would drift the span one byte earlier per line — truncating the tail of
+ * Context, and with it a stale citation the repair could otherwise have followed.
  */
 export function contextSpan(description: string): ContextSpan | undefined {
   const lines = scanMarkdown(description);
@@ -122,16 +127,17 @@ export function contextSpan(description: string): ContextSpan | undefined {
   let end = description.length;
   for (const line of lines) {
     const lineEnd = offset + line.text.length;
+    const nextLine = lineEnd + (description.startsWith("\r\n", lineEnd) ? 2 : 1);
     if (start === undefined) {
       if (line.heading?.key === "context") {
-        start = Math.min(lineEnd + 1, description.length);
+        start = Math.min(nextLine, description.length);
         depth = line.heading.depth;
       }
     } else if (line.heading && line.heading.depth <= depth) {
       end = Math.max(start, offset);
       break;
     }
-    offset = lineEnd + 1;
+    offset = nextLine;
   }
   if (start === undefined) return undefined;
   return { start, end, body: description.slice(start, end) };
@@ -188,6 +194,19 @@ export async function verifyCitedPath(worktreePath: string, path: string): Promi
           `\`${cur}\` has stood for more than one file — git records it renamed to ` +
           `${history.renamedTo.map((p) => `\`${p}\``).join(" and ")}, so which one the bead meant ` +
           `is not something history answers`,
+      };
+    }
+    if (history.renames > 1) {
+      // The same destination twice is not one rename (PR #223 review): the path had to be recreated
+      // between those commits, so it has stood for two files just as surely as two destinations
+      // would mean — and the latest `to` is an incarnation the bead may never have pointed at.
+      return {
+        path,
+        state: "unresolved",
+        why:
+          `\`${cur}\` was renamed to \`${history.renamedTo[0]}\` ${history.renames} times — the ` +
+          `path was recreated between those commits, so the name has stood for more than one file ` +
+          `and which one the bead meant is not something history answers`,
       };
     }
     if (history.deleted && history.renamedTo.length === 1) {
