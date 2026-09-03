@@ -894,8 +894,13 @@ const envRead = (source) =>
  * variable without ever spelling `process.env.NAME` (PR #217 review). Everything up to the `=` is
  * captured and the names picked out of it separately, since a binding may be renamed, defaulted or
  * quoted.
+ *
+ * The trailing guard is `(?![\w$])` rather than `\b`, because an alias may END in `$` (`const env$ =
+ * process.env`) and `\b` after a `$` demands a word character follow it — the read would match
+ * nothing (PR #217 review).
  */
-const envDestructure = (source) => new RegExp(String.raw`\{([^{}]*)\}\s*(?::[^=]+)?=\s*${source}\b`, "g");
+const envDestructure = (source) =>
+  new RegExp(String.raw`\{([^{}]*)\}\s*(?::[^=]+)?=\s*${source}(?![\w$])`, "g");
 
 /**
  * A local standing in for the whole environment — `const env = process.env` — through which
@@ -907,6 +912,13 @@ const ENV_ALIAS = new RegExp(
   String.raw`(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*${PROCESS_ENV}\b`,
   "g",
 );
+
+/**
+ * One captured alias, as a pattern the reads above can be anchored on: its `$`s escaped, behind a
+ * lookbehind rather than a `\b` — a `$` is not a word character, so `\b$env` would match nothing
+ * even escaped, while the lookbehind still refuses a match inside a longer identifier.
+ */
+const aliasSource = (alias) => String.raw`(?<![\w$])` + alias.replaceAll("$", () => String.raw`\$`);
 
 /**
  * One bound name in that pattern: whatever sits in KEY position — at the start or after a comma —
@@ -946,8 +958,10 @@ function configEnvNames(appRoot) {
 
 /** Every build-environment variable one file's text names, folded into `names`. */
 function envNamesIn(text, names) {
-  // An alias is an identifier by construction, so it carries no regex metacharacter into these.
-  const aliases = [...text.matchAll(ENV_ALIAS)].map(([, alias]) => String.raw`\b${alias}`);
+  // A JavaScript identifier may contain `$`, which is a regex anchor — `const $env = process.env`
+  // interpolated raw compiles a pattern matching nothing, and the reads through that alias go
+  // unrecorded (PR #217 review). `$` is the only metacharacter the capture admits.
+  const aliases = [...text.matchAll(ENV_ALIAS)].map(([, alias]) => aliasSource(alias));
   for (const source of [PROCESS_ENV, ...aliases]) {
     for (const [, dotted, indexed] of text.matchAll(envRead(source))) names.add(dotted ?? indexed);
     for (const [, bindings] of text.matchAll(envDestructure(source)))

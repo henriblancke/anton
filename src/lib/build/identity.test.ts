@@ -1149,6 +1149,20 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
   });
 
+  // A JavaScript identifier may contain `$`, which is a regex anchor — an alias interpolated raw
+  // compiled a pattern matching nothing, so every read through `$env` went unrecorded and the digest
+  // stayed identical across a changed value (PR #217 review).
+  it("reads a variable through an alias whose name contains a dollar sign", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.ts"),
+      "const $env = process.env;\nconst env$ = process.env;\nconst { ANALYZE } = env$;\nexport default { env: { FLAVOR: $env.BUILD_FLAVOR, A: ANALYZE } };\n",
+    );
+    const base = { BUILD_FLAVOR: "one", ANALYZE: "0" };
+    expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
+  });
+
   // The two routes compose: an alias may itself be destructured, which names a variable at two
   // removes from anything spelling `process.env`.
   it("reads a variable destructured out of an alias of process.env", () => {
