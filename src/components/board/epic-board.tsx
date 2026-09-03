@@ -4,7 +4,7 @@ import { useState } from "react";
 import { DndContext, closestCorners } from "@dnd-kit/core";
 import { restrictToWindowEdges } from "@dnd-kit/modifiers";
 
-import type { Board, EscalationView } from "@/lib/types";
+import type { Board, EscalationView, UnwatchedParks } from "@/lib/types";
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { BoardCanvas } from "@/components/board/board-canvas";
 import {
@@ -15,6 +15,7 @@ import {
 import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { BoardToolbar } from "@/components/board/board-toolbar";
 import { EscalationStrip } from "@/components/board/escalation-strip";
+import { UnwatchedParksBand } from "@/components/board/unwatched-parks-band";
 import { OperatorQueue } from "@/components/board/operator-queue";
 import { useBoardBreaker } from "@/components/board/use-board-breaker";
 import { useBoardDrag } from "@/components/board/use-board-drag";
@@ -36,6 +37,7 @@ export function EpicBoard({
   slug,
   initialBoard,
   escalations = [],
+  parks,
   breaker,
   budgetAware = false,
 }: {
@@ -48,6 +50,11 @@ export function EpicBoard({
    * need the board's poll.
    */
   escalations?: EscalationView[];
+  /**
+   * Parked work with nothing watching it (anton-kh98), server-rendered by the page. Absent — and so
+   * silent — whenever the stall watcher is armed or nothing is parked; its presence IS the signal.
+   */
+  parks?: UnwatchedParks;
   /**
    * Why the autopilot has stopped filling the queue, if it has (anton-5c8h). The FIRST paint only:
    * the board re-reads it on its own slower cadence because a hold is released by a PR merging or
@@ -100,6 +107,9 @@ export function EpicBoard({
       {/* Above the escalations, because it outranks them: an escalation is one stalled card, a
           breaker is every card that would have started. */}
       <BoardBreakerSlot slug={slug} polled={polledBreaker} streamed={breaker} />
+      {/* Directly above the strip it explains: with the watcher off, the strip has no producer at
+          all, so an empty strip means "nothing detected", not "nothing wrong". */}
+      <UnwatchedParksBand slug={slug} parks={parks} />
       {/* The one band that still needs a DECISION about a card below it, not just a look. Escalations
           come from the page's server render — they are answered by an action that reloads, not by a
           poll — so they don't ride the board payload the way hygiene/trend/scan health used to. */}

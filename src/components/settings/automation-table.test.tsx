@@ -445,11 +445,19 @@ describe("the automation rows", () => {
     expect(screen.getByText("in progress · failed 7d ago")).toBeTruthy();
   });
 
-  // unstick acts on run-health's findings. With the producer off it is not broken, it is idle —
-  // and without saying so the row reads as a failure.
-  it("says which automations are idle because the one that feeds them is off", () => {
+  // unstick acts on run-health's findings. With the producer off it is not broken, it is inert —
+  // and without saying so the row reads as a healthy hourly automation (anton-kh98), which is
+  // precisely the belief that leaves parked work waiting for a week.
+  it("says an automation is a no-op while the one that feeds it is off", () => {
     renderTable({ "run-health": { enabled: false } });
-    expect(screen.getByText(/idle until run-health is on/)).toBeTruthy();
+    expect(screen.getByText(/a no-op until run-health is on/)).toBeTruthy();
+  });
+
+  // The row with no row of its own — a project predating the type — is the same claim: nothing
+  // feeds it, so it does nothing.
+  it("says an automation is a no-op when the one that feeds it has no schedule at all", () => {
+    renderTable({ "run-health": { enabled: null } });
+    expect(screen.getByText(/a no-op until run-health is on/)).toBeTruthy();
   });
 
   it("says which automations are fed once the one that feeds them is on", () => {

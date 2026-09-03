@@ -7,6 +7,7 @@ import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
 import { openEscalations } from "@/lib/escalations";
 import { currentBreaker } from "@/lib/autopilot-state";
+import { unwatchedParksForProject } from "@/lib/unwatched-parks";
 
 export const dynamic = "force-dynamic";
 
@@ -22,10 +23,13 @@ export default async function ProjectBoardPage({
   //   • settings — whether this project paces autonomous work (anton-y2ue), which drives the
   //     per-card approval affordance (Approve immediate vs Queue paced).
   //   • escalations — stalls the unstick pass could not safely restart (anton-wvcy).
-  const [board, settings, escalations] = await Promise.all([
+  //   • parks — parked work with nothing watching it (anton-kh98), which is what the escalation
+  //     read CANNOT surface: with the watcher off it has no producer and comes back empty.
+  const [board, settings, escalations, parks] = await Promise.all([
     project ? getBoard(project) : null,
     getProjectSettingsBySlug(slug),
     project ? openEscalations(project.id) : [],
+    project ? unwatchedParksForProject(project.id) : undefined,
   ]);
 
   // Whether the autopilot has stopped, and which kind: a quality disarm that needs a human
@@ -56,6 +60,7 @@ export default async function ProjectBoardPage({
             slug={slug}
             initialBoard={board}
             escalations={escalations}
+            parks={parks}
             breaker={breaker}
             budgetAware={settings.budgetAware === true}
           />

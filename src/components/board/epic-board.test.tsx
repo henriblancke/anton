@@ -16,7 +16,14 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { DragEndEvent } from "@dnd-kit/core";
 import { toast } from "sonner";
 
-import { STAGES, type Board, type Epic, type EscalationView, type Stage } from "@/lib/types";
+import {
+  STAGES,
+  type Board,
+  type Epic,
+  type EscalationView,
+  type Stage,
+  type UnwatchedParks,
+} from "@/lib/types";
 import { makeEpicRow } from "@/components/board/epic.fixture";
 import { STAGE_LABELS } from "@/components/board/board-utils";
 
@@ -317,6 +324,54 @@ describe("EpicBoard operator queue (anton-qfso.1)", () => {
   it("shows no band at all when nothing is the operator's", () => {
     render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
     expect(screen.queryByText("Yours to do")).toBeNull();
+  });
+});
+
+/**
+ * The band that says the escalation strip below it has no producer (anton-kh98). It is wired here
+ * and not on the Health page because the silence it corrects is the BOARD's: an empty strip on an
+ * unwatched queue reads exactly like a healthy one.
+ */
+describe("EpicBoard unwatched parked work (anton-kh98)", () => {
+  const parks: UnwatchedParks = {
+    parkedCount: 13,
+    oldestSince: Math.floor((Date.now() - 7 * 24 * 3_600_000) / 1000),
+    oldestAgeMs: 7 * 24 * 3_600_000,
+    disarmed: ["run-health"],
+  };
+
+  const escalation: EscalationView = {
+    id: "esc-1",
+    findingKey: "parked-run:r-1",
+    kind: "parked-run",
+    reason: "parked 4h ago: agent exited 1",
+    epicBeadId: "anton-e1",
+    ageMs: 4 * 3_600_000,
+    status: "open",
+    noted: true,
+    raisedAt: 0,
+  };
+
+  it("sits above the escalation strip it explains", () => {
+    render(
+      <EpicBoard
+        slug="tmp"
+        initialBoard={board("1:sync", "backlog")}
+        escalations={[escalation]}
+        parks={parks}
+      />,
+    );
+
+    const unwatched = screen.getByText("Parked work, unwatched");
+    const needsYou = screen.getByText("Needs you");
+    expect(
+      unwatched.compareDocumentPosition(needsYou) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("adds no band to a board whose watcher is armed", () => {
+    render(<EpicBoard slug="tmp" initialBoard={board("1:sync", "backlog")} />);
+    expect(screen.queryByText("Parked work, unwatched")).toBeNull();
   });
 });
 
