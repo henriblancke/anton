@@ -16,6 +16,8 @@
  *     and that holds whether or not the board happens to hold them all;
  *   • a prerequisite already CLOSED — it is not what stopped this run, and parking behind it would
  *     park forever;
+ *   • a prerequisite that is a gardener PROPOSAL — an ask about the board rather than work that can
+ *     land, so the edge would outlive the founder's decision and park the target on nothing;
  *   • an ordering the board ALREADY records — then the block is something else;
  *   • an edge bd would reject: a cycle, or a `discovered-from` edge already on the same directed
  *     pair (anton-wsap — bd holds one edge per pair and answers `bd link --type blocks` with
@@ -28,8 +30,10 @@
  * project that has not armed the class gets the edge RESOLVED and recorded rather than drawn (R5.3).
  */
 import { beads, type Bead } from "../beads/bd";
+import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { indexBoard, isOpenWork, type BoardIndex } from "./board-index";
+import { isProposalBead } from "./detections";
 import type { ProposalAutonomy } from "./autonomy";
 import {
   decideRepair,
@@ -88,6 +92,35 @@ function mintedPrefixes(index: BoardIndex): Set<string> {
   return prefixes;
 }
 
+/**
+ * Why the bead named as the prerequisite is not work this edge may point at, or undefined when it
+ * is.
+ *
+ * Shared between the snapshot read in {@link resolvePrereq} and the re-read at the mutation boundary
+ * in {@link repairDepMissing}, for the reason apply-steps.ts shares `blockerUnusable` with its
+ * under-lock re-check: the bar the WRITE is held to has to be the bar the decision was made against,
+ * or the two drift and the edge lands on something the resolver would have refused.
+ */
+function prereqUnusable(prereq: Bead): string | undefined {
+  // A proposal is open work, so `isOpenWork` waves it through — but it is an ASK about the board,
+  // not work that can land, and it closes the moment the founder approves or declines it. The edge
+  // outlives that (`src/lib/pm/order-guards.ts` refuses the same pair for the same reason), leaving
+  // the target parked behind something whose completion says nothing about what it was waiting for.
+  if (isProposalBead(prereq)) {
+    return (
+      `\`${prereq.id}\` is named as the prerequisite but it is a proposal, not work — approving or ` +
+      `declining it would close it without landing anything, and the edge would outlive it`
+    );
+  }
+  if (!isOpenWork(prereq)) {
+    return (
+      `\`${prereq.id}\` is named as the prerequisite but it is already settled (${prereq.status}) — ` +
+      `it is not what stopped this run, and parking behind it would park for good`
+    );
+  }
+  return undefined;
+}
+
 /** What the board answers for the prerequisite the agent named. */
 export type PrereqVerdict =
   | { state: "resolved"; id: string }
@@ -142,15 +175,8 @@ export function resolvePrereq(
         `records ordering only, so there is nothing to point at`,
     };
   }
-  const prereq = index.byId.get(id)!;
-  if (!isOpenWork(prereq)) {
-    return {
-      state: "unresolved",
-      why:
-        `\`${id}\` is named as the prerequisite but it is already settled (${prereq.status}) — it is ` +
-        `not what stopped this run, and parking behind it would park for good`,
-    };
-  }
+  const unusable = prereqUnusable(index.byId.get(id)!);
+  if (unusable) return { state: "unresolved", why: unusable };
   if (index.recordsBlocker(targetId, id)) {
     return {
       state: "unresolved",
@@ -253,6 +279,10 @@ function readBoard(repoPath: string): Promise<Bead[]> {
  * back ({@link revertPrereqEdge}). Unlike a rewritten pointer, an edge is board state OTHER runs
  * read: an unrecorded one would hold work back with nothing on the board saying who drew it or why,
  * and no fingerprint to stop anton drawing it again. Better no edge and a human reading the block.
+ *
+ * All of it under BOTH beads' write locks, with the prerequisite re-read inside them: the board this
+ * resolved against is a snapshot, and an edge is only an ordering while the work it points at is
+ * still ahead of the target (see {@link prereqMoved}).
  */
 export async function repairDepMissing(args: {
   /** Where bd writes go — the project's beads workspace. */
@@ -295,31 +325,69 @@ export async function repairDepMissing(args: {
   // Resolving the prerequisite is a board READ, so the shadow is the armed answer minus the writes.
   if (decision.action === "shadow") return { action: "shadow", blockerId, attempted };
 
-  await beads.link(repoPath, bead.id, blockerId, "blocks");
-  let label: string;
+  // Both beads' locks, and the prerequisite re-read inside them (PR #223 review). The board above is
+  // a SNAPSHOT, and the one thing this edge cannot survive is the prerequisite settling between that
+  // read and this write: the caller parks the run behind an edge whose blocker has already landed,
+  // and no blocker-completion event is left to resume it — the stranded wait apply-steps.ts locks
+  // its own links against.
+  return withBeadWriteLocks(repoPath, [bead.id, blockerId], async () => {
+    const moved = await prereqMoved(repoPath, blockerId);
+    if (moved) {
+      return {
+        action: "escalate",
+        why:
+          `${bead.id} blocked as \`${KLASS}\`, but the prerequisite moved between the board read and ` +
+          `the write — anton drew no edge rather than park it behind work that is no longer there.`,
+        evidence: [moved],
+      };
+    }
+    await beads.link(repoPath, bead.id, blockerId, "blocks");
+    let label: string;
+    try {
+      label = await recordRepair(repoPath, bead, KLASS, attempted, now);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      const reverted = await revertPrereqEdge(repoPath, bead.id, blockerId).then(
+        () => true,
+        () => false,
+      );
+      return {
+        action: "escalate",
+        why:
+          `${bead.id} blocked as \`${KLASS}\` and anton could not record the repair, so it did not ` +
+          `keep the edge — an ordering nothing on the board explains is worse than none.`,
+        evidence: [
+          `the \`blocks\` edge ${bead.id} → ${blockerId} could not be stamped (${detail})`,
+          reverted
+            ? `the edge was taken back, so the board is as it was`
+            : `taking the edge back FAILED too — ${bead.id} is still recorded as blocked by ` +
+              `${blockerId}; remove it with \`bd dep remove ${bead.id} ${blockerId}\` if that ordering is wrong`,
+        ],
+      };
+    }
+    return { action: "parked", label, blockerId, attempted };
+  });
+}
+
+/**
+ * Why the prerequisite is no longer something this edge may point at, read fresh from bd at the
+ * write — or undefined when it still is.
+ *
+ * Held to {@link prereqUnusable}, the same bar the snapshot was held to, plus the two readings only
+ * a live read has: a bead that has since left the board, and a read that FAILED. The failure is a
+ * refusal rather than an assumption either way — anton parks a ticket behind an ordering it could
+ * check, and a `bd show` that broke is not a check.
+ */
+async function prereqMoved(repoPath: string, blockerId: string): Promise<string | undefined> {
+  let prereq: Bead | undefined;
   try {
-    label = await recordRepair(repoPath, bead, KLASS, attempted, now);
+    prereq = await beads.show(repoPath, blockerId);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
-    const reverted = await revertPrereqEdge(repoPath, bead.id, blockerId).then(
-      () => true,
-      () => false,
-    );
-    return {
-      action: "escalate",
-      why:
-        `${bead.id} blocked as \`${KLASS}\` and anton could not record the repair, so it did not ` +
-        `keep the edge — an ordering nothing on the board explains is worse than none.`,
-      evidence: [
-        `the \`blocks\` edge ${bead.id} → ${blockerId} could not be stamped (${detail})`,
-        reverted
-          ? `the edge was taken back, so the board is as it was`
-          : `taking the edge back FAILED too — ${bead.id} is still recorded as blocked by ` +
-            `${blockerId}; remove it with \`bd dep remove ${bead.id} ${blockerId}\` if that ordering is wrong`,
-      ],
-    };
+    return `\`${blockerId}\` could not be re-read before the edge was drawn (${detail})`;
   }
-  return { action: "parked", label, blockerId, attempted };
+  if (!prereq?.id) return `\`${blockerId}\` is no longer on the board`;
+  return prereqUnusable(prereq);
 }
 
 /**

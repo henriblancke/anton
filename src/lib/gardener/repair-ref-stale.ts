@@ -30,6 +30,7 @@
  * armed the class gets the rewrite WORKED OUT and recorded rather than written (R5.3).
  */
 import { beads } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { isContractHeading } from "../beads/contract";
 import { scanMarkdown, type ScannedLine } from "../beads/markdown";
 import { readPathHistory, type PathHistory } from "../git/ops";
@@ -212,14 +213,16 @@ async function inWorktree(worktreePath: string, path: string): Promise<boolean> 
 }
 
 /**
- * What git records happening to the file that USED to wear `path` — read from the incarnation living
- * there now.
+ * What git records removing whatever wore `path` before now — a delete, or a rename away.
  *
- * `--follow` walks BACKWARDS from a path's current life, so where the walk starts decides what it
- * can see: a removal BEFORE the current file took the name is reported (the walk keeps the name
- * across a plain re-add), and one before a RENAME brought the file in is not (the walk switches to
- * the pre-rename name at that commit). Both readings are what the callers below need — the second is
- * why a rename that legitimately replaced an already-deleted name stays followable.
+ * WHICH HISTORY IS READ is the caller's call, and the two readings answer different questions.
+ * `follow` walks BACKWARDS from the file living there now, switching to the old name at every rename
+ * it meets: a removal before the current file took the name is reported (the walk keeps the name
+ * across a plain re-add) and one before a RENAME brought the file in is not, which is why a rename
+ * that legitimately replaced an already-deleted name stays followable from its DESTINATION. Reading
+ * the pathname's own history instead ({@link readPathHistory}'s `follow: false`) reports every
+ * removal the NAME has seen, which is the only way to see a file renamed in over a name the bead's
+ * own file has vacated.
  *
  * `undefined` means the name has stood for one file since. An unreadable history is neither answer:
  * it is anton failing to check, and is carried back as `unreadable` rather than as "nothing
@@ -228,10 +231,11 @@ async function inWorktree(worktreePath: string, path: string): Promise<boolean> 
 async function removalSince(
   worktreePath: string,
   path: string,
+  options: { follow: boolean },
 ): Promise<{ how: string } | { unreadable: string } | undefined> {
   let history: PathHistory;
   try {
-    history = await readPathHistory(worktreePath, path);
+    history = await readPathHistory(worktreePath, path, options);
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);
     return { unreadable: `git history for \`${path}\` could not be read (${detail})` };
@@ -255,7 +259,9 @@ async function recreatedSinceRename(
   worktreePath: string,
   path: string,
 ): Promise<string | undefined> {
-  const removal = await removalSince(worktreePath, path);
+  // FOLLOWED, deliberately: the question is what happened to this file AFTER the rename put it here,
+  // and a removal the name saw before it arrived belongs to a file the bead never pointed at.
+  const removal = await removalSince(worktreePath, path, { follow: true });
   if (removal === undefined) return undefined;
   if ("unreadable" in removal) return removal.unreadable;
   return (
@@ -272,8 +278,17 @@ async function recreatedSinceRename(
  * Being in the tree is not on its own an answer. A bead written before `src/a.ts` was renamed to
  * `src/b.ts` cites a name an unrelated file was later committed at, and reading only the worktree
  * calls that pointer good — so a Context that ALSO cites something followable would be rewritten,
- * stamped repaired and retried with `src/a.ts` still aimed at the wrong file. `--follow` reports the
- * rename away, because a plain re-add does not switch the name the walk is following.
+ * stamped repaired and retried with `src/a.ts` still aimed at the wrong file.
+ *
+ * Read from the PATHNAME rather than followed from the file (PR #223 review). The replacement does
+ * not have to arrive as a plain re-add: `src/a.ts` deleted and an unrelated `src/x.ts` later renamed
+ * INTO `src/a.ts` is the same wrong pointer, and `--follow` cannot see it — the walk switches to
+ * `src/x.ts` at that incoming rename and reports the name as clean. What this asks is whether the
+ * NAME has stood for more than one file, and only the name's own history answers it.
+ *
+ * The cost is the conservatism this module is built on: a bead written AFTER such a recreation cites
+ * a path anton now refuses to vouch for, and the block goes to a human rather than being repaired
+ * around. That is the same trade the plain re-add case has always made.
  *
  * Returns the refusal's reason, or `undefined` when the citation still names its own file.
  */
@@ -281,7 +296,7 @@ async function recreatedAtCitedPath(
   worktreePath: string,
   path: string,
 ): Promise<string | undefined> {
-  const removal = await removalSince(worktreePath, path);
+  const removal = await removalSince(worktreePath, path, { follow: false });
   if (removal === undefined) return undefined;
   if ("unreadable" in removal) return removal.unreadable;
   return (
@@ -428,7 +443,8 @@ export interface RefStaleBead extends RepairedBead {
  * bead that is correct and unstamped — it can be repaired again, which is the survivable direction.
  * The reverse would leave a bead stamped for a repair that never landed and no second attempt
  * allowed. A stamp that FAILS rather than crashing is settled the same way, deliberately — see
- * {@link stampRewrite}.
+ * {@link stampRewrite}. The description write itself is serialized against every other write to this
+ * bead and refuses to land on prose that moved under it — see {@link writeRewrite}.
  */
 export async function repairRefStale(args: {
   /** Where bd writes go — the project's beads workspace. */
@@ -509,7 +525,56 @@ export async function repairRefStale(args: {
     return { action: "shadow", description: rewritten, rewrites, attempted };
   }
 
-  await beads.update(repoPath, bead.id, { description: rewritten }, bead.labels);
+  return writeRewrite({ repoPath, bead, description, rewritten, rewrites, attempted, now });
+}
+
+/**
+ * Write the rewritten description — under the bead's own write lock, and only onto the description
+ * the rewrite was computed from (PR #223 review).
+ *
+ * This repair replaces the WHOLE description, and it is worked out from a read taken before a string
+ * of git history reads. An operator editing the ticket in that window (`updateTicket`,
+ * ticket-detail.ts) takes this same lock around its own read-modify-write, so without it here the
+ * repair's stale copy would land afterwards and silently overwrite everything they typed.
+ *
+ * The lock is taken around the RE-READ and the write rather than around the history reads, so a save
+ * from the UI never queues behind git. That leaves the read this rewrite was computed from outside
+ * the lock, which is what the equality check settles: a description that moved since means the
+ * rewrite is computed against text nobody has any more, so anton writes nothing and the block goes
+ * to a human. Holding the lock across the whole repair would not save the fix either — the operator's
+ * own patch carries a description typed against the pre-repair text and would clobber it — so
+ * refusing is both the cheaper and the honest answer.
+ *
+ * Labels come from the re-read for the same reason: `beads.update` diffs the patch against the
+ * labels it is handed, and diffing against a stale set would take back label edits made in the
+ * window.
+ */
+async function writeRewrite(args: {
+  repoPath: string;
+  bead: RefStaleBead;
+  /** The description the rewrite was computed from — the compare half of the compare-and-set. */
+  description: string;
+  rewritten: string;
+  rewrites: PathRewrite[];
+  attempted: string;
+  now: number;
+}): Promise<RefStaleOutcome> {
+  const { repoPath, bead, description, rewritten, rewrites, attempted, now } = args;
+  const written = await withBeadWriteLock(repoPath, bead.id, async () => {
+    const current = await beads.show(repoPath, bead.id);
+    if ((current.description ?? "") !== description) return false;
+    await beads.update(repoPath, bead.id, { description: rewritten }, current.labels ?? []);
+    return true;
+  });
+  if (!written) {
+    return {
+      action: "escalate",
+      why:
+        `${bead.id} was rewritten while anton was checking its pointers, so the repair it worked out ` +
+        `no longer describes the bead — writing it would overwrite that edit, and this needs a human.`,
+      evidence: [`the repair anton did not write: ${attempted}`],
+    };
+  }
   const label = await stampRewrite(repoPath, bead, attempted, now);
   return { action: "repaired", ...(label ? { label } : {}), description: rewritten, rewrites, attempted };
 }

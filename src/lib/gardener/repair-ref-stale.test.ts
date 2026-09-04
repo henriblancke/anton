@@ -22,11 +22,27 @@ const updateMock =
 const tagMock = vi.fn<(repo: string, id: string, labels: string[]) => Promise<string>>(async () => "");
 const noteMock = vi.fn<(repo: string, id: string, text: string) => Promise<string>>(async () => "");
 
+/** A bead as bd holds it — what the re-read at the write finds. */
+interface BoardBead {
+  id: string;
+  description: string;
+  labels: string[];
+  notes?: string;
+}
+
+/**
+ * What `bd show` answers at the write, which is the compare half of the repair's compare-and-set.
+ * {@link bead} points it at the bead under test; a case that means to race a founder's edit moves it
+ * afterwards.
+ */
+let onBoard: BoardBead;
+const showMock = vi.fn(async () => onBoard as unknown as import("../beads/bd").Bead);
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
-    beads: { ...actual.beads, update: updateMock, tag: tagMock, note: noteMock },
+    beads: { ...actual.beads, show: showMock, update: updateMock, tag: tagMock, note: noteMock },
   };
 });
 
@@ -49,9 +65,14 @@ const suite = has("git") ? describe : describe.skip;
 const BEAD = "anton-a1b2";
 const T0 = Date.UTC(2026, 8, 3, 9, 0, 0);
 
-/** A bead as the board hands it back, carrying whatever description and stamps the case needs. */
-function bead(description: string, labels: string[] = [], notes?: string) {
-  return { id: BEAD, description, labels, ...(notes === undefined ? {} : { notes }) };
+/**
+ * A bead as the board hands it back, carrying whatever description and stamps the case needs — and
+ * recorded as what the re-read at the write finds, since nothing has edited it in between unless a
+ * case says so.
+ */
+function bead(description: string, labels: string[] = [], notes?: string): BoardBead {
+  onBoard = { id: BEAD, description, labels, ...(notes === undefined ? {} : { notes }) };
+  return onBoard;
 }
 
 /** The contract shape every case's bead is written in — Context is the only section under test. */
@@ -254,6 +275,8 @@ suite("ref-stale, against a real git history", () => {
     write("src/replacer.ts", "export const replacer = 'an eighth file long enough to pair on it';\n");
     write("src/legacy.ts", "export const legacy = 'the older file that used to wear that name';\n");
     write("src/reborn.ts", "export const reborn = 'a ninth file long enough to pair on similarity';\n");
+    write("src/usurped.ts", "export const usurped = 'a tenth file long enough to pair on it';\n");
+    write("src/intruder.ts", "export const intruder = 'the file that takes an old name over';\n");
     g(["add", "-A"]);
     g(["commit", "-qm", "c1"]);
 
@@ -319,6 +342,14 @@ suite("ref-stale, against a real git history", () => {
     write("src/reborn.ts", "export const impostor = 'a later file that took an old name over';\n");
     g(["add", "-A"]);
     g(["commit", "-qm", "c21"]);
+
+    // The same reincarnation arriving as a RENAME rather than a re-add, which is the one `--follow`
+    // cannot see (PR #223 review): followed from the file living at `src/usurped.ts` now, the walk
+    // switches to `src/intruder.ts` at c23 and never reaches the deletion at c22.
+    g(["rm", "-q", "src/usurped.ts"]);
+    g(["commit", "-qm", "c22"]);
+    g(["mv", "src/intruder.ts", "src/usurped.ts"]);
+    g(["commit", "-qm", "c23"]);
   });
 
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -327,6 +358,7 @@ suite("ref-stale, against a real git history", () => {
     updateMock.mockClear();
     tagMock.mockClear();
     noteMock.mockClear();
+    showMock.mockClear();
   });
 
   describe("verifyCitedPath", () => {
@@ -605,6 +637,48 @@ suite("ref-stale, against a real git history", () => {
       expect(note).not.toContain(repairFingerprint(BEAD, "ref-stale"));
     });
 
+    // The rewrite replaces the WHOLE description and is computed from a read taken before a string
+    // of git history reads. A founder saving an edit in that window would be silently overwritten,
+    // so the write compares before it sets (PR #223 review).
+    it("refuses to write a rewrite the bead moved out from under", async () => {
+      const stale = bead(contract("touches: `src/moved.ts` and `src/here.ts`."));
+      const edited = contract("touches: `src/moved.ts`. Rewritten by hand mid-repair.");
+      onBoard = { id: BEAD, description: edited, labels: [] };
+
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: stale,
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome.action).toBe("escalate");
+      expect(outcome.action === "escalate" && outcome.why).toContain("rewritten while");
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    // Labels are read at the write for the same reason the description is: `beads.update` diffs the
+    // patch against the labels it is handed, so a stale set would take back an edit made meanwhile.
+    it("writes against the labels the bead carries at the write, not the ones it was read with", async () => {
+      const stale = bead(contract("touches `src/moved.ts`."), []);
+      onBoard = { id: BEAD, description: stale.description, labels: ["domain:eng"] };
+
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: stale,
+        block: {},
+        now: T0,
+        autonomy: "apply",
+      });
+
+      expect(outcome.action).toBe("repaired");
+      expect(updateMock).toHaveBeenCalledWith(repo, BEAD, expect.anything(), ["domain:eng"]);
+    });
+
     it("armed at `shadow`: works the rewrite out and writes NOTHING (R5.3)", async () => {
       const description = contract("touches: `src/moved.ts` and `src/here.ts`.");
       const outcome = await repairRefStale({
@@ -724,6 +798,26 @@ suite("ref-stale, against a real git history", () => {
       expect(outcome.action).toBe("escalate");
       const evidence = outcome.action === "escalate" ? outcome.evidence.join(" ") : "";
       expect(evidence).toContain("src/reborn.ts");
+      expect(evidence).toContain("committed afterwards");
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(tagMock).not.toHaveBeenCalled();
+    });
+
+    // The replacement does not have to arrive as a re-add: an unrelated file renamed INTO the cited
+    // name is the same wrong pointer, and `--follow` reports that name as clean because the walk
+    // switches to the incoming file at the rename (PR #223 review).
+    it("escalates a present citation an unrelated file was RENAMED into", async () => {
+      const outcome = await repairRefStale({
+        repoPath: repo,
+        worktreePath: repo,
+        bead: bead(contract("touches `src/moved.ts` and `src/usurped.ts`.")),
+        block: { reason: "src/moved.ts is not in the worktree" },
+        now: T0,
+        autonomy: "apply",
+      });
+      expect(outcome.action).toBe("escalate");
+      const evidence = outcome.action === "escalate" ? outcome.evidence.join(" ") : "";
+      expect(evidence).toContain("src/usurped.ts");
       expect(evidence).toContain("committed afterwards");
       expect(updateMock).not.toHaveBeenCalled();
       expect(tagMock).not.toHaveBeenCalled();

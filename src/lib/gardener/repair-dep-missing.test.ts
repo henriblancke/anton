@@ -21,12 +21,23 @@ const tagMock = vi.fn<(repo: string, id: string, labels: string[]) => Promise<st
 const noteMock = vi.fn<(repo: string, id: string, text: string) => Promise<string>>(async () => "");
 const listMock = vi.fn<(repo: string, extra?: string[]) => Promise<unknown[]>>(async () => []);
 
+/**
+ * The prerequisite as bd holds it AT THE WRITE — what the re-read inside the locks finds. Defaults
+ * to the open bead the board snapshot resolved; a case that means to race another run moves it.
+ */
+let livePrereq: Bead | undefined;
+const showMock = vi.fn<(repo: string, id: string) => Promise<Bead>>(async (_repo, id) => {
+  if (livePrereq?.id === id) return livePrereq;
+  throw new Error(`bd show: no such issue: ${id}`);
+});
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
     ...actual,
     beads: {
       ...actual.beads,
+      show: showMock,
       link: linkMock,
       unlink: unlinkMock,
       tag: tagMock,
@@ -88,9 +99,13 @@ const alreadyRepaired = (attempted = `recorded \`${PREREQ}\` as a blocker`): Bea
     notes: repairNote(repairFingerprint(TARGET, "dep-missing"), attempted),
   } as Partial<Bead>);
 
+/** A gardener proposal's fingerprint label — `gardener:<kind>:<12 hex>`, the shape isProposalBead reads. */
+const PROPOSAL_LABEL = "gardener:duplicate:0123456789ab";
+
 beforeEach(() => {
-  for (const m of [linkMock, unlinkMock, tagMock, noteMock, listMock]) m.mockClear();
+  for (const m of [linkMock, unlinkMock, tagMock, noteMock, listMock, showMock]) m.mockClear();
   listMock.mockImplementation(async () => board());
+  livePrereq = bead(PREREQ);
 });
 
 describe("the prerequisite the agent named", () => {
@@ -169,6 +184,17 @@ describe("the prerequisite the agent named", () => {
     expect(resolvePrereq(indexBoard(closed), TARGET, `blocked on ${PREREQ}`)).toMatchObject({
       state: "unresolved",
       why: expect.stringContaining("already settled"),
+    });
+  });
+
+  // A proposal is open work, so `isOpenWork` waves it through — but it is an ask, and it closes
+  // when the founder decides rather than when anything lands (PR #223 review). `src/lib/pm/
+  // order-guards.ts` refuses the same pair for the same reason.
+  it("refuses a prerequisite that is a proposal rather than work", () => {
+    const asked = [bead(TARGET), bead(PREREQ, { labels: [PROPOSAL_LABEL] } as Partial<Bead>)];
+    expect(resolvePrereq(indexBoard(asked), TARGET, `blocked on ${PREREQ}`)).toMatchObject({
+      state: "unresolved",
+      why: expect.stringContaining("proposal, not work"),
     });
   });
 
@@ -385,6 +411,69 @@ describe("repairDepMissing", () => {
 
     expect(outcome).toMatchObject({ action: "parked", blockerId: PREREQ });
     expect(linkMock).toHaveBeenCalledWith(REPO, TARGET, PREREQ, "blocks");
+  });
+
+  // The board is a SNAPSHOT, and the one thing this edge cannot survive is the prerequisite landing
+  // between that read and the write: the caller parks the run behind it, and a blocker that has
+  // already completed leaves no event to resume the park (PR #223 review).
+  it("draws NO edge when the prerequisite settles between the board read and the write", async () => {
+    livePrereq = bead(PREREQ, { status: "closed" });
+
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+      board: board(),
+    });
+
+    expect(outcome).toMatchObject({
+      action: "escalate",
+      evidence: [expect.stringContaining("already settled")],
+    });
+    expect(linkMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("draws NO edge when the prerequisite becomes a proposal's bead at the write", async () => {
+    livePrereq = bead(PREREQ, { labels: [PROPOSAL_LABEL] } as Partial<Bead>);
+
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+      board: board(),
+    });
+
+    expect(outcome).toMatchObject({
+      action: "escalate",
+      evidence: [expect.stringContaining("proposal, not work")],
+    });
+    expect(linkMock).not.toHaveBeenCalled();
+  });
+
+  // A `bd show` that broke is not a check: anton parks a ticket behind an ordering it has verified,
+  // never behind one it failed to.
+  it("draws NO edge when the prerequisite cannot be re-read at the write", async () => {
+    livePrereq = undefined;
+
+    const outcome = await repairDepMissing({
+      repoPath: REPO,
+      bead: bead(TARGET),
+      block: block(`blocked on ${PREREQ}`),
+      now: T0,
+      autonomy: "apply",
+      board: board(),
+    });
+
+    expect(outcome).toMatchObject({
+      action: "escalate",
+      evidence: [expect.stringContaining("could not be re-read")],
+    });
+    expect(linkMock).not.toHaveBeenCalled();
   });
 
   it("KEEPS the edge when only the repair's note fails — the stamp is what the guard reads", async () => {

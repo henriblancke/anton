@@ -535,19 +535,29 @@ const DELETE_STATUS = /^D\t([^\t]+)$/;
  * ordered newest-first and bounded: a hot path removed a dozen times over is not the mechanical
  * rename this exists to resolve.
  *
+ * `follow: false` reads the PATHNAME's own history instead, and the difference is not cosmetic (PR
+ * #223 review). `--follow` walks backwards from whatever wears the name now, switching to the old
+ * name at every rename it meets — so a file renamed INTO this path hides everything that happened to
+ * the path before it arrived, including the deletion of the file that used to be there. A caller
+ * asking "did this name ever stand for a different file" has to ask it of the name, not of the file.
+ *
  * `core.quotePath=false` because git C-quotes a non-ASCII path by default (`"src/caf\303\251.ts"`),
  * and a quoted entry no longer splits on a literal tab — the parse would hand back a path that
  * exists nowhere. `:(literal)` for the same class of reason as {@link readFileAtRev}: a pathspec is
  * PARSED before it is matched, so a cited path that opens with pathspec magic would fail the
  * command outright rather than simply not resolving.
  */
-export async function readPathHistory(repoPath: string, path: string): Promise<PathHistory> {
+export async function readPathHistory(
+  repoPath: string,
+  path: string,
+  options: { follow?: boolean } = {},
+): Promise<PathHistory> {
   const removals = (
     await git(repoPath, [
       "-c",
       "core.quotePath=false",
       "log",
-      "--follow",
+      ...(options.follow === false ? [] : ["--follow"]),
       "--format=%H",
       "--diff-filter=D",
       "--",

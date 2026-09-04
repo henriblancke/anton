@@ -399,6 +399,30 @@ suite("readPathHistory (real git)", () => {
     });
   });
 
+  // `--follow` walks backwards from the file living at the path NOW, switching to the old name at
+  // every rename — so a file renamed INTO the path hides the deletion of what used to be there
+  // (PR #223 review). Reading the pathname's own history is the only way to see it.
+  it("sees a removal an incoming rename hides, only with the follow off", async () => {
+    writeFileSync(join(repo, "cited.ts"), "export const cited = 1;\n".repeat(20));
+    writeFileSync(join(repo, "other.ts"), "export const other = 2;\n".repeat(20));
+    commit("add cited.ts and other.ts");
+    g(["rm", "-q", "cited.ts"]);
+    commit("delete cited.ts");
+    g(["mv", "other.ts", "cited.ts"]);
+    commit("rename other.ts -> cited.ts");
+
+    expect(await readPathHistory(repo, "cited.ts")).toEqual({
+      renamedTo: [],
+      renames: 0,
+      deleted: false,
+    });
+    expect(await readPathHistory(repo, "cited.ts", { follow: false })).toEqual({
+      renamedTo: [],
+      renames: 0,
+      deleted: true,
+    });
+  });
+
   it("counts a path renamed to the same destination twice as two renames", async () => {
     // The destination is deleted and the source recreated in between, so both removals read
     // `R old.ts new.ts` — one destination, two unrelated incarnations of the same name.
