@@ -83,6 +83,11 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
   // so there the cards stay in Backlog, where they still appear exactly once. They are still PICKS
   // there, mark and all, so that layout carries the plan's generation itself rather than losing it
   // with the lane.
+  //
+  // In epic grouping the lane therefore never paints AT ALL — not for a frame (anton-wds3). That
+  // holds because `grouping` is the operator's own choice from the very first render: the server
+  // reads it from the cookie and hands it to `useBoardGrouping` as its server snapshot, so this
+  // never computes a lane the next commit throws away.
   const upNext = useMemo(
     () =>
       takeUpNext(columns, narrowed.standalone, grouping === "stage" ? board?.upNext : undefined),

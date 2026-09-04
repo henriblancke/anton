@@ -10,6 +10,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 
 import { STAGES, type Board, type Epic, type StandaloneItem, type Stage } from "@/lib/types";
 import { makeEpicRow } from "@/components/board/epic.fixture";
+import { boardGroupingCookieName } from "@/lib/board-grouping";
+import { UP_NEXT_LABEL } from "@/components/board/board-utils";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() } }));
 
@@ -167,7 +169,11 @@ function pressed(label: Grouping): boolean {
 }
 
 beforeEach(() => {
-  window.localStorage.clear();
+  // The preference is a cookie, so the server can render the chosen grouping itself (anton-wds3).
+  // Cleared between cases or a toggle in one suite decides the next one's first paint.
+  for (const slug of ["tmp", "other"]) {
+    document.cookie = `${boardGroupingCookieName(slug)}=; path=/; max-age=0`;
+  }
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => new Response(null, { status: 304 })) as unknown as typeof fetch,
@@ -300,6 +306,19 @@ describe("board grouping (anton-9pkk.4)", () => {
           .map((b) => b.hasAttribute("disabled")),
       ).toEqual([true, false]),
     );
+  });
+
+  it("opens on the grouping the server read, with no lane to un-paint (anton-wds3)", () => {
+    // The page reads the cookie and hands the board the SAME value the hook's server snapshot
+    // serves, so the first paint is already the swimlanes. Before this, every load of an
+    // Epic-grouped board painted stage columns with the Up Next lane and dropped both on mount.
+    document.cookie = `${boardGroupingCookieName("tmp")}=epic; path=/`;
+
+    render(<EpicBoard slug="tmp" initialBoard={picked()} initialGrouping="epic" />);
+
+    expect(pressed("Epic")).toBe(true);
+    expect(screen.getByRole("region", { name: `Epic ${OUTCOME.title}` })).toBeTruthy();
+    expect(screen.queryByLabelText(UP_NEXT_LABEL)).toBeNull();
   });
 
   it("remembers the grouping per project", () => {

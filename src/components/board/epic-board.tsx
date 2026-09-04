@@ -24,7 +24,7 @@ import { useBoardView } from "@/components/board/use-board-view";
 import { useUnwatchedParks } from "@/components/board/use-unwatched-parks";
 import { useUpNextReorder } from "@/components/board/use-up-next-reorder";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
-import type { BoardSort } from "@/components/board/board-utils";
+import type { BoardGrouping, BoardSort } from "@/components/board/board-utils";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 
 /**
@@ -37,6 +37,7 @@ import { TicketDialog } from "@/components/ticket/ticket-dialog";
 export function EpicBoard({
   slug,
   initialBoard,
+  initialGrouping = "stage",
   escalations = [],
   parks,
   breaker,
@@ -44,6 +45,12 @@ export function EpicBoard({
 }: {
   slug: string;
   initialBoard: Board | null;
+  /**
+   * The grouping cookie as the SERVER read it (anton-wds3) — the first paint's arrangement, and the
+   * hook's server snapshot, so a board stored on Epic never paints the stage layout it is about to
+   * replace. Defaults to `stage` for callers that render no cookie of their own.
+   */
+  initialGrouping?: BoardGrouping;
   /**
    * Open escalations, server-rendered by the page (anton-ue90.1). They are the only signal that
    * still gets a band above the board — hygiene, review trend, and housekeeping moved to the Health
@@ -72,7 +79,7 @@ export function EpicBoard({
 }) {
   const [sort, setSort] = useState<BoardSort>("default");
   // Stage columns or epic swimlanes — the same cards either way, remembered per project.
-  const [grouping, setGrouping] = useBoardGrouping(slug);
+  const [grouping, setGrouping] = useBoardGrouping(slug, initialGrouping);
   // The ticket whose detail dialog is open. Epics still deep-link to their own page; standalone
   // chips (an epic-of-one) and the operator queue's parented human tickets — neither of which the
   // epic page can act on — reuse the shared TicketDialog inline.
