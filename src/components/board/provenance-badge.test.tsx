@@ -55,6 +55,20 @@ describe("◈ PM", () => {
   });
 });
 
+describe("the badge's own shape", () => {
+  it("wraps its chip in a link that adds no line box of its own", () => {
+    // The meta row it sits in is a stretching flex row, and a flex item blockifies: a link left at
+    // its inherited metrics would be 24px tall (16px/1.5) around a 16px chip, set the flex line's
+    // cross size, and grow every chip beside it by 8px. A badged card would then wear taller chips
+    // than an unbadged one for no reason but having been badged (anton-ssks).
+    const html = render({ kind: "policy", ref: "types" });
+    const anchorClass = /<a[^>]*class="([^"]*)"/.exec(html)?.[1] ?? "";
+
+    expect(anchorClass).toContain("inline-flex");
+    expect(anchorClass).toContain("leading-none");
+  });
+});
+
 describe("a writer this build has no wording for", () => {
   it("renders nothing for the RESERVED repair kind — the grammar is extended, not forked", () => {
     expect(render({ kind: "repaired", ref: "anton-9" })).toBe("");

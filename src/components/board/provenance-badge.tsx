@@ -98,7 +98,12 @@ export function ProvenanceBadge({
       title={grammar.title(provenance)}
       onClick={(e) => e.stopPropagation()}
       className={cn(
-        "pointer-events-auto rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        // `inline-flex leading-none` is load-bearing, not cosmetic: a flex item blockifies, and a
+        // block anchor would establish a text line box at the INHERITED metrics (16px/1.5 = 24px)
+        // around a 16px chip. The meta row stretches, so that one anchor would set the flex line's
+        // cross size and every chip beside it would grow 8px — a card would wear taller chips for
+        // no reason but having been badged (anton-ssks).
+        "pointer-events-auto inline-flex leading-none rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
         className,
       )}
     >

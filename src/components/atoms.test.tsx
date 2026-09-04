@@ -81,6 +81,16 @@ describe("PrChip", () => {
     expect(html).toContain("#218");
   });
 
+  it("wraps the chip in a link that adds no line box of its own", () => {
+    // A bare anchor around a chip renders 24px tall (inherited 16px/1.5) around 16px of chip, and
+    // in a stretching row it drags every chip beside it up with it (anton-ssks). The wrapper must
+    // collapse to the chip: laid out as an inline flex box, at the chip's own metrics.
+    const html = renderToStaticMarkup(<PrChip href="https://x/1">#1</PrChip>);
+    const anchorClass = /<a[^>]*class="([^"]*)"/.exec(html)?.[1] ?? "";
+    expect(anchorClass).toContain("inline-flex");
+    expect(anchorClass).toContain("leading-none");
+  });
+
   it("tints a merged PR as done and drops the glyph where the label already says so", () => {
     const html = renderToStaticMarkup(
       <PrChip href="https://x/1" tone="done" icon={false}>
