@@ -145,6 +145,16 @@ export interface AliasRule {
    */
   exact?: boolean;
   /**
+   * What a specifier must END with, for the one pattern shape whose `*` is not at the end:
+   * `"@/*-models"` claims `@/foo-models` and nothing else (PR #190 review). Only ever set on a
+   * claim — no rule anton can MAP carries one — so it narrows what an unresolved rule swallows
+   * rather than changing where a resolved one points.
+   *
+   * The examples here put a `-` after the wildcard rather than the `/` such a pattern usually
+   * carries, because that spelling would close this comment.
+   */
+  suffix?: string;
+  /**
    * The pattern declares at least one target anton cannot resolve — a substitution that isn't at
    * the end of the target, or a target the config spells in a shape this reader doesn't model. The
    * rule still claims its specifiers so the path-tail fallback cannot answer in tsc's place, but
@@ -155,14 +165,25 @@ export interface AliasRule {
 }
 
 /**
- * What a rule's targets stand in for in `spec` — `""` for an exact rule, the tail behind the
- * prefix for a wildcard one — and undefined when the rule does not claim the specifier. An exact
- * rule claims the specifier it names and nothing beneath it: `@/ui/widgetry` is not the module
+ * What a rule's targets stand in for in `spec` — `""` for an exact rule, the text the pattern's `*`
+ * stood for otherwise — and undefined when the rule does not claim the specifier. An exact rule
+ * claims the specifier it names and nothing beneath it: `@/ui/widgetry` is not the module
  * `"@/ui/widget"` maps, and matching it by prefix would send the import somewhere tsc never does.
+ *
+ * A rule carrying a `suffix` bounds the match at both ends, which is what keeps a claim on
+ * `"@/*-models"` off every other `@/` specifier — those still belong to whatever rule maps them.
+ * The `*` is allowed to stand for nothing, since a claim that swallows one specifier too many only
+ * ever leaves a signal standing.
  */
 export function aliasRemainder(rule: AliasRule, spec: string): string | undefined {
   if (rule.exact) return spec === rule.prefix ? "" : undefined;
-  return spec.startsWith(rule.prefix) ? spec.slice(rule.prefix.length) : undefined;
+  if (!spec.startsWith(rule.prefix)) return undefined;
+  const rest = spec.slice(rule.prefix.length);
+  const suffix = rule.suffix ?? "";
+  if (suffix === "") return rest;
+  return rest.length >= suffix.length && rest.endsWith(suffix)
+    ? rest.slice(0, rest.length - suffix.length)
+    : undefined;
 }
 
 /**
@@ -304,9 +325,20 @@ function rulesOf(baseDir: string, options: TsConfig["compilerOptions"]): AliasRu
   const rules: AliasRule[] = [];
   for (const [pattern, declared] of Object.entries(paths)) {
     const exact = !pattern.includes("*");
-    // A `*` anywhere but at the end of the PATTERN is a shape this model cannot express even as a
-    // claim: no specifier can be matched against it by prefix.
-    if (!exact && !pattern.endsWith("/*")) continue;
+    // tsc accepts a single `*` ANYWHERE in a pattern — `"@/*/models": ["src/*/models"]` resolves
+    // `@/foo/models` — and this model can map only the ones ending in the wildcard. Dropping the
+    // rest leaves their specifiers to the path-tail fallback, which reads `@/ui/models` as an
+    // unrelated package's same-named module, inventing a caller and deleting a true finding
+    // (PR #190 review).
+    // So the pattern claims what it matches and maps nothing: prefix and suffix bound the claim to
+    // the specifiers tsc would send here, and nothing else loses its mapping. A pattern with more
+    // than one `*` is one tsc rejects outright, so it names no import and is skipped.
+    if (!exact && !pattern.endsWith("/*")) {
+      const parts = pattern.split("*");
+      if (parts.length !== 2) continue;
+      rules.push({ prefix: parts[0], suffix: parts[1], targets: [], unresolved: true });
+      continue;
+    }
     // `paths` comes off unvalidated JSON, so a target list that isn't one declares no target anton
     // can read — the rule claims and maps nothing rather than throwing out of the nightly pass.
     const targets = Array.isArray(declared) ? declared : [];

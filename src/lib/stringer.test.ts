@@ -1821,6 +1821,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/page.ts");
     });
 
+    // tsc takes a single `*` anywhere in a pattern, and the rule model maps only the ones ending
+    // `/*`. Dropping `"@/*/models"` leaves its specifier to the path-tail fallback, which binds an
+    // unrelated package's same-named module and deletes that module's genuine finding (PR #190
+    // review). The pattern claims what it matches and maps nothing, so no caller is invented.
+    it("does not read a tail behind a pattern whose wildcard is not at the end", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*/models": ["./src/*/models"] } },
+        }),
+        "packages/other/ui/models.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/ui/models';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/other/ui/models.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The import names whatever `src/ui/models` is, never the package module — so its finding
+      // stands rather than being erased by a caller the tail invented.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
     // A tail is read off an aliased specifier only where the repo publishes no mapping for it. A
     // monorepo holds more than one module whose path ends `ui/widget`, and `@/*` names exactly one
     // of them: matching the tail behind a mapping that already answered binds an unrelated
@@ -2820,6 +2844,31 @@ describe("scan", () => {
 
       expect(result.signals).toEqual([]);
       expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }, { symbol: "Panel" }]);
+    });
+
+    // `const { default: Renamed } = require('./interop')` selects the same `.default` the direct
+    // read does, and the caller writes the original symbol nowhere — so leaving the destructured
+    // spelling out reports a live default export dead (PR #190 review).
+    it("counts a destructured `default` require binding", async () => {
+      const repo = initRepo({
+        "src/lib/interop.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/lib/host.js":
+          "const { default: Card } = require('./interop');\nexports.host = () => Card();\n",
+        // Not vacuous: a destructured NAMED binding reaches no default, so this one still reports.
+        "src/lib/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+        "src/lib/stale.js":
+          "const { other: Kept } = require('./orphan');\nexports.stale = () => Kept();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/interop.ts", "Panel"),
+        unused("src/lib/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/host.js");
     });
 
     // A declaration broken after `export default` is still that module's default; the head has to

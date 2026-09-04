@@ -406,6 +406,26 @@ describe("readAliases", () => {
     expect(await readAliases(repo, "apps/app")).toEqual([]);
     expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
   });
+
+  // tsc takes a single `*` anywhere in a pattern, and this model can map only the ones ending
+  // `/*`. Dropping the rest hands their specifiers to the path-tail fallback, which binds an
+  // unrelated same-named module — so the pattern claims what it matches and maps nothing (PR #190
+  // review).
+  it("claims a pattern whose wildcard is not at the end instead of dropping it", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { "@/*/models": ["./src/*/models"], "@/ui/*": ["./src/ui/*"] },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", suffix: "/models", targets: [], unresolved: true },
+      { prefix: "@/ui/", targets: ["src/ui"] },
+    ]);
+  });
 });
 
 describe("claimingRules", () => {
@@ -433,6 +453,19 @@ describe("claimingRules", () => {
 
   it("claims nothing when no rule matches", () => {
     expect(claimingRules([broad, narrow], "react")).toEqual([]);
+  });
+
+  // The claim is bounded at both ends, so it swallows only what tsc would send to that pattern —
+  // every other `@/` specifier still belongs to the rule that maps it.
+  it("bounds a nonterminal-wildcard claim by its suffix", () => {
+    const claim = { prefix: "@/", suffix: "/models", targets: [], unresolved: true };
+
+    expect(aliasRemainder(claim, "@/foo/models")).toBe("foo");
+    expect(aliasRemainder(claim, "@/ui/widget")).toBeUndefined();
+    expect(aliasRemainder(claim, "@/models")).toBeUndefined();
+    expect(claimingRules([claim, { prefix: "@/ui/", targets: ["src/ui"] }], "@/ui/widget")).toEqual([
+      { rule: { prefix: "@/ui/", targets: ["src/ui"] }, rest: "widget" },
+    ]);
   });
 });
 

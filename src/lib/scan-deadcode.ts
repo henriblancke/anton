@@ -3209,6 +3209,21 @@ const DEFAULT_REQUIRE_INTEROP =
   /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\.default\b/gm;
 
 /**
+ * `const { default: Renamed } = require('./widget')` — the destructured spelling of the interop
+ * read above, and the exact mirror of `DEFAULT_LIST_IMPORT` on the CommonJS side (PR #190 review).
+ * It selects the same `.default` off the same module object, and the caller writes the original
+ * symbol nowhere, so leaving it out reports a live symbol dead.
+ *
+ * Only the renaming form exists to match: `const { default } = …` binds a reserved word and is a
+ * syntax error, so every valid destructured default carries a local name.
+ *
+ * The list body admits only what a destructuring pattern is spelled with, so it cannot reach past
+ * the statement's own `}` for a `default:` belonging to another one.
+ */
+const DEFAULT_REQUIRE_DESTRUCTURED =
+  /(?:^|[;{}])\s*(?:const|let|var)\s*\{[\w$,:\s]*?\bdefault\s*:\s*([A-Za-z_$][\w$]*)[\w$,:\s]*\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]/gm;
+
+/**
  * `import * as ns from './widget'` — a namespace import binds no default under its own name, which
  * is why `DEFAULT_IMPORT` leaves it out, but `ns.default()` reaches one (anton-23xe). The binding
  * recorded for it is `ns.default` rather than `ns`, because `ns` alone is also how every NAMED
@@ -3249,6 +3264,7 @@ function defaultBindingsOf(
   // holds the symbol, and the property beside it is a mention grep already reads.
   collect(DEFAULT_REQUIRE, (how) => how.cjs);
   collect(DEFAULT_REQUIRE_INTEROP, (how) => how.esm);
+  collect(DEFAULT_REQUIRE_DESTRUCTURED, (how) => how.esm);
   collect(DEFAULT_NAMESPACE_IMPORT, (how) => how.esm, (ns) => `${ns}.default`);
   return locals;
 }
