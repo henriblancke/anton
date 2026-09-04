@@ -76,7 +76,10 @@ export function PrLink({
       target="_blank"
       rel="noopener noreferrer"
       onClick={(e) => e.stopPropagation()}
-      className={cn("pointer-events-auto focus-visible:outline-none", className)}
+      // Collapsed to the chip it wraps for the same reason the provenance badge is: a link around a
+      // chip must add no line box of its own, or it renders 24px tall around 16px of chip and drags
+      // its row with it (anton-ssks).
+      className={cn("pointer-events-auto inline-flex leading-none focus-visible:outline-none", className)}
       title="Open pull request"
     >
       {children}
