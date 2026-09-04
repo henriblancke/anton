@@ -687,14 +687,6 @@ function blankAll(line: string): string {
 /** Shell scripts, whose heredoc payloads are data the interpreter never runs as code. */
 const SHELL_FILE = /\.(?:sh|bash|zsh)$/i;
 
-/**
- * Where a heredoc redirection begins — a `<<` that is neither the `<<<` of a here-string nor the
- * `<<=` of a shift-assign. The guard runs on BOTH sides, because without the lookbehind `<<<EOF`
- * still matches at its second `<` — the engine simply starts one character later — and a
- * here-string would then blank the rest of the script.
- */
-const HEREDOC_ARROW = /(?<!<)<<(-?)(?!<|=)/g;
-
 /** What ends a shell word: whitespace, a redirection, or an operator. */
 const WORD_END = /[\s;&|<>()]/;
 
@@ -744,8 +736,11 @@ function heredocWord(line: string, from: number): { word: string; quoted: boolea
  *
  * Reading a comment as code queues a delimiter no later line answers, which blanks the rest of the
  * script; reading code as a comment loses an opener and leaves its payload read as executable,
- * which invents a caller. Tracking the quotes is what keeps both out — a `#` inside a literal is
- * text, and one behind a backslash is the character itself.
+ * which invents a caller. Tracking the quotes is what keeps both out.
+ *
+ * The quoted text itself is left ALONE. A delimiter is quoted to make its payload literal, so
+ * blanking the spans here would erase the quotes on `<<'EOF'` and lose the opener entirely; the
+ * `<<` operator's own quoting is judged in `heredocOpeners`, where the two can be told apart.
  */
 function shellCode(line: string): string {
   let quote: string | undefined;
@@ -771,14 +766,33 @@ function shellCode(line: string): string {
 /** Every heredoc a line opens, in the order their payloads follow. */
 function heredocOpeners(line: string): { word: string; dash: boolean; quoted: boolean }[] {
   const found: { word: string; dash: boolean; quoted: boolean }[] = [];
-  HEREDOC_ARROW.lastIndex = 0;
-  for (let m = HEREDOC_ARROW.exec(line); m; m = HEREDOC_ARROW.exec(line)) {
-    let at = m.index + m[0].length;
-    while (line[at] === " " || line[at] === "\t") at += 1;
-    const { word, quoted, end } = heredocWord(line, at);
-    if (!word) continue;
-    found.push({ word, dash: m[1] === "-", quoted });
-    HEREDOC_ARROW.lastIndex = Math.max(end, HEREDOC_ARROW.lastIndex);
+  let quote: string | undefined;
+  for (let at = 0; at < line.length; at += 1) {
+    const char = line[at];
+    if (char === "\\" && quote !== "'") {
+      at += 1;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    // A `<<` inside a literal redirects nothing: `echo "example <<EOF here"` is one argument, and
+    // queueing `EOF` off it waits for a terminator no later line answers (anton-23xe).
+    if (char !== "<" || line[at + 1] !== "<") continue;
+    // `<<<` is a here-string and `<<=` a shift-assign; neither opens a payload.
+    if (line[at - 1] === "<" || line[at + 2] === "<" || line[at + 2] === "=") continue;
+    let cursor = at + 2;
+    const dash = line[cursor] === "-";
+    if (dash) cursor += 1;
+    while (line[cursor] === " " || line[cursor] === "\t") cursor += 1;
+    const { word, quoted, end } = heredocWord(line, cursor);
+    if (word) found.push({ word, dash, quoted });
+    at = Math.max(end - 1, at + 1);
   }
   return found;
 }
@@ -794,9 +808,9 @@ function heredocOpeners(line: string): { word: string; dash: boolean; quoted: bo
  * value, not a call — so neither opens a span. Nesting is counted, because `$(a $(b))` closes on
  * its second `)` and stopping at the first would blank the tail of the outer command.
  */
-function unmaskedSubstitutions(line: string): string {
+function unmaskedSubstitutions(line: string, from = 0): { text: string; depth: number } {
   const out = blankAll(line).split("");
-  let depth = 0;
+  let depth = from;
   for (let at = 0; at < line.length; at += 1) {
     if (line[at] === "\\") {
       if (depth > 0) out[at] = line[at];
@@ -825,7 +839,7 @@ function unmaskedSubstitutions(line: string): string {
     }
     out[at] = line[at];
   }
-  return out.join("");
+  return { text: out.join(""), depth };
 }
 
 /**
@@ -844,6 +858,10 @@ function unmaskedSubstitutions(line: string): string {
  */
 function maskHeredocs(text: string): string {
   const pending: { word: string; dash: boolean; quoted: boolean }[] = [];
+  // How deep the payload's command substitution stands as the next line begins. A `$(` opened on
+  // one payload line closes on a later one — `$(\n  Widget\n)` is one command — so the depth is
+  // carried rather than reset per line, which would blank the call inside it (anton-23xe).
+  let depth = 0;
   return text
     .split("\n")
     .map((line) => {
@@ -852,16 +870,22 @@ function maskHeredocs(text: string): string {
         const terminator = open.dash ? line.replace(/^\t+/, "") : line;
         if (terminator === open.word) {
           pending.shift();
+          depth = 0;
           return blankAll(line);
         }
         // A quoted delimiter makes the whole payload literal; a bare one leaves its command
         // substitutions running, and those are code however the rest of the payload reads.
-        return open.quoted ? blankAll(line) : unmaskedSubstitutions(line);
+        if (open.quoted) return blankAll(line);
+        const masked = unmaskedSubstitutions(line, depth);
+        depth = masked.depth;
+        return masked.text;
       }
       // Openers are read off the CODE part only. This pass runs before the comment grammar, so a
       // `# cat <<EOF` shown in a comment would otherwise queue a terminator that never arrives and
       // blank every line below it.
-      pending.push(...heredocOpeners(shellCode(line)));
+      const opened = heredocOpeners(shellCode(line));
+      if (opened.length > 0) depth = 0;
+      pending.push(...opened);
       return line;
     })
     .join("\n");
@@ -2962,7 +2986,10 @@ async function aliasesGoverning(
  * both answer — as they already would have. A pattern with no `*` claims its whole specifier, so
  * it is the most specific rule any import can match.
  */
-function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
+function aliasedModules(
+  aliases: readonly AliasRule[],
+  spec: string,
+): { mapped: string[]; claimed: boolean } {
   let claiming: { rule: AliasRule; rest: string }[] = [];
   let longest = -1;
   for (const rule of aliases) {
@@ -2975,9 +3002,16 @@ function aliasedModules(aliases: readonly AliasRule[], spec: string): string[] {
     claiming.push({ rule, rest });
   }
   const mapped: string[] = [];
-  for (const { rule, rest } of claiming)
+  for (const { rule, rest } of claiming) {
+    // More than one target is an ORDERED fallback list, and tsc resolves the first of them that
+    // exists on disk. This pass reads no disk, so it cannot say which — and answering with all of
+    // them credits a caller of `first/widget` to `fallback/widget` too, inventing a caller and
+    // deleting a true finding (anton-23xe). Claiming without mapping leaves the signal standing,
+    // which is the side this filter errs on. Resolving them in order is anton-5tjw.
+    if (rule.targets.length > 1) return { mapped: [], claimed: claiming.length > 0 };
     for (const target of rule.targets) mapped.push(posix(normalize(join(target, rest))));
-  return mapped;
+  }
+  return { mapped, claimed: claiming.length > 0 };
 }
 
 /**
@@ -3013,8 +3047,11 @@ function specifierNames(
   if (spec.startsWith("./") || spec.startsWith("../"))
     return names(withoutModuleExtension(posix(normalize(join(dirname(importer), spec)))));
   const path = posix(spec);
-  const mapped = aliasedModules(aliases, path);
+  const { mapped, claimed } = aliasedModules(aliases, path);
   if (mapped.length > 0) return mapped.some((to) => names(withoutModuleExtension(to)));
+  // A rule claimed the prefix but could not be resolved. The tail must not answer in its place:
+  // that is the match which reads `@/ui/widget` as an unrelated package's same-named module.
+  if (claimed) return false;
   if (!MODULE_ALIAS.test(path)) return false;
   const tail = withoutModuleExtension(path.replace(MODULE_ALIAS, ""));
   if (!tail.includes("/")) return false;
@@ -3137,6 +3174,15 @@ const DEFAULT_REQUIRE =
 const DEFAULT_REQUIRE_INTEROP =
   /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\.default\b/gm;
 
+/**
+ * `import * as ns from './widget'` — a namespace import binds no default under its own name, which
+ * is why `DEFAULT_IMPORT` leaves it out, but `ns.default()` reaches one (anton-23xe). The binding
+ * recorded for it is `ns.default` rather than `ns`, because `ns` alone is also how every NAMED
+ * export is reached: crediting a file for writing `ns.somethingElse()` would invent a caller.
+ */
+const DEFAULT_NAMESPACE_IMPORT =
+  /(?:^|[;{}])\s*import\s+(?:type\s+)?\*\s+as\s+([A-Za-z_$][\w$]*)\s*\bfrom\s*['"]([^'"]+)['"]/gm;
+
 /** The local names `program` binds the default export of one of `modules` to. */
 function defaultBindingsOf(
   program: readonly string[],
@@ -3149,13 +3195,17 @@ function defaultBindingsOf(
   // symbol dead.
   const text = program.join("\n");
   const locals: string[] = [];
-  const collect = (pattern: RegExp, reachable: (how: DefaultExport) => boolean): void => {
+  const collect = (
+    pattern: RegExp,
+    reachable: (how: DefaultExport) => boolean,
+    bind: (local: string) => string = (local) => local,
+  ): void => {
     pattern.lastIndex = 0;
     for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
       const [, local, spec] = match;
       if (local === undefined || spec === undefined) continue;
       for (const [declared, how] of modules)
-        if (reachable(how) && specifierNames(file, spec, declared, aliases)) locals.push(local);
+        if (reachable(how) && specifierNames(file, spec, declared, aliases)) locals.push(bind(local));
     }
   };
   collect(DEFAULT_IMPORT, () => true);
@@ -3165,6 +3215,7 @@ function defaultBindingsOf(
   // holds the symbol, and the property beside it is a mention grep already reads.
   collect(DEFAULT_REQUIRE, (how) => how.cjs);
   collect(DEFAULT_REQUIRE_INTEROP, (how) => how.esm);
+  collect(DEFAULT_NAMESPACE_IMPORT, (how) => how.esm, (ns) => `${ns}.default`);
   return locals;
 }
 

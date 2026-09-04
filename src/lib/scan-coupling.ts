@@ -367,7 +367,11 @@ export async function readDirAliases(repoPath: string, dir = "."): Promise<DirAl
     if (!config) continue;
     governed = true;
     const rules = await aliasesFrom(repoPath, join(dir, name), config, EXTENDS_DEPTH);
-    if (rules.length > 0) return { rules, governed };
+    // The FIRST parseable config governs, whether or not it published a mapping (anton-23xe).
+    // Falling through to a sibling reads a jsconfig's `paths` for a directory tsc resolves through
+    // its tsconfig — which ignores jsconfig entirely when one is present — so `@/widget` would take
+    // a mapping the compiler never applies, inventing a caller and deleting a true finding.
+    return { rules, governed };
   }
   return { rules: [], governed };
 }

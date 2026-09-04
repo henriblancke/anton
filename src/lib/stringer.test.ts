@@ -2606,6 +2606,119 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("scripts/quoted.sh");
     });
 
+    // A heredoc opener cannot be written inside a literal, so quoted text must not queue one:
+    // `echo "example <<EOF here"` names no redirection, and waiting for a terminator that never
+    // arrives blanks the rest of the script.
+    it("does not open a heredoc from a marker inside shell quotes", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/quotedmarker.sh": "echo \"example <<EOF here\"\nneverCalled\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/quotedmarker.sh");
+    });
+
+    // A `$(` opened on one payload line closes on a later one — `$(\n  neverCalled\n)` is one
+    // command — so the substitution depth is carried rather than reset per line.
+    it("keeps a command substitution open across heredoc payload lines", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/multiline.sh": "cat <<EOF > a.ts\necho $(\n  neverCalled\n)\nEOF\n",
+        // Not vacuous: text outside the substitution is still copied payload, not code.
+        "scripts/plain.sh": "cat <<EOF > b.ts\nneverCalled\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/multiline.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/plain.sh");
+    });
+
+    // A namespace import binds no default under its own name, but `ns.default()` reaches one. The
+    // binding recorded is `ns.default`, never `ns` — `ns` alone is how every NAMED export is
+    // reached, and crediting a file for `ns.somethingElse()` would invent a caller.
+    it("counts a namespace import whose `.default` member is called", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/lib/page.ts": "import * as ns from './widget';\nexport const page = () => ns.default();\n",
+        // Not vacuous: a namespace import that touches only a NAMED export is no caller of the
+        // default, so this module's signal stands.
+        "src/lib/panel.ts":
+          "export const named = 1;\nexport default function Panel() {\n  return null;\n}\n",
+        "src/lib/host.ts": "import * as other from './panel';\nexport const host = () => other.named;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget"),
+        unused("src/lib/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Panel" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // An ordered fallback list is resolved by tsc against disk, first existing target wins. This
+    // pass reads no disk, so it maps neither — and the path tail must not answer in their place.
+    it("credits no module for a `paths` rule with ordered fallback targets", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./first/*", "./fallback/*"] } },
+        }),
+        "first/widget.ts": "export default function First() {\n  return null;\n}\n",
+        "fallback/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("fallback/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // tsc resolves `@/widget` to first/widget.ts, so fallback/widget.ts has no caller and its
+      // finding must survive.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // tsc ignores jsconfig.json entirely when a tsconfig is present, so the FIRST parseable config
+    // governs whether or not it published a mapping. Falling through to the sibling would resolve
+    // `@/widget` through a mapping the compiler never applies.
+    it("lets a paths-less tsconfig govern rather than falling through to jsconfig", async () => {
+      const repo = initRepo({
+        "apps/web/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+        "apps/web/jsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "apps/web/src/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("apps/web/src/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The tsconfig governs and publishes no mapping, so `@/widget` resolves to nothing here and
+      // the finding stands rather than being dropped through jsconfig's rule.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
     // `module.exports = function Widget() {}` puts a keyword where the name usually stands, and
     // `require('./widget').default` is how CommonJS reaches an ESM default. Neither caller writes
     // the original symbol, so missing either reports a live function dead.
