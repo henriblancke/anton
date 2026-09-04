@@ -360,6 +360,18 @@ export interface UpNextEntry {
   createdAt: string;
 }
 
+/**
+ * Why there is no ranking to draw, when the reason is one the operator can act on (anton-w579).
+ *
+ * Three distinct nothings, and the lane must say which — "no plan" and "the pass is off" and "the
+ * board is empty of claimable work" ask for three different things from the person reading it.
+ *
+ *   • `disarmed` — the `board-picker` schedule is off here, so no pass ranks anything.
+ *   • `proposes-only` — the pass runs and records a ranking, but the level promises nothing offered.
+ *   • `no-claimable-work` — the pass ran against this board and found nothing it may start.
+ */
+export type UpNextAbsence = "disarmed" | "proposes-only" | "no-claimable-work";
+
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
  * SyncStatus there — kept as a separate declaration so client components import types without the
  * server-only bd module. */
@@ -444,6 +456,14 @@ export interface Board {
    * never shown. Absent exactly when the lane is.
    */
   upNextPlanId?: string;
+  /**
+   * WHICH absence it is, when {@link upNext} is missing for a reason the operator can clear
+   * (anton-w579). Absent alongside a lane that IS drawn, and absent for the one withheld state
+   * nothing on this screen clears — a plan the board has moved past, which the next pass fixes on
+   * its own. The lane keeps its column for a named absence: "Up Next" over nothing reads as "anton
+   * has nothing to start", but so does an empty space where the lane was.
+   */
+  upNextAbsence?: UpNextAbsence;
   /** Sync health for this project's beads workspace. */
   sync: SyncStatusView;
   /**

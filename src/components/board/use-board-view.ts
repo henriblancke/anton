@@ -3,7 +3,14 @@
 import { useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { STAGES, type Board, type Epic, type Stage, type StandaloneItem } from "@/lib/types";
+import {
+  STAGES,
+  type Board,
+  type Epic,
+  type Stage,
+  type StandaloneItem,
+  type UpNextAbsence,
+} from "@/lib/types";
 import {
   boardFiltersFromSearchParams,
   emptyStageMap,
@@ -37,6 +44,12 @@ export interface BoardView {
   upNextPlan: string[];
   /** The generation the picks on screen were drawn from, so a verdict names the plan it answers. */
   planId?: string;
+  /**
+   * WHICH absence the lane is showing, when the server named one (anton-w579). Carried through
+   * untouched: the states it names are about the PASS and the board, and no filter on this screen
+   * clears any of them.
+   */
+  upNextAbsence?: UpNextAbsence;
 }
 
 /**
@@ -104,5 +117,6 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
     upNext: upNext.cards,
     upNextPlan,
     ...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId }),
+    ...(board?.upNextAbsence === undefined ? {} : { upNextAbsence: board.upNextAbsence }),
   };
 }

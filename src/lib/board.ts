@@ -31,7 +31,7 @@ import {
 } from "./picker-veto";
 import { reviewTrajectory } from "./review-trajectory";
 import { isScheduleEnabled } from "./schedules";
-import { upNextEntries, upNextVersion } from "./up-next";
+import { upNextAbsence, upNextEntries, upNextVersion, type UpNextStance } from "./up-next";
 import {
   latestScanHealth,
   latestScanHealthVersion,
@@ -107,7 +107,7 @@ export async function getBoardVersion(project: Project): Promise<string> {
     // upNextVersion, which is what makes a level change land on the next poll: moving between
     // `propose` and `shadow` touches neither a bead, nor the plan row, nor the policy.
     provenanceVersion(picker.offers ? plan : undefined, picker.policy),
-    upNextVersion(picker.offers),
+    upNextVersion(picker),
     project.repoPath,
   );
 }
@@ -206,7 +206,7 @@ async function readPickerPlan(project: Project): Promise<BoardPickerPlan | undef
  * Fail-soft to "offering" on each half independently — losing a read must not silently hide a lane
  * that is running, and the plan's own freshness fence still governs what it may claim.
  */
-interface PickerStance {
+interface PickerStance extends UpNextStance {
   /** The policy armed on this machine, or undefined when the project has armed none. */
   policy?: Policy;
   /** The pass is running AND its level puts picks in front of the operator. */
@@ -221,11 +221,21 @@ async function readPickerStance(project: Project): Promise<PickerStance> {
     }),
     readPickerLevel(project),
   ]);
-  return { ...level, offers: scheduled && level.offers };
+  // The two halves are kept apart, not collapsed into `offers`: a withheld lane has to say WHICH
+  // absence it is (anton-w579), and "the schedule is off" and "the level only proposes" are cleared
+  // in two different places.
+  const { offers: levelOffers, ...rest } = level;
+  return { ...rest, scheduled, levelOffers, offers: scheduled && levelOffers };
+}
+
+/** What settings alone say: the armed policy, and whether the resolved autonomy offers its picks. */
+interface PickerLevel {
+  policy?: Policy;
+  offers: boolean;
 }
 
 /** The settings half of {@link readPickerStance} — the armed policy and the resolved autonomy. */
-async function readPickerLevel(project: Project): Promise<PickerStance> {
+async function readPickerLevel(project: Project): Promise<PickerLevel> {
   try {
     const db = getDb();
     // Two independent reads, so one round trip rather than two on every board view.
@@ -453,6 +463,10 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // subtracted for the same reason: a target vetoed since the pass ran is not up next.
   const currentPlan = planIsStale ? undefined : armedPlan;
   const upNext = upNextEntries(allBeads, currentPlan, deferrals);
+  // Which nothing this is (anton-w579). A withheld lane that simply vanishes reads as "anton has
+  // nothing to start" on a board where the pass is switched off, only proposing, or looking at
+  // nothing it may claim — three states with three different clearing conditions.
+  const absence = upNextAbsence(picker, upNext);
   // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
   // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
   const marksFor = (stage: Stage, id: string): BeadProvenance[] | undefined =>
@@ -491,7 +505,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
       scanHealthVersion(scan),
       deferralVersion(deferrals),
       provenanceVersion(armedPlan, picker.policy),
-      upNextVersion(picker.offers),
+      upNextVersion(picker),
       project.repoPath,
     ),
     columns,
@@ -503,6 +517,8 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     // The generation rides with the lane it projects: a card's veto names the decision it was drawn
     // from, so a tab a later pass has overtaken records no pick rather than a stranger's.
     ...(upNext?.length && currentPlan ? { upNext, upNextPlanId: currentPlan.planId } : {}),
+    // Rides beside the lane it replaces, never with it: named only while there is no ranking drawn.
+    ...(upNext?.length && currentPlan ? {} : absence ? { upNextAbsence: absence } : {}),
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),

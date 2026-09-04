@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Bead } from "@/lib/beads/types";
 import type { BoardPickerPlan, PickerPlanEntry } from "@/lib/board-picker-plan";
-import { upNextEntries, upNextVersion } from "@/lib/up-next";
+import { upNextAbsence, upNextEntries, upNextVersion } from "@/lib/up-next";
 
 const AGE = "2026-08-01T00:00:00.000Z";
 
@@ -134,7 +134,51 @@ describe("upNextEntries", () => {
 });
 
 describe("upNextVersion", () => {
+  const on = { scheduled: true, levelOffers: true };
+
   it("moves when the picker is disarmed, which changes no plan row at all", () => {
-    expect(upNextVersion(true)).not.toBe(upNextVersion(false));
+    expect(upNextVersion(on)).not.toBe(upNextVersion({ ...on, scheduled: false }));
+  });
+
+  it("tells the two off states apart, so a poll cannot 304 onto the wrong absence", () => {
+    // Disarming a `propose` project moves no bead, no plan row and no policy — only this token.
+    expect(upNextVersion({ scheduled: false, levelOffers: true })).not.toBe(
+      upNextVersion({ scheduled: true, levelOffers: false }),
+    );
+  });
+});
+
+/**
+ * Which absence the lane names (anton-w579). Only the ones an operator can clear get a name: the
+ * lane holds its column for those and says what would fill it, while a ranking simply withheld stays
+ * out of the layout rather than telling the operator to act on a wait.
+ */
+describe("upNextAbsence", () => {
+  const armed = { scheduled: true, levelOffers: true };
+
+  it("names a disarmed pass ahead of the level, since nothing runs to reach it", () => {
+    expect(upNextAbsence({ scheduled: false, levelOffers: false }, undefined)).toBe("disarmed");
+    expect(upNextAbsence({ scheduled: false, levelOffers: true }, undefined)).toBe("disarmed");
+  });
+
+  it("names the level when the pass runs but promises nothing offered", () => {
+    expect(upNextAbsence({ scheduled: true, levelOffers: false }, undefined)).toBe("proposes-only");
+  });
+
+  it("names an empty ranking as a board with nothing claimable on it", () => {
+    expect(upNextAbsence(armed, [])).toBe("no-claimable-work");
+  });
+
+  it("names nothing for a ranking that was withheld rather than empty", () => {
+    // No plan recorded, or one the board has moved past: the next pass clears it, not the operator.
+    expect(upNextAbsence(armed, undefined)).toBeUndefined();
+  });
+
+  it("names nothing while there is a lane to draw", () => {
+    expect(
+      upNextAbsence(armed, [
+        { beadId: "anton-1", rank: 1, type: "feature", unblocks: 0, createdAt: AGE },
+      ]),
+    ).toBeUndefined();
   });
 });

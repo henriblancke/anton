@@ -1364,6 +1364,66 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
     expect((await getBoard(project)).upNext).toBeUndefined();
   });
 
+  /**
+   * Which nothing it is (anton-w579). A lane that simply vanishes reads as "anton has nothing to
+   * start" whichever of these three states the project is actually in — so the board names the ones
+   * an operator can clear, and stays silent about the one only the next pass clears.
+   */
+  describe("naming the absence the lane leaves behind (anton-w579)", () => {
+    it("names a disarmed pass", async () => {
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = planOver(board, "f-1");
+      pickerArmed = false;
+
+      expect((await getBoard(project)).upNextAbsence).toBe("disarmed");
+    });
+
+    it("names the level ahead of the plan at propose, where the pass runs and offers nothing", async () => {
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = planOver(board, "f-1");
+      projectSettings = { pickerAutonomy: "propose" };
+
+      expect((await getBoard(project)).upNextAbsence).toBe("proposes-only");
+    });
+
+    it("names a pass that ran and found nothing it may claim", async () => {
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      // A plan recorded against THIS board with no entries in it: the picker looked and admitted
+      // nothing, which is a fact about the board rather than about the pass.
+      pickerPlan = { ...planOver(board, "f-1"), entries: [] };
+
+      expect((await getBoard(project)).upNextAbsence).toBe("no-claimable-work");
+    });
+
+    it("names nothing when the board has merely moved past the plan", async () => {
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = {
+        ...planOver(board, "f-1"),
+        stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
+      };
+
+      const served = await getBoard(project);
+      expect(served.upNext).toBeUndefined();
+      // Nothing the operator does clears a stale plan — the next pass does. A named state here
+      // would ask them to act on a wait.
+      expect(served.upNextAbsence).toBeUndefined();
+    });
+
+    it("names nothing while a lane is drawn", async () => {
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = planOver(board, "f-1");
+
+      const served = await getBoard(project);
+      expect(served.upNext).toHaveLength(1);
+      expect(served.upNextAbsence).toBeUndefined();
+    });
+  });
+
   it("withholds the lane at propose, where nothing is offered (R3.5)", async () => {
     // The pass still ranks and records at `propose` — the plan row is there — but the level promises
     // a ranking and nothing else. A lane drawn from it would offer `[Release]` and vetoes, and RECORD

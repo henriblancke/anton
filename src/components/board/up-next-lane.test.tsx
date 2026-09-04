@@ -18,6 +18,7 @@ import {
   type Epic,
   type Stage,
   type StandaloneItem,
+  type UpNextAbsence,
   type UpNextEntry,
 } from "@/lib/types";
 
@@ -296,6 +297,80 @@ describe("Up Next lane (anton-t9m4)", () => {
 
     expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull();
     expect(laneOf("anton-run")).toBe("Implementing");
+  });
+});
+
+/**
+ * A withheld lane that names its absence (anton-w579).
+ *
+ * The rule the suite above pins — absent, never empty — is about the lane the server could not
+ * draw. These are the states where it CAN say why: the pass is off, the level only proposes, or the
+ * board holds nothing claimable. Each keeps the section in the layout and each says, in its own
+ * words, what would clear it — the standing rule for every stopped state on this board (anton-5c8h).
+ */
+describe("a named absence in place of the lane (anton-w579)", () => {
+  const withAbsence = (absence: UpNextAbsence): Board => ({ ...fixture(), upNextAbsence: absence });
+
+  /** The absence panel's text, header included — what the operator actually reads in the column. */
+  function absenceLane(): HTMLElement {
+    return screen.getByRole("region", { name: "Up Next" });
+  }
+
+  it("holds its column between Backlog and Implementing instead of vanishing", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("disarmed")} />);
+
+    expect(laneOrder()).toEqual(["Backlog", "Up Next", "Implementing", "In-review", "Done"]);
+    // No ranking, so every backlog target is still exactly where Backlog left it.
+    expect(laneOf("anton-pick1")).toBe("Backlog");
+    expect(cardCount("anton-pick1")).toBe(1);
+  });
+
+  it("names a disarmed picker, and that turning it back on fills the lane", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("disarmed")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("board-picker is switched off");
+    expect(lane.textContent).toContain("Turn board-picker back on and the next pass fills this lane.");
+    expect(lane.querySelector('a[href="/projects/tmp/settings#automation"]')).toBeTruthy();
+  });
+
+  it("names a level that only proposes, and that shadow is what offers the picks", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("proposes-only")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("propose offers nothing");
+    expect(lane.textContent).toContain(
+      "Raise picker autonomy to shadow and its picks appear here to release or veto.",
+    );
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')).toBeTruthy();
+  });
+
+  it("names a board with nothing claimable, and what would put something in the lane", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("no-claimable-work")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("nothing it may claim");
+    expect(lane.textContent).toContain(
+      "Approve a target the policy admits — or release one you set aside — and the next pass ranks it here.",
+    );
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')).toBeTruthy();
+  });
+
+  it("says which nothing it is rather than counting zero picks", () => {
+    // A `0` in the count's place is the one reading this must never give: two of the three states
+    // say nothing at all about how much work the board holds.
+    for (const absence of ["disarmed", "proposes-only", "no-claimable-work"] as const) {
+      cleanup();
+      render(<EpicBoard slug="tmp" initialBoard={withAbsence(absence)} />);
+      expect(absenceLane().textContent).not.toMatch(/(^|\s)0(\s|$)/);
+    }
+  });
+
+  it("keeps the lane absent when the server named no absence", () => {
+    // A plan the board has moved past is not a state the operator clears — naming it would ask them
+    // to act on a wait. It stays out of the layout, exactly as before.
+    render(<EpicBoard slug="tmp" initialBoard={fixture()} />);
+    expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull();
   });
 });
 

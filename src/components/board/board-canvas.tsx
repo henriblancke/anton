@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import { BoardColumn } from "@/components/board/board-column";
 import { EpicLaneView, LaneStageStrip } from "@/components/board/epic-lane";
 import { PlanGenerationProvider } from "@/components/board/pick-decision";
-import { UpNextLane } from "@/components/board/up-next-lane";
+import { UpNextAbsenceLane, UpNextLane } from "@/components/board/up-next-lane";
 import type { EpicLane } from "@/components/board/board-utils";
 import type { BoardView } from "@/components/board/use-board-view";
 
@@ -42,6 +42,7 @@ export function BoardCanvas({
       upNext={view.upNext}
       upNextPlan={view.upNextPlan}
       {...(view.planId === undefined ? {} : { planId: view.planId })}
+      {...(view.upNextAbsence === undefined ? {} : { upNextAbsence: view.upNextAbsence })}
       reordering={reordering}
       {...cards}
     />
@@ -55,7 +56,10 @@ export function BoardCanvas({
  *
  * An empty lane is worse than none: with no plan recorded — or a picker the operator disarmed —
  * "Up Next" with nothing under it reads as "anton has nothing to start" rather than "no pass is
- * running here" (R3.4).
+ * running here" (R3.4). Which is why the lane holds its column for a NAMED absence (anton-w579) and
+ * only for a named one: the header then says which nothing it is and what clears it, instead of
+ * leaving the operator to read a bare count of zero — or a missing column — as a verdict on their
+ * board.
  */
 function BoardStageGrid({
   columns,
@@ -63,6 +67,7 @@ function BoardStageGrid({
   upNext,
   upNextPlan,
   planId,
+  upNextAbsence,
   reordering,
   onVetoed,
   ...cards
@@ -70,14 +75,17 @@ function BoardStageGrid({
   columns: Record<Stage, Epic[]>;
   standalone: Record<Stage, StandaloneItem[]>;
   reordering: boolean;
-} & Pick<BoardView, "upNext" | "upNextPlan" | "planId"> &
+} & Pick<BoardView, "upNext" | "upNextPlan" | "planId" | "upNextAbsence"> &
   CardContext) {
   const hasUpNext = upNext.length > 0;
+  // The section keeps its column while it has something to say — a ranking, or an absence it can
+  // name. Only the unnamed absence (a plan the board has moved past) drops back to four columns.
+  const showsLane = hasUpNext || upNextAbsence !== undefined;
   return (
     <div
       className={cn(
         "grid min-h-0 flex-1 grid-cols-1 gap-3.5 sm:grid-cols-2",
-        hasUpNext ? "xl:grid-cols-5" : "xl:grid-cols-4",
+        showsLane ? "xl:grid-cols-5" : "xl:grid-cols-4",
       )}
     >
       {STAGES.map((stage) => (
@@ -97,6 +105,9 @@ function BoardStageGrid({
               onVetoed={onVetoed}
               {...cards}
             />
+          )}
+          {stage === "backlog" && !hasUpNext && upNextAbsence !== undefined && (
+            <UpNextAbsenceLane slug={cards.slug} absence={upNextAbsence} />
           )}
         </Fragment>
       ))}
