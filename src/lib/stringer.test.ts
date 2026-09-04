@@ -2722,6 +2722,59 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
     });
 
+    // A target whose substitution is not its last segment is a valid mapping this reader cannot
+    // resolve. Dropping the rule leaves `@/ui/widget` to the path tail, which reads an unrelated
+    // package's same-named module as the one the caller imported — inventing a caller and
+    // deleting a true finding. Claiming without mapping keeps the tail out (PR #190 review).
+    it("credits no module for a `paths` rule whose target shape it cannot resolve", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*/index"] } },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // tsc resolves `@/ui/widget` to src/ui/widget/index.ts, so the package module has no caller
+      // and its finding must survive.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // tsc merges `baseUrl` and `paths` independently across `extends`, so an app declaring `paths`
+    // while inheriting `baseUrl` anchors its mapping under the BASE's baseUrl. Anchoring it beside
+    // the app names the app's own same-named module instead — crediting the wrong one with the
+    // caller and deleting the finding that was right (PR #190 review).
+    it("resolves an app's own mapping under the baseUrl it inherits", async () => {
+      const repo = initRepo({
+        "tsconfig.base.json": JSON.stringify({ compilerOptions: { baseUrl: "./packages" } }),
+        "apps/web/tsconfig.json": JSON.stringify({
+          extends: "../../tsconfig.base.json",
+          compilerOptions: { paths: { "@/*": ["*"] } },
+        }),
+        "packages/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/ui/widget.ts", "Widget"),
+        unused("apps/web/ui/widget.ts", "Surface"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The import names the package module, so the app's same-named module keeps its finding.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Surface" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/page.ts");
+    });
+
     // tsc ignores jsconfig.json entirely when a tsconfig is present, so the FIRST parseable config
     // governs whether or not it published a mapping. Falling through to the sibling would resolve
     // `@/widget` through a mapping the compiler never applies.

@@ -3002,7 +3002,12 @@ function aliasedModules(
     // them credits a caller of `first/widget` to `fallback/widget` too, inventing a caller and
     // deleting a true finding (anton-23xe). Claiming without mapping leaves the signal standing,
     // which is the side this filter errs on. Resolving them in order is anton-5tjw.
-    if (rule.targets.length > 1) return { mapped: [], claimed: claiming.length > 0 };
+    //
+    // An `unresolved` rule declares a target anton could not model at all, so what it did map is a
+    // PARTIAL list read the same way: the target tsc would pick may be one that isn't here
+    // (PR #190 review).
+    if (rule.unresolved || rule.targets.length > 1)
+      return { mapped: [], claimed: claiming.length > 0 };
     for (const target of rule.targets) mapped.push(posix(normalize(join(target, rest))));
   }
   return { mapped, claimed: claiming.length > 0 };

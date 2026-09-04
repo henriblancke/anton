@@ -319,6 +319,77 @@ describe("readAliases", () => {
     expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
   });
 
+  // tsc merges `compilerOptions` property by property, so a config declaring `paths` while
+  // inheriting `baseUrl` anchors its mapping under the BASE's baseUrl. Anchoring it beside the
+  // config that declares `paths` names a directory tsc never resolves to, which attributes the
+  // import to the wrong module (PR #190 review).
+  it("resolves a locally declared mapping under an inherited baseUrl", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({ compilerOptions: { baseUrl: "./packages" } }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { paths: { "@/*": ["*"] } },
+      }),
+      // Nothing declares a baseUrl here, so the same mapping anchors beside its own config —
+      // which is what makes the case above non-vacuous.
+      "apps/heir/tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["*"] } } }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([{ prefix: "@/", targets: ["packages"] }]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([
+      { prefix: "@/", targets: ["apps/heir"] },
+    ]);
+  });
+
+  // The mirror image: a config declaring `baseUrl` while inheriting `paths` anchors the INHERITED
+  // mapping under its own baseUrl, not under the base that wrote the mapping.
+  it("anchors an inherited mapping under the inheriting config's own baseUrl", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({
+        compilerOptions: { paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { baseUrl: "." },
+      }),
+      // The sibling declares no baseUrl anywhere in its chain, so the mapping stays anchored at the
+      // config that declared it — tsc's own default.
+      "apps/heir/tsconfig.json": JSON.stringify({ extends: "../../tsconfig.base.json" }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([
+      { prefix: "@/", targets: ["apps/app/src"] },
+    ]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
+  });
+
+  // A target whose substitution isn't its last segment, and one with no substitution at all, are
+  // valid mappings this reader cannot resolve. Dropping the rule leaves the specifier to the
+  // path-tail fallback, which names an unrelated module — so the rule claims and maps nothing
+  // instead (PR #190 review).
+  it("claims a pattern whose targets it cannot resolve, mapping nothing", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: {
+            "@/*": ["./src/*/index"],
+            "#/*": ["./fixed.ts"],
+            "~/*": ["./src/*", "./legacy/*/index"],
+          },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", targets: [], unresolved: true },
+      { prefix: "#/", targets: [], unresolved: true },
+      // A partial list is still a claim anton must not read as the whole mapping: the target tsc
+      // would pick may be the one missing from it.
+      { prefix: "~/", targets: ["src"], unresolved: true },
+    ]);
+  });
+
   it("stops inheriting when a config declares paths, empty included", async () => {
     const repo = writeRepo({
       "tsconfig.base.json": JSON.stringify({

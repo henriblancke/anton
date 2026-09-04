@@ -132,7 +132,7 @@ function parseEdges(source: string): RawEdge[] {
   return edges;
 }
 
-/** A `"@/*": ["./src/*"]`-shaped tsconfig path mapping, the only form anton resolves. */
+/** A `"@/*": ["./src/*"]`-shaped tsconfig path mapping — or, `unresolved`, a claim on one. */
 export interface AliasRule {
   /** What a specifier must start with — the whole pattern when the rule is `exact`. */
   prefix: string;
@@ -144,6 +144,14 @@ export interface AliasRule {
    * same-named module, inventing a caller and deleting a true finding (anton-23xe).
    */
   exact?: boolean;
+  /**
+   * The pattern declares at least one target anton cannot resolve — a substitution that isn't at
+   * the end of the target, or a target the config spells in a shape this reader doesn't model. The
+   * rule still claims its specifiers so the path-tail fallback cannot answer in tsc's place, but
+   * what it maps is incomplete, so a resolver must not treat its targets as the whole answer
+   * (PR #190 review).
+   */
+  unresolved?: boolean;
 }
 
 /**
@@ -276,33 +284,55 @@ async function readConfig(repoPath: string, file: string): Promise<TsConfig | un
 }
 
 /**
- * The rules a `paths` mapping declares, resolved against the directory of the config DECLARING it.
- * That is the directory the mapping's own `baseUrl` is relative to, which is why an inherited
- * mapping cannot be resolved against the inheriting app: `"@/*": ["./src/*"]` written in the repo
- * root's base config names the ROOT's `src`, whatever app extends it.
+ * The rules a `paths` mapping declares, resolved against `baseDir` — the directory the effective
+ * `baseUrl` names, or the directory of the config DECLARING the mapping when the chain sets none.
+ * That is why an inherited mapping cannot be resolved against the inheriting app: `"@/*":
+ * ["./src/*"]` written in the repo root's base config names the ROOT's `src`, whatever app extends
+ * it.
+ *
+ * A pattern anton cannot resolve still CLAIMS its specifiers (PR #190 review). A target whose
+ * substitution is not its last segment (`src/*` with `/index` behind it) and one with no
+ * substitution at all (`"@/*": ["src/fixed"]`) are both valid mappings this rule model cannot
+ * express, and dropping the rule leaves the specifier to the path-tail fallback — which reads
+ * `@/ui/widget` as an unrelated package's same-named module, inventing a caller and deleting a true
+ * finding. A claim that maps nothing only ever leaves a signal standing, the side this filter errs
+ * on.
  */
-function rulesOf(dir: string, options: TsConfig["compilerOptions"]): AliasRule[] {
+function rulesOf(baseDir: string, options: TsConfig["compilerOptions"]): AliasRule[] {
   const paths = options?.paths;
   if (!paths) return [];
-  const base = options?.baseUrl ?? ".";
   const rules: AliasRule[] = [];
-  for (const [pattern, targets] of Object.entries(paths)) {
-    if (pattern.endsWith("/*")) {
-      const mapped = targets
-        .filter((target) => target.endsWith("/*"))
-        .map((target) => normalize(join(dir, base, target.slice(0, -2))));
-      if (mapped.length > 0) rules.push({ prefix: pattern.slice(0, -1), targets: mapped });
-      continue;
-    }
-    // A pattern with no substitution names one module outright, and its targets name files rather
-    // than directories — nothing is appended to them.
-    if (pattern.includes("*")) continue;
+  for (const [pattern, declared] of Object.entries(paths)) {
+    const exact = !pattern.includes("*");
+    // A `*` anywhere but at the end of the PATTERN is a shape this model cannot express even as a
+    // claim: no specifier can be matched against it by prefix.
+    if (!exact && !pattern.endsWith("/*")) continue;
+    // `paths` comes off unvalidated JSON, so a target list that isn't one declares no target anton
+    // can read — the rule claims and maps nothing rather than throwing out of the nightly pass.
+    const targets = Array.isArray(declared) ? declared : [];
     const mapped = targets
-      .filter((target) => !target.includes("*"))
-      .map((target) => normalize(join(dir, base, target)));
-    if (mapped.length > 0) rules.push({ prefix: pattern, targets: mapped, exact: true });
+      .map((target) => (typeof target === "string" ? targetDir(baseDir, target, exact) : undefined))
+      .filter((target): target is string => target !== undefined);
+    const rule: AliasRule = exact
+      ? { prefix: pattern, targets: mapped, exact: true }
+      : { prefix: pattern.slice(0, -1), targets: mapped };
+    if (mapped.length !== targets.length) rule.unresolved = true;
+    rules.push(rule);
   }
   return rules;
+}
+
+/**
+ * The directory one target stands for, or undefined when its shape is one anton does not resolve.
+ *
+ * A wildcard target is the directory behind its `*` — `"*"` and `"./*"` being `baseUrl` itself,
+ * which is how a project roots its own modules through `baseUrl` alone. An exact pattern's targets
+ * name files rather than directories, so nothing is appended to them.
+ */
+function targetDir(baseDir: string, target: string, exact: boolean): string | undefined {
+  if (exact) return target.includes("*") ? undefined : normalize(join(baseDir, target));
+  if (target !== "*" && !target.endsWith("/*")) return undefined;
+  return normalize(join(baseDir, target.slice(0, -2)));
 }
 
 /**
@@ -329,6 +359,51 @@ function extendsTargets(dir: string, spec: unknown): string[] {
 }
 
 /**
+ * The `extends` entries of a config, in the order tsc applies them — an array is read LAST-FIRST,
+ * because a later entry overrides an earlier one.
+ *
+ * Entries stay `unknown`: they come straight off unvalidated JSON, and `extendsTargets` is what
+ * decides which of them name a config anton can follow.
+ */
+function extendsChain(config: TsConfig): unknown[] {
+  const spec = config.extends;
+  if (spec === undefined) return [];
+  return Array.isArray(spec) ? [...spec].reverse() : [spec];
+}
+
+/**
+ * The directory the effective `baseUrl` names — what every `paths` target resolves against — or
+ * undefined when no config in the chain declares one, which leaves the mapping anchored at the
+ * config that declares it (tsc's own default since 4.1).
+ *
+ * tsc merges `compilerOptions` property by property across `extends`, and a relative `baseUrl` is
+ * resolved against the config that WROTE it. So a child declaring `paths` while inheriting
+ * `baseUrl` anchors its mapping under the base's directory, and a child declaring `baseUrl` while
+ * inheriting `paths` anchors the inherited mapping under its own. Anchoring either beside whichever
+ * config happens to declare `paths` attaches the import to a module tsc never names, crediting
+ * the wrong module with a caller and deleting a true finding (PR #190 review).
+ */
+async function baseDirOf(
+  repoPath: string,
+  file: string,
+  config: TsConfig,
+  depth: number,
+): Promise<string | undefined> {
+  const dir = normalize(dirname(file));
+  const own = config.compilerOptions?.baseUrl;
+  if (typeof own === "string") return normalize(join(dir, own));
+  if (depth <= 0) return undefined;
+  for (const spec of extendsChain(config))
+    for (const target of extendsTargets(dir, spec)) {
+      const base = await readConfig(repoPath, target);
+      if (!base) continue;
+      const inherited = await baseDirOf(repoPath, target, base, depth - 1);
+      if (inherited !== undefined) return inherited;
+    }
+  return undefined;
+}
+
+/**
  * A config's answer about `paths`: the rules it supplies, and whether it DECLARED the property at
  * all. The two are separate because an empty declaration is still an override and an absent one is
  * not, and a bare rule list cannot tell them apart (PR #190 review).
@@ -344,14 +419,24 @@ const NO_DECLARATION: DeclaredAliases = { rules: [], declared: false };
 /**
  * The `paths` mapping the config at `file` supplies, its `extends` chain included. A config
  * publishing its own mapping answers with it; one that only inherits is answered by the nearest
- * config in its chain that DECLARES one, resolved against THAT config's directory.
+ * config in its chain that DECLARES one.
+ *
+ * `baseDir` rides along unchanged because it is the whole chain's answer, not one config's: tsc
+ * merges `baseUrl` and `paths` independently, so wherever the mapping is declared it anchors under
+ * the effective `baseUrl` (`baseDirOf`), and only a chain declaring none falls back to the
+ * directory of the config that declared the mapping.
  *
  * `extends` arrays are read last-first, because a later entry overrides an earlier one.
  */
-async function aliasesOf(repoPath: string, file: string, depth: number): Promise<DeclaredAliases> {
+async function aliasesOf(
+  repoPath: string,
+  file: string,
+  depth: number,
+  baseDir: string | undefined,
+): Promise<DeclaredAliases> {
   if (depth <= 0) return NO_DECLARATION;
   const config = await readConfig(repoPath, file);
-  return config ? aliasesFrom(repoPath, file, config, depth) : NO_DECLARATION;
+  return config ? aliasesFrom(repoPath, file, config, depth, baseDir) : NO_DECLARATION;
 }
 
 /**
@@ -389,19 +474,14 @@ async function aliasesFrom(
   file: string,
   config: TsConfig,
   depth: number,
+  baseDir: string | undefined,
 ): Promise<DeclaredAliases> {
   const dir = normalize(dirname(file));
   if (declaresPaths(config.compilerOptions))
-    return { rules: rulesOf(dir, config.compilerOptions), declared: true };
-  const bases =
-    config.extends === undefined
-      ? []
-      : Array.isArray(config.extends)
-        ? config.extends
-        : [config.extends];
-  for (const spec of [...bases].reverse())
+    return { rules: rulesOf(baseDir ?? dir, config.compilerOptions), declared: true };
+  for (const spec of extendsChain(config))
     for (const target of extendsTargets(dir, spec)) {
-      const inherited = await aliasesOf(repoPath, target, depth - 1);
+      const inherited = await aliasesOf(repoPath, target, depth - 1, baseDir);
       if (inherited.declared) return inherited;
     }
   return NO_DECLARATION;
@@ -444,7 +524,11 @@ export async function readDirAliases(repoPath: string, dir = "."): Promise<DirAl
     const config = await readConfig(repoPath, join(dir, name));
     if (!config) continue;
     governed = true;
-    const { rules } = await aliasesFrom(repoPath, join(dir, name), config, EXTENDS_DEPTH);
+    // The effective `baseUrl` is read from the config GOVERNING the directory, not from whichever
+    // config in its chain declares `paths` — tsc merges the two options independently.
+    const file = join(dir, name);
+    const baseDir = await baseDirOf(repoPath, file, config, EXTENDS_DEPTH);
+    const { rules } = await aliasesFrom(repoPath, file, config, EXTENDS_DEPTH, baseDir);
     // The FIRST parseable config governs, whether or not it published a mapping (anton-23xe).
     // Falling through to a sibling reads a jsconfig's `paths` for a directory tsc resolves through
     // its tsconfig — which ignores jsconfig entirely when one is present — so `@/widget` would take
