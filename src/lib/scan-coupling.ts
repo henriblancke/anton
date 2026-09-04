@@ -329,16 +329,29 @@ function extendsTargets(dir: string, spec: unknown): string[] {
 }
 
 /**
+ * A config's answer about `paths`: the rules it supplies, and whether it DECLARED the property at
+ * all. The two are separate because an empty declaration is still an override and an absent one is
+ * not, and a bare rule list cannot tell them apart (PR #190 review).
+ */
+interface DeclaredAliases {
+  rules: AliasRule[];
+  /** Whether this config, or the nearest one in its `extends` chain, wrote `paths`. */
+  declared: boolean;
+}
+
+const NO_DECLARATION: DeclaredAliases = { rules: [], declared: false };
+
+/**
  * The `paths` mapping the config at `file` supplies, its `extends` chain included. A config
  * publishing its own mapping answers with it; one that only inherits is answered by the nearest
- * config in its chain that publishes one, resolved against THAT config's directory.
+ * config in its chain that DECLARES one, resolved against THAT config's directory.
  *
  * `extends` arrays are read last-first, because a later entry overrides an earlier one.
  */
-async function aliasesOf(repoPath: string, file: string, depth: number): Promise<AliasRule[]> {
-  if (depth <= 0) return [];
+async function aliasesOf(repoPath: string, file: string, depth: number): Promise<DeclaredAliases> {
+  if (depth <= 0) return NO_DECLARATION;
   const config = await readConfig(repoPath, file);
-  return config ? aliasesFrom(repoPath, file, config, depth) : [];
+  return config ? aliasesFrom(repoPath, file, config, depth) : NO_DECLARATION;
 }
 
 /**
@@ -363,16 +376,23 @@ function declaresPaths(options: TsConfig["compilerOptions"]): boolean {
   return typeof paths === "object" && paths !== null;
 }
 
-/** The mapping a config already read supplies — `aliasesOf` past the read. */
+/**
+ * The mapping a config already read supplies — `aliasesOf` past the read.
+ *
+ * A base is accepted on its DECLARATION, not on its rule count: the last member of an `extends`
+ * array writing `paths: {}` clears the mapping for everything that extends it, and reading its
+ * empty answer as "nothing to inherit" walks on to an earlier member and resurrects a mapping tsc
+ * has cleared (PR #190 review).
+ */
 async function aliasesFrom(
   repoPath: string,
   file: string,
   config: TsConfig,
   depth: number,
-): Promise<AliasRule[]> {
+): Promise<DeclaredAliases> {
   const dir = normalize(dirname(file));
-  const own = rulesOf(dir, config.compilerOptions);
-  if (own.length > 0 || declaresPaths(config.compilerOptions)) return own;
+  if (declaresPaths(config.compilerOptions))
+    return { rules: rulesOf(dir, config.compilerOptions), declared: true };
   const bases =
     config.extends === undefined
       ? []
@@ -382,9 +402,9 @@ async function aliasesFrom(
   for (const spec of [...bases].reverse())
     for (const target of extendsTargets(dir, spec)) {
       const inherited = await aliasesOf(repoPath, target, depth - 1);
-      if (inherited.length > 0) return inherited;
+      if (inherited.declared) return inherited;
     }
-  return [];
+  return NO_DECLARATION;
 }
 
 /**
@@ -424,7 +444,7 @@ export async function readDirAliases(repoPath: string, dir = "."): Promise<DirAl
     const config = await readConfig(repoPath, join(dir, name));
     if (!config) continue;
     governed = true;
-    const rules = await aliasesFrom(repoPath, join(dir, name), config, EXTENDS_DEPTH);
+    const { rules } = await aliasesFrom(repoPath, join(dir, name), config, EXTENDS_DEPTH);
     // The FIRST parseable config governs, whether or not it published a mapping (anton-23xe).
     // Falling through to a sibling reads a jsconfig's `paths` for a directory tsc resolves through
     // its tsconfig — which ignores jsconfig entirely when one is present — so `@/widget` would take

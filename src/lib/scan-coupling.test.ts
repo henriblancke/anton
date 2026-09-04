@@ -296,6 +296,29 @@ describe("readAliases", () => {
   // A derived config writing `paths` overrides the base's entirely, so `{}` is how a nested project
   // CLEARS an inherited `@/*`. Reading the rule count instead walks `extends` and resurrects it,
   // attributing the import to the base's target (PR #190 review).
+  // An `extends` array is read last-first because a later entry overrides an earlier one, and that
+  // override has to survive the entry declaring `paths: {}`. Reading its empty answer as "nothing
+  // to inherit" walks on to the earlier base and resurrects a mapping tsc has cleared (PR #190
+  // review).
+  it("stops at an extends member that clears paths instead of falling back to an earlier one", async () => {
+    const repo = writeRepo({
+      "tsconfig.aliases.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "tsconfig.clear.json": JSON.stringify({ compilerOptions: { paths: {} } }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: ["../../tsconfig.aliases.json", "../../tsconfig.clear.json"],
+      }),
+      // Reverse the order and the aliases win, which is what makes the case above non-vacuous.
+      "apps/heir/tsconfig.json": JSON.stringify({
+        extends: ["../../tsconfig.clear.json", "../../tsconfig.aliases.json"],
+      }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
+  });
+
   it("stops inheriting when a config declares paths, empty included", async () => {
     const repo = writeRepo({
       "tsconfig.base.json": JSON.stringify({

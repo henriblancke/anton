@@ -3058,9 +3058,44 @@ function specifierNames(
 }
 
 /**
- * The word every specifier naming `module` must contain: the module's own file name, or its
- * directory's when the file is the directory's `index`. Grepping for it is how the importers of a
- * module are found without walking the tree.
+ * The words an EXACT alias lets a specifier name `module` by, which its file name is not among.
+ *
+ * A wildcard mapping carries the module's own path through the specifier — `@/ui/widget` under
+ * `"@/*"` still writes `widget` — so `moduleWord` finds those importers. A pattern with no `*`
+ * renames the module outright: `"@/widget": ["src/components/special.ts"]` is imported as
+ * `@/widget`, which contains no `special`, so the grep that looks for the file name never reaches
+ * the importer and a caller binding the default under another name goes unfound — leaving a live
+ * symbol reported dead (PR #190 review).
+ *
+ * Read from the mapping governing the DECLARING module, which is where a project that aliases its
+ * own file writes the rule. An exact alias declared only in some OTHER project and reaching across
+ * a package boundary is still missed; that under-covers, which leaves the signal standing, and is
+ * the direction this filter errs in.
+ *
+ * The word is the specifier's last segment, because that is what a word-boundary grep can match
+ * inside `from "@/widget"`.
+ */
+function exactAliasWords(module: string, aliases: readonly AliasRule[]): string[] {
+  const target = withoutModuleExtension(posix(module));
+  const words: string[] = [];
+  for (const rule of aliases) {
+    if (!rule.exact) continue;
+    const names = rule.targets.some((to) => {
+      const resolved = withoutModuleExtension(posix(to));
+      return resolved === target || `${resolved}/index` === target;
+    });
+    if (!names) continue;
+    const word = rule.prefix.split("/").pop();
+    if (word) words.push(word);
+  }
+  return words;
+}
+
+/**
+ * The word every specifier naming `module` through a WILDCARD mapping must contain: the module's
+ * own file name, or its directory's when the file is the directory's `index`. Grepping for it is
+ * how the importers of a module are found without walking the tree. An exact alias can rename the
+ * module past this word, which `exactAliasWords` answers for.
  */
 function moduleWord(module: string): string | undefined {
   const segments = withoutModuleExtension(posix(module)).split("/");
@@ -3258,6 +3293,8 @@ async function defaultBindingCallers(
   for (const declared of modules.keys()) {
     const word = moduleWord(declared);
     if (word) words.add(word);
+    const governing = await aliasesGoverning(repoPath, declared, aliases);
+    for (const alias of exactAliasWords(declared, governing)) words.add(alias);
   }
   const callers = new Set<string>();
   let read = 0;

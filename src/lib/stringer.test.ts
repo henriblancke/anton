@@ -1793,6 +1793,34 @@ describe("scan", () => {
       expect(result.deadcode.dropped).toEqual([]);
     });
 
+    // An exact mapping renames the module outright, so the specifier carries no trace of its file
+    // name: `@/widget` contains no `special`, the grep that looks for the file name never reaches
+    // the importer, and the caller binding the default under another name goes unfound — leaving a
+    // live symbol reported dead (PR #190 review).
+    it("finds a default-import caller that names the module by an exact alias", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@/widget": ["./src/components/special.ts"] },
+          },
+        }),
+        "src/components/special.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+        "src/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/components/special.ts", "Widget"),
+        unused("src/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/page.ts");
+    });
+
     // A tail is read off an aliased specifier only where the repo publishes no mapping for it. A
     // monorepo holds more than one module whose path ends `ui/widget`, and `@/*` names exactly one
     // of them: matching the tail behind a mapping that already answered binds an unrelated
