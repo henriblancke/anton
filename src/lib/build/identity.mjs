@@ -1520,6 +1520,30 @@ function pidAlive(pid) {
 const BIRTH_STAMP_ENV = { TZ: "UTC", LC_ALL: "C" };
 
 /**
+ * This boot of this kernel, as a uuid — null off Linux, or where procfs does not carry it.
+ *
+ * `/proc/<pid>/stat` field 22 counts clock ticks since BOOT, so it is unique only within one
+ * (PR #217 review). A pidfile that outlives a reboot names a pid the kernel is free to hand out
+ * again from the low numbers it restarts at, and an early service that lands on the recorded number
+ * at the recorded tick offset — repeatable, since boot replays the same work in the same order —
+ * wears a stamp identical to the dead daemon's. `anton stop` would then SIGTERM and SIGKILL a
+ * stranger. Pairing the counter with the boot it was counted in is what makes it an identity.
+ *
+ * The shape is checked, not just the read: the id is stored as a colon-separated field of the stamp,
+ * so anything carrying a colon or a space would change what the stamp PARSES as rather than what it
+ * says. A malformed read is treated as no read at all — the stamp degrades to the bare counter,
+ * which is where this started.
+ */
+function bootId() {
+  try {
+    const id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return /^[0-9a-fA-F-]{8,64}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * When the process holding `pid` was born, as an opaque stamp — null when this machine cannot say.
  *
  * A pid is not an identity: the OS reuses the number, and a record left by a server that exited
@@ -1530,6 +1554,11 @@ const BIRTH_STAMP_ENV = { TZ: "UTC", LC_ALL: "C" };
  * procfs first (no spawn, and the field is the kernel's own value in clock ticks since boot), then
  * `ps -o lstart=`, which macOS and procps both support. Neither is required: a platform that
  * answers with neither degrades to the bare pid check, which is where this started.
+ *
+ * A procfs stamp carries the boot it was counted in where the kernel names one — `proc:<ticks>` on
+ * its own counts from a zero the next reboot resets, so the pair is the identity and the counter
+ * alone is not (see `bootId`). Both spellings are read as `proc` and compare field by field, so a
+ * stamp written before this qualifier existed still proves what it always did (`procStampVerdict`).
  *
  * The `ps` fallback is read under a FIXED locale and time zone (PR #217 review). `lstart` is a
  * formatted date, not a token: the same live process prints `Wed Sep  2 07:16:57 2026` to a shell
@@ -1554,7 +1583,10 @@ export function processStartedAt(pid) {
     // itself contain spaces, so the split has to start after its closing paren.
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const started = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
-    if (/^\d+$/.test(started ?? "")) return `proc:${started}`;
+    if (/^\d+$/.test(started ?? "")) {
+      const boot = bootId();
+      return boot ? `proc:${started}:${boot}` : `proc:${started}`;
+    }
   } catch {}
   const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
     encoding: "utf8",
@@ -1586,6 +1618,10 @@ function birthStampSource(stamp) {
  * Callers fail closed on it — the pid names nobody — but must not treat it as proof of death, since
  * deleting the record or pidfile of a live server is the one outcome here that cannot be undone.
  *
+ * Within one reader the stamps are compared on the fields they share rather than as opaque strings,
+ * so a qualifier one side predates cannot masquerade as a different process — see
+ * `procStampVerdict`.
+ *
  * @param {string} stored
  * @param {string|null} now
  * @returns {"same"|"different"|"unknown"}
@@ -1593,7 +1629,37 @@ function birthStampSource(stamp) {
 export function birthStampVerdict(stored, now) {
   if (now === null) return "unknown";
   if (now === stored) return "same";
-  return birthStampSource(stored) === birthStampSource(now) ? "different" : "unknown";
+  const source = birthStampSource(stored);
+  if (source !== birthStampSource(now)) return "unknown";
+  return source === "proc" ? procStampVerdict(stored, now) : "different";
+}
+
+/**
+ * Two procfs stamps compared field by field: the tick counter always, the boot id only when BOTH
+ * carry one.
+ *
+ * The boot id is a qualifier this reader gained after stamps were already on disk (PR #217 review),
+ * and an absence on either side is not evidence — the rule the identity comparison already applies
+ * to every field added after the fact. A stamp written by the previous anton says exactly what it
+ * always said, no more: same counter, same process. Comparing it against a qualified one as a plain
+ * string would instead make every stamped daemon on Linux unprovable across the upgrade that
+ * introduced the field, leaving `stop`, `update` and `uninstall` refusing to act on a server that is
+ * perfectly fine until the operator killed it by hand.
+ *
+ * When both sides ARE qualified the id decides: a matching counter under a DIFFERENT boot is the
+ * collision this qualifier exists to catch, and the recorded process is proven gone — nothing
+ * survives a reboot.
+ *
+ * @param {string} stored
+ * @param {string} now
+ * @returns {"same"|"different"}
+ */
+function procStampVerdict(stored, now) {
+  const [, storedTicks, storedBoot] = stored.split(":");
+  const [, nowTicks, nowBoot] = now.split(":");
+  if (storedTicks !== nowTicks) return "different";
+  if (!storedBoot || !nowBoot) return "same";
+  return storedBoot === nowBoot ? "same" : "different";
 }
 
 /**

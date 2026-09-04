@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  birthStampVerdict,
   buildDrift,
   buildMatchesCheckout,
   buildRecordFile,
@@ -1666,6 +1667,34 @@ describe("the record a running server leaves", () => {
 
   it("tags the birth stamp it reads with the reader that produced it", () => {
     expect(processStartedAt(process.pid)).toMatch(/^(proc|ps):/);
+  });
+
+  // `/proc/<pid>/stat` field 22 counts clock ticks since BOOT, so it is unique only within one. A
+  // pidfile that outlives a reboot names a pid the kernel is free to reissue from the low numbers it
+  // restarts at, and an early service landing on that number at that tick offset wears the dead
+  // daemon's stamp exactly — `anton stop` would SIGTERM and SIGKILL a stranger (PR #217 review).
+  it("proves a procfs stamp from an earlier boot is a different process", () => {
+    const boot = "proc:4212345:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa";
+    const reboot = "proc:4212345:1b2d3e4f-0000-4000-8000-bbbbbbbbbbbb";
+    expect(birthStampVerdict(boot, boot)).toBe("same");
+    expect(birthStampVerdict(boot, reboot)).toBe("different");
+    // The counter still decides within one boot — the boot id narrows nothing else.
+    expect(birthStampVerdict(boot, "proc:9999999:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa")).toBe("different");
+  });
+
+  // The boot id is a qualifier stamps already on disk predate, and an absence is not evidence.
+  // Comparing the two spellings as opaque strings would call every stamped Linux daemon unprovable
+  // across the upgrade that added the field, leaving `stop`, `update` and `uninstall` refusing to act
+  // on a server that is fine until the operator killed it by hand (PR #217 review).
+  it("compares a stamp written before the boot qualifier on the fields it does carry", () => {
+    const legacy = "proc:4212345";
+    const qualified = "proc:4212345:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa";
+    expect(birthStampVerdict(legacy, qualified)).toBe("same");
+    expect(birthStampVerdict(qualified, legacy)).toBe("same");
+    // ...and says no more than it ever did: a different counter is still a different process.
+    expect(birthStampVerdict(legacy, "proc:9999999:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa")).toBe("different");
+    // The other reader remains incomparable either way.
+    expect(birthStampVerdict(qualified, "ps:Wed Sep  2 07:16:57 2026")).toBe("unknown");
   });
 
   // The prune is the only writer here, so it stands on the STALE half: a record kept one boot too
