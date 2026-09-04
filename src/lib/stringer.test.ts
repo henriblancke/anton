@@ -2584,6 +2584,71 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).not.toContain("scripts/backslash.sh");
     });
 
+    // Heredoc openers are read before the comment grammar runs, so a `# cat <<EOF` shown in a
+    // comment would queue a terminator no later line answers and blank every line below it.
+    it("does not open a heredoc from a marker inside a shell comment", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/documented.sh": "# usage: cat <<EOF\nneverCalled\n",
+        // Not vacuous: a `#` inside quotes opens no comment, so this heredoc is real and its
+        // payload stays inert.
+        "scripts/quoted.sh": "echo \"a # b\"\ncat <<'EOF' > a.ts\nneverCalled();\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/documented.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/quoted.sh");
+    });
+
+    // `module.exports = function Widget() {}` puts a keyword where the name usually stands, and
+    // `require('./widget').default` is how CommonJS reaches an ESM default. Neither caller writes
+    // the original symbol, so missing either reports a live function dead.
+    it("counts a named module.exports function and a `.default` require binding", async () => {
+      const repo = initRepo({
+        "src/lib/widget.js": "module.exports = function Widget() {\n  return null;\n};\n",
+        "src/lib/page.js": "const Renamed = require('./widget');\nexports.page = () => Renamed();\n",
+        "src/lib/interop.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/lib/host.js":
+          "const Card = require('./interop').default;\nexports.host = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.js", "Widget"),
+        unused("src/lib/interop.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }, { symbol: "Panel" }]);
+    });
+
+    // A declaration broken after `export default` is still that module's default; the head has to
+    // reach across the newline to find the name.
+    it("counts a default export whose head is broken across lines", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default\nfunction Widget() {\n  return null;\n}\n",
+        "src/lib/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+        // Not vacuous: a default export nothing imports is still reported.
+        "src/lib/orphan.ts": "export default\nfunction Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget"),
+        unused("src/lib/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
     // MDX is a program: a component imported and rendered only from a docs page has a real caller,
     // and discounting the whole file as prose leaves that component reported dead every night. Its
     // markdown body still is prose, so only the shapes MDX executes may count.

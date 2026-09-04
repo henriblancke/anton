@@ -738,6 +738,36 @@ function heredocWord(line: string, from: number): { word: string; quoted: boolea
   return { word, quoted, end: at };
 }
 
+/**
+ * The part of a shell line before its comment. `#` opens one only at the start of a word and only
+ * outside quotes, so `echo "a # b"` carries none and `a#b` is one word (anton-23xe).
+ *
+ * Reading a comment as code queues a delimiter no later line answers, which blanks the rest of the
+ * script; reading code as a comment loses an opener and leaves its payload read as executable,
+ * which invents a caller. Tracking the quotes is what keeps both out — a `#` inside a literal is
+ * text, and one behind a backslash is the character itself.
+ */
+function shellCode(line: string): string {
+  let quote: string | undefined;
+  for (let at = 0; at < line.length; at += 1) {
+    const char = line[at];
+    if (char === "\\" && quote !== "'") {
+      at += 1;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === "#" && (at === 0 || /\s/.test(line[at - 1] as string))) return line.slice(0, at);
+  }
+  return line;
+}
+
 /** Every heredoc a line opens, in the order their payloads follow. */
 function heredocOpeners(line: string): { word: string; dash: boolean; quoted: boolean }[] {
   const found: { word: string; dash: boolean; quoted: boolean }[] = [];
@@ -828,7 +858,10 @@ function maskHeredocs(text: string): string {
         // substitutions running, and those are code however the rest of the payload reads.
         return open.quoted ? blankAll(line) : unmaskedSubstitutions(line);
       }
-      pending.push(...heredocOpeners(line));
+      // Openers are read off the CODE part only. This pass runs before the comment grammar, so a
+      // `# cat <<EOF` shown in a comment would otherwise queue a terminator that never arrives and
+      // blank every line below it.
+      pending.push(...heredocOpeners(shellCode(line)));
       return line;
     })
     .join("\n");
@@ -3016,7 +3049,7 @@ function moduleWord(module: string): string | undefined {
  * nowhere for a per-word match to find — goes unfound, leaving a live symbol reported dead.
  */
 const DEFAULT_EXPORT_HEAD =
-  /(?:^|[;{}])[ \t]*(?:export[ \t]+default[ \t]+(?:async[ \t]+)?(?:function[ \t*]+|(?:abstract[ \t]+)?class[ \t]+|interface[ \t]+)?|(?:module\.exports|exports\.default)[ \t]*=[ \t]*)/gm;
+  /(?:^|[;{}])[ \t]*(?:export\s+default\s+(?:async\s+)?(?:function[\s*]+|(?:abstract\s+)?class\s+|interface\s+)?|(?:module\.exports|exports\.default)[ \t]*=\s*(?:async\s+)?(?:function[\s*]+|(?:abstract\s+)?class\s+)?)/gm;
 
 /**
  * `export { Widget as default }` — the same claim written as a re-export, and the list is read
@@ -3093,6 +3126,17 @@ const DEFAULT_LIST_IMPORT =
 const DEFAULT_REQUIRE =
   /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]/gm;
 
+/**
+ * `const Renamed = require('./widget').default` — how CommonJS reaches an ESM default, and the only
+ * shape that selects it off the module object (anton-23xe). The caller writes the original symbol
+ * nowhere, so leaving it out reports a live symbol dead.
+ *
+ * It answers for an ESM default alone: where a module assigned `module.exports` outright there is
+ * no `.default` on it to select, and counting one would invent a caller.
+ */
+const DEFAULT_REQUIRE_INTEROP =
+  /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\.default\b/gm;
+
 /** The local names `program` binds the default export of one of `modules` to. */
 function defaultBindingsOf(
   program: readonly string[],
@@ -3120,6 +3164,7 @@ function defaultBindingsOf(
   // assigned `module.exports` outright. Requiring an ESM module yields a namespace whose `.default`
   // holds the symbol, and the property beside it is a mention grep already reads.
   collect(DEFAULT_REQUIRE, (how) => how.cjs);
+  collect(DEFAULT_REQUIRE_INTEROP, (how) => how.esm);
   return locals;
 }
 
