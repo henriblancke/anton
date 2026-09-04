@@ -1,5 +1,7 @@
 /**
- * The Up Next projection (anton-t9m4): the recorded plan joined to the board it was ranked over.
+ * The Up Next projection (anton-t9m4): a ranking joined to the board it was ranked over — the live
+ * decision the board read derives (anton-r0ew), or the plan row a pass recorded, which are the same
+ * shape here.
  *
  * What is pinned here is what the lane is allowed to CLAIM about a pick — its position, its
  * priority, its type, and how much open work it frees. Those four are the ranking's own inputs, so a
@@ -42,7 +44,7 @@ function plan(entries: PickerPlanEntry[]): BoardPickerPlan {
 }
 
 describe("upNextEntries", () => {
-  it("has no lane at all without a recorded plan", () => {
+  it("has no lane at all without a ranking", () => {
     expect(upNextEntries([bead({ id: "anton-1" })], undefined)).toBeUndefined();
   });
 
@@ -115,20 +117,11 @@ describe("upNextEntries", () => {
     expect(entries?.[0]).not.toHaveProperty("priority");
   });
 
-  it("drops a pick the operator vetoed since the pass ran", () => {
-    const entries = upNextEntries(
-      [bead({ id: "anton-1" }), bead({ id: "anton-2" })],
-      plan([
-        { beadId: "anton-1", rank: 1, rule: "policy" },
-        { beadId: "anton-2", rank: 2, rule: "policy" },
-      ]),
-      new Map([["anton-1", 1_770_000_100_000]]),
-    );
+  // A vetoed target never reaches here: `decideBoardPickerPlan` excludes it as `deferred` before it
+  // ranks anything (picker-decision.test.ts), and re-subtracting vetoes in the projection would be a
+  // second answer to a question the ranking already answered.
 
-    expect(entries?.map((e) => e.beadId)).toEqual(["anton-2"]);
-  });
-
-  it("records a plan that admitted nothing as an empty lane, not as no lane", () => {
+  it("records a ranking that admitted nothing as an empty lane, not as no lane", () => {
     expect(upNextEntries([bead({ id: "anton-1" })], plan([]))).toEqual([]);
   });
 });

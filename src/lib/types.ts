@@ -440,20 +440,25 @@ export interface Board {
    */
   operatorQueue: OperatorQueueItem[];
   /**
-   * The board-picker's recorded plan, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole
-   * input. The lane resolves each entry against the BACKLOG column and takes those cards out of it,
-   * so a bead never renders twice.
+   * What anton would start next, ranked (anton-t9m4 / R3.1–R3.4) — the Up Next lane's whole input,
+   * derived from THIS board read (anton-r0ew) rather than from the plan a pass wrote down. The lane
+   * resolves each entry against the BACKLOG column and takes those cards out of it, so a bead never
+   * renders twice.
    *
-   * ABSENT, never empty, whenever there is no projection to show: the picker is disarmed for this
-   * project, or it has never run here. An empty lane titled "Up Next" would read as "anton has
+   * ABSENT, never empty, whenever there is no ranking to show: the picker is disarmed for this
+   * project, or its level offers nothing. An empty lane titled "Up Next" would read as "anton has
    * nothing to start" on a board where the pass simply isn't running.
    */
   upNext?: UpNextEntry[];
   /**
-   * The GENERATION of the plan {@link upNext} was projected from — carried so a verdict can name the
-   * decision the operator actually looked at (PR #212 review). A veto posted from a tab a later pass
-   * has overtaken sends this id, and the server records no pick rather than one the operator was
-   * never shown. Absent exactly when the lane is.
+   * The recorded GENERATION a verdict on {@link upNext} is answered against — carried so a veto or a
+   * release names the decision anton has written down (PR #212 review). A veto posted from a tab a
+   * later pass has overtaken sends this id, and the server records no pick rather than one the
+   * operator was never shown.
+   *
+   * Absent while the lane has outrun that record — no pass has run here yet, or the board has moved
+   * past the one it wrote — because the ranking on screen is live and the ledger is not. The lane is
+   * still drawn: a verdict then records no pick rather than binding to a decision that is history.
    */
   upNextPlanId?: string;
   /**

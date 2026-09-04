@@ -23,6 +23,8 @@ import {
 } from "./board-picker-plan";
 import { boardProvenance, provenanceVersion } from "./board-provenance";
 import { getDb } from "./db";
+import { ADMIT_ALL_POLICY, decideBoardPickerPlan } from "./jobs/picker-decision";
+import { armedPickerPolicy } from "./jobs/picker-policy";
 import {
   deferralVersion,
   latestDeclinedPicks,
@@ -430,23 +432,26 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // (isPickerPick), so ordinary Backlog cards would go on offering to record accepts against a pass
   // that no longer runs, or a level that never asked.
   const armedPlan = picker.offers ? plan : undefined;
+  // One clock read for both questions the picker is asked below — what would anton start now, and is
+  // the recorded plan still that — so the lane and the badge can never be answering about different
+  // moments.
+  const observedAtMs = Date.now();
   // Does the recorded plan still describe the decision anton would make NOW? Asked ONCE, over every
   // input to that decision — the beads and the armed policy, which stampBoard folds in together, plus
   // the deferrals, whose expiry no digest can see (isPlanStale). So an operator narrowing
   // `pickerPolicy` without touching a bead invalidates the plan, and so does a hold running out on a
   // target the pass set aside — or on one it picked, when no pass ran to record the exclusion.
   //
-  // Every live claim the board makes about the picker reads this one answer: the Up Next lane
-  // (withheld whole rather than presented as a current ranking) and the `[Release]` derived from the
-  // provenance badge. They must not disagree — a lane that vanished while its button stayed would go
-  // on offering a start against a decision anton has already stopped standing behind.
+  // What this governs is HISTORY's claim on the present: the `◈ policy` badge (flagged rather than
+  // dropped) and the `[Release]` derived from it, which answers against the recorded generation. The
+  // lane no longer reads it at all — it is derived below, so it has no generation to outlive.
   //
   // The declines are read here rather than beside the deferrals above because the question is about
   // ONE generation — it needs the plan id the read above returns.
   const declined = armedPlan ? await readDeclinedPicks(project, armedPlan.planId) : undefined;
   const planIsStale =
     armedPlan !== undefined &&
-    isPlanStale(armedPlan, stampBoard(allBeads, Date.now(), picker.policy), deferrals, declined);
+    isPlanStale(armedPlan, stampBoard(allBeads, observedAtMs, picker.policy), deferrals, declined);
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
   // A stale plan still badges — the rule a target WAS picked under does not stop being true — but
@@ -457,12 +462,30 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     policy: picker.policy,
     planIsStale,
   });
-  // The Up Next lane's input (anton-t9m4). The lane holds a stricter standard than the badge beside
-  // it: a badge records the rule a target WAS picked under (history), while the lane claims this is
-  // the order anton would start work in NOW — so a stale plan is withheld whole. Deferrals are
-  // subtracted for the same reason: a target vetoed since the pass ran is not up next.
+  // The Up Next lane's input (anton-r0ew): the ranking DERIVED here, not the one a pass wrote down.
+  // The lane claims this is the order anton would start work in NOW, and that claim is cheap to make
+  // true — `decideBoardPickerPlan` is the pure decision the pass itself makes, and this read already
+  // holds every input it takes. So a claim, a new bead or a lapsed hold re-ranks the lane on the next
+  // read, where projecting a recorded plan could only blank it until the next pass ran.
+  //
+  // Gated on OFFERING, unchanged: a disarmed pass — or one at `propose` — puts no picks in front of
+  // the operator, and a ranking computed anyway would draw the lane the level promised not to.
+  const ranking = picker.offers
+    ? decideBoardPickerPlan({
+        board: allBeads,
+        policy: picker.policy
+          ? armedPickerPolicy(picker.policy, allBeads, new Date(observedAtMs))
+          : ADMIT_ALL_POLICY,
+        ...(picker.policy ? { armedPolicy: picker.policy } : {}),
+        runtime: { observedAtMs, deferrals },
+      })
+    : undefined;
+  const upNext = upNextEntries(allBeads, ranking);
+  // The generation a verdict on those picks is RECORDED against — still the plan row, and still only
+  // while anton stands behind it. The ranking above is live; the accept/veto ledger is not, so a
+  // verdict either names the decision that was written down or names none (anton-5axf binds the
+  // button to it and says so on the card).
   const currentPlan = planIsStale ? undefined : armedPlan;
-  const upNext = upNextEntries(allBeads, currentPlan, deferrals);
   // Which nothing this is (anton-w579). A withheld lane that simply vanishes reads as "anton has
   // nothing to start" on a board where the pass is switched off, only proposing, or looking at
   // nothing it may claim — three states with three different clearing conditions.
@@ -511,14 +534,17 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     columns,
     standalone,
     operatorQueue: humanWork,
-    // Length, not existence: a plan every entry drops out of (the bead left the snapshot, or every
-    // pick is vetoed) projects an EMPTY lane, and `Board.upNext` promises absent-never-empty — an
-    // "Up Next" heading over nothing reads as "anton has nothing to start".
-    // The generation rides with the lane it projects: a card's veto names the decision it was drawn
-    // from, so a tab a later pass has overtaken records no pick rather than a stranger's.
-    ...(upNext?.length && currentPlan ? { upNext, upNextPlanId: currentPlan.planId } : {}),
+    // Length, not existence: a ranking that admits nothing is an EMPTY lane, and `Board.upNext`
+    // promises absent-never-empty — an "Up Next" heading over nothing reads as "anton has nothing to
+    // start", which is what `upNextAbsence` says in words instead.
+    // The generation rides along only when there is one to stand behind: a card's veto names the
+    // decision it can be recorded against, so a tab a later pass has overtaken — or a lane that has
+    // outrun the plan row entirely — records no pick rather than a stranger's.
+    ...(upNext?.length
+      ? { upNext, ...(currentPlan ? { upNextPlanId: currentPlan.planId } : {}) }
+      : {}),
     // Rides beside the lane it replaces, never with it: named only while there is no ranking drawn.
-    ...(upNext?.length && currentPlan ? {} : absence ? { upNextAbsence: absence } : {}),
+    ...(upNext?.length ? {} : absence ? { upNextAbsence: absence } : {}),
     hygiene,
     ...(trajectory ? { reviewTrajectory: trajectory } : {}),
     ...(scan ? { scanHealth: scan } : {}),
