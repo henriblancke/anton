@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import type { ProposalAutonomy, EarnedKind } from "@/components/settings/settings-autonomy";
+import type { RepairAutonomy } from "@/components/settings/settings-repair";
 import { SECTIONS } from "@/components/settings/settings-sections";
 import {
   dirtyFields,
@@ -54,6 +55,8 @@ export interface SettingsForm {
     nominated: Set<string>;
   };
   armKind: (kindId: string, level: ProposalAutonomy) => void;
+  /** Arm one block class's repair (R5.3) — the same act, over a different policy. */
+  armRepair: (classId: string, level: RepairAutonomy) => void;
   /** Which staged edits differ from what is persisted, keyed by SECTIONS' `dirtyKeys`. */
   dirty: Record<string, boolean>;
   /** The sections those edits live in — what the save bar names. */
@@ -220,6 +223,11 @@ export function useSettingsForm({
       setDraft((prev) => ({
         ...prev,
         proposalAutonomy: { ...prev.proposalAutonomy, [kindId]: level },
+      })),
+    armRepair: (classId, level) =>
+      setDraft((prev) => ({
+        ...prev,
+        repairAutonomy: { ...prev.repairAutonomy, [classId]: level },
       })),
     dirty,
     dirtySections: SECTIONS.filter((s) => s.dirtyKeys.some((key) => dirty[key])),

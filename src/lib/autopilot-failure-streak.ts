@@ -34,15 +34,36 @@ export interface RunOutcome {
   cancelled?: boolean;
   /** The work this run carried was closed won't-do (`abandoned` on the bead). */
   abandoned?: boolean;
+  /**
+   * The ticket the run stopped inside, when it stopped inside one. A repair acts on the bead that
+   * BLOCKED, and inside a grouped run that is a child — so a weigher reading only `epicBeadId`
+   * would never see the repair it is meant to price.
+   */
+  ticketBeadId?: string;
+  /**
+   * Unix SECONDS this ATTEMPT started — the run's start, or its most recent resume for a row a
+   * resume reused. Carried for the weigher alone: "a failed repair" is a failure that came AFTER
+   * one, and without an instant to order against, the block that provoked the repair counts as its
+   * failure too. The attempt rather than the row, because a `dep-missing` repair parks the run it
+   * repaired and the resume continues in place.
+   */
+  startedAt?: number;
+  /**
+   * Unix SECONDS this run SETTLED (`endedAt ?? updatedAt`, as the disarm fence reads it). Carried
+   * for the weigher alongside {@link startedAt}: a repaired ticket can commit and then have a later
+   * run-level step fail, so the deliveries that answer a repair are the ones before the run's
+   * failure, not only those before its start.
+   */
+  settledAt?: number;
 }
 
 /**
  * How much one failed run weighs against the threshold.
  *
  * A hook rather than a constant because failures are not equal evidence: a failed AUTO-REPAIR is a
- * second failure stacked on the one it was dispatched to fix, and a later feature counts it double.
- * Passing the weigher in keeps that decision at the call site instead of teaching this module about
- * repairs it has no other reason to know.
+ * second failure stacked on the one it was dispatched to fix, and it counts double (R5.8 —
+ * gardener/repair.ts `repairedFailureWeight`). Passing the weigher in keeps that decision at the
+ * call site instead of teaching this module about repairs it has no other reason to know.
  */
 export type FailureWeight = (run: RunOutcome) => number;
 

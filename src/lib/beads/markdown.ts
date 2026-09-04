@@ -57,6 +57,15 @@ export interface ScannedLine {
   delimiter: boolean;
   /** What the line RENDERS — HTML comments stripped outside fences, fenced content kept as written. */
   visible: string;
+  /**
+   * {@link text} with every commented span blanked to spaces — CHARACTER-FOR-CHARACTER as long as
+   * the source, so an offset into it is an offset into the source.
+   *
+   * `visible` answers "what does this line say"; this answers "where in the line does it say it",
+   * which is what a caller that REWRITES a line needs. Inside a fence it is `text` verbatim, since a
+   * `<!--` there is content rather than markup.
+   */
+  masked: string;
   /** The heading this line opens. Never set inside a fence or an HTML comment: the render shows a
    * literal line there, not a section. */
   heading?: Heading;
@@ -82,43 +91,58 @@ interface ScanState {
 
 interface CommentScan {
   visible: string;
+  /** See {@link ScannedLine.masked}. */
+  masked: string;
   inComment: boolean;
 }
 
-/** What follows the `-->` that closes the comment `text` starts inside, or undefined when the
- * comment never closes — it then swallows the rest of the text, the way it renders. */
-const afterComment = (text: string): string | undefined => {
-  const at = text.indexOf(COMMENT_CLOSE);
-  if (at === -1) return undefined;
-  return text.slice(at + COMMENT_CLOSE.length);
+/** Where the comment open at `from` ends — the offset just past its `-->` — or undefined when the
+ * comment never closes and swallows the rest of the text, the way it renders. */
+const commentEnd = (text: string, from: number): number | undefined => {
+  const at = text.indexOf(COMMENT_CLOSE, from);
+  return at === -1 ? undefined : at + COMMENT_CLOSE.length;
 };
 
-/** {@link stripComments} for text that starts OUTSIDE a comment. */
-function stripFromOutside(text: string): CommentScan {
-  let visible = "";
-  let rest = text;
-  for (;;) {
-    const at = rest.indexOf(COMMENT_OPEN);
-    if (at === -1) return { visible: visible + rest, inComment: false };
-    visible += rest.slice(0, at);
-    const after = afterComment(rest.slice(at + COMMENT_OPEN.length));
-    if (after === undefined) return { visible, inComment: true };
-    rest = after;
-  }
-}
+const blanks = (len: number): string => " ".repeat(len);
 
 /**
- * `text` with its HTML comments removed, and the comment state it leaves behind for the next line.
+ * `text` with its HTML comments removed, the same text with them BLANKED, and the comment state it
+ * leaves behind for the next line.
  *
  * The one comment state machine in the contract. `<!--` and `-->` are matched in order, so an
  * unclosed comment swallows the rest of the text — the way it renders, which is what makes the
  * judgement fail closed rather than read hidden markup as authored spec.
+ *
+ * Two renderings of one walk rather than two walks: a caller that reads what a line SAYS wants the
+ * comments gone, a caller that rewrites the line in place needs its own offsets back, and computing
+ * those separately is how the two would come to disagree about where a comment ends.
  */
 function stripComments(text: string, inComment: boolean): CommentScan {
-  if (!inComment) return stripFromOutside(text);
-  const rest = afterComment(text);
-  if (rest === undefined) return { visible: "", inComment: true };
-  return stripFromOutside(rest);
+  let visible = "";
+  let masked = "";
+  let at = 0;
+  let open = inComment;
+  for (;;) {
+    if (open) {
+      const end = commentEnd(text, at);
+      if (end === undefined) {
+        return { visible, masked: masked + blanks(text.length - at), inComment: true };
+      }
+      masked += blanks(end - at);
+      at = end;
+      open = false;
+      continue;
+    }
+    const start = text.indexOf(COMMENT_OPEN, at);
+    if (start === -1) {
+      const rest = text.slice(at);
+      return { visible: visible + rest, masked: masked + rest, inComment: false };
+    }
+    visible += text.slice(at, start);
+    masked += text.slice(at, start) + blanks(COMMENT_OPEN.length);
+    at = start + COMMENT_OPEN.length;
+    open = true;
+  }
 }
 
 const fenceOf = (text: string): Fence | undefined => {
@@ -162,12 +186,14 @@ function scanLine(state: ScanState, text: string): ScannedLine {
   if (state.inComment) {
     const comment = stripComments(text, true);
     state.inComment = comment.inComment;
-    return { text, fenced: false, delimiter: false, visible: comment.visible };
+    return { text, fenced: false, delimiter: false, visible: comment.visible, masked: comment.masked };
   }
-  if (fenceDelimiter(state, text)) return { text, fenced: true, delimiter: true, visible: "" };
+  if (fenceDelimiter(state, text)) {
+    return { text, fenced: true, delimiter: true, visible: "", masked: text };
+  }
   // Inside a fence everything is literal: comment state is not tracked there, matching the render's
   // own rule that a `<!--` in fenced code is content rather than markup.
-  if (state.fence) return { text, fenced: true, delimiter: false, visible: text };
+  if (state.fence) return { text, fenced: true, delimiter: false, visible: text, masked: text };
   const comment = stripComments(text, false);
   state.inComment = comment.inComment;
   return {
@@ -175,6 +201,7 @@ function scanLine(state: ScanState, text: string): ScannedLine {
     fenced: false,
     delimiter: false,
     visible: comment.visible,
+    masked: comment.masked,
     heading: headingOf(text),
   };
 }

@@ -4,7 +4,7 @@
  * the row status off them, the ticket loop absorbs exactly one, the runner classifies the poison
  * ones — so they live together rather than beside the code that happens to throw them.
  */
-import { parkedOnGateClause, PoisonEpic } from "./errors";
+import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
 
 /**
  * The run ran every ticket it could and the rest are held by a prerequisite outside it (anton-1two).
@@ -49,6 +49,71 @@ export class BlockedByAgentError extends Error {
   constructor(msg: string) {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
+  }
+}
+
+/**
+ * A block anton REPAIRED, so the run retries instead of parking (anton-fzas / R5.10).
+ *
+ * Thrown in place of the poison the block would otherwise have raised — {@link NoDeliveryError} or
+ * {@link BlockedByAgentError} — and deliberately NOT poison itself. That single difference is the
+ * whole mechanism: a plain error goes back through the runner's ordinary retry budget and backoff,
+ * so the repaired bead re-enters the queue exactly like any other retried work, behind the same
+ * brakes, with no special standing. There is no bypass to review because there is no bypass.
+ *
+ * "Retried ONCE" is not counted here and must not be: the repair stamp on the bead is what bounds it
+ * (R5.6). A second block of the same class finds a bead anton has already repaired, the guard
+ * (`gardener/repair.ts` `decideRepair`) escalates instead of repairing, and the run parks on the
+ * poison it would have parked on the first time — so the retry happens at most once per bead per class no matter how many
+ * attempts the runner's budget allows.
+ */
+export class RepairedBlockError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** The block this repair answered — kept so the run's error still states what stopped it. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${ticketId} blocked, and anton repaired it: ${attempted}. The run failed so the ticket goes ` +
+        `back through the queue for one retry against the corrected bead; a second block of the ` +
+        `same kind will park it for a human instead. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
+    this.name = "RepairedBlockError";
+  }
+}
+
+/**
+ * The block anton answered by DRAWING THE EDGE it was missing (anton-qg4h / R5.4): the ticket needs
+ * another bead to land first, so the ordering is recorded and the run parks behind it.
+ *
+ * A {@link BlockedTailError}, which is precisely what this now is — a run holding work that waits on
+ * a prerequisite outside it — and that inheritance is the whole behaviour: the RUN row parks rather
+ * than failing, so the resume continues in this same row and worktree once the blocker lands, and
+ * the JOB parks rather than retrying. The contrast with {@link RepairedBlockError} is deliberate: a
+ * rewritten pointer earns an immediate retry because the bead is now correct, while an ordering
+ * earns a WAIT — retrying now would spend an attempt proving the edge anton just drew.
+ *
+ * Phrased through {@link blockedByPoison} so the blocker id is readable back out of the park message
+ * by the run-health sweep, exactly as it is for a run that was already blocked when it started.
+ */
+export class ParkedOnPrereqError extends BlockedTailError {
+  constructor(
+    readonly ticketId: string,
+    /** The prerequisite the new edge points at. */
+    readonly blockerId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+    /** The block this repair answered — kept so the park still states what stopped the run. */
+    readonly block: unknown,
+  ) {
+    super(
+      `${blockedByPoison(ticketId, [blockerId]).message} — anton drew that edge itself after the ` +
+        `agent reported \`dep-missing\`: ${attempted}. It stopped with: ` +
+        (block instanceof Error ? block.message : String(block)),
+    );
   }
 }
 

@@ -4,18 +4,21 @@ import { buildContractReport, formatContractReport } from "./contract-report";
 
 const STAMPS = { created_at: "2026-07-28T00:00:00Z", updated_at: "2026-07-28T00:00:00Z" };
 
+/** Four of the five, in the contract's own order — Goal → Context → Out of scope → Verify. The
+ * rubric is absent on purpose: like most of the board, the fixture's acceptance lives only in bd's
+ * field. */
 const SHAPED = [
   "## Goal",
   "Ship the thing.",
+  "",
+  "## Context",
+  "touches: src/lib/beads/contract.ts",
   "",
   "## Out of scope",
   "- not the other thing",
   "",
   "## Verify",
   "- unit test covers it",
-  "",
-  "## Context",
-  "touches: src/lib/beads/contract.ts",
 ].join("\n");
 
 const ticket = (over: Partial<Bead> = {}): Bead => ({
@@ -29,10 +32,27 @@ const ticket = (over: Partial<Bead> = {}): Bead => ({
   ...over,
 });
 
-/** The rubric written into the DESCRIPTION too — the shape the form rate asks for, and the one the
- * fixture deliberately lacks (its acceptance lives only in bd's field, like most of the board). */
-const withRubric = (description: string) =>
-  `${description}\n\n## Acceptance Criteria\n- [ ] it works`;
+/** The rubric written into the DESCRIPTION too, in the contract's own position — after Goal, ahead
+ * of Context (skills/bd/SKILL.md) — so a fixture meant to be form-conformant carries the order too. */
+function withRubric(description: string): string {
+  const at = description.indexOf("## Context");
+  expect(at).toBeGreaterThanOrEqual(0);
+  return `${description.slice(0, at)}## Acceptance Criteria\n- [ ] it works\n\n${description.slice(at)}`;
+}
+
+/** The same sections, re-emitted in the given order — how order drift is staged. */
+function reorder(description: string, headings: string[]): string {
+  return headings
+    .map((h) => {
+      const lines = description.split("\n");
+      const start = lines.findIndex((l) => l.trim().toLowerCase() === `## ${h.toLowerCase()}`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const rest = lines.slice(start + 1);
+      const end = rest.findIndex((l) => l.startsWith("## "));
+      return [lines[start], ...(end === -1 ? rest : rest.slice(0, end))].join("\n").trim();
+    })
+    .join("\n\n");
+}
 
 /** Drop one `## <heading>` block, leaving the rest intact — how each gap under test is created. */
 function without(description: string, heading: string): string {
@@ -209,6 +229,7 @@ describe("buildContractReport form rate", () => {
         issueType: "task",
         status: "open",
         missing: ["Acceptance"],
+        misplaced: [],
       },
     ]);
   });
@@ -231,7 +252,7 @@ describe("buildContractReport form rate", () => {
       withAcceptance({ id: "anton-also", description: without(SHAPED, "Verify") }),
     ]);
     expect(report.form.rows.map((r) => [r.id, r.missing])).toEqual([
-      ["anton-messy", ["Acceptance", "Goal", "Verify"]],
+      ["anton-messy", ["Goal", "Acceptance", "Verify"]],
       ["anton-also", ["Verify"]],
       ["anton-tidy", ["Acceptance"]],
     ]);
@@ -239,6 +260,58 @@ describe("buildContractReport form rate", () => {
       { section: "Acceptance", count: 2 },
       { section: "Verify", count: 2 },
       { section: "Goal", count: 1 },
+    ]);
+  });
+
+  // A description holding all five in the wrong sequence is drift, not conformance (anton-um80) —
+  // and the report must say which repair it needs: move the section, do not author it.
+  it("counts a shuffled description as falling short, and tallies order apart from absence", () => {
+    const shuffled = reorder(withRubric(SHAPED), [
+      "Goal",
+      "Acceptance Criteria",
+      "Out of scope",
+      "Verify",
+      "Context",
+    ]);
+    const report = buildContractReport([
+      ticket({ id: "anton-order", description: shuffled }),
+      ticket({ id: "anton-tidy", description: withRubric(SHAPED) }),
+    ]);
+    // The gate is untouched by order: neither bead carries a violation, and the exit code stays 0.
+    expect(report).toMatchObject({ judged: 2, conformant: 2, blocked: 0, blocking: 0, advisory: 0 });
+    expect(report.form.conformant).toBe(1);
+    expect(report.form.rows).toEqual([
+      {
+        id: "anton-order",
+        title: "A shaped ticket",
+        issueType: "task",
+        status: "open",
+        missing: [],
+        misplaced: ["Context"],
+      },
+    ]);
+    expect(report.form.bySection).toEqual([]);
+    expect(report.form.misplacedBySection).toEqual([{ section: "Context", count: 1 }]);
+  });
+
+  // Absent sections are the bigger failure, so they rank a row ahead of a merely shuffled one.
+  it("ranks a bead missing sections ahead of one that only has them out of order", () => {
+    const report = buildContractReport([
+      ticket({
+        id: "anton-shuffled",
+        description: reorder(withRubric(SHAPED), [
+          "Verify",
+          "Out of scope",
+          "Context",
+          "Acceptance Criteria",
+          "Goal",
+        ]),
+      }),
+      ticket({ id: "anton-absent", description: without(withRubric(SHAPED), "Verify") }),
+    ]);
+    expect(report.form.rows.map((r) => [r.id, r.missing, r.misplaced])).toEqual([
+      ["anton-absent", ["Verify"], []],
+      ["anton-shuffled", [], ["Acceptance", "Context", "Out of scope", "Verify"]],
     ]);
   });
 
@@ -295,7 +368,7 @@ describe("formatContractReport", () => {
       ]),
     );
     expect(text).toContain("2/2 run-gated beads conformant (100%)");
-    expect(text).toContain("form     1/2 descriptions carry every section (50%) — Acceptance 1");
+    expect(text).toContain("form     1/2 descriptions carry every section, in order (50%) — missing Acceptance 1");
     expect(text).toContain("anton-a  [task/open]  Rubric in bd's field");
     expect(text).toContain("missing   Acceptance");
     expect(text).toContain("Never blocking, never in the exit code");
@@ -306,7 +379,7 @@ describe("formatContractReport", () => {
   it("reports form gaps beside the clean-board verdict", () => {
     const text = formatContractReport(buildContractReport([ticket({ id: "anton-a" })]));
     expect(text).toContain("No violations.");
-    expect(text).toContain("form     0/1 descriptions carry every section (0%)");
+    expect(text).toContain("form     0/1 descriptions carry every section, in order (0%)");
     expect(text).toContain("anton-a  [task/open]");
     expect(text).toContain("a form gap alone never withholds a run.");
     expect(text).not.toContain("BLOCKING above");
@@ -324,8 +397,32 @@ describe("formatContractReport", () => {
     const text = formatContractReport(
       buildContractReport([ticket({ description: withRubric(SHAPED) })]),
     );
-    expect(text).toContain("form     1/1 descriptions carry every section (100%)");
+    expect(text).toContain("form     1/1 descriptions carry every section, in order (100%)");
     expect(text).not.toContain("missing ");
+  });
+
+  it("prints a misplaced section on its own line, so the repair is not confused with authoring", () => {
+    const text = formatContractReport(
+      buildContractReport([
+        ticket({
+          id: "anton-order",
+          title: "Context appended by --context",
+          description: reorder(withRubric(SHAPED), [
+            "Goal",
+            "Acceptance Criteria",
+            "Out of scope",
+            "Verify",
+            "Context",
+          ]),
+        }),
+      ]),
+    );
+    expect(text).toContain(
+      "form     0/1 descriptions carry every section, in order (0%) — out of order Context 1",
+    );
+    expect(text).toContain("misplaced Context");
+    expect(text).not.toContain("missing ");
+    expect(text).toContain("Never blocking, never in the exit code");
   });
 
   it("prefixes the headline with the board when several are reported", () => {

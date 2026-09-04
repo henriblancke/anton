@@ -23,11 +23,11 @@
 import { beads } from "../beads/bd";
 import type { Bead } from "../beads/types";
 import {
-  EVEN_WEIGHT,
   describeFailureStreak,
   detectFailureStreak,
   failureStreakEvidence,
   verdictOf,
+  EVEN_WEIGHT,
   type FailureStreak,
   type FailureWeight,
   type RunOutcome,
@@ -38,9 +38,10 @@ import {
   lastReArmAt,
   settledAfterReArm,
 } from "../autopilot-disarm";
+import { repairedBeadIds, repairedFailureWeight } from "../gardener/repair";
 import { isActiveRun } from "@/components/runs/run-view-utils";
 import { getProjectSettings, resolveFailureBreaker } from "../projects";
-import { listRecentRunOutcomes, type RunDetail } from "../runs";
+import { listDeliveriesByBead, listRecentRunOutcomes, type RunDetail } from "../runs";
 import { cancelledExecuteEpicJobs, type AntonDb, type CancelledJob, type Clock } from "./queue";
 
 /**
@@ -141,7 +142,11 @@ export interface FailureBreakerInput {
   projectId: string;
   /** The board the pass just read — how an abandoned target is recognised, at no extra `bd` call. */
   board: readonly Bead[];
-  /** Absent → every failure counts once. The seam a failed auto-repair later counts double through. */
+  /**
+   * How a failed run is priced against the threshold. Absent → {@link repairWeigher} over `board`,
+   * which is the live rule: a failure that followed an auto-repair counts double (R5.8), until the
+   * repaired bead delivers. Passed explicitly only by tests pinning the arithmetic itself.
+   */
   weigh?: FailureWeight;
 }
 
@@ -176,7 +181,7 @@ export async function checkFailureStreak(
   if (!config || disarmed) return undefined;
 
   const since = await lastReArmAt(db, projectId);
-  const weigh = input.weigh ?? EVEN_WEIGHT;
+  const weigh = input.weigh ?? (await repairWeigher(db, projectId, input.board));
   const outcomes = await readRunOutcomes(db, projectId, input.board, {
     threshold: config.threshold,
     weigh,
@@ -192,6 +197,26 @@ export async function checkFailureStreak(
     evidence: failureStreakEvidence(streak),
   });
   return { streak, latched: created, disarmId: disarm.id };
+}
+
+/**
+ * The live weighing rule: a failure that followed an auto-repair counts double (R5.8), for as long
+ * as the repair stands unanswered.
+ *
+ * The stamps come off the board the pass already read; the deliveries that SPEND them cannot, so
+ * they are read from the run rows — and only for the beads a stamp actually names, which is normally
+ * none of them and no query at all (gardener/repair.ts `repairedFailureWeight`).
+ */
+async function repairWeigher(
+  db: AntonDb,
+  projectId: string,
+  board: readonly Bead[],
+): Promise<FailureWeight> {
+  const repaired = repairedBeadIds(board);
+  // The common board carries no stamp at all, and answering it here skips the weigher's own re-scan
+  // as well as the delivery read (PR #223 review).
+  if (repaired.length === 0) return EVEN_WEIGHT;
+  return repairedFailureWeight(board, await listDeliveriesByBead(db, projectId, repaired));
 }
 
 /**
@@ -236,6 +261,16 @@ async function readRunOutcomes(
       const outcome: RunOutcome = {
         id: run.id,
         epicBeadId: run.epicBeadId,
+        // The bead a repair would have acted on inside a grouped run, and when this attempt began —
+        // the two facts the repair weigher orders a failure against (gardener/repair.ts). The
+        // ATTEMPT's start, not the row's: a parked run resumes in place, so the row's `startedAt`
+        // would place a post-resume failure before the repair that parked it. Rows written before
+        // the column existed fall back to it.
+        ticketBeadId: run.ticketBeadId,
+        startedAt: run.attemptStartedAt ?? startedAt,
+        // When this attempt SETTLED, read exactly as the re-arm fence reads it — the far end of the
+        // span a delivery may have landed inside (gardener/repair.ts).
+        settledAt: run.endedAt ?? run.updatedAt,
         status: run.status,
         error: run.error,
         // A newer row that somehow starts no later than this one is not a later attempt, so it

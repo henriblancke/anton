@@ -243,12 +243,16 @@ async function openRunRow(args: {
   // attempt on a review it never had and could re-latch the disarm a human just cleared. Cleared
   // here, and rewritten by the gate the moment this attempt is reviewed. `jobId` moves with the
   // attempt (anton-rgso): a resume is a NEW job over the same row, and a cancel the operator raises
-  // from here names that job, not the one that first parked.
+  // from here names that job, not the one that first parked. `attemptStartedAt` moves for the same
+  // reason (anton-tebf): the repair weigher orders a failure against when its attempt began, and a
+  // `dep-missing` repair parks the run it repaired — so a row still claiming the original start
+  // would price the resumed attempt's failure as if it predated the repair.
   await updateRun(db, clock, runId, {
     status: "running",
     jobId: ctx.jobId,
     error: null,
     reviewScore: null,
+    attemptStartedAt: clock.now(),
   });
   return { runId, existing };
 }

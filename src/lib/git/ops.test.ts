@@ -29,6 +29,7 @@ import {
   openPullRequest,
   pullRequestState,
   readFileAtRev,
+  readPathHistory,
   readWorktreeState,
   resolveFreshBase,
   resolveMergeBase,
@@ -344,6 +345,101 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+});
+
+suite("readPathHistory (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const commit = (msg: string) => {
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", msg]);
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-pathhist-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    commit("init");
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("resolves a single rename to its destination", async () => {
+    writeFileSync(join(repo, "old.ts"), "export const x = 1;\n".repeat(20));
+    commit("add old.ts");
+    g(["mv", "old.ts", "new.ts"]);
+    commit("rename old.ts -> new.ts");
+
+    expect(await readPathHistory(repo, "old.ts")).toEqual({
+      renamedTo: ["new.ts"],
+      renames: 1,
+      deleted: false,
+    });
+  });
+
+  it("reports a removal with no rename paired to it as deleted", async () => {
+    writeFileSync(join(repo, "gone.ts"), "export const gone = true;\n");
+    commit("add gone.ts");
+    g(["rm", "-q", "gone.ts"]);
+    commit("remove gone.ts");
+
+    expect(await readPathHistory(repo, "gone.ts")).toEqual({
+      renamedTo: [],
+      renames: 0,
+      deleted: true,
+    });
+  });
+
+  // `--follow` walks backwards from the file living at the path NOW, switching to the old name at
+  // every rename — so a file renamed INTO the path hides the deletion of what used to be there
+  // (PR #223 review). Reading the pathname's own history is the only way to see it.
+  it("sees a removal an incoming rename hides, only with the follow off", async () => {
+    writeFileSync(join(repo, "cited.ts"), "export const cited = 1;\n".repeat(20));
+    writeFileSync(join(repo, "other.ts"), "export const other = 2;\n".repeat(20));
+    commit("add cited.ts and other.ts");
+    g(["rm", "-q", "cited.ts"]);
+    commit("delete cited.ts");
+    g(["mv", "other.ts", "cited.ts"]);
+    commit("rename other.ts -> cited.ts");
+
+    expect(await readPathHistory(repo, "cited.ts")).toEqual({
+      renamedTo: [],
+      renames: 0,
+      deleted: false,
+    });
+    expect(await readPathHistory(repo, "cited.ts", { follow: false })).toEqual({
+      renamedTo: [],
+      renames: 0,
+      deleted: true,
+    });
+  });
+
+  it("counts a path renamed to the same destination twice as two renames", async () => {
+    // The destination is deleted and the source recreated in between, so both removals read
+    // `R old.ts new.ts` — one destination, two unrelated incarnations of the same name.
+    writeFileSync(join(repo, "old.ts"), "export const x = 1;\n".repeat(20));
+    commit("add old.ts");
+    g(["mv", "old.ts", "new.ts"]);
+    commit("rename old.ts -> new.ts (first)");
+    g(["rm", "-q", "new.ts"]);
+    writeFileSync(join(repo, "old.ts"), "export const y = 2;\n".repeat(20));
+    commit("drop new.ts, recreate old.ts");
+    g(["mv", "old.ts", "new.ts"]);
+    commit("rename old.ts -> new.ts (second)");
+
+    expect(await readPathHistory(repo, "old.ts")).toMatchObject({
+      renamedTo: ["new.ts"],
+      renames: 2,
+    });
   });
 });
 

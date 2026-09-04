@@ -21,6 +21,7 @@ import {
   type EarnedPicker,
 } from "@/components/settings/sections/picker-autonomy-section";
 import { PromptSection } from "@/components/settings/sections/prompt-section";
+import { RepairsSection } from "@/components/settings/sections/repairs-section";
 import { ProposalsSection } from "@/components/settings/sections/proposals-section";
 import { ReviewFixSection } from "@/components/settings/sections/review-fix-section";
 import { ReviewSection } from "@/components/settings/sections/review-section";
@@ -142,8 +143,8 @@ export function SettingsView({
     patchSettings: form.patchSettings,
   });
 
-  // Elements, not components: building all thirteen costs a `createElement` each and keeps the panel
-  // choice a lookup rather than a thirteen-arm chain — only the one this renders ever mounts.
+  // Elements, not components: building all fourteen costs a `createElement` each and keeps the panel
+  // choice a lookup rather than a fourteen-arm chain — only the one this renders ever mounts.
   const panels: Record<SectionId, ReactNode> = {
     general: <GeneralSection project={project} form={form} />,
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
@@ -152,6 +153,7 @@ export function SettingsView({
     execution: <ExecutionSection form={form} />,
     autopilot: <AutopilotSection form={form} />,
     value: <ValueSection form={form} labelVocabulary={labelVocabulary} />,
+    repairs: <RepairsSection form={form} projectSlug={project.slug} />,
     gates: <GatesSection form={form} />,
     review: <ReviewSection form={form} agents={agents} />,
     "review-fix": <ReviewFixSection form={form} />,
