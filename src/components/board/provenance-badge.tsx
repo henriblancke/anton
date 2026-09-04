@@ -3,7 +3,7 @@ import Link from "next/link";
 import type { BeadProvenance, ProvenanceKind } from "@/lib/types";
 import { criterionLabel, policyHref } from "@/lib/policy/href";
 import { cn } from "@/lib/utils";
-import { MetaChip } from "@/components/atoms";
+import { CHIP_WRAPPER, MetaChip } from "@/components/atoms";
 
 /**
  * The mark every automated writer signs with. ONE glyph, so a card's provenance is scannable as a
@@ -98,12 +98,10 @@ export function ProvenanceBadge({
       title={grammar.title(provenance)}
       onClick={(e) => e.stopPropagation()}
       className={cn(
-        // `inline-flex leading-none` is load-bearing, not cosmetic: a flex item blockifies, and a
-        // block anchor would establish a text line box at the INHERITED metrics (16px/1.5 = 24px)
-        // around a 16px chip. The meta row stretches, so that one anchor would set the flex line's
-        // cross size and every chip beside it would grow 8px — a card would wear taller chips for
-        // no reason but having been badged (anton-ssks).
-        "pointer-events-auto inline-flex leading-none rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        // `CHIP_WRAPPER` is load-bearing, not cosmetic: without it this anchor is 24px tall around a
+        // 16px chip and drags the whole meta row with it (anton-ssks).
+        CHIP_WRAPPER,
+        "pointer-events-auto rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
         className,
       )}
     >

@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { PageHeader, PrChip, WorkingPulse, prLabel } from "@/components/atoms";
+import { CHIP_WRAPPER, PageHeader, PrChip, WorkingPulse, prLabel } from "@/components/atoms";
 
 // Listed token by token, not as one literal, so a search for the bar's class string still finds
 // the single component that owns it rather than this pin.
@@ -87,8 +87,13 @@ describe("PrChip", () => {
     // collapse to the chip: laid out as an inline flex box, at the chip's own metrics.
     const html = renderToStaticMarkup(<PrChip href="https://x/1">#1</PrChip>);
     const anchorClass = /<a[^>]*class="([^"]*)"/.exec(html)?.[1] ?? "";
-    expect(anchorClass).toContain("inline-flex");
-    expect(anchorClass).toContain("leading-none");
+    expect(anchorClass).toContain(CHIP_WRAPPER);
+  });
+
+  it("collapses the INERT wrapper too — a ref with no url still measures one chip tall", () => {
+    const html = renderToStaticMarkup(<PrChip className="ml-auto">#1</PrChip>);
+    const spanClass = /<span[^>]*class="([^"]*)"/.exec(html)?.[1] ?? "";
+    expect(spanClass).toContain(CHIP_WRAPPER);
   });
 
   it("tints a merged PR as done and drops the glyph where the label already says so", () => {
