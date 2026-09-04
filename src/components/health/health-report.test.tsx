@@ -81,12 +81,12 @@ describe("HealthReport", () => {
         })}
       />,
     );
-    expect(screen.getByText("This anton server is older than the code on disk")).toBeTruthy();
+    expect(screen.getByText("This anton server is not running the build on disk")).toBeTruthy();
   });
 
   it("shows no such banner for a server started from the current checkout", () => {
     render(<HealthReport slug="anton" health={health()} />);
-    expect(screen.queryByText("This anton server is older than the code on disk")).toBeNull();
+    expect(screen.queryByText("This anton server is not running the build on disk")).toBeNull();
   });
 
   it("always renders the vitals rail, even with nothing to report", () => {

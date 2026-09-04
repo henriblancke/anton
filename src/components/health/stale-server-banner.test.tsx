@@ -37,7 +37,7 @@ describe("StaleServerBanner", () => {
 
   it("names both builds and the restart when the checkout moved under the process", () => {
     render(<StaleServerBanner servers={[server()]} />);
-    expect(screen.getByText("This anton server is older than the code on disk")).toBeTruthy();
+    expect(screen.getByText("This anton server is not running the build on disk")).toBeTruthy();
     expect(screen.getByText(/booted from 0\.4\.0 \(aaaaaaa\)/)).toBeTruthy();
     expect(screen.getByText(/0\.4\.0 \(bbbbbbb\)/)).toBeTruthy();
     expect(screen.getByText(/Restart the server to adopt the build on disk/)).toBeTruthy();
@@ -97,8 +97,8 @@ describe("StaleServerBanner", () => {
         ]}
       />,
     );
-    expect(screen.getByText("The anton server on pid 4242 is older than the code on disk")).toBeTruthy();
-    expect(screen.getByText("The anton server on pid 4243 is older than the code on disk")).toBeTruthy();
+    expect(screen.getByText("The anton server on pid 4242 is not running the build on disk")).toBeTruthy();
+    expect(screen.getByText("The anton server on pid 4243 is not running the build on disk")).toBeTruthy();
     expect(screen.getByText("runs scheduled jobs")).toBeTruthy();
   });
 
@@ -107,9 +107,32 @@ describe("StaleServerBanner", () => {
   // UI they are looking at while the stale runner keeps executing the nightlies.
   it("names a lone drifting neighbour by pid rather than calling it this server", () => {
     render(<StaleServerBanner servers={[server({ pid: 4243, self: false, runner: true })]} />);
-    expect(screen.getByText("The anton server on pid 4243 is older than the code on disk")).toBeTruthy();
+    expect(screen.getByText("The anton server on pid 4243 is not running the build on disk")).toBeTruthy();
     expect(screen.getByText(/Restart pid 4243 to adopt the build on disk/)).toBeTruthy();
     expect(screen.queryByText(/This anton server/)).toBeNull();
+  });
+
+  // Drift proves the builds differ and nothing more: on a rollback the code on disk is the OLDER of
+  // the two, so copy claiming the process is behind — or that shipped work is missing — states the
+  // reverse of what happened (PR #217 review).
+  it("claims a mismatch rather than a direction when the install was rolled back", () => {
+    render(
+      <StaleServerBanner
+        servers={[
+          server({
+            drift: drift({
+              state: "outdated",
+              running: { version: "0.4.0", revision: null },
+              onDisk: { version: "0.3.9", revision: null },
+            }),
+          }),
+        ]}
+      />,
+    );
+    expect(screen.getByText("This anton server is not running the build on disk")).toBeTruthy();
+    expect(screen.queryByText(/older/)).toBeNull();
+    expect(screen.queryByText(/shipped/)).toBeNull();
+    expect(screen.getByText(/booted from 0\.4\.0 and the runtime on disk is now 0\.3\.9/)).toBeTruthy();
   });
 
   // The verdict says "restart", so anton must not also be restarting itself: a live process may be

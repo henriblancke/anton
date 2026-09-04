@@ -1,5 +1,5 @@
 /**
- * Build drift (anton-pzfb) — how anton tells that the PROCESS it is running is older than the code
+ * Build drift (anton-pzfb) — how anton tells that the PROCESS it is running is not the code that is
  * on disk.
  *
  * A server is a snapshot: it holds whatever JavaScript existed when it booted, and nothing about a
@@ -1140,12 +1140,21 @@ export const MAX_ROUTE_ENTRIES = 4096;
  * appears in no env file and is named in no config — so the stamp compared equal and
  * `buildMatchesCheckout` reused a `.next` holding the previous value.
  *
- * Scoped to the route tree, and deliberately not to the whole application. Every module a route
- * imports is build-evaluated too, but most of `src/` is server code read at RUNTIME: folding in
- * every `ANTON_*` a library names would rebuild whenever a shell set one differently — a runner and
- * an `ANTON_RUNNER=off` UI sharing an install would each rebuild over the other's `.next` on every
- * start. So this narrows the hole the way `configEnvNames` does: a build input the digest cannot see
- * belongs in a route file, the config, or behind a variable named in one.
+ * Scoped to the route tree, and deliberately not to the modules it imports. Every module a route
+ * imports is build-evaluated too, so the import closure is the theoretically correct set — and
+ * following it is what makes this digest unusable (PR #217 review). Measured on this checkout, 99
+ * route files reach 525 modules, and the variables those modules name include `PATH`, `USER`,
+ * `NAME`, `NODE_ENV`, `ANTON_DB`, `ANTON_STATE_DIR`, `ANTON_OPERATOR` and `ANTON_MAX_CONCURRENT` —
+ * routes import the same libraries the server runs on, and those read the environment at RUNTIME.
+ * Every one of them holds a different value in a different shell, and `sameCheckout` compares this
+ * digest against the stamp: `PATH` alone would run a full `next build` on every start from a shell
+ * that loaded a different toolchain, and a runner beside an `ANTON_RUNNER=off` UI would rebuild over
+ * each other's `.next` forever.
+ *
+ * So this narrows the hole the way `configEnvNames` does rather than closing it, and what stays open
+ * is named: a statically rendered page importing a module that reads `process.env.BUILD_FLAVOR`
+ * moves no digest, so changing only `BUILD_FLAVOR` reuses the prerendered output. A build input this
+ * digest can see belongs in a route file, the config, or behind a variable named in one.
  *
  * A symlinked directory is not entered — `isDirectory()` is false for the link itself — which is
  * also what keeps the walk acyclic.
@@ -1690,7 +1699,34 @@ export function compareBuild(running, onDisk) {
     return verdict("modified");
   }
   if (running.source && onDisk.source && running.source !== onDisk.source) return verdict("modified");
+  if (replacedInPlace(running, onDisk)) return verdict("modified");
   return verdict("current");
+}
+
+/**
+ * Did the SHAPE of the install change under the server — a git checkout replaced in place by a
+ * git-less source tree, or the reverse (PR #217 review)?
+ *
+ * Every comparison above pairs a field with ITSELF, so a pair carrying different KINDS of evidence
+ * slips past all of them: a running checkout names `revision` and `worktree`, a source tree on disk
+ * names `source`, neither field stands on both sides, and the version alone then reads "current"
+ * over code that may be entirely different. The two digests cannot be compared to each other — one
+ * is a diff against HEAD, the other a walk of the tree — so that the evidence changed KIND is the
+ * whole finding, and "modified" is the only honest reading of it.
+ *
+ * Both digests must be present, which keeps this off the absences the rest of the function refuses
+ * to read as drift: a bundle and a record written before either field carry neither, and a checkout
+ * whose git read failed carries neither either — `readBuildIdentity` gates `worktree` on a revision
+ * it could name and `source` on there being no revision at all — so none of them reaches here.
+ *
+ * The cost is one restart on a checkout whose FIRST commit lands under a running server: an unborn
+ * HEAD names no revision, so that install reads as source-backed before the commit exists and
+ * checkout-backed after, with the same code on disk throughout. One prompt, once, on an install
+ * shape almost nobody starts anton from — against a replacement this comparison would otherwise
+ * call current for as long as the process lives.
+ */
+function replacedInPlace(a, b) {
+  return Boolean((a.worktree && b.source) || (a.source && b.worktree));
 }
 
 /**
@@ -1814,6 +1850,13 @@ export function describeBuildIdentity(identity) {
 /**
  * The drift as one sentence naming both builds and the single action that clears it. Shared by
  * doctor and the nightly session log so the operator reads the same claim wherever it surfaces.
+ *
+ * The claim is that the two builds DIFFER, never that the one on disk is the newer of them (PR #217
+ * review). `compareBuild` compares versions, commits and digests for equality and nothing
+ * establishes an order: a checkout reset to an ancestor, an install rolled back, or a switch to a
+ * divergent branch all read exactly like an upgrade. Telling the operator that shipped work is
+ * missing states the reverse of what happened in each of those, and the restart that clears it is
+ * the same either way.
  */
 export function describeBuildDrift(drift) {
   const onDisk = describeBuildIdentity(drift.onDisk);
@@ -1827,6 +1870,6 @@ export function describeBuildDrift(drift) {
   const what = drift.state === "outdated" ? "the runtime on disk is" : "the checkout is now";
   return (
     `the running anton server is ${describeBuildIdentity(drift.running)} but ${what} ${onDisk} — ` +
-    `nothing shipped since it booted is running. Restart the server to run it`
+    `the build it is running is not the one on disk. Restart the server to run it`
   );
 }

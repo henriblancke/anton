@@ -200,6 +200,28 @@ describe("compareBuild", () => {
     expect(compareBuild(running, { ...running, source: null }).state).toBe("current");
   });
 
+  // A git checkout replaced in place by a git-less source tree at the same version: every field
+  // above pairs with itself, so no pair stands on both sides and the version alone read "current"
+  // over what may be entirely different code (PR #217 review).
+  it("calls a checkout replaced in place by a git-less source tree modified", () => {
+    const checkout = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
+    const sources = { version: "0.4.0", revision: null, source: "dd44ee55ff66" };
+    expect(compareBuild(checkout, sources).state).toBe("modified");
+    expect(compareBuild(sources, checkout).state).toBe("modified");
+  });
+
+  // And it stays off every absence the rest of the comparison refuses to read: a bundle, a record
+  // predating the digests, and a checkout whose git read failed all carry neither digest.
+  it("reads a missing digest on one side as no evidence, not a change of install shape", () => {
+    const checkout = { version: "0.4.0", revision: "a".repeat(40), worktree: "clean" };
+    const bundle = { version: "0.4.0", revision: null };
+    expect(compareBuild(checkout, bundle).state).toBe("current");
+    expect(compareBuild(bundle, checkout).state).toBe("current");
+    const failedRead = { version: "0.4.0", revision: REVISION_UNREADABLE, worktree: null, source: null };
+    const sources = { version: "0.4.0", revision: null, source: "dd44ee55ff66" };
+    expect(compareBuild(sources, failedRead).state).toBe("current");
+  });
+
   it("ignores a worktree digest only one side carries", () => {
     const undigested = { version: RUNNING.version, revision: RUNNING.revision };
     expect(compareBuild(undigested, { ...RUNNING, worktree: "9f2c1a4bb001" }).state).toBe("current");
@@ -1875,6 +1897,20 @@ describe("the sentence an operator reads", () => {
     expect(said).toContain("0.4.0 (aaaaaaa)");
     expect(said).toContain("0.4.0 (bbbbbbb)");
     expect(said).toContain("Restart the server");
+  });
+
+  // The sentence claims a mismatch, not a direction: on a rollback the build on disk is the OLDER
+  // of the two, and telling the operator that shipped work is missing reverses the facts.
+  it("does not claim the build on disk is the newer one", () => {
+    const said = describeBuildDrift({
+      state: "outdated",
+      running: { version: "0.4.0", revision: null },
+      onDisk: { version: "0.3.9", revision: null },
+      bootedAt: null,
+    });
+    expect(said).toContain("the build it is running is not the one on disk");
+    expect(said).not.toContain("shipped");
+    expect(said).not.toContain("older");
   });
 
   it("says what cannot be established for an unstamped build, and still names the restart", () => {

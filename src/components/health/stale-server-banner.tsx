@@ -6,6 +6,13 @@ import { describeBuildIdentity, type ServerDrift } from "@/lib/build/drift";
 /**
  * What each verdict means in the operator's terms — the claim, then what it costs.
  *
+ * The claim is a MISMATCH, never a direction (PR #217 review). Drift is established by comparing
+ * versions, commits and digests for equality, and none of that puts the two builds in an order: a
+ * checkout reset to an ancestor, an install rolled back, or a switch to a divergent branch all
+ * reach this line looking exactly like an upgrade. Saying the process is older — and that shipped
+ * work is missing — states the reverse of what happened in each of those, so the copy says only
+ * what the evidence holds. The restart that clears it is the same either way.
+ *
  * `who` stays generic only for the process rendering this page, alone: "this anton server" is what
  * an operator reads as the tab in front of them, so a drifting NEIGHBOUR wearing it sends them to
  * restart the wrong process — the current UI — while the stale runner keeps executing the
@@ -25,7 +32,7 @@ function driftCopy(server: ServerDrift, who: string): { headline: string; detail
   }
   const moved = drift.state === "outdated" ? "the runtime on disk is now" : "the checkout has since moved to";
   return {
-    headline: `${who} is older than the code on disk`,
+    headline: `${who} is not running the build on disk`,
     detail: `It booted from ${describeBuildIdentity(drift.running)} and ${moved} ${onDisk}.`,
   };
 }
@@ -41,7 +48,7 @@ function driftCopy(server: ServerDrift, who: string): { headline: string; detail
 function consequence(runner: boolean | undefined): string | null {
   if (runner === undefined) return null;
   return runner
-    ? "Scheduled jobs — the nightly scan, the patrol, every run — execute the build this process holds, so anything shipped since it booted is not running."
+    ? "Scheduled jobs — the nightly scan, the patrol, every run — execute the build this process holds and not the one on disk, so whatever differs between them is not in effect for any of them."
     : "This process serves the UI only (ANTON_RUNNER=off), so scheduled jobs are unaffected by it — the process running them is reported here separately when its own build drifts.";
 }
 
