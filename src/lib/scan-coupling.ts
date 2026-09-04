@@ -157,6 +157,42 @@ export function aliasRemainder(rule: AliasRule, spec: string): string | undefine
   return spec.startsWith(rule.prefix) ? spec.slice(rule.prefix.length) : undefined;
 }
 
+/**
+ * The rules that claim `spec` and are the MOST SPECIFIC to do so — every rule whose prefix is the
+ * longest of those matching, each with what its targets stand in for.
+ *
+ * Overlapping patterns are how a project carves an exception out of a broad alias — `"@/*":
+ * ["src/*"]` beside `"@/ui/widget": ["vendor/special.ts"]` — and tsc resolves such an import
+ * through the longest matching pattern ALONE, whatever order the patterns are written in. Taking
+ * the first rule that matches attaches the import to the broad target instead, which is a module
+ * tsc never names: the coupling graph then draws an edge that does not exist, and the dead-code
+ * verifier credits the wrong module with a caller (PR #190 review). A pattern with no `*` claims
+ * its whole specifier, so it is the most specific rule any import can match.
+ *
+ * Rules tie only when the same pattern is declared twice, which is equally specific either way, so
+ * both answer and the caller decides what to do with them.
+ *
+ * Shared with the dead-code verifier's `aliasedModules`, which asks the same question of the same
+ * rules and must not answer it differently.
+ */
+export function claimingRules(
+  aliases: readonly AliasRule[],
+  spec: string,
+): { rule: AliasRule; rest: string }[] {
+  let claiming: { rule: AliasRule; rest: string }[] = [];
+  let longest = -1;
+  for (const rule of aliases) {
+    const rest = aliasRemainder(rule, spec);
+    if (rest === undefined || rule.prefix.length < longest) continue;
+    if (rule.prefix.length > longest) {
+      longest = rule.prefix.length;
+      claiming = [];
+    }
+    claiming.push({ rule, rest });
+  }
+  return claiming;
+}
+
 /** As much of a tsconfig as a path mapping is read out of. */
 interface TsConfig {
   extends?: string | string[];
@@ -305,6 +341,28 @@ async function aliasesOf(repoPath: string, file: string, depth: number): Promise
   return config ? aliasesFrom(repoPath, file, config, depth) : [];
 }
 
+/**
+ * Whether a config DECLARES `paths` at all, which is the question `extends` inheritance turns on
+ * and not how many rules anton could model out of it (PR #190 review).
+ *
+ * tsc overrides `compilerOptions` property by property, so a derived config writing `paths` replaces
+ * the base's mapping entirely — `"paths": {}` in a nested project is how that project deliberately
+ * CLEARS an inherited `@/*`, and reading the rule count instead walks `extends` and resurrects it.
+ * The import is then attributed to the base's target, which credits an unrelated module with a
+ * caller and deletes a true finding — the same failure the tail fallback causes, one step earlier.
+ *
+ * The same answer covers a mapping declared in a shape anton cannot model (every pattern a
+ * mid-string wildcard, every target filtered out): tsc still reads it as an override, so inheriting
+ * there would apply a mapping the compiler doesn't.
+ *
+ * A non-object `paths` is not a declaration. It comes off unvalidated JSON, tsc rejects the config
+ * outright, and there is nothing for it to override with.
+ */
+function declaresPaths(options: TsConfig["compilerOptions"]): boolean {
+  const paths = options?.paths;
+  return typeof paths === "object" && paths !== null;
+}
+
 /** The mapping a config already read supplies — `aliasesOf` past the read. */
 async function aliasesFrom(
   repoPath: string,
@@ -314,7 +372,7 @@ async function aliasesFrom(
 ): Promise<AliasRule[]> {
   const dir = normalize(dirname(file));
   const own = rulesOf(dir, config.compilerOptions);
-  if (own.length > 0) return own;
+  if (own.length > 0 || declaresPaths(config.compilerOptions)) return own;
   const bases =
     config.extends === undefined
       ? []
@@ -431,11 +489,15 @@ async function resolveFile(state: GraphState, base: string): Promise<string | un
   return found;
 }
 
-/** Where a `@/…`-style specifier lands, or undefined when no alias rule claims it. */
+/**
+ * Where a `@/…`-style specifier lands, or undefined when no alias rule claims it.
+ *
+ * Only the most specific claiming rule is consulted, because that is the only one tsc consults
+ * (`claimingRules`). Within it the targets are an ORDERED fallback list and the first that exists
+ * on disk wins, which is tsc's rule too.
+ */
 async function resolveAlias(state: GraphState, spec: string): Promise<string | undefined> {
-  for (const rule of state.aliases) {
-    const rest = aliasRemainder(rule, spec);
-    if (rest === undefined) continue;
+  for (const { rule, rest } of claimingRules(state.aliases, spec)) {
     for (const target of rule.targets) {
       const file = await resolveFile(state, normalize(join(target, rest)));
       if (file) return file;

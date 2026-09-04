@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ScanSignal } from "./scan-severity";
 import {
   aliasRemainder,
+  claimingRules,
   filterCouplingSignals,
   importGraph,
   judgeCycle,
@@ -116,6 +117,28 @@ describe("importGraph", () => {
     // subtracted for it — but it still proves a runtime dependency for the cycle walk.
     expect(await graph.edgesOf("src/a.ts")).toEqual([
       { file: "src/b.ts", typeOnly: false, relative: false },
+    ]);
+  });
+
+  // tsc resolves an import through the LONGEST matching pattern, whatever order the patterns are
+  // written in. Taking the first match attaches the import to the broad target — a module tsc never
+  // names — so the graph draws an edge that does not exist (PR #190 review).
+  it("resolves an alias through the most specific pattern, not the first declared", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { "@/*": ["./src/*"], "@/ui/*": ["./vendor/*"] },
+        },
+      }),
+      "src/a.ts": `import { w } from "@/ui/widget";\nexport const a = () => w();\n`,
+      // Both candidates exist, so only the pattern choice can decide which one the edge names.
+      "src/ui/widget.ts": `export const w = () => 1;\n`,
+      "vendor/widget.ts": `export const w = () => 2;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "vendor/widget.ts", typeOnly: false, relative: false },
     ]);
   });
 
@@ -268,6 +291,54 @@ describe("readAliases", () => {
     expect(aliasRemainder(rule, "@/ui/widget")).toBe("");
     expect(aliasRemainder(rule, "@/ui/widgetry")).toBeUndefined();
     expect(aliasRemainder({ prefix: "@/", targets: ["src"] }, "@/ui/widget")).toBe("ui/widget");
+  });
+
+  // A derived config writing `paths` overrides the base's entirely, so `{}` is how a nested project
+  // CLEARS an inherited `@/*`. Reading the rule count instead walks `extends` and resurrects it,
+  // attributing the import to the base's target (PR #190 review).
+  it("stops inheriting when a config declares paths, empty included", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { paths: {} },
+      }),
+      // The sibling that declares none still inherits — an absence is not an override.
+      "apps/heir/tsconfig.json": JSON.stringify({ extends: "../../tsconfig.base.json" }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src"] }]);
+  });
+});
+
+describe("claimingRules", () => {
+  const broad = { prefix: "@/", targets: ["src"] };
+  const narrow = { prefix: "@/ui/", targets: ["vendor"] };
+  const exact = { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true };
+
+  // Declaration order must not decide: tsc picks the longest matching pattern either way.
+  it("answers with the longest matching prefix whichever order the rules are in", () => {
+    expect(claimingRules([broad, narrow], "@/ui/widget")).toEqual([
+      { rule: narrow, rest: "widget" },
+    ]);
+    expect(claimingRules([narrow, broad], "@/ui/widget")).toEqual([
+      { rule: narrow, rest: "widget" },
+    ]);
+  });
+
+  it("reads a pattern with no wildcard as the most specific rule an import can match", () => {
+    expect(claimingRules([broad, exact], "@/ui/widget")).toEqual([{ rule: exact, rest: "" }]);
+    // And it claims nothing beneath the module it names.
+    expect(claimingRules([broad, exact], "@/ui/widgetry")).toEqual([
+      { rule: broad, rest: "ui/widgetry" },
+    ]);
+  });
+
+  it("claims nothing when no rule matches", () => {
+    expect(claimingRules([broad, narrow], "react")).toEqual([]);
   });
 });
 

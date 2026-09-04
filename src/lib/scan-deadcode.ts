@@ -25,7 +25,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
-import { aliasRemainder, readDirAliases, type AliasRule } from "./scan-coupling";
+import { claimingRules, readDirAliases, type AliasRule } from "./scan-coupling";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -2985,22 +2985,16 @@ async function aliasesGoverning(
  * Rules tie only when the same pattern is declared twice, and then they are equally specific, so
  * both answer — as they already would have. A pattern with no `*` claims its whole specifier, so
  * it is the most specific rule any import can match.
+ *
+ * The selection itself lives in `claimingRules`, shared with the coupling graph's `resolveAlias`:
+ * two resolvers reading the same rules must not disagree about which one tsc would apply (PR #190
+ * review).
  */
 function aliasedModules(
   aliases: readonly AliasRule[],
   spec: string,
 ): { mapped: string[]; claimed: boolean } {
-  let claiming: { rule: AliasRule; rest: string }[] = [];
-  let longest = -1;
-  for (const rule of aliases) {
-    const rest = aliasRemainder(rule, spec);
-    if (rest === undefined || rule.prefix.length < longest) continue;
-    if (rule.prefix.length > longest) {
-      longest = rule.prefix.length;
-      claiming = [];
-    }
-    claiming.push({ rule, rest });
-  }
+  const claiming = claimingRules(aliases, spec);
   const mapped: string[] = [];
   for (const { rule, rest } of claiming) {
     // More than one target is an ORDERED fallback list, and tsc resolves the first of them that
