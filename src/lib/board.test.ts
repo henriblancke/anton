@@ -1458,6 +1458,24 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
       expect(served.upNextAbsence).toBe("policy-unreadable");
     });
 
+    it("withholds the RECORDED plan too, so no Backlog card offers a start beside that absence", async () => {
+      // The plan row outlives the ranking otherwise (PR #226 review): its stamp is compared against
+      // one taken with no policy, so an admit-all plan armed before the operator narrowed the policy
+      // never reads stale. Its entries would keep `◈ policy` — and the `[Release]` derived from it —
+      // right next to a lane saying anton won't guess what the policy admits.
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = planOver(board, "f-1");
+      settingsReadFails = true;
+
+      const served = await getBoard(project);
+      expect(served.upNextAbsence).toBe("policy-unreadable");
+      expect(served.columns.backlog[0]?.provenance).toBeUndefined();
+      expect(served.upNextPlanId).toBeUndefined();
+      // Both halves of the freshness token agree on that, or every poll re-reads instead of 304ing.
+      expect(await getBoardVersion(project)).toBe(served.version);
+    });
+
     it("names nothing while a lane is drawn", async () => {
       const board = [feature()];
       listMock.mockResolvedValue(board);

@@ -102,13 +102,15 @@ export async function getBoardVersion(project: Project): Promise<string> {
     hygiene,
     scan,
     deferralVersion(deferrals),
-    // Gated on OFFERING, exactly as the served board gates the marks themselves (`armedPlan` in
-    // getBoard): a picker that is switched off — or running below the level that offers its picks —
-    // carries no provenance, so letting a plan row written before that move the token would break a
-    // 304 and serve back data the client already holds. The stance itself is covered separately by
-    // upNextVersion, which is what makes a level change land on the next poll: moving between
-    // `propose` and `shadow` touches neither a bead, nor the plan row, nor the policy.
-    provenanceVersion(picker.offers ? plan : undefined, picker.policy),
+    // Gated exactly as the served board gates the marks themselves (`armedPlan` in getBoard) — on
+    // OFFERING, and on the policy being known: a picker that is switched off, running below the
+    // level that offers its picks, or whose policy anton could not read carries no provenance, so
+    // letting a plan row move the token would break a 304 and serve back data the client already
+    // holds. The two gates must stay identical or the poll's token and the served board's disagree
+    // and every poll re-reads. The stance itself is covered separately by upNextVersion, which is
+    // what makes a level change land on the next poll: moving between `propose` and `shadow`
+    // touches neither a bead, nor the plan row, nor the policy.
+    provenanceVersion(picker.offers && picker.policyKnown ? plan : undefined, picker.policy),
     upNextVersion(picker),
     project.repoPath,
   );
@@ -438,7 +440,14 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // would badge every old entry `◈ policy`. That badge is what `[Release]` is derived from
   // (isPickerPick), so ordinary Backlog cards would go on offering to record accepts against a pass
   // that no longer runs, or a level that never asked.
-  const armedPlan = picker.offers ? plan : undefined;
+  //
+  // And only while the armed policy is KNOWN (PR #226 review). A failed settings read fails soft to
+  // "offering" with no policy, which would leave the recorded plan reading as current — its digest
+  // compared against a stamp taken with no policy, so an admit-all plan armed under a since-narrowed
+  // one never falls stale. Its entries would keep their `◈ policy` badge and the `[Release]` derived
+  // from it, offering a start beside the very `policy-unreadable` absence that says anton will not
+  // guess. Withheld here, the plan retires with the ranking rather than outliving it.
+  const armedPlan = picker.offers && picker.policyKnown ? plan : undefined;
   // One clock read for both questions the picker is asked below — what would anton start now, and is
   // the recorded plan still that — so the lane and the badge can never be answering about different
   // moments.
@@ -474,6 +483,12 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // true — `decideBoardPickerPlan` is the pure decision the pass itself makes, and this read already
   // holds every input it takes. So a claim, a new bead or a lapsed hold re-ranks the lane on the next
   // read, where projecting a recorded plan could only blank it until the next pass ran.
+  //
+  // "Cheap" measured, on this repo's own 781-bead board (PR #226 review): ~35ms of CPU per read for
+  // the whole derivation, against ~1.2s for the `bd list` snapshot the read already spends. Most of
+  // it is duplicated — `eligibleTargets` walks the board three times (here, `armedPickerPolicy`,
+  // `boardProvenance`) and it is stamped twice — but ~3% of a read is not worth memoizing across
+  // these call sites, and the poll's 304 path (`getBoardVersion`) derives nothing at all.
   //
   // Gated on OFFERING, unchanged: a disarmed pass — or one at `propose` — puts no picks in front of
   // the operator, and a ranking computed anyway would draw the lane the level promised not to.

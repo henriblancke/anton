@@ -369,10 +369,29 @@ describe("a named absence in place of the lane (anton-w579)", () => {
     expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')).toBeTruthy();
   });
 
+  it("names an unreadable policy, and sends the operator where the sentence points", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("policy-unreadable")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("can’t read this project’s work policy");
+    // The instruction and the link must name ONE action: an operator told to reload and handed a
+    // settings link is being sent away from the board they were just told to stay on.
+    expect(lane.textContent).toContain("check the armed policy");
+    expect(lane.textContent).not.toContain("Reload");
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')?.textContent).toBe(
+      "Work policy",
+    );
+  });
+
   it("says which nothing it is rather than counting zero picks", () => {
     // A `0` in the count's place is the one reading this must never give: two of the three states
     // say nothing at all about how much work the board holds.
-    for (const absence of ["disarmed", "proposes-only", "no-claimable-work"] as const) {
+    for (const absence of [
+      "disarmed",
+      "proposes-only",
+      "policy-unreadable",
+      "no-claimable-work",
+    ] as const) {
       cleanup();
       render(<EpicBoard slug="tmp" initialBoard={withAbsence(absence)} />);
       expect(absenceLane().textContent).not.toMatch(/(^|\s)0(\s|$)/);

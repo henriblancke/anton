@@ -205,8 +205,10 @@ const ABSENCE_COPY: Record<
   "policy-unreadable": {
     badge: "?",
     headline: "anton can’t read this project’s work policy, so it won’t guess a ranking.",
-    clears:
-      "Reload the board — a ranking drawn without the armed policy would offer targets it rejects.",
+    // The only absence with no operator action to name: the next board read retries the settings on
+    // its own. So the sentence sends them to the same place the link does — the panel that says what
+    // is armed — rather than to a reload the board is already doing.
+    clears: "The next board read retries it — check the armed policy if this lane stays empty.",
     link: { label: "Work policy", hash: "policy" },
   },
   "no-claimable-work": {
