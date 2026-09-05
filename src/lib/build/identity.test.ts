@@ -342,6 +342,47 @@ describe("readBuildIdentity", () => {
     expect(readBuildIdentity(dir).worktree).toBe(first);
   });
 
+  // `--exclude-standard` applies GIT's exclusions and knows nothing of anton's. An operator who
+  // points `ANTON_DB` at an in-tree path no `.gitignore` covers had every database write move this
+  // digest, so the running server read as modified forever and each later start rebuilt an artifact
+  // already current — the failure the git-less walk's exclusion exists to prevent, reached by the
+  // other reader. A checkout and a tarball of it have to answer the same here (PR #217 review).
+  it("ignores the state a configured ANTON_DB places inside a tracked checkout", () => {
+    const dir = gitCheckout();
+    const env = { ANTON_DB: join("state", "anton.db") };
+    mkdirSync(join(dir, "state"));
+    writeFileSync(join(dir, "state", "anton.db"), "sqlite");
+    const first = readBuildIdentity(dir, env).worktree;
+
+    // The writes a running server makes, none of which is a change to the code it compiled.
+    writeFileSync(join(dir, "state", "anton.db"), "sqlite after a job wrote to it");
+    writeFileSync(join(dir, "state", "anton.db-wal"), "wal");
+    writeFileSync(join(dir, "state", buildRecordFile(process.pid)), "{}");
+    expect(readBuildIdentity(dir, env).worktree).toBe(first);
+
+    // Named entries, not the whole directory: ordinary source under that path is still build input.
+    writeFileSync(join(dir, "state", "schema.ts"), SOURCE);
+    expect(readBuildIdentity(dir, env).worktree).not.toBe(first);
+  });
+
+  // A configured DIRECTORY excludes everything beneath it, the same way the walk never descends into
+  // one — session logs are written continuously, so a digest that saw them would never settle.
+  it("ignores a whole configured sessions root inside a tracked checkout", () => {
+    const dir = gitCheckout();
+    const env = { ANTON_SESSIONS_ROOT: join("var", "sessions") };
+    mkdirSync(join(dir, "var", "sessions", "abc"), { recursive: true });
+    writeFileSync(join(dir, "var", "sessions", "abc", "log.txt"), "one");
+    const first = readBuildIdentity(dir, env).worktree;
+
+    writeFileSync(join(dir, "var", "sessions", "abc", "log.txt"), "one, then a great deal more");
+    writeFileSync(join(dir, "var", "sessions", "def.json"), "{}");
+    expect(readBuildIdentity(dir, env).worktree).toBe(first);
+
+    // ...and an untracked file that is NOT state still moves it, so the digest is not simply blind.
+    writeFileSync(join(dir, "page.tsx"), "export default () => null;\n");
+    expect(readBuildIdentity(dir, env).worktree).not.toBe(first);
+  });
+
   // Next reads `.env*` at BUILD time and inlines every NEXT_PUBLIC_* value into the bundle, but the
   // file is gitignored — so without naming it back in, changing a compiled-in value leaves the
   // digest untouched and `anton start` serves the old value while calling the build current.

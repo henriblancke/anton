@@ -281,8 +281,21 @@ function git(appRoot, args, input) {
  * `--ignore-submodules=none` because that flattened line is the only record of a submodule moving to
  * a different commit, and either repository's config (`diff.ignoreSubmodules`,
  * `submodule.<name>.ignore`) can otherwise suppress it.
+ *
+ * The configured runtime state `runtimeStatePaths` names is dropped from the UNTRACKED list, exactly
+ * as the git-less walk drops it (PR #217 review). `--exclude-standard` applies git's exclusions and
+ * knows nothing of anton's: an operator who points `ANTON_DB` or `ANTON_SESSIONS_ROOT` at an in-tree
+ * path that no `.gitignore` covers had every database write and session log move this digest, so the
+ * running server read as modified forever and each later start rebuilt an artifact that was already
+ * current — the failure the source walk's exclusion exists to prevent, reached by the other reader.
+ * A checkout and a tarball of it must answer the same here, or the digest describes the install
+ * rather than the code.
+ *
+ * Only the untracked list is filtered. State an operator COMMITTED moves the tracked diff instead,
+ * which is one blob rather than a list of paths, and it is also no longer state git is silent about
+ * — it is a file in the tree, which this digest is right to see.
  */
-function readWorktreeDigest(appRoot) {
+function readWorktreeDigest(appRoot, env = process.env) {
   const listed = git(appRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (listed === null) return null;
   const diff = git(appRoot, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "HEAD"]);
@@ -295,11 +308,19 @@ function readWorktreeDigest(appRoot) {
   if (converted === null) return null;
   const envFiles = ignoredEnvFiles(appRoot);
   if (envFiles === null) return null;
-  const submodules = submoduleDigests(appRoot, trackedPaths(tracked, GITLINK_MODE));
+  const submodules = submoduleDigests(appRoot, trackedPaths(tracked, GITLINK_MODE), env);
   if (submodules === null) return null;
   const hidden = hiddenTrackedPaths(appRoot);
   if (hidden === null) return null;
-  const inputs = [...listed.split("\0").filter(Boolean), ...envFiles, ...links, ...converted, ...hidden];
+  const isState = runtimeStateEntry(appRoot, env);
+  const untracked = listed.split("\0").filter(Boolean);
+  const inputs = [
+    ...(isState ? untracked.filter((path) => !isState(path)) : untracked),
+    ...envFiles,
+    ...links,
+    ...converted,
+    ...hidden,
+  ];
   const files = [...new Set(inputs)].sort();
   if (!files.length && !diff && !submodules.length) return WORKTREE_CLEAN;
   const digest = createHash("sha256").update(diff).update("\0");
@@ -493,7 +514,7 @@ const SKIP_WORKTREE_TAG = "S";
  * Marking only the absent state keeps the ordinary checkout — every submodule present and committed
  * — reading `WORKTREE_CLEAN`.
  */
-function submoduleDigests(appRoot, paths) {
+function submoduleDigests(appRoot, paths, env) {
   const digests = [];
   for (const path of paths) {
     const root = join(appRoot, path);
@@ -501,7 +522,7 @@ function submoduleDigests(appRoot, paths) {
       digests.push([path, SUBMODULE_ABSENT]);
       continue;
     }
-    const worktree = readWorktreeDigest(root);
+    const worktree = readWorktreeDigest(root, env);
     if (worktree === null) return null;
     if (worktree !== WORKTREE_CLEAN) digests.push([path, worktree]);
   }
@@ -920,6 +941,38 @@ function pathKeys(dir) {
 }
 
 /**
+ * Is this repo-relative path configured runtime state? The same exclusion `sourceSkip` applies,
+ * asked of a path git reported rather than of an entry a walk is standing on (PR #217 review).
+ *
+ * Null when the environment configures none, so the caller can skip the pass entirely.
+ *
+ * The predicates are registered per DIRECTORY, so the path is walked component by component and each
+ * asked of the directory above it — which is how a configured directory (`ANTON_SESSIONS_ROOT`)
+ * excludes everything beneath it, the same way the walk never descends into one. Only the state
+ * predicates apply here, never `skipsSourceEntry`: those names are what a SOURCE walk ignores, and
+ * git has already applied its own exclusions to this list.
+ */
+function runtimeStateEntry(appRoot, env) {
+  const { byDir } = runtimeStatePaths(appRoot, env);
+  if (byDir.size === 0) return null;
+  let root;
+  try {
+    root = realpathSync(appRoot);
+  } catch {
+    root = appRoot;
+  }
+  return (path) => {
+    let dir = root;
+    for (const part of path.split("/")) {
+      const matchers = byDir.get(dir);
+      if (matchers !== undefined && matchers.some((matches) => matches(part))) return true;
+      dir = join(dir, part);
+    }
+    return false;
+  };
+}
+
+/**
  * What a source walk skips for this install: the fixed root names, plus whatever runtime state the
  * environment has placed inside the tree.
  */
@@ -1334,7 +1387,7 @@ export function readBuildIdentity(appRoot, env = process.env) {
   return {
     version: readVersion(appRoot),
     revision,
-    worktree: revision && revision !== REVISION_UNREADABLE ? readWorktreeDigest(appRoot) : null,
+    worktree: revision && revision !== REVISION_UNREADABLE ? readWorktreeDigest(appRoot, env) : null,
     source: revision === null && !isBundleInstall(appRoot) ? readSourceDigest(appRoot, env) : null,
     env: readEnvDigest(env, appRoot),
   };
