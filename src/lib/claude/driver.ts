@@ -76,15 +76,16 @@ function abortError(): Error {
  * signal the whole process GROUP, since Node's built-in AbortSignal handling reaches only the
  * direct child and would leave the shell commands claude spawned orphaned.
  *
- * A CANCELLED session settles only once that group is actually gone (PR #228 review). Signalling is
- * not stopping: Node emits the abort's `error` the instant it delivers SIGTERM, and claude — or a
- * test runner, a formatter, a `git` it spawned — keeps writing the worktree until it exits. The
- * ticket-timeout path re-runs the verify gates and COMMITS that tree the moment this promise
- * settles, so settling on the signal hands it a snapshot still being written: the commit is
- * inconsistent, and whatever lands after the final cleanliness check is thrown away with the failed
- * run's worktree. So an abort holds its rejection until the whole GROUP is gone — not merely until
- * the direct child closes, which a descendant that traps the signal outlives — escalating
- * SIGTERM → SIGKILL for anything that ignores the first one.
+ * A FORCIBLY TERMINATED session — cancelled, or killed as stalled — settles only once that group is
+ * actually gone (PR #228 review). Signalling is not stopping: Node emits the abort's `error` the
+ * instant it delivers SIGTERM, and claude — or a test runner, a formatter, a `git` it spawned —
+ * keeps writing the worktree until it exits. The ticket-timeout path re-runs the verify gates and
+ * COMMITS that tree the moment this promise settles, so settling on the signal hands it a snapshot
+ * still being written: the commit is inconsistent, and whatever lands after the final cleanliness
+ * check is thrown away with the failed run's worktree. So both terminations hold their rejection
+ * until the whole GROUP is gone — not merely until the direct child closes, which a descendant that
+ * traps the signal or holds none of claude's pipes outlives — escalating SIGTERM → SIGKILL for
+ * anything that ignores the first one.
  */
 function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Promise<ClaudeResult> {
   return new Promise<ClaudeResult>((resolve, reject) => {
@@ -174,17 +175,27 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
     });
     /**
      * Settle once the process GROUP is empty, not merely the direct child (PR #228 review). Claude
-     * exiting on SIGTERM proves nothing about the shell command it spawned: a descendant that traps
-     * the signal and holds none of claude's pipes lets `close` fire while it keeps writing the
+     * exiting proves nothing about the shell command it spawned: a descendant that traps the signal
+     * — or that simply holds none of claude's pipes — lets `close` fire while it keeps writing the
      * worktree, and the ticket-timeout path verifies and commits that tree the instant this promise
      * settles. So the escalation is delivered NOW rather than waiting out its timer, and the
-     * rejection waits for the group to actually go — bounded by `abandon`, which stays armed: a
-     * group that cannot be reaped must not wedge the run.
+     * rejection waits for the group to actually go.
+     *
+     * Both forced endings come through here. A stalled session's group-wide SIGKILL is a DELIVERY,
+     * not an exit — a tool process dies no more promptly for it than a cancelled one does — so the
+     * watchdog path needs the same wait, and (having no timer of its own) arms the bound here.
      */
     const settleWhenGroupGone = (finish: () => void) => {
+      if (settled) return;
       killTree(child, "SIGKILL");
       if (escalate) clearTimeout(escalate);
       escalate = undefined;
+      // The wait must stay bounded: a group that cannot be reaped is unreapable rather than a live
+      // writer, and holding for it would wedge the run instead of protecting the tree.
+      if (!abandon) {
+        abandon = setTimeout(() => settle(finish), abortGraceMs() * 2);
+        abandon.unref?.();
+      }
       const poll = () => {
         // `abandon` may have given up on this group already; without this the loop would outlive
         // the settled promise, polling a group nothing is waiting on for the process's lifetime.
@@ -207,11 +218,15 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
         settleWhenGroupGone(() => reject(aborting as Error));
         return;
       }
-      settle(() => {
+      const finish = () => {
         const error = exitError({ code, stalled: watchdog.stalled, stallMs, stderr, stream });
         if (error) reject(error);
         else resolve(toClaudeResult(stream));
-      });
+      };
+      // A stalled session was killed the same group-wide way a cancelled one is, so it inherits the
+      // same hazard: claude's `close` says nothing about the tool process still writing the tree.
+      if (watchdog.stalled) settleWhenGroupGone(finish);
+      else settle(finish);
     });
   });
 }

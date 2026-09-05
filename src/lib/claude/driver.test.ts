@@ -2,12 +2,29 @@
  * Headless claude driver (anton-dzh.3): stream-json parsing, event normalization, and
  * usage-limit detection against fake claude binaries (no network / no real claude needed).
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
 import { ABORT_GRACE_ENV, CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
+
+/**
+ * `groupAlive` is answered through a hook so a test can hold a group "alive" on demand. SIGKILL
+ * cannot be trapped, so no fake descendant can be made to reliably outlive the direct child on real
+ * timing — and without that hold there is nothing to prove the driver waits for the group at all.
+ * Unset, every call goes straight to the real implementation.
+ */
+const spawnHooks = vi.hoisted(() => ({ groupAlive: null as (() => boolean) | null }));
+
+vi.mock("./driver-spawn", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./driver-spawn")>();
+  return {
+    ...actual,
+    groupAlive: (...args: Parameters<typeof actual.groupAlive>) =>
+      spawnHooks.groupAlive?.() ?? actual.groupAlive(...args),
+  };
+});
 
 let dir: string;
 let prevBin: string | undefined;
@@ -71,6 +88,18 @@ function alive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Wait for a fixture's own "I am up" signal. A fixed sleep is not one: under a loaded full-suite
+ * run node's spawn alone can outlast it, and the test then aborts a process that never started.
+ */
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`fake claude never wrote ${basename(path)}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
@@ -1054,8 +1083,36 @@ describe("runClaude", () => {
     const caught = await runClaudeExpectingError(bin, { prompt: "wedge tree", stallTimeoutMs: 1_500 });
     expect(caught).toMatchObject({ signature: "stalled" });
 
-    const childPid = Number(readFileSync(childPidPath, "utf8"));
-    expect(await waitForProcessExit(childPid)).toBe(true);
+    // Asked with no grace at all (PR #228 review): a descendant merely on its way out is still a
+    // descendant writing the worktree, and the timeout path commits that tree as soon as this
+    // promise settles.
+    expect(alive(Number(readFileSync(childPidPath, "utf8")))).toBe(false);
+  });
+
+  // The same property proven directly: the watchdog's group-wide SIGKILL is a delivery, not an
+  // exit, so the rejection must wait on the group emptying rather than on claude's `close`.
+  it("holds a stalled session's rejection until its process group is gone", async () => {
+    const bin = writeFakeHangingClaude("stalled-held-claude", [
+      { type: "system", subtype: "init", session_id: "sess-stall-held" },
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+    let groupGone = false;
+    spawnHooks.groupAlive = () => !groupGone;
+
+    try {
+      const run = runClaude({ cwd: dir, prompt: "wedge", stallTimeoutMs: 500 });
+      const outcome = await Promise.race([
+        run.then(() => "settled", () => "settled"),
+        new Promise((r) => setTimeout(() => r("waiting"), 1_200)),
+      ]);
+      // Well past the watchdog firing and claude's own close: only the live group holds this back.
+      expect(outcome).toBe("waiting");
+
+      groupGone = true;
+      await expect(run).rejects.toMatchObject({ signature: "stalled" });
+    } finally {
+      spawnHooks.groupAlive = null;
+    }
   });
 
   // PR #228 review: the ticket-timeout path re-runs the verify gates and COMMITS the worktree as
@@ -1069,10 +1126,13 @@ describe("runClaude", () => {
       process.env[CLAUDE_BIN_ENV] = bin;
       const control = new AbortController();
 
-      const run = runClaude({ cwd: dir, prompt: "cancel me", signal: control.signal });
+      let up = () => {};
+      const started = new Promise<void>((resolve) => { up = resolve; });
+      const run = runClaude({ cwd: dir, prompt: "cancel me", signal: control.signal, onEvent: up });
       // Abort only once the fake is up and has trapped SIGTERM — before that it would die on the
-      // default disposition and prove nothing.
-      await new Promise((r) => setTimeout(r, 300));
+      // default disposition and prove nothing. It writes its first event after installing the trap,
+      // so that event is the proof; a fixed sleep only guesses at it.
+      await started;
       control.abort();
 
       await expect(run).rejects.toMatchObject({ name: "AbortError" });
@@ -1094,7 +1154,7 @@ describe("runClaude", () => {
 
       try {
         const run = runClaude({ cwd: dir, prompt: "trap sigterm", signal: control.signal });
-        await new Promise((r) => setTimeout(r, 300));
+        await waitForFile(pidPath);
         control.abort();
 
         await expect(run).rejects.toMatchObject({ name: "AbortError" });
@@ -1122,7 +1182,9 @@ describe("runClaude", () => {
 
       try {
         const run = runClaude({ cwd: dir, prompt: "cancel my tree", signal: control.signal });
-        await new Promise((r) => setTimeout(r, 400));
+        // The descendant's pid file is written by the descendant itself: waiting for it is what
+        // makes "the group still holds a writer" true at the moment of the abort.
+        await waitForFile(pidPath);
         control.abort();
 
         await expect(run).rejects.toMatchObject({ name: "AbortError" });
