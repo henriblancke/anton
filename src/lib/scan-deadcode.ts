@@ -25,7 +25,13 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
-import { aliasTarget, claimingRules, readDirAliases, type AliasRule } from "./scan-coupling";
+import {
+  aliasTarget,
+  claimingRules,
+  moduleSpecifiers,
+  readDirAliases,
+  type AliasRule,
+} from "./scan-coupling";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -829,6 +835,14 @@ interface SubstitutionState {
   depth: number;
   /** Whether a backquoted span is open. */
   backtick: boolean;
+  /**
+   * The quote a `$(` substitution is standing inside, if any. The shell parses quotes there, so a
+   * parenthesis under one is text: `$(printf '(')` closes on its only real `)`, and counting the
+   * quoted one leaves the depth open past it — every later payload line then reads as code and a
+   * `Widget` written in the payload invents a caller (PR #190 review). It carries between lines
+   * because a quoted argument can span them.
+   */
+  quote?: string;
 }
 
 const NO_SUBSTITUTION: SubstitutionState = { depth: 0, backtick: false };
@@ -838,10 +852,10 @@ function unmaskedSubstitutions(
   from: SubstitutionState = NO_SUBSTITUTION,
 ): { text: string } & SubstitutionState {
   const out = blankAll(line).split("");
-  let { depth, backtick } = from;
+  let { depth, backtick, quote } = from;
   for (let at = 0; at < line.length; at += 1) {
     const inside = depth > 0 || backtick;
-    if (line[at] === "\\") {
+    if (line[at] === "\\" && quote !== "'") {
       if (inside) out[at] = line[at];
       at += 1;
       if (inside && at < line.length) out[at] = line[at];
@@ -863,6 +877,19 @@ function unmaskedSubstitutions(
       continue;
     }
     if (depth === 0) continue;
+    // Inside a substitution the shell still parses quotes, so a parenthesis under one is text and
+    // must not move the depth (PR #190 review). The quote itself is code — it is part of the
+    // command being run — so it is copied like everything else in the span.
+    if (quote !== undefined) {
+      if (line[at] === quote) quote = undefined;
+      out[at] = line[at];
+      continue;
+    }
+    if (line[at] === "'" || line[at] === '"') {
+      quote = line[at];
+      out[at] = line[at];
+      continue;
+    }
     if (line[at] === "(") depth += 1;
     else if (line[at] === ")") {
       depth -= 1;
@@ -870,7 +897,7 @@ function unmaskedSubstitutions(
     }
     out[at] = line[at];
   }
-  return { text: out.join(""), depth, backtick };
+  return { text: out.join(""), depth, backtick, quote };
 }
 
 /**
@@ -909,7 +936,7 @@ function maskHeredocs(text: string): string {
         // substitutions running, and those are code however the rest of the payload reads.
         if (open.quoted) return blankAll(line);
         const masked = unmaskedSubstitutions(line, substitution);
-        substitution = { depth: masked.depth, backtick: masked.backtick };
+        substitution = { depth: masked.depth, backtick: masked.backtick, quote: masked.quote };
         return masked.text;
       }
       // Openers are read off the CODE part only. This pass runs before the comment grammar, so a
@@ -3487,6 +3514,50 @@ async function defaultBindingCallers(
 }
 
 /**
+ * The callers whose evidence belongs to `module`, out of the ones found for a symbol that MORE THAN
+ * ONE file declares.
+ *
+ * A grep answers per SYMBOL, and two packages exporting `parse` share every hit — so a file that
+ * imports and calls only `a.ts`'s `parse` was read as a caller of `b.ts`'s too, and both findings
+ * were dropped though only one had a caller (PR #190 review). A file's own imports say which module
+ * it means, and `specifierNames` already answers that question for the default-binding search.
+ *
+ * A caller that names NO declaring module keeps counting for all of them, which is what this pass
+ * did for every caller before. Its reference is real — the grep found the symbol on a code line —
+ * and nothing here can say which declaration it meant: the two modules may be reached through a
+ * language this reader parses no imports for, or through a re-export, or the file may be in the
+ * same package. Crediting it to one and not the other would be a guess, and dropping it from all of
+ * them would resurrect a finding the tree contradicts. So the narrowing only ever acts on evidence
+ * it can attribute, and the ambiguous rest stays shared.
+ */
+async function callersNaming(
+  repoPath: string,
+  module: string,
+  declaring: ReadonlySet<string>,
+  callers: readonly string[],
+  masked: Map<string, MaskedFile | undefined>,
+  aliases: AliasCache,
+  abort?: AbortSignal,
+): Promise<string[]> {
+  const mine: string[] = [];
+  for (const file of callers) {
+    abort?.throwIfAborted();
+    const entry = await maskedFile(repoPath, file, masked, abort);
+    const specs = entry ? moduleSpecifiers(entry.program.join("\n")) : [];
+    if (specs.length === 0) {
+      mine.push(file);
+      continue;
+    }
+    const governing = await aliasesGoverning(repoPath, file, aliases);
+    const named = [...declaring].filter((declared) =>
+      specs.some((spec) => specifierNames(file, spec, declared, governing)),
+    );
+    if (named.length === 0 || named.includes(module)) mine.push(file);
+  }
+  return mine;
+}
+
+/**
  * Drop the deadcode signals the tree contradicts, and say which. Runs BEFORE annotation, in
  * lib/stringer's one filter seam, so the health record's counts and the triage prompt's file
  * describe the same set.
@@ -3584,7 +3655,14 @@ export async function filterDeadcodeSignals(
     }
 
     const declaring = declarers.get(symbol) ?? new Set([path]);
-    const callers = files.filter((file) => !declaring.has(file));
+    const shared = files.filter((file) => !declaring.has(file));
+    // A symbol only one file declares has nothing to attribute: every caller is its caller. Two or
+    // more, and the grep's per-symbol answer has to be narrowed to this signal's own module before
+    // it can contradict this signal (PR #190 review).
+    const callers =
+      declaring.size > 1 && shared.length > 0
+        ? await callersNaming(repoPath, path, declaring, shared, masked, aliases, abort)
+        : shared;
     if (callers.length === 0) continue;
     const shown = callers.slice(0, 3);
     const rest = callers.length - shown.length;

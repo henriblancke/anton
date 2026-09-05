@@ -118,6 +118,16 @@ function isTypeOnly(statement: string): boolean {
   return bindings.length > 0 && bindings.every((name) => /^type\s/.test(name));
 }
 
+/**
+ * Every module specifier a file names, however it imports it — the `from` clauses, the side-effect
+ * imports and the dynamic `import()`/`require()` calls, without the type-only judgement the graph
+ * needs. What a file names is how the dead-code filter tells WHICH declaring module a caller is a
+ * caller of, when two of them export the same symbol (PR #190 review).
+ */
+export function moduleSpecifiers(source: string): string[] {
+  return [...new Set(parseEdges(source).map((edge) => edge.spec))];
+}
+
 function parseEdges(source: string): RawEdge[] {
   const edges: RawEdge[] = [];
   for (const match of source.matchAll(FROM_STATEMENT)) {

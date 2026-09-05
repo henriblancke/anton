@@ -3057,6 +3057,68 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.js");
     });
 
+    // A grep answers per SYMBOL, so two packages exporting `parse` share every hit. A file that
+    // imports and calls only one of them was read as a caller of both, and both findings were
+    // dropped though only one had a caller (PR #190 review).
+    it("credits a caller to the module it imports, not to every namesake", async () => {
+      const repo = initRepo({
+        "packages/a/parse.ts": "export function parse() {\n  return 1;\n}\n",
+        "packages/b/parse.ts": "export function parse() {\n  return 2;\n}\n",
+        "src/caller.ts": "import { parse } from '../packages/a/parse';\nexport const go = () => parse();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/a/parse.ts", "parse"),
+        unused("packages/b/parse.ts", "parse"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // b's finding survives; a's is dropped, naming the caller that actually imports it.
+      expect(result.signals).toMatchObject([{ FilePath: "packages/b/parse.ts" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ path: "packages/a/parse.ts" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/caller.ts");
+    });
+
+    // A caller that names no declaring module at all still counts for every one of them: its
+    // reference is real and nothing here can say which declaration it meant.
+    it("keeps an unattributable reference shared between namesakes", async () => {
+      const repo = initRepo({
+        "packages/a/parse.ts": "export function parse() {\n  return 1;\n}\n",
+        "packages/b/parse.ts": "export function parse() {\n  return 2;\n}\n",
+        "scripts/run.py": "parse()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/a/parse.ts", "parse"),
+        unused("packages/b/parse.ts", "parse"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toHaveLength(2);
+    });
+
+    // A parenthesis under a quote inside `$(…)` is text, not nesting: counting it leaves the depth
+    // open past the real `)`, exposing every later payload line as code (PR #190 review).
+    it("does not count a quoted parenthesis inside a heredoc substitution", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/quoted.sh": "cat <<EOF > a.ts\n$(printf '(')\nneverCalled();\nEOF\n",
+        // Not vacuous: a real substitution on the same shape still counts as a caller.
+        "src/lib/other.ts": "export function alsoCalled() {}\n",
+        "scripts/real.sh": "cat <<EOF > b.ts\n$(alsoCalled)\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+        unused("src/lib/other.ts", "alsoCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "alsoCalled" }]);
+    });
+
     // A declaration broken after `export default` is still that module's default; the head has to
     // reach across the newline to find the name.
     it("counts a default export whose head is broken across lines", async () => {
@@ -4736,8 +4798,11 @@ describe("scan", () => {
     });
 
     // The sibling exclusion must not swallow a real caller: a third file that calls the symbol still
-    // drops both signals, so the fix stays a declaration rule rather than a blanket mute.
-    it("still drops namesake declarations when a third file calls the symbol", async () => {
+    // drops the signal it belongs to, so the fix stays a declaration rule rather than a blanket
+    // mute. Which signal that is now follows the caller's own import — it names `packages/b`, so
+    // `packages/a`'s `format` keeps its finding rather than being dropped on a namesake's evidence
+    // (PR #190 review; this assertion previously read "both", which was the bug).
+    it("drops the namesake the caller actually imports, and only that one", async () => {
       const repo = initRepo({
         "packages/a/format.ts": "export function format() {}\n",
         "packages/b/format.ts": "export function format() {}\n",
@@ -4749,8 +4814,8 @@ describe("scan", () => {
         unused("packages/b/format.ts", "format"),
       ]);
 
-      expect(result.kept).toEqual([]);
-      expect(result.deadcode.dropped).toHaveLength(2);
+      expect(result.kept).toMatchObject([{ FilePath: "packages/a/format.ts" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ path: "packages/b/format.ts" }]);
       expect(result.deadcode.dropped[0].reason).toContain("packages/b/use.ts");
       expect(result.deadcode.dropped[0].reason).not.toContain("format.ts");
     });
