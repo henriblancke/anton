@@ -1635,13 +1635,13 @@ export function birthStampVerdict(stored, now) {
 }
 
 /**
- * Two procfs stamps compared field by field: the tick counter always, the boot id only when BOTH
- * carry one.
+ * Two procfs stamps compared field by field: the tick counter always, then the boot id, whose
+ * absence means different things on either side of the comparison.
  *
  * The boot id is a qualifier this reader gained after stamps were already on disk (PR #217 review),
- * and an absence on either side is not evidence — the rule the identity comparison already applies
- * to every field added after the fact. A stamp written by the previous anton says exactly what it
- * always said, no more: same counter, same process. Comparing it against a qualified one as a plain
+ * and an absence in the STORED stamp is not evidence — the rule the identity comparison already
+ * applies to every field added after the fact. A stamp written by the previous anton says exactly
+ * what it always said, no more: same counter, same process. Comparing it against a qualified one as a plain
  * string would instead make every stamped daemon on Linux unprovable across the upgrade that
  * introduced the field, leaving `stop`, `update` and `uninstall` refusing to act on a server that is
  * perfectly fine until the operator killed it by hand.
@@ -1650,16 +1650,25 @@ export function birthStampVerdict(stored, now) {
  * collision this qualifier exists to catch, and the recorded process is proven gone — nothing
  * survives a reboot.
  *
+ * The two absences are NOT the same absence, and the direction decides which (PR #217 review). A
+ * stored stamp that never carried an id was written by an anton that could not record one, and
+ * saying `same` on the counter alone is the reading it has always had. A stored stamp that DOES
+ * carry one, reread on a machine that now answers without it — a remounted procfs, a container that
+ * hides the file — is the opposite case and fails closed exactly as an unreadable birth time does
+ * (see `recordAlive`): the id is there because this machine could read it at boot, so losing it now
+ * leaves a reboot's worth of pid reuse indistinguishable from the live process, which is the whole
+ * hole the qualifier was added to close.
+ *
  * @param {string} stored
  * @param {string} now
- * @returns {"same"|"different"}
+ * @returns {"same"|"different"|"unknown"}
  */
 function procStampVerdict(stored, now) {
   const [, storedTicks, storedBoot] = stored.split(":");
   const [, nowTicks, nowBoot] = now.split(":");
   if (storedTicks !== nowTicks) return "different";
-  if (!storedBoot || !nowBoot) return "same";
-  return storedBoot === nowBoot ? "same" : "different";
+  if (!storedBoot) return "same";
+  return !nowBoot ? "unknown" : storedBoot === nowBoot ? "same" : "different";
 }
 
 /**
@@ -1699,6 +1708,13 @@ export function recordAlive(record, startedAt = processStartedAt) {
  * unaccounted for on every later read, when the next read that CAN resolve the stamp would have
  * named it again.
  *
+ * A record is JSON off disk, so the stamp is CHECKED rather than cast (PR #217 review). `startedAt`
+ * arriving as a number — a hand-edited file, a format this reader predates — would otherwise reach
+ * the string comparison and throw, and the throw does not stay local: `anton doctor` aborts, and the
+ * Health path catches it into an empty result, so one malformed file silently suppresses every
+ * build-drift answer anton has. A stamp it cannot read is the unverifiable case, which is already
+ * spelled here — the record names nobody, and is not deleted for it.
+ *
  * @param {{[key: string]: unknown}|null|undefined} record
  * @param {(pid: number) => string|null} [startedAt]
  * @returns {{alive: boolean, stale: boolean}}
@@ -1706,8 +1722,9 @@ export function recordAlive(record, startedAt = processStartedAt) {
 export function recordVerdict(record, startedAt = processStartedAt) {
   if (!record || !pidAlive(record.pid)) return { alive: false, stale: true };
   if (!record.startedAt) return { alive: true, stale: false };
+  if (typeof record.startedAt !== "string") return { alive: false, stale: false };
   const verdict = birthStampVerdict(
-    /** @type {string} */ (record.startedAt),
+    record.startedAt,
     startedAt(/** @type {number} */ (record.pid)),
   );
   if (verdict === "same") return { alive: true, stale: false };

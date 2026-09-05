@@ -1690,11 +1690,37 @@ describe("the record a running server leaves", () => {
     const legacy = "proc:4212345";
     const qualified = "proc:4212345:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa";
     expect(birthStampVerdict(legacy, qualified)).toBe("same");
-    expect(birthStampVerdict(qualified, legacy)).toBe("same");
     // ...and says no more than it ever did: a different counter is still a different process.
     expect(birthStampVerdict(legacy, "proc:9999999:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa")).toBe("different");
     // The other reader remains incomparable either way.
     expect(birthStampVerdict(qualified, "ps:Wed Sep  2 07:16:57 2026")).toBe("unknown");
+  });
+
+  // The other direction is not the same absence: a stored stamp that HAS a boot id was written on a
+  // machine that could read one, so a reread answering without it — a remounted procfs, a container
+  // that hides the file — leaves a reboot's worth of pid reuse indistinguishable from the live
+  // process. That is the hole the qualifier exists to close, so it fails closed (PR #217 review).
+  it("refuses to vouch for a qualified stamp whose boot id cannot be reread", () => {
+    const qualified = "proc:4212345:8f3c1a2e-0000-4000-8000-aaaaaaaaaaaa";
+    expect(birthStampVerdict(qualified, "proc:4212345")).toBe("unknown");
+    // Unproven, not proven dead: the record survives to be named again by a read that can resolve it.
+    const record = { ...RUNNING, pid: process.pid, startedAt: qualified };
+    expect(recordVerdict(record, () => "proc:4212345")).toEqual({ alive: false, stale: false });
+    // A different counter still proves reuse without the id — the boot narrows nothing else.
+    expect(birthStampVerdict(qualified, "proc:9999999")).toBe("different");
+  });
+
+  // A record is JSON off disk. A `startedAt` that is not a string reached the string comparison and
+  // threw, and the throw did not stay local: doctor aborted and the Health path caught it into an
+  // empty result, so one malformed file silently suppressed every build-drift answer (PR #217
+  // review).
+  it("treats a record whose birth stamp is not a string as unverifiable rather than throwing", () => {
+    const malformed = { ...RUNNING, pid: process.pid, startedAt: 4212345 };
+    expect(() => recordVerdict(malformed)).not.toThrow();
+    expect(recordVerdict(malformed)).toEqual({ alive: false, stale: false });
+    expect(recordAlive(malformed)).toBe(false);
+    // An ABSENT stamp is the other case and still answers on the pid alone.
+    expect(recordVerdict({ ...RUNNING, pid: process.pid })).toEqual({ alive: true, stale: false });
   });
 
   // The prune is the only writer here, so it stands on the STALE half: a record kept one boot too
