@@ -7,8 +7,10 @@
  * reopenAbsorbedTimeouts}) — which is here because the verdict it acts on is this module's.
  */
 import { beads, gateReason, HUMAN_AGENT, labelValueOf, type Bead } from "../beads/bd";
+import { latestBlockNoteCommit } from "../beads/block-note";
 import { ownerOf } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { parseTicketNotes } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { blockedByPoison, PoisonEpic } from "./errors";
 import { mustPersist } from "./execute-epic-persist";
@@ -104,6 +106,239 @@ export function blockedRunPoison(beadId: string, readiness: RunReadiness, board:
   // parses the ids back out of it to report this stall as the gate's own wait rather than twice.
   const asks = openHumanGateAsks(board, readiness.blockers);
   return asks.length > 0 ? new PoisonEpic(`${blocked.message}. ${asks.join(" ")}`) : blocked;
+}
+
+/**
+ * The statuses `bd update --claim` refuses for a reason no retry and no agent can clear (anton-fude).
+ * Verified against bd 1.1.2 by claiming a bead in each status: `open` is the only status
+ * claimable by an actor that does not already hold the bead (`in_progress` re-claims by the
+ * same actor succeed — that idempotency is what lets a resume re-claim its own ticket cleanly).
+ *
+ * `closed` is deliberately absent — a closed ticket is settled work the dispatch loop skips (or
+ * reopens for a cross-machine resume) long before the claim — and so is `in_progress`, which is an
+ * ownership question runTicket's own claim gate answers. What is left is the two states a PERSON
+ * writes: `blocked` (anton's own human-review verdict on a ticket that delivered nothing) and
+ * `deferred` (snoozed out of the queue).
+ */
+const HUMAN_HELD_STATUSES: ReadonlySet<string> = new Set(["blocked", "deferred"]);
+
+/** A ticket no run may claim until a person moves it, and the account the board carries for it. */
+export interface HumanHeldTicket {
+  id: string;
+  status: string;
+  /** anton's newest note on the bead — why it blocked the ticket — when it left one. */
+  note?: string;
+  /**
+   * The branch + short sha of the work this ticket's block left behind, when its note records a
+   * commit. Both halves matter: the remedy this ticket is owed ({@link humanHeldClause}) turns on
+   * whether that branch is the one THIS run ships. The sha is absent when the run that wrote the
+   * note could not read it — a commit that cannot be located is still a commit.
+   */
+  committed?: { branch: string; head?: string };
+}
+
+/**
+ * The run's tickets a person has to release before any run can dispatch them (anton-fude).
+ *
+ * A run that blocks a ticket for human review — the no-delivery gate's verdict — leaves the board in
+ * a state its own resume cannot walk past: the ticket is neither closed nor abandoned, so the
+ * dispatch loop hands it to runTicket, whose first act is the hard claim gate bd refuses outright.
+ * Answering it HERE, off the board, is what turns that into a park naming the ticket instead of a
+ * claim failure blamed on a foreign operator or a locked DB.
+ *
+ * Abandoned tickets are excluded for the same reason the dispatch loop drops them: a human already
+ * settled them, and this run runs without them.
+ *
+ * Judges only the tickets handed to it, and the caller hands it the ones this run would DISPATCH: a
+ * child a cross-run blocker holds is never claimed this pass, so parking over its status would stall
+ * its independent siblings (PR #227 review).
+ */
+export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
+  return tickets
+    .filter((t) => HUMAN_HELD_STATUSES.has(t.status) && !beads.isAbandoned(t))
+    .map((t) => {
+      const notes = machineNotes(t);
+      const note = clampNote(notes.at(-1));
+      // Read off the FULL notes, never the clamped one: the evidence clause sits at the end of a
+      // block note, which is exactly what the cap above cuts off.
+      const commit = latestBlockNoteCommit(notes);
+      return {
+        id: t.id,
+        status: t.status,
+        ...(note ? { note } : {}),
+        ...(commit?.committed
+          ? { committed: { branch: commit.branch, ...(commit.head ? { head: commit.head } : {}) } }
+          : {}),
+      };
+    });
+}
+
+/** How much of a bead's note one park message may carry — enough to act on, bounded for the row. */
+const HELD_NOTE_CHARS = 300;
+
+/**
+ * A bead's machine notes, newest last: anton's own account of why it stopped there. Human notes are
+ * excluded — a person's steer is written to the AGENT, not to the operator reading this park.
+ */
+function machineNotes(bead: Bead): string[] {
+  return parseTicketNotes(bead.notes)
+    .filter((n) => n.source === "system")
+    .map((n) => n.text);
+}
+
+/** One note as the run row may carry it: flattened, and capped so a runaway can't bloat the park. */
+function clampNote(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > HELD_NOTE_CHARS ? `${flat.slice(0, HELD_NOTE_CHARS).trimEnd()}…` : flat;
+}
+
+/**
+ * Where a held ticket's work stands relative to the pull request THIS run opens — the only thing its
+ * remedy turns on (PR #227 review).
+ *
+ * `here` is the sole verdict that licenses "review it and close", and it takes a git answer, never a
+ * branch NAME: anton's branches are deterministic per target, so a run resumed on another machine
+ * derives the same name over a checkout that lacks the commit its note records (the machine that
+ * made it parked before pushing) — the same cross-machine gap the dispatch loop closes with
+ * `worktreeHasCommitFor`. `elsewhere` is the note of a re-parented ticket, still pointing at its
+ * original run's branch. Both `elsewhere` and `absent` mean this run ships without that work.
+ *
+ * `unverified` is the note of a run that committed but could not read the sha (PR #227 review):
+ * there IS work, and git cannot be asked where it is without a commit to ask about. It is its own
+ * verdict rather than a lean either way — called `here` it would license closing a ticket whose work
+ * may be in no pull request, called `none` it would send an operator to redo work already on the
+ * branch.
+ */
+type HeldWork =
+  | { where: "none" }
+  | { where: "here"; head: string }
+  | { where: "elsewhere"; branch: string; head?: string }
+  | { where: "absent"; head: string }
+  | { where: "unverified"; branch: string };
+
+/** Read {@link HeldWork} off the ticket's note plus `commitsHere` — see {@link humanHeldPoison}. */
+function heldWork(
+  held: HumanHeldTicket,
+  branch: string,
+  commitsHere: ReadonlySet<string>,
+): HeldWork {
+  const committed = held.committed;
+  if (!committed) return { where: "none" };
+  if (committed.branch !== branch) return { where: "elsewhere", ...committed };
+  if (!committed.head) return { where: "unverified", branch };
+  return { where: commitsHere.has(held.id) ? "here" : "absent", head: committed.head };
+}
+
+/**
+ * What one held ticket owes the operator: why no run may take it, and the move that frees it.
+ *
+ * A blocked ticket has FIVE remedies, and which one applies turns on where its work landed
+ * (PR #227 review). Recommending `--status open` for a ticket that already committed HERE is wrong
+ * twice over: reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run
+ * dispatches the agent again ON TOP of that commit and can block right back at the same zero diff —
+ * and abandoning it drops the work from the board while its commit stays on the run branch. That
+ * case is owed what the block note itself says: review the commit, then close.
+ *
+ * Work that is NOT here — committed on another branch, or on this branch but only in another
+ * machine's unpushed checkout — is owed the opposite of that: it is in no PR this run opens, so
+ * closing or abandoning the ticket settles the board over work this target never ships. Reopening is
+ * the move — the same one a zero-diff block gets — with the commit named so the operator can bring
+ * it across instead of redoing it.
+ *
+ * Work whose sha was never recorded is owed neither: the operator is pointed at the branch to settle
+ * the question a machine could not, because both remedies above are wrong on the wrong answer.
+ */
+function humanHeldClause(held: HumanHeldTicket, work: HeldWork, branch: string): string {
+  const why =
+    held.status === "deferred"
+      ? `${held.id} is deferred — snoozed out of the queue, so no run may claim it (\`bd undefer ` +
+        `${held.id}\` to bring it back)`
+      : work.where === "here"
+        ? `${held.id} is blocked pending human review with its work ALREADY COMMITTED on this ` +
+          `run's branch (@ ${work.head}) — review that commit and \`bd close ${held.id}\` if ` +
+          `it satisfies the ticket, which is what lets a resume walk past it; reopen it ` +
+          `(\`bd update ${held.id} --status open\`) only to have an agent keep working on top of ` +
+          `that commit`
+        : work.where === "elsewhere"
+          ? `${held.id} is blocked pending human review and its work was committed on ` +
+            `${work.branch}${work.head ? ` (@ ${work.head})` : ""}, NOT on this run's branch ` +
+            `(${branch}) — so this run's pull request does not contain it, and closing or ` +
+            `abandoning it would settle the board over work this target never ships. Reopen it ` +
+            `(\`bd update ${held.id} --status open\`) to have an agent redo it here, or land that ` +
+            `commit on ${branch} yourself before closing it`
+          : work.where === "absent"
+            ? `${held.id} is blocked pending human review and its note records a commit on ` +
+              `${branch} (@ ${work.head}) that is NOT on this machine's ${branch} — the run that ` +
+              `made it parked before pushing, so this run's pull request does not contain it and ` +
+              `closing or abandoning it would settle the board over work this run never ships. ` +
+              `Reopen it (\`bd update ${held.id} --status open\`) to have an agent redo it here, ` +
+              `or push that commit from the machine holding it and land it on ${branch} before ` +
+              `closing it`
+            : work.where === "unverified"
+              ? `${held.id} is blocked pending human review and its note records that its work ` +
+                `WAS committed on ${branch}, but the run could not read the commit's sha — so ` +
+                `nothing here can tell whether this run's pull request contains it. Find the ` +
+                `ticket's commit (\`git log --oneline ${branch} | grep ${held.id}\`): review it ` +
+                `and \`bd close ${held.id}\` if it satisfies the ticket, or reopen it ` +
+                `(\`bd update ${held.id} --status open\`) to have an agent redo it here if it is ` +
+                `not on the branch`
+              : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
+                `it is resolved)`;
+  return held.note ? `${why}: "${held.note}"` : why;
+}
+
+/**
+ * The park a run takes for a ticket only a person can release (anton-fude).
+ *
+ * PARK, never skip or auto-reopen. Reopening would re-run a ticket whose last run delivered nothing
+ * and land it right back in `blocked` — the human-review gate answered by the machine that tripped
+ * it — and skipping would open the target's single pull request missing work the board still shows
+ * as open, the same reason the allowlist and contract gates park rather than narrow.
+ *
+ * `commitsHere` is the caller's git-verified answer to "which of these tickets' recorded commits are
+ * actually reachable from `branch` on this machine" (PR #227 review). It is an INPUT rather than a
+ * read of this module's own because the module is board-only, and it is required rather than
+ * optional because every remedy that settles the board over a commit depends on it: a caller that
+ * cannot verify passes the empty set and gets the answers that leave the work in the operator's
+ * hands.
+ */
+export function humanHeldPoison(
+  targetId: string,
+  held: HumanHeldTicket[],
+  branch: string,
+  commitsHere: ReadonlySet<string>,
+): PoisonEpic {
+  const one = held.length === 1;
+  const it = one ? "it" : "them";
+  const work = held.map((h) => [h, heldWork(h, branch, commitsHere)] as const);
+  // Abandoning is a BOARD move, not a branch one: for a ticket whose work is verifiably ON THIS
+  // BRANCH it settles the bead and leaves the commit in the run's pull request, so it can't be
+  // offered as "drops the work". A commit this checkout does not have buys none of that — this run
+  // ships without it, so abandoning really does drop the work here (PR #227 review).
+  //
+  // A MIXED set names which tickets earn that reassurance (PR #227 review). An unqualified "a commit
+  // already on the branch stays in the pull request" reads as covering every ticket listed, so an
+  // operator abandoning the lot would drop the ones whose work is on another branch or another
+  // machine — the exact loss the per-ticket clauses above warn about.
+  const hereIds = work.filter(([, w]) => w.where === "here").map(([h]) => h.id);
+  const abandon =
+    hereIds.length === 0
+      ? `or abandon ${it}, which drops the work from this run`
+      : hereIds.length === work.length
+        ? `or abandon ${it} to settle the board — a commit already on the branch stays in this ` +
+          `run's pull request either way`
+        : `or abandon ${it} to settle the board, bearing in mind that only the ` +
+          `${hereIds.length === 1 ? "commit" : "commits"} already on this branch ` +
+          `(${hereIds.join(", ")}) ${hereIds.length === 1 ? "stays" : "stay"} in this run's pull ` +
+          `request either way — abandoning the rest drops that work from this run`;
+  return new PoisonEpic(
+    `${targetId} has ${one ? "a ticket" : `${held.length} tickets`} no agent can pick up: ` +
+      work.map(([h, w]) => humanHeldClause(h, w, branch)).join("; ") +
+      `. bd refuses \`--claim\` on ${one ? "that status" : "those statuses"}, so the run stopped ` +
+      `before dispatching anything rather than dying at the ticket's claim gate. Resolve ${it} — ` +
+      `${abandon} — then resume the run`,
+  );
 }
 
 /**

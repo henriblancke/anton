@@ -493,6 +493,32 @@ export async function worktreeHasCommitFor(
 }
 
 /**
+ * True when `commit` is reachable from `branch` in `repoPath` — "the work is in what this run
+ * ships", asked of git rather than inferred from a branch NAME (PR #227 review).
+ *
+ * anton's branches are deterministic per target, so a note recording a commit on `anton/<id>` says
+ * nothing about this machine: a run resumed elsewhere derives the same name over a worktree cut from
+ * origin, while the commit itself was never pushed and lives only where it was made — the same
+ * cross-machine gap {@link worktreeHasCommitFor} closes for the dispatch loop. Asked of the
+ * REPOSITORY, not a checkout, because worktrees share refs and objects: the answer holds for the
+ * run's worktree whether or not it exists yet, and a branch this machine has never seen resolves
+ * nowhere.
+ *
+ * Fails closed to `false` (unknown sha, missing branch, git error). "Absent" leaves the work in the
+ * operator's hands; "present" is what licenses settling the board over it.
+ */
+export async function branchContainsCommit(
+  repoPath: string,
+  branch: string,
+  commit: string,
+): Promise<boolean> {
+  return git(repoPath, ["merge-base", "--is-ancestor", commit, branch]).then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
  * What git's history says became of `path` on this branch — the raw read behind the `ref-stale`
  * repair (anton-fzas / R5.4). It reports; it does not judge. Whether a single destination is a
  * rename anton may follow, or a pointer it must refuse to guess at, is

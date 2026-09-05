@@ -6,7 +6,8 @@
  * and the note a blocked ticket leaves for the operator. The run-level walk owns which tickets run
  * and in what order; this owns what happens inside one.
  */
-import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
+import { blockNoteEvidence } from "../beads/block-note";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import { shadowNote } from "../gardener/repair";
@@ -141,14 +142,12 @@ async function claimTicket(
   // owner's claim. Claiming is idempotent for the same actor, so a resume re-claims cleanly. A
   // conflict aborts the run before any session/worktree work; the job retries and either skips the
   // now-closed ticket (already-closed check in the caller) or reclaims one whose owner released it.
+  // What a refusal actually means — and whether any retry can change it — is classified by
+  // {@link ticketClaimFailure}.
   try {
     await beads.claim(repo, ticket.id, operator);
   } catch (e) {
-    throw new Error(
-      `refusing to execute ${ticket.id}: could not claim it for ${operator ?? "this operator"} ` +
-        `— already claimed by another operator, or the beads DB is locked ` +
-        `(${e instanceof Error ? e.message : String(e)})`,
-    );
+    throw ticketClaimFailure(ticket.id, operator, e);
   }
   // Announce the stage + nudge a sync so the claim reaches teammates within a heartbeat
   // (fire-and-forget; the end-of-run sync is the backstop).
@@ -179,6 +178,63 @@ async function claimTicket(
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+}
+
+/** The statuses bd refuses a claim on that a LATER attempt can still find changed — see below. */
+const RACED_CLAIM_STATUSES: ReadonlySet<string> = new Set(["in_progress", "closed"]);
+
+/**
+ * Why the ticket claim gate refused, as the error the caller throws (anton-fude) — the same split
+ * `claimRunTarget` makes for the run target (execute-epic-claim.ts), one tier down.
+ *
+ * A STATUS bd will never accept (`issue not claimable: status blocked`) is a decision written to the
+ * board, so the identical call repeats the identical error: poison, naming the status and the move
+ * that clears it. Reporting it as the foreign-claim / locked-DB case sent the operator to debug
+ * beads over a ticket anton itself had blocked for human review. Everything else keeps its retry —
+ * an operator's live claim and a wedged Dolt DB are both states a later attempt can find changed.
+ *
+ * Two statuses are refusals bd words the same way but that are NOT decisions (PR #227 review), so
+ * they keep the retry:
+ *   • `in_progress` — bd says `not claimable: status in_progress` when the bead is held by SOMEBODY
+ *     ELSE, and that clears the moment they finish: the same ownership conflict as `already claimed
+ *     by`, which the retryable branch below is written for. Poisoning it would park a whole run
+ *     permanently over a sibling run's live claim. (Our own claim never lands here at all —
+ *     re-claiming as the same actor succeeds.)
+ *   • `closed` — the run's board snapshot is stale, not held: another actor closed the ticket after
+ *     the snapshot and before this claim. A retry re-reads the board and the loop's own
+ *     closed-ticket handling takes it from there (execute-epic-dispatch `dispatchTicket`), skipping
+ *     a commit already on the branch or reopening the bead to regenerate work this branch lacks.
+ *     Parking would demand a person reopen a ticket anton reopens by itself.
+ */
+export function ticketClaimFailure(
+  ticketId: string,
+  operator: string | undefined,
+  e: unknown,
+): Error {
+  const cause = e instanceof Error ? e.message : String(e);
+  const status = unclaimableStatus(e);
+  if (status && !RACED_CLAIM_STATUSES.has(status)) {
+    return new PoisonEpic(
+      `refusing to execute ${ticketId}: bd will not claim it while its status is "${status}", and ` +
+        `no retry can change that — the run must not dispatch an agent on a ticket it does not own. ` +
+        `Move ${ticketId} back to a claimable status (\`bd update ${ticketId} --status open\`) or ` +
+        `abandon it, then resume the run. (${cause})`,
+    );
+  }
+  // A ticket CLOSED under the run's snapshot gets its own words — blaming a rival operator or a
+  // locked DB for a ticket somebody simply finished is the same misdirection as the park above.
+  // `in_progress` keeps the ownership wording below, which is exactly what bd means by it.
+  if (status === "closed") {
+    return new Error(
+      `refusing to execute ${ticketId}: it was closed after this run read the board — retrying so ` +
+        `the next attempt re-reads it and either skips the ticket or reopens it to regenerate the ` +
+        `work this branch is missing (${cause})`,
+    );
+  }
+  return new Error(
+    `refusing to execute ${ticketId}: could not claim it for ${operator ?? "this operator"} ` +
+      `— already claimed by another operator, or the beads DB is locked (${cause})`,
+  );
 }
 
 /** Open this ticket's session and make it the job's live handle. */
@@ -646,6 +702,8 @@ async function settleTicketTimeout(args: {
     ).catch(() => {});
     const leftovers = await rollbackTimedOutTicket(worktreePath, baseline, committed);
     const marked = await blockTimedOutTicket({
+      sessionId: session.sessionId,
+      branch: run.branch,
       repo,
       ticket,
       worktreePath,
@@ -716,8 +774,10 @@ async function blockTimedOutTicket(args: {
   timeoutMs: number;
   committed: boolean;
   leftovers: boolean;
+  sessionId: string;
+  branch: string;
 }): Promise<boolean> {
-  const { repo, ticket, worktreePath, timeoutMs, committed, leftovers } = args;
+  const { repo, ticket, worktreePath, timeoutMs, committed, leftovers, sessionId, branch } = args;
   await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
   await safe(() => beads.unassign(repo, ticket.id));
   await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
@@ -729,21 +789,20 @@ async function blockTimedOutTicket(args: {
   // operator needs the timeout's own account either way).
   const marked =
     committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
+  // The tip this ticket's work landed on — the same best-effort read the human-review block makes,
+  // and only when something was committed: an unreadable worktree costs the sha, never the note and
+  // never the verdict (`committed` is passed on its own, so a failed read records
+  // `committed ... @ unknown`, not the false "nothing committed" — PR #227 review).
+  const head = committed
+    ? await readWorktreeState(worktreePath)
+        .then((s) => s.head)
+        .catch(() => undefined)
+    : undefined;
   await safe(() =>
     beads.note(
       repo,
       ticket.id,
-      `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its ` +
-        `budget, so the run blocked it and carried on with the rest of the feature. ` +
-        (committed
-          ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
-            `and close the ticket by hand if it is complete. `
-          : leftovers
-            ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
-              `(${worktreePath}), so the run stopped rather than let another ticket commit it — ` +
-              `clear the worktree by hand before resuming. `
-            : `Its partial work was rolled back (nothing from it is on the branch). `) +
-        `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
+      timedOutTicketNote({ timeoutMs, committed, leftovers, worktreePath, sessionId, branch, head }),
     ),
   );
   // Either halt the caller makes PARKS the run and tells the operator to resume it, so this ticket
@@ -845,7 +904,7 @@ async function releaseFailedTicket(args: {
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       // The tip this ticket's work landed on — the operator's route from the note straight to the
       // diff. Best-effort and only when something was committed: an unreadable worktree costs the
-      // sha, never the note.
+      // sha, never the note and never the verdict (see `blockNoteEvidence`).
       const head = committed
         ? await readWorktreeState(worktreePath)
             .then((s) => s.head)
@@ -861,6 +920,7 @@ async function releaseFailedTicket(args: {
             error: e,
             sessionId,
             branch: run.branch,
+            committed,
             head,
           }),
         ),
@@ -1086,10 +1146,12 @@ export function ticketBlockNote(args: {
   error?: unknown;
   sessionId: string;
   branch: string;
-  /** The committed tip, full sha; absent when this ticket committed nothing. */
+  /** Whether this ticket's work landed on the branch — not inferable from `kind`. */
+  committed: boolean;
+  /** The committed tip, full sha; absent when the HEAD read failed. */
   head?: string;
 }): string {
-  const { kind, sessionId, branch, head } = args;
+  const { kind, sessionId, branch, committed, head } = args;
   const reason = blockNoteDetail(args.selfReport?.reason ?? "");
   // A reason that flattens to nothing is NO reason — drop it, so the rendering falls back to the
   // category text rather than trailing an empty quote or a dangling dash.
@@ -1108,10 +1170,49 @@ export function ticketBlockNote(args: {
         : `run failed after committing work — needs review.` +
           (failure ? ` It failed with: ${failure}` : "");
 
-  const evidence = head
-    ? `session ${sessionId}, committed on ${branch} @ ${head.slice(0, 7)}`
-    : `session ${sessionId}, nothing committed on ${branch}`;
-  return blockNoteOneLine(`anton: ${body} [${evidence}]`);
+  // Written through the shared grammar: the board's park gate reads this clause back to tell a
+  // committed block (review and close) from a zero-diff one (reopen and re-run) — see block-note.ts.
+  return blockNoteOneLine(
+    `anton: ${body} [${blockNoteEvidence({ sessionId, branch, committed, head })}]`,
+  );
+}
+
+/**
+ * The operator-facing note left on a ticket the BUDGET stopped (anton-t1mo).
+ *
+ * Carries the same trailing evidence clause as every other block note (PR #227 review). A timeout
+ * the run absorbs leaves the ticket `blocked` — and `reopenAbsorbedTimeouts` deliberately keeps a
+ * COMMITTED one blocked — so the next run's human-held park gate reads this note to choose its
+ * remedy. Without the clause it reads "no commit recorded" and tells the operator to reopen and
+ * re-run work that is already on the branch, or to abandon it; with it, the same committed timeout
+ * gets the move the prose has always asked for: review the commit, then close.
+ */
+export function timedOutTicketNote(args: {
+  timeoutMs: number;
+  committed: boolean;
+  /** Partial work the rollback could not undo — still in the shared worktree. */
+  leftovers: boolean;
+  worktreePath: string;
+  sessionId: string;
+  branch: string;
+  /** The committed tip, full sha; absent when this ticket committed nothing. */
+  head?: string;
+}): string {
+  const { timeoutMs, committed, leftovers, worktreePath, sessionId, branch, head } = args;
+  const fate = committed
+    ? `Its work IS committed on the branch (it was stopped after the commit) — review it and ` +
+      `close the ticket by hand if it is complete.`
+    : leftovers
+      ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
+        `(${worktreePath}), so the run stopped rather than let another ticket commit it — clear ` +
+        `the worktree by hand before resuming.`
+      : `Its partial work was rolled back (nothing from it is on the branch).`;
+  return blockNoteOneLine(
+    `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its budget, ` +
+      `so the run blocked it and carried on with the rest of the feature. ${fate} Re-scope it ` +
+      `into smaller tickets, or raise ticketTimeoutMinutes, then resume the run ` +
+      `[${blockNoteEvidence({ sessionId, branch, committed, head })}]`,
+  );
 }
 
 /** The error's own words, or "" when there are none worth repeating. */

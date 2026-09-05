@@ -36,6 +36,7 @@ import {
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
+  branchContainsCommit,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
@@ -345,6 +346,58 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+});
+
+/**
+ * PR #227 review: the held-ticket park may only offer "abandon it, the commit stays in the pull
+ * request" for a commit this machine actually has. anton's branch names are deterministic per
+ * target, so the name a block note records is the same on every machine — only git can say whether
+ * the commit behind it is here.
+ */
+suite("branchContainsCommit (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () =>
+    execFileSync("git", ["-C", repo, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-branchhas-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("answers for a branch that is not checked out, by short sha", async () => {
+    g(["checkout", "-q", "-b", "anton/anton-x7la"]);
+    writeFileSync(join(repo, "work.md"), "work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-od4: implement the thing"]);
+    const sha = head();
+    // Back on main: the run's checkout need not exist for the repository to answer for its branch.
+    g(["checkout", "-q", "main"]);
+
+    expect(await branchContainsCommit(repo, "anton/anton-x7la", sha)).toBe(true);
+    // The commit is on the run's branch only — main, the base a fresh worktree is cut from, lacks it.
+    expect(await branchContainsCommit(repo, "main", sha)).toBe(false);
+  });
+
+  it("fails closed for a branch this machine never had, and for an unknown sha", async () => {
+    // The cross-machine resume: same deterministic branch name, no such branch (and no such object)
+    // in this clone.
+    expect(await branchContainsCommit(repo, "anton/anton-x7la", "0123456")).toBe(false);
+    expect(await branchContainsCommit(repo, "main", "0123456")).toBe(false);
   });
 });
 
