@@ -169,7 +169,7 @@ export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
 const HELD_NOTE_CHARS = 300;
 
 /**
- * A bead's machine notes, oldest last: anton's own account of why it stopped there. Human notes are
+ * A bead's machine notes, newest last: anton's own account of why it stopped there. Human notes are
  * excluded — a person's steer is written to the AGENT, not to the operator reading this park.
  */
 function machineNotes(bead: Bead): string[] {

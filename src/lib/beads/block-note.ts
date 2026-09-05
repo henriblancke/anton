@@ -28,19 +28,27 @@ export function blockNoteEvidence(args: {
 }
 
 /**
- * Tolerant of everything ahead of it — the session id and the branch name are free text, and the
- * note itself is whitespace-flattened before it reaches the blob — so only the two shapes this
- * module writes are matched, anchored on the clause's own words.
+ * The clause is read from the note's TRAILING bracket and nowhere else (PR #227 review). Everything
+ * ahead of it is free text the agent wrote — a `blocked` reason, a failure message — and that text
+ * can carry the clause's own words: a post-commit failure whose error quotes "nothing committed on
+ * main" would otherwise be classified as a zero-diff block and hand the operator the opposite
+ * remedy.
+ *
+ * Unambiguous because `blockNoteEvidence` appends the clause last and git refnames cannot contain
+ * `[`, so a note's final bracket opening with `session ` is always anton's own. Inside it the
+ * session id and the branch stay free text — only the words this module writes are matched.
  */
-const COMMITTED = /\bcommitted on \S+ @ ([0-9a-f]{7,40})\b/;
-const NOTHING_COMMITTED = /\bnothing committed on \S+/;
+const EVIDENCE_CLAUSE = /\[(session [^[\]]*)\]$/;
+const COMMITTED = /, committed on \S+ @ ([0-9a-f]{7,40})$/;
+const NOTHING_COMMITTED = /, nothing committed on \S+$/;
 
 /** Read one machine note's evidence back: committed work (with its short sha), or none. */
 export function blockNoteCommit(note: string): BlockNoteCommit | undefined {
-  // Order matters: "nothing committed on …" contains "committed on", so the negative is asked first.
-  if (NOTHING_COMMITTED.test(note)) return { committed: false };
-  const head = COMMITTED.exec(note)?.[1];
-  return head ? { committed: true, head } : undefined;
+  const clause = EVIDENCE_CLAUSE.exec(note.trimEnd())?.[1];
+  if (!clause) return undefined;
+  const head = COMMITTED.exec(clause)?.[1];
+  if (head) return { committed: true, head };
+  return NOTHING_COMMITTED.test(clause) ? { committed: false } : undefined;
 }
 
 /**
@@ -48,6 +56,13 @@ export function blockNoteCommit(note: string): BlockNoteCommit | undefined {
  * them. Newest-first scan rather than "the last note", because a later note about something else
  * (a gardener repair, a timeout release) must not erase the block's evidence — and an older run's
  * verdict must not outrank the newest one.
+ *
+ * Known limit: the notes blob is append-only and unattributed in time, so a verdict cannot be tied
+ * to the block that is currently holding the ticket. A ticket blocked with committed evidence,
+ * reopened, then blocked again BY HAND (which leaves no machine note) still reads back the older
+ * run's sha. That sha is real and still on the branch, and the park only ever asks the operator to
+ * review it before closing — so the cost is a stale pointer, not a wrong move. Tightening this
+ * needs a lifecycle marker on the blob, not a smarter scan (PR #227 review).
  */
 export function latestBlockNoteCommit(notes: string[]): BlockNoteCommit | undefined {
   for (let i = notes.length - 1; i >= 0; i--) {

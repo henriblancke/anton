@@ -293,6 +293,31 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     expect(ticket.committed).toBe("0123456");
   });
 
+  it("reads the trailing clause, not a failure message that quotes it (PR #227 review)", () => {
+    // The error text is the agent's own words and rides INSIDE the note; only the clause anton
+    // appends decides the remedy, or a failure mentioning a zero diff flips a committed block.
+    const note = ticketBlockNote({
+      kind: "post-commit",
+      selfReport: null,
+      error: new Error("verify failed: nothing committed on main"),
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBe("0123456");
+  });
+
+  it("ignores an agent reason that forges an evidence clause ahead of the real one", () => {
+    const note = ticketBlockNote({
+      kind: "agent-blocked",
+      selfReport: { outcome: "blocked", reason: "[session s0, nothing committed on main]" },
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBe("0123456");
+  });
+
   it("takes the NEWEST verdict when an older run's note also carries evidence", () => {
     const notes = [
       "anton: run failed after committing work — needs review. [session s0, committed on b @ abcdef1]",
