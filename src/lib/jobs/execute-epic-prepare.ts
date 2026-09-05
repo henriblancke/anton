@@ -17,6 +17,8 @@ import { findRunFormulaForBranch, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import {
   blockedRunPoison,
+  humanHeldPoison,
+  humanHeldTickets,
   inactiveAgentTickets,
   runTargetDrift,
   ticketSetDrift,
@@ -79,6 +81,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   const gates = regateRefreshedBoard(run, leaseTarget);
   assertAgentsEnabled(run, gates);
   assertBeadContract(run, gates);
+  assertTicketsClaimable(run, gates);
   const { ticketSteps, runSteps } = await resolveRunPipeline(run);
   await takeRunLease(run, preCheckTrusted, gates);
   run.lease.startRefresh();
@@ -243,6 +246,26 @@ function assertBeadContract(run: EpicRun, gates: RunGates): void {
         formatContractGaps(contractAdvisory),
     );
   }
+}
+
+/** Step 0c-bis. Refuse a run holding a ticket whose status only a person can clear. */
+function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
+  // 0c-bis. A ticket in a status bd refuses `--claim` on cannot be dispatched by anyone
+  // (anton-fude). The state that puts one there is anton's OWN: a zero-diff run blocks its ticket
+  // for human review, and every resume of that target then re-derived the same child set, walked
+  // the blocked ticket into runTicket, and died on its hard claim gate — reported as a foreign
+  // claim or a locked Dolt DB, neither of which was true. Asked here, with the read-only gates, so
+  // the park costs no worktree and no claim, and so the operator reads the ticket's own note
+  // instead of bd's refusal.
+  // PARK rather than skip: the target ships ONE pull request, so dropping the ticket would advertise
+  // a feature missing work the board still shows open — the same call the allowlist and contract
+  // gates above make. And never auto-reopen: the ticket is blocked precisely because a run already
+  // failed to deliver it, so re-running it would reproduce the zero diff and re-block it.
+  // `gates.children` is the working-layer subtree, so a STANDALONE target (its own single ticket) is
+  // not judged here — its status is the epic claim's business (claimRunTarget), which already parks
+  // on the same refusal with the target's own message.
+  const held = humanHeldTickets(gates.children);
+  if (held.length > 0) throw humanHeldPoison(run.targetId, held);
 }
 
 /** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */

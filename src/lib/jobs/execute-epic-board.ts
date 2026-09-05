@@ -9,6 +9,7 @@
 import { beads, gateReason, HUMAN_AGENT, labelValueOf, type Bead } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { parseTicketNotes } from "../beads/notes";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "../epic-graph";
 import { blockedByPoison, PoisonEpic } from "./errors";
 import { mustPersist } from "./execute-epic-persist";
@@ -104,6 +105,94 @@ export function blockedRunPoison(beadId: string, readiness: RunReadiness, board:
   // parses the ids back out of it to report this stall as the gate's own wait rather than twice.
   const asks = openHumanGateAsks(board, readiness.blockers);
   return asks.length > 0 ? new PoisonEpic(`${blocked.message}. ${asks.join(" ")}`) : blocked;
+}
+
+/**
+ * The statuses `bd update --claim` refuses for a reason no retry and no agent can clear (anton-fude).
+ * Verified against bd 1.1.2 by claiming a bead in each status: `open` is the ONLY claimable one.
+ *
+ * `closed` is deliberately absent — a closed ticket is settled work the dispatch loop skips (or
+ * reopens for a cross-machine resume) long before the claim — and so is `in_progress`, which is an
+ * ownership question runTicket's own claim gate answers. What is left is the two states a PERSON
+ * writes: `blocked` (anton's own human-review verdict on a ticket that delivered nothing) and
+ * `deferred` (snoozed out of the queue).
+ */
+const HUMAN_HELD_STATUSES: ReadonlySet<string> = new Set(["blocked", "deferred"]);
+
+/** A ticket no run may claim until a person moves it, and the account the board carries for it. */
+export interface HumanHeldTicket {
+  id: string;
+  status: string;
+  /** anton's newest note on the bead — why it blocked the ticket — when it left one. */
+  note?: string;
+}
+
+/**
+ * The run's tickets a person has to release before any run can dispatch them (anton-fude).
+ *
+ * A run that blocks a ticket for human review — the no-delivery gate's verdict — leaves the board in
+ * a state its own resume cannot walk past: the ticket is neither closed nor abandoned, so the
+ * dispatch loop hands it to runTicket, whose first act is the hard claim gate bd refuses outright.
+ * Answering it HERE, off the board, is what turns that into a park naming the ticket instead of a
+ * claim failure blamed on a foreign operator or a locked DB.
+ *
+ * Abandoned tickets are excluded for the same reason the dispatch loop drops them: a human already
+ * settled them, and this run runs without them.
+ */
+export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
+  return tickets
+    .filter((t) => HUMAN_HELD_STATUSES.has(t.status) && !beads.isAbandoned(t))
+    .map((t) => {
+      const note = latestMachineNote(t);
+      return { id: t.id, status: t.status, ...(note ? { note } : {}) };
+    });
+}
+
+/** How much of a bead's note one park message may carry — enough to act on, bounded for the row. */
+const HELD_NOTE_CHARS = 300;
+
+/**
+ * anton's newest note on a bead: its own account of why it stopped there. Machine notes only — a
+ * human's steer is written to the AGENT, not to the operator reading this park.
+ */
+function latestMachineNote(bead: Bead): string | undefined {
+  const text = parseTicketNotes(bead.notes)
+    .filter((n) => n.source === "system")
+    .at(-1)?.text;
+  if (!text) return undefined;
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > HELD_NOTE_CHARS ? `${flat.slice(0, HELD_NOTE_CHARS).trimEnd()}…` : flat;
+}
+
+/** What one held ticket owes the operator: why no run may take it, and the move that frees it. */
+function humanHeldClause(held: HumanHeldTicket): string {
+  const why =
+    held.status === "deferred"
+      ? `${held.id} is deferred — snoozed out of the queue, so no run may claim it (\`bd undefer ` +
+        `${held.id}\` to bring it back)`
+      : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
+        `it is resolved)`;
+  return held.note ? `${why}: "${held.note}"` : why;
+}
+
+/**
+ * The park a run takes for a ticket only a person can release (anton-fude).
+ *
+ * PARK, never skip or auto-reopen. Reopening would re-run a ticket whose last run delivered nothing
+ * and land it right back in `blocked` — the human-review gate answered by the machine that tripped
+ * it — and skipping would open the target's single pull request missing work the board still shows
+ * as open, the same reason the allowlist and contract gates park rather than narrow.
+ */
+export function humanHeldPoison(targetId: string, held: HumanHeldTicket[]): PoisonEpic {
+  const one = held.length === 1;
+  return new PoisonEpic(
+    `${targetId} has ${one ? "a ticket" : `${held.length} tickets`} no agent can pick up: ` +
+      held.map(humanHeldClause).join("; ") +
+      `. bd refuses \`--claim\` on ${one ? "that status" : "those statuses"}, so the run stopped ` +
+      `before dispatching anything rather than dying at the ticket's claim gate. Resolve ` +
+      `${one ? "it" : "them"} — or abandon ${one ? "it" : "them"}, which drops the work from this ` +
+      `run — then resume the run`,
+  );
 }
 
 /**

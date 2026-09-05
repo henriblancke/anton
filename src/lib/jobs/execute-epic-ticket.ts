@@ -6,7 +6,7 @@
  * and the note a blocked ticket leaves for the operator. The run-level walk owns which tickets run
  * and in what order; this owns what happens inside one.
  */
-import { beads, labelValueOf, LABELS, type Bead } from "../beads/bd";
+import { beads, labelValueOf, LABELS, unclaimableStatus, type Bead } from "../beads/bd";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import { shadowNote } from "../gardener/repair";
@@ -141,14 +141,12 @@ async function claimTicket(
   // owner's claim. Claiming is idempotent for the same actor, so a resume re-claims cleanly. A
   // conflict aborts the run before any session/worktree work; the job retries and either skips the
   // now-closed ticket (already-closed check in the caller) or reclaims one whose owner released it.
+  // What a refusal actually means — and whether any retry can change it — is classified by
+  // {@link ticketClaimFailure}.
   try {
     await beads.claim(repo, ticket.id, operator);
   } catch (e) {
-    throw new Error(
-      `refusing to execute ${ticket.id}: could not claim it for ${operator ?? "this operator"} ` +
-        `— already claimed by another operator, or the beads DB is locked ` +
-        `(${e instanceof Error ? e.message : String(e)})`,
-    );
+    throw ticketClaimFailure(ticket.id, operator, e);
   }
   // Announce the stage + nudge a sync so the claim reaches teammates within a heartbeat
   // (fire-and-forget; the end-of-run sync is the backstop).
@@ -179,6 +177,37 @@ async function claimTicket(
   void beads
     .sync(repo)
     .catch((e) => console.error(`[execute-epic] claim sync failed for ${ticket.id}`, e));
+}
+
+/**
+ * Why the ticket claim gate refused, as the error the caller throws (anton-fude) — the same split
+ * `claimRunTarget` makes for the run target (execute-epic-claim.ts), one tier down.
+ *
+ * A STATUS bd will never accept (`issue not claimable: status blocked`) is a decision written to the
+ * board, so the identical call repeats the identical error: poison, naming the status and the move
+ * that clears it. Reporting it as the foreign-claim / locked-DB case sent the operator to debug
+ * beads over a ticket anton itself had blocked for human review. Everything else keeps its retry —
+ * an operator's live claim and a wedged Dolt DB are both states a later attempt can find changed.
+ */
+export function ticketClaimFailure(
+  ticketId: string,
+  operator: string | undefined,
+  e: unknown,
+): Error {
+  const cause = e instanceof Error ? e.message : String(e);
+  const status = unclaimableStatus(e);
+  if (status) {
+    return new PoisonEpic(
+      `refusing to execute ${ticketId}: bd will not claim it while its status is "${status}", and ` +
+        `no retry can change that — the run must not dispatch an agent on a ticket it does not own. ` +
+        `Move ${ticketId} back to a claimable status (\`bd update ${ticketId} --status open\`) or ` +
+        `abandon it, then resume the run. (${cause})`,
+    );
+  }
+  return new Error(
+    `refusing to execute ${ticketId}: could not claim it for ${operator ?? "this operator"} ` +
+      `— already claimed by another operator, or the beads DB is locked (${cause})`,
+  );
 }
 
 /** Open this ticket's session and make it the job's live handle. */

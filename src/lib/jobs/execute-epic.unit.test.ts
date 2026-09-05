@@ -18,6 +18,8 @@ import {
 import { splitFormulaPhases } from "./execute-epic-formula";
 import {
   deliveredTickets,
+  humanHeldPoison,
+  humanHeldTickets,
   inactiveAgentTickets,
   orderTickets,
   reopenAbsorbedTimeouts,
@@ -46,6 +48,7 @@ import {
   claudeResumeDecision,
   continuationPrompt,
   ticketBlockNote,
+  ticketClaimFailure,
 } from "./execute-epic-ticket";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
@@ -190,6 +193,141 @@ describe("inactiveAgentTickets", () => {
       { id: "t-1", agent: "docker" },
       { id: "t-2", agent: "alembic" },
     ]);
+  });
+});
+
+/**
+ * anton-fude: a child ticket in a status bd refuses `--claim` on is one NO run can dispatch — and
+ * the state that puts one there is anton's own no-delivery block. Every resume then re-derived the
+ * same child set and walked that ticket into runTicket's hard claim gate, which reported a foreign
+ * claim or a locked Dolt DB. What the board gate has to answer is: which tickets, and what does the
+ * operator do about each.
+ */
+describe("humanHeldTickets — the children only a person can release (anton-fude)", () => {
+  const held = (id: string, status: string, notes?: string): Bead =>
+    ({ id, title: id, status, ...(notes ? { notes } : {}) }) as Bead;
+
+  it("reports a blocked child with the note the run left on it", () => {
+    const note = "anton: run made no changes (clean agent exit, zero diff) — nothing was delivered.";
+    expect(humanHeldTickets([held("anton-od4", "blocked", note)])).toEqual([
+      { id: "anton-od4", status: "blocked", note },
+    ]);
+  });
+
+  it("reports a deferred child the same way — bd refuses that claim too", () => {
+    expect(humanHeldTickets([held("anton-od4", "deferred")])).toEqual([
+      { id: "anton-od4", status: "deferred" },
+    ]);
+  });
+
+  it("leaves the statuses a run settles for itself to the loop", () => {
+    // `open` is the only status bd claims; `closed` is skipped or reopened by the dispatch loop, and
+    // `in_progress` is an ownership question runTicket's own claim gate answers.
+    expect(
+      humanHeldTickets([
+        held("t-1", "open"),
+        held("t-2", "closed"),
+        held("t-3", "in_progress"),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("never reports an abandoned ticket — a human already settled it and the run drops it", () => {
+    const abandoned = { ...held("t-1", "blocked"), labels: [LABELS.abandoned] } as Bead;
+    expect(humanHeldTickets([abandoned])).toEqual([]);
+  });
+
+  it("carries anton's NEWEST note, not a human's steer and not a stale earlier verdict", () => {
+    // Machine notes live one per line in the blob (beads/notes.ts), newest last; a human's steer is
+    // written to the agent, so the operator reading this park is owed anton's own account instead.
+    const notes = [
+      "anton: skipped behind a timeout",
+      formatHumanNote("try the other helper", "Henri Blancke", new Date(0)),
+      "anton: blocked for review — zero diff",
+    ].join("\n");
+    expect(humanHeldTickets([held("t-1", "blocked", notes)])[0].note).toBe(
+      "anton: blocked for review — zero diff",
+    );
+  });
+
+  it("caps a runaway note rather than pouring it into the run row", () => {
+    const note = humanHeldTickets([held("t-1", "blocked", `anton: ${"x".repeat(500)}`)])[0].note!;
+    expect(note.length).toBeLessThanOrEqual(301);
+    expect(note.endsWith("…")).toBe(true);
+  });
+});
+
+describe("humanHeldPoison — the park a held child leaves behind (anton-fude)", () => {
+  it("names the ticket, its note and the move that frees it", () => {
+    const error = humanHeldPoison("anton-x7la", [
+      { id: "anton-od4", status: "blocked", note: "anton: run made no changes (zero diff)" },
+    ]);
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("anton-x7la");
+    expect(error.message).toContain("anton-od4 is blocked pending human review");
+    expect(error.message).toContain("anton: run made no changes (zero diff)");
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).toMatch(/resume the run$/);
+  });
+
+  it("tells a deferred child's own remedy apart from a blocked one's", () => {
+    const error = humanHeldPoison("anton-x7la", [{ id: "anton-od4", status: "deferred" }]);
+    expect(error.message).toContain("is deferred");
+    expect(error.message).toContain("bd undefer anton-od4");
+    expect(error.message).not.toContain("--status open");
+  });
+
+  it("names every held ticket, not just the first", () => {
+    const error = humanHeldPoison("anton-x7la", [
+      { id: "anton-od4", status: "blocked" },
+      { id: "anton-9zz", status: "deferred" },
+    ]);
+    expect(error.message).toContain("2 tickets");
+    expect(error.message).toContain("anton-od4");
+    expect(error.message).toContain("anton-9zz");
+  });
+});
+
+/**
+ * anton-fude: runTicket's claim gate used to give one answer — a foreign operator, or a locked DB —
+ * to every refusal, including the one it could not possibly be: a status bd will never accept.
+ */
+describe("ticketClaimFailure — why the ticket claim gate refused (anton-fude)", () => {
+  const bdRefusal = (stderr: string) =>
+    Object.assign(new Error(`Command failed: bd update t-1 --claim\n${stderr}`), { stderr });
+
+  it("parks on a status refusal, naming the status rather than a foreign claim or a locked DB", () => {
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status blocked"),
+    );
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain('status is "blocked"');
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toMatch(/already claimed by another operator|beads DB is locked/);
+    // bd's own words survive into the park, so the operator sees what it actually said.
+    expect(error.message).toContain("issue not claimable: status blocked");
+  });
+
+  it("keeps the retryable answer for a foreign claim — an owner can still release it", () => {
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue already claimed by bob"),
+    );
+
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("already claimed by another operator, or the beads DB is locked");
+    expect(error.message).toContain("alice");
+  });
+
+  it("keeps it for a wedged DB too — the state a later attempt may find changed", () => {
+    const error = ticketClaimFailure("anton-od4", undefined, bdRefusal("Error 1105: database is locked"));
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("this operator");
   });
 });
 
