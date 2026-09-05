@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 1679a0761618
+version: 7e8368fe1280
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -392,7 +392,15 @@ bd ready --label approved --unassigned --json --limit 0
 
 Then narrow the pool to **run targets** (the run-target rule above) against one full board read
 (`bd list --status all --json --limit 0`, which carries parentage and `blocks` edges), keeping only
-beads that are `open`, carry `approved`, have no assignee, and are **not labelled `agent:human`**.
+beads that are `open`, carry `approved`, have no assignee, are **not a proposal**, and are **not
+labelled `agent:human`**.
+
+**A proposal is a decision, not work.** The gardener and the product master file proposals as
+parentless tasks carrying a full contract, so every other rule above admits them; what marks one is
+a fingerprint label — `gardener:<kind>:<hash>` or `pm:<kind>:<hash>`. Skip any bead carrying one.
+Approving a proposal applies a board move (rehome, reprioritize, kill, split) and closes the bead;
+it never starts a run, so claiming one would send an agent to implement a change anton makes itself.
+They stay on the board, visible and decidable — by a person, not by a worker.
 
 **Human work is excluded, and it is not a bug that it sits there.** `agent:human` marks a bead no
 agent can complete end to end — it needs a credential, an account, a purchase, a signature, or a
@@ -400,9 +408,9 @@ taste call. Every other `agent:` value resolves to a specialist prompt; `human` 
 a human bead left in the set would dispatch to the DEFAULT agent and burn a run failing at work no
 agent can do. It is approved, real, and waiting for a person — not backlog, not unshaped.
 
-The exclusion belongs to this narrowing step, **not** to the pool query: bd's own `--exclude-label`
-flag would move it into the argv and drift from the one flag set every worker and anton share.
-Whatever holds the board already reads it for parentage, so the label costs nothing to check here.
+Both exclusions belong to this narrowing step, **not** to the pool query: bd's own `--exclude-label`
+flag would move them into the argv and drift from the one flag set every worker and anton share.
+Whatever holds the board already reads it for parentage, so the labels cost nothing to check here.
 
 Rank what survives — the order is total and deterministic, so two machines agree on what is next:
 

@@ -8,6 +8,7 @@
  *      "what does anton pick up next", identical on every machine reading the same board.
  */
 import { describe, expect, it } from "vitest";
+import { proposalFingerprint, type GardenerDetectionKind } from "../gardener/detections";
 import { beads, buildClaimableReadyArgs, rankClaimableTargets, type Bead, type BeadDep } from "./bd";
 
 const bead = (b: Partial<Bead>): Bead =>
@@ -96,6 +97,50 @@ describe("rankClaimableTargets — the set", () => {
     ];
 
     expect(ids(rankClaimableTargets(board, board))).toEqual(["f4"]);
+  });
+
+  it("drops a proposal — a decision a person applies, not work an agent implements", () => {
+    // anton-x37c: a proposal is a parentless task carrying a full contract, so every other clause
+    // admits it. Both producers file one, and the fingerprint — not the namespace — is the rule.
+    const board = [
+      bead({
+        id: "p1",
+        issue_type: "task",
+        priority: 0,
+        labels: ["approved", proposalFingerprint("stale", "t9")],
+      }),
+      bead({
+        id: "p2",
+        issue_type: "task",
+        labels: ["approved", proposalFingerprint("low-value", "t9")],
+      }),
+      bead({ id: "t1", issue_type: "task", priority: 2 }),
+    ];
+
+    expect(ids(rankClaimableTargets(board, board))).toEqual(["t1"]);
+  });
+
+  it("leaves the ranking of every other target untouched when proposals are open", () => {
+    // The epic's measure: the order of real work must not move with how many proposals sit open.
+    const others = [
+      bead({ id: "f1", issue_type: "feature", priority: 1, created_at: "2026-01-01T00:00:00Z" }),
+      bead({ id: "f2", issue_type: "feature", priority: 0, created_at: "2026-02-01T00:00:00Z" }),
+      bead({ id: "t3", issue_type: "task", priority: 1, created_at: "2026-03-01T00:00:00Z" }),
+    ];
+    const kinds: GardenerDetectionKind[] = ["mispriority", "misfiled", "oversized"];
+    const proposals = kinds.map((kind, i) =>
+      bead({
+        id: `p${i}`,
+        issue_type: "task",
+        priority: 0,
+        created_at: "2026-01-01T00:00:00Z",
+        labels: ["approved", proposalFingerprint(kind, "t9")],
+      }),
+    );
+
+    expect(rankClaimableTargets([...others, ...proposals], [...others, ...proposals])).toEqual(
+      rankClaimableTargets(others, others),
+    );
   });
 
   it("leaves the ranking of every other target untouched when human work is on the board", () => {
