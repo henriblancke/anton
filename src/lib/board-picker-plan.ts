@@ -182,9 +182,10 @@ export interface DigestField {
  * rather than as its text.
  *
  * The classification is a TABLE rather than a comment because it has to stay true: {@link digestLine}
- * is built from it, so a column added without a stated verdict does not compile. Every field here
- * comes back decision-relevant, and that is the honest reading of the code as it stands — the
- * narrowing this epic is after lives one level down, in {@link DIGEST_LABEL_NAMESPACES}, where
+ * hashes the entries this table calls decision-relevant and nothing else, so a column added without
+ * a stated verdict does not compile, and a verdict is a change to the fence rather than a note about
+ * it. Every field here comes back decision-relevant, and that is the honest reading of the code as
+ * it stands — the narrowing lives one level down, in {@link DIGEST_LABEL_NAMESPACES}, where
  * anton's own bookkeeping namespaces churn inside the `labels` column without any of the decision's
  * readers ever consulting them.
  *
@@ -252,7 +253,7 @@ export const DIGEST_FIELDS: readonly DigestField[] = [
     relevance: "decision-relevant",
     scope: "board",
     why: "`abandoned` and `agent:human` refuse a target outright, `stage:in-review` changes which beads the contract gate even reads, and the operator's criteria are written over the board's own namespaces — narrowed per namespace in {@link DIGEST_LABEL_NAMESPACES}",
-    read: (b) => [...(b.labels ?? [])].sort().join(","),
+    read: (b) => [...(b.labels ?? [])].filter(isDecisionRelevantLabel).sort().join(","),
   },
   {
     field: "dependencies",
@@ -329,22 +330,35 @@ const IRRELEVANT_NAMESPACES: ReadonlySet<string> = new Set(
  * Is this label one the fence must carry? True unless its namespace is classified
  * `not-decision-relevant` above — an unknown namespace, and every bare label, stays in.
  *
- * The narrowing's fail-closed rule, stated once here so the pass that applies it (anton-7zpv) and
- * the argument that justifies it cannot drift apart.
+ * The narrowing's fail-closed rule, stated once here and applied by the `labels` column of
+ * {@link DIGEST_FIELDS}, so the rule and the argument that justifies it cannot drift apart.
  */
 export function isDecisionRelevantLabel(label: string): boolean {
   return !IRRELEVANT_NAMESPACES.has(namespaceOf(label));
 }
 
-/** The classified projection, written in column order. */
+/**
+ * The columns the fence actually hashes. Derived from the table rather than restated, so a field
+ * reclassified `not-decision-relevant` leaves the digest by that edit alone.
+ */
+const FENCED_FIELDS: readonly DigestField[] = DIGEST_FIELDS.filter(
+  (f) => f.relevance === "decision-relevant",
+);
+
+/** The classified projection, written in column order — the decision-relevant columns, and only
+ *  those. */
 function digestLine(bead: Bead): string {
-  return DIGEST_FIELDS.map((f) => f.read(bead)).join("\t");
+  return FENCED_FIELDS.map((f) => f.read(bead)).join("\t");
 }
 
 /**
- * Stamp the inputs one decision was made from. Order-independent — the lines are sorted before
- * hashing — because two reads of an unchanged board may return the beads in any order, and a stamp
- * that disagreed with itself over that would report every plan stale.
+ * Stamp the inputs one decision was made from — the classified ones ({@link DIGEST_FIELDS}) and no
+ * others, so a `run-lease:` heartbeat rewritten mid-run leaves the ranking's fence exactly where it
+ * was.
+ *
+ * Order-independent — the lines are sorted before hashing — because two reads of an unchanged board
+ * may return the beads in any order, and a stamp that disagreed with itself over that would report
+ * every plan stale.
  *
  * The armed POLICY is hashed alongside the beads (anton-t9m4 review): admission is a function of
  * both, so an operator who narrows `pickerPolicy` without touching a bead has invalidated the plan

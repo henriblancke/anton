@@ -97,6 +97,22 @@ describe("board stamp", () => {
     expect(stampBoard(shuffled, OBSERVED).digest).toBe(stampBoard(board, OBSERVED).digest);
   });
 
+  it("stamps the same board the same way every time it is asked", () => {
+    const board = () => [bead({ id: "anton-a" }), bead({ id: "anton-b" })];
+
+    expect(stampBoard(board(), OBSERVED).digest).toBe(stampBoard(board(), OBSERVED).digest);
+  });
+
+  // Admission is a function of the board AND the policy, so the fence has to move with either.
+  it("folds the armed policy into the digest", () => {
+    const board = [bead()];
+    const armed = stampBoard(board, OBSERVED, { types: ["feature"] });
+
+    expect(armed.digest).not.toBe(stampBoard(board, OBSERVED).digest);
+    expect(armed.digest).not.toBe(stampBoard(board, OBSERVED, { types: ["bug"] }).digest);
+    expect(armed.digest).toBe(stampBoard(board, OBSERVED, { types: ["feature"] }).digest);
+  });
+
   it("carries the observation moment and the snapshot's size verbatim", () => {
     const stamped = stampBoard([bead(), bead({ id: "anton-b" })], OBSERVED);
 
@@ -294,13 +310,65 @@ describe("decision inputs", () => {
     },
   );
 
-  // This ticket classifies; the narrowing itself is anton-7zpv. Until it lands the fence still
-  // carries every label, and saying so out loud is what makes the next diff readable.
-  it("still stamps the namespaces it has classified irrelevant", () => {
-    const before = stampBoard([bead()], OBSERVED);
-    const scored = stampBoard([bead({ labels: ["approved", "domain:eng", "review-score:8"] })], OBSERVED);
+  // The narrowing itself (anton-7zpv), driven off the table so a namespace reclassified there moves
+  // the fence and this test together or not at all.
+  it.each(DIGEST_LABEL_NAMESPACES)(
+    "stamps a $namespace label only while it is decision-relevant",
+    ({ namespace, relevance }) => {
+      const before = stampBoard([bead()], OBSERVED);
+      const tagged = stampBoard(
+        [bead({ labels: ["approved", "domain:eng", `${namespace}:whatever`] })],
+        OBSERVED,
+      );
 
-    expect(scored.digest).not.toBe(before.digest);
+      expect(tagged.digest === before.digest).toBe(relevance === "not-decision-relevant");
+    },
+  );
+
+  /**
+   * What the narrowing buys: anton's own bookkeeping churns inside the `labels` column — a lease
+   * heartbeat rewritten every few seconds, a score filed when a run lands, provenance on a bead its
+   * automation created — and none of it can retire a ranking any more.
+   */
+  it("holds still while anton rewrites its own bookkeeping labels", () => {
+    const before = [bead({ id: "anton-a" }), bead({ id: "anton-b" })];
+    const churned = [
+      bead({ id: "anton-a", labels: ["approved", "domain:eng", "run-lease:1800000042"] }),
+      bead({
+        id: "anton-b",
+        labels: ["review-score:8", "approved", "source:stringer", "domain:eng"],
+      }),
+    ];
+
+    expect(stampBoard(churned, OBSERVED).digest).toBe(stampBoard(before, OBSERVED).digest);
+  });
+
+  // Order-independence survives the narrowing: the filter runs before the sort, and the bead order
+  // still does not reach the hash.
+  it("holds still when the surviving labels arrive in a different order", () => {
+    const one = bead({ id: "anton-a", labels: ["run-lease:1", "domain:eng", "approved"] });
+    const two = bead({ id: "anton-b", labels: ["stage:implementing", "approved"] });
+    const swapped = [
+      { ...two, labels: ["approved", "stage:implementing", "review-score:9"] },
+      { ...one, labels: ["approved", "domain:eng"] },
+    ];
+
+    expect(stampBoard(swapped, OBSERVED).digest).toBe(stampBoard([one, two], OBSERVED).digest);
+  });
+
+  // The mirror of "carries $field in the fence", and vacuous only while every column is
+  // decision-relevant: the moment one is not, it must leave the digest rather than merely be
+  // annotated as unread.
+  it("drops any column it has classified irrelevant", () => {
+    for (const { field, read } of DIGEST_FIELDS.filter(
+      (f) => f.relevance === "not-decision-relevant",
+    )) {
+      const before = shaped();
+      const after = shaped(EDIT[field]);
+
+      expect(read(after)).not.toBe(read(before));
+      expect(stampBoard([after], OBSERVED).digest).toBe(stampBoard([before], OBSERVED).digest);
+    }
   });
 });
 
