@@ -5,7 +5,9 @@
  * Three sets come out of it and every one of them is load-bearing downstream: what was DELIVERED
  * (the PR body and the review contract speak for exactly that), what was HELD (a blocker outside
  * this run — the tail parks), and what was SKIPPED behind a rolled-back timeout (merge finalization
- * reads its marker, not this module's memory).
+ * reads its marker, not this module's memory). A fourth — what anton RETIRED as already shipped
+ * (anton-5bpd) — is recorded on the run rather than here: the ticket is settled on the board, so
+ * nothing downstream has to decide anything about it beyond saying it is not in the PR.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
@@ -22,7 +24,7 @@ import {
   skippedDependents,
   type SkipCause,
 } from "./execute-epic-board";
-import { BlockedTailError, TicketTimeoutError } from "./execute-epic-errors";
+import { BlockedTailError, TicketRetiredError, TicketTimeoutError } from "./execute-epic-errors";
 import { mustPersist, mustRead, safe } from "./execute-epic-persist";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
@@ -51,6 +53,10 @@ interface DispatchLedger {
    * tickets written against IT still have their mechanism and must still run, whatever rolled back
    * further up the chain. Same rule merge finalization applies; recorded as the loop goes, since
    * only the loop knows what actually landed here.
+   *
+   * A ticket anton RETIRED as already shipped (anton-5bpd) counts too, for that same reason read one
+   * step out: its work is in the run's BASE rather than in a commit on this branch, so the tickets
+   * written against it have their mechanism just as surely.
    */
   onBranch: Set<string>;
 }
@@ -359,6 +365,19 @@ async function dispatchTicket(
     });
     onBranch.add(ticket.id); // it committed, so nothing behind it is missing its mechanism
   } catch (e) {
+    // A ticket anton RETIRED as already shipped is absorbed too (anton-5bpd). The repair verified
+    // against git and the board that its work is already in the tree and closed the bead as
+    // superseded by whatever landed it, so there is nothing left for this run — or any retry — to
+    // do. Halting here would park the whole feature on a ticket that is finished, which is exactly
+    // the false stall the class exists to end. Nothing cascades: the work it was waiting for is in
+    // the run's BASE, so every ticket written against it still has its mechanism.
+    if (e instanceof TicketRetiredError) {
+      run.retired.push({ id: e.ticketId, replacedBy: e.replacementId });
+      onBranch.add(e.ticketId);
+      console.warn(`[execute-epic] ${epicBeadId}: ${e.message}`);
+      await ctx.heartbeat();
+      return;
+    }
     // A ticket that ran out of time is the ONE failure this loop absorbs (anton-t1mo). It has
     // already blocked its own bead and rolled its partial work back, so the feature can carry
     // on: the tickets behind it are independent work, and ending the run here would deliver
@@ -491,6 +510,26 @@ async function deliveredOrPark(
           : "") +
         ` — nothing was delivered. Re-scope them into ` +
         `smaller tickets, or raise this project's ticketTimeoutMinutes, then resume the run`,
+    );
+  }
+
+  // Nothing timed out, and what is left to show was RETIRED rather than run (anton-5bpd): every
+  // ticket anton could dispatch turned out to have already shipped, so each is closed as superseded
+  // and no commit is on this branch. Carrying on would review nothing and hand `gh pr create` a
+  // branch with no diff. Park instead, naming the retirements — the epic itself is the thing left to
+  // settle, and only a person decides whether it is now empty or still wants work.
+  if (delivered.length === 0 && run.retired.length > 0) {
+    const retirements = run.retired.map((r) => `${r.id} → superseded by ${r.replacedBy}`).join(", ");
+    throw new PoisonEpic(
+      run.standaloneRun
+        ? `${epicBeadId} had ALREADY SHIPPED (${retirements}) — anton verified that against the ` +
+          `repository and the board and closed it as superseded, with the evidence on the bead. ` +
+          `Nothing was committed here, so there is no pull request to open and nothing is left to ` +
+          `run; read the bead if you want to check what anton checked`
+        : `every ticket under ${epicBeadId} that this run could dispatch had ALREADY SHIPPED ` +
+          `(${retirements}) — each is closed on the board with anton's evidence on it, and nothing ` +
+          `was committed here, so there is no pull request to open. Close ${epicBeadId} by hand to ` +
+          `settle it, or give it work that has not landed yet and resume the run`,
     );
   }
 

@@ -128,7 +128,7 @@ async function finishRun(
   skipped: Map<string, SkipCause>,
   carry: RunPhaseCarry,
 ): Promise<void> {
-  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, timedOut } = run;
+  const { db, clock, ctx, projectId, repo, runId, targetId: epicBeadId, timedOut, retired } = run;
   const { worktree } = prep;
   const staleBodyFallback = carry.staleBodyFallback;
   // A feature that delivered most of itself still owes the founder the part it didn't
@@ -142,6 +142,17 @@ async function finishRun(
       `whether its work is in this PR; re-scope them or raise ticketTimeoutMinutes, then run them.`
     : null;
   if (timeoutNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${timeoutNotice}`));
+
+  // The tickets anton RETIRED as already shipped (anton-5bpd) — the founder reads the TARGET at the
+  // merge gate, and a ticket that is closed but in no diff would otherwise look like work this PR
+  // carries. Each bead already holds anton's evidence; this says, in one place, that the feature
+  // shipped minus these because they were already in the tree.
+  const retiredNotice = retired.length
+    ? `${retired.length} ticket(s) had already shipped and were retired as superseded — ` +
+      `${retired.map((r) => `${r.id} (superseded by ${r.replacedBy})`).join(", ")}. Each is closed ` +
+      `with the evidence anton verified on it, and none of them is in this PR.`
+    : null;
+  if (retiredNotice) await safe(() => beads.note(repo, epicBeadId, `anton: ${retiredNotice}`));
 
   // The tickets the timeout took down with it (anton-67xj) — the founder reads the TARGET at the
   // merge gate, so the PR's missing half is named there too, not only on each skipped bead.
@@ -159,7 +170,9 @@ async function finishRun(
   await updateRun(db, clock, runId, {
     status: "done",
     endedAt: clock.now(),
-    error: [timeoutNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") || null,
+    error:
+      [timeoutNotice, retiredNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") ||
+      null,
   });
   // The branch and its PR carry the work now, so the checkout is residue; the branch survives
   // because the target is still open in review (anton-hrun.1). The claim comes off first: the

@@ -467,6 +467,13 @@ export interface TicketTimeoutOutcome {
   committed: boolean;
 }
 
+/** One entry in a run's RETIREMENT ledger (anton-5bpd): a ticket anton closed mid-run as already
+ * shipped, and the bead the board now records it as superseded by. */
+export interface RetiredTicketOutcome {
+  id: string;
+  replacedBy: string;
+}
+
 /**
  * Whether a LIVE read of a ticket this run's budget stopped is still the run's to reopen
  * (PR #199 review).

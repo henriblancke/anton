@@ -36,11 +36,9 @@
  * board rather than part of it. The convention is reused; the namespace must not be.
  *
  * Pure values plus one write. Nothing here decides WHETHER a class is repairable in a given
- * situation or performs a repair — the factual repairs are anton-fzas (`ref-stale`) and anton-qg4h
- * (`dep-missing`), and both pass through {@link decideRepair} before they touch anything.
- *
- * `already-shipped` is a block class (see `claude/anton-result.ts`) with no repair yet: anton has no
- * way to VERIFY the claim, so it escalates rather than being acted on.
+ * situation or performs a repair — the factual repairs are anton-fzas (`ref-stale`), anton-qg4h
+ * (`dep-missing`) and anton-5bpd (`already-shipped`), and all three pass through
+ * {@link decideRepair} before they touch anything.
  */
 import { createHash } from "node:crypto";
 import { beads } from "../beads/bd";
@@ -50,9 +48,9 @@ import type { ProposalAutonomy } from "./autonomy";
 import { FINGERPRINT_HASH_LENGTH } from "./detections";
 
 /**
- * The block classes anton will attempt a repair for — the factual pair (R5.4) and the inventive pair
- * (R5.5). `env` and `other` are deliberately absent: nothing anton can check makes them actionable,
- * so they escalate on their first appearance, not their second.
+ * The block classes anton will attempt a repair for — the factual ones (R5.4, anton-5bpd) and the
+ * inventive pair (R5.5). `env` and `other` are deliberately absent: nothing anton can check makes
+ * them actionable, so they escalate on their first appearance, not their second.
  *
  * A closed set, and {@link isRepairClass} is an EXACT membership test, because the guard is the last
  * thing standing between an unrecognised class and a confident repair. Anything the result parser
@@ -61,6 +59,7 @@ import { FINGERPRINT_HASH_LENGTH } from "./detections";
 export const REPAIR_CLASSES = [
   "ref-stale",
   "dep-missing",
+  "already-shipped",
   "acceptance-missing",
   "oversized",
 ] as const;

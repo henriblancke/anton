@@ -27,6 +27,7 @@ import {
   NoDeliveryError,
   ParkedOnPrereqError,
   RepairedBlockError,
+  TicketRetiredError,
   TicketTimeoutError,
   WorktreeDirtyError,
 } from "./execute-epic-errors";
@@ -99,7 +100,14 @@ export async function settleFailedTicket(args: {
   // on. Before the release, because what the repair answers decides whether this bead is left
   // `blocked` for a person or `open` for the retry it just earned.
   const repair = repairableBlock(e, kinds)
-    ? await repairBlockedTicket({ run, ticket, logPath, selfReport: progress.selfReport, e })
+    ? await repairBlockedTicket({
+        run,
+        ticket,
+        logPath,
+        selfReport: progress.selfReport,
+        e,
+        committed: progress.committed,
+      })
     : undefined;
   await releaseFailedTicket({ run, ticket, session, progress, e, kinds, repair });
   // The repaired bead goes back through the ordinary queue (R5.10): a non-poison error spends one of
@@ -111,11 +119,19 @@ export async function settleFailedTicket(args: {
   if (repair?.action === "parked") {
     throw new ParkedOnPrereqError(ticket.id, repair.blockerId, repair.attempted, e);
   }
+  // A RETIRED ticket earns neither a retry nor a wait (anton-5bpd): its work has already landed, so
+  // there is nothing left for any attempt to do. The bead is closed against its survivor with the
+  // evidence on it, and the ticket LOOP absorbs this one error and carries on with the rest of the
+  // feature — halting the epic would park a whole run on a ticket that is finished.
+  if (repair?.action === "retired") {
+    throw new TicketRetiredError(ticket.id, repair.replacementId, repair.attempted);
+  }
   throw e;
 }
 
 /**
- * Whether this failure is one a FACTUAL repair may run on at all (anton-fzas, anton-qg4h / R5.4).
+ * Whether this failure is one a FACTUAL repair may run on at all (anton-fzas, anton-qg4h,
+ * anton-5bpd / R5.4).
  *
  * Only the two block kinds that mean "the agent could not do the work": a zero-diff run
  * ({@link NoDeliveryError}), and one the agent itself declared incomplete
@@ -338,7 +354,8 @@ async function settleAbortedTicket(args: {
  * (commits exist), OR the agent delivered nothing at all (zero diff). Both are human-review
  * states — block with an operator-facing note. Resetting a no-delivery ticket to open would
  * silently re-queue it into the ready pool and hide the false-success. A `needs-human` ask is
- * the exception to that rule, excused by `settleAbortedTicket` before this runs. All
+ * the exception to that rule, excused by `settleAbortedTicket` before this runs, and so is a ticket
+ * anton RETIRED (anton-5bpd), whose outcome is already recorded and must not be rewritten. All
  * best-effort: never mask the run's error; the epic-level finally sync pushes the release.
  */
 async function releaseFailedTicket(args: {
@@ -356,6 +373,14 @@ async function releaseFailedTicket(args: {
   const { committed, selfReport } = args.progress;
   const { noDelivery, agentBlocked, needsHuman } = args.kinds;
   if (isUsageLimitError(e)) return;
+  // A RETIRED bead (anton-5bpd) is SETTLED, not released: the repair closed it as superseded by the
+  // work that actually shipped it. Both branches below would undo that — `blocked` rewrites a
+  // recorded outcome, and `open` re-queues a ticket whose work is already in the tree — so neither
+  // runs. Only the claim comes off, so the board never shows a dead session's ticket as in-flight.
+  if (args.repair?.action === "retired") {
+    await releaseTicketClaim(repo, ticket.id);
+    return;
+  }
   // A REPAIRED bead is not a human-review state, it is work with one retry coming (R5.10) — and
   // `blocked` is a status bd refuses to claim, so blocking it here would kill that retry on its own
   // first step. Left `open` like every other re-queued ticket; the repair's own note and stamp are
@@ -380,8 +405,13 @@ async function releaseFailedTicket(args: {
   } else {
     await safe(() => beads.setStatus(repo, ticket.id, "open"));
   }
-  await safe(() => beads.unassign(repo, ticket.id));
-  await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+  await releaseTicketClaim(repo, ticket.id);
+}
+
+/** Hand the claim back: the assignee and the stage label a live run puts on a ticket. */
+async function releaseTicketClaim(repo: string, ticketId: string): Promise<void> {
+  await safe(() => beads.unassign(repo, ticketId));
+  await safe(() => beads.untag(repo, ticketId, [LABELS.stage("implementing")]));
 }
 
 /** Block the bead for a human, with the note that says which failure this was and where its evidence is. */

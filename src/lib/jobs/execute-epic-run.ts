@@ -16,7 +16,7 @@ import { releaseWorktreeClaim, type Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
 import type { Project } from "../types";
 import { updateRun, type RunPatch, type RunRow } from "../runs";
-import type { RunReadiness, TicketTimeoutOutcome } from "./execute-epic-board";
+import type { RetiredTicketOutcome, RunReadiness, TicketTimeoutOutcome } from "./execute-epic-board";
 import type { LiveArmedAsk } from "./execute-epic-human-gate";
 import type { RunLease } from "./execute-epic-lease";
 import { safe } from "./execute-epic-persist";
@@ -56,6 +56,12 @@ export interface EpicRun {
 
   /** Tickets this run had to stop, and whether each got its work committed before it was stopped. */
   timedOut: TicketTimeoutOutcome[];
+  /**
+   * Tickets anton RETIRED mid-run as already shipped (anton-5bpd), and the bead each is now
+   * superseded by. The run carried on without them, so the target has to say what its pull request
+   * therefore does not contain.
+   */
+  retired: RetiredTicketOutcome[];
   /**
    * What the review gate found on the branch when it failed with an error anton rethrows unchanged
    * (a usage limit, a transient claude failure) — the settle folds it into that attempt's run error,
@@ -137,6 +143,7 @@ export function makeEpicRun(seed: EpicRunSeed): EpicRun {
   const run: EpicRun = {
     ...seed,
     timedOut: [],
+    retired: [],
     orphanNotice: "",
     childCascade: null,
     armedPark: undefined,

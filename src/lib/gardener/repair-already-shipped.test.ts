@@ -1,7 +1,7 @@
 /**
- * The `already-shipped` claim check (anton-9a4m), against a REAL seeded repository and a seeded
- * board — the two things the claim is checked against, so a test that faked either would only prove
- * the mock agrees with itself.
+ * The `already-shipped` repair (anton-9a4m, anton-5bpd) — the CHECK against a REAL seeded repository
+ * and a seeded board (the two things the claim is checked against, so a test that faked either would
+ * only prove the mock agrees with itself), and the RETIREMENT that acts on what it answers.
  *
  * The claims, in the order they matter:
  *   • A claim naming work that landed VERIFIES: the commit is in the base's history, the bead is
@@ -19,14 +19,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Bead } from "../beads/bd";
 
-const noteMock = vi.fn(async () => "");
-const tagMock = vi.fn(async () => "");
+const noteMock = vi.fn<(cwd: string, id: string, text: string) => Promise<string>>(async () => "");
+const tagMock = vi.fn<(cwd: string, id: string, labels: string[]) => Promise<string>>(async () => "");
 const linkMock = vi.fn(async () => "");
 const closeMock = vi.fn(async () => "");
 const updateMock = vi.fn(async () => "");
 const setPrRefMock = vi.fn(async () => "");
+const supersedeMock = vi.fn<(cwd: string, id: string, replacement: string) => Promise<string>>(
+  async () => "",
+);
 /** Every bd seam that WRITES. A check that touches one of these has stopped being a check. */
-const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock];
+const bdWrites = [noteMock, tagMock, linkMock, closeMock, updateMock, setPrRefMock, supersedeMock];
+/** The under-lock re-read the RETIREMENT makes; the check never calls it. */
+const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 
 const loadAllIssuesMock = vi.fn<(cwd: string, opts?: unknown) => Promise<Bead[]>>(async () => []);
 
@@ -42,6 +47,8 @@ vi.mock("../beads/bd", async () => {
       close: closeMock,
       update: updateMock,
       setPrRef: setPrRefMock,
+      supersede: supersedeMock,
+      show: showMock,
     },
   };
 });
@@ -51,8 +58,16 @@ vi.mock("../beads/issues", async () => {
   return { ...actual, loadAllIssues: loadAllIssuesMock };
 });
 
-const { claimedCommits, claimedPullRequests, shippedEvidenceNote, verifyShippedClaim } =
-  await import("./repair-already-shipped");
+const {
+  claimedCommits,
+  claimedPullRequests,
+  repairAlreadyShipped,
+  resolveShipper,
+  shippedEvidenceNote,
+  verifyShippedClaim,
+} = await import("./repair-already-shipped");
+const { indexBoard } = await import("./board-index");
+const { repairLabel } = await import("./repair");
 const { GH_BIN_ENV } = await import("../git/ops");
 
 function has(cmd: string): boolean {
@@ -343,5 +358,201 @@ describe("what a claim NAMES", () => {
       claimedPullRequests("PR #85, also https://github.com/o/r/pull/85 and #12"),
     ).toEqual(["gh-85", "gh-12"]);
     expect(claimedPullRequests(undefined)).toEqual([]);
+  });
+});
+
+/**
+ * The RETIREMENT (anton-5bpd) — what anton does with the check's answer, and everything it refuses
+ * to do with anything less than a verified one.
+ *
+ * A bead-only claim throughout: it exercises every gate without a repository, because what these
+ * assert is the DECISION, and the git half of the evidence has its own suite above.
+ */
+describe("repairAlreadyShipped — the retirement", () => {
+  const REPO = "/tmp/anton-shipped-repo";
+  const NOW = 1_700_000_000_000;
+  /** The claim the epic's own motivating example makes, minus the parts that need a repository. */
+  const CLAIM = `Already implemented by ${SHIPPER}`;
+  const board = (over: Partial<Bead> = {}) => [
+    bead(TARGET, { status: "in_progress" }),
+    bead(SHIPPER, { status: "closed", ...over }),
+  ];
+
+  const retire = (args: Partial<Parameters<typeof repairAlreadyShipped>[0]> = {}) =>
+    repairAlreadyShipped({
+      repoPath: REPO,
+      base: "main",
+      bead: { id: TARGET },
+      block: { reason: CLAIM },
+      committed: false,
+      now: NOW,
+      autonomy: "apply",
+      board: board(),
+      ...args,
+    });
+
+  beforeEach(() => {
+    for (const write of bdWrites) write.mockClear();
+    showMock.mockReset();
+    // The under-lock re-read finds both ends exactly as the snapshot did.
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "closed" }),
+    );
+    loadAllIssuesMock.mockClear();
+    loadAllIssuesMock.mockResolvedValue(board());
+  });
+
+  it("retires the ticket as superseded, with the evidence on the bead and the stamp beside it", async () => {
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({
+      action: "retired",
+      replacementId: SHIPPER,
+      label: repairLabel(TARGET, "already-shipped", NOW),
+      proof: [`\`${SHIPPER}\` is closed on the board`],
+    });
+    expect(supersedeMock).toHaveBeenCalledWith(REPO, TARGET, SHIPPER);
+
+    // The EVIDENCE note (the acceptance's "with the evidence in a note"), and it is ONE line — the
+    // notes blob is line-delimited, so a multi-line note would parse back unattributed.
+    const evidence = noteMock.mock.calls.map((c) => c[2]).find((t) => t.includes("verified"))!;
+    expect(evidence).toContain(SHIPPER);
+    expect(evidence).toContain("acceptance criteria");
+    expect(evidence.split("\n")).toHaveLength(1);
+
+    // The STAMP, so a repeat escalates rather than repairing again (R5.6).
+    expect(tagMock).toHaveBeenCalledWith(REPO, TARGET, [repairLabel(TARGET, "already-shipped", NOW)]);
+
+    // Written in the order the module promises: the statement of what anton checked lands BEFORE
+    // anything is settled on the strength of it.
+    const firstNote = Math.min(...noteMock.mock.invocationCallOrder);
+    expect(firstNote).toBeLessThan(supersedeMock.mock.invocationCallOrder[0]!);
+    expect(supersedeMock.mock.invocationCallOrder[0]!).toBeLessThan(tagMock.mock.invocationCallOrder[0]!);
+  });
+
+  it("at `shadow` — the shipped default — works the retirement out and writes NOTHING", async () => {
+    const outcome = await retire({ autonomy: "shadow" });
+
+    expect(outcome).toMatchObject({
+      action: "shadow",
+      replacementId: SHIPPER,
+      proof: [`\`${SHIPPER}\` is closed on the board`],
+    });
+    expect((outcome as { attempted: string }).attempted).toContain(`bd supersede ${TARGET} --with ${SHIPPER}`);
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("at `propose` it escalates without resolving anything", async () => {
+    const outcome = await retire({ autonomy: "propose" });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("not armed to repair");
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("escalates the SECOND block on a ticket it already retired (R5.6)", async () => {
+    const outcome = await retire({
+      bead: { id: TARGET, labels: [repairLabel(TARGET, "already-shipped", NOW - 60_000)] },
+    });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("already repaired it");
+    expect((outcome as { prior?: { klass: string } }).prior?.klass).toBe("already-shipped");
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("retires NOTHING when the claim does not verify — the ticket blocks as it does today", async () => {
+    // The named bead is still open and points at no PR: nothing there says its work landed.
+    const outcome = await retire({ board: board({ status: "open" }) });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("could NOT verify");
+    expect((outcome as { evidence: string[] }).evidence.join(" ")).toContain("nothing there says its work landed");
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("refuses a claim its own run's diff contradicts, before it reads anything", async () => {
+    const outcome = await retire({ committed: true });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("committed changes");
+    expect(loadAllIssuesMock).not.toHaveBeenCalled();
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("refuses to pick a survivor: no bead named, or more than one", async () => {
+    const noBead = await retire({ block: { reason: "already done, see commit 9c51510" } });
+    expect(noBead).toMatchObject({ action: "escalate" });
+    expect((noBead as { evidence: string[] }).evidence.join(" ")).toContain("names no bead id");
+
+    const two = await retire({
+      block: { reason: `shipped by ${SHIPPER} and anton-zzzz` },
+      board: [...board(), bead("anton-zzzz", { status: "closed" })],
+    });
+    expect(two).toMatchObject({ action: "escalate" });
+    expect((two as { evidence: string[] }).evidence.join(" ")).toContain("2 bead ids");
+
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("refuses to strand open work beneath the ticket it would close", async () => {
+    const child = bead("anton-kid", { status: "open" });
+    (child as unknown as Record<string, unknown>).parent = TARGET;
+    const outcome = await retire({ board: [...board(), child] });
+
+    expect(outcome).toMatchObject({ action: "escalate" });
+    expect((outcome as { why: string }).why).toContain("strand");
+    for (const write of bdWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing when either end moved between the check and the write", async () => {
+    // Somebody else settled the ticket in the window — anton does not rewrite that outcome.
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "closed" }) : bead(SHIPPER, { status: "closed" }),
+    );
+    const settled = await retire();
+    expect(settled).toMatchObject({ action: "escalate" });
+    expect((settled as { evidence: string[] }).evidence.join(" ")).toContain("already settled");
+
+    // …and the survivor reopened with no PR: it has not landed, so nothing is superseded by it.
+    showMock.mockImplementation(async (_cwd, id) =>
+      id === TARGET ? bead(TARGET, { status: "in_progress" }) : bead(SHIPPER, { status: "open" }),
+    );
+    const reopened = await retire();
+    expect(reopened).toMatchObject({ action: "escalate" });
+    expect((reopened as { evidence: string[] }).evidence.join(" ")).toContain("open again");
+
+    expect(supersedeMock).not.toHaveBeenCalled();
+    expect(tagMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the retirement when only the STAMP failed, and says the guard is not armed for it", async () => {
+    tagMock.mockRejectedValueOnce(new Error("beads db is locked"));
+
+    const outcome = await retire();
+
+    expect(outcome).toMatchObject({ action: "retired", replacementId: SHIPPER });
+    expect((outcome as { label?: string }).label).toBeUndefined();
+    expect(supersedeMock).toHaveBeenCalledWith(REPO, TARGET, SHIPPER);
+    const notes = noteMock.mock.calls.map((c) => c[2]);
+    expect(notes.some((t) => t.includes("could not stamp it"))).toBe(true);
+  });
+});
+
+describe("resolveShipper", () => {
+  const index = (beadsOnBoard: Bead[]) => indexBoard(beadsOnBoard);
+
+  it("resolves exactly one named bead the board holds, never the ticket itself", () => {
+    const board = [bead(TARGET), bead(SHIPPER, { status: "closed" })];
+    expect(resolveShipper(index(board), TARGET, `shipped by ${SHIPPER}, not ${TARGET}`)).toEqual({
+      state: "resolved",
+      id: SHIPPER,
+    });
+  });
+
+  it("refuses a bead id with this board's prefix that nobody filed", () => {
+    const verdict = resolveShipper(index([bead(TARGET)]), TARGET, "shipped by anton-ghost");
+    expect(verdict).toMatchObject({ state: "unresolved" });
+    expect((verdict as { why: string }).why).toContain("the board holds no such bead");
   });
 });

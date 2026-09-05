@@ -234,6 +234,38 @@ export function askSettleError(raw: unknown, signal: AbortSignal): unknown {
 }
 
 /**
+ * The ticket's work had ALREADY LANDED, so anton retired it as superseded and the run carries on
+ * (anton-5bpd / R5.4).
+ *
+ * Deliberately NOT poison, and — like {@link TicketTimeoutError} — deliberately not fatal to the
+ * run: the ticket loop catches this one error and moves to the next ticket. The contrast with the
+ * other repairs is the point. A rewritten pointer earns a RETRY because the bead is now correct, an
+ * ordering earns a WAIT because the work cannot start yet; a retirement earns neither, because there
+ * is nothing left to run. Halting the epic over it would park a whole feature on a ticket that is
+ * finished.
+ *
+ * `repairAlreadyShipped` has already closed the bead against its survivor and put the evidence on it
+ * by the time this is thrown, so nothing downstream settles it — the loop only records which ticket
+ * it was, so the target can say what its pull request does not contain.
+ */
+export class TicketRetiredError extends Error {
+  constructor(
+    readonly ticketId: string,
+    /** The bead the ticket is now recorded as superseded by. */
+    readonly replacementId: string,
+    /** What the repair did, in the words the bead's own note carries. */
+    readonly attempted: string,
+  ) {
+    super(
+      `${ticketId} was already shipped by ${replacementId}: anton verified that against the ` +
+        `repository and the board, retired the ticket as superseded, and the run carried on with ` +
+        `the rest of the feature. ${attempted}`,
+    );
+    this.name = "TicketRetiredError";
+  }
+}
+
+/**
  * One ticket outlived its wall-clock budget (anton-t1mo — `ticketTimeoutMinutes`).
  *
  * Deliberately NOT poison, and deliberately not fatal to the run: the ticket loop catches this one
