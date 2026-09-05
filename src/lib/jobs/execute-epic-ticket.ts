@@ -779,11 +779,19 @@ export async function settleTicketTimeout(args: {
     // was kept, nothing is rolled back, and nothing goes to the board. Return so the abort path
     // below settles the ticket the way whoever stopped the run intends.
     if ("jobAborted" in kept) return;
+    // Work the agent committed ITSELF that anton could not mark (PR #228 review). It sits on the
+    // branch exactly as a preserve does — so the rollback below must not touch it — but no reader
+    // can find it, which is why it is not `preservedOn`: that name promises a resume continuing from
+    // the work, and here the promise would be false. The run halts on it further down.
+    const unmarkedOn = "unmarkedOn" in kept ? kept.unmarkedOn : null;
     // A FRESH preserve is the only outcome that moved the branch; everything else — an attempt that
     // wrote nothing, and a refusal whose rollback keeps a previous attempt's commit — leaves what is
-    // on the branch to a previous attempt, and the operator is owed that either way.
-    const fresh = "branch" in kept && !kept.retained;
-    const preservedOn = "branch" in kept ? kept.branch : kept.retainedOn;
+    // on the branch to a previous attempt, and the operator is owed that either way. The unmarked
+    // adoption counts as fresh HERE and only here: what it decides is the tree read below, and its
+    // commits moved the branch off the baseline just as a preserve's do.
+    const fresh = ("branch" in kept && !kept.retained) || unmarkedOn !== null;
+    const preservedOn =
+      "branch" in kept ? kept.branch : "retainedOn" in kept ? kept.retainedOn : null;
     const retained = preservedOn !== null && !fresh;
     // Both routes answer the SAME question — is anything of this ticket still loose in the tree —
     // and neither is trusted to have worked. A FRESH preserve re-reads the tree from scratch (`null`
@@ -811,6 +819,7 @@ export async function settleTicketTimeout(args: {
       leftovers,
       preservedOn,
       retained,
+      unmarkedOn,
       ...("rolledBackWhy" in kept ? { rolledBackWhy: kept.rolledBackWhy } : {}),
     });
     // Emptying the tree is what keeps the REST of the run honest, so its failure cannot be absorbed
@@ -839,6 +848,23 @@ export async function settleTicketTimeout(args: {
           `but bd would not record \`${LABELS.notDelivered}\` on it — the run stopped rather than ` +
           `carry on to a pull request whose merge would close this undelivered ticket as shipped. ` +
           `Check the beads DB, then resume the run`,
+      );
+    }
+    // The work is on the branch and unfindable, and no resume repairs that by itself: every one
+    // reports a zero diff and parks again, and a run that later gains child tickets carries these
+    // explicitly incomplete commits into their pull request, past a shape guard that reads the
+    // marker this branch does not have. Absorbing the timeout walks the run into one of those two,
+    // so it stops for the person who can mark the commits or take them off.
+    if (unmarkedOn) {
+      throw new PoisonEpic(
+        `${ticket.id} exceeded its ${Math.round(timeoutMs / 60_000)}m ticket budget, and the work ` +
+          `the agent had committed itself is on \`${unmarkedOn}\` — NOT rolled back — but anton ` +
+          `could not record the \`${preservedCommitPrefix(ticket.id)}\` marker a resume reads, ` +
+          `even with this project's hooks bypassed. Unmarked, that work is invisible both to a ` +
+          `resume and to the guard that keeps it out of a child ticket's pull request, so the run ` +
+          `stopped here. Mark the branch tip by hand (an empty commit whose subject starts ` +
+          `\`${preservedCommitPrefix(ticket.id)}\`) or take the commits off \`${unmarkedOn}\`, ` +
+          `then resume the run`,
       );
     }
     throw new TicketTimeoutError(ticket.id, timeoutMs, delivered, preservedOn);
@@ -883,9 +909,16 @@ const PRESERVE_VERIFY_MAX_MS = 15 * 60_000;
  * previous attempt's preserved commit, write more, and have the additions rejected — the rollback
  * then drops only the additions, and reporting a bare rollback would tell the operator work that is
  * still on the branch was thrown away.
+ *
+ * `unmarkedOn` is the state that is neither kept nor lost (PR #228 review): the agent's own commits
+ * are on the branch and must not be reset away, but anton could not record the marker every reader
+ * of preserved work goes through, so no resume can find them. Reported apart from `branch` because
+ * the difference is the whole meaning of the answer — "preserved" promises a resume that continues
+ * from the work, and this one cannot make that promise. The caller halts on it for a person.
  */
 type PreservedWork =
   | { branch: string; retained: boolean }
+  | { unmarkedOn: string }
   | { rolledBackWhy: string; retainedOn: string | null }
   | { jobAborted: true };
 
@@ -929,7 +962,8 @@ type PreservedWork =
  * - git refuses the commit outright, or `git add -A` finds nothing to commit AND HEAD never moved —
  *   either way nothing was preserved, and the reason says which. An empty index with a HEAD that
  *   DID move is not that case: the agent committed its own work, and {@link adoptSelfCommittedWork}
- *   keeps it.
+ *   keeps it — or, when it cannot make that work findable, stops for a person rather than roll a
+ *   commit back or call it preserved.
  */
 export async function preserveTimedOutWork(args: {
   run: Omit<StepContext, "tickets">;
@@ -954,13 +988,7 @@ export async function preserveTimedOutWork(args: {
     );
     return { rolledBackWhy: why, retainedOn };
   };
-  if (committed) return { rolledBackWhy: "its work was already committed", retainedOn };
-  if (!baseline) {
-    return rollBack(`anton could not read the worktree this ticket started from`);
-  }
-
   const now = await readWorktreeState(worktreePath).catch(() => null);
-  if (!now) return rollBack(`anton could not read the worktree back`);
   // "Nothing kept" is a verdict on THIS attempt, never on the branch (PR #228 review). A resume that
   // starts from a previous attempt's preserved commit leaves it wherever the ticket ends — untouched
   // if nothing was written, and still there if what was written gets refused below, since the
@@ -968,12 +996,23 @@ export async function preserveTimedOutWork(args: {
   // point tells the operator the truth about the branch; without it the bead note and the park say
   // the work is gone and the next resume starts over, when in fact it continues from that commit.
   // Only while HEAD is on the run's branch: off it, anton cannot say what the rollback puts back.
+  //
+  // Asked BEFORE the already-committed exit below, because that exit is one of the answers it has to
+  // be true of (PR #228 review): a resume that adopted a previous attempt's preserved commit and had
+  // the delivery gate REFUSE it leaves that work exactly where it was, and an exit reporting no
+  // preserved branch tells the park the next resume starts over — when it continues from the commit.
   if (
+    now &&
     now.ref === `refs/heads/${branch}` &&
     (await worktreeHasPreservedCommitFor(worktreePath, ticket.id))
   ) {
     retainedOn = branch;
   }
+  if (committed) return { rolledBackWhy: "its work was already committed", retainedOn };
+  if (!baseline) {
+    return rollBack(`anton could not read the worktree this ticket started from`);
+  }
+  if (!now) return rollBack(`anton could not read the worktree back`);
   // Asked before the sibling check below, so a ticket that left nothing is never told the reason it
   // could not keep work it never wrote.
   if (sameWorktreeState(now, baseline)) {
@@ -1099,10 +1138,20 @@ export async function preserveTimedOutWork(args: {
  * treats it as delivery for the same reason this must treat it as preserved: the commits are real,
  * they are on the run's branch, and here they have just passed the project's verify gates.
  *
- * The marker is what keeps that work FINDABLE. The agent's own subjects carry no `WIP <id>:` prefix,
- * so without one the resume's zero diff reads as "nothing landed" and parks the run one step from
- * the pull request it already earned. A marker that cannot be written is still no reason to roll
- * back — the work outranks its bookkeeping — so the failure is logged and the commits are kept.
+ * The marker is what keeps that work FINDABLE, and it is the ONLY thing that does: both readers of
+ * preserved work — `step:commit`, which turns a resume's zero diff into the delivery it already
+ * earned, and `assertPreservedWorkFitsShape`, which refuses to dispatch children onto a branch that
+ * carries one — go through the `WIP <id>:` subject, and the agent's own subjects carry no prefix at
+ * all. So an unmarked adoption is not a preserve with a missing receipt; it is work no resume can
+ * see, and reporting it preserved is the false success this path exists to refuse (PR #228 review):
+ * unseen, every resume reports a zero diff and parks again, and a resume taken after the target is
+ * split walks explicitly incomplete commits past the shape guard and into a child's pull request.
+ *
+ * Rejection is the failure worth retrying, and hooks are what reject — a `commit-msg` hook that
+ * takes the agent's conventional subject and refuses anton's `WIP` one. The retry bypasses them,
+ * which this commit and no other may do: it is EMPTY, so no hook is being asked about content. Only
+ * when that fails too is the work truly unmarked — never rolled back, since the commits outrank
+ * their bookkeeping, but handed to a person instead of reported as preserved.
  */
 async function adoptSelfCommittedWork(args: {
   worktreePath: string;
@@ -1114,17 +1163,23 @@ async function adoptSelfCommittedWork(args: {
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
   const { worktreePath, branch, ticket, timeoutMs, logPath, alreadyMarked } = args;
+  const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   const marked =
     alreadyMarked ||
-    (await safe(() =>
-      commitMarker(worktreePath, preservedCommitMessage(ticket, timeoutMs, { marker: true })),
-    ));
+    (await safe(() => commitMarker(worktreePath, message))) ||
+    (await safe(() => commitMarker(worktreePath, message, { bypassHooks: true })));
+  if (!marked) {
+    await logPreserve(
+      logPath,
+      `the agent committed this ticket's work itself — KEPT on ${branch}, but anton could not ` +
+        `record the marker a resume reads, even with this project's hooks bypassed: stopping for ` +
+        `a person rather than reporting work no resume can see as preserved`,
+    );
+    return { unmarkedOn: branch };
+  }
   await logPreserve(
     logPath,
-    marked
-      ? `the agent committed this ticket's work itself — KEPT on ${branch} rather than rolled back`
-      : `the agent committed this ticket's work itself — KEPT on ${branch}, but anton could not ` +
-          `record the marker a resume reads, so that resume may report a zero diff`,
+    `the agent committed this ticket's work itself — KEPT on ${branch} rather than rolled back`,
   );
   return { branch, retained: false };
 }
@@ -1250,11 +1305,17 @@ async function blockTimedOutTicket(args: {
    * or had what it added rolled back (`rolledBackWhy` tells the two apart).
    */
   retained?: boolean;
+  /**
+   * The branch carrying work the agent committed ITSELF that anton could not mark (PR #228 review):
+   * kept, but findable by no resume, so a person is the only one who can settle it.
+   */
+  unmarkedOn?: string | null;
   /** Why the work could NOT be kept — the operator is owed the reason, not just the verdict. */
   rolledBackWhy?: string;
 }): Promise<boolean> {
   const { repo, ticket, worktreePath, timeoutMs, committed, delivered, leftovers, preservedOn } =
     args;
+  const unmarkedOn = args.unmarkedOn ?? null;
   await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
   await safe(() => beads.unassign(repo, ticket.id));
   await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
@@ -1291,7 +1352,17 @@ async function blockTimedOutTicket(args: {
               `${preservedOn && !args.retained ? "fully committed" : "rolled back"} ` +
               `and is STILL in the run's worktree (${worktreePath}), so the run stopped rather ` +
               `than let another ticket commit it — clear the worktree by hand before resuming. `
-            : preservedOn
+            : // Kept, and invisible: the agent's own subjects name neither this ticket nor its
+              // incompleteness, and the marker that would is the one thing anton could not write —
+              // so the operator, not a resume, is what stands between this work and a lost branch.
+              unmarkedOn
+              ? `The work the agent committed ITSELF is on branch \`${unmarkedOn}\` and was NOT ` +
+                `rolled back, but anton could not record the ` +
+                `\`${preservedCommitPrefix(ticket.id)}\` marker a resume reads — not even with ` +
+                `this project's hooks bypassed. Unmarked, no resume can see that work and no ` +
+                `guard keeps it out of a child ticket's pull request, so the run stopped. Mark ` +
+                `the branch tip by hand, or take the commits off it, before resuming. `
+              : preservedOn
               ? (args.retained
                   ? (args.rolledBackWhy
                       ? `What this attempt added was rolled back (${args.rolledBackWhy}), but the ` +
@@ -1311,15 +1382,18 @@ async function blockTimedOutTicket(args: {
         `Split it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
     ),
   );
-  // Either halt the caller makes PARKS the run and tells the operator to resume it, so this ticket
-  // has to stay claimable (anton-67xj). The block above left it `blocked` — or `in_progress` and
-  // unowned, if that best-effort status write failed — and runTicket's hard claim gate refuses
-  // both, so the advertised resume would die on its own first step. Put it back at `open`, the same
-  // restore the stale-marker path performs; the note above is what carries the timeout's account to
-  // the operator, not the status. A timeout the run ABSORBS keeps `blocked` here: it carries on to
-  // a PR, and the block is the human's cue — and if that run later stops instead, its own stopping
-  // path reopens what it absorbed, for exactly the reason above.
-  if (leftovers || !marked) await safe(() => beads.setStatus(repo, ticket.id, "open"));
+  // Every halt the caller makes PARKS the run and tells the operator to resume it, so this ticket
+  // has to stay claimable (anton-67xj) — the unmarked adoption included (PR #228 review), since the
+  // resume that follows the operator's fix is what finishes it. The block above left it `blocked` —
+  // or `in_progress` and unowned, if that best-effort status write failed — and runTicket's hard
+  // claim gate refuses both, so the advertised resume would die on its own first step. Put it back
+  // at `open`, the same restore the stale-marker path performs; the note above is what carries the
+  // timeout's account to the operator, not the status. A timeout the run ABSORBS keeps `blocked`
+  // here: it carries on to a PR, and the block is the human's cue — and if that run later stops
+  // instead, its own stopping path reopens what it absorbed, for exactly the reason above.
+  if (leftovers || !marked || unmarkedOn) {
+    await safe(() => beads.setStatus(repo, ticket.id, "open"));
+  }
   return marked;
 }
 

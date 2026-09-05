@@ -239,6 +239,33 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
   });
 
+  // The same resume once more, at the exit that runs FIRST (PR #228 review): `step:commit` adopted
+  // the preserved commit, the delivery gate refused it, and the deadline landed. Nothing was rolled
+  // back — the commit is where it always was — so an exit that reported no preserved branch would
+  // hand the park a ticket it says starts over, and send the next resume off to redo kept work.
+  it("reports the branch's preserved commit even when this attempt already committed", async () => {
+    write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+    const baseline = await readWorktreeState(repo);
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "exit 1" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: true,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({
+      rolledBackWhy: "its work was already committed",
+      retainedOn: BRANCH,
+    });
+    expect(head()).toBe(baseline.head);
+  });
+
   // The empty index that is NOT an empty ticket (PR #228 review): the agent committed its own work
   // and the deadline landed before `step:commit` recorded it. `commitAll` finds nothing staged, and
   // read as "nothing to commit" the rollback hard-resets to the baseline — deleting the finished,
@@ -266,6 +293,66 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(out(["rev-list", "--count", `${selfCommitted}..HEAD`])).toBe("1");
     expect(subjects()).toContain("feat: the agent's own subject");
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+  });
+
+  // The marker is the ONLY way either reader finds self-committed work, and a project whose
+  // `commit-msg` hook enforces its own subject convention refuses anton's `WIP` one (PR #228
+  // review). Losing the marker to a message check costs the ticket its whole path back to a pull
+  // request, so the retry bypasses the hooks — legitimate on this commit alone, which is empty.
+  it("marks self-committed work even when a commit-msg hook refuses anton's subject", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the subject this project's hook accepts"]);
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "commit-msg"), '#!/bin/sh\ngrep -q "^WIP " "$1" && exit 1\nexit 0\n', {
+      mode: 0o755,
+    });
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+  });
+
+  // …and when even that cannot be written, the work is neither kept-and-findable nor lost. Reported
+  // as preserved it would promise a resume that continues from it (PR #228 review) — but nothing on
+  // the branch names the ticket, so every resume reports a zero diff, and a resume taken after the
+  // target is split walks these commits past the shape guard into a child's pull request.
+  it("reports self-committed work it could not mark AT ALL rather than call it preserved", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    const selfCommitted = head();
+    // No commit of any kind can be written from here — hooks bypassed or not.
+    g(["config", "commit.gpgsign", "true"]);
+    g(["config", "gpg.program", join(repo, "no-such-gpg")]);
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ unmarkedOn: BRANCH });
+    // The agent's commit outranks its bookkeeping: kept exactly where it was, never reset away.
+    expect(head()).toBe(selfCommitted);
+    expect(subjects()).toContain("feat: the agent's own subject");
+    expect(subjects().some((s) => s.startsWith(`WIP ${ticket.id}:`))).toBe(false);
   });
 
   // …and the marker is written once. A resume that starts from a previous attempt's preserved
@@ -526,6 +613,114 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     expect(err.committed).toBe(true);
     expect(tagged).not.toContainEqual([LABELS.notDelivered]);
     expect(notes.join("\n")).toMatch(/stopped after the commit/);
+  });
+
+  // The refusal that lands on an ADOPTED preserved commit (PR #228 review). Nothing was rolled back
+  // — the commit is where the previous attempt left it — so the timeout must carry that branch out
+  // to the park, which decides from it whether a resume continues the work or starts it over.
+  it("carries the preserved branch out of a refusal that had nothing of its own to keep", async () => {
+    g(["commit", "-q", "--allow-empty", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+
+    const err = await settle(false);
+
+    expect(err.preservedOn).toBe(BRANCH);
+  });
+});
+
+// Work an agent committed itself that anton could NOT mark is on the branch and invisible to every
+// reader of it (PR #228 review). Absorbed as a preserve, each resume reports a zero diff and parks
+// again, and a resume taken after the target is split carries explicitly incomplete commits into a
+// child's pull request. So the run stops here, on a bead a person can pick back up.
+suite("settleTicketTimeout — unmarkable self-committed work stops the run", () => {
+  let sandbox: string;
+  let repo: string;
+  let logPath: string;
+  let tdb: TestDb;
+  let notes: string[];
+  let statuses: string[];
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () => execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  const run = (): Omit<StepContext, "tickets"> => ({
+    db: tdb.db,
+    clock: new FixedClock(1_700_000_000_000),
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {} },
+    projectId: randomUUID(),
+    runId: randomUUID(),
+    repoPath: repo,
+    worktreePath: repo,
+    branch: BRANCH,
+    baseBranch: "main",
+    baseRef: "origin/main",
+    target: ticket,
+    settings: { testCommand: "true" } satisfies ProjectSettings,
+  });
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    sandbox = mkdtempSync(join(tmpdir(), "anton-settle-unmarked-"));
+    repo = join(sandbox, "repo");
+    logPath = join(sandbox, "session.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", BRANCH]);
+
+    notes = [];
+    statuses = [];
+    vi.spyOn(beads, "tag").mockResolvedValue("");
+    vi.spyOn(beads, "note").mockImplementation(async (_repo, _id, body) => {
+      notes.push(body);
+      return "";
+    });
+    vi.spyOn(beads, "setStatus").mockImplementation(async (_repo, _id, status) => {
+      statuses.push(status);
+      return "";
+    });
+    vi.spyOn(beads, "unassign").mockResolvedValue("");
+    vi.spyOn(beads, "untag").mockResolvedValue("");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    tdb.close();
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("parks the run with what a person must do, and leaves the commits alone", async () => {
+    const baseline = await readWorktreeState(repo);
+    writeFileSync(join(repo, "FINISHED.md"), "work the agent committed itself\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    const selfCommitted = head();
+    g(["config", "commit.gpgsign", "true"]);
+    g(["config", "gpg.program", join(repo, "no-such-gpg")]);
+
+    const err = await settleTicketTimeout({
+      run: run(),
+      ticket,
+      session: { logPath },
+      baseline,
+      progress: { committed: false, delivered: false, selfReport: null },
+      timeoutMs: 60_000,
+      standalone: true,
+      ranOutOfTime: true,
+    }).catch((e: unknown) => e);
+
+    expect(isPoisonError(err)).toBe(true);
+    expect((err as Error).message).toContain(`WIP ${ticket.id}:`);
+    expect((err as Error).message).toContain(BRANCH);
+    expect((err as Error).message).toMatch(/resume the run/);
+    // The work is untouched, the operator has the account, and the bead is claimable for the resume
+    // that follows their fix.
+    expect(head()).toBe(selfCommitted);
+    expect(notes.join("\n")).toMatch(/could not record/);
+    expect(statuses).toContain("open");
   });
 });
 

@@ -370,13 +370,26 @@ export async function isAncestor(
 /**
  * Record an EMPTY commit — a marker that carries a message and no diff.
  *
- * The one caller is `step:commit` adopting work an agent committed itself. Those commits are real
- * and keep their own messages, but they don't carry the `<ticketId>:` subject that
- * {@link worktreeHasCommitFor} reads, so without a marker a resume cannot see that the ticket's
- * work is already on the branch and re-runs it — onto a tree where there is nothing left to do.
+ * The callers are `step:commit` and the ticket-timeout preserve, both adopting work an agent
+ * committed itself. Those commits are real and keep their own messages, but they don't carry the
+ * `<ticketId>:` subject {@link worktreeHasCommitFor} reads (nor the `WIP <ticketId>:` one
+ * {@link worktreeHasPreservedCommitFor} reads), so without a marker a resume cannot see that the
+ * ticket's work is already on the branch and re-runs it — onto a tree where there is nothing left
+ * to do.
+ *
+ * `bypassHooks` is the RETRY a caller makes when the ordinary marker was rejected (PR #228 review):
+ * a project whose `commit-msg` hook enforces its own subject convention refuses anton's, and losing
+ * the marker to a message check costs a whole ticket's work its only path back to a pull request.
+ * Legitimate precisely because this commit is EMPTY — there is no content for a hook to have an
+ * opinion about — and never taken for a commit that carries a diff.
  */
-export async function commitMarker(worktreePath: string, message: string): Promise<void> {
-  await git(worktreePath, ["commit", "--allow-empty", "-m", message]);
+export async function commitMarker(
+  worktreePath: string,
+  message: string,
+  options: { bypassHooks?: boolean } = {},
+): Promise<void> {
+  const bypass = options.bypassHooks ? ["--no-verify"] : [];
+  await git(worktreePath, ["commit", "--allow-empty", ...bypass, "-m", message]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
