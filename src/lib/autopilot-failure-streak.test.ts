@@ -102,7 +102,10 @@ describe("detectFailureStreak", () => {
 
 describe("the case the operator reads", () => {
   const timeout = (id: string, ticket: string) =>
-    run(id, { error: `ticket ${ticket} timed out after 45m\n  at step commit` });
+    run(id, {
+      ticketBeadId: ticket,
+      error: `ticket ${ticket} timed out after 45m\n  at step commit`,
+    });
 
   it("names the shared failure point when the runs differ only in their ids", () => {
     const runs = [timeout("c", "anton-c3"), timeout("b", "anton-b2"), timeout("a", "anton-a1")];
@@ -193,4 +196,130 @@ describe("the case the operator reads", () => {
       "cccccccc · anton-two · failed · test gate failed",
     ]);
   });
+});
+
+/**
+ * What a signature masks, and — as much the point — what it no longer does (anton-4mql). Every row
+ * is three runs differing in ONE fragment: a quantity collapses and the streak keeps its common
+ * point; anything else stands and the streak honestly reports none. The pairs of rows that differ
+ * only in whether the varying token carries a digit are the criterion itself — character shape alone
+ * must never decide the verdict, so both members of a pair must land the same way.
+ */
+describe("what a failure point is compared modulo", () => {
+  const EPIC = "anton-w0rk";
+
+  /** The table reads oldest first; the breaker is handed runs newest first, as its callers do. */
+  const commonPointOf = (points: readonly string[]) =>
+    detectFailureStreak(
+      points.map((error, i) => run(`r${i}`, { epicBeadId: EPIC, error })).reverse(),
+      THREE,
+    )!.commonFailure;
+
+  const cases: Array<{ what: string; points: [string, string, string]; shared: boolean }> = [
+    {
+      what: "durations — the same timeout, three lengths",
+      points: [
+        "worktree checkout timed out after 45m",
+        "worktree checkout timed out after 90m",
+        "worktree checkout timed out after 1h30m",
+      ],
+      shared: true,
+    },
+    {
+      what: "durations spelled every way an error spells them",
+      points: [
+        "test gate gave up after 2.5s",
+        "test gate gave up after 1500ms",
+        "test gate gave up after 3 minutes",
+      ],
+      shared: true,
+    },
+    {
+      what: "ports — one dev server that will not bind",
+      points: [
+        "dev server could not bind localhost:3000",
+        "dev server could not bind localhost:3001",
+        "dev server could not bind localhost:5432",
+      ],
+      shared: true,
+    },
+    {
+      what: "a port named in words",
+      points: [
+        "port 3000 is already in use",
+        "port 3001 is already in use",
+        "port 51234 is already in use",
+      ],
+      shared: true,
+    },
+    {
+      what: "an exit code is NOT a quantity — 137 is an OOM kill and 1 is a test failure",
+      points: [
+        "the build exited with code 1",
+        "the build exited with code 2",
+        "the build exited with code 137",
+      ],
+      shared: false,
+    },
+    {
+      what: "paths differing by a digit stand — the old rule masked these",
+      points: [
+        "/tmp/anton-run-1/worktree is missing",
+        "/tmp/anton-run-2/worktree is missing",
+        "/tmp/anton-run-3/worktree is missing",
+      ],
+      shared: false,
+    },
+    {
+      what: "paths differing by a letter stand too — and that is the same verdict as the digits",
+      points: [
+        "/tmp/anton-run-a/worktree is missing",
+        "/tmp/anton-run-b/worktree is missing",
+        "/tmp/anton-run-c/worktree is missing",
+      ],
+      shared: false,
+    },
+    {
+      what: "bead ids the row cannot name stand, digits or none — the old rule split on exactly this",
+      points: [
+        "waiting on anton-k4qr before this can run",
+        "waiting on anton-gsny before this can run",
+        "waiting on anton-ptsy before this can run",
+      ],
+      shared: false,
+    },
+    {
+      what: "an id whose base36 tail reads like a duration is still an id",
+      points: [
+        "anton-12ms would not check out",
+        "anton-34ms would not check out",
+        "anton-56ms would not check out",
+      ],
+      shared: false,
+    },
+    {
+      what: "…and the duration beside that id still masks",
+      points: [
+        "anton-12ms timed out after 45m",
+        "anton-12ms timed out after 90m",
+        "anton-12ms timed out after 1h30m",
+      ],
+      shared: true,
+    },
+    {
+      what: "identical points — the control",
+      points: [
+        "base branch would not check out",
+        "base branch would not check out",
+        "base branch would not check out",
+      ],
+      shared: true,
+    },
+  ];
+
+  for (const { what, points, shared } of cases) {
+    it(shared ? `collapses ${what}` : `keeps ${what} apart`, () => {
+      expect(commonPointOf(points)).toBe(shared ? points[0] : undefined);
+    });
+  }
 });
