@@ -127,6 +127,55 @@ describe("the case the operator reads", () => {
     );
   });
 
+  /**
+   * The three real parks the digit heuristic split (anton-q2jw): one broken ordering described three
+   * times, differing ONLY in the bead ids each run was carrying — and two of those ids
+   * (`anton-gsny`, `anton-ptsy`) carry no digit at all, so nothing about their shape says they vary.
+   */
+  const depMissingPark = (ticket: string, blocker: string) =>
+    `${ticket} is blocked by ${blocker} — refusing to execute; resume the run once the blocker(s) ` +
+    `complete — anton drew that edge itself after the agent reported \`dep-missing\`: recorded ` +
+    `\`${blocker}\` as a blocker of ${ticket} (bd link ${ticket} ${blocker} --type blocks), ` +
+    `parking it until that lands`;
+
+  const blocked = (id: string, epic: string, ticket: string, blocker: string) =>
+    run(id, {
+      epicBeadId: epic,
+      ticketBeadId: ticket,
+      status: "parked",
+      error: depMissingPark(ticket, blocker),
+    });
+
+  it("collapses three parks that differ only in ids whose characters say nothing", () => {
+    const runs = [
+      blocked("c", "anton-stb2", "anton-0lom", "anton-k4qr"),
+      blocked("b", "anton-u189", "anton-7zpv", "anton-gsny"),
+      blocked("a", "anton-x37c", "anton-n8eb", "anton-ptsy"),
+    ];
+    expect(detectFailureStreak(runs, THREE)!.commonFailure).toBe(
+      "anton-n8eb is blocked by anton-ptsy — refusing to execute; resume the run once the " +
+        "blocker(s) complete — anton drew that edge itself after t",
+    );
+  });
+
+  it("masks the run target too, not only the ticket and its blockers", () => {
+    const target = (epic: string) =>
+      run(epic, { epicBeadId: epic, error: `worktree for ${epic} would not check out` });
+    const runs = [target("anton-gsny"), target("anton-ptsy"), target("anton-k4qr")];
+    expect(detectFailureStreak(runs, THREE)!.commonFailure).toBe(
+      "worktree for anton-k4qr would not check out",
+    );
+  });
+
+  it("still reports nothing when one of those parks is a different failure", () => {
+    const runs = [
+      run("c", { epicBeadId: "anton-stb2", error: "test gate failed: 3 tests red" }),
+      blocked("b", "anton-u189", "anton-7zpv", "anton-gsny"),
+      blocked("a", "anton-x37c", "anton-n8eb", "anton-ptsy"),
+    ];
+    expect(detectFailureStreak(runs, THREE)!.commonFailure).toBeUndefined();
+  });
+
   it("names no shared point when one run recorded no error at all", () => {
     const runs = [run("c"), timeout("b", "anton-b2"), timeout("a", "anton-a1")];
     expect(detectFailureStreak(runs, THREE)!.commonFailure).toBeUndefined();

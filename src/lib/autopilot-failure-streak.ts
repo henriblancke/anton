@@ -15,6 +15,7 @@
  * stay testable without a db, a repo or a job queue.
  */
 import type { RunStatus } from "@/components/runs/run-view-utils";
+import { poisonBlockerIds } from "./jobs/errors";
 
 /** What one run says about the environment it ran in. */
 export type RunVerdict = "delivered" | "failure" | "ignored";
@@ -165,16 +166,53 @@ function failurePoint(run: RunOutcome): string {
   return line.trim().slice(0, FAILURE_POINT_CHARS);
 }
 
+/** What a run-specific token collapses to, bead id or digit-carrying token alike. */
+const MASK = "#";
+
+/**
+ * The bead ids THIS run is known to name: the target it ran, the ticket it stopped inside, and the
+ * blockers a blocked park spells out (jobs/errors.ts owns that clause and its parser). All three
+ * arrive on the row or in the message the row already carries, so the module stays pure — nothing
+ * here asks the board what a token is.
+ */
+function knownBeadIds(run: RunOutcome): string[] {
+  const blockers = (run.error && poisonBlockerIds(run.error)) || [];
+  return [run.epicBeadId, run.ticketBeadId, ...blockers].filter(
+    (id): id is string => typeof id === "string" && id.length > 0,
+  );
+}
+
+/**
+ * Take the run's own ids out of its failure point.
+ *
+ * LONGEST FIRST, because a child id contains its parent's (`anton-287p.1` / `anton-287p`): masking
+ * the parent first leaves `#.1` behind, and that leftover is exactly the difference that makes two
+ * runs of one break look like two breaks.
+ */
+function maskBeadIds(point: string, ids: readonly string[]): string {
+  return [...new Set(ids)]
+    .sort((a, b) => b.length - a.length)
+    .reduce((text, id) => text.replaceAll(id, MASK), point);
+}
+
 /**
  * Two failures are the same point once the run-specific parts are taken out: "ticket anton-a1b2
  * timed out after 45m" and "ticket anton-c3d4 timed out after 45m" are one broken environment
- * described twice, not two hard tickets. Any token carrying a digit — bead id, path, duration,
- * port — is what varies between two runs of the same break, so that is what collapses.
+ * described twice, not two hard tickets.
+ *
+ * The BEAD IDS are masked from what the run row already knows they are, not inferred from their
+ * characters (anton-q2jw). anton's ids are 4-character base36 slugs and only about 73% of them carry
+ * a digit, so the token rule below reads `anton-k4qr` as run-specific and `anton-gsny` as part of
+ * the sentence: three identical dep-missing parks scored three signatures, and the operator was told
+ * a streak with exactly one cause had none.
+ *
+ * The token rule still runs after the ids are out, for the run-specific parts no row can name —
+ * durations, ports, paths, pids.
  */
-function signatureOf(point: string): string {
-  return point
-    .toLowerCase()
-    .replace(/[\w./:-]*\d[\w./:-]*/g, "#")
+function signatureOf(run: RunOutcome, point: string): string {
+  const ids = knownBeadIds(run).map((id) => id.toLowerCase());
+  return maskBeadIds(point.toLowerCase(), ids)
+    .replace(/[\w./:-]*\d[\w./:-]*/g, MASK)
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -189,9 +227,10 @@ function signatureOf(point: string): string {
 export function sharedFailurePoint(runs: readonly RunOutcome[]): string | undefined {
   const points = runs.map(failurePoint);
   if (points.length === 0 || points.some((p) => p.length === 0)) return undefined;
-  const signature = signatureOf(points[0]);
+  const signatures = runs.map((run, i) => signatureOf(run, points[i]!));
+  const signature = signatures[0]!;
   if (!signature) return undefined;
-  return points.every((p) => signatureOf(p) === signature) ? points[0] : undefined;
+  return signatures.every((s) => s === signature) ? points[0] : undefined;
 }
 
 /** Why the breaker fired, in one sentence — the disarm's `detail`. */
