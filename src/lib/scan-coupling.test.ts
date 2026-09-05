@@ -541,6 +541,43 @@ describe("readDirAliases", () => {
     expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
     expect(await readDirAliases(repo, "apps")).toEqual({ rules: [], governed: false });
   });
+
+  // tsc reads straight past a UTF-8 BOM; `JSON.parse` refuses the file. Read as "no config here",
+  // the lookup climbed past a real project boundary and applied the ancestor's mapping (PR #190
+  // review).
+  it("reads a config written with a byte-order mark", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": `\uFEFF${JSON.stringify({ compilerOptions: { baseUrl: "." } })}`,
+      "apps/lib/tsconfig.json": `\uFEFF${JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "#/*": ["./own/*"] } },
+      })}`,
+    });
+
+    // The paths-less one still BOUNDS its project, so nothing is inherited from the root...
+    expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
+    // ...and one that does publish a mapping is read rather than thrown away.
+    expect(await readDirAliases(repo, "apps/lib")).toEqual({
+      rules: [{ prefix: "#/", targets: ["apps/lib/own/*"] }],
+      governed: true,
+    });
+  });
+
+  // The boundary is the file's EXISTENCE, which is what tsc reads it as — not whether this reader
+  // could make sense of it. Climbing past a broken config applies a mapping the compiler never
+  // would (PR #190 review).
+  it("treats a config it cannot parse as governing its directory", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": "{ this is not json",
+    });
+
+    expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
+  });
 });
 
 describe("judgeCycle", () => {

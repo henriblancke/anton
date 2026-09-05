@@ -326,8 +326,30 @@ function stripJsonc(text: string): string {
 
 /** The tsconfig at `file`, or undefined when there is none anton can read. */
 async function readConfig(repoPath: string, file: string): Promise<TsConfig | undefined> {
+  const text = await readConfigText(repoPath, file);
+  return text === undefined ? undefined : parseConfig(text);
+}
+
+/** One config's bytes, or undefined when there is no such file to read. */
+async function readConfigText(repoPath: string, file: string): Promise<string | undefined> {
   try {
-    return JSON.parse(stripJsonc(await readFile(join(repoPath, file), "utf8"))) as TsConfig;
+    return await readFile(join(repoPath, file), "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * One config's text as an object, or undefined when it is not one this reader can parse.
+ *
+ * A leading BOM goes first. An editor on Windows writes one, tsc reads straight past it, and
+ * `JSON.parse` refuses the file outright — which read as "no config here", let the lookup climb
+ * past a real project boundary, and applied an ancestor's `@/*` to a project that declares none
+ * (PR #190 review).
+ */
+function parseConfig(text: string): TsConfig | undefined {
+  try {
+    return JSON.parse(stripJsonc(text.replace(/^\uFEFF/, ""))) as TsConfig;
   } catch {
     return undefined;
   }
@@ -588,9 +610,16 @@ export interface DirAliases {
 export async function readDirAliases(repoPath: string, dir = "."): Promise<DirAliases> {
   let governed = false;
   for (const name of CONFIG_NAMES) {
-    const config = await readConfig(repoPath, join(dir, name));
-    if (!config) continue;
+    const text = await readConfigText(repoPath, join(dir, name));
+    if (text === undefined) continue;
+    // A config anton cannot PARSE still bounds the project — the boundary is the file's existence,
+    // which is what tsc reads it as, not whether this reader could make sense of it (PR #190
+    // review). Climbing past it applies an ancestor's mapping the compiler never would; stopping
+    // here leaves the specifier to the tail fallback, which is where every unreadable mapping in
+    // this module already lands.
     governed = true;
+    const config = parseConfig(text);
+    if (!config) return { rules: [], governed };
     // The effective `baseUrl` is read from the config GOVERNING the directory, not from whichever
     // config in its chain declares `paths` — tsc merges the two options independently.
     const file = join(dir, name);

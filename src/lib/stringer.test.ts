@@ -3033,6 +3033,30 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/panel/page.ts");
     });
 
+    // `require('./widget').default` on a `module.exports = fn` module selects a property that is
+    // `undefined` — not the exported function. Reading the binding as the whole module credits a
+    // caller the code never had and deletes a true finding (PR #190 review).
+    it("does not read a member selection off a require as the whole module", async () => {
+      const repo = initRepo({
+        "src/lib/widget.js": "module.exports = function Widget() {\n  return null;\n};\n",
+        "src/lib/host.js":
+          "const Renamed = require('./widget').default;\nexports.host = () => Renamed?.();\n",
+        // Not vacuous: the whole-module binding beside it is still a caller.
+        "src/lib/panel.js": "module.exports = function Panel() {\n  return null;\n};\n",
+        "src/lib/page.js": "const Card = require('./panel');\nexports.page = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.js", "Widget"),
+        unused("src/lib/panel.js", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.js");
+    });
+
     // A declaration broken after `export default` is still that module's default; the head has to
     // reach across the newline to find the name.
     it("counts a default export whose head is broken across lines", async () => {

@@ -3277,9 +3277,17 @@ const DEFAULT_IMPORT =
 const DEFAULT_LIST_IMPORT =
   /(?:^|[;{}])\s*import\s+(?:type\s+)?\{[\w$,\s]*?\bdefault\s+as\s+([A-Za-z_$][\w$]*)[\w$,\s]*\}\s*from\s*['"]([^'"]+)['"]/gm;
 
-/** `const Renamed = require('./widget')` — CommonJS binding the whole module, default and all. */
+/**
+ * `const Renamed = require('./widget')` — CommonJS binding the WHOLE module, default and all.
+ *
+ * The call must end there. `require('./widget').default` selects a property off the module object,
+ * and on a `module.exports = function Widget() {}` module that property is `undefined` — not the
+ * exported function — so reading the binding as the whole module credits a caller the code never
+ * had and deletes a true finding (PR #190 review). `.default` off an ESM module is the interop
+ * shape below, which answers for it under the right reachability.
+ */
 const DEFAULT_REQUIRE =
-  /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]/gm;
+  /(?:^|[;{}])\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)\s*(?![.?[])/gm;
 
 /**
  * `const Renamed = require('./widget').default` — how CommonJS reaches an ESM default, and the only
