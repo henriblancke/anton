@@ -14,6 +14,7 @@ import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
+import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
 import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
 import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
@@ -189,6 +190,11 @@ export interface ScanResult {
    * signals whose flagged line holds a test placeholder (see {@link filterSecretSignals}).
    */
   secrets: SecretFilter;
+  /**
+   * What the reference check removed from `signals` — dead-code findings whose symbol has callers
+   * elsewhere in the tree — before anyone counted them (see {@link filterDeadcodeSignals}).
+   */
+  deadcode: DeadcodeFilter;
   /** Which baseline this scan measured against, and which one it left (see {@link DeltaState}). */
   deltaState: DeltaState;
   /**
@@ -598,18 +604,20 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
  *   raw fields and drifting from the trend (see {@link annotateSignal}).
  *
  * It is also the one seam where a signal can still be dropped from BOTH readers at once — see
- * {@link dropUntrackedSignals}, {@link filterSecretSignals}, {@link filterCouplingSignals} and
- * {@link filterDuplicationSignals}.
+ * {@link dropUntrackedSignals}, {@link filterSecretSignals}, {@link filterCouplingSignals},
+ * {@link filterDuplicationSignals} and {@link filterDeadcodeSignals}.
  */
 async function readAnnotatedSignals(
   scanFile: string,
   repoPath: string,
+  opts: { exclude: readonly string[]; abort?: AbortSignal },
 ): Promise<{
   signals: ScanSignal[];
   untracked: UntrackedFilter;
   coupling: CouplingFilter;
   duplication: DuplicationFilter;
   secrets: SecretFilter;
+  deadcode: DeadcodeFilter;
 }> {
   let parsed: unknown;
   try {
@@ -644,15 +652,21 @@ async function readAnnotatedSignals(
   // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
   // should never be paid for a finding the index already contradicted.
   const { kept: unfaked, secrets } = await filterSecretSignals(repoPath, tracked);
-  // Coupling last: it reads the source of the modules a signal names, so it should never be paid for
-  // a finding the index already contradicted.
+  // Coupling after that: it reads the source of the modules a signal names, so it should never be
+  // paid for a finding the index already contradicted.
   const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, unfaked);
   // Same reason, same order: reading the source at a reported clone window is only worth paying for
   // a finding the index hasn't already contradicted.
-  const { kept, duplication } = await filterDuplicationSignals(repoPath, coupled);
+  const { kept: deduped, duplication } = await filterDuplicationSignals(repoPath, coupled);
+  // Deadcode last: one `git grep` per symbol is cheap but not free, so it runs over only what every
+  // cheaper filter left.
+  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, deduped, {
+    exclude: opts.exclude,
+    abort: opts.abort,
+  });
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
-  return { signals: kept, untracked, coupling, duplication, secrets };
+  return { signals: kept, untracked, coupling, duplication, secrets, deadcode };
 }
 
 /**
@@ -694,7 +708,8 @@ export async function scan(opts: {
   if (delta) args.push("--delta");
   // Skip build output / caches so the walk stays on source (the .next build dir alone made this scan
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
-  args.push("--exclude", [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])].join(","));
+  const exclude = [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])];
+  args.push("--exclude", exclude.join(","));
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
   args.push("--no-color");
@@ -719,10 +734,15 @@ export async function scan(opts: {
 
   let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;
   try {
-    read = await readAnnotatedSignals(opts.scanFile, opts.repoPath);
+    read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
+      exclude,
+      abort: opts.signal,
+    });
   } catch (err) {
     // Refusing the output means refusing the whole pass, baseline included: the retry has to see the
-    // same window this attempt consumed, or its findings are lost to a clean-looking rescan.
+    // same window this attempt consumed, or its findings are lost to a clean-looking rescan. A
+    // cancel lands here too — the reference check stops on the caller's signal, and the pass it
+    // abandons still consumed the window.
     throw await rejectWithBaselineRestored(err, unwind);
   }
 
@@ -736,6 +756,7 @@ export async function scan(opts: {
     coupling: read.coupling,
     duplication: read.duplication,
     secrets: read.secrets,
+    deadcode: read.deadcode,
     deltaState: {
       ...(before ? { before } : {}),
       ...(after ? { after } : {}),

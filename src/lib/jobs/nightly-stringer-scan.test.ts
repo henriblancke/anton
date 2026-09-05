@@ -48,6 +48,7 @@ vi.mock("../stringer", async (importOriginal) => {
       collectorFailures: [{ name: "gitlog", error: "opening repo: broken" }],
       untracked: { dropped: [] },
       coupling: { dropped: [], recounted: [] },
+      deadcode: { dropped: [] },
       duplication: {
         dropped: [{ path: "src/doc.ts", kind: "code-clone", reason: "6 comment line(s)" }],
       },

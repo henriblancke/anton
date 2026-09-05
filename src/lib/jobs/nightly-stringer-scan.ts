@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { appendSessionLog } from "../sessions";
 import { refreshCheckout } from "../git/refresh";
 import { describeCouplingFilter } from "../scan-coupling";
+import { describeDeadcodeFilter } from "../scan-deadcode";
 import { describeDuplicationFilter } from "../scan-duplication";
 import { describeSecretFilter } from "../scan-secrets";
 import { summarizeSignals, type ScanCounts } from "../scan-health";
@@ -131,13 +132,25 @@ async function reportScanDiagnostics(
   const couplingLine = describeCouplingFilter(result.coupling);
   if (couplingLine) await appendSessionLog(logPath, `[stringer] ${couplingLine}\n`);
 
+  // Dead-code findings whose symbol has callers the collector never followed (anton-23xe). A silent
+  // filter is indistinguishable from a collector that found nothing, and a tree anton could not
+  // search leaves the phantoms counted — both belong on the session rather than in the counts alone.
+  const deadcodeLine = describeDeadcodeFilter(result.deadcode);
+  if (deadcodeLine) {
+    const prefix = result.deadcode.unavailable ? "WARNING: " : "";
+    await appendSessionLog(logPath, `[stringer] ${prefix}${deadcodeLine}\n`);
+    if (result.deadcode.unavailable) {
+      console.warn(`[nightly-stringer] ${project.slug}: ${deadcodeLine}`);
+    }
+  }
+
   // Duplication signals over blocks that hold no statement (anton-vb2h). This filter can remove
   // most of a scan, so it says so out loud: silence here would be indistinguishable from a
   // duplication collector that found nothing.
   const duplicationLine = describeDuplicationFilter(result.duplication);
   if (duplicationLine) await appendSessionLog(logPath, `[stringer] ${duplicationLine}\n`);
 
-  // Committed-secret signals over test fixtures (anton-r016). The loudest of the four: this is the
+  // Committed-secret signals over test fixtures (anton-r016). The loudest of the five: this is the
   // one class that must never be filtered silently, so a dropped secret is logged with the line and
   // the value that cleared it.
   const secretsLine = describeSecretFilter(result.secrets);

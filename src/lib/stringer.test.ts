@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { describeCouplingFilter } from "./scan-coupling";
+import { describeDeadcodeFilter, filterDeadcodeSignals, SYMBOL_BUDGET } from "./scan-deadcode";
 import { describeDuplicationFilter, filterDuplicationSignals } from "./scan-duplication";
 import { describeSecretFilter, entropyOf } from "./scan-secrets";
 import {
@@ -1255,6 +1256,3678 @@ describe("scan", () => {
       expect((result.signals[2] as { Title: string }).Title).toBe(
         "High coupling: src/only-values imports 12 modules",
       );
+    });
+  });
+
+  // anton-23xe: the `deadcode` collector doesn't follow every reference — all ten unused-function
+  // signals in the 2026-08-17 scan named a symbol with real callers, every one of them in a test
+  // file. They cost the health record a debt point a night and triage the judgment to re-derive
+  // that they were wrong.
+  describe("dead-code signals whose symbol has callers elsewhere in the tree", () => {
+    /** A committed tree — the reference check asks git what the repo holds. */
+    function initRepo(files: Record<string, string>): string {
+      const repo = join(dir, "repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      return repo;
+    }
+
+    /** stringer's own phrasing, tags and confidence for an unused symbol. */
+    const unused = (path: string, symbol: string, kind = "unused-function") => ({
+      Source: "deadcode",
+      Kind: kind,
+      FilePath: path,
+      Line: 1,
+      Title: `Unused ${kind === "unused-type" ? "type" : "function"}: ${symbol}`,
+      Description: "",
+      Confidence: 0.3,
+      Tags: ["dead-code", "cleanup-candidate", "test-only-reference"],
+    });
+
+    it("drops the ones with callers and reports the rest unchanged, on both sides of the seam", async () => {
+      const repo = initRepo({
+        // withOperator in miniature: declared in a helper, called only from a suite.
+        "src/testing/integration.ts": "export function withOperator() {}\n",
+        "src/routes/claim.test.ts": "import { withOperator } from '../testing/integration';\nwithOperator();\n",
+        // ...and one nobody anywhere calls.
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+      });
+      const scanFile = join(dir, "scan.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), {
+        signals: [
+          unused("src/testing/integration.ts", "withOperator"),
+          unused("src/lib/orphan.ts", "neverCalled"),
+        ],
+        metadata: { total_count: 2 },
+      });
+
+      const result = await scan({ repoPath: repo, scanFile });
+
+      // The genuinely unreferenced one survives, at the severity it always carried.
+      expect(result.signals).toMatchObject([
+        { Title: "Unused function: neverCalled", AntonSeverity: "low", AntonClass: "debt" },
+      ]);
+      expect(result.deadcode.dropped).toMatchObject([
+        { path: "src/testing/integration.ts", symbol: "withOperator", kind: "unused-function" },
+      ]);
+      // The drop names its caller, so it can be checked by hand without re-running the scan.
+      expect(result.deadcode.dropped[0].reason).toContain("src/routes/claim.test.ts");
+      expect(describeDeadcodeFilter(result.deadcode)).toContain("dropped 1 dead-code signal(s)");
+      // Same set on both sides: the health record counts `signals`, triage reads the file.
+      const written = JSON.parse(readFileSync(scanFile, "utf8")) as { signals: { Title: string }[] };
+      expect(written.signals.map((s) => s.Title)).toEqual(["Unused function: neverCalled"]);
+    });
+
+    // A symbol that only ever mentions itself — its own declaration, its own recursive call — is
+    // exactly what the collector claims, so nothing here may read as a caller.
+    it("does not count the declaring file's own mentions as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts":
+          "export function neverCalled(n: number): number {\n  return n > 0 ? neverCalled(n - 1) : 0;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("./src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode).toEqual({ dropped: [] });
+      expect(describeDeadcodeFilter(result.deadcode)).toBeUndefined();
+    });
+
+    // stringer spells `FilePath` however its collector saw the file. An absolute one has to be made
+    // repo-relative before it can be discounted from git's hits, or the declaration reads as its own
+    // caller and erases the finding — the exact inverse of what the check is for.
+    it("excludes the declaring file when the signal spells it absolutely", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts":
+          "export function neverCalled(n: number): number {\n  return n > 0 ? neverCalled(n - 1) : 0;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused(join(repo, "src/lib/orphan.ts"), "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode).toEqual({ dropped: [] });
+    });
+
+    // An import is a binding taken, not a use made: a module that still imports a symbol it stopped
+    // calling is the stale half of the very finding being checked. Counting that line as a caller
+    // lets one forgotten import delete a true finding about a symbol nothing invokes — while the
+    // file that imports AND uses it names the symbol on a line of its own, which still counts.
+    it("does not count an import of the symbol as a use of it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.tsx": "import { Widget } from './widget';\nexport const Stale = () => null;\n",
+        "src/ui/wrapped.ts": "import {\n  Widget,\n} from './widget';\nexport const kept = 1;\n",
+        "src/ui/types.ts": "import type { Widget } from './widget';\nexport const kept = 1;\n",
+        "src/ui/page.tsx": "import { Widget } from './widget';\nexport const Page = () => <Widget />;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/wrapped.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/types.ts");
+    });
+
+    // The mask ends with the declaration, not with the line holding it: a statement after the `;`
+    // runs, `import('./widget')` is a call rather than a declaration, and a re-export republishes
+    // the symbol under another module's name. Blanking any of those reports a live symbol dead.
+    it("keeps the code beside an import, a dynamic import, and a re-export", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/list.ts": "import { Widget } from './widget'; export const list = [Widget];\n",
+        "src/ui/lazy.ts": "export const lazy = () => import('./widget').then((m) => m.Widget);\n",
+        "src/ui/index.ts": "export { Widget } from './widget';\n",
+        "src/ui/stale.tsx": "import { Widget } from './widget';\nexport const Stale = () => null;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/list.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/lazy.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/index.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
+    });
+
+    // CommonJS spells the same stale binding as a declaration: `const { Widget } = require(...)`
+    // takes the name without calling it, so counting that line deletes a true finding exactly as a
+    // forgotten `import` would. Only the binding is discounted — the initializer beside it still
+    // carries the call that keeps a live symbol out of the report.
+    it("does not count a CommonJS require binding as a use of it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.js": "const { Widget } = require('./widget');\nmodule.exports = 1;\n",
+        "src/ui/wrapped.js": "const {\n  Widget,\n} = require('./widget');\nmodule.exports = 2;\n",
+        "src/ui/renamed.js": "const Renamed = require('./widget').Widget;\nmodule.exports = 3;\n",
+        "src/ui/calls.js": "const html = require('./widget').Widget();\nmodule.exports = html;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/calls.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/wrapped.js");
+    });
+
+    // The mask stops at the `=` of a `require` declaration and nowhere else: a value binding names
+    // the symbol on the right of its own `=`, and a `const` that never reaches one must leave the
+    // lines under it alone.
+    it("keeps a value declaration and the code under an unterminated binding", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/alias.js": "const alias = Widget;\nmodule.exports = alias;\n",
+        "src/ui/late.js": "const {\n  other,\n} = require('./other');\nmodule.exports = () => Widget();\n",
+        "src/ui/other.js": "module.exports = { other: 1 };\n",
+        "src/ui/stale.js": "const { Widget } = require('./widget');\nmodule.exports = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/alias.js");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/late.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+    });
+
+    // ...and the `require` may sit on the line under the `=` a formatter broke after. Looking only
+    // at the rest of the `=` line rejects the binding, leaves the stale half standing, and lets a
+    // module that merely still requires the symbol read as its own caller. The `=` of a value
+    // declaration is still no boundary, however far its initializer is from it.
+    it("does not count a CommonJS binding whose `require` wraps onto the next line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.js": "const { Widget } =\n  require('./widget');\nmodule.exports = 1;\n",
+        "src/ui/value.js": "const alias =\n  Widget;\nmodule.exports = alias;\n",
+        "src/ui/calls.js": "const html = require('./widget').Widget();\nmodule.exports = html;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/calls.js");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/value.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+    });
+
+    // Java spells an import without a module string, so the mask had nothing to end it at and left
+    // `import static pkg.Orphan.neverCalled;` standing — a binding taken and never called, reading
+    // as its own caller and erasing a true finding. The statement ends at its own `;`: far enough
+    // to discount the binding, never far enough to reach the call on the line below it or the
+    // statement sharing its line.
+    it("does not count a quoteless import as a use, and keeps the code under it", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/Stale.java":
+          "import static com.example.util.Orphan.neverCalled;\n\npublic class Stale {}\n",
+        "src/Main.java":
+          "import com.example.util.Helper;\n\npublic class Main {\n  void run() { neverCalled(); }\n}\n",
+        "src/Same.java": "import com.example.util.Helper; class Same { void r() { neverCalled(); } }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/Main.java");
+      expect(result.deadcode.dropped[0].reason).toContain("src/Same.java");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/Stale.java");
+    });
+
+    // A quoteless import that never closes its own statement is still bounded by the line it stops
+    // on: a language spelling one without a `;` (Kotlin) has its binding discounted, and the call
+    // written under it still counts.
+    it("ends a quoteless import at its line when no `;` closes it", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/Stale.kt": "import com.example.util.neverCalled\n\nclass Stale\n",
+        "src/Main.kt": "import com.example.util.neverCalled\n\nfun run() { neverCalled() }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/Main.kt");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/Stale.kt");
+    });
+
+    // Python spells the same stale binding as `from widget import Widget`, where the `import`
+    // keyword never stands at the head of the statement and no module string ever ends it. Counting
+    // that line lets one forgotten import delete a true finding exactly as an ESM one would, while
+    // the module that calls what it imports names the symbol again on a line of its own — and a
+    // `raise … from` names it mid-statement, where an import never starts.
+    it("does not count a Python import of the symbol as a use of it", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/stale.py": "from widget import Widget\n\nkept = 1\n",
+        "src/py/wrapped.py": "from widget import (\n    Widget,\n)\n\nkept = 2\n",
+        "src/py/module.py": "import Widget\n\nkept = 3\n",
+        "src/py/calls.py": "from widget import Widget\n\nhtml = Widget()\n",
+        "src/py/raises.py": "def run():\n    raise ValueError('gone') from Widget\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/calls.py");
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/raises.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/stale.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/wrapped.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/module.py");
+    });
+
+    // Rust spells the same stale binding as `use crate::widget::Widget`, under a keyword no other
+    // mask reads — so the surviving hit was classified as executable code and one forgotten `use`
+    // deleted a true finding. The declaration ends at its own `;`, and a grouped list is followed
+    // only while its brace is open, so the code under it still counts.
+    it("does not count a Rust `use` binding as a use of the symbol", async () => {
+      const repo = initRepo({
+        "src/widget.rs": "pub fn Widget() {}\n",
+        "src/panel.rs": "pub fn Panel() {}\n",
+        "src/stale.rs": "use crate::widget::Widget;\n\npub fn stale() {}\n",
+        "src/wrapped.rs":
+          "use crate::widget::{\n    Widget,\n    Panel,\n};\n\npub fn wrapped() {}\n",
+        "src/calls.rs": "use crate::panel::Panel;\n\npub fn calls() {\n    Panel();\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget.rs", "Widget"),
+        unused("src/panel.rs", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the symbol the tree really calls is still dropped, and by the file that calls
+      // it rather than by either file that only bound it.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/calls.rs");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/stale.rs");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/wrapped.rs");
+    });
+
+    // Rust's two exceptions, the same two ESM has: a binding taken under another name holds the
+    // file's only mention of the symbol, and a `pub use` republishes it under this module's path,
+    // which is a use of it rather than a binding taken and forgotten.
+    it("counts a Rust rename the file uses, and a `pub use` re-export", async () => {
+      const repo = initRepo({
+        "src/widget.rs": "pub fn Widget() {}\n",
+        "src/renamed.rs":
+          "use crate::widget::Widget as Renamed;\n\npub fn renamed() {\n    Renamed();\n}\n",
+        "src/panel.rs": "pub fn Panel() {}\n",
+        "src/api.rs": "pub use crate::panel::Panel;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget.rs", "Widget"),
+        unused("src/panel.rs", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }, { symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/renamed.rs");
+      expect(result.deadcode.dropped[1].reason).toContain("src/api.rs");
+    });
+
+    // A binding taken under another name is the one import that is not a stale half: the statement
+    // holds the file's only mention of the symbol, and every use of it beside is spelled with the
+    // local name, which the searched symbol can never match. Blanking that reports a live symbol
+    // dead — while an alias nothing uses stays discounted exactly as a plain stale import is.
+    it("counts a renamed import whose local name the file still uses", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/renamed.ts":
+          "import { Widget as Renamed } from './widget';\nexport const page = () => Renamed();\n",
+        "src/ui/wrapped.ts":
+          "import {\n  Widget as Wrapped,\n} from './widget';\nexport const list = [Wrapped];\n",
+        "src/ui/cjs.js":
+          "const { Widget: Required } = require('./widget');\nmodule.exports = () => Required();\n",
+        "src/ui/stale.ts": "import { Widget as Unused } from './widget';\nexport const kept = 1;\n",
+        "src/ui/stale.js": "const { Widget: Ignored } = require('./widget');\nmodule.exports = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/renamed.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/wrapped.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/cjs.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.js");
+    });
+
+    // ...and the rename itself wraps. A formatter breaks a long binding list wherever it fits, so
+    // `Widget` and the `as Renamed` that names it can land on different lines. Reading the rename a
+    // line at a time finds neither half, blanks the imported name without putting it back, and the
+    // call spelled with the local name matches nothing — reporting a live symbol dead.
+    it("counts a renamed import whose rename wraps onto the next line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/renamed.ts":
+          "import {\n  Widget\n    as Renamed,\n} from './widget';\nexport const page = () => Renamed();\n",
+        "src/ui/cjs.js":
+          "const {\n  Widget:\n    Required,\n} = require('./widget');\nmodule.exports = () => Required();\n",
+        // An alias nothing uses stays discounted, wrapped or not.
+        "src/ui/stale.ts":
+          "import {\n  Widget\n    as Unused,\n} from './widget';\nexport const kept = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/renamed.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/cjs.js");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+    });
+
+    // Python spells the rename `import Widget as Renamed`, and it reads the same way: the statement
+    // carries the only mention of the symbol, so discounting it wholesale hides the caller that
+    // keeps a live symbol out of the report.
+    it("counts a renamed Python import whose local name the file still uses", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/renamed.py": "from widget import Widget as Renamed\n\nhtml = Renamed()\n",
+        "src/py/stale.py": "from widget import Widget as Unused\n\nkept = 1\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/renamed.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/stale.py");
+    });
+
+    // An alias is put back only on the evidence a hit for the symbol itself would need. A page that
+    // says `<p>Panel was removed</p>` is telling a reader the component is gone: reading that
+    // sentence as a use restores `Widget` inside an otherwise masked import, and the stale import
+    // then reads as a caller and deletes the true finding.
+    it("does not restore a renamed import whose local name only appears in rendered text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/stale.tsx":
+          "import { Widget as Panel } from './widget';\nexport const Stale = () => <p>Panel was removed</p>;\n",
+        "src/ui/notes.mdx":
+          "import { Widget as Card } from './widget';\n\nCard was the old renderer.\n",
+        "src/ui/page.tsx":
+          "import { Widget as Panel } from './widget';\nexport const Page = () => <Panel />;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.mdx");
+    });
+
+    // A default export consumed under another name writes the symbol nowhere outside its own
+    // module, so its grep finds no caller and a live function is reported dead. The binding is
+    // resolved from the declaring module instead — and a module bound and never used is still the
+    // stale half the import mask exists to discount.
+    it("counts a default export a caller imported under another name", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/ui/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+        "src/ui/list.ts": "import Also, { other } from './widget';\nexport const list = [Also];\n",
+        "src/ui/stale.ts": "import Ignored from './widget';\nexport const kept = 1;\n",
+        "src/ui/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+        unused("src/ui/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/list.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+    });
+
+    // The same binding written the other two ways a repo spells it: an alias specifier, which no
+    // build config is read to resolve and so is matched by its tail, and a CommonJS `require` of a
+    // module that assigned `module.exports` outright.
+    it("follows a default binding through an alias specifier and a require", async () => {
+      const repo = initRepo({
+        "src/ui/panel/index.tsx": "export default function Panel() {\n  return null;\n}\n",
+        "src/ui/page.tsx": "import Card from '@/ui/panel';\nexport const Page = () => <Card />;\n",
+        "src/cjs/widget.js": "function Widget() {\n  return null;\n}\nmodule.exports = Widget;\n",
+        "src/cjs/caller.js":
+          "const Required = require('./widget');\nmodule.exports = () => Required();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/panel/index.tsx", "Panel"),
+        unused("src/cjs/widget.js", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }, { symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[1].reason).toContain("src/cjs/caller.js");
+    });
+
+    // A tail is only read off a specifier the repo roots its OWN modules under. A bare `ui/widget`
+    // is as readily a package subpath, and the local file whose path merely ends the same way is
+    // not what that import named — binding the package's export to the local symbol's name would
+    // invent a caller and delete a finding that was right.
+    it("does not follow a package specifier a local module's path merely ends with", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/ui/page.ts": "import Renamed from 'ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // An exact mapping renames the module outright, so the specifier carries no trace of its file
+    // name: `@/widget` contains no `special`, the grep that looks for the file name never reaches
+    // the importer, and the caller binding the default under another name goes unfound — leaving a
+    // live symbol reported dead (PR #190 review).
+    it("finds a default-import caller that names the module by an exact alias", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@/widget": ["./src/components/special.ts"] },
+          },
+        }),
+        "src/components/special.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+        "src/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/components/special.ts", "Widget"),
+        unused("src/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/page.ts");
+    });
+
+    // `"@/*/models"` is resolved through its substitution, so `@/ui/models` names `src/ui/models`
+    // and nothing else. Dropping the pattern used to leave the specifier to the path-tail fallback,
+    // which bound an unrelated package's same-named module and deleted its genuine finding
+    // (PR #190 review).
+    it("does not read a tail behind a pattern whose wildcard is not at the end", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*/models": ["./src/*/models"] } },
+        }),
+        "packages/other/ui/models.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/ui/models';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/other/ui/models.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The import names whatever `src/ui/models` is, never the package module — so its finding
+      // stands rather than being erased by a caller the tail invented.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A tail is read off an aliased specifier only where the repo publishes no mapping for it. A
+    // monorepo holds more than one module whose path ends `ui/widget`, and `@/*` names exactly one
+    // of them: matching the tail behind a mapping that already answered binds an unrelated
+    // package's default to the caller's name, inventing a caller and deleting a finding that was
+    // right.
+    it("resolves an alias through the repo's `paths` mapping, not by path tail", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./apps/web/*"] } },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/ui/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/home.ts": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/ui/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the module the mapping DOES name is still resolved, so the caller that binds
+      // its default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/home.ts");
+    });
+
+    // ...and the mapping that answers is the one governing the importing FILE. A monorepo declares
+    // `@/*` in the app that uses it, so reading only the repo root's tsconfig finds no rule there,
+    // falls back to the specifier's tail, and binds an unrelated package's default to the caller's
+    // name — inventing a caller and deleting a finding that was right.
+    it("resolves an alias through the importing app's own tsconfig, not the repo root's", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+        "apps/web/tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/src/ui/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/src/home.ts": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/src/ui/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the app's own mapping still resolves the module it does name, so the caller
+      // that binds that default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.ts");
+    });
+
+    // ...and a mapping the app INHERITS answers exactly as one it declares. An app extending a
+    // shared base config publishes no `paths` of its own, so a reader stopping at the local file
+    // finds no rule, falls back to the specifier's tail, and binds an unrelated package's default
+    // to the caller's name — inventing a caller and deleting a finding that was right. The
+    // inherited targets resolve against the BASE config's directory, which is what its `baseUrl`
+    // is relative to.
+    it("resolves an alias inherited through the app tsconfig's `extends`", async () => {
+      const repo = initRepo({
+        "tsconfig.base.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./apps/web/src/*"] } },
+        }),
+        "apps/web/tsconfig.json": JSON.stringify({ extends: "../../tsconfig.base.json" }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/src/ui/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/src/home.ts": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/src/ui/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the inherited mapping still resolves the module it does name, so the caller
+      // binding that default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.ts");
+    });
+
+    // ...and a JavaScript project publishes the same mapping in `jsconfig.json`, with no tsconfig
+    // in the tree at all. Looking only for the latter reads the app as publishing no mapping and
+    // falls back to the specifier's tail, which binds an unrelated package's default to the
+    // caller's name — inventing a caller and deleting a finding that was right.
+    it("resolves an alias through a JavaScript project's `jsconfig.json`", async () => {
+      const repo = initRepo({
+        "apps/web/jsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "packages/unused/ui/widget.js": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/ui/widget.js": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/src/ui/panel.js": "export default function Panel() {\n  return null;\n}\n",
+        "apps/web/src/page.js":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+        "apps/web/src/home.js": "import Card from '@/ui/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.js", "Widget"),
+        unused("apps/web/src/ui/panel.js", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the jsconfig mapping still resolves the module it does name, so the caller
+      // binding that default under another name is found.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/home.js");
+    });
+
+    // A pattern with no `*` maps one module outright, and tsc honours it exactly as it honours a
+    // wildcard. Skipping it reads the project as publishing no mapping for that specifier, which
+    // sends it to the path-tail fallback — and the tail binds an unrelated package's same-named
+    // module to the caller's name, inventing a caller and deleting a finding that was right.
+    it("resolves an exact `paths` mapping, not only a wildcard one", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@/ui/widget": ["./apps/web/ui/widget.ts"] },
+          },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+        unused("apps/web/ui/widget.ts", "Surface"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the module the mapping DOES name keeps its caller, so the exact rule is read
+      // rather than merely dropped in a way that happens to leave both signals standing.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Surface" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/page.ts");
+    });
+
+    // A project is bounded by its own config. tsc inherits `paths` through `extends` and never from
+    // an ancestor DIRECTORY, so an app declaring none resolves `@/widget` as a package. Climbing
+    // past that config applies the root's mapping the compiler never applies, names the root's
+    // `src/widget` and invents a caller for it.
+    it("stops the `paths` lookup at the nearest config, mapping or not", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "apps/app/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+        "src/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/panel.ts": "export default function Panel() {\n  return null;\n}\n",
+        "apps/app/page.ts":
+          "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+        "src/home.ts": "import Card from '@/panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget.ts", "Widget"),
+        unused("src/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Not vacuous: the root's own files still resolve through the root's mapping.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/home.ts");
+    });
+
+    // Overlapping patterns are how a monorepo carves an exception out of a broad alias, and tsc
+    // resolves the import through the longest matching prefix alone. Expanding every rule that
+    // matches lets `@/special/widget` name the broad target too, so a caller of the real module
+    // reads as a caller of the unrelated one — inventing a caller and deleting a finding that was
+    // right.
+    it("resolves an alias through the most specific `paths` rule, not every matching one", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: {
+            baseUrl: ".",
+            paths: { "@/*": ["./apps/web/src/*"], "@/special/*": ["./packages/special/*"] },
+          },
+        }),
+        // What the broad rule would reach if both patterns expanded — nothing imports it.
+        "apps/web/src/special/widget.ts": "export default function Broad() {\n  return null;\n}\n",
+        "packages/special/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/special/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("apps/web/src/special/widget.ts", "Broad"),
+        unused("packages/special/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Broad" }]);
+      // Not vacuous: the specific rule still resolves the module it does name, so the caller that
+      // binds THAT default under another name is found.
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/src/page.ts");
+    });
+
+    // `import { default as Renamed }` is the list spelling of a default import — the mirror of the
+    // `export { Widget as default }` already read on the export side. The caller writes the
+    // original symbol nowhere, so a pattern that rejects the leading brace reports a live symbol
+    // dead.
+    it("counts a default import written as `{ default as Renamed }`", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/lib/page.ts":
+          "import { default as Renamed } from './widget';\nexport const page = () => Renamed();\n",
+        // Not vacuous: a default export nothing imports is still reported.
+        "src/lib/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget"),
+        unused("src/lib/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // `export default interface Widget {}` stands a keyword where the name usually does. A reader
+    // consuming only `function` and `class` takes `interface` for the exported name, reads the
+    // module as declaring no default at all, and never resolves the binding its caller took — and
+    // `import type Renamed from './widget'` writes `Widget` nowhere for a per-word match to find,
+    // so a live type is reported dead.
+    it("counts a default export declared as an interface", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default interface Widget {\n  id: string;\n}\n",
+        "src/lib/page.ts":
+          "import type Renamed from './widget';\nexport const page = (w: Renamed) => w.id;\n",
+        // Not vacuous: a default-exported type nothing imports is still reported.
+        "src/lib/orphan.ts": "export default interface Orphan {\n  id: string;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget", "unused-type"),
+        unused("src/lib/orphan.ts", "Orphan", "unused-type"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused type: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget", kind: "unused-type" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // A formatter wraps an export list as readily as an import one, leaving `Widget as default` on
+    // a line whose `export {` opened above it. Read line by line the module declares no default at
+    // all, so the binding its caller took is never resolved and a live symbol is reported dead.
+    it("counts a default export declared by a wrapped export list", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts":
+          "function Widget() {\n  return null;\n}\n\nexport {\n  Widget as default,\n};\n",
+        "src/ui/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.ts");
+    });
+
+    // `exports.default = Widget` is the compiled spelling of an ESM default, not a whole-module
+    // export: `require('./widget')` hands back the object, so the binding is not the symbol and the
+    // requiring file is no caller. Reading it as CommonJS deletes a true finding.
+    it("does not follow a require through a module that exported only its default", async () => {
+      const repo = initRepo({
+        "src/cjs/widget.js": "function Widget() {\n  return null;\n}\nexports.default = Widget;\n",
+        "src/cjs/caller.js":
+          "const Required = require('./widget');\nmodule.exports = () => Required();\n",
+        "src/cjs/panel.js": "function Panel() {\n  return null;\n}\nexports.default = Panel;\n",
+        "src/cjs/page.js": "import Card from './panel';\nexport const page = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/cjs/widget.js", "Widget"),
+        unused("src/cjs/panel.js", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/cjs/page.js");
+    });
+
+    // A formatter wraps a long specifier list, leaving the local name and the module it came from on
+    // different lines. Reading the statement line by line never sees them together, so the binding is
+    // missed and a live default export is reported dead.
+    it("counts a default binding written across wrapped import lines", async () => {
+      const repo = initRepo({
+        "src/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/ui/page.ts":
+          "import Renamed, {\n  other,\n} from './widget';\nexport const page = () => Renamed(other);\n",
+        "src/ui/list.ts": "import Also\n  from './widget';\nexport const list = [Also];\n",
+        "src/ui/stale.ts":
+          "import Ignored, {\n  gone,\n} from './widget';\nexport const kept = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/list.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/stale.ts");
+    });
+
+    // Python's triple quote opens a docstring, but `f"""` opens an expression: the text between its
+    // braces runs, and `f"""{Widget()}"""` calls the symbol. Reading every triple-quoted span as a
+    // comment blanks that call and reports a live symbol dead — while the literal text around the
+    // interpolation is still prose, and a docstring is still a docstring.
+    it("reads a Python f-string interpolation as code and its docstrings as prose", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/inline.py": 'def render():\n    return f"""{Widget()}"""\n',
+        "src/py/block.py": 'def page():\n    return f"""\n    <div>{Widget()}</div>\n    """\n',
+        "src/py/doc.py": '"""\nWidget was the old renderer.\n"""\nkept = 1\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/inline.py");
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/block.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/doc.py");
+    });
+
+    // A brace a string inside the interpolation holds is a character rather than a delimiter:
+    // `f"""{ {'}}': Widget()} }"""` closes on the brace its punctuation matches. Counting the quoted
+    // one ends the expression early, which blanks the call behind it and reports a live symbol dead
+    // — while the literal text past the brace that really closes it is still prose.
+    it("reads a brace quoted inside an f-string expression as text, not as the end of it", async () => {
+      const repo = initRepo({
+        "src/py/widget.py": "def Widget():\n    return None\n",
+        "src/py/quoted.py": 'def render():\n    return f"""{ {\'}}\': Widget()} }"""\n',
+        "src/py/wrapped.py": "def page():\n    return f\"\"\"{ '''\n    }\n    ''' + Widget()}\"\"\"\n",
+        "src/py/doc.py": 'def note():\n    return f"""{ {\'}\': 1} }\n    Widget was removed\n    """\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/py/widget.py", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/quoted.py");
+      expect(result.deadcode.dropped[0].reason).toContain("src/py/wrapped.py");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/py/doc.py");
+    });
+
+    // A name written in prose is being described, not called. Without this the module that documents
+    // a symbol keeps it alive forever, and the filter goes blind to the symbols it exists to check.
+    it("does not count a name in a comment or a doc as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts":
+          "// neverCalled was the old nightly entry point.\n/**\n * neverCalled goes next.\n */\nexport const kept = 1;\n",
+        "docs/history.md": "- `neverCalled` used to run every night\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A block comment's continuation lines carry no marker of their own, so judging a hit by its
+    // own text alone reads prose as a call — and deletes a finding that was right.
+    it("does not count a name inside an open block comment as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts":
+          "/*\nneverCalled was removed later.\n*/\nexport const kept = 1;\n",
+        "scripts/notes.py": '"""\nneverCalled ran the old nightly.\n"""\nkept = 1\n',
+        "public/notes.html": "<!--\nneverCalled used to run here.\n-->\n<p>kept</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // ...and the tracking has to end where the block does, or a caller written under a docblock
+    // stops counting and the filter goes blind to exactly the case it was built for.
+    it("counts a call written below a block comment that mentions the symbol", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.ts":
+          "/*\nneverCalled is called below.\n*/\nimport { neverCalled } from './orphan';\nneverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+    });
+
+    // A hit is a line, not a position: prose written after real code carries no marker where the
+    // line begins, so reading the line as code proves a caller that isn't there.
+    it("does not count a name in a comment opened after code as a reference", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts":
+          "export const kept = 1; /* neverCalled was removed */\nexport const also = 2; // neverCalled went with it\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A marker quoted inside a string opens no comment. Blanking from the `//` in a URL erases the
+    // call written beside it, and the file then proves no caller for a symbol it does use — the
+    // filter reports a signal the tree had already disproved.
+    it("counts a call written after a string that holds a comment marker", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.ts": 'const url = "https://host"; neverCalled();\n',
+        "src/lib/block.ts": "const opener = '/*';\nneverCalled();\n",
+        "src/lib/tick.ts": "const url = `https://host`;\nneverCalled();\n",
+        "config/deploy.yml": 'url: "https://host" # neverCalled runs here\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/block.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/tick.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("config/deploy.yml");
+    });
+
+    // ...and stepping over the literal must not step over the comment behind it: a marker past the
+    // closing quote still blanks its line, or prose proves a caller that isn't there. A quote that
+    // never closes on its line is no literal to step over at all — the tail of a template literal
+    // still carries the comment written after it.
+    it("still masks a comment opened after a string on the same line", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.ts": 'const url = "https://host"; // neverCalled was removed\n',
+        "src/lib/wrapped.ts": "const banner = `\n  hello\n`; // neverCalled was removed\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A regex literal carries the same markers a string does, and they delimit nothing there
+    // either: `s.split(/\//)` holds a `//` that opens no comment, and blanking from it erases the
+    // call behind it — the file then proves no caller for a symbol it does use.
+    it("counts a call written after a regex literal that holds a comment marker", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/split.ts":
+          "export const head = (s: string) => s.split(/\\//)[0] + neverCalled();\n",
+        "src/lib/klass.ts": "export const mark = (s: string) => s.replace(/[/*]/g, neverCalled());\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/split.ts");
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/klass.ts");
+    });
+
+    // ...and a slash that only looks like an opener must not step over the comment past it. A tag
+    // closes with one (`</div>`), a TypeScript assertion divides behind one (`a! / b`), and reading
+    // either as a literal runs an invented span over the prose behind it — which then proves a
+    // caller that isn't there.
+    it("still masks a comment behind a slash that opens no regex literal", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/ui/tag.tsx":
+          "export const Page = () => <div>{count}</div>; {/* neverCalled was removed */}\n",
+        "src/lib/divide.ts": "export const half = (a?: number) => a! / 2; // neverCalled was here\n",
+        "src/lib/notes.ts": "// neverCalled was removed with /[/*]/ and its callers\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // PHP takes `#` as a line comment on top of `//`, so it reads neither like C nor like a file
+    // anton has no grammar for: prose after `#` must not prove a caller, and a real call must still
+    // count.
+    it("reads both PHP comment markers as prose and still counts a PHP caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/legacy/notes.php": "<?php\n# neverCalled was removed\n// neverCalled went with it\n",
+        "src/legacy/caller.php": "<?php\nneverCalled(); # neverCalled was here\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/legacy/caller.php");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/legacy/notes.php");
+    });
+
+    // `;` opens a comment in Lisp and guards ASI in TypeScript. Reading every marker in every file
+    // leaves a symbol with a real caller counted as dead — the phantom this filter exists to stop.
+    it("counts a caller whose line opens with a marker its own language does not have", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.ts": "const ready = true\n;neverCalled()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+    });
+
+    // A repo that commits its build output names every symbol it bundled. stringer never walked
+    // `dist/`, so counting the copy there as a caller would delete a finding about source it DID
+    // walk — the reference check has to read the same file set the scan did.
+    it("ignores mentions in trees the scan excluded, and honours extra excludes", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "dist/bundle.js": "function neverCalled(){}\nneverCalled();\n",
+        "vendor/copy.ts": "neverCalled();\n",
+        "generated/api.ts": "neverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({
+        repoPath: repo,
+        scanFile: join(dir, "scan.json"),
+        exclude: ["generated/**"],
+      });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // ...and excluding is not the same as searching nothing: source outside the excluded trees
+    // still answers.
+    it("still counts a caller that sits outside the excluded trees", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "dist/bundle.js": "neverCalled();\n",
+        "src/lib/caller.ts": "import { neverCalled } from './orphan';\nneverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("dist/bundle.js");
+    });
+
+    // Rust and Swift nest block comments: the inner `*/` closes only the inner opener. Ending the
+    // comment there reads the outer comment's remaining prose as a call site.
+    it("keeps a nested block comment open until its outer delimiter closes", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/notes.rs":
+          "/* outer /* inner */\nneverCalled was removed later.\n*/\nfn kept() {}\n",
+        "src/lib/notes.swift": "/* /* x */ neverCalled went too */\nlet kept = 1\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // ...and the nesting count has to end the comment where it really ends, or a Rust caller below
+    // a nested docblock stops counting.
+    it("counts a Rust caller written below a nested block comment", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/caller.rs":
+          "/* outer /* inner */ still comment */\nfn go() { neverCalled(); }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.rs");
+    });
+
+    // Ruby's block comment is `=begin`/`=end`, not `#`. Reading it with `#` alone leaves the block's
+    // continuation lines looking like code, so prose naming the symbol proves a caller that isn't
+    // there — and a real Ruby call below the block still has to count.
+    it("reads a Ruby =begin block as prose and still counts a Ruby caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/legacy/notes.rb":
+          "=begin\nneverCalled ran the old nightly.\n=end # neverCalled went with it\nkept = 1\n",
+        "src/legacy/caller.rb": "=begin\nneverCalled is called below.\n=end\nneverCalled()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/legacy/caller.rb");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/legacy/notes.rb");
+    });
+
+    // JSON has no call syntax at all, and the unknown-language grammar leaves quoted strings
+    // intact on purpose, so a `"neverCalled"` in a fixture or a locale bundle read as a caller and
+    // deleted a finding that was right.
+    it("does not count a name in a JSON file, and still counts a real caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "fixtures/locale.json": JSON.stringify({ label: "neverCalled", tip: "neverCalled ran" }),
+        "src/lib/caller.ts": "import { neverCalled } from './orphan';\nneverCalled();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("fixtures/locale.json");
+    });
+
+    // A heredoc payload is data the shell writes out, not code it runs. A script that scaffolds
+    // source is exactly where a symbol's name lands inside one, and reading that payload as
+    // executable invented a caller and deleted a finding that was right.
+    it("does not count a name inside a shell heredoc, and still counts a shell caller", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/scaffold.sh":
+          "cat <<'EOF' > generated.ts\nneverCalled();\nEOF\necho done\n",
+        // The dash form strips leading tabs from its terminator, and the payload is still data.
+        "scripts/indented.sh": "cat <<-EOF > other.ts\n\tneverCalled();\n\tEOF\necho done\n",
+        "scripts/run.sh": "node -e \"require('./orphan').neverCalled()\"\n",
+        // `<<<` is a here-STRING and opens no payload. Without a guard on the left of the `<<`,
+        // the opener still matches at its second `<` and blanks the rest of the script.
+        "scripts/herestring.sh": "grep -q ok <<<EOF\nneverCalled\n",
+        // A BARE delimiter still expands: the shell runs `$(...)` while writing the payload, so
+        // this is a real caller and blanking it would hide one.
+        "scripts/expand.sh": "cat <<EOF > gen.ts\n$(neverCalled)\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/run.sh");
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/herestring.sh");
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/expand.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/scaffold.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/indented.sh");
+    });
+
+    // Quoting the delimiter is what makes a payload inert. The same `$(neverCalled)` that runs
+    // under `<<EOF` is literal text under `<<'EOF'`, so the two cannot be masked the same way:
+    // blanking both hides a real caller, blanking neither invents one.
+    it("counts a substitution in a bare heredoc and not the same text in a quoted one", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/literal.sh": "cat <<'EOF' > a.ts\n$(neverCalled)\nEOF\n",
+        "scripts/expanding.sh": "cat <<EOF > b.ts\n$(neverCalled)\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/expanding.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/literal.sh");
+    });
+
+    // A backquoted span spreads over payload lines exactly as `$(` does. Read one line at a time it
+    // ran to the end of its opener and left nothing behind, so every line under it was blanked as
+    // inert data and the call between the backquotes went unseen (PR #190 review).
+    it("counts a backtick substitution opened and closed on different heredoc lines", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/multiline.sh": "cat <<EOF > a.ts\ntext `\nneverCalled\n` more\nEOF\n",
+        // Not vacuous: the same shape under a QUOTED delimiter is literal, so it calls nothing.
+        "scripts/literal.sh": "cat <<'EOF' > b.ts\ntext `\nneverCalled\n` more\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/multiline.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/literal.sh");
+    });
+
+    // A delimiter is an ordinary shell WORD, so it may be assembled from quoted and unquoted
+    // pieces. Reading only the first piece leaves a terminator that never matches and blanks the
+    // rest of the script; a spelling matched not at all leaves the payload read as executable,
+    // which invents a caller. Both spellings end at a line reading `EOF`.
+    it("reads a heredoc delimiter written in pieces, quoted and backslashed", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        // Captured as `E` before: the terminator never matched and every line below was blanked.
+        "scripts/pieces.sh": "cat <<'E'OF > a.ts\nneverCalled();\nEOF\nneverCalled\n",
+        // Matched not at all before: the payload read as code and invented a caller.
+        "scripts/backslash.sh": "cat <<\\EOF > b.ts\nneverCalled();\nEOF\necho done\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      // The payloads are inert under both spellings; the command AFTER the terminator is not, and
+      // it is only reachable once the terminator is recognised.
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/pieces.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/backslash.sh");
+    });
+
+    // Heredoc openers are read before the comment grammar runs, so a `# cat <<EOF` shown in a
+    // comment would queue a terminator no later line answers and blank every line below it.
+    it("does not open a heredoc from a marker inside a shell comment", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/documented.sh": "# usage: cat <<EOF\nneverCalled\n",
+        // Not vacuous: a `#` inside quotes opens no comment, so this heredoc is real and its
+        // payload stays inert.
+        "scripts/quoted.sh": "echo \"a # b\"\ncat <<'EOF' > a.ts\nneverCalled();\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/documented.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/quoted.sh");
+    });
+
+    // Bash starts a comment wherever a WORD may start, which is after a metacharacter as surely as
+    // after a space. Read as code, `true;# cat <<EOF` queues an `EOF` no later line answers and
+    // blanks every command below it — including the real call (PR #190 review).
+    it("does not open a heredoc from a comment following a shell metacharacter", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/inline.sh": "true;# cat <<EOF\nneverCalled\n",
+        "scripts/piped.sh": "echo hi |# cat <<EOF\nneverCalled\n",
+        // Not vacuous: `a#b` is one word, so this `#` opens nothing and the heredoc below is real.
+        "scripts/word.sh": "echo a#b\ncat <<'EOF' > a.ts\nneverCalled();\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/inline.sh");
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/piped.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/word.sh");
+    });
+
+    // A heredoc opener cannot be written inside a literal, so quoted text must not queue one:
+    // `echo "example <<EOF here"` names no redirection, and waiting for a terminator that never
+    // arrives blanks the rest of the script.
+    it("does not open a heredoc from a marker inside shell quotes", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/quotedmarker.sh": "echo \"example <<EOF here\"\nneverCalled\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/quotedmarker.sh");
+    });
+
+    // A `$(` opened on one payload line closes on a later one — `$(\n  neverCalled\n)` is one
+    // command — so the substitution depth is carried rather than reset per line.
+    it("keeps a command substitution open across heredoc payload lines", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/multiline.sh": "cat <<EOF > a.ts\necho $(\n  neverCalled\n)\nEOF\n",
+        // Not vacuous: text outside the substitution is still copied payload, not code.
+        "scripts/plain.sh": "cat <<EOF > b.ts\nneverCalled\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("scripts/multiline.sh");
+      expect(result.deadcode.dropped[0].reason).not.toContain("scripts/plain.sh");
+    });
+
+    // A namespace import binds no default under its own name, but `ns.default()` reaches one. The
+    // binding recorded is `ns.default`, never `ns` — `ns` alone is how every NAMED export is
+    // reached, and crediting a file for `ns.somethingElse()` would invent a caller.
+    it("counts a namespace import whose `.default` member is called", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/lib/page.ts": "import * as ns from './widget';\nexport const page = () => ns.default();\n",
+        // Not vacuous: a namespace import that touches only a NAMED export is no caller of the
+        // default, so this module's signal stands.
+        "src/lib/panel.ts":
+          "export const named = 1;\nexport default function Panel() {\n  return null;\n}\n",
+        "src/lib/host.ts": "import * as other from './panel';\nexport const host = () => other.named;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget"),
+        unused("src/lib/panel.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Panel" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // An ordered fallback list is resolved by tsc against disk, first existing target wins. This
+    // pass reads no disk, so it maps neither — and the path tail must not answer in their place.
+    it("credits no module for a `paths` rule with ordered fallback targets", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./first/*", "./fallback/*"] } },
+        }),
+        "first/widget.ts": "export default function First() {\n  return null;\n}\n",
+        "fallback/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("fallback/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // tsc resolves `@/widget` to first/widget.ts, so fallback/widget.ts has no caller and its
+      // finding must survive.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // A target whose substitution is not its last segment is a valid mapping this reader cannot
+    // resolve. Dropping the rule leaves `@/ui/widget` to the path tail, which reads an unrelated
+    // package's same-named module as the one the caller imported — inventing a caller and
+    // deleting a true finding. Claiming without mapping keeps the tail out (PR #190 review).
+    it("credits no module for a `paths` rule whose target shape it cannot resolve", async () => {
+      const repo = initRepo({
+        "tsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*/index"] } },
+        }),
+        "packages/unused/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/unused/ui/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // tsc resolves `@/ui/widget` to src/ui/widget/index.ts, so the package module has no caller
+      // and its finding must survive.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // tsc merges `baseUrl` and `paths` independently across `extends`, so an app declaring `paths`
+    // while inheriting `baseUrl` anchors its mapping under the BASE's baseUrl. Anchoring it beside
+    // the app names the app's own same-named module instead — crediting the wrong one with the
+    // caller and deleting the finding that was right (PR #190 review).
+    it("resolves an app's own mapping under the baseUrl it inherits", async () => {
+      const repo = initRepo({
+        "tsconfig.base.json": JSON.stringify({ compilerOptions: { baseUrl: "./packages" } }),
+        "apps/web/tsconfig.json": JSON.stringify({
+          extends: "../../tsconfig.base.json",
+          compilerOptions: { paths: { "@/*": ["*"] } },
+        }),
+        "packages/ui/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/ui/widget.ts": "export default function Surface() {\n  return null;\n}\n",
+        "apps/web/page.ts":
+          "import Renamed from '@/ui/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/ui/widget.ts", "Widget"),
+        unused("apps/web/ui/widget.ts", "Surface"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The import names the package module, so the app's same-named module keeps its finding.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Surface" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("apps/web/page.ts");
+    });
+
+    // tsc ignores jsconfig.json entirely when a tsconfig is present, so the FIRST parseable config
+    // governs whether or not it published a mapping. Falling through to the sibling would resolve
+    // `@/widget` through a mapping the compiler never applies.
+    it("lets a paths-less tsconfig govern rather than falling through to jsconfig", async () => {
+      const repo = initRepo({
+        "apps/web/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+        "apps/web/jsconfig.json": JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+        }),
+        "apps/web/src/widget.ts": "export default function Widget() {\n  return null;\n}\n",
+        "apps/web/src/page.ts":
+          "import Renamed from '@/widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("apps/web/src/widget.ts", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // The tsconfig governs and publishes no mapping, so `@/widget` resolves to nothing here and
+      // the finding stands rather than being dropped through jsconfig's rule.
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // `module.exports = function Widget() {}` puts a keyword where the name usually stands, and
+    // `require('./widget').default` is how CommonJS reaches an ESM default. Neither caller writes
+    // the original symbol, so missing either reports a live function dead.
+    it("counts a named module.exports function and a `.default` require binding", async () => {
+      const repo = initRepo({
+        "src/lib/widget.js": "module.exports = function Widget() {\n  return null;\n};\n",
+        "src/lib/page.js": "const Renamed = require('./widget');\nexports.page = () => Renamed();\n",
+        "src/lib/interop.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/lib/host.js":
+          "const Card = require('./interop').default;\nexports.host = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.js", "Widget"),
+        unused("src/lib/interop.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }, { symbol: "Panel" }]);
+    });
+
+    // `const { default: Renamed } = require('./interop')` selects the same `.default` the direct
+    // read does, and the caller writes the original symbol nowhere — so leaving the destructured
+    // spelling out reports a live default export dead (PR #190 review).
+    it("counts a destructured `default` require binding", async () => {
+      const repo = initRepo({
+        "src/lib/interop.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/lib/host.js":
+          "const { default: Card } = require('./interop');\nexports.host = () => Card();\n",
+        // Not vacuous: a destructured NAMED binding reaches no default, so this one still reports.
+        "src/lib/orphan.ts": "export default function Orphan() {\n  return null;\n}\n",
+        "src/lib/stale.js":
+          "const { other: Kept } = require('./orphan');\nexports.stale = () => Kept();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/interop.ts", "Panel"),
+        unused("src/lib/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/host.js");
+    });
+
+    // A directory index is imported as `"."` by its own neighbours, a specifier carrying no word
+    // for the discovery grep to find — `moduleWord` answers with the DIRECTORY's name, which such
+    // an importer never writes, so the caller went unread and a live default stayed dead (PR #190
+    // review).
+    it("finds a default-import caller that names a directory index as `.`", async () => {
+      const repo = initRepo({
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/widget/page.ts": "import Renamed from '.';\nexport const page = () => Renamed();\n",
+        // Not vacuous: a neighbour that binds the default and never uses it is still the stale half.
+        "src/panel/index.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/panel/stale.ts": "import Ignored from '.';\nexport const kept = 1;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+        unused("src/panel/index.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Panel" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/widget/page.ts");
+    });
+
+    // Resolution tries `src/widget.ts` before `src/widget/index.ts`, so an import of `./widget`
+    // where both exist names the FILE. Accepting the index as well credited that import to the
+    // index's own default and deleted its true finding (PR #190 review).
+    it("does not credit an import of a file module to the directory index beside it", async () => {
+      const repo = initRepo({
+        "src/widget.ts": "export default function Chosen() {\n  return null;\n}\n",
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+        // Not vacuous: with no file beside it, the same import DOES name the index.
+        "src/panel/index.ts": "export default function Panel() {\n  return null;\n}\n",
+        "src/home.ts": "import Card from './panel';\nexport const home = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+        unused("src/panel/index.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/home.ts");
+    });
+
+    // The sibling listing is a fallback for a specifier no grep can find, and it has to honour the
+    // same exclusions the grep does — they are caller-supplied and need not be whole trees, so a
+    // fixture stringer never scanned must not remove a finding (PR #190 review).
+    it("keeps an excluded sibling out of the index-import candidates", async () => {
+      const repo = initRepo({
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/widget/fixture.ts": "import Renamed from '.';\nexport const f = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+      ]);
+
+      const result = await scan({
+        repoPath: repo,
+        scanFile: join(dir, "scan.json"),
+        exclude: ["src/widget/fixture.ts"],
+      });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // Which module a specifier RESOLVES to is a fact about the disk, not about the scan's reading
+    // list: an excluded `src/widget.ts` still outranks `src/widget/index.ts` for every importer of
+    // `./widget`, and reading precedence off the filtered tree credited them to the index and
+    // dropped its true finding (PR #190 review).
+    it("reads index shadowing off the tree, not off the scan's exclusions", async () => {
+      const repo = initRepo({
+        "src/widget.ts": "export default function Chosen() {\n  return null;\n}\n",
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+      ]);
+
+      const result = await scan({
+        repoPath: repo,
+        scanFile: join(dir, "scan.json"),
+        exclude: ["src/widget.ts"],
+      });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // Prose is documentation wherever it is found. A README beside an index showing the import in
+    // an example is not a caller, and parsing it as one deletes a true finding (PR #190 review).
+    it("does not read an example in a neighbouring README as a default-import caller", async () => {
+      const repo = initRepo({
+        "src/widget/index.ts": "export default function Widget() {\n  return null;\n}\n",
+        "src/widget/README.md": "Use it like this:\n\n    import Renamed from '.';\n    Renamed();\n",
+        "src/panel/index.ts": "export default function Panel() {\n  return null;\n}\n",
+        // Not vacuous: a real neighbour beside the other index is still found.
+        "src/panel/page.ts": "import Card from '.';\nexport const page = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/widget/index.ts", "Widget"),
+        unused("src/panel/index.ts", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/panel/page.ts");
+    });
+
+    // `require('./widget').default` on a `module.exports = fn` module selects a property that is
+    // `undefined` — not the exported function. Reading the binding as the whole module credits a
+    // caller the code never had and deletes a true finding (PR #190 review).
+    it("does not read a member selection off a require as the whole module", async () => {
+      const repo = initRepo({
+        "src/lib/widget.js": "module.exports = function Widget() {\n  return null;\n};\n",
+        "src/lib/host.js":
+          "const Renamed = require('./widget').default;\nexports.host = () => Renamed?.();\n",
+        // Not vacuous: the whole-module binding beside it is still a caller.
+        "src/lib/panel.js": "module.exports = function Panel() {\n  return null;\n};\n",
+        "src/lib/page.js": "const Card = require('./panel');\nexports.page = () => Card();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.js", "Widget"),
+        unused("src/lib/panel.js", "Panel"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Widget" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Panel" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.js");
+    });
+
+    // A grep answers per SYMBOL, so two packages exporting `parse` share every hit. A file that
+    // imports and calls only one of them was read as a caller of both, and both findings were
+    // dropped though only one had a caller (PR #190 review).
+    it("credits a caller to the module it imports, not to every namesake", async () => {
+      const repo = initRepo({
+        "packages/a/parse.ts": "export function parse() {\n  return 1;\n}\n",
+        "packages/b/parse.ts": "export function parse() {\n  return 2;\n}\n",
+        "src/caller.ts": "import { parse } from '../packages/a/parse';\nexport const go = () => parse();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/a/parse.ts", "parse"),
+        unused("packages/b/parse.ts", "parse"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // b's finding survives; a's is dropped, naming the caller that actually imports it.
+      expect(result.signals).toMatchObject([{ FilePath: "packages/b/parse.ts" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ path: "packages/a/parse.ts" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/caller.ts");
+    });
+
+    // Attribution follows the import that SUPPLIED the symbol, not every module the file names. A
+    // file importing `parse` from one package and `helper` from another names both, and crediting
+    // the `parse()` call against both drops the finding for the module that only ever supplied
+    // `helper` (PR #190 review).
+    it("credits a caller through the import that bound the symbol, not its other imports", async () => {
+      const repo = initRepo({
+        "packages/a/parse.ts": "export function parse() {\n  return 1;\n}\n",
+        "packages/b/parse.ts":
+          "export function parse() {\n  return 2;\n}\nexport function helper() {\n  return 3;\n}\n",
+        "src/caller.ts":
+          "import { parse } from '../packages/a/parse';\n" +
+          "import { helper } from '../packages/b/parse';\n" +
+          "export const go = () => parse() + helper();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/a/parse.ts", "parse"),
+        unused("packages/b/parse.ts", "parse"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Only `a`'s `parse` has a caller — `b`'s is reached for `helper` alone.
+      expect(result.signals).toMatchObject([{ FilePath: "packages/b/parse.ts" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ path: "packages/a/parse.ts" }]);
+    });
+
+    // A caller that names no declaring module at all still counts for every one of them: its
+    // reference is real and nothing here can say which declaration it meant.
+    it("keeps an unattributable reference shared between namesakes", async () => {
+      const repo = initRepo({
+        "packages/a/parse.ts": "export function parse() {\n  return 1;\n}\n",
+        "packages/b/parse.ts": "export function parse() {\n  return 2;\n}\n",
+        "scripts/run.py": "parse()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/a/parse.ts", "parse"),
+        unused("packages/b/parse.ts", "parse"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toHaveLength(2);
+    });
+
+    // A parenthesis under a quote inside `$(…)` is text, not nesting: counting it leaves the depth
+    // open past the real `)`, exposing every later payload line as code (PR #190 review).
+    it("does not count a quoted parenthesis inside a heredoc substitution", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "scripts/quoted.sh": "cat <<EOF > a.ts\n$(printf '(')\nneverCalled();\nEOF\n",
+        // Not vacuous: a real substitution on the same shape still counts as a caller.
+        "src/lib/other.ts": "export function alsoCalled() {}\n",
+        "scripts/real.sh": "cat <<EOF > b.ts\n$(alsoCalled)\nEOF\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+        unused("src/lib/other.ts", "alsoCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "alsoCalled" }]);
+    });
+
+    // A declaration broken after `export default` is still that module's default; the head has to
+    // reach across the newline to find the name.
+    it("counts a default export whose head is broken across lines", async () => {
+      const repo = initRepo({
+        "src/lib/widget.ts": "export default\nfunction Widget() {\n  return null;\n}\n",
+        "src/lib/page.ts": "import Renamed from './widget';\nexport const page = () => Renamed();\n",
+        // Not vacuous: a default export nothing imports is still reported.
+        "src/lib/orphan.ts": "export default\nfunction Orphan() {\n  return null;\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/widget.ts", "Widget"),
+        unused("src/lib/orphan.ts", "Orphan"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: Orphan" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // MDX is a program: a component imported and rendered only from a docs page has a real caller,
+    // and discounting the whole file as prose leaves that component reported dead every night. Its
+    // markdown body still is prose, so only the shapes MDX executes may count.
+    it("counts an MDX import and render, and not the prose or the fenced example around it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/notes.mdx":
+          "Widget was removed in favour of Panel.\n\n{/* Widget shipped here once */}\n\n" +
+          "```tsx\nimport { Widget } from '../src/ui/widget';\n```\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // A code example is fenced with three or more backticks OR tildes, and the delimiter is the
+    // fence rather than the backticks inside it. Pairing backticks one at a time sees no fence in
+    // `~~~~tsx` and pairs an even-length one off against itself, so the example's `<Widget />`
+    // reads as a rendered tag and erases a finding that was right.
+    it("reads a tilde fence and an even-length backtick fence as an example, not a caller", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/tilde.mdx": "How it looked:\n\n~~~~tsx\n<Widget />\n~~~~\n",
+        "docs/even.mdx": "How it looked:\n\n````tsx\n<Widget />\n````\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/tilde.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/even.mdx");
+    });
+
+    // An inline code span runs from a backtick run to the next run of the same length, so a doubled
+    // span shows a tag rather than rendering one — and a fence only closes on its own character, so
+    // a tilde row inside a backtick block is body text rather than the end of the example.
+    it("reads a doubled inline span and a foreign fence line as example text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/span.mdx": "Render it with ``<Widget />`` on the page.\n",
+        "docs/mixed.mdx": "```tsx\n~~~\n<Widget />\n```\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/span.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/mixed.mdx");
+    });
+
+    // MDX wraps. An import list runs over three lines and an expression opens its `{` on one of
+    // its own, so the line naming the component carries neither the keyword nor the brace. Reading
+    // each line alone misses the caller under the brace — and reads the wrapped specifier list as
+    // one, though a page that imports a component and never renders it calls nothing.
+    it("counts an MDX caller written across lines, and not a wrapped import on its own", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/imports.mdx": "import {\n  Widget,\n} from '../src/ui/widget';\n",
+        "docs/renders.mdx": "import {\n  Widget,\n} from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/expression.mdx": "{\n  Widget()\n}\n",
+        "docs/notes.mdx": "Widget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/renders.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/expression.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/imports.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // An ESM statement can wrap without opening a delimiter on its first line — `export default`
+    // with the component under it. MDX ends that block at the blank line, so the continuation is
+    // code and the prose after the blank line is not; closing it on its opening line reads the
+    // caller as markdown and leaves the component reported dead.
+    it("counts an MDX ESM continuation that opens no delimiter, and stops at the blank line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/layout.mdx": "export default\n  Widget()\n",
+        "docs/notes.mdx": "export const slug = 'notes'\n\nWidget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/layout.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // Backticks mean two things in MDX: a markdown code span, which shows a symbol, and a template
+    // literal inside an ESM statement, which runs. Masking every span alike blanks the
+    // interpolation and leaves a live component reported dead.
+    it("keeps a template literal in an MDX ESM block, and still masks a code span in prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/meta.mdx": "export const value = `${Widget()}`\n",
+        "docs/multi.mdx": "export const banner = `\n  ${Widget()}\n`\n",
+        "docs/notes.mdx": "export the `Widget` helper from the old build.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/meta.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/multi.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // MDX opens its ESM block on a statement, not on a paragraph that happens to start with the
+    // keyword: `export Widget from the old build` is a sentence. Reading it as code lets the prose
+    // prove its own caller — and carries that mistake down the paragraph, since the block runs to
+    // the blank line — while the statement beside it still counts.
+    it("reads an MDX paragraph opening with an ESM keyword as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/notes.mdx": "export Widget from the old build.\n",
+        "docs/para.mdx": "export was dropped from the docs\nWidget was removed in favour of Panel.\n",
+        "docs/uses.mdx": "export const value = Widget()\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/para.mdx");
+    });
+
+    // The ESM block is not the only executable place a backtick can stand: a braced expression runs
+    // too, so the template literal in ``{`${Widget()}`}`` interpolates a real call. Masking it as a
+    // markdown span leaves that caller unseen and the finding standing.
+    it("keeps a template literal inside an MDX expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/inline.mdx": "Rendered with {`${Widget()}`} on the page.\n",
+        "docs/wrapped.mdx": "{\n  `${Widget()}`\n}\n",
+        "docs/notes.mdx": "The `Widget` helper was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/inline.mdx");
+      expect(result.deadcode.dropped[0].reason).toContain("docs/wrapped.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // JSX lets a comment's braces stand off its `/* */`. Matching only the attached `{/*` leaves
+    // the span unmasked, and the `{` in front of it then proves the prose is an expression —
+    // erasing a finding that was right.
+    it("masks an MDX comment written with spaces inside its braces", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import { Widget } from '../src/ui/widget';\n\n<Widget />\n",
+        "docs/notes.mdx": "{ /* Widget was removed in favour of Panel */ }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // An MDX ESM block is JavaScript, so `//` opens a comment there. The prose behind it sits on a
+    // line already read as executable, where it proves a caller that isn't there — and the block
+    // has to survive that comment, so a real reference under it still counts.
+    it("masks a line comment inside an MDX ESM block and still counts the reference under it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/notes.mdx": "export const meta = {\n  // Widget was removed in favour of Panel\n  title: 'Notes',\n};\n",
+        "docs/layout.mdx": "export const layout = {\n  // rendered below\n  render: Widget,\n};\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/layout.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // An MDX expression closes on the line that opened it: in `Current: {version}. Widget was
+    // removed.` the symbol is markdown prose, not code. Accepting any earlier `{` reads that
+    // sentence as executable, calls the page a caller, and deletes a true finding.
+    it("counts an MDX symbol only while its expression is still open", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "Rendered with {Widget()} on the page.\n",
+        "docs/notes.mdx": "Current: {version}. Widget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // A page importing a namespace renders through it — `<UI.Widget />` — and may name the symbol
+    // nowhere else. Reading the member tag as prose reports a component that ships on every page.
+    it("counts an MDX component rendered through a namespace import", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "import * as UI from '../src/ui/widget';\n\n<UI.Widget />\n",
+        "docs/notes.mdx": "Widget was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // Comment masking leaves an HTML file's rendered text intact, where a name is being shown to a
+    // reader rather than called. A committed page describing a removed symbol would otherwise prove
+    // its own caller and delete a true finding; a `<script>` in the same file still calls.
+    it("does not count a symbol rendered as markup text, and still counts a script that calls it", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "public/notes.html": "<h1>API</h1>\n<p>neverCalled was removed from the old API</p>\n",
+        "public/app.html": "<body>\n<script>\n  neverCalled();\n</script>\n</body>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A tag name resolves a binding only where the format has one: `<Widget />` in a single-file
+    // component renders the imported symbol, while the same element in static HTML, XML or SVG is
+    // the document's own vocabulary. Reading those as callers deletes a true finding.
+    it("does not count an element name in static markup, and still counts a component tag", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/page.svelte": "<main>\n  <Widget />\n</main>\n",
+        "public/notes.html": "<Widget>gone</Widget>\n",
+        "public/feed.xml": "<entry>\n  <Widget>gone</Widget>\n</entry>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/feed.xml");
+    });
+
+    // A `<script>` only runs when its type says so: `application/ld+json` and `importmap` hold data
+    // a browser never executes, so a name inside one is shown rather than called — and its JSON
+    // braces are not the template interpolation that would count it by the other route.
+    it("reads a data script's body as inert, and still counts an executable one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html":
+          '<script type="application/ld+json">\n{"name": "Widget"}\n</script>\n<p>gone</p>\n',
+        "public/app.html": '<script type="text/javascript;charset=utf-8">\nWidget();\n</script>\n',
+        "public/module.html": '<script type="module">\n  Widget();\n</script>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).toContain("public/module.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // ...and a template is not prose either: a rendered tag and an attribute value each name a
+    // real caller, so the same rule that discounts markup text must still count them.
+    it("counts a component rendered as a tag or called from an attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/page.svelte": "<main>\n  <Widget />\n</main>\n",
+        "src/ui/app.vue": '<template>\n  <button @click="Widget()">go</button>\n</template>\n',
+        "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.svelte");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/app.vue");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A static attribute is content, not a binding: `title="Widget was removed"` shows the name to
+    // a reader exactly as the text between the tags does. Only an attribute that carries code —
+    // a handler, a directive, a dynamic bind — names a caller.
+    it("does not count a symbol inside a static attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html":
+          '<div title="Widget was removed" data-note=\'Widget was removed\'>gone</div>\n',
+        "src/ui/notes.vue": '<template>\n  <Panel title="Widget was removed" />\n</template>\n',
+        "public/app.html": '<button onclick="Widget()">go</button>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
+    // HTML lets a handler's value stand unquoted, and a minifier writes it that way. The browser
+    // still invokes it, so requiring a quote after the `=` reports a live function dead.
+    it("counts a symbol in an unquoted handler attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/bare.html": "<button onclick=Widget()>go</button>\n",
+        "src/ui/notes.vue": "<template>\n  <Panel title=static>Widget was removed</Panel>\n</template>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/bare.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
+    // A handler's value runs to the quote that opened it, and the other quote inside it is code:
+    // `onclick="log('x'); Widget()"` is a call the browser makes. Ending the value at that
+    // apostrophe reads a live handler as text and leaves a finding standing about a live function.
+    it("counts a symbol after a nested quote in a handler attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/app.html": "<button onclick=\"log('x'); Widget()\">go</button>\n",
+        "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A handler's value wraps as ordinary formatting, and the browser runs it all the same: the
+    // line under `onclick="` carries no attribute of its own, so judging it alone misses the call
+    // and leaves a false dead-code signal standing. A static value that wraps the same way is
+    // still the text a reader sees.
+    it("counts a symbol inside a handler attribute whose value wrapped", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/app.html": '<button\n  onclick="\n    Widget()\n  "\n>go</button>\n',
+        "public/notes.html": '<div\n  title="\n    Widget was removed\n  "\n>gone</div>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A `<script>`'s own attributes wrap too. Reading the opener only where it fits on one line
+    // finds no opener at all, so the import and call inside the body read as markup and the live
+    // component stays reported dead — while a wrapped data script is still inert.
+    it("reads a script whose opening tag wraps onto later lines", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/page.svelte":
+          "<script\n  lang=\"ts\"\n>\n  import Widget from './widget';\n  Widget();\n</script>\n",
+        "public/notes.html":
+          '<script\n  type="application/ld+json"\n>\n{"name": "Widget"}\n</script>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A tag name inside another tag's quoted attribute is text, not an element: `title="<script>"`
+    // opens nothing. Recognizing it as an opener makes every line under it read as program, so the
+    // page's own rendered prose proves a caller and a true finding is deleted.
+    it("does not open a script from a tag name quoted inside another tag's attribute", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html":
+          '<div title="example <script>">shown</div>\n<p>Widget was removed</p>\n',
+        "public/app.html": "<script>\n  Widget();\n</script>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A brace binds only where the format gives it meaning: `{Widget()}` invokes the symbol in a
+    // single-file component, while the same braces in static HTML, XML or SVG are characters the
+    // page shows. Reading those as an expression deletes a true finding.
+    it("does not count a braced name in static markup, and still counts a component expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.svelte": "<p>{Widget()}</p>\n",
+        "public/notes.html": "<p>Write {Widget} literally</p>\n",
+        "public/icon.svg": "<title>{Widget} was removed</title>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/icon.svg");
+    });
+
+    // The two shapes with no code punctuation around them at all: a Svelte directive binding
+    // (`use:enhance`) and an Astro frontmatter call, which runs above the markup rather than in a
+    // `<script>`. Both name the symbol as plainly as an ordinary call does.
+    it("counts a template directive and a call in Astro frontmatter", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/form.svelte": "<form use:Widget>\n</form>\n",
+        "src/ui/wrapped.svelte": "<form\n  use:Widget\n>\n</form>\n",
+        "src/pages/index.astro":
+          "---\nimport { Widget } from '../ui/widget';\nconst html = Widget();\n---\n<main>{html}</main>\n",
+        "public/notes.html": "<p>Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/form.svelte");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/wrapped.svelte");
+      expect(result.deadcode.dropped[0].reason).toContain("src/pages/index.astro");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A directive prefix binds inside a tag. Rendered text that happens to end in one — `The old
+    // use:` before the symbol — is a sentence, and reading it as a binding lets a doc page prove
+    // its own caller and delete a true finding.
+    it("does not count a directive prefix in rendered text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/form.svelte": "<form use:Widget>\n</form>\n",
+        "public/notes.html": "<p>The old use: Widget was removed</p>\n",
+        "src/ui/notes.vue": "<template>\n  <p>Written in: Widget, now gone</p>\n</template>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/form.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
+    // An attribute binds inside the tag that declares it. Rendered text that spells one — `<p>Write
+    // onclick=Widget in docs</p>` — is a sentence whose tag closed before the symbol, and reading
+    // it as a handler lets a doc page prove its own caller. The handler that really runs still
+    // counts, including one whose value shows a `>` the tag does not end at.
+    it("does not count a handler attribute spelled in rendered text", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "public/notes.html": "<p>Write onclick=Widget in docs</p>\n",
+        "public/quoted.html": '<p>Write <code>onclick="Widget()"</code> in docs</p>\n',
+        "public/app.html": '<button onclick="a > b && Widget()">go</button>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/quoted.html");
+    });
+
+    // Vue interpolates with `{{ … }}`: a single brace in its template is a character the page
+    // shows, so applying Svelte's one-brace rule to a `.vue` file lets prose prove its own caller.
+    // The doubled brace still runs there, and one brace still runs in Svelte and Astro.
+    it("requires doubled braces for a Vue interpolation, and keeps one for Svelte", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.vue": "<template>\n  <p>Write {Widget} literally</p>\n</template>\n",
+        "src/ui/live.vue": "<template>\n  <p>{{ Widget() }}</p>\n</template>\n",
+        "src/ui/live.svelte": "<p>{Widget()}</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.vue");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
+    // ...and `{{` is a delimiter rather than a nesting: prose that happens to nest two single
+    // braces — `<p>Write {one {Widget} two} literally</p>` — interpolates nothing, so reading its
+    // depth as an expression makes the sentence a caller and deletes a true finding. A Vue
+    // expression that really does nest a brace still runs.
+    it("opens a Vue interpolation on adjacent braces only, not on nested ones", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.vue": "<template>\n  <p>Write {one {Widget} two} literally</p>\n</template>\n",
+        "src/ui/nested.vue": "<template>\n  <p>{{ fn({ a: Widget }) }}</p>\n</template>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/nested.vue");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.vue");
+    });
+
+    // A `<script>` runs between its tags, not across its line. Rendered text sharing the line with
+    // one is still markup, so reading the whole line as code lets that prose prove a caller and
+    // delete a true finding — while the script's own body has to keep counting.
+    it("reads a script's body rather than its whole line", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "public/notes.html": "<p>neverCalled was removed</p><script>const x = 1;</script>\n",
+        "public/braced.html": "<script>const o = {};</script><p>neverCalled was removed</p>\n",
+        "public/app.html": "<p>still wired</p><script>neverCalled();</script>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/braced.html");
+    });
+
+    // A `>` inside a quoted attribute is part of the value, not the end of the tag. Ending the
+    // opening tag there hands the rest of the attribute back as script body, so text a reader sees
+    // reads as a program and proves its own caller — while the script beside it still has to run.
+    it("keeps a quoted greater-than inside a script tag out of its body", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "public/notes.html": '<script title="> neverCalled was removed">const x = 1;</script>\n',
+        "public/app.html": "<script>neverCalled();</script>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("public/app.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+    });
+
+    // A template expression closes on its own line too — `<p>{version} Widget was removed</p>`
+    // renders the symbol as text once `}` has run. Reading any earlier `{` as executable context
+    // lets a committed page prove its own caller and erase a genuinely unused symbol.
+    it("counts a markup symbol only while its expression is still open", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.svelte": "<p>{Widget(version)} shipped</p>\n",
+        "src/ui/notes.svelte": "<p>{version} Widget was removed in favour of Panel</p>\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.svelte");
+    });
+
+    // ...and an interpolation that wraps stays open across the lines it spans: `<div>{{` with the
+    // call under it names a caller the template really invokes, and reading that line alone
+    // reports a live binding dead. A blank line still ends the expression, and a `<style>` rule's
+    // braces never open one, so neither can let prose below prove a caller.
+    it("counts a markup symbol inside an expression opened on an earlier line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.vue": "<template>\n  <div>{{\n    Widget()\n  }}</div>\n</template>\n",
+        "public/notes.html": "<p>Press { to open the menu</p>\n\n<p>Widget was removed</p>\n",
+        "src/ui/theme.svelte": '<style>\n  .banner {\n    content: "Widget was removed";\n  }\n</style>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.vue");
+      expect(result.deadcode.dropped[0].reason).not.toContain("public/notes.html");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/theme.svelte");
+    });
+
+    // A CSS rule's brace is the stylesheet's own punctuation on the line it opens on as well:
+    // `.notice::after { content: "Widget was removed"; }` shows the name to a reader. Reading that
+    // brace as a template interpolation makes a stylesheet prove its own caller and deletes a true
+    // finding about a genuinely unused symbol.
+    it("does not count a symbol inside a style rule that opens on its own line", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/live.svelte": "<p>{Widget()}</p>\n",
+        "src/ui/theme.svelte":
+          '<style>\n  .notice::after { content: "Widget was removed"; }\n</style>\n',
+        "src/ui/inline.vue":
+          '<template>\n  <p>shipped</p>\n</template>\n<style>.notice { content: "Widget"; }</style>\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/theme.svelte");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/inline.vue");
+    });
+
+    // A brace inside a string is text rather than the end of the expression holding it: `{ready ?
+    // "}"` with the call under it still runs. Counting the quoted one closes the expression a line
+    // early, so the caller below reads as markdown and a live component is reported dead.
+    it("counts an MDX symbol under a quoted brace in a multiline expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/live.mdx": '{ready\n  ? "}"\n  : Widget()}\n',
+        "docs/notes.mdx": "Widget was removed in favour of Panel\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/live.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // A quoted brace does not close the expression around it, and a backtick inside one that is
+    // still open is a template literal rather than a markdown code span: reading `{ready ? "}" :
+    // `${Widget()}`}` the other way blanks the literal and the caller it interpolates, and the live
+    // component goes on being reported dead.
+    it("counts an MDX template literal beside a quoted brace in the same expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/live.mdx": '{ready\n  ? "}"\n  : `${Widget()}`}\n',
+        "docs/notes.mdx": "The `Widget` helper was removed in favour of Panel.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/live.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // Markdown writes a literal brace as `\{`, which opens no expression. Counting it reads the
+    // sentence behind it as code, so a page that only mentions the symbol proves its own caller and
+    // erases a genuinely unused one — while a real expression on the same page still counts.
+    it("reads an escaped brace in MDX prose as text, not an open expression", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "docs/uses.mdx": "Rendered with {Widget()} on the page.\n",
+        "docs/notes.mdx": "Use \\{ before Widget in prose.\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("docs/uses.mdx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("docs/notes.mdx");
+    });
+
+    // A `.tsx` file is a program, but not everything on its lines runs: the text a tag opens and a
+    // plain string prop are what the page shows a reader. Reading either as code lets a page that
+    // merely names the symbol prove its own caller and erase a genuinely unused one — while the
+    // import that renders it, and a generic closing with the same `>` a tag does, still count.
+    it("reads JSX text and string props as prose, and still counts the code beside them", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx": "export const Panel = () => <p>Widget was removed in favour of Panel</p>;\n",
+        "src/ui/notice.tsx": 'export const Notice = () => <p title="Widget was removed">gone</p>;\n',
+        "src/ui/page.tsx": "import { Widget } from './widget';\nexport const Page = () => <Widget />;\n",
+        "src/ui/registry.tsx": "export const registry = new Map<string, Widget>([['a', Widget]]);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/page.tsx");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/registry.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+    });
+
+    // A tag names a binding, and a binding may open with the `_` or `$` a JavaScript identifier
+    // does: `<_Panel>` renders the symbol under it exactly as `<Panel>` would. Reading only a
+    // letter as the start of a name leaves that tag unopened, which hands the sentence behind it
+    // back as program and lets a paragraph naming a removed component prove its own caller.
+    it("reads JSX text inside a tag named with an underscore or a dollar as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx": "export const Panel = () => <_Panel>Widget was removed</_Panel>;\n",
+        "src/ui/notice.tsx": "export const Notice = () => <$Note>Widget was removed</$Note>;\n",
+        "src/ui/live.tsx": "export const Live = () => <_Panel>{Widget()}</_Panel>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+    });
+
+    // ...and that text wraps onto lines of its own as ordinary formatting: `<p>` with the sentence
+    // under it renders the symbol exactly as the single-line form does, and judging that line alone
+    // reads a paragraph as program text and deletes a finding that was right. The run ends at the
+    // first punctuation, so an interpolation under the same tag still counts as the call it is.
+    it("reads JSX text wrapped onto its own line as prose, and still counts a call under a tag", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx":
+          "export const Panel = () => (\n  <p>\n    Widget was removed in favour of Panel\n  </p>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => (\n  <p>\n    {Widget()}\n  </p>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+    });
+
+    // A fragment renders its children the same way a named tag does: `<>` with a sentence under it
+    // is prose, and reading it as program text lets a page that merely names the symbol prove its
+    // own caller. The interpolation under the same fragment still counts as the call it is.
+    it("reads JSX text inside a fragment as prose, and still counts a call under one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx":
+          "export const Panel = () => (\n  <>\n    Widget was removed in favour of Panel\n  </>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => (\n  <>\n    {Widget()}\n  </>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+    });
+
+    // A child expression closes on the line that opened it: `<p>{version} Widget was removed</p>`
+    // renders the symbol as text once `}` has run, and a tag whose attribute interpolates still
+    // opens the prose under it. Reading either brace as executable context lets a page that merely
+    // names the symbol prove its own caller and erase a genuinely unused one — while the symbol
+    // inside an expression the line leaves open counts as the call it is.
+    it("reads JSX text after a closed interpolation as prose, and still counts one left open", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.tsx":
+          "export const Notes = () => <p>{version} Widget was removed in favour of Panel</p>;\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <p className={styles.note}>\n" +
+          "    Widget was removed in favour of Panel\n  </p>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>{version} {Widget()}</p>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A character entity is how rendered JSX writes punctuation its syntax would otherwise take:
+    // `<p>&mdash; Widget was removed</p>` is prose. Reading the `&` and `;` it spells as the
+    // program's operators makes that paragraph code again and deletes a true finding, while the
+    // interpolation beside the same entity stays the call it is.
+    it("reads a JSX entity as rendered text, and still counts a call beside one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.tsx": "export const Notes = () => <p>&mdash; Widget was removed</p>;\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <p>\n    &#8212;&nbsp;Widget was removed\n  </p>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>&mdash; {Widget()}</p>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A prop's value shows the angle bracket it holds — `<p title="a > b">Widget was removed</p>`.
+    // Ending the tag at that `>` leaves the element unopened, so the prose behind it reads as
+    // program and a paragraph naming a removed component proves its own caller. The value that
+    // wraps carries the same bracket onto the line under it, while the call beside one stays the
+    // call it is.
+    it("reads JSX text after a quoted angle bracket in a prop as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notes.tsx":
+          'export const Notes = () => <p title="a > b">Widget was removed in favour of Panel</p>;\n',
+        "src/ui/note.tsx":
+          'export const Note = () => (\n  <p\n    title="a > b"\n  >\n' +
+          "    Widget was removed in favour of Panel\n  </p>\n);\n",
+        "src/ui/live.tsx": 'export const Live = () => <p title="a > b">{Widget()}</p>;\n',
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notes.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A static prop is quoted the way HTML quotes one: JSX gives its value no escapes, so a
+    // trailing backslash is a character rather than a guard on the quote behind it. Reading it as
+    // an escape leaves the attribute open past the end of the tag, hands the element's children to
+    // it as rendered text, and the call standing there stops counting as a caller.
+    it("ends a wrapped JSX prop at a quote a backslash precedes, and still reads its text as prose", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/call.tsx":
+          'export const Call = () => (\n  <p\n    title="C:\\"\n  >\n    {Widget()}\n  </p>\n);\n',
+        "src/ui/prose.tsx":
+          'export const Prose = () => (\n  <p\n    title="C:\\"\n  >\n' +
+          "    Widget was removed in favour of Panel\n  </p>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/call.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/prose.tsx");
+    });
+
+    // Children nest, and a sibling element closes only itself: the paragraph beside `<span>gone
+    // </span>` is still the text their `<div>` opened. Reading that `</span>` as the end of the
+    // parent's text makes the prose under it program again, so a page that merely names the symbol
+    // proves its own caller — while the interpolation beside the same sibling stays the call it is.
+    it("reads JSX text beside a nested element as prose, and still counts a call beside one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/panel.tsx":
+          "export const Panel = () => (\n  <div>\n    <span>gone</span>\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    <span>gone</span>\n" +
+          "    {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/panel.tsx");
+    });
+
+    // The same nesting holds along a line, not just down the page: the prose after `<strong>Note:
+    // </strong>` or a self-closing `<Icon />` is still the text their `<p>` opened, and the closing
+    // punctuation in front of it is the child's, not the parent's. Reading it as program lets a page
+    // that only names the symbol prove its own caller — while the interpolation after the same child
+    // stays the call it is.
+    it("reads JSX text after an inline child tag as prose, and still counts a call after one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n" +
+          "  <p><strong>Note:</strong> Widget was removed in favour of Panel</p>\n);\n",
+        "src/ui/icon.tsx":
+          "export const Icon = () => (\n" +
+          "  <p><Info /> Widget was removed in favour of Panel</p>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <p><strong>Note:</strong> {Widget()}</p>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/icon.tsx");
+    });
+
+    // Rendered prose carries ordinary punctuation. JSX gives an operator no meaning between a tag
+    // and its children — code stands there only inside a `{…}` — so a slash in `A/B` or an
+    // ampersand in `R&D` is a character the page shows, and reading it as program lets a doc page
+    // prove its own caller. Nor does it end the element: the paragraph under `A/B testing` is
+    // still the `<div>`'s text. The interpolation and the tag beside that prose stay code.
+    it("reads JSX text holding an operator as prose, and still counts the code beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/slash.tsx": "export const Doc = () => <p>A/B Widget documentation</p>;\n",
+        "src/ui/prose.tsx":
+          "export const Note = () => (\n" +
+          "  <p>R&D + QA dropped Widget in favour of Panel</p>\n);\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    A/B testing\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>{Widget()}</p>;\n",
+        "src/ui/after.tsx":
+          "export const After = () => (\n  <div>\n    A/B testing\n" +
+          "    <Widget />\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/after.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/slash.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/prose.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // Prose brackets its asides. Code stands between a tag and its children only inside a `{…}`,
+    // so the parentheses around `(deprecated)` are characters the page shows — reading them as
+    // program lets a doc page prove its own caller, and ends the element so the sentence under the
+    // aside reads as program too. The call beside that prose keeps the parentheses it really uses.
+    it("reads JSX text holding parentheses as prose, and still counts a call beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/aside.tsx": "export const Doc = () => <p>(Widget was removed)</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    (deprecated)\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => <p>{Widget()}</p>;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/aside.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // Prose brackets the name it labels. Code stands between a tag and its children only inside a
+    // `{…}`, so the `[]` around `[Widget]` are characters the page shows — reading them as program
+    // lets a doc page prove its own caller, and ends the element so the sentence under the label
+    // reads as program too. Outside every element the same brackets still list and index, and the
+    // module that puts the symbol in an array keeps counting.
+    it("reads JSX text holding brackets as prose, and still counts an array beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/bracket.tsx": "export const Doc = () => <p>[Widget] was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    [deprecated]\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const items = [Widget];\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/bracket.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // Prose joins its clauses with a semicolon. Code stands between a tag and its children only
+    // inside a `{…}`, so the `;` in `Deprecated; Widget was removed` is a character the page shows
+    // — reading it as program lets a doc page prove its own caller, and ends the element so the
+    // sentence under it reads as program too. The statement beside that prose keeps its own.
+    it("reads JSX text holding a semicolon as prose, and still counts the statement beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/clause.tsx": "export const Doc = () => <p>Deprecated; Widget was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    Deprecated; superseded\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => {\n  const el = Widget();\n  return el;\n};\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/clause.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // Prose writes an equals sign too. Code stands between a tag and its children only inside a
+    // `{…}`, so the `=` in `Status = Widget was removed` is a character the page shows — reading it
+    // as program lets a doc page prove its own caller, and ends the element so the sentence under
+    // it reads as program too. Outside every element the same sign still binds a name, and the
+    // module that assigns the call keeps counting.
+    it("reads JSX text holding an equals sign as prose, and still counts the assignment beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/label.tsx": "export const Doc = () => <p>Status = Widget was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    Status = deprecated\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const Live = () => {\n  const el = Widget();\n  return el;\n};\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/label.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // Prose quotes the name it shows and separates its labels with a pipe. Code stands between a
+    // tag and its children only inside a `{…}`, so the backticks around `Widget` and the `|` beside
+    // them are characters the page renders — reading them as program lets a doc page prove its own
+    // caller, and ends the element so the sentence under them reads as program too. Outside every
+    // element the same marks still open a template literal, and the module that calls through one
+    // keeps counting.
+    it("reads JSX text holding a backticked name or a pipe as prose, and still counts a template literal beside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/quoted.tsx": "export const Doc = () => <p>Use `Widget` instead</p>;\n",
+        "src/ui/pipe.tsx": "export const Pipe = () => <p>| Widget was removed</p>;\n",
+        "src/ui/multi.tsx":
+          "export const Multi = () => (\n  <div>\n    Docs | changelog\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx": "export const label = `${Widget()}`;\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/quoted.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/pipe.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/multi.tsx");
+    });
+
+    // A component spaces its children apart, and JSX gives that gap no meaning: the paragraph under
+    // an empty line is still the `<div>`'s text, so closing the element there reads the prose as
+    // program and lets a sentence naming a removed component prove its own caller. MDX and markup
+    // do end a block at a blank line — a module does not. The call written under the same gap is
+    // still the call it is.
+    it("keeps a JSX element open across a blank line, and still counts a call under one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/gap.tsx":
+          "export const Doc = () => (\n  <div>\n    <Header />\n\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    <Header />\n\n" +
+          "    {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/gap.tsx");
+    });
+
+    // A child expression wraps onto lines of its own too, and it is the element's child rather
+    // than the end of it: `<div>` with `{ready &&` under it still renders the prose written after
+    // the brace closes. Ending the parent's text on that opener reads the sentence below as
+    // program and lets a paragraph naming a removed component prove its own caller — while the
+    // lines the expression itself spans stay the code they are.
+    it("keeps a JSX element open across a wrapped child expression, and still counts a call inside one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <div>\n    {ready &&\n      <span />}\n" +
+          "    Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    {ready &&\n      Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // Elements nest down the page, and how many stand open is what the line under them is reading:
+    // the prose after a `</span>` closed two levels deep is still the `<div>`'s text. Counting one
+    // parent for any depth subtracts that child and reads the sentence as program, so a page naming
+    // a removed component proves its own caller — while the interpolation after the same closing
+    // tag stays the call it is.
+    it("reads JSX text after a closing tag nested two deep as prose, and still counts a call there", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <div>\n    <span>\n      gone\n" +
+          "    </span> Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    <span>\n      gone\n" +
+          "    </span> {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A wrapped child expression can also end on the line that names the symbol: `{ready &&` closes
+    // with `<span />}` and the parent's children resume behind that brace. Reading the whole line as
+    // the program the expression opened lets the prose after it prove its own caller — while the
+    // interpolation written in the same place is still the call it is.
+    it("resumes JSX text past the brace that closes a wrapped expression, and still counts a call there", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          "export const Note = () => (\n  <div>\n    {ready &&\n" +
+          "      <span />} Widget was removed in favour of Panel\n  </div>\n);\n",
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <div>\n    {ready &&\n" +
+          "      <span />} {Widget()}\n  </div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A tag whose props wrapped ENDS on the line that names the symbol, and past that `>` the line
+    // is the element's children: `<div` closed with `>Widget was removed</div>` renders the symbol.
+    // Reading the tail as more of the attribute list leaves no element open, so the prose proves
+    // its own caller — while the interpolation written in the same place is still the call it is.
+    it("resumes JSX text past the bracket that closes a wrapped tag, and still counts a call there", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/note.tsx":
+          'export const Note = () => (\n  <div\n    className="note"\n' +
+          "  >Widget was removed in favour of Panel</div>\n);\n",
+        "src/ui/live.tsx":
+          'export const Live = () => (\n  <div\n    className="live"\n' +
+          "  >{Widget()}</div>\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/note.tsx");
+    });
+
+    // A tag's props wrap onto lines of their own as ordinary formatting, and so can the value of
+    // one: the line carrying `title="Widget was removed"` has no opener on it, and the line under
+    // `title="` has neither. Judging either alone reads a static prop as program and lets it prove
+    // its own caller — while the expression prop beside them is still the call it is.
+    it("reads a static prop wrapped onto its own line as prose, and still counts one that runs", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notice.tsx":
+          "export const Notice = () => (\n  <Empty\n" +
+          '    title="Widget was removed in favour of Panel"\n  />\n);\n',
+        "src/ui/split.tsx":
+          "export const Split = () => (\n  <Empty\n" +
+          '    title="\n      Widget was removed in favour of Panel\n    "\n  />\n);\n',
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
+    });
+
+    // Only the quote decides what a prop shows. JSX interpolates a braced value the attribute
+    // writes bare, so a brace inside the quotes is a character the prop renders: rejecting
+    // `title="Use {Widget} here"` over its own punctuation reads a rendered prop as program and
+    // lets it prove its own caller — while the bare braced prop beside it is still the call it is.
+    it("keeps a brace inside a quoted JSX prop inert, and still counts a bare braced one", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notice.tsx":
+          'export const Notice = () => <Empty title="Use {Widget} here — it was removed" />;\n',
+        "src/ui/split.tsx":
+          "export const Split = () => (\n  <Empty\n" +
+          '    title="Use {Widget} here — it was removed"\n  />\n);\n',
+        "src/ui/live.tsx": "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
+    });
+
+    // A wrapped value ends at the quote that opened it, not at any quote: the apostrophe in a
+    // double-quoted `title` is prose, and reading it as the end of the value makes the sentence
+    // behind it program — which lets a page that only names the symbol prove its own caller. Past
+    // the real closing quote the line is the attribute list again, where a static prop is prose too.
+    it("ends a wrapped JSX prop at its own quote, not at an apostrophe inside it", async () => {
+      const repo = initRepo({
+        "src/ui/widget.tsx": "export function Widget() {\n  return null;\n}\n",
+        "src/ui/notice.tsx":
+          "export const Notice = () => (\n  <Empty\n    title=\"\n" +
+          "      It's Widget documentation, now gone\n    \"\n  />\n);\n",
+        "src/ui/split.tsx":
+          'export const Split = () => (\n  <Empty\n    body="\n      still open\n' +
+          '    " title="Widget was removed"\n  />\n);\n',
+        "src/ui/live.tsx":
+          "export const Live = () => (\n  <Empty\n    body={Widget()}\n  />\n);\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/ui/widget.tsx", "Widget"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "Widget" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/ui/live.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/notice.tsx");
+      expect(result.deadcode.dropped[0].reason).not.toContain("src/ui/split.tsx");
+    });
+
+    // SQL comments out the rest of a line with `--`, which can open after code: the line test the
+    // unknown-language fallback runs sees a statement, and the prose behind it reads as a call.
+    it("masks a SQL comment opened after code, and still counts the call beside one", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "db/notes.sql": "SELECT 1; -- neverCalled was removed\n",
+        "db/caller.sql": "SELECT neverCalled(); -- still wired up\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("db/caller.sql");
+      expect(result.deadcode.dropped[0].reason).not.toContain("db/notes.sql");
+    });
+
+    // A file anton has no grammar for still has block comments: `.jsonnet` writes them `/* ... */`,
+    // and their continuation lines carry no marker for the line test to see. Accepting one as code
+    // deletes a genuine finding — while a real call below the block still has to count.
+    it("tracks block comments in a file anton has no grammar for, and still counts its callers", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "infra/notes.jsonnet": "/*\nneverCalled was removed\n*/\n{}\n",
+        "infra/caller.jsonnet": "/*\nneverCalled is called below.\n*/\n{ value: neverCalled() }\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("infra/caller.jsonnet");
+      expect(result.deadcode.dropped[0].reason).not.toContain("infra/notes.jsonnet");
+    });
+
+    // HCL comments with `#` and `//`, both of which can open after code — a shape the unknown-
+    // language line test cannot see, so `ami = "ami-1" # neverCalled was removed` reads as a call
+    // and deletes a true finding. A real HCL call on the line beside one still has to count.
+    it("masks an HCL comment opened after code, and still counts the call beside one", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "infra/notes.tf":
+          'variable "ami" {\n  default = "ami-1" # neverCalled was removed\n' +
+          "  tags = {} // neverCalled went with it\n}\n",
+        "infra/caller.tf": "locals {\n  hook = neverCalled(var.env) # still wired up\n}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "neverCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("infra/caller.tf");
+      expect(result.deadcode.dropped[0].reason).not.toContain("infra/notes.tf");
+    });
+
+    it("drops an unused type the same way, and reads a whole-word reference only", async () => {
+      const repo = initRepo({
+        "src/lib/types.ts": "export type ScanPass = { id: string };\n",
+        "src/lib/pass.ts": "import type { ScanPass } from './types';\nexport const p: ScanPass = { id: '1' };\n",
+        // `neverCalledTwice` contains `neverCalled`, but a substring is not a reference to it.
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/other.ts": "export function neverCalledTwice() {}\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("src/lib/types.ts", "ScanPass", "unused-type"),
+        unused("src/lib/orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "ScanPass", kind: "unused-type" }]);
+    });
+
+    // Under-filtering costs one triaged bead; over-filtering deletes a finding nobody hears about
+    // again. So anything anton cannot check rides through untouched.
+    it("keeps every signal it cannot check — other collectors, unreadable titles, pathless signals", async () => {
+      const repo = initRepo({ "src/lib/orphan.ts": "export function neverCalled() {}\n" });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        { Source: "todos", Kind: "todo", FilePath: "src/lib/orphan.ts", Title: "TODO: neverCalled" },
+        { ...unused("src/lib/orphan.ts", "neverCalled"), Title: "Dead code found in this file" },
+        { ...unused("src/lib/orphan.ts", "neverCalled"), FilePath: "" },
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(3);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // anton tolerates the scratch and generated files a checkout accumulates — the nightly refresh
+    // fast-forwards past them rather than standing down (git/refresh.ts) — but the health point it
+    // records names a SHA whose tree holds none of them. Counting an untracked caller would erase a
+    // signal the shipped tree does not contradict, and score the same commit differently on two
+    // machines. A tracked file edited and not yet committed is the tree being measured, and counts.
+    it("does not count an untracked file as a caller, and still reads uncommitted edits", async () => {
+      const repo = initRepo({
+        "src/lib/orphan.ts": "export function neverCalled() {}\n",
+        "src/lib/live.ts": "export function stillCalled() {}\n",
+        "src/lib/caller.ts": "export const ready = 1;\n",
+      });
+      writeFileSync(join(repo, "scratch.ts"), "neverCalled();\n", "utf8");
+      writeFileSync(join(repo, "src/lib/caller.ts"), "stillCalled();\n", "utf8");
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("src/lib/orphan.ts", "neverCalled"),
+        unused("src/lib/live.ts", "stillCalled"),
+      ]);
+
+      expect(result.kept).toMatchObject([{ Title: "Unused function: neverCalled" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "stillCalled" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/caller.ts");
+    });
+
+    // A filter that can't search the tree must under-filter rather than delete findings — and say
+    // why, so the surviving signals aren't read as the repo suddenly growing dead code.
+    it("counts everything and reports why when the tree cannot be searched", async () => {
+      const notARepo = join(dir, "loose");
+      mkdirSync(notARepo, { recursive: true });
+      writeFileSync(join(notARepo, "orphan.ts"), "export function neverCalled() {}\n", "utf8");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("orphan.ts", "neverCalled"),
+      ]);
+
+      const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.deadcode.dropped).toEqual([]);
+      expect(result.deadcode.unavailable).toBeTruthy();
+      expect(describeDeadcodeFilter(result.deadcode)).toContain("could not be searched");
+    });
+
+    // `git grep -w` counts `$` as a non-word character, so a `$`-suffixed identifier still matches
+    // at its own boundaries — the check has to find those callers, not read the symbol as unmatched
+    // and leave a false finding standing.
+    it("finds the callers of a symbol whose name ends in `$`", async () => {
+      const repo = initRepo({
+        "src/lib/render.ts": "export function render$() {}\n",
+        "src/lib/page.ts": "import { render$ } from './render';\nrender$();\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [unused("src/lib/render.ts", "render$")]);
+
+      expect(result.kept).toEqual([]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "render$" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/page.ts");
+    });
+
+    // `git grep -w` breaks a word on `$` and `#`, but JavaScript spells identifiers with both, so
+    // grep hands back `$mount` and `this.#mount` for a search on `mount`. Reading those as callers
+    // deletes a true finding — while the `boot` call in the same file still has to count, so the
+    // rejection is the boundary rule and not a file the check never read.
+    it("reads `$` and `#` as identifier characters rather than word boundaries", async () => {
+      const repo = initRepo({
+        "src/lib/mount.ts": "export function mount() {}\n",
+        "src/lib/boot.ts": "export function boot() {}\n",
+        "src/lib/other.ts": "export const $mount = 1;\nexport const mount$ = 2;\n",
+        "src/lib/klass.ts":
+          "import { boot } from './boot';\nexport class K {\n  #mount() {}\n  run() {\n    this.#mount();\n    boot();\n  }\n}\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("src/lib/mount.ts", "mount"),
+        unused("src/lib/boot.ts", "boot"),
+      ]);
+
+      expect(result.kept).toMatchObject([{ Title: "Unused function: mount" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ symbol: "boot" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("src/lib/klass.ts");
+    });
+
+    // Two dead symbols with the same name in different files each mention themselves, so excluding
+    // only the signal's own path makes each declaration read as the other's caller — silently
+    // erasing both true findings.
+    it("does not read one declaration of a symbol as a caller of its namesake", async () => {
+      const repo = initRepo({
+        "packages/a/format.ts": "export function format() {}\n",
+        "packages/b/format.ts": "export function format() {}\n",
+        "packages/b/use.ts": "export function helper() {}\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("packages/a/format.ts", "format"),
+        unused("packages/b/format.ts", "format"),
+      ]);
+
+      expect(result.kept).toHaveLength(2);
+      expect(result.deadcode.dropped).toEqual([]);
+    });
+
+    // The sibling exclusion must not swallow a real caller: a third file that calls the symbol still
+    // drops the signal it belongs to, so the fix stays a declaration rule rather than a blanket
+    // mute. Which signal that is now follows the caller's own import — it names `packages/b`, so
+    // `packages/a`'s `format` keeps its finding rather than being dropped on a namesake's evidence
+    // (PR #190 review; this assertion previously read "both", which was the bug).
+    it("drops the namesake the caller actually imports, and only that one", async () => {
+      const repo = initRepo({
+        "packages/a/format.ts": "export function format() {}\n",
+        "packages/b/format.ts": "export function format() {}\n",
+        "packages/b/use.ts": "import { format } from './format';\nformat();\n",
+      });
+
+      const result = await filterDeadcodeSignals(repo, [
+        unused("packages/a/format.ts", "format"),
+        unused("packages/b/format.ts", "format"),
+      ]);
+
+      expect(result.kept).toMatchObject([{ FilePath: "packages/a/format.ts" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ path: "packages/b/format.ts" }]);
+      expect(result.deadcode.dropped[0].reason).toContain("packages/b/use.ts");
+      expect(result.deadcode.dropped[0].reason).not.toContain("format.ts");
+    });
+
+    // The budget stops a baseline pass from spending a nightly on greps, but a truncated pass that
+    // says nothing reads exactly like a verified one — the health record would count findings the
+    // tree was never asked about.
+    it("reports how many signals the symbol budget left unchecked, and keeps them", async () => {
+      const repo = initRepo({
+        "src/testing/integration.ts": "export function withOperator() {}\n",
+        "src/routes/claim.test.ts": "withOperator();\n",
+      });
+      // One signal per distinct symbol fills the budget, then the one with a real caller sits past
+      // it: unchecked, so it must survive rather than be dropped.
+      const signals = [
+        ...Array.from({ length: SYMBOL_BUDGET }, (_, i) => unused("src/lib/orphan.ts", `dead${i}`)),
+        unused("src/testing/integration.ts", "withOperator"),
+      ];
+
+      const result = await filterDeadcodeSignals(repo, signals);
+
+      expect(result.kept).toHaveLength(signals.length);
+      expect(result.deadcode.dropped).toEqual([]);
+      expect(result.deadcode.unchecked).toBe(1);
+      expect(describeDeadcodeFilter(result.deadcode)).toContain("1 dead-code signal(s) were counted unchecked");
+    });
+
+    // The budget withholds greps, not answers: a symbol already searched is in hand, so a signal
+    // past the budget that names one is still checked. Counting it unchecked would leave a signal
+    // standing that this very pass had already contradicted.
+    it("still checks a signal past the budget whose symbol was already searched", async () => {
+      const repo = initRepo({
+        "src/testing/integration.ts": "export function withOperator() {}\n",
+        "src/routes/claim.test.ts": "withOperator();\n",
+      });
+      // The budget fills on withOperator plus one signal per distinct dead symbol. Past it sits an
+      // unsearched symbol — which goes unchecked — and a second withOperator, whose answer is free.
+      const signals = [
+        unused("src/testing/integration.ts", "withOperator"),
+        ...Array.from({ length: SYMBOL_BUDGET - 1 }, (_, i) =>
+          unused("src/lib/orphan.ts", `dead${i}`),
+        ),
+        unused("src/lib/orphan.ts", "unsearched"),
+        unused("src/testing/integration.ts", "withOperator"),
+      ];
+
+      const result = await filterDeadcodeSignals(repo, signals);
+
+      expect(result.deadcode.unchecked).toBe(1);
+      expect(result.deadcode.dropped).toHaveLength(2);
+      expect(result.kept).toHaveLength(signals.length - 2);
+    });
+
+    // A cancelled job must stop the check, not ride it out: the greps are what the shutdown waits
+    // on, and a filter that returned a verdict anyway would let the pass record itself.
+    describe("cancellation", () => {
+      it("starts no grep once the caller has aborted", async () => {
+        const repo = initRepo({
+          "src/testing/integration.ts": "export function withOperator() {}\n",
+          "src/routes/claim.test.ts": "withOperator();\n",
+        });
+
+        await expect(
+          filterDeadcodeSignals(repo, [unused("src/testing/integration.ts", "withOperator")], {
+            abort: AbortSignal.abort(),
+          }),
+        ).rejects.toMatchObject({ name: "AbortError" });
+      });
+
+      // The abort kills the grep anton is waiting on; reporting that as an unsearchable tree would
+      // count the pass as verified-but-unavailable and let it finish writing.
+      it("rejects rather than reporting the killed grep as an unsearchable tree", async () => {
+        const repo = initRepo({
+          "src/testing/integration.ts": "export function withOperator() {}\n",
+          "src/routes/claim.test.ts": "withOperator();\n",
+        });
+        const ac = new AbortController();
+        const filtering = filterDeadcodeSignals(
+          repo,
+          [unused("src/testing/integration.ts", "withOperator")],
+          { abort: ac.signal },
+        );
+        ac.abort();
+
+        await expect(filtering).rejects.toMatchObject({ name: "AbortError" });
+      });
     });
   });
 

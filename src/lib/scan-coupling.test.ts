@@ -14,11 +14,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ScanSignal } from "./scan-severity";
 import {
+  aliasRemainder,
+  claimingRules,
   filterCouplingSignals,
   importGraph,
   judgeCycle,
   judgeFanOut,
   readAliases,
+  readDirAliases,
   type Graph,
 } from "./scan-coupling";
 
@@ -117,6 +120,66 @@ describe("importGraph", () => {
     ]);
   });
 
+  // tsc resolves an import through the LONGEST matching pattern, whatever order the patterns are
+  // written in. Taking the first match attaches the import to the broad target — a module tsc never
+  // names — so the graph draws an edge that does not exist (PR #190 review).
+  it("resolves an alias through the most specific pattern, not the first declared", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { "@/*": ["./src/*"], "@/ui/*": ["./vendor/*"] },
+        },
+      }),
+      "src/a.ts": `import { w } from "@/ui/widget";\nexport const a = () => w();\n`,
+      // Both candidates exist, so only the pattern choice can decide which one the edge names.
+      "src/ui/widget.ts": `export const w = () => 1;\n`,
+      "vendor/widget.ts": `export const w = () => 2;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "vendor/widget.ts", typeOnly: false, relative: false },
+    ]);
+  });
+
+  // A rule whose target list lost its unmodellable substitutions keeps the ones it could read, and
+  // those are not the ones tsc reaches first. Resolving through a surviving fallback draws an edge
+  // to a module tsc never names, and a wrong edge is how a real cycle gets dropped (PR #190 review).
+  /** `@/*` with a mid-path substitution ahead of an ordinary one — tsc's own fallback order. */
+  const ORDERED_TARGETS = JSON.stringify({
+    compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/real/*/index", "./src/fallback/*"] } },
+  });
+  const ALIAS_IMPORTER = `import { x } from "@/x";\nexport const a = () => x();\n`;
+
+  // The first target that exists on disk wins, including one whose substitution sits mid-path —
+  // a shape the rule model could not express, so the whole rule was refused (PR #190 review).
+  it("resolves an alias through the first declared target that exists", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": ORDERED_TARGETS,
+      "src/a.ts": ALIAS_IMPORTER,
+      "src/real/x/index.ts": `export const x = () => 1;\n`,
+      "src/fallback/x.ts": `export const x = () => 2;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "src/real/x/index.ts", typeOnly: false, relative: false },
+    ]);
+  });
+
+  // ...and the later target answers when the earlier one is simply absent. Refusing the rule lost
+  // this edge, and a lost runtime edge is how a real cycle gets dropped as a phantom.
+  it("falls back to a later target when the first names no file", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": ORDERED_TARGETS,
+      "src/a.ts": ALIAS_IMPORTER,
+      "src/fallback/x.ts": `export const x = () => 2;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "src/fallback/x.ts", typeOnly: false, relative: false },
+    ]);
+  });
+
   it("separates erased edges from the runtime ones", async () => {
     const graph = await graphOf({
       "src/a.ts": [
@@ -186,6 +249,350 @@ describe("importGraph", () => {
     // nothing", which would drop the signal it was asked about.
     expect(await graph.edgesOf("src/a.ts")).toBeUndefined();
     expect(await graph.valueTargetsOf("src/a.ts")).toBeUndefined();
+  });
+});
+
+describe("readAliases", () => {
+  // tsconfig.json is JSONC — `tsc --init` writes one full of `//` comments, and a trailing comma is
+  // legal in it. Read with plain `JSON.parse` such a config publishes no mapping at all, and the
+  // specifier falls back to its path tail, which binds an unrelated package's same-named module.
+  it("reads a tsconfig written as JSONC — comments, block comments and a trailing comma", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": [
+        "{",
+        "  // The app's own sources.",
+        "  /* baseUrl is what the targets below are relative to. */",
+        '  "note": "a // b, c",',
+        '  "compilerOptions": {',
+        '    "baseUrl": ".",',
+        '    "paths": { "@/*": ["./src/*"] },',
+        "  },",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    // `note` also proves strings are copied through untouched: a `//` and a `,`-before-`}` inside
+    // one, eaten as syntax, would leave a document `JSON.parse` rejects and no rules at all.
+    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
+  });
+
+  // `extends` comes off unvalidated JSON, so a config spelling it as anything but a string reaches
+  // the resolver as-is. Before, `null.startsWith` threw a TypeError out through `filterCouplingSignals`
+  // and failed the whole nightly pass over one malformed config.
+  it("ignores an `extends` value that is not a string instead of throwing", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({ extends: null, compilerOptions: { baseUrl: "." } }),
+    });
+
+    await expect(readAliases(repo)).resolves.toEqual([]);
+  });
+
+  // ...and one bad entry does not cost the chain the base that IS readable.
+  it("follows the string entries of an `extends` array past a malformed one", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      // An `extends` array is read last-first, so the malformed entry is reached FIRST here.
+      "tsconfig.json": JSON.stringify({ extends: ["./tsconfig.base.json", null] }),
+    });
+
+    expect(await readAliases(repo)).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
+  });
+
+  // A pattern with no `*` maps one module outright and tsc honours it. Skipped, the specifier falls
+  // to the path tail, which binds an unrelated package's same-named module. Its targets name files,
+  // so nothing is appended to them.
+  it("reads an exact mapping beside a wildcard one", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { "@/*": ["./src/*"], "@/ui/widget": ["./vendor/special.ts"] },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", targets: ["src/*"] },
+      { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true },
+    ]);
+  });
+
+  // An exact rule claims the specifier it names and nothing beneath it: `@/ui/widgetry` is not the
+  // module `"@/ui/widget"` maps, and matching it by prefix would send the import where tsc never
+  // does — inventing an edge, and with it a caller.
+  it("claims only the specifier an exact mapping names", async () => {
+    const rule = { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true };
+
+    expect(aliasRemainder(rule, "@/ui/widget")).toBe("");
+    expect(aliasRemainder(rule, "@/ui/widgetry")).toBeUndefined();
+    expect(aliasRemainder({ prefix: "@/", targets: ["src/*"] }, "@/ui/widget")).toBe("ui/widget");
+  });
+
+  // A derived config writing `paths` overrides the base's entirely, so `{}` is how a nested project
+  // CLEARS an inherited `@/*`. Reading the rule count instead walks `extends` and resurrects it,
+  // attributing the import to the base's target (PR #190 review).
+  // An `extends` array is read last-first because a later entry overrides an earlier one, and that
+  // override has to survive the entry declaring `paths: {}`. Reading its empty answer as "nothing
+  // to inherit" walks on to the earlier base and resurrects a mapping tsc has cleared (PR #190
+  // review).
+  it("stops at an extends member that clears paths instead of falling back to an earlier one", async () => {
+    const repo = writeRepo({
+      "tsconfig.aliases.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "tsconfig.clear.json": JSON.stringify({ compilerOptions: { paths: {} } }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: ["../../tsconfig.aliases.json", "../../tsconfig.clear.json"],
+      }),
+      // Reverse the order and the aliases win, which is what makes the case above non-vacuous.
+      "apps/heir/tsconfig.json": JSON.stringify({
+        extends: ["../../tsconfig.clear.json", "../../tsconfig.aliases.json"],
+      }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
+  });
+
+  // tsc merges `compilerOptions` property by property, so a config declaring `paths` while
+  // inheriting `baseUrl` anchors its mapping under the BASE's baseUrl. Anchoring it beside the
+  // config that declares `paths` names a directory tsc never resolves to, which attributes the
+  // import to the wrong module (PR #190 review).
+  it("resolves a locally declared mapping under an inherited baseUrl", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({ compilerOptions: { baseUrl: "./packages" } }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { paths: { "@/*": ["*"] } },
+      }),
+      // Nothing declares a baseUrl here, so the same mapping anchors beside its own config —
+      // which is what makes the case above non-vacuous.
+      "apps/heir/tsconfig.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["*"] } } }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([{ prefix: "@/", targets: ["packages/*"] }]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([
+      { prefix: "@/", targets: ["apps/heir/*"] },
+    ]);
+  });
+
+  // The mirror image: a config declaring `baseUrl` while inheriting `paths` anchors the INHERITED
+  // mapping under its own baseUrl, not under the base that wrote the mapping.
+  it("anchors an inherited mapping under the inheriting config's own baseUrl", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({
+        compilerOptions: { paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { baseUrl: "." },
+      }),
+      // The sibling declares no baseUrl anywhere in its chain, so the mapping stays anchored at the
+      // config that declared it — tsc's own default.
+      "apps/heir/tsconfig.json": JSON.stringify({ extends: "../../tsconfig.base.json" }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([
+      { prefix: "@/", targets: ["apps/app/src/*"] },
+    ]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
+  });
+
+  // A target whose substitution isn't its last segment, and one with no substitution at all, are
+  // valid mappings this reader cannot resolve. Dropping the rule leaves the specifier to the
+  // path-tail fallback, which names an unrelated module — so the rule claims and maps nothing
+  // instead (PR #190 review).
+  // A substitution mid-path, and a target carrying none at all, are mappings tsc honours — they are
+  // templates like any other now, in the order the config declares them (PR #190 review).
+  it("keeps every target the config declares, in order, as a template", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: {
+            "@/*": ["./src/*/index"],
+            "#/*": ["./fixed.ts"],
+            "~/*": ["./src/*", "./legacy/*/index"],
+          },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", targets: ["src/*/index"] },
+      { prefix: "#/", targets: ["fixed.ts"] },
+      { prefix: "~/", targets: ["src/*", "legacy/*/index"] },
+    ]);
+  });
+
+  // What `unresolved` means now: a target tsc itself would refuse, or one the config did not spell
+  // as a string at all. The rule still claims, so the path-tail fallback cannot answer in its place.
+  it("claims but maps nothing for a target tsc would refuse", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          // Two substitutions in one target, and a target that is not a string.
+          paths: { "@/*": ["./src/*/*"], "#/*": [7], "~/*": ["./src/*", "./a/*/b/*"] },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", targets: [], unresolved: true },
+      { prefix: "#/", targets: [], unresolved: true },
+      // A partial list is still a claim anton must not read as the whole mapping: the target tsc
+      // would pick may be the one missing from it.
+      { prefix: "~/", targets: ["src/*"], unresolved: true },
+    ]);
+  });
+
+  it("stops inheriting when a config declares paths, empty included", async () => {
+    const repo = writeRepo({
+      "tsconfig.base.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": JSON.stringify({
+        extends: "../../tsconfig.base.json",
+        compilerOptions: { paths: {} },
+      }),
+      // The sibling that declares none still inherits — an absence is not an override.
+      "apps/heir/tsconfig.json": JSON.stringify({ extends: "../../tsconfig.base.json" }),
+    });
+
+    expect(await readAliases(repo, "apps/app")).toEqual([]);
+    expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
+  });
+
+  // tsc takes a single `*` anywhere in a pattern, and the text either side of it is what a
+  // specifier must start and end with. Such a pattern is now MAPPED like any other rather than
+  // claimed and left unresolved (PR #190 review; this assertion previously read `targets: [],
+  // unresolved: true`, which was the half-measure).
+  it("resolves a pattern whose wildcard is not at the end", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: { "@/*/models": ["./src/*/models"], "@/ui/*": ["./src/ui/*"] },
+        },
+      }),
+    });
+
+    expect(await readAliases(repo)).toEqual([
+      { prefix: "@/", suffix: "/models", targets: ["src/*/models"] },
+      { prefix: "@/ui/", targets: ["src/ui/*"] },
+    ]);
+  });
+
+  // Its specifiers resolve through the substitution the pattern names, and every other `@/` one
+  // still belongs to whatever rule maps it.
+  it("substitutes through a nonterminal wildcard, and claims nothing beyond it", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*/models": ["./src/*/models"] } },
+      }),
+      "src/a.ts": `import { m } from "@/b/models";\nexport const a = () => m();\n`,
+      "src/b/models.ts": `export const m = () => 1;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "src/b/models.ts", typeOnly: false, relative: false },
+    ]);
+  });
+});
+
+describe("claimingRules", () => {
+  const broad = { prefix: "@/", targets: ["src/*"] };
+  const narrow = { prefix: "@/ui/", targets: ["vendor/*"] };
+  const exact = { prefix: "@/ui/widget", targets: ["vendor/special.ts"], exact: true };
+
+  // Declaration order must not decide: tsc picks the longest matching pattern either way.
+  it("answers with the longest matching prefix whichever order the rules are in", () => {
+    expect(claimingRules([broad, narrow], "@/ui/widget")).toEqual([
+      { rule: narrow, rest: "widget" },
+    ]);
+    expect(claimingRules([narrow, broad], "@/ui/widget")).toEqual([
+      { rule: narrow, rest: "widget" },
+    ]);
+  });
+
+  it("reads a pattern with no wildcard as the most specific rule an import can match", () => {
+    expect(claimingRules([broad, exact], "@/ui/widget")).toEqual([{ rule: exact, rest: "" }]);
+    // And it claims nothing beneath the module it names.
+    expect(claimingRules([broad, exact], "@/ui/widgetry")).toEqual([
+      { rule: broad, rest: "ui/widgetry" },
+    ]);
+  });
+
+  it("claims nothing when no rule matches", () => {
+    expect(claimingRules([broad, narrow], "react")).toEqual([]);
+  });
+
+  // The claim is bounded at both ends, so it swallows only what tsc would send to that pattern —
+  // every other `@/` specifier still belongs to the rule that maps it.
+  it("bounds a nonterminal-wildcard claim by its suffix", () => {
+    const claim = { prefix: "@/", suffix: "/models", targets: [], unresolved: true };
+
+    expect(aliasRemainder(claim, "@/foo/models")).toBe("foo");
+    expect(aliasRemainder(claim, "@/ui/widget")).toBeUndefined();
+    expect(aliasRemainder(claim, "@/models")).toBeUndefined();
+    expect(claimingRules([claim, { prefix: "@/ui/", targets: ["src/ui/*"] }], "@/ui/widget")).toEqual([
+      { rule: { prefix: "@/ui/", targets: ["src/ui/*"] }, rest: "widget" },
+    ]);
+  });
+});
+
+describe("readDirAliases", () => {
+  // A project is bounded by its own config: tsc inherits `paths` through `extends` and never from
+  // an ancestor directory, so a lookup has to know a config exists even when it publishes no
+  // mapping. Reading "no rules" as "no config" climbs past it and applies a mapping tsc doesn't.
+  it("reports a config that publishes no mapping as governing its directory", async () => {
+    const repo = writeRepo({
+      "apps/app/tsconfig.json": JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+    });
+
+    expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
+    expect(await readDirAliases(repo, "apps")).toEqual({ rules: [], governed: false });
+  });
+
+  // tsc reads straight past a UTF-8 BOM; `JSON.parse` refuses the file. Read as "no config here",
+  // the lookup climbed past a real project boundary and applied the ancestor's mapping (PR #190
+  // review).
+  it("reads a config written with a byte-order mark", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": `\uFEFF${JSON.stringify({ compilerOptions: { baseUrl: "." } })}`,
+      "apps/lib/tsconfig.json": `\uFEFF${JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "#/*": ["./own/*"] } },
+      })}`,
+    });
+
+    // The paths-less one still BOUNDS its project, so nothing is inherited from the root...
+    expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
+    // ...and one that does publish a mapping is read rather than thrown away.
+    expect(await readDirAliases(repo, "apps/lib")).toEqual({
+      rules: [{ prefix: "#/", targets: ["apps/lib/own/*"] }],
+      governed: true,
+    });
+  });
+
+  // The boundary is the file's EXISTENCE, which is what tsc reads it as — not whether this reader
+  // could make sense of it. Climbing past a broken config applies a mapping the compiler never
+  // would (PR #190 review).
+  it("treats a config it cannot parse as governing its directory", async () => {
+    const repo = writeRepo({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*": ["./src/*"] } },
+      }),
+      "apps/app/tsconfig.json": "{ this is not json",
+    });
+
+    expect(await readDirAliases(repo, "apps/app")).toEqual({ rules: [], governed: true });
   });
 });
 
