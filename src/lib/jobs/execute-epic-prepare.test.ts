@@ -296,6 +296,24 @@ describe("prepareEpicRun — a held child is caught on every board the run adopt
     expect(publishRunClaimMock).not.toHaveBeenCalled();
   });
 
+  it("runs the independent siblings of a blocked child a cross-run blocker holds (PR #227 review)", async () => {
+    // t-2 waits on a `blocks` edge OUTSIDE this run, so the dispatch loop parks it in the held tail
+    // and never claims it — its status reaches no claim gate. Parking the whole run over it would
+    // stall t-1, the partial gating anton-1two exists to keep.
+    const all = board(ticket("t-1"), ticket("t-2", "blocked"));
+    loadAllIssuesMock.mockResolvedValue(all);
+    preflightHumanTicketsMock.mockResolvedValue(preflight(all));
+    const gatedRun = run(all);
+    gatedRun.readiness = () => ({ blockers: ["anton-elsewhere"], gated: ["t-2"], runnable: true });
+
+    const prep = await prepareEpicRun(gatedRun);
+
+    expect(prep.done).toBe(false);
+    if (prep.done) return;
+    expect([...prep.gated]).toContain("t-2");
+    expect(publishRunClaimMock).toHaveBeenCalled();
+  });
+
   it("prepares the run when every board it adopts leaves the children claimable", async () => {
     const all = board(ticket("t-1"), ticket("t-2"));
     loadAllIssuesMock.mockResolvedValue(all);

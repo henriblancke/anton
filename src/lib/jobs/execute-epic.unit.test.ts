@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { LABELS, type Bead, type BeadDep, type Gate } from "../beads/bd";
+import { latestBlockNoteCommit } from "../beads/block-note";
 import { formatHumanNote, parseTicketNotes } from "../beads/notes";
 import {
   blockedTailReason,
@@ -49,6 +50,7 @@ import {
   continuationPrompt,
   ticketBlockNote,
   ticketClaimFailure,
+  timedOutTicketNote,
 } from "./execute-epic-ticket";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
@@ -440,6 +442,23 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
     expect(error.message).toContain("bd update anton-od4 --status open");
     expect(error.message).not.toContain("bd close");
     expect(error.message).toContain("drops the work from this run");
+  });
+
+  it("names WHICH commits survive an abandon when the held set is mixed (PR #227 review)", () => {
+    // One ticket's work is on this branch, the other's is on another machine's. An unqualified "a
+    // commit already on the branch stays in the pull request" reads as covering both, so an operator
+    // abandoning the pair would drop the work this checkout does not have.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [
+        { id: "anton-od4", status: "blocked", committed: { branch: BRANCH, head: "0123456" } },
+        { id: "anton-9zz", status: "blocked", committed: { branch: BRANCH, head: "89abcde" } },
+      ],
+      BRANCH,
+      new Set(["anton-od4"]),
+    );
+    expect(error.message).toContain("only the commit already on this branch (anton-od4)");
+    expect(error.message).toContain("abandoning the rest drops that work from this run");
   });
 
   it("names every held ticket, not just the first", () => {
@@ -1273,6 +1292,51 @@ describe("ticketBlockNote (anton-vqql)", () => {
     expect(entries[0]).toMatchObject({ source: "human", author: "Henri" });
     expect(entries[1]).toMatchObject({ source: "system", author: "anton" });
     expect(entries[1]!.text).toContain("the migration this depends on does not exist yet");
+  });
+});
+
+/**
+ * PR #227 review: a timeout the run ABSORBS leaves the ticket blocked, and the next run's park gate
+ * reads its note to choose a remedy. Without the shared evidence clause a committed timeout reads as
+ * "no commit" and gets told to reopen and redo work that is already on the branch.
+ */
+describe("timedOutTicketNote (anton-t1mo)", () => {
+  const HEAD = "0123456789abcdef0123456789abcdef01234567";
+  const timedOut = (over: Partial<Parameters<typeof timedOutTicketNote>[0]> = {}) =>
+    timedOutTicketNote({
+      timeoutMs: 30 * 60_000,
+      committed: true,
+      leftovers: false,
+      worktreePath: "/tmp/wt",
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      head: HEAD,
+      ...over,
+    });
+
+  it("records a committed timeout in the grammar the park gate reads", () => {
+    const out = timedOut();
+    expect(out).toContain("outlived its budget");
+    expect(out).toContain("Its work IS committed on the branch");
+    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+    expect(latestBlockNoteCommit([out])).toEqual({
+      committed: true,
+      branch: "anton/anton-e1",
+      head: "0123456",
+    });
+  });
+
+  it("records a rolled-back timeout as the zero-diff block it is", () => {
+    const out = timedOut({ committed: false, head: undefined });
+    expect(out).toContain("rolled back");
+    expect(latestBlockNoteCommit([out])).toEqual({ committed: false, branch: "anton/anton-e1" });
+  });
+
+  it("still points at the worktree when the rollback failed — as ONE machine note", () => {
+    const out = timedOut({ committed: false, leftovers: true, head: undefined });
+    expect(out).toContain("/tmp/wt");
+    expect(out).not.toContain("\n");
+    expect(parseTicketNotes(out)).toHaveLength(1);
   });
 });
 

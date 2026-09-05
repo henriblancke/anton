@@ -147,6 +147,10 @@ export interface HumanHeldTicket {
  *
  * Abandoned tickets are excluded for the same reason the dispatch loop drops them: a human already
  * settled them, and this run runs without them.
+ *
+ * Judges only the tickets handed to it, and the caller hands it the ones this run would DISPATCH: a
+ * child a cross-run blocker holds is never claimed this pass, so parking over its status would stall
+ * its independent siblings (PR #227 review).
  */
 export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
   return tickets
@@ -290,10 +294,22 @@ export function humanHeldPoison(
   // BRANCH it settles the bead and leaves the commit in the run's pull request, so it can't be
   // offered as "drops the work". A commit this checkout does not have buys none of that — this run
   // ships without it, so abandoning really does drop the work here (PR #227 review).
-  const abandon = work.some(([, w]) => w.where === "here")
-    ? `or abandon ${it} to settle the board — a commit already on the branch stays in this run's ` +
-      `pull request either way`
-    : `or abandon ${it}, which drops the work from this run`;
+  //
+  // A MIXED set names which tickets earn that reassurance (PR #227 review). An unqualified "a commit
+  // already on the branch stays in the pull request" reads as covering every ticket listed, so an
+  // operator abandoning the lot would drop the ones whose work is on another branch or another
+  // machine — the exact loss the per-ticket clauses above warn about.
+  const hereIds = work.filter(([, w]) => w.where === "here").map(([h]) => h.id);
+  const abandon =
+    hereIds.length === 0
+      ? `or abandon ${it}, which drops the work from this run`
+      : hereIds.length === work.length
+        ? `or abandon ${it} to settle the board — a commit already on the branch stays in this ` +
+          `run's pull request either way`
+        : `or abandon ${it} to settle the board, bearing in mind that only the ` +
+          `${hereIds.length === 1 ? "commit" : "commits"} already on this branch ` +
+          `(${hereIds.join(", ")}) ${hereIds.length === 1 ? "stays" : "stay"} in this run's pull ` +
+          `request either way — abandoning the rest drops that work from this run`;
   return new PoisonEpic(
     `${targetId} has ${one ? "a ticket" : `${held.length} tickets`} no agent can pick up: ` +
       work.map(([h, w]) => humanHeldClause(h, w, branch)).join("; ") +

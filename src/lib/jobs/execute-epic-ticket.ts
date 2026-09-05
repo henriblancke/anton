@@ -702,6 +702,8 @@ async function settleTicketTimeout(args: {
     ).catch(() => {});
     const leftovers = await rollbackTimedOutTicket(worktreePath, baseline, committed);
     const marked = await blockTimedOutTicket({
+      sessionId: session.sessionId,
+      branch: run.branch,
       repo,
       ticket,
       worktreePath,
@@ -772,8 +774,10 @@ async function blockTimedOutTicket(args: {
   timeoutMs: number;
   committed: boolean;
   leftovers: boolean;
+  sessionId: string;
+  branch: string;
 }): Promise<boolean> {
-  const { repo, ticket, worktreePath, timeoutMs, committed, leftovers } = args;
+  const { repo, ticket, worktreePath, timeoutMs, committed, leftovers, sessionId, branch } = args;
   await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
   await safe(() => beads.unassign(repo, ticket.id));
   await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
@@ -785,21 +789,18 @@ async function blockTimedOutTicket(args: {
   // operator needs the timeout's own account either way).
   const marked =
     committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
+  // The tip this ticket's work landed on — the same best-effort read the human-review block makes,
+  // and only when something was committed: an unreadable worktree costs the sha, never the note.
+  const head = committed
+    ? await readWorktreeState(worktreePath)
+        .then((s) => s.head)
+        .catch(() => undefined)
+    : undefined;
   await safe(() =>
     beads.note(
       repo,
       ticket.id,
-      `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its ` +
-        `budget, so the run blocked it and carried on with the rest of the feature. ` +
-        (committed
-          ? `Its work IS committed on the branch (it was stopped after the commit) — review it ` +
-            `and close the ticket by hand if it is complete. `
-          : leftovers
-            ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
-              `(${worktreePath}), so the run stopped rather than let another ticket commit it — ` +
-              `clear the worktree by hand before resuming. `
-            : `Its partial work was rolled back (nothing from it is on the branch). `) +
-        `Re-scope it into smaller tickets, or raise ticketTimeoutMinutes, then resume the run`,
+      timedOutTicketNote({ timeoutMs, committed, leftovers, worktreePath, sessionId, branch, head }),
     ),
   );
   // Either halt the caller makes PARKS the run and tells the operator to resume it, so this ticket
@@ -1167,6 +1168,44 @@ export function ticketBlockNote(args: {
   // Written through the shared grammar: the board's park gate reads this clause back to tell a
   // committed block (review and close) from a zero-diff one (reopen and re-run) — see block-note.ts.
   return blockNoteOneLine(`anton: ${body} [${blockNoteEvidence({ sessionId, branch, head })}]`);
+}
+
+/**
+ * The operator-facing note left on a ticket the BUDGET stopped (anton-t1mo).
+ *
+ * Carries the same trailing evidence clause as every other block note (PR #227 review). A timeout
+ * the run absorbs leaves the ticket `blocked` — and `reopenAbsorbedTimeouts` deliberately keeps a
+ * COMMITTED one blocked — so the next run's human-held park gate reads this note to choose its
+ * remedy. Without the clause it reads "no commit recorded" and tells the operator to reopen and
+ * re-run work that is already on the branch, or to abandon it; with it, the same committed timeout
+ * gets the move the prose has always asked for: review the commit, then close.
+ */
+export function timedOutTicketNote(args: {
+  timeoutMs: number;
+  committed: boolean;
+  /** Partial work the rollback could not undo — still in the shared worktree. */
+  leftovers: boolean;
+  worktreePath: string;
+  sessionId: string;
+  branch: string;
+  /** The committed tip, full sha; absent when this ticket committed nothing. */
+  head?: string;
+}): string {
+  const { timeoutMs, committed, leftovers, worktreePath, sessionId, branch, head } = args;
+  const fate = committed
+    ? `Its work IS committed on the branch (it was stopped after the commit) — review it and ` +
+      `close the ticket by hand if it is complete.`
+    : leftovers
+      ? `Its partial work could NOT be rolled back and is STILL in the run's worktree ` +
+        `(${worktreePath}), so the run stopped rather than let another ticket commit it — clear ` +
+        `the worktree by hand before resuming.`
+      : `Its partial work was rolled back (nothing from it is on the branch).`;
+  return blockNoteOneLine(
+    `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its budget, ` +
+      `so the run blocked it and carried on with the rest of the feature. ${fate} Re-scope it ` +
+      `into smaller tickets, or raise ticketTimeoutMinutes, then resume the run ` +
+      `[${blockNoteEvidence({ sessionId, branch, head })}]`,
+  );
 }
 
 /** The error's own words, or "" when there are none worth repeating. */

@@ -283,9 +283,22 @@ async function assertTicketsClaimable(run: EpicRun, gates: RunGates): Promise<vo
   // `gates.children` is the working-layer subtree, so a STANDALONE target (its own single ticket) is
   // not judged here — its status is the epic claim's business (claimRunTarget), which already parks
   // on the same refusal with the target's own message.
-  const held = humanHeldTickets(gates.children);
+  const held = humanHeldTickets(dispatchableChildren(gates));
   if (held.length === 0) return;
   throw humanHeldPoison(run.targetId, held, run.branch, await commitsHere(run, held));
+}
+
+/**
+ * The children this run would actually DISPATCH — the only ones whose status can stop it
+ * (PR #227 review).
+ *
+ * A child a blocker outside this run holds is never claimed this pass: the loop parks it in the
+ * held tail (`partitionTickets`) without touching bd, so its status reaches no claim gate. Judging
+ * it here would park the whole run over a ticket the run was already going to walk past, taking its
+ * independent siblings down with it — the partial-gating rule anton-1two exists to keep.
+ */
+function dispatchableChildren(gates: RunGates): Bead[] {
+  return gates.children.filter((c) => !gates.gated.has(c.id));
 }
 
 /**
@@ -365,7 +378,7 @@ async function assertReservedTicketsClaimable(run: EpicRun, gates: RunGates): Pr
     );
   }
   const reserved = new Map(runTickets(reservedBoard, epicBeadId).map((t) => [t.id, t]));
-  const held = humanHeldTickets(gates.children.map((c) => reserved.get(c.id) ?? c));
+  const held = humanHeldTickets(dispatchableChildren(gates).map((c) => reserved.get(c.id) ?? c));
   if (held.length === 0) return;
   throw humanHeldPoison(epicBeadId, held, run.branch, await commitsHere(run, held));
 }
