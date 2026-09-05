@@ -528,7 +528,7 @@ export async function isAncestor(
  * ticket's work is already on the branch and re-runs it — onto a tree where there is nothing left
  * to do.
  *
- * `bypassHooks` is the RETRY a caller makes when the ordinary marker was rejected (PR #228 review):
+ * `bypassHooks` is the RETRY a caller makes when the ordinary marker was REJECTED (PR #228 review):
  * a project whose `commit-msg` hook enforces its own subject convention refuses anton's, and losing
  * the marker to a message check costs a whole ticket's work its only path back to a pull request.
  * Legitimate precisely because this commit is EMPTY — there is no content for a hook to have an
@@ -540,15 +540,28 @@ export async function commitMarker(
   options: { bypassHooks?: boolean } = {},
 ): Promise<void> {
   // `--allow-empty` PERMITS an empty commit; it does not FORCE one (PR #228 review). A `pre-commit`
-  // hook that stages files before rejecting leaves that content in the index, and the `--no-verify`
-  // retry — which bypasses the very hooks that would have inspected it — would then ship it inside a
-  // commit whose message says it is empty, past a caller's cleanliness check that reads the now-clean
-  // tree as proof nothing was left behind. Pinning the index to HEAD first makes this commit's tree
-  // identical to HEAD by construction; whatever a hook wrote stays in the working tree, where that
-  // check can still see it.
+  // hook that stages files leaves that content in the index, and the commit would then ship it under
+  // a message saying it is empty, past a caller's cleanliness check that reads the now-clean tree as
+  // proof nothing was left behind. Pinning the index to HEAD is the first half of the answer;
+  // whatever a hook wrote stays in the working tree, where that check can still see it.
   await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
+  const parent = await git(worktreePath, ["rev-parse", "HEAD"]);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
   await gitCommit(worktreePath, ["commit", "--allow-empty", ...bypass, "-m", message]);
+  // The other half: the reset runs BEFORE the hooks do, so a `pre-commit` that stages a file and
+  // exits ZERO stages it after the pin and the commit carries it anyway (PR #228 review) — no
+  // rejection, so no `--no-verify` retry either. Verify the marker is what it claims to be, and
+  // when it is not, drop it and remake it with the hooks that wrote the content bypassed. The
+  // `--mixed` reset moves the branch back and unstages, leaving the hook's file in the working
+  // tree for the caller's cleanliness check exactly as a rejection would.
+  if ((await treeOf(worktreePath, "HEAD")) === (await treeOf(worktreePath, parent))) return;
+  await git(worktreePath, ["reset", "--quiet", "--mixed", parent]);
+  await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", message]);
+}
+
+/** The tree a revision points at — two revisions sharing one are identical in content. */
+function treeOf(worktreePath: string, rev: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", `${rev}^{tree}`]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
@@ -708,6 +721,32 @@ async function branchSubjects(
   if (options.strict) return (await git(worktreePath, BRANCH_SUBJECTS_ARGS)).split("\n");
   const log = await git(worktreePath, BRANCH_SUBJECTS_ARGS).catch(() => "");
   return log.split("\n");
+}
+
+/**
+ * True when `commit` is reachable from `branch` in `repoPath` — "the work is in what this run
+ * ships", asked of git rather than inferred from a branch NAME (PR #227 review).
+ *
+ * anton's branches are deterministic per target, so a note recording a commit on `anton/<id>` says
+ * nothing about this machine: a run resumed elsewhere derives the same name over a worktree cut from
+ * origin, while the commit itself was never pushed and lives only where it was made — the same
+ * cross-machine gap {@link worktreeHasCommitFor} closes for the dispatch loop. Asked of the
+ * REPOSITORY, not a checkout, because worktrees share refs and objects: the answer holds for the
+ * run's worktree whether or not it exists yet, and a branch this machine has never seen resolves
+ * nowhere.
+ *
+ * Fails closed to `false` (unknown sha, missing branch, git error). "Absent" leaves the work in the
+ * operator's hands; "present" is what licenses settling the board over it.
+ */
+export async function branchContainsCommit(
+  repoPath: string,
+  branch: string,
+  commit: string,
+): Promise<boolean> {
+  return git(repoPath, ["merge-base", "--is-ancestor", commit, branch]).then(
+    () => true,
+    () => false,
+  );
 }
 
 /**

@@ -160,9 +160,9 @@ export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPol
    * deferred on the click that deferred it — the hold is server state, and the board's own poll is
    * up to 30s away, which is long enough for an operator to click `not now` twice.
    *
-   * It also leaves Up Next on that click. The lane is driven by the recorded plan, which the next
-   * picker pass rewrites up to ten minutes from now — so without this the declined target would keep
-   * its place in the ranking it was just refused a place in.
+   * It also leaves Up Next on that click. The lane is derived per board read (anton-r0ew), and the
+   * next one is up to a poll away — so without this the declined target would keep its place in the
+   * ranking it was just refused a place in.
    *
    * Only the sequence moves, unlike the reorder and move paths, which also bracket their write: this
    * is called once the veto route has recorded the deferral, so it is already durable and every
@@ -183,10 +183,23 @@ export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPol
         );
       }
       // The lane is ABSENT, never empty (types.ts): vetoing its last card drops it rather than
-      // leaving an "Up Next" heading over nothing, which reads as "anton has nothing to start".
-      const { upNext: ranked, ...rest } = prev;
+      // leaving an "Up Next" heading over nothing. Dropping it SILENTLY is the other half of that
+      // rule (anton-w579) — so the lane keeps its column and names the absence the veto just
+      // created, which is the one a lane that was drawing picks a moment ago can create: a pass that
+      // is armed and offering, over a board holding nothing it may claim. That is what the next read
+      // derives too, so the optimistic answer and the authoritative one agree.
+      const { upNext: ranked, upNextPlanId, upNextAbsence: named, ...rest } = prev;
       const upNext = ranked?.filter((entry) => entry.beadId !== beadId);
-      return { ...rest, columns, standalone, ...(upNext?.length ? { upNext } : {}) };
+      const absence = upNext?.length ? undefined : ranked?.length ? "no-claimable-work" : named;
+      return {
+        ...rest,
+        columns,
+        standalone,
+        ...(upNext?.length
+          ? { upNext, ...(upNextPlanId === undefined ? {} : { upNextPlanId }) }
+          : {}),
+        ...(absence === undefined ? {} : { upNextAbsence: absence }),
+      };
     });
   }, []);
 

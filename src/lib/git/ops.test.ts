@@ -22,6 +22,7 @@ import { join } from "node:path";
 import {
   COMMIT_TIMEOUT_ENV,
   commitAll,
+  commitMarker,
   DEFAULT_DIFF_PATCH_CHARS,
   diffAgainstBase,
   findOpenPullRequest,
@@ -38,6 +39,7 @@ import {
   restoreWorktreeState,
   sameWorktreeState,
   worktreeHasCommitFor,
+  branchContainsCommit,
 } from "./ops";
 import { GH_BIN_ENV } from "./ops";
 
@@ -347,6 +349,58 @@ suite("worktreeHasCommitFor (real git)", () => {
 
   it("returns false in a repo with no matching commit (fresh cross-machine worktree)", async () => {
     expect(await worktreeHasCommitFor(repo, "anton-jz1.2")).toBe(false);
+  });
+});
+
+/**
+ * PR #227 review: the held-ticket park may only offer "abandon it, the commit stays in the pull
+ * request" for a commit this machine actually has. anton's branch names are deterministic per
+ * target, so the name a block note records is the same on every machine — only git can say whether
+ * the commit behind it is here.
+ */
+suite("branchContainsCommit (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () =>
+    execFileSync("git", ["-C", repo, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-branchhas-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("answers for a branch that is not checked out, by short sha", async () => {
+    g(["checkout", "-q", "-b", "anton/anton-x7la"]);
+    writeFileSync(join(repo, "work.md"), "work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "anton-od4: implement the thing"]);
+    const sha = head();
+    // Back on main: the run's checkout need not exist for the repository to answer for its branch.
+    g(["checkout", "-q", "main"]);
+
+    expect(await branchContainsCommit(repo, "anton/anton-x7la", sha)).toBe(true);
+    // The commit is on the run's branch only — main, the base a fresh worktree is cut from, lacks it.
+    expect(await branchContainsCommit(repo, "main", sha)).toBe(false);
+  });
+
+  it("fails closed for a branch this machine never had, and for an unknown sha", async () => {
+    // The cross-machine resume: same deterministic branch name, no such branch (and no such object)
+    // in this clone.
+    expect(await branchContainsCommit(repo, "anton/anton-x7la", "0123456")).toBe(false);
+    expect(await branchContainsCommit(repo, "main", "0123456")).toBe(false);
   });
 });
 
@@ -1243,4 +1297,58 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
       expect(existsSync(marker)).toBe(true);
     },
   );
+});
+
+// PR #228 review: the index pin runs BEFORE the hooks do, so a `pre-commit` that stages a file and
+// exits ZERO gets its content into the marker anyway — no rejection, so no `--no-verify` retry. A
+// marker carrying a diff is content that passed none of the preservation gates, and a resume adopts
+// it as the ticket's preserved work.
+suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-marker-hook-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+
+    // The formatter-shaped hook: it rewrites the tree, stages what it wrote, and lets the commit
+    // through. Nothing about it fails, which is why the rejection retry never sees it.
+    const hook = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(
+      hook,
+      ["#!/bin/sh", "printf 'generated\\n' > generated.txt", "git add generated.txt", "exit 0", ""].join(
+        "\n",
+      ),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")("keeps the marker tree-identical to HEAD", async () => {
+    const before = g(["rev-parse", "HEAD"]);
+
+    await commitMarker(repo, "WIP anton-x1: preserved");
+
+    // One commit added, and it carries NOTHING: the hook's file is not in the marker's tree.
+    expect(g(["rev-parse", "HEAD~1"])).toBe(before);
+    expect(g(["rev-parse", "HEAD^{tree}"])).toBe(g(["rev-parse", `${before}^{tree}`]));
+    expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
+    // And it is still in the WORKING TREE, where the caller's cleanliness check reads it — a marker
+    // that swallowed it would leave a clean tree standing as proof nothing was left behind.
+    expect(g(["status", "--porcelain"])).toContain("generated.txt");
+  });
 });

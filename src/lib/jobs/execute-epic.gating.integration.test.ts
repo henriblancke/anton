@@ -200,6 +200,90 @@ process.exit(0);`),
     expect((await beads.show(repo, ticketB)).status).toBe("open");
   });
 
+  /**
+   * anton-fude — the resume a run's OWN human-review block used to make impossible. A zero-diff
+   * ticket is left `blocked` with an operator-facing note; every later attempt re-derived the same
+   * child set, walked that ticket into runTicket's hard claim gate, and died reporting a foreign
+   * claim or a locked Dolt DB — neither of which was true. It must park naming the ticket and its
+   * note, dispatch nothing, and leave the block for the person it is addressed to.
+   *
+   * Both statuses bd refuses `--claim` on for a human's reason are covered: `blocked` (anton's own
+   * verdict) and `deferred` (a person's snooze).
+   */
+  for (const held of [
+    {
+      status: "blocked" as const,
+      note: "anton: run made no changes (clean agent exit, zero diff) — nothing was delivered; needs a human.",
+      says: "blocked pending human review",
+      remedy: /--status open/,
+    },
+    { status: "deferred" as const, note: undefined, says: "is deferred", remedy: /bd undefer/ },
+  ]) {
+    it(`parks on a ${held.status} child instead of dying at its claim gate (anton-fude)`, async () => {
+      const epicH = await beads.create(repo, {
+        title: `Feature H-${held.status}`,
+        type: "epic",
+        acceptance: "work file exists",
+        description: "## Goal\nH",
+      });
+      await beads.approve(repo, epicH);
+      const stuck = createTicket(repo, { title: "Stuck ticket", parent: epicH });
+      // A sibling with nothing wrong with it: the park must hold the whole run, not narrow to it —
+      // the target ships one PR, so shipping without the held ticket would advertise a partial one.
+      const sibling = createTicket(repo, { title: "Runnable sibling", parent: epicH });
+      if (held.status === "deferred") await beads.defer(repo, stuck);
+      else execFileSync("bd", ["update", stuck, "--status", "blocked"], { cwd: repo, stdio: "ignore" });
+      if (held.note) await beads.note(repo, stuck, held.note);
+
+      // A claude that records every ticket it is dispatched for — nothing may reach it.
+      const invLog = join(sandbox, `held-${held.status}.jsonl`);
+      const loggingClaude = writeBin(
+        binDir,
+        `claude-held-${held.status}`,
+        fakeClaudeReadingStdin(`const m=prompt.match(/Ticket: (\\S+)/);
+fs.appendFileSync(${JSON.stringify(invLog)},(m?m[1]:'unknown')+'\\n');
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work\\n');
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'done',session_id:'sh',num_turns:1,is_error:false});
+process.exit(0);`),
+      );
+
+      const runner = makeEpicRunner(ctx);
+
+      process.env.ANTON_CLAUDE_BIN = loggingClaude;
+      let jobId: string;
+      try {
+        jobId = await driveEpicRun(runner, { projectId, epicBeadId: epicH });
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+      }
+
+      // Poison on the first attempt: no retry budget spent on a status only a person can change.
+      const job = await getJob(tdb.db, jobId!);
+      expect(job?.status).toBe("parked");
+      expect(job?.attempts).toBe(1);
+      expect(job?.lastError).toContain(stuck);
+      expect(job?.lastError).toMatch(held.says);
+      expect(job?.lastError).toMatch(held.remedy);
+      // The ticket's own account reaches the operator, and the misleading claim story never does.
+      if (held.note) expect(job?.lastError).toContain("zero diff");
+      expect(job?.lastError).not.toMatch(/already claimed by another operator|beads DB is locked/);
+
+      // Nothing was dispatched — not the held ticket, and not its runnable sibling.
+      const invoked = existsSync(invLog) ? readFileSync(invLog, "utf8") : "";
+      expect(invoked).toBe("");
+
+      // The block stands exactly as the person it is addressed to left it: never auto-reopened
+      // (which would re-run a zero-delivery ticket straight back into the same block) and never
+      // claimed. The sibling is untouched, so the resume after the fix still has it to run.
+      const stuckNow = await beads.show(repo, stuck);
+      expect(stuckNow.status).toBe(held.status);
+      expect(stuckNow.assignee ?? null).toBeNull();
+      expect((await beads.show(repo, sibling)).status).toBe("open");
+      expect((await beads.show(repo, epicH)).labels ?? []).not.toContain("stage:in-review");
+    });
+  }
+
   it("parks an owned epic when the runner has no operator identity (anton-i71 review)", async () => {
     // Same soft-lock as the take-over above, but the runner can't resolve an operator at all
     // (no ANTON_OPERATOR, no global git user.name) — an older queued job on an unconfigured

@@ -23,7 +23,12 @@ vi.mock("./bd", async () => {
 
 const { loadAllIssues } = await import("./issues");
 
-beforeEach(() => listMock.mockReset());
+const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+beforeEach(() => {
+  listMock.mockReset();
+  warn.mockClear();
+});
 
 const REPO = "/tmp/anton";
 
@@ -54,6 +59,39 @@ describe("loadAllIssues", () => {
     );
 
     expect((await loadAllIssues(REPO)).map((b) => b.id)).toEqual(["t-1"]);
+  });
+
+  it("says so once — degrading silently would hide the bead-count drop the ranking is built on", async () => {
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? Promise.reject(new Error("bd: database is locked")) : [target],
+    );
+
+    expect((await loadAllIssues(REPO)).map((b) => b.id)).toEqual(["t-1"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls[0]?.[0]);
+    expect(line).toContain(REPO);
+    expect(line).toContain("bd: database is locked");
+    // The drop itself: how many blockers stay unresolved, and which.
+    expect(line).toContain("1 blocker(s)");
+    expect(line).toContain("g-1");
+  });
+
+  it("stays quiet when the gate listing succeeds", async () => {
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gate] : [target],
+    );
+
+    await loadAllIssues(REPO);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("leaves the strict failure to the caller rather than logging it as degradation", async () => {
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? Promise.reject(new Error("bd: database is locked")) : [target],
+    );
+
+    await expect(loadAllIssues(REPO, { strictGates: true })).rejects.toThrow();
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("surfaces that same failure under strictGates, so a job retries instead of poisoning", async () => {

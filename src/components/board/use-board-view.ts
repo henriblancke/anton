@@ -3,7 +3,14 @@
 import { useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { STAGES, type Board, type Epic, type Stage, type StandaloneItem } from "@/lib/types";
+import {
+  STAGES,
+  type Board,
+  type Epic,
+  type Stage,
+  type StandaloneItem,
+  type UpNextAbsence,
+} from "@/lib/types";
 import {
   boardFiltersFromSearchParams,
   emptyStageMap,
@@ -37,6 +44,18 @@ export interface BoardView {
   upNextPlan: string[];
   /** The generation the picks on screen were drawn from, so a verdict names the plan it answers. */
   planId?: string;
+  /**
+   * Every bead the LIVE ranking names, whatever the grouping. In the stage view the lane's rows say
+   * this by existing; the swimlanes have no rows, so their cards are told which of them are picks
+   * (PR #226 review) — the half of "unrecorded pick" that a card cannot see for itself.
+   */
+  ranked: ReadonlySet<string>;
+  /**
+   * WHICH absence the lane is showing, when the server named one (anton-w579). Carried through
+   * untouched: the states it names are about the PASS and the board, and no filter on this screen
+   * clears any of them.
+   */
+  upNextAbsence?: UpNextAbsence;
 }
 
 /**
@@ -70,6 +89,11 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
   // so there the cards stay in Backlog, where they still appear exactly once. They are still PICKS
   // there, mark and all, so that layout carries the plan's generation itself rather than losing it
   // with the lane.
+  //
+  // In epic grouping the lane therefore never paints AT ALL — not for a frame (anton-wds3). That
+  // holds because `grouping` is the operator's own choice from the very first render: the server
+  // reads it from the cookie and hands it to `useBoardGrouping` as its server snapshot, so this
+  // never computes a lane the next commit throws away.
   const upNext = useMemo(
     () =>
       takeUpNext(columns, narrowed.standalone, grouping === "stage" ? board?.upNext : undefined),
@@ -88,6 +112,13 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
     [grouping, board],
   );
 
+  // Read off the board rather than off `upNext` above, which is empty in the epic grouping — the
+  // ranking is a fact about the project, not about the arrangement the operator is looking at.
+  const ranked = useMemo(
+    () => new Set((board?.upNext ?? []).map((entry) => entry.beadId)),
+    [board?.upNext],
+  );
+
   // The swimlanes are a regrouping of the very cards above — the sorted columns feed both views, so
   // a lane's cards carry the chosen sort and there is no second board to keep in step.
   const lanes = useMemo(
@@ -103,6 +134,8 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
     lanes,
     upNext: upNext.cards,
     upNextPlan,
+    ranked,
     ...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId }),
+    ...(board?.upNextAbsence === undefined ? {} : { upNextAbsence: board.upNextAbsence }),
   };
 }

@@ -598,7 +598,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
     const settled = settleTicketTimeout({
       run: run(abort.signal),
       ticket,
-      session: { logPath },
+      session: { logPath, sessionId: "sess-1" },
       baseline,
       progress: { committed: false, delivered: false, selfReport: null },
       timeoutMs: 60_000,
@@ -652,7 +652,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
       await settleTicketTimeout({
         run: run(),
         ticket,
-        session: { logPath },
+        session: { logPath, sessionId: "sess-1" },
         baseline,
         progress: { committed: true, delivered, selfReport: null },
         timeoutMs: 60_000,
@@ -818,7 +818,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
     const err = await settleTicketTimeout({
       run: run(),
       ticket,
-      session: { logPath },
+      session: { logPath, sessionId: "sess-1" },
       baseline,
       progress: { committed: false, delivered: false, selfReport: null },
       timeoutMs: 60_000,

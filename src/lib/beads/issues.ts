@@ -31,14 +31,22 @@ async function loadWorkIssues(cwd: string): Promise<Bead[]> {
 }
 
 /**
- * Does the listing point at a `blocks` blocker it does not itself contain? That dangling edge is
+ * The `blocks` blockers the listing points at but does not itself contain. Such a dangling edge is
  * the ONLY thing a second read can resolve, and in practice it means a gate (see
- * {@link loadGateIssues}).
+ * {@link loadGateIssues}) — so the count of them is also the bead count a failed gate read costs
+ * the board, which is what makes that failure legible in a log.
  */
-function hasDanglingBlocker(work: Bead[]): boolean {
+function danglingBlockerIds(work: Bead[]): string[] {
   const known = new Set(work.map((b) => b.id));
-  return beads.edgesOf(work).some((e) => e.type === "blocks" && !known.has(e.to));
+  const dangling = beads
+    .edgesOf(work)
+    .filter((e) => e.type === "blocks" && !known.has(e.to))
+    .map((e) => e.to);
+  return [...new Set(dangling)];
 }
+
+const preview = (ids: string[], max = 5): string =>
+  ids.length <= max ? ids.join(", ") : `${ids.slice(0, max).join(", ")}, +${ids.length - max} more`;
 
 /**
  * Gate beads, which bd OMITS from every ordinary listing (measured against bd 1.1.2: a poured
@@ -54,10 +62,22 @@ function hasDanglingBlocker(work: Bead[]): boolean {
  * Best-effort by DEFAULT (a UI read degrades to the pre-gate behaviour — gates absent ⇒ their edges
  * read as open blockers — rather than failing the whole board read), strict when the caller asks:
  * see {@link LoadIssuesOptions.strictGates}.
+ *
+ * Degrading is not the same as being silent: the degraded board is cached as the snapshot and the
+ * lane's ranking is computed from it, so a swallowed failure changes what the operator is shown
+ * with no symptom but a bead count that quietly drops. Hence the warning.
  */
-function loadGateIssues(cwd: string, strict: boolean): Promise<Bead[]> {
+function loadGateIssues(cwd: string, strict: boolean, dangling: string[]): Promise<Bead[]> {
   const gates = beads.list(cwd, ["--status", "all", "--type", "gate"]);
-  return strict ? gates : gates.catch(() => []);
+  if (strict) return gates;
+  return gates.catch((e: unknown) => {
+    console.warn(
+      `[beads.issues] ${cwd}: gate listing failed — board degraded without its gates; ` +
+        `${dangling.length} blocker(s) stay unresolved and read as open (${preview(dangling)}): ` +
+        (e instanceof Error ? e.message : String(e)),
+    );
+    return [];
+  });
 }
 
 export interface LoadIssuesOptions {
@@ -85,10 +105,11 @@ export async function loadAllIssues(
   // Dolt lock, and anton-hwkx trimmed approve down to exactly one. A board with no dangling blocker
   // has no gate that could change any answer, so it keeps paying for one read; only a board that
   // actually holds a gate edge pays for the second.
-  if (!hasDanglingBlocker(work)) return work;
+  const dangling = danglingBlockerIds(work);
+  if (dangling.length === 0) return work;
   // Deduped rather than concatenated: a future bd that starts carrying gates in the ordinary
   // listing must not double them (and a test double answering both reads alike must not either).
-  return dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false)]);
+  return dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false, dangling)]);
 }
 
 export function allIssues(
