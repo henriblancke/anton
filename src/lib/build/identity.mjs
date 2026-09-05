@@ -1121,22 +1121,32 @@ const APP_DIRECTORIES = ["app", "src/app"];
 const ROUTE_SOURCE = /\.(?:m?[jt]sx?)$/;
 
 /**
- * A colocated test, which sits in the route tree and is absent from the build (PR #217 review).
+ * Test SCAFFOLDING colocated in the route tree — a test, or the fixtures and mocks it stands on.
+ * Present in the tree, absent from the build (PR #217 review).
  *
  * Next routes on exact filenames — `page`, `route`, `layout` — so `route.test.ts` is routed by
  * nothing and no route imports it; it is compiled into no artifact. Reading it anyway is not a
- * harmless extra name, it is the failure this scan refuses the import closure to avoid: a test sets
- * up the environment it runs under, so it names the RUNTIME variables that differ per shell.
- * `route.integration.test.ts` in this checkout reads `process.env.USER`, which would move the digest
- * for every operator on the machine and run a full `next build` on an artifact that is identical.
+ * harmless extra name, it is the failure this scan refuses the import closure to avoid: scaffolding
+ * SETS UP the environment its tests run under, so it names the RUNTIME variables that differ per
+ * shell. Measured on this checkout, `route.integration.test.ts` reads `process.env.USER` and
+ * `approve.fixture.ts` assigns `process.env.ANTON_OPERATOR` — a real machine-scoped setting
+ * (`src/lib/operator.ts`) — so two operators on one machine each rebuilt an artifact identical to
+ * the other's.
  *
- * `__tests__` and `__mocks__` are skipped whole, for the same reason and to spare the walk's budget:
- * nothing under either is routed.
+ * The scaffolding is named by convention rather than by what routes it: this scan deliberately reads
+ * every OTHER module beside a route, because a page importing a colocated `config.ts` is genuinely
+ * compiled with what that file names, and narrowing to Next's routed filenames would trade this
+ * false rebuild for a stale artifact — the failure this whole surface exists to prevent. So the
+ * boundary is the naming every test runner already shares, and a production module deliberately
+ * named `*.mock.ts` would fall through it: the same miss the import closure already accepts.
  */
-const ROUTE_TEST_SOURCE = /\.(?:test|spec)\.(?:m?[jt]sx?)$/;
+const TEST_SCAFFOLD_SOURCE = /\.(?:test|spec|fixtures?|mocks?|stor(?:y|ies))\.(?:m?[jt]sx?)$/;
 
-/** Directories the route walk does not enter: dependencies, and test trees Next never routes. */
-const UNROUTED_DIRECTORIES = new Set(["node_modules", "__tests__", "__mocks__"]);
+/**
+ * Directories the route walk does not enter: dependencies, and the test trees Next never routes.
+ * Skipping them whole also spares the walk's budget, since nothing under any of them is a route.
+ */
+const UNROUTED_DIRECTORIES = new Set(["node_modules", "__tests__", "__mocks__", "__fixtures__", "__snapshots__"]);
 
 /**
  * `env` for a build environment anton could only read PART of — the route scan ran past its ceiling,
@@ -1213,7 +1223,7 @@ function walkRoutes(dir, budget, names) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (!UNROUTED_DIRECTORIES.has(entry.name)) walkRoutes(path, budget, names);
-    } else if (entry.isFile() && ROUTE_SOURCE.test(entry.name) && !ROUTE_TEST_SOURCE.test(entry.name)) {
+    } else if (entry.isFile() && ROUTE_SOURCE.test(entry.name) && !TEST_SCAFFOLD_SOURCE.test(entry.name)) {
       try {
         envNamesIn(readFileSync(path, "utf8"), names);
       } catch {}

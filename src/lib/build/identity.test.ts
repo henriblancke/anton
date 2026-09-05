@@ -1368,30 +1368,56 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).toMatch(/^[0-9a-f]{12}$/);
   });
 
-  // A colocated test sits IN the route tree and is compiled into nothing: Next routes on exact
+  // Test scaffolding sits IN the route tree and is compiled into nothing: Next routes on exact
   // filenames, so `route.test.ts` is routed by nothing and imported by no route. Reading it is the
-  // failure the import closure is refused to avoid, arriving by the front door — a test sets up the
-  // environment it runs under, so it names the runtime variables that differ per shell.
-  // `route.integration.test.ts` in this repo reads `process.env.USER`, which rebuilt an identical
-  // artifact for every operator on the machine (PR #217 review).
-  it("ignores a variable only a colocated test in the route tree reads", () => {
+  // failure the import closure is refused to avoid, arriving by the front door — scaffolding sets up
+  // the environment its tests run under, so it names the runtime variables that differ per shell.
+  // In this repo `route.integration.test.ts` reads `process.env.USER` and `approve.fixture.ts`
+  // assigns `process.env.ANTON_OPERATOR`, so two operators on one machine each rebuilt an artifact
+  // identical to the other's (PR #217 review).
+  it("ignores a variable only colocated test scaffolding in the route tree names", () => {
     const dir = app();
     const routes = join(dir, "src", "app", "api");
     mkdirSync(join(routes, "__tests__"), { recursive: true });
+    mkdirSync(join(routes, "__fixtures__"), { recursive: true });
     writeFileSync(join(routes, "route.tsx"), "export const F = process.env.BUILD_FLAVOR;\n");
     writeFileSync(join(routes, "route.test.ts"), "beforeEach(() => delete process.env.USER);\n");
     writeFileSync(join(routes, "route.integration.test.ts"), "const h = process.env.HOME;\n");
     writeFileSync(join(routes, "route.spec.tsx"), "const s = process.env.SHELL;\n");
+    writeFileSync(join(routes, "approve.fixture.ts"), "process.env.ANTON_OPERATOR = 'alice';\n");
+    writeFileSync(join(routes, "db.mocks.ts"), "const d = process.env.ANTON_DB;\n");
+    writeFileSync(join(routes, "card.stories.tsx"), "const t = process.env.TERM;\n");
     writeFileSync(join(routes, "__tests__", "helper.ts"), "const p = process.env.PATH;\n");
+    writeFileSync(join(routes, "__fixtures__", "seed.ts"), "const l = process.env.LANG;\n");
 
-    // None of those four move the digest...
-    const base = { BUILD_FLAVOR: "one", USER: "alice", HOME: "/home/alice", SHELL: "/bin/zsh", PATH: "/usr/bin" };
+    // None of that scaffolding moves the digest...
+    const base = {
+      BUILD_FLAVOR: "one", USER: "alice", HOME: "/home/alice", SHELL: "/bin/zsh", PATH: "/usr/bin",
+      ANTON_OPERATOR: "alice", ANTON_DB: "/one/anton.db", TERM: "xterm", LANG: "en_US",
+    };
     const digest = readBuildIdentity(dir, base).env;
-    for (const shell of [{ USER: "bob" }, { HOME: "/home/bob" }, { SHELL: "/bin/bash" }, { PATH: "/opt/bin" }])
+    for (const shell of [
+      { USER: "bob" }, { HOME: "/home/bob" }, { SHELL: "/bin/bash" }, { PATH: "/opt/bin" },
+      { ANTON_OPERATOR: "bob" }, { ANTON_DB: "/two/anton.db" }, { TERM: "dumb" }, { LANG: "fr_FR" },
+    ])
       expect(readBuildIdentity(dir, { ...base, ...shell }).env).toBe(digest);
 
     // ...while the real route beside them still does.
     expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(digest);
+  });
+
+  // The exclusion is scaffolding by NAME, not "everything Next does not route": a page compiles with
+  // whatever a colocated module it imports names, and narrowing to routed filenames would trade a
+  // false rebuild for a stale artifact — the failure this surface exists to prevent (PR #217 review).
+  it("still reads a variable an ordinary module beside a route names", () => {
+    const dir = app();
+    const routes = join(dir, "src", "app", "api");
+    mkdirSync(routes, { recursive: true });
+    writeFileSync(join(routes, "route.tsx"), "import { c } from './config';\nexport const F = c;\n");
+    writeFileSync(join(routes, "config.ts"), "export const c = process.env.BUILD_FLAVOR;\n");
+    expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).not.toBe(
+      readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env,
+    );
   });
 
   // The scope stops at the route tree on purpose. Most of an app's server code reads its environment
