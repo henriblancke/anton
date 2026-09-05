@@ -10,7 +10,9 @@
  *     edge is that the queue moves on to the thing that was in the way;
  *   • a prerequisite that is a ticket of THIS RUN is a scheduling correction, not a wait (anton-0gm2):
  *     the same edge is drawn, then the run re-orders itself, dispatches the prerequisite, comes back
- *     to the blocked ticket and finishes — no park, no failure, and an account on the bead;
+ *     to the blocked ticket and finishes — no park, no failure, and an account on the bead. A
+ *     prerequisite the run CARRIES but is holding behind a blocker outside it is not that case: this
+ *     attempt will never land it, so it parks exactly as an outside prerequisite does;
  *   • a prerequisite that resolves to NOTHING escalates: no edge, no stamp, today's poison park, and
  *     an account on the bead of why anton refused. The repair records ordering; it never files work.
  *
@@ -246,6 +248,62 @@ process.exit(0);`),
       expect(account).toBeDefined();
       expect(account).toContain(prereq);
       expect(account).toContain("dispatches it next");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("PARKS when the prerequisite is a ticket this run is HOLDING behind an outside blocker", async () => {
+    // The run CARRIES the prerequisite but cannot land it: a bead outside the run blocks it, so the
+    // dispatch loop holds it and this attempt will never run it. That is a genuine wait, not a
+    // scheduling correction — re-ordering around it would schedule nothing, re-dispatch the blocked
+    // ticket into the identical failure, and park the run on generic no-delivery poison instead of
+    // the blocked-by park the run-health sweep reads the blocker id back out of.
+    const outside = await seedTarget("The upstream schema nobody has landed yet");
+    const epic = await beads.create(repo, {
+      title: "The exports feature",
+      type: "epic",
+      description: "## Goal\nShip exports.\n\n## Acceptance\nIt exports.",
+    });
+    await beads.approve(repo, epic);
+    const wiring = createTicket(repo, { title: "Wire the exports page up", parent: epic });
+    const held = createTicket(repo, { title: "Add the exports schema", parent: epic });
+    await beads.link(repo, held, outside, "blocks");
+
+    // One dispatch mark per agent run — a re-order would cost a second one on the same ticket.
+    const dispatches = join(ctx.sandbox, "held-prereq-dispatches");
+    const claude = writeBin(
+      binDir,
+      "claude-heldprereq",
+      fakeClaudeReadingStdin(`const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'shp'});
+fs.appendFileSync('${dispatches}','x');
+e({type:'result',subtype:'success',result:'ANTON-RESULT: blocked — dep-missing — the schema ${held} adds has to land before this can be wired up',session_id:'shp',num_turns:1,is_error:false});
+process.exit(0);`),
+    );
+
+    const runner = makeEpicRunner(ctx);
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = claude;
+    try {
+      const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic });
+      expect(await tickToIdle(runner)).toBe(1);
+
+      // The unchanged outside-park path, blocker id and all.
+      const job = await getJob(tdb.db, jobId);
+      expect(job?.status).toBe("parked");
+      expect(job?.lastError).toContain(`is blocked by ${held}`);
+      expect(job?.lastError).toContain("anton drew that edge itself");
+      expect(await edgeExists(wiring, held)).toBe(true);
+
+      // …and it cost exactly one dispatch: nothing was re-ordered, so nothing was re-run.
+      expect(readFileSync(dispatches, "utf8")).toBe("x");
+      const parked = await beads.show(repo, wiring);
+      expect(parked.status).toBe("open");
+      const notes = parseTicketNotes(parked.notes)
+        .filter((n) => n.source === "system")
+        .map((n) => n.text);
+      expect(notes.some((t) => t.includes("re-ordered, not parked"))).toBe(false);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
     }

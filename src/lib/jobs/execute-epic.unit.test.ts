@@ -1030,6 +1030,7 @@ describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)"
       ticket: ticket("wiring"),
       remaining: [ticket("other"), ticket("schema")],
       blockerId: "schema",
+      drawn: [],
       all: board,
     });
     expect(reorder.ok).toBe(true);
@@ -1049,6 +1050,7 @@ describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)"
       ticket: ticket("wiring"),
       remaining: [ticket("schema"), ticket("migration")],
       blockerId: "schema",
+      drawn: [],
       all: board,
     });
     expect(reorder.ok).toBe(true);
@@ -1064,6 +1066,7 @@ describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)"
       ticket: ticket("wiring"),
       remaining: [ticket("other")],
       blockerId: "schema",
+      drawn: [],
       all: board,
     });
     expect(reorder.ok).toBe(true);
@@ -1082,11 +1085,66 @@ describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)"
       ticket: ticket("wiring"),
       remaining: [ticket("after"), ticket("schema")],
       blockerId: "schema",
+      drawn: [],
       all: board,
     });
     expect(reorder.ok).toBe(true);
     if (!reorder.ok) return;
     expect(ids(reorder.order)).toEqual(["schema", "wiring", "after"]);
+  });
+
+  it("honours the orderings EARLIER re-orders in the same run drew", () => {
+    // Three tickets, no edges on the board. `page` blocks naming `api`, so the run records that and
+    // re-orders. `api` then blocks naming `schema` — and THAT sort has to honour the first ordering
+    // too: forgetting it puts `page` back ahead of `api`, where it blocks on the same missing
+    // prerequisite again and the repair's one-per-bead guard parks the run on the very incident
+    // this correction exists to prevent.
+    const board = [ticket("page"), ticket("api"), ticket("schema")];
+    const first = reorderForPrereq({
+      ticket: ticket("page"),
+      remaining: [ticket("api"), ticket("schema")],
+      blockerId: "api",
+      drawn: [],
+      all: board,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(ids(first.order)).toEqual(["api", "schema", "page"]);
+
+    const second = reorderForPrereq({
+      ticket: ticket("api"),
+      remaining: [ticket("schema"), ticket("page")],
+      blockerId: "schema",
+      drawn: [{ blockerId: "api", ticketId: "page" }],
+      all: board,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(ids(second.order)).toEqual(["schema", "api", "page"]);
+  });
+
+  it("counts a carried ordering once, and ignores one nothing left can obey", () => {
+    // An edge stated twice would count twice in the in-degree and read as a cycle no edge closes,
+    // and an ordering whose prerequisite the loop has already passed constrains nothing left to sort.
+    const board = [
+      ticket("page"),
+      { ...ticket("api"), dependencies: [dep("api", "schema")] } as Bead,
+      ticket("schema"),
+    ];
+    const reorder = reorderForPrereq({
+      ticket: ticket("page"),
+      remaining: [ticket("api"), ticket("schema")],
+      blockerId: "api",
+      drawn: [
+        { blockerId: "schema", ticketId: "api" }, // already on the board
+        { blockerId: "api", ticketId: "page" }, // the very edge this re-order is drawing
+        { blockerId: "gone", ticketId: "page" }, // dispatched already — not in what is left
+      ],
+      all: board,
+    });
+    expect(reorder.ok).toBe(true);
+    if (!reorder.ok) return;
+    expect(ids(reorder.order)).toEqual(["schema", "api", "page"]);
   });
 
   it("REFUSES a cycle rather than falling through to input order", () => {
@@ -1106,6 +1164,7 @@ describe("reorderForPrereq — a prerequisite the run holds itself (anton-0gm2)"
       ticket: ticket("wiring"),
       remaining: [ticket("schema"), ticket("other")],
       blockerId: "schema",
+      drawn: [],
       all: board,
     });
     expect(reorder.ok).toBe(false);

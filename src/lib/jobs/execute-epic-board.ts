@@ -698,14 +698,27 @@ export type PrereqReorder =
   /** The new edge closes a cycle: the ids the sort could not place, in input order. */
   | { ok: false; cycle: string[] };
 
+/** An ordering a run RECORDED for itself mid-dispatch: the prerequisite, then the ticket that named it. */
+export interface PrereqEdge {
+  blockerId: string;
+  ticketId: string;
+}
+
 /**
  * Re-order what a run has LEFT to dispatch so a prerequisite the run holds ITSELF runs before the
  * ticket that named it (anton-0gm2) — the scheduling correction that replaces parking the run
  * behind its own work.
  *
- * The new edge is passed in rather than read off `all`, because it is not there: the run's board
- * snapshot predates the write the repair just made. Everything else about the graph is the snapshot's
- * ({@link dependentEdges}), so a re-order can only ever ADD the one ordering anton recorded.
+ * The run's own edges are passed in rather than read off `all`, because they are not there: the
+ * board snapshot predates every write the repair makes, and it is never refreshed mid-dispatch.
+ * Everything else about the graph is the snapshot's ({@link dependentEdges}), so a re-order can only
+ * ever ADD orderings anton actually recorded.
+ *
+ * `drawn` carries the ones from EARLIER re-orders in the same run, and carrying them is load-bearing
+ * (PR review): a second re-order that saw only its own edge would sort a graph the first one's
+ * ordering is missing from, and could dispatch a ticket ahead of the prerequisite anton already
+ * recorded for it — the same missing-prerequisite block again, which the repair's one-per-bead
+ * guard then escalates.
  *
  * `ticket` goes back LAST in the input and the prerequisite FIRST, which is the whole preference
  * this function expresses: among tickets the edges leave equally ready, the prerequisite is
@@ -724,10 +737,16 @@ export function reorderForPrereq(args: {
   remaining: Bead[];
   /** The prerequisite the repair's edge points at — one of the run's own tickets. */
   blockerId: string;
-  /** The run's board snapshot: every edge except the one the repair just drew. */
+  /**
+   * Every ordering this run drew for ITSELF before this one. Required rather than optional: an
+   * absent argument would silently claim the run has recorded nothing, which is true only of the
+   * first re-order.
+   */
+  drawn: readonly PrereqEdge[];
+  /** The run's board snapshot: every edge except the ones the repair drew during dispatch. */
   all: Bead[];
 }): PrereqReorder {
-  const { ticket, remaining, blockerId, all } = args;
+  const { ticket, remaining, blockerId, drawn, all } = args;
   const prereq = remaining.find((t) => t.id === blockerId);
   const input = [
     ...(prereq ? [prereq] : []),
@@ -735,9 +754,19 @@ export function reorderForPrereq(args: {
     ticket,
   ];
   const adj = dependentEdges(input, all);
-  // The edge the repair drew, added by hand for the reason above. Only when the prerequisite is
-  // still pending: an ordering against a ticket the loop has passed constrains nothing left to sort.
-  if (prereq) adj.get(blockerId)!.push(ticket.id);
+  const ids = new Set(input.map((t) => t.id));
+  const seen = new Set<string>();
+  for (const [from, dependents] of adj) for (const to of dependents) seen.add(`${from}→${to}`);
+  const add = (edge: PrereqEdge): void => {
+    // An ordering against a ticket the loop has already passed constrains nothing left to sort, and
+    // a duplicate would count twice in the in-degree and read as a cycle no edge actually closes.
+    if (!ids.has(edge.blockerId) || !ids.has(edge.ticketId)) return;
+    if (seen.has(`${edge.blockerId}→${edge.ticketId}`)) return;
+    seen.add(`${edge.blockerId}→${edge.ticketId}`);
+    adj.get(edge.blockerId)!.push(edge.ticketId);
+  };
+  for (const edge of drawn) add(edge);
+  add({ blockerId, ticketId: ticket.id });
   const placed = topoIds(input, adj);
   if (placed.length !== input.length) {
     const sorted = new Set(placed);

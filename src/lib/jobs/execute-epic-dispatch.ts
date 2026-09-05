@@ -23,6 +23,7 @@ import {
   reorderNote,
   skipNote,
   skippedDependents,
+  type PrereqEdge,
   type SkipCause,
 } from "./execute-epic-board";
 import {
@@ -80,13 +81,17 @@ export async function dispatchRunTickets(
   // (anton-0gm2): a ticket that blocks on a prerequisite the run holds itself is a scheduling
   // correction, and the corrected order is what the rest of this loop dispatches.
   const queue = [...dispatchable];
+  // Every ordering the run has drawn for itself so far, carried forward: each re-order must honour
+  // the ones before it, or the second forgets the first and dispatches a ticket ahead of the
+  // prerequisite anton already recorded for it.
+  const drawn: PrereqEdge[] = [];
   while (queue.length > 0) {
     const ticket = queue.shift()!;
     try {
-      await dispatchTicket(run, prep, ticket, ledger, recordSkipped);
+      await dispatchTicket(run, prep, ticket, dispatchable, ledger, recordSkipped);
     } catch (e) {
       if (!(e instanceof ReorderedOnPrereqError)) throw e;
-      queue.splice(0, queue.length, ...(await reorderAroundPrereq(run, ticket, queue, e)));
+      queue.splice(0, queue.length, ...(await reorderAroundPrereq(run, ticket, queue, e, drawn)));
     }
   }
 
@@ -119,11 +124,14 @@ async function reorderAroundPrereq(
   ticket: Bead,
   remaining: Bead[],
   blocked: ReorderedOnPrereqError,
+  /** The run's own orderings so far — read by this re-order, and extended by it. */
+  drawn: PrereqEdge[],
 ): Promise<Bead[]> {
   const { repo, targetId: epicBeadId, all } = run;
   const { blockerId } = blocked;
-  const reorder = reorderForPrereq({ ticket, remaining, blockerId, all });
+  const reorder = reorderForPrereq({ ticket, remaining, blockerId, drawn, all });
   if (!reorder.ok) throw new PrereqCycleError(ticket.id, blockerId, reorder.cycle);
+  drawn.push({ blockerId, ticketId: ticket.id });
   const account = reorderNote({ ticketId: ticket.id, blockerId, reorder });
   await appendSessionLog(blocked.logPath, `[reorder] ${account}\n`).catch(() => {});
   await safe(() => beads.note(repo, ticket.id, account));
@@ -285,11 +293,30 @@ function makeSkipRecorder(
   };
 }
 
+/**
+ * The tickets this run can still dispatch and LAND — what a `dep-missing` prerequisite is tested
+ * against (`prereqSite`), and deliberately narrower than the run's whole ticket set (PR review).
+ *
+ * A prerequisite this run is HOLDING behind a blocker outside it, or has SKIPPED behind a rolled-back
+ * timeout, is one this attempt will never run: the wait it names is genuine, so it must take the
+ * outside-park path, whose message the run-health sweep reads the blocker id back out of. Calling it
+ * a sibling would re-order the run around a ticket that cannot move, re-dispatch the blocked ticket
+ * into the identical failure, and park on generic no-delivery poison instead.
+ *
+ * A prerequisite the loop has already PASSED stays in, because it landed: that ordering is satisfied,
+ * and the blocked ticket has earned the one retry the re-order gives it.
+ */
+function landableTicketIds(dispatchable: Bead[], ledger: DispatchLedger): string[] {
+  return dispatchable.filter((t) => !ledger.skipCause.has(t.id)).map((t) => t.id);
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
   prep: Extract<RunPreparation, { done: false }>,
   ticket: Bead,
+  /** Every ticket this attempt may dispatch — membership, not order (the queue re-orders). */
+  dispatchable: Bead[],
   ledger: DispatchLedger,
   recordSkipped: (t: Bead, c: SkipCause, doneOnBoard: boolean) => Promise<void>,
 ): Promise<void> {
@@ -402,10 +429,7 @@ async function dispatchTicket(
       run: runStep,
       steps: ticketSteps,
       ticket,
-      // The whole set this run holds, not just what is left to dispatch: a prerequisite that has
-      // ALREADY run is still this run's own work, and the ordering it names is about the dispatch
-      // order, which is a property of the run rather than of where the loop has got to.
-      runTicketIds: tickets.map((t) => t.id),
+      runTicketIds: landableTicketIds(dispatchable, ledger),
       operator,
       closeOnDone: !standaloneRun,
       timeoutMs: ticketTimeoutMs,
