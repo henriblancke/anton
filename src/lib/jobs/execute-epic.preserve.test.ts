@@ -35,7 +35,8 @@ import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
 import { assertPreservedWorkFitsShape } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
-import { preserveTimedOutWork, settleTicketTimeout } from "./execute-epic-ticket";
+import { preserveTimedOutWork } from "./execute-epic-ticket-preserve";
+import { settleTicketTimeout } from "./execute-epic-ticket-settle";
 import type { Clock } from "./queue";
 import type { StepContext } from "./step-registry";
 
@@ -441,11 +442,11 @@ suite("preserveTimedOutWork (real git)", () => {
   });
 
   // The marker is EMPTY by contract, and `--allow-empty` only permits that — it does not force it
-  // (PR #228 review). A `pre-commit` hook that stages files before rejecting leaves them in the
-  // index, and the retry that bypasses the hooks would commit that unverified content under a
-  // message saying the commit is empty — while the caller's cleanliness check, reading the tree the
-  // commit just emptied, reports nothing left behind.
-  it("marks self-committed work with a commit that is EMPTY even when a hook staged files", async () => {
+  // (PR #228 review). So the marker is made with this project's hooks BYPASSED: a `pre-commit` that
+  // stages files of its own would otherwise either ride into a commit whose message says it is
+  // empty, or be left loose in the worktree the NEXT ticket commits from, under a ticket that never
+  // wrote it. Bypassed, the hook never runs and neither outcome exists.
+  it("marks self-committed work with a commit that is EMPTY, past a hook that would stage files", async () => {
     const baseline = await readWorktreeState(repo);
     write("FINISHED.md", "work the agent committed itself, against the contract\n");
     g(["add", "-A"]);
@@ -470,10 +471,43 @@ suite("preserveTimedOutWork (real git)", () => {
 
     expect(kept).toEqual({ branch: BRANCH, retained: false });
     expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
-    // The marker carries no diff, and what the hook wrote is still in the tree for the caller's own
-    // cleanliness check to halt on.
+    // The marker carries no diff, and the hook never ran — so there is no leftover in the worktree
+    // for the next ticket's `git add -A` to commit under its own name either.
     expect(out(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])).toBe("");
-    expect(out(["status", "--porcelain"])).toContain("HOOK_STAGED.md");
+    expect(out(["status", "--porcelain"])).toBe("");
+  });
+
+  // PR #228 review: a `commit-msg` hook enforcing conventional subjects (commitlint, husky) refuses
+  // anton's `WIP <id>:` one. Read as "anton could not commit the work", that refusal rolls a
+  // gate-passing tree back — the exact loss anton-d967 exists to stop, on a project where every gate
+  // passed. Retried with the hooks bypassed, since the tree has already been proven sound by the
+  // project's OWN gates and what lands is explicitly incomplete, blocked and in no pull request.
+  it("preserves a gate-passing tree past a commit-msg hook that refuses the WIP subject", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "gate-passing work a message check must not delete\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "commit-msg"), '#!/bin/sh\ngrep -q "^feat" "$1" || exit 1\n', {
+      mode: 0o755,
+    });
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    // Committed ONCE, not once per attempt: the retry runs only because the first commit never
+    // landed, and the work is in the tree it preserved.
+    expect(subjects().filter((line) => line.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
+    expect(out(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])).toBe("FINISHED.md");
+    expect(out(["status", "--porcelain"])).toBe("");
   });
 
   // "No preserved commit on the branch" is what every refusal reports as work that is gone, so a

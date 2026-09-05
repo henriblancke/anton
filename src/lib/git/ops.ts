@@ -476,18 +476,26 @@ function exitedWith(error: unknown, code: number): boolean {
  * An empty index is NOT proof that nothing was delivered: an agent that committed its own work
  * (against the base contract, but it happens) leaves exactly the same empty index. Only HEAD tells
  * the two apart — see `commitStep`, which is the caller that has to.
+ *
+ * `bypassHooks` runs the commit with this project's hooks off, and a run's ordinary commits never
+ * ask for it: hooks are the project's own gate on content, and anton has no standing to skip them.
+ * Its one caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a `commit-msg`
+ * hook refused before anything landed (PR #228 review) — a tree the project's own verify gates have
+ * already passed, on its way to a commit that is explicitly incomplete and in no pull request.
  */
 export async function commitAll(
   worktreePath: string,
   message: string,
+  options: { bypassHooks?: boolean } = {},
 ): Promise<{ committed: boolean }> {
   await git(worktreePath, ["add", "-A"]);
+  const bypass = options.bypassHooks ? ["--no-verify"] : [];
   try {
     // Exits non-zero when there ARE staged changes → there is something to commit.
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
     return { committed: false };
   } catch {
-    await gitCommit(worktreePath, ["commit", "-m", message]);
+    await gitCommit(worktreePath, ["commit", ...bypass, "-m", message]);
     return { committed: true };
   }
 }
@@ -528,40 +536,21 @@ export async function isAncestor(
  * ticket's work is already on the branch and re-runs it — onto a tree where there is nothing left
  * to do.
  *
- * `bypassHooks` is the RETRY a caller makes when the ordinary marker was REJECTED (PR #228 review):
- * a project whose `commit-msg` hook enforces its own subject convention refuses anton's, and losing
- * the marker to a message check costs a whole ticket's work its only path back to a pull request.
- * Legitimate precisely because this commit is EMPTY — there is no content for a hook to have an
- * opinion about — and never taken for a commit that carries a diff.
+ * This project's hooks are ALWAYS bypassed here (PR #228 review). The marker is EMPTY by
+ * construction, so there is no content for a `pre-commit` hook to have an opinion about and
+ * no subject a `commit-msg` hook enforcing its own convention is entitled to cost a whole ticket's
+ * work its only path back to a pull request. A hook that DID run could only do harm here: one that
+ * stages files of its own — a formatter, a generator — either ships them under a message saying the
+ * commit is empty, or leaves them loose in a worktree the NEXT ticket commits from, under a ticket
+ * that never wrote them.
  */
-export async function commitMarker(
-  worktreePath: string,
-  message: string,
-  options: { bypassHooks?: boolean } = {},
-): Promise<void> {
-  // `--allow-empty` PERMITS an empty commit; it does not FORCE one (PR #228 review). A `pre-commit`
-  // hook that stages files leaves that content in the index, and the commit would then ship it under
-  // a message saying it is empty, past a caller's cleanliness check that reads the now-clean tree as
-  // proof nothing was left behind. Pinning the index to HEAD is the first half of the answer;
-  // whatever a hook wrote stays in the working tree, where that check can still see it.
+export async function commitMarker(worktreePath: string, message: string): Promise<void> {
+  // `--allow-empty` PERMITS an empty commit; it does not FORCE one. Anything a caller happened to
+  // leave staged would ship under a message saying this commit is empty, so the index is pinned to
+  // HEAD first — the working tree is left alone, where a caller's cleanliness check can still see
+  // whatever is in it.
   await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
-  const parent = await git(worktreePath, ["rev-parse", "HEAD"]);
-  const bypass = options.bypassHooks ? ["--no-verify"] : [];
-  await gitCommit(worktreePath, ["commit", "--allow-empty", ...bypass, "-m", message]);
-  // The other half: the reset runs BEFORE the hooks do, so a `pre-commit` that stages a file and
-  // exits ZERO stages it after the pin and the commit carries it anyway (PR #228 review) — no
-  // rejection, so no `--no-verify` retry either. Verify the marker is what it claims to be, and
-  // when it is not, drop it and remake it with the hooks that wrote the content bypassed. The
-  // `--mixed` reset moves the branch back and unstages, leaving the hook's file in the working
-  // tree for the caller's cleanliness check exactly as a rejection would.
-  if ((await treeOf(worktreePath, "HEAD")) === (await treeOf(worktreePath, parent))) return;
-  await git(worktreePath, ["reset", "--quiet", "--mixed", parent]);
   await gitCommit(worktreePath, ["commit", "--allow-empty", "--no-verify", "-m", message]);
-}
-
-/** The tree a revision points at — two revisions sharing one are identical in content. */
-function treeOf(worktreePath: string, rev: string): Promise<string> {
-  return git(worktreePath, ["rev-parse", `${rev}^{tree}`]);
 }
 
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {

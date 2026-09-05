@@ -45,15 +45,14 @@ import {
 } from "./execute-epic-human-gate";
 import { mergeGatePlan } from "./execute-epic-merge-gate";
 import { reviewParkMessage } from "./execute-epic-review";
+import { assertDelivered } from "./execute-epic-ticket";
+import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
+import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
 import {
-  assertDelivered,
-  claudeResumeDecision,
-  continuationPrompt,
   ticketBlockNote,
-  ticketClaimFailure,
   timedOutTicketNote,
   type TicketProgress,
-} from "./execute-epic-ticket";
+} from "./execute-epic-ticket-settle";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { runTickets } from "../ticket-view";
 import { BUILTIN_STEPS, ticketPrompt } from "./step-registry";

@@ -1299,10 +1299,10 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
   );
 });
 
-// PR #228 review: the index pin runs BEFORE the hooks do, so a `pre-commit` that stages a file and
-// exits ZERO gets its content into the marker anyway — no rejection, so no `--no-verify` retry. A
-// marker carrying a diff is content that passed none of the preservation gates, and a resume adopts
-// it as the ticket's preserved work.
+// PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only
+// commit anton makes that may. A `pre-commit` that stages files of its own is the reason: run, it
+// either ships that content under a message saying the commit is empty, or leaves it loose in the
+// worktree the NEXT ticket commits from, under a ticket that never wrote it.
 suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", () => {
   let sandbox: string;
   let repo: string;
@@ -1322,7 +1322,7 @@ suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", (
     g(["commit", "-q", "-m", "init"]);
 
     // The formatter-shaped hook: it rewrites the tree, stages what it wrote, and lets the commit
-    // through. Nothing about it fails, which is why the rejection retry never sees it.
+    // through. Nothing about it fails — a rejection is not what makes it dangerous here.
     const hook = join(repo, ".git", "hooks", "pre-commit");
     writeFileSync(
       hook,
@@ -1338,17 +1338,37 @@ suite("commitMarker (real git · a pre-commit hook that stages and succeeds)", (
     rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
 
-  it.runIf(process.platform !== "win32")("keeps the marker tree-identical to HEAD", async () => {
-    const before = g(["rev-parse", "HEAD"]);
+  it.runIf(process.platform !== "win32")(
+    "keeps the marker tree-identical to HEAD and the worktree clean",
+    async () => {
+      const before = g(["rev-parse", "HEAD"]);
+
+      await commitMarker(repo, "WIP anton-x1: preserved");
+
+      // One commit added, and it carries NOTHING: the hook's file is not in the marker's tree.
+      expect(g(["rev-parse", "HEAD~1"])).toBe(before);
+      expect(g(["rev-parse", "HEAD^{tree}"])).toBe(g(["rev-parse", `${before}^{tree}`]));
+      expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
+      // And the hook never ran at all, so there is no leftover for the next ticket's `git add -A`
+      // to sweep up under its own name — the dirt a bypassed hook cannot make.
+      expect(g(["status", "--porcelain"])).toBe("");
+    },
+  );
+
+  // PR #228 review: a `commit-msg` hook enforcing conventional subjects would otherwise refuse
+  // anton's `WIP <id>:` marker, costing a preserved ticket's work the only thing that makes it
+  // findable — to a resume, and to the guard that keeps it out of a child ticket's pull request.
+  it.runIf(process.platform !== "win32")("lands past a commit-msg hook that rejects it", async () => {
+    const hook = join(repo, ".git", "hooks", "commit-msg");
+    writeFileSync(
+      hook,
+      ["#!/bin/sh", 'grep -q "^feat" "$1" || exit 1', "exit 0", ""].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
 
     await commitMarker(repo, "WIP anton-x1: preserved");
 
-    // One commit added, and it carries NOTHING: the hook's file is not in the marker's tree.
-    expect(g(["rev-parse", "HEAD~1"])).toBe(before);
-    expect(g(["rev-parse", "HEAD^{tree}"])).toBe(g(["rev-parse", `${before}^{tree}`]));
     expect(g(["log", "-1", "--format=%s"])).toBe("WIP anton-x1: preserved");
-    // And it is still in the WORKING TREE, where the caller's cleanliness check reads it — a marker
-    // that swallowed it would leave a clean tree standing as proof nothing was left behind.
-    expect(g(["status", "--porcelain"])).toContain("generated.txt");
   });
 });
