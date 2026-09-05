@@ -188,6 +188,12 @@ async function claimTicket(
  * that clears it. Reporting it as the foreign-claim / locked-DB case sent the operator to debug
  * beads over a ticket anton itself had blocked for human review. Everything else keeps its retry —
  * an operator's live claim and a wedged Dolt DB are both states a later attempt can find changed.
+ *
+ * `in_progress` is the one status bd words as a refusal that is NOT a decision (PR #227 review): bd
+ * says `not claimable: status in_progress` when the bead is held by SOMEBODY ELSE, and that clears
+ * the moment they finish — the same ownership conflict as `already claimed by`, which the retryable
+ * branch below is written for. Poisoning it would park a whole run permanently over a sibling run's
+ * live claim. (Our own claim never lands here at all: re-claiming as the same actor succeeds.)
  */
 export function ticketClaimFailure(
   ticketId: string,
@@ -196,7 +202,7 @@ export function ticketClaimFailure(
 ): Error {
   const cause = e instanceof Error ? e.message : String(e);
   const status = unclaimableStatus(e);
-  if (status) {
+  if (status && status !== "in_progress") {
     return new PoisonEpic(
       `refusing to execute ${ticketId}: bd will not claim it while its status is "${status}", and ` +
         `no retry can change that — the run must not dispatch an agent on a ticket it does not own. ` +

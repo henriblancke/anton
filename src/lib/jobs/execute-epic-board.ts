@@ -109,7 +109,9 @@ export function blockedRunPoison(beadId: string, readiness: RunReadiness, board:
 
 /**
  * The statuses `bd update --claim` refuses for a reason no retry and no agent can clear (anton-fude).
- * Verified against bd 1.1.2 by claiming a bead in each status: `open` is the ONLY claimable one.
+ * Verified against bd 1.1.2 by claiming a bead in each status: `open` is the only status
+ * claimable by an actor that does not already hold the bead (`in_progress` re-claims by the
+ * same actor succeed — that idempotency is what lets a resume re-claim its own ticket cleanly).
  *
  * `closed` is deliberately absent — a closed ticket is settled work the dispatch loop skips (or
  * reopens for a cross-machine resume) long before the claim — and so is `in_progress`, which is an

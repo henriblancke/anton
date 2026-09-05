@@ -84,6 +84,13 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   assertTicketsClaimable(run, gates);
   const { ticketSteps, runSteps } = await resolveRunPipeline(run);
   await takeRunLease(run, preCheckTrusted, gates);
+  // Asked AGAIN on the board the lease confirmed (PR #227 review). The gates above ran on the
+  // pre-lease read, and step 1c adopts the confirmed children in their place — so a person blocking
+  // or deferring a child inside the lease window arrives unjudged, and the run would dispatch its
+  // earlier siblings before parking at that ticket's claim gate. Re-asking here is what makes "a
+  // held child stops the run before any dispatch" hold across that window too; it is pure and reads
+  // no board, so the second call costs nothing.
+  assertTicketsClaimable(run, gates);
   run.lease.startRefresh();
   await armHumanTicketWaits(run, gates);
   const { worktree, runStep } = await warmRunWorktree(run);
@@ -248,7 +255,11 @@ function assertBeadContract(run: EpicRun, gates: RunGates): void {
   }
 }
 
-/** Step 0c-bis. Refuse a run holding a ticket whose status only a person can clear. */
+/**
+ * Step 0c-bis. Refuse a run holding a ticket whose status only a person can clear. Pure and
+ * board-free, so the caller asks it twice — once on the pre-lease read, once on the children the
+ * lease confirmed.
+ */
 function assertTicketsClaimable(run: EpicRun, gates: RunGates): void {
   // 0c-bis. A ticket in a status bd refuses `--claim` on cannot be dispatched by anyone
   // (anton-fude). The state that puts one there is anton's OWN: a zero-diff run blocks its ticket

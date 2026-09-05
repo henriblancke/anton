@@ -324,6 +324,20 @@ describe("ticketClaimFailure — why the ticket claim gate refused (anton-fude)"
     expect(error.message).toContain("alice");
   });
 
+  it("keeps it retryable for a FOREIGN in_progress claim — the holder can still release it", () => {
+    // bd words somebody else's live claim as a status refusal too (`not claimable: status
+    // in_progress`), but it is an ownership conflict, not a decision written to the board: poisoning
+    // it would park the whole run permanently over a sibling run's ticket that clears on its own.
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status in_progress"),
+    );
+
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("already claimed by another operator, or the beads DB is locked");
+  });
+
   it("keeps it for a wedged DB too — the state a later attempt may find changed", () => {
     const error = ticketClaimFailure("anton-od4", undefined, bdRefusal("Error 1105: database is locked"));
     expect(error).not.toBeInstanceOf(PoisonEpic);
