@@ -313,6 +313,40 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect(await verdictsFor(epic)).toHaveLength(0);
   });
 
+  it("records nothing for a pick the policy's age bounds have moved past", async () => {
+    // The decision input the plan's digest structurally cannot hold (PR #226 review): a pick crosses
+    // a whole-day age boundary while every hashed field sits still. The board withdraws `[Release]`
+    // for it there, and this route — reachable by a tab drawn before the crossing — has to agree, or
+    // the click starts and credits a run the current policy refuses.
+    actAs("anton-test");
+    const epic = await runTarget("Soaking pick");
+    const project = await projectId();
+    // A soak the target has not served: filed seconds ago, so it is inside `minAgeDays` — the same
+    // shape as a pick that ages out of `maxAgeDays`, and the one a fresh bead can actually reach.
+    const policy = { minAgeDays: 1 };
+    await getDb()
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ pickerAutonomy: "shadow", pickerPolicy: policy }) })
+      .where(eq(schema.projects.id, project));
+
+    try {
+      // Stamped WITH the policy, so the digest half of the fence matches exactly: age is the only
+      // thing left that can retire this plan.
+      await planFor(epic, stampBoard(await loadAllIssues(repo), Date.now(), policy));
+
+      expect((await approve(epic, { release: true })).status).toBe(200);
+      expect(await executeEpicJobs(epic)).toHaveLength(1);
+
+      expect(await verdictsFor(epic)).toHaveLength(0);
+    } finally {
+      // Shared suite db: leave the project unarmed for whatever runs next.
+      await getDb()
+        .update(schema.projects)
+        .set({ settingsJson: JSON.stringify({ pickerAutonomy: "shadow" }) })
+        .where(eq(schema.projects.id, project));
+    }
+  });
+
   it("records nothing for a pick the operator has vetoed", async () => {
     // A deferred target is off the lane until its window runs out (`upNextEntries`), so a release
     // against it answers a pick nobody was being offered — whatever the plan still ranks.

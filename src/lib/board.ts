@@ -16,6 +16,7 @@ import {
 import { issueSnapshotVersion, type SnapshotReadOptions } from "./beads/snapshot";
 import { operatorQueue } from "./operator-queue";
 import {
+  agedOutPicks,
   isPlanStale,
   latestBoardPickerPlan,
   stampBoard,
@@ -480,9 +481,11 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   const observedAtMs = Date.now();
   // Does the recorded plan still describe the decision anton would make NOW? Asked ONCE, over every
   // input to that decision — the beads and the armed policy, which stampBoard folds in together, plus
-  // the deferrals, whose expiry no digest can see (isPlanStale). So an operator narrowing
+  // the two the digest structurally cannot hold (isPlanStale): the deferrals, whose expiry it cannot
+  // see, and the age bounds, which move with the clock (agedOutPicks). So an operator narrowing
   // `pickerPolicy` without touching a bead invalidates the plan, and so does a hold running out on a
-  // target the pass set aside — or on one it picked, when no pass ran to record the exclusion.
+  // target the pass set aside — or on one it picked, when no pass ran to record the exclusion — or a
+  // pick simply growing older than the policy admits, which the derived lane has already dropped.
   //
   // What this governs is HISTORY's claim on the present: the `◈ policy` badge (flagged rather than
   // dropped) and the `[Release]` derived from it, which answers against the recorded generation. The
@@ -493,7 +496,13 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   const declined = armedPlan ? await readDeclinedPicks(project, armedPlan.planId) : undefined;
   const planIsStale =
     armedPlan !== undefined &&
-    isPlanStale(armedPlan, stampBoard(allBeads, observedAtMs, picker.policy), deferrals, declined);
+    isPlanStale(
+      armedPlan,
+      stampBoard(allBeads, observedAtMs, picker.policy),
+      deferrals,
+      declined,
+      agedOutPicks(armedPlan, allBeads, picker.policy, observedAtMs),
+    );
   // Who touched each bead and why (anton-cqxd), joined once over the whole board: the picker's
   // recorded plan and the product master's own proposals, which are ordinary beads in this snapshot.
   // A stale plan still badges — the rule a target WAS picked under does not stop being true — but

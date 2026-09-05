@@ -1791,4 +1791,68 @@ describe("a pick the board has moved past (anton-t9m4)", () => {
       { kind: "policy", detail: "any claimable run target" },
     ]);
   });
+
+  /**
+   * The move no digest can see (PR #226 review): the board, the settings and the plan row all sit
+   * still, and the pick simply grows older than `maxAgeDays`. The derived lane drops it the moment
+   * it crosses; the badge reads the recorded plan, so it has to retire with it or the card goes on
+   * offering `[Release]` for work the current policy refuses — which the approve route, validating
+   * through the same fence, would then start and record an accept for.
+   */
+  describe("a pick that has aged past the policy", () => {
+    const SOAKED = "## Goal\nShip it.\n\n## Acceptance\n- [ ] it works";
+    const dated = (createdAt: string) =>
+      makeBead({
+        id: "f-1",
+        title: "A feature",
+        issue_type: "feature",
+        created_at: createdAt,
+        // A dated bead is contract-READABLE, so it must clear the approve gate or age is never what
+        // withheld it.
+        description: SOAKED,
+      });
+
+    /** A plan a pass recorded over exactly this board AND this policy — both halves of the fence. */
+    const planUnder = (board: Bead[], policy: import("./policy/types").Policy) => ({
+      projectId: "p1",
+      planId: "plan-1",
+      generatedAt: 1_770_000_000,
+      stamp: stampBoard(board, 1_770_000_000_000, policy),
+      entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    });
+
+    it("flags the badge stale and withholds the generation once the ceiling is crossed", async () => {
+      const policy = { maxAgeDays: 30 };
+      const board = [dated("2020-01-01T00:00:00Z")];
+      listMock.mockResolvedValue(board);
+      projectSettings = { pickerPolicy: policy, pickerAutonomy: "shadow" };
+      pickerPlan = planUnder(board, policy);
+
+      const served = await getBoard(project);
+      expect(served.columns.backlog[0]?.provenance).toEqual([
+        { kind: "policy", detail: "any claimable run target", stale: true },
+      ]);
+      // The live decision refuses it too, so the lane says the board holds nothing claimable rather
+      // than ranking a target the badge beside it has just retired.
+      expect(served.upNext).toBeUndefined();
+      expect(served.upNextAbsence).toBe("no-claimable-work");
+      expect(served.upNextPlanId).toBeUndefined();
+    });
+
+    it("leaves the mark and the generation alone while the pick is inside the ceiling", async () => {
+      const policy = { maxAgeDays: 30 };
+      const board = [dated(new Date(Date.now() - 5 * 86_400_000).toISOString())];
+      listMock.mockResolvedValue(board);
+      projectSettings = { pickerPolicy: policy, pickerAutonomy: "shadow" };
+      pickerPlan = planUnder(board, policy);
+
+      const served = await getBoard(project);
+      expect(served.columns.backlog[0]?.provenance).toEqual([
+        { kind: "policy", ref: "age", detail: "any claimable run target" },
+      ]);
+      expect(served.upNext?.map((e) => e.beadId)).toEqual(["f-1"]);
+      expect(served.upNextPlanId).toBe("plan-1");
+    });
+  });
 });

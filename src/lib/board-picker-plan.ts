@@ -23,6 +23,7 @@ import { eq } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
+import { ageBoundBreached, ageInDays } from "./policy/age";
 import { policyDigest } from "./policy/digest";
 import type { Policy } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -147,8 +148,8 @@ function contractDigest(bead: Bead): string {
  * rather than as its text.
  *
  * Age is the one ranking input absent here, and necessarily: it is a function of wall-clock time,
- * so it changes every second and no digest can hold it. Age drift is handled by the pass's cadence,
- * not by the fence.
+ * so it changes every second and no digest can hold it. It is re-judged instead of hashed —
+ * {@link agedOutPicks}, which the fence reads beside this digest.
  */
 function digestLine(bead: Bead): string {
   const labels = [...(bead.labels ?? [])].sort().join(",");
@@ -193,6 +194,43 @@ export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy)
 }
 
 /**
+ * Recorded picks the policy's age bounds have since moved past — the decision input {@link digestLine}
+ * cannot carry (PR #226 review).
+ *
+ * A policy stating `minAgeDays`/`maxAgeDays` admits on WHOLE DAYS elapsed since a bead was filed, so
+ * a pick crosses out of the policy while every hashed input sits still. The board read already drops
+ * it from Up Next — that lane is derived live — but the `◈ policy` badge and the `[Release]` derived
+ * from it read the recorded PLAN, and the approve route validates a release through the same fence.
+ * Blind to age, the card would go on offering a start the current policy refuses, and clicking it
+ * would record an accept and launch the run.
+ *
+ * Only the age bounds are re-judged, never the whole policy: every other criterion reads bead fields
+ * the digest already covers, and a second evaluation of them here would be a second answer to a
+ * question the stamp has settled.
+ *
+ * An entry whose bead has left the snapshot is skipped — a bead gone from the board moves the digest,
+ * which is the stronger verdict and already the one that fires.
+ */
+export function agedOutPicks(
+  plan: BoardPickerPlan,
+  board: readonly Bead[],
+  policy: Policy | undefined,
+  nowMs: number,
+): ReadonlySet<string> {
+  const out = new Set<string>();
+  if (policy?.minAgeDays === undefined && policy?.maxAgeDays === undefined) return out;
+
+  const now = new Date(nowMs);
+  const byId = new Map(board.map((bead) => [bead.id, bead]));
+  for (const entry of plan.entries) {
+    const bead = byId.get(entry.beadId);
+    if (!bead) continue;
+    if (ageBoundBreached(ageInDays(bead.created_at, now), policy)) out.add(entry.beadId);
+  }
+  return out;
+}
+
+/**
  * Is the recorded plan still about the board as it now reads?
  *
  * Compares the snapshot, never the age: a plan computed an hour ago against a board nobody has
@@ -216,14 +254,21 @@ export function stampBoard(board: Bead[], observedAtMs: number, policy?: Policy)
  * evidence, skewing the track record earned autonomy reads. So a decline recorded against THIS
  * generation retires it as soon as the hold it placed runs out, whether or not a pass observed the
  * veto. While the hold is live nothing changes: the lane still subtracts that one card.
+ *
+ * `agedOut` is the fourth, and the one the digest structurally cannot hold ({@link agedOutPicks}):
+ * a pick the policy's age bounds have moved past. Retiring the WHOLE generation over one such entry
+ * matches the deferral rule above and is the honest reading — the ranking those bounds produced is
+ * not the ranking they would produce now — and the next pass rewrites it within its cadence.
  */
 export function isPlanStale(
   plan: BoardPickerPlan,
   current: BoardStamp,
   deferrals?: ReadonlyMap<string, number>,
   declined?: ReadonlySet<string>,
+  agedOut?: ReadonlySet<string>,
 ): boolean {
   if (plan.stamp.digest !== current.digest) return true;
+  if (plan.entries.some((e) => agedOut?.has(e.beadId))) return true;
   const lapsed = (beadId: string) => !deferrals?.has(beadId);
   if (plan.exclusions.some((x) => x.reason === "deferred" && lapsed(x.beadId))) return true;
   return plan.entries.some((e) => declined?.has(e.beadId) && lapsed(e.beadId));

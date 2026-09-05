@@ -24,6 +24,7 @@
  * for the same reason, until the operator ranks it themselves and states a bound against THEIR
  * ranking — the one ordering in this module, and it arrives from the policy, never from the board.
  */
+import { ageBoundBreached } from "./age";
 import {
   namespaceOf,
   valueOf,
@@ -204,23 +205,24 @@ export function explainPolicyMatch(candidate: PolicyCandidate, policy: Policy): 
     }
   }
 
-  const ageBounded = typeof policy.minAgeDays === "number" || typeof policy.maxAgeDays === "number";
-  if (ageBounded) {
-    if (typeof candidate.ageDays !== "number") {
-      failed.push({ criterion: "age", label: "age", reason: "carries no creation date" });
-    } else if (typeof policy.minAgeDays === "number" && candidate.ageDays < policy.minAgeDays) {
-      failed.push({
-        criterion: "age",
-        label: "age",
-        reason: `was filed ${days(candidate.ageDays)} ago, inside the ${days(policy.minAgeDays)} the policy waits before starting anything`,
-      });
-    } else if (typeof policy.maxAgeDays === "number" && candidate.ageDays > policy.maxAgeDays) {
-      failed.push({
-        criterion: "age",
-        label: "age",
-        reason: `was filed ${days(candidate.ageDays)} ago, past the ${days(policy.maxAgeDays)} the policy admits`,
-      });
-    }
+  // Through the shared bound, never a second comparison: the recorded plan's fence re-judges this
+  // same criterion off the clock (`board-picker-plan.ts`), and a card may not be explained by one
+  // rounding of "a day" and released under another.
+  const aged = ageBoundBreached(candidate.ageDays, policy);
+  if (aged?.bound === "unknown") {
+    failed.push({ criterion: "age", label: "age", reason: "carries no creation date" });
+  } else if (aged?.bound === "min") {
+    failed.push({
+      criterion: "age",
+      label: "age",
+      reason: `was filed ${days(aged.ageDays)} ago, inside the ${days(aged.limit)} the policy waits before starting anything`,
+    });
+  } else if (aged?.bound === "max") {
+    failed.push({
+      criterion: "age",
+      label: "age",
+      reason: `was filed ${days(aged.ageDays)} ago, past the ${days(aged.limit)} the policy admits`,
+    });
   }
 
   for (const criterion of policy.labels ?? []) {
