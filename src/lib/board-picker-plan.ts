@@ -25,7 +25,7 @@ import { contractStatusOf } from "./beads/contract";
 import type { Bead } from "./beads/types";
 import { ageBoundBreached, ageInDays } from "./policy/age";
 import { policyDigest } from "./policy/digest";
-import type { Policy } from "./policy/types";
+import { namespaceOf, type Policy } from "./policy/types";
 import type { AntonDb, Clock } from "./jobs/queue";
 
 /**
@@ -136,9 +136,43 @@ function contractDigest(bead: Bead): string {
     .join(",");
 }
 
+/** Can a move in this input change which targets the pass picks, or the order it picks them in? */
+export type DecisionRelevance = "decision-relevant" | "not-decision-relevant";
+
 /**
- * The projection of a bead the digest covers: exactly the inputs eligibility and the PRIME ranking
- * read, and nothing else.
+ * WHOSE copy of the field the decision reads — the distinction a narrowing of this fence lives or
+ * dies on (anton-gsny).
+ *
+ *   • `candidate` — read only off a bead that could itself be picked: the policy predicate and the
+ *     comparator see the admitted set and nothing else.
+ *   • `board`     — read off beads that are NOT candidates. The transitive `blocks` walk
+ *     (`beads/rank.ts`) counts what finishing a target releases, and it traverses the whole
+ *     snapshot: a closed bead three hops downstream changes a pick's `unblocks` and can reorder the
+ *     queue. Card attribution, the container-epic test and the contract gate reach off-candidate
+ *     beads the same way.
+ *
+ * So a fence narrowed to "the beads this plan picked" would be wrong, not merely tighter — most of
+ * the ranking's second term is computed from beads no policy would ever admit. The narrowing that
+ * IS available is per-FIELD (and, inside {@link DIGEST_LABEL_NAMESPACES}, per-namespace), never per
+ * bead.
+ */
+export type DecisionScope = "candidate" | "board";
+
+/** One column of {@link digestLine}, classified, with the read that makes the classification true. */
+export interface DigestField {
+  /** The bead field, named as this module writes it. */
+  field: string;
+  relevance: DecisionRelevance;
+  scope: DecisionScope;
+  /** One line: which read makes it so. */
+  why: string;
+  /** How the column is written. The table IS the line, so a column cannot be added unclassified. */
+  read: (bead: Bead) => string;
+}
+
+/**
+ * The projection of a bead the digest covers — exactly the inputs eligibility and the PRIME ranking
+ * read — and the ARGUMENT for each one (anton-gsny).
  *
  * Deliberately NOT the bead's raw prose or its `updated_at` stamp. A digest over "was this bead
  * written at all" would mark every plan stale the moment somebody fixed a typo in a description, on
@@ -147,34 +181,184 @@ function contractDigest(bead: Bead): string {
  * whatever the description says about the contract, which enters as {@link contractDigest}'s verdict
  * rather than as its text.
  *
+ * The classification is a TABLE rather than a comment because it has to stay true: {@link digestLine}
+ * hashes the entries this table calls decision-relevant and nothing else, so a column added without
+ * a stated verdict does not compile, and a verdict is a change to the fence rather than a note about
+ * it. Every field here comes back decision-relevant, and that is the honest reading of the code as
+ * it stands — the narrowing lives one level down, in {@link DIGEST_LABEL_NAMESPACES}, where
+ * anton's own bookkeeping namespaces churn inside the `labels` column without any of the decision's
+ * readers ever consulting them.
+ *
+ * Fail CLOSED, in both directions: an input nobody could classify stays in the fence, and a field
+ * whose reader is merely unlikely — not provably absent — is decision-relevant. The cost of keeping
+ * one is a plan retired early and rewritten by the next pass; the cost of dropping one is a
+ * `[Release]` offering a start the board no longer supports.
+ *
  * Age is the one ranking input absent here, and necessarily: it is a function of wall-clock time,
  * so it changes every second and no digest can hold it. It is re-judged instead of hashed —
  * {@link agedOutPicks}, which the fence reads beside this digest.
  */
-function digestLine(bead: Bead): string {
-  const labels = [...(bead.labels ?? [])].sort().join(",");
-  const deps = (bead.dependencies ?? [])
-    .map((d) => `${d.type}:${d.issue_id}>${d.depends_on_id}`)
-    .sort()
-    .join(",");
-  return [
-    bead.id,
-    bead.status,
-    bead.issue_type ?? "",
-    bead.priority ?? "",
-    bead.assignee ?? "",
-    bead.parent ?? bead.parent_id ?? "",
-    bead.created_at ?? "",
-    labels,
-    deps,
-    contractDigest(bead),
-  ].join("\t");
+export const DIGEST_FIELDS: readonly DigestField[] = [
+  {
+    field: "id",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "the `blocks` walk's node key and the comparator's final tiebreak, so a bead's identity decides both what it releases and where it sits among equals",
+    read: (b) => b.id,
+  },
+  {
+    field: "status",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "eligibility admits `open` alone, and the walk reads EVERY bead's status to decide what still waits, which blockers still grip, and where the chain halts",
+    read: (b) => b.status,
+  },
+  {
+    field: "issue_type",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "run-target identity is read off a bead and its children (a feature child turns an epic into a container), the tier gate reads it over the subtree, and the policy's `types` criterion admits on it",
+    read: (b) => b.issue_type ?? "",
+  },
+  {
+    field: "priority",
+    relevance: "decision-relevant",
+    scope: "candidate",
+    why: "the comparator's first term and the policy's min/maxPriority bound — nothing reads it off a bead that could not be picked",
+    read: (b) => String(b.priority ?? ""),
+  },
+  {
+    field: "assignee",
+    relevance: "decision-relevant",
+    scope: "candidate",
+    why: "a held claim is the `claimed` exclusion, and a claim a human took is never taken back",
+    read: (b) => b.assignee ?? "",
+  },
+  {
+    field: "parent",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "card attribution walks the whole parent chain, so a re-parent anywhere moves container-ness, the ticket set a run would dispatch, and the policy's parentage depth",
+    read: (b) => b.parent ?? b.parent_id ?? "",
+  },
+  {
+    field: "created_at",
+    relevance: "decision-relevant",
+    scope: "candidate",
+    why: "the age tiebreak between equally urgent picks, and the field the policy's age bounds judge — the bounds themselves move with the clock, which is what {@link agedOutPicks} re-judges",
+    read: (b) => b.created_at ?? "",
+  },
+  {
+    field: "labels",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "`abandoned` and `agent:human` refuse a target outright, `stage:in-review` changes which beads the contract gate even reads, and the operator's criteria are written over the board's own namespaces — narrowed per namespace in {@link DIGEST_LABEL_NAMESPACES}",
+    read: (b) => [...(b.labels ?? [])].filter(isDecisionRelevantLabel).sort().join(","),
+  },
+  {
+    field: "dependencies",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "`blocks` edges are the whole input to the transitive unblocking walk and to the blocker rollup; parent-child edges carry the parentage the card attribution reads",
+    read: (b) =>
+      (b.dependencies ?? [])
+        .map((d) => `${d.type}:${d.issue_id}>${d.depends_on_id}`)
+        .sort()
+        .join(","),
+  },
+  {
+    field: "contract",
+    relevance: "decision-relevant",
+    scope: "board",
+    why: "the approve gate judges the target AND every ticket the run would dispatch, so a child's cleared Acceptance disqualifies a card that is not itself the edited bead",
+    read: contractDigest,
+  },
+];
+
+/** One `ns:` group inside the `labels` column, classified on its own — see {@link DIGEST_FIELDS}. */
+export interface DigestLabelNamespace {
+  /** The `ns` of a `ns:value` label, as the board writes it — `"stage"`, not `"stage:"`. */
+  namespace: string;
+  relevance: DecisionRelevance;
+  why: string;
 }
 
 /**
- * Stamp the inputs one decision was made from. Order-independent — the lines are sorted before
- * hashing — because two reads of an unchanged board may return the beads in any order, and a stamp
- * that disagreed with itself over that would report every plan stale.
+ * The `labels` column, argued per namespace — where this epic's narrowing actually is (anton-gsny).
+ *
+ * anton writes four namespaces of its own bookkeeping (`POLICY_CONTROL_NAMESPACES`), and the store
+ * REFUSES a policy criterion over any of them (`projects.ts`), so no operator rule can be reading
+ * one. Three of the four are read by nothing in the decision either — they describe anton's runs,
+ * not what is worth starting — and one is, which is the finding worth writing down: `stage:` looks
+ * like pure bookkeeping and is not.
+ *
+ * Everything else on a board is decision-relevant by DEFAULT, which is the fail-closed half of
+ * {@link isDecisionRelevantLabel}: a repo invents its own vocabulary, an operator's criteria are
+ * written over exactly that vocabulary, and a namespace nobody has classified is one nobody has
+ * proved unread.
+ */
+export const DIGEST_LABEL_NAMESPACES: readonly DigestLabelNamespace[] = [
+  {
+    namespace: "stage",
+    relevance: "decision-relevant",
+    why: "`stage:in-review` makes `contractGatedBeads` skip a standalone target, so it can flip that target from `approval-gap` to eligible — anton writes this one, but eligibility reads it back",
+  },
+  {
+    namespace: "run-lease",
+    relevance: "not-decision-relevant",
+    why: "a heartbeat expiry rewritten every few seconds mid-run; eligibility, the policy and the walk all ignore it, the run it marks is already `claimed` and `in_progress` to this fence, and a race against a foreign lease is arbitrated by the claim protocol, not here",
+  },
+  {
+    namespace: "review-score",
+    relevance: "not-decision-relevant",
+    why: "anton's verdict on a finished run — read by the UI and by the score-slide breaker, which the apply path re-asks live (`picker-apply-checks`), never by eligibility, the policy or the ranking",
+  },
+  {
+    namespace: "source",
+    relevance: "not-decision-relevant",
+    why: "provenance for a bead anton's own automation filed; read only by the board's card projection (`ticket-view`), which no part of the decision consults",
+  },
+];
+
+const IRRELEVANT_NAMESPACES: ReadonlySet<string> = new Set(
+  DIGEST_LABEL_NAMESPACES.filter((n) => n.relevance === "not-decision-relevant").map(
+    (n) => n.namespace,
+  ),
+);
+
+/**
+ * Is this label one the fence must carry? True unless its namespace is classified
+ * `not-decision-relevant` above — an unknown namespace, and every bare label, stays in.
+ *
+ * The narrowing's fail-closed rule, stated once here and applied by the `labels` column of
+ * {@link DIGEST_FIELDS}, so the rule and the argument that justifies it cannot drift apart.
+ */
+export function isDecisionRelevantLabel(label: string): boolean {
+  return !IRRELEVANT_NAMESPACES.has(namespaceOf(label));
+}
+
+/**
+ * The columns the fence actually hashes. Derived from the table rather than restated, so a field
+ * reclassified `not-decision-relevant` leaves the digest by that edit alone.
+ */
+const FENCED_FIELDS: readonly DigestField[] = DIGEST_FIELDS.filter(
+  (f) => f.relevance === "decision-relevant",
+);
+
+/** The classified projection, written in column order — the decision-relevant columns, and only
+ *  those. */
+function digestLine(bead: Bead): string {
+  return FENCED_FIELDS.map((f) => f.read(bead)).join("\t");
+}
+
+/**
+ * Stamp the inputs one decision was made from — the classified ones ({@link DIGEST_FIELDS}) and no
+ * others, so a `run-lease:` heartbeat rewritten mid-run leaves the ranking's fence exactly where it
+ * was.
+ *
+ * Order-independent — the lines are sorted before hashing — because two reads of an unchanged board
+ * may return the beads in any order, and a stamp that disagreed with itself over that would report
+ * every plan stale.
  *
  * The armed POLICY is hashed alongside the beads (anton-t9m4 review): admission is a function of
  * both, so an operator who narrows `pickerPolicy` without touching a bead has invalidated the plan
