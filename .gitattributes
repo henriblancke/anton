@@ -1,0 +1,31 @@
+# Source stays diffable (anton-flih).
+#
+# `diff` forces git to render a patch for these globs instead of falling back to
+# `Binary files differ` when it finds a stray control byte. Every reviewer here — human, Codex,
+# Claude, anton's own pre-PR review — reads diffs, so a file git calls binary is a file nobody
+# reviews; that is how a bug reached main in epic-graph.ts (anton-74f8).
+#
+# `text` is deliberately NOT set. It would also switch on end-of-line normalisation: a no-op today
+# and a surprise for a Windows checkout later. Diffability is what this buys; nothing else.
+#
+# The `Binary files differ` alarm this retires is replaced, not deleted, by the `control-bytes` CI
+# gate — `bun run check:control-bytes` (src/lib/control-bytes.ts). Keep the globs below in step with
+# SOURCE_EXTENSIONS there; control-bytes.test.ts fails when they drift.
+#
+# See .product/decisions/2026-09-05-source-diffability.md.
+
+*.cjs   diff
+*.css   diff
+*.html  diff
+*.js    diff
+*.json  diff
+*.md    diff
+*.mjs   diff
+*.sh    diff
+*.sql   diff
+*.svg   diff
+*.toml  diff
+*.ts    diff
+*.tsx   diff
+*.yaml  diff
+*.yml   diff

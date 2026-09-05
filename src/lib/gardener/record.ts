@@ -230,7 +230,9 @@ export function readPassRecords(log: string): PassRecordSummary {
       records.push(record);
       continue;
     }
-    const key = `${producer} ${proposal}`;
+    // JSON, not a NUL separator: a literal control byte makes git classify the whole module
+    // binary, and a module nobody can diff is a module nobody reviews (anton-74f8/anton-flih).
+    const key = JSON.stringify([producer, proposal]);
     const at = applies.get(key);
     if (at !== undefined) records[at] = record;
     else {
