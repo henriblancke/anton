@@ -1000,13 +1000,25 @@ export async function preserveTimedOutWork(args: {
   // it: the rollback a refusal asks for restores the baseline, which on a resume that started from
   // that commit still contains it.
   let retainedOn: string | null = null;
+  // …and the third answer that read can give (PR #228 review): the history could not be READ at all.
+  // Absence is what every refusal below reports as "nothing of this ticket is on the branch", so a
+  // `git log` that failed may not decay into it — the operator would be told a resume starts over on
+  // a branch that may still carry a previous attempt's commit. It cannot be asserted either, since a
+  // claimed retention is what suppresses the marker a resume reads, so the doubt is what travels.
+  let retainedUnreadable = false;
+  const unreadableCaveat = (): string =>
+    retainedUnreadable
+      ? `; anton could not read \`${branch}\`'s history, so work a previous attempt preserved may ` +
+        `still be on it`
+      : ``;
   const rollBack = async (why: string): Promise<PreservedWork> => {
+    const rolledBackWhy = why + unreadableCaveat();
     await logPreserve(
       logPath,
-      `rolling back — ${why}` +
+      `rolling back — ${rolledBackWhy}` +
         (retainedOn ? ` (a previous attempt's work stays on ${retainedOn})` : ``),
     );
-    return { rolledBackWhy: why, retainedOn };
+    return { rolledBackWhy, retainedOn };
   };
   const now = await readWorktreeState(worktreePath).catch(() => null);
   // "Nothing kept" is a verdict on THIS attempt, never on the branch (PR #228 review). A resume that
@@ -1021,12 +1033,17 @@ export async function preserveTimedOutWork(args: {
   // be true of (PR #228 review): a resume that adopted a previous attempt's preserved commit and had
   // the delivery gate REFUSE it leaves that work exactly where it was, and an exit reporting no
   // preserved branch tells the park the next resume starts over — when it continues from the commit.
-  if (
-    now &&
-    now.ref === `refs/heads/${branch}` &&
-    (await worktreeHasPreservedCommitFor(worktreePath, ticket.id))
-  ) {
-    retainedOn = branch;
+  //
+  // Read STRICTLY (PR #228 review): the non-strict read fails closed to "absent", which is this
+  // caller's UNSAFE answer — a transient `git log` failure would be reported as proof that no
+  // retained work exists, and the note and park built on it would send the next resume off to redo
+  // work the rollback leaves untouched on the branch.
+  if (now && now.ref === `refs/heads/${branch}`) {
+    const preserved = await worktreeHasPreservedCommitFor(worktreePath, ticket.id, { strict: true })
+      .then((yes) => (yes ? "yes" : "no"))
+      .catch(() => "unreadable");
+    if (preserved === "yes") retainedOn = branch;
+    retainedUnreadable = preserved === "unreadable";
   }
   if (committed) return { rolledBackWhy: "its work was already committed", retainedOn };
   if (!baseline) {
@@ -1043,7 +1060,7 @@ export async function preserveTimedOutWork(args: {
       );
       return { branch: retainedOn, retained: true };
     }
-    return { rolledBackWhy: "it left nothing in the worktree", retainedOn };
+    return { rolledBackWhy: `it left nothing in the worktree` + unreadableCaveat(), retainedOn };
   }
   if (!standalone) {
     return rollBack(
@@ -1131,20 +1148,38 @@ export async function preserveTimedOutWork(args: {
     return { jobAborted: true };
   }
   if (!kept.committed) {
+    // Neither an empty index NOR a rejected commit is proof that nothing was committed (PR #228
+    // review), so HEAD decides before any refusal does — a rollback here hard-resets the branch, and
+    // whatever is past the baseline goes with it.
+    //
+    // The empty index is the agent having committed its own work, which is exactly what
+    // `step:commit` adopts rather than refuses. The rejection is `post-commit`: githooks(5) runs it
+    // AFTER the commit is made, explicitly unable to affect the outcome, so a hook that outlives the
+    // commit budget rejects a call whose commit is already on the branch — and rolling that back
+    // deletes the very work this path had just finished saving.
+    const after = "error" in kept ? await readWorktreeState(worktreePath).catch(() => null) : now;
+    if (after && (await movedForwardOnBranch(worktreePath, baseline, after, branch))) {
+      return adoptSelfCommittedWork({
+        worktreePath,
+        branch,
+        ticket,
+        timeoutMs,
+        logPath,
+        why:
+          "error" in kept
+            ? `git rejected this ticket's preserved commit after it had already landed`
+            : `the agent committed this ticket's work itself`,
+        // A landed-but-rejected commit is anton's OWN, so it already carries the `WIP <id>:` subject
+        // a resume reads and needs no marker. An unmarked forward HEAD is the agent's work and does.
+        alreadyMarked:
+          retainedOn !== null ||
+          ("error" in kept && (await worktreeHasPreservedCommitFor(worktreePath, ticket.id))),
+      });
+    }
     if ("error" in kept) {
       return rollBack(
         `anton could not commit the work (${kept.error instanceof Error ? kept.error.message : String(kept.error)})`,
       );
-    }
-    // An empty index is not proof the ticket wrote nothing (PR #228 review). HEAD moved — and the
-    // checks above already proved it moved FORWARD on the run's branch — so the agent committed its
-    // own work, which is exactly what `step:commit` adopts rather than refuses. Rolling back here
-    // would hard-reset that commit off the branch: the deletion of finished work this whole path
-    // exists to stop, arriving through the one door that looks like an empty tree.
-    if (now.head !== baseline.head) {
-      return adoptSelfCommittedWork({
-        worktreePath, branch, ticket, timeoutMs, logPath, alreadyMarked: retainedOn !== null,
-      });
     }
     return rollBack(`there was nothing for git to commit`);
   }
@@ -1157,6 +1192,11 @@ export async function preserveTimedOutWork(args: {
  * record it (PR #228 review). Against the operating contract, but it happens — and `step:commit`
  * treats it as delivery for the same reason this must treat it as preserved: the commits are real,
  * they are on the run's branch, and here they have just passed the project's verify gates.
+ *
+ * The other way in is anton's OWN preserved commit landing under a `git commit` that then failed —
+ * a `post-commit` hook outliving the commit budget (PR #228 review). Same fact, same handling: the
+ * branch moved forward and what is past the baseline may not be reset away. That commit already
+ * carries its `WIP` subject, so it arrives `alreadyMarked` and only the log line differs.
  *
  * The marker is what keeps that work FINDABLE, and it is the ONLY thing that does: both readers of
  * preserved work — `step:commit`, which turns a resume's zero diff into the delivery it already
@@ -1179,10 +1219,12 @@ async function adoptSelfCommittedWork(args: {
   ticket: Bead;
   timeoutMs: number;
   logPath: string;
+  /** How the commits on this branch came to be there, for the operator reading the log. */
+  why: string;
   /** A previous attempt's marker is already on the branch; one is all a resume needs. */
   alreadyMarked: boolean;
 }): Promise<PreservedWork> {
-  const { worktreePath, branch, ticket, timeoutMs, logPath, alreadyMarked } = args;
+  const { worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
   const marked =
     alreadyMarked ||
@@ -1191,17 +1233,28 @@ async function adoptSelfCommittedWork(args: {
   if (!marked) {
     await logPreserve(
       logPath,
-      `the agent committed this ticket's work itself — KEPT on ${branch}, but anton could not ` +
-        `record the marker a resume reads, even with this project's hooks bypassed: stopping for ` +
-        `a person rather than reporting work no resume can see as preserved`,
+      `${why} — KEPT on ${branch}, but anton could not record the marker a resume reads, even ` +
+        `with this project's hooks bypassed: stopping for a person rather than reporting work no ` +
+        `resume can see as preserved`,
     );
     return { unmarkedOn: branch };
   }
-  await logPreserve(
-    logPath,
-    `the agent committed this ticket's work itself — KEPT on ${branch} rather than rolled back`,
-  );
+  await logPreserve(logPath, `${why} — KEPT on ${branch} rather than rolled back`);
   return { branch, retained: false };
+}
+
+/**
+ * Whether the branch ADDED commits since the ticket started — the state `step:commit` adopts as
+ * delivery, and the one thing that tells a commit anton made from one it never got to make.
+ */
+async function movedForwardOnBranch(
+  worktreePath: string,
+  baseline: WorktreeState,
+  now: WorktreeState,
+  branch: string,
+): Promise<boolean> {
+  if (now.head === baseline.head || now.ref !== `refs/heads/${branch}`) return false;
+  return stillContains(worktreePath, baseline, now);
 }
 
 /** Whether the branch still CONTAINS where the ticket started — no reset, amend or rebase. */

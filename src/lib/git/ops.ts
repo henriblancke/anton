@@ -539,6 +539,14 @@ export async function commitMarker(
   message: string,
   options: { bypassHooks?: boolean } = {},
 ): Promise<void> {
+  // `--allow-empty` PERMITS an empty commit; it does not FORCE one (PR #228 review). A `pre-commit`
+  // hook that stages files before rejecting leaves that content in the index, and the `--no-verify`
+  // retry — which bypasses the very hooks that would have inspected it — would then ship it inside a
+  // commit whose message says it is empty, past a caller's cleanliness check that reads the now-clean
+  // tree as proof nothing was left behind. Pinning the index to HEAD first makes this commit's tree
+  // identical to HEAD by construction; whatever a hook wrote stays in the working tree, where that
+  // check can still see it.
+  await git(worktreePath, ["reset", "--quiet", "--mixed", "HEAD"]);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
   await gitCommit(worktreePath, ["commit", "--allow-empty", ...bypass, "-m", message]);
 }

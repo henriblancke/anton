@@ -29,7 +29,7 @@ import { makeTestDb, type TestDb } from "../db/testing";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import type { Worktree } from "../git/worktree";
 import type { ProjectSettings } from "../projects";
-import { readWorktreeState } from "../git/ops";
+import { COMMIT_TIMEOUT_ENV, readWorktreeState } from "../git/ops";
 import { isPoisonError } from "./errors";
 import { TicketTimeoutError } from "./execute-epic-errors";
 import { outOfTimeParkMessage } from "./execute-epic-dispatch";
@@ -116,6 +116,7 @@ suite("preserveTimedOutWork (real git)", () => {
   });
 
   afterEach(() => {
+    delete process.env[COMMIT_TIMEOUT_ENV];
     tdb.close();
     rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
   });
@@ -406,6 +407,108 @@ suite("preserveTimedOutWork (real git)", () => {
       retainedOn: null,
     });
     expect(head()).toBe(baseline.head);
+  });
+
+  // The commit that LANDED under a call git then rejected (PR #228 review). `post-commit` runs after
+  // the commit is made — githooks(5) is explicit that it cannot affect the outcome — so a hook that
+  // outlives the commit budget fails a `git commit` whose commit is already on the branch. Read as
+  // "nothing was committed", the rollback hard-resets to the baseline and deletes the preserved
+  // commit this path had just finished making: the exact loss it exists to prevent.
+  it("keeps a preserved commit that landed under a git commit the hooks then failed", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("HALF_WRITTEN.md", "finished work a post-commit hook must not cost the run\n");
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "post-commit"), "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    // Long enough for git to reach the hook, short enough that the hook outlives it.
+    process.env[COMMIT_TIMEOUT_ENV] = "1500";
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    expect(head()).not.toBe(baseline.head);
+    // Kept as it was made — the commit already carries the subject a resume reads, so nothing is
+    // marked twice on top of it.
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
+  });
+
+  // The marker is EMPTY by contract, and `--allow-empty` only permits that — it does not force it
+  // (PR #228 review). A `pre-commit` hook that stages files before rejecting leaves them in the
+  // index, and the retry that bypasses the hooks would commit that unverified content under a
+  // message saying the commit is empty — while the caller's cleanliness check, reading the tree the
+  // commit just emptied, reports nothing left behind.
+  it("marks self-committed work with a commit that is EMPTY even when a hook staged files", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(
+      join(hooks, "pre-commit"),
+      "#!/bin/sh\necho leaked > HOOK_STAGED.md\ngit add HOOK_STAGED.md\nexit 1\n",
+      { mode: 0o755 },
+    );
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
+    // The marker carries no diff, and what the hook wrote is still in the tree for the caller's own
+    // cleanliness check to halt on.
+    expect(out(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])).toBe("");
+    expect(out(["status", "--porcelain"])).toContain("HOOK_STAGED.md");
+  });
+
+  // "No preserved commit on the branch" is what every refusal reports as work that is gone, so a
+  // `git log` that could not RUN may not decay into it (PR #228 review). Read as proof of absence,
+  // the bead note and the park tell the operator a resume starts the ticket over — while the
+  // rollback restores a baseline that still carries the previous attempt's commit.
+  it("reports the doubt when the branch's history cannot be read at all", async () => {
+    write("HALF_WRITTEN.md", "work preserved by the attempt before this one\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", `WIP ${ticket.id}: ${ticket.title}`]);
+    const baseline = await readWorktreeState(repo);
+    write("MORE.md", "what this attempt added, and the gates refuse\n");
+    // `git log` fails outright; every other read the preserve makes still works.
+    g(["config", "log.date", "bogus"]);
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "exit 1" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toMatchObject({
+      rolledBackWhy: expect.stringContaining("does not pass this project's verify gates"),
+      retainedOn: null,
+    });
+    expect((kept as { rolledBackWhy: string }).rolledBackWhy).toContain(
+      `could not read \`${BRANCH}\`'s history`,
+    );
+    // …and the commit the read could not see is still there, exactly as the doubt says it may be.
+    g(["config", "--unset", "log.date"]);
+    expect(subjects()).toContain(`WIP ${ticket.id}: ${ticket.title}`);
   });
 
   // The abort's other landing spot: `commitAll` runs on no signal (a pre-commit hook can hold it for
