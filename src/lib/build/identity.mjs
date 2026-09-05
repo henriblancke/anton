@@ -1002,15 +1002,27 @@ const ENV_EXPANSION = /(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
  */
 const NEXT_CONFIG_FILES = ["next.config.js", "next.config.mjs", "next.config.ts", "next.config.mts"];
 
-/**
- * How `process.env` itself is spelled — the source every read below hangs off, with the optional
- * chain `process?.env` spelled too (PR #217 review): it is valid, it compiles the same value in, and
- * a pattern stopping at the `?` records nothing for it.
- */
-const PROCESS_ENV = String.raw`process\s*\??\.\s*env`;
-
 /** A quoted key, in any of the three string delimiters: the `["NAME"]` half of an env read. */
 const QUOTED_KEY = "[\"'`]([^\"'`]+)[\"'`]";
+
+/** `env` spelled as a quoted key, capturing nothing: the `["env"]` half of `process["env"]`. */
+const QUOTED_ENV = "[\"'`]env[\"'`]";
+
+/**
+ * How `process.env` itself is spelled — the source every read below hangs off.
+ *
+ * Three spellings, because each compiles the same value in and a pattern that misses one records
+ * nothing for it. The optional chain `process?.env` is valid and a pattern stopping at the `?` sees
+ * nothing (PR #217 review). `env` may also be reached as a quoted key — `process["env"].FLAVOR`,
+ * `process?.["env"].FLAVOR` — which is the same property access written the other way, and the
+ * alternation covers it (PR #217 review): the reads, the destructures and the alias binding all hang
+ * off this one fragment, so a spelling added here is recognised by every scanner at once.
+ *
+ * The alternation is contained inside `process(?:…)` and captures nothing, so this stays a drop-in
+ * for the patterns that interpolate it — `envRead` reads its names from groups 1 and 2, and
+ * `ENV_ALIAS` its binding from group 1.
+ */
+const PROCESS_ENV = String.raw`process(?:\s*\??\.\s*env|\s*(?:\?\.)?\s*\[\s*${QUOTED_ENV}\s*\])`;
 
 /**
  * One read off `source`: `source.NAME` or `source["NAME"]`, each in its optional-chained spelling
@@ -1028,7 +1040,8 @@ const envRead = (source) =>
  *
  * The trailing guard is `(?![\w$])` rather than `\b`, because an alias may END in `$` (`const env$ =
  * process.env`) and `\b` after a `$` demands a word character follow it — the read would match
- * nothing (PR #217 review).
+ * nothing (PR #217 review). `ENV_ALIAS` below carries the same guard for the same reason on the
+ * other side: `process["env"]` ends in `]`, and a `\b` there would demand a word character too.
  */
 const envDestructure = (source) =>
   new RegExp(String.raw`\{([^{}]*)\}\s*(?::[^=]+)?=\s*${source}(?![\w$])`, "g");
@@ -1040,7 +1053,7 @@ const envDestructure = (source) =>
  * one extra pass rather than a blind spot.
  */
 const ENV_ALIAS = new RegExp(
-  String.raw`(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*${PROCESS_ENV}\b`,
+  String.raw`(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*${PROCESS_ENV}(?![\w$])`,
   "g",
 );
 

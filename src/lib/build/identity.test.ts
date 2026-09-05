@@ -1300,6 +1300,25 @@ describe("the build-time environment in an identity", () => {
     expect(readBuildIdentity(dir, { BUILD_FLAVOR: "one" }).env).not.toBe(readBuildIdentity(dir, { BUILD_FLAVOR: "two" }).env);
   });
 
+  // `env` is reachable as a quoted key too — `process["env"].BUILD_FLAVOR` is the same property
+  // access written the other way, and compiles the same value in. A pattern anchored only on the dot
+  // spelling recorded nothing for it, so changing that variable left the digest put and
+  // `buildMatchesCheckout` handed back the `.next` compiled with the previous value (PR #217 review).
+  it("reads a variable the config takes off a bracket-spelled process.env", () => {
+    const dir = app();
+    writeFileSync(
+      join(dir, "next.config.mjs"),
+      'const env = process["env"];\n' +
+        'const { MODE } = process?.["env"];\n' +
+        "export default { env: { F: process['env'].BUILD_FLAVOR, A: process[`env`][\"ANALYZE\"], M: env.LEVEL, D: MODE } };\n",
+    );
+    const base = { BUILD_FLAVOR: "one", ANALYZE: "0", LEVEL: "low", MODE: "fast" };
+    expect(readBuildIdentity(dir, { ...base, BUILD_FLAVOR: "two" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, ANALYZE: "1" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, LEVEL: "high" }).env).not.toBe(readBuildIdentity(dir, base).env);
+    expect(readBuildIdentity(dir, { ...base, MODE: "slow" }).env).not.toBe(readBuildIdentity(dir, base).env);
+  });
+
   // Same rule as an expanded env-file name: a variable the config names but the environment does
   // not set compiles nothing in, so it must not rebuild on every unrelated shell.
   it("names a config variable only where the environment sets one", () => {
