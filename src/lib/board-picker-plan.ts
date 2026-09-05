@@ -316,7 +316,7 @@ export const DIGEST_LABEL_NAMESPACES: readonly DigestLabelNamespace[] = [
   {
     namespace: "source",
     relevance: "not-decision-relevant",
-    why: "provenance for a bead anton's own automation filed; read only by the board's card projection (`ticket-view`), which no part of the decision consults",
+    why: "provenance for a bead anton's own automation filed; no reader in the picker decision path consults it (ticket-view reads it for display, orphan-grooming reads it to find its own bucket epic — neither is in eligibility, the policy or the ranking)",
   },
 ];
 
