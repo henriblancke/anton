@@ -1821,10 +1821,10 @@ describe("scan", () => {
       expect(result.deadcode.dropped[0].reason).toContain("src/page.ts");
     });
 
-    // tsc takes a single `*` anywhere in a pattern, and the rule model maps only the ones ending
-    // `/*`. Dropping `"@/*/models"` leaves its specifier to the path-tail fallback, which binds an
-    // unrelated package's same-named module and deletes that module's genuine finding (PR #190
-    // review). The pattern claims what it matches and maps nothing, so no caller is invented.
+    // `"@/*/models"` is resolved through its substitution, so `@/ui/models` names `src/ui/models`
+    // and nothing else. Dropping the pattern used to leave the specifier to the path-tail fallback,
+    // which bound an unrelated package's same-named module and deleted its genuine finding
+    // (PR #190 review).
     it("does not read a tail behind a pattern whose wildcard is not at the end", async () => {
       const repo = initRepo({
         "tsconfig.json": JSON.stringify({
@@ -3077,6 +3077,32 @@ describe("scan", () => {
       expect(result.signals).toMatchObject([{ FilePath: "packages/b/parse.ts" }]);
       expect(result.deadcode.dropped).toMatchObject([{ path: "packages/a/parse.ts" }]);
       expect(result.deadcode.dropped[0].reason).toContain("src/caller.ts");
+    });
+
+    // Attribution follows the import that SUPPLIED the symbol, not every module the file names. A
+    // file importing `parse` from one package and `helper` from another names both, and crediting
+    // the `parse()` call against both drops the finding for the module that only ever supplied
+    // `helper` (PR #190 review).
+    it("credits a caller through the import that bound the symbol, not its other imports", async () => {
+      const repo = initRepo({
+        "packages/a/parse.ts": "export function parse() {\n  return 1;\n}\n",
+        "packages/b/parse.ts":
+          "export function parse() {\n  return 2;\n}\nexport function helper() {\n  return 3;\n}\n",
+        "src/caller.ts":
+          "import { parse } from '../packages/a/parse';\n" +
+          "import { helper } from '../packages/b/parse';\n" +
+          "export const go = () => parse() + helper();\n",
+      });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        unused("packages/a/parse.ts", "parse"),
+        unused("packages/b/parse.ts", "parse"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      // Only `a`'s `parse` has a caller — `b`'s is reached for `helper` alone.
+      expect(result.signals).toMatchObject([{ FilePath: "packages/b/parse.ts" }]);
+      expect(result.deadcode.dropped).toMatchObject([{ path: "packages/a/parse.ts" }]);
     });
 
     // A caller that names no declaring module at all still counts for every one of them: its

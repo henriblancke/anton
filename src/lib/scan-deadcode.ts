@@ -25,13 +25,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { promisify } from "node:util";
-import {
-  aliasTarget,
-  claimingRules,
-  moduleSpecifiers,
-  readDirAliases,
-  type AliasRule,
-} from "./scan-coupling";
+import { aliasTarget, claimingRules, readDirAliases, type AliasRule } from "./scan-coupling";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 const execFileAsync = promisify(execFile);
@@ -3514,6 +3508,48 @@ async function defaultBindingCallers(
 }
 
 /**
+ * `import …clause… from 'spec'` and `export …clause… from 'spec'` — the binding list and the module
+ * it came from, so a reference can be traced to the import that supplied it rather than to every
+ * module the file happens to name.
+ */
+const IMPORT_BINDING = /(?:^|[;{}])\s*(?:import|export)\s+([^'"]*?)\bfrom\s*['"]([^'"]+)['"]/gm;
+
+/** `const { parse } = require('./a')` — the CommonJS spelling of the same thing. */
+const REQUIRE_BINDING =
+  /(?:^|[;{}])\s*(?:const|let|var)\s+([^=;]*?)=\s*require\s*\(\s*['"]([^'"]+)['"]/gm;
+
+/** A literal for a `RegExp`: an identifier may hold `$`, which is an anchor if left raw. */
+function escapeForPattern(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The modules a file could have taken `symbol` FROM — the specifier of every import or require
+ * whose binding list names it.
+ *
+ * Scoped to the statement that binds the symbol, not to everything the file imports (PR #190
+ * review). A file importing `parse` from one package and `helper` from another names both modules,
+ * and crediting a call to `parse()` against both drops a finding for the module that only ever
+ * supplied `helper`.
+ *
+ * A rename binds another name — `import { parse as p }` writes `parse` on the import line alone,
+ * which is masked out of the reference count — so a caller reached through one is not a caller by
+ * this symbol's spelling, and answering nothing for it is right.
+ */
+function specifiersBinding(source: string, symbol: string): string[] {
+  const specs = new Set<string>();
+  const names = new RegExp(`\\b${escapeForPattern(symbol)}\\b`);
+  for (const pattern of [IMPORT_BINDING, REQUIRE_BINDING]) {
+    pattern.lastIndex = 0;
+    for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
+      const [, clause, spec] = match;
+      if (clause !== undefined && spec !== undefined && names.test(clause)) specs.add(spec);
+    }
+  }
+  return [...specs];
+}
+
+/**
  * The callers whose evidence belongs to `module`, out of the ones found for a symbol that MORE THAN
  * ONE file declares.
  *
@@ -3522,17 +3558,18 @@ async function defaultBindingCallers(
  * were dropped though only one had a caller (PR #190 review). A file's own imports say which module
  * it means, and `specifierNames` already answers that question for the default-binding search.
  *
- * A caller that names NO declaring module keeps counting for all of them, which is what this pass
- * did for every caller before. Its reference is real — the grep found the symbol on a code line —
- * and nothing here can say which declaration it meant: the two modules may be reached through a
- * language this reader parses no imports for, or through a re-export, or the file may be in the
- * same package. Crediting it to one and not the other would be a guess, and dropping it from all of
- * them would resurrect a finding the tree contradicts. So the narrowing only ever acts on evidence
- * it can attribute, and the ambiguous rest stays shared.
+ * A caller whose import of the symbol names NO declaring module keeps counting for all of them,
+ * which is what this pass did for every caller before. Its reference is real — the grep found the
+ * symbol on a code line — and nothing here can say which declaration it meant: the module may be
+ * reached through a language this reader parses no imports for, or through a re-export, or the file
+ * may be in the same package. Crediting it to one and not the other would be a guess, and dropping
+ * it from all of them would resurrect a finding the tree contradicts. So the narrowing only ever
+ * acts on evidence it can attribute, and the ambiguous rest stays shared.
  */
 async function callersNaming(
   repoPath: string,
   module: string,
+  symbol: string,
   declaring: ReadonlySet<string>,
   callers: readonly string[],
   masked: Map<string, MaskedFile | undefined>,
@@ -3543,7 +3580,7 @@ async function callersNaming(
   for (const file of callers) {
     abort?.throwIfAborted();
     const entry = await maskedFile(repoPath, file, masked, abort);
-    const specs = entry ? moduleSpecifiers(entry.program.join("\n")) : [];
+    const specs = entry ? specifiersBinding(entry.program.join("\n"), symbol) : [];
     if (specs.length === 0) {
       mine.push(file);
       continue;
@@ -3661,7 +3698,7 @@ export async function filterDeadcodeSignals(
     // it can contradict this signal (PR #190 review).
     const callers =
       declaring.size > 1 && shared.length > 0
-        ? await callersNaming(repoPath, path, declaring, shared, masked, aliases, abort)
+        ? await callersNaming(repoPath, path, symbol, declaring, shared, masked, aliases, abort)
         : shared;
     if (callers.length === 0) continue;
     const shown = callers.slice(0, 3);

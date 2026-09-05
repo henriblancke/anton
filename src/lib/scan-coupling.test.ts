@@ -467,11 +467,11 @@ describe("readAliases", () => {
     expect(await readAliases(repo, "apps/heir")).toEqual([{ prefix: "@/", targets: ["src/*"] }]);
   });
 
-  // tsc takes a single `*` anywhere in a pattern, and this model can map only the ones ending
-  // `/*`. Dropping the rest hands their specifiers to the path-tail fallback, which binds an
-  // unrelated same-named module — so the pattern claims what it matches and maps nothing (PR #190
-  // review).
-  it("claims a pattern whose wildcard is not at the end instead of dropping it", async () => {
+  // tsc takes a single `*` anywhere in a pattern, and the text either side of it is what a
+  // specifier must start and end with. Such a pattern is now MAPPED like any other rather than
+  // claimed and left unresolved (PR #190 review; this assertion previously read `targets: [],
+  // unresolved: true`, which was the half-measure).
+  it("resolves a pattern whose wildcard is not at the end", async () => {
     const repo = writeRepo({
       "tsconfig.json": JSON.stringify({
         compilerOptions: {
@@ -482,8 +482,24 @@ describe("readAliases", () => {
     });
 
     expect(await readAliases(repo)).toEqual([
-      { prefix: "@/", suffix: "/models", targets: [], unresolved: true },
+      { prefix: "@/", suffix: "/models", targets: ["src/*/models"] },
       { prefix: "@/ui/", targets: ["src/ui/*"] },
+    ]);
+  });
+
+  // Its specifiers resolve through the substitution the pattern names, and every other `@/` one
+  // still belongs to whatever rule maps it.
+  it("substitutes through a nonterminal wildcard, and claims nothing beyond it", async () => {
+    const graph = await graphOf({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { baseUrl: ".", paths: { "@/*/models": ["./src/*/models"] } },
+      }),
+      "src/a.ts": `import { m } from "@/b/models";\nexport const a = () => m();\n`,
+      "src/b/models.ts": `export const m = () => 1;\n`,
+    });
+
+    expect(await graph.edgesOf("src/a.ts")).toEqual([
+      { file: "src/b/models.ts", typeOnly: false, relative: false },
     ]);
   });
 });

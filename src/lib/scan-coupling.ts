@@ -118,16 +118,6 @@ function isTypeOnly(statement: string): boolean {
   return bindings.length > 0 && bindings.every((name) => /^type\s/.test(name));
 }
 
-/**
- * Every module specifier a file names, however it imports it — the `from` clauses, the side-effect
- * imports and the dynamic `import()`/`require()` calls, without the type-only judgement the graph
- * needs. What a file names is how the dead-code filter tells WHICH declaring module a caller is a
- * caller of, when two of them export the same symbol (PR #190 review).
- */
-export function moduleSpecifiers(source: string): string[] {
-  return [...new Set(parseEdges(source).map((edge) => edge.spec))];
-}
-
 function parseEdges(source: string): RawEdge[] {
   const edges: RawEdge[] = [];
   for (const match of source.matchAll(FROM_STATEMENT)) {
@@ -169,10 +159,9 @@ export interface AliasRule {
    */
   exact?: boolean;
   /**
-   * What a specifier must END with, for the one pattern shape whose `*` is not at the end:
-   * `"@/*-models"` claims `@/foo-models` and nothing else (PR #190 review). Only ever set on a
-   * claim — no rule anton can MAP carries one — so it narrows what an unresolved rule swallows
-   * rather than changing where a resolved one points.
+   * What a specifier must END with, for a pattern whose `*` is not at the end: `"@/*-models"`
+   * matches `@/foo-models` and nothing else, and the `*` stands for what lies between (PR #190
+   * review). Absent when the pattern ends in its wildcard, which is every ordinary `"@/*"`.
    *
    * The examples here put a `-` after the wildcard rather than the `/` such a pattern usually
    * carries, because that spelling would close this comment.
@@ -385,21 +374,13 @@ function rulesOf(baseDir: string, options: TsConfig["compilerOptions"]): AliasRu
   if (!paths) return [];
   const rules: AliasRule[] = [];
   for (const [pattern, declared] of Object.entries(paths)) {
-    const exact = !pattern.includes("*");
-    // tsc accepts a single `*` ANYWHERE in a pattern — `"@/*/models": ["src/*/models"]` resolves
-    // `@/foo/models` — and this model can map only the ones ending in the wildcard. Dropping the
-    // rest leaves their specifiers to the path-tail fallback, which reads `@/ui/models` as an
-    // unrelated package's same-named module, inventing a caller and deleting a true finding
-    // (PR #190 review).
-    // So the pattern claims what it matches and maps nothing: prefix and suffix bound the claim to
-    // the specifiers tsc would send here, and nothing else loses its mapping. A pattern with more
-    // than one `*` is one tsc rejects outright, so it names no import and is skipped.
-    if (!exact && !pattern.endsWith("/*")) {
-      const parts = pattern.split("*");
-      if (parts.length !== 2) continue;
-      rules.push({ prefix: parts[0], suffix: parts[1], targets: [], unresolved: true });
-      continue;
-    }
+    // tsc takes a single `*` ANYWHERE in a pattern and no more than one, so the text on either side
+    // of it is what a specifier must start and end with. Splitting there is the whole grammar: one
+    // part means an exact pattern, two mean a wildcard one wherever its `*` sits, and three or more
+    // is a config tsc rejects outright, which names no import (PR #190 review).
+    const parts = pattern.split("*");
+    if (parts.length > 2) continue;
+    const exact = parts.length === 1;
     // `paths` comes off unvalidated JSON, so a target list that isn't one declares no target anton
     // can read — the rule claims and maps nothing rather than throwing out of the nightly pass.
     const targets = Array.isArray(declared) ? declared : [];
@@ -410,7 +391,8 @@ function rulesOf(baseDir: string, options: TsConfig["compilerOptions"]): AliasRu
       .filter((target): target is string => target !== undefined);
     const rule: AliasRule = exact
       ? { prefix: pattern, targets: mapped, exact: true }
-      : { prefix: pattern.slice(0, -1), targets: mapped };
+      : { prefix: parts[0] as string, targets: mapped };
+    if (!exact && parts[1]) rule.suffix = parts[1];
     if (mapped.length !== targets.length) rule.unresolved = true;
     rules.push(rule);
   }
