@@ -8,7 +8,7 @@ answers re-checked against 1.2.2 (latest stable) and unchanged.
 | # | Question | Answer |
 | --- | --- | --- |
 | 1 | Does push map `parent-child` onto Linear sub-issues? | **No.** Push never sends a parent. Hierarchy is import-only. |
-| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the ~5-in-8 of the default population that carry a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (§2). |
+| 2 | Does push carry bead labels? | **No.** Push never sends `labelIds`, so the run-lease cannot reach Linear as a label — but a lease-only change is still **one read per linked bead**, plus a write for the majority of the beads the `area:` routing plan actually selects — those carrying a structured `acceptance_criteria`/`design`/`notes` field, whose unchanged-issue skip never fires (120 of the 194 selected under the widest routing reading; §2). |
 | 3 | What does `--update-refs` write into `external_ref`? | The **Linear issue URL verbatim, always** — the flag is declared but never read, so it cannot be turned off. |
 
 Consequences for the downstream tickets are at the bottom.
@@ -152,51 +152,87 @@ before the rule, and **anton itself fills a structured field at runtime** — `b
 notes and human steering land on a run target (`beads.note`, `src/lib/beads/bd.ts:2315-2321`), and
 `notes` is one of the three fields `BuildLinearDescription` appends.
 
-Measure the population the sync actually processes, not a convenient slice of it. The design's
-default for **Also include** is *Open and closed* and the mock's previewed command is `--state all`,
-so the population is **every epic and feature on the board, open or closed** — a closed bead is
-fetched, compared and updated on every cycle exactly like an open one:
+Measure the population the sync actually processes — which is **not** every epic and feature. The
+routing plan runs **one pass per mapped `area:`**: anton sets `linear.project_id`, pushes that
+pass's ids, restores it, and **skips unmapped areas rather than guessing**
+(`docs/design/2026-07-26-tier-and-linear-ux.md:104-110`); each pass must hand bd its own selected
+ids or `project_id` silently suppresses every create (*Other findings*, below). The population is
+therefore the **union of the ids `planLinearPushes` emits**, and two things decide it:
+
+1. **Which areas the operator maps.** The routing table is per-install and empty by default, so a
+   fully mapped table is the *upper bound* — any real table selects a subset of what follows.
+2. **Whether a feature carrying no `area:` of its own is routed by its parent epic's.** The design
+   gives an epic exactly one `area:` (`:19`) and says an epic without one reads *"not synced — needs
+   `area:`"* (`:48`), but says nothing about a feature — 186 of the 187 on this board carry no
+   `area:` of their own. That is an 18× difference in N, so it is now an explicit open question on
+   the routing decision (`:107-110`) and `planLinearPushes` cannot be written until it is settled.
+
+Both readings, with the field breakdown, from one board read:
 
 ```bash
-bd list --status all --json --limit 0 | jq -c '
+bd list --status all --json --limit 0 | jq '
   def structured: ((.acceptance_criteria//"")!="") or ((.design//"")!="") or ((.notes//"")!="");
-  [.[] | select(.issue_type=="epic" or .issue_type=="feature")] as $t |
-  {default_state_all: {total: ($t|length), structured: ([$t[]|select(structured)]|length)},
-   if_open_only:      {total:      ([$t[]|select(.status=="open")]|length),
-                       structured: ([$t[]|select(.status=="open" and structured)]|length)},
-   by_field: {acceptance_criteria: ([$t[]|select((.acceptance_criteria//"")!="")]|length),
-              design:              ([$t[]|select((.design//"")!="")]|length),
-              notes:               ([$t[]|select((.notes//"")!="")]|length)},
-   since_the_contract: {total:      ([$t[]|select(.created_at>"2026-08-15")]|length),
-                        structured: ([$t[]|select(.created_at>"2026-08-15" and structured)]|length),
-                        notes_only: ([$t[]|select(.created_at>"2026-08-15" and (.notes//"")!=""
-                                                 and (.acceptance_criteria//"")=="")]|length)}}'
+  def own_area: ((.labels//[])|map(select(startswith("area:")))|first);
+  . as $all | ([$all[]|{key:.id,value:own_area}]|from_entries) as $areaOf |
+  [$all[]|select(.issue_type=="epic" or .issue_type=="feature")
+        | {status, s: structured, own: own_area,
+           inh: (own_area // ($areaOf[.parent//""] // null)),        # inherit from parent epic
+           new: (.created_at>"2026-08-15"), ac: ((.acceptance_criteria//"")!=""),
+           no: ((.notes//"")!="")}] as $t |
+  def pop(f): {selected:    ([$t[]|select(f)]|length),
+               writes:      ([$t[]|select(f and .s)]|length),
+               open_only:   ([$t[]|select(f and .status=="open")]|length),
+               open_writes: ([$t[]|select(f and .status=="open" and .s)]|length)};
+  {tier_chips_select: ($t|length),
+   own_label_only: pop(.own!=null),
+   parent_inherited: pop(.inh!=null),
+   unreachable_either_way: ([$t[]|select(.inh==null)]|length),
+   passes: ([$t[]|select(.inh!=null)|.inh]|group_by(.)|map({(.[0]):length})|add),
+   inherited_detail: {closed:            ([$t[]|select(.inh!=null and .status!="open")]|length),
+                      closed_writes:     ([$t[]|select(.inh!=null and .status!="open" and .s)]|length),
+                      acceptance:        ([$t[]|select(.inh!=null and .ac)]|length),
+                      notes:             ([$t[]|select(.inh!=null and .no)]|length),
+                      since_contract:    ([$t[]|select(.inh!=null and .new)]|length),
+                      since_structured:  ([$t[]|select(.inh!=null and .new and .s)]|length),
+                      since_notes_only:  ([$t[]|select(.inh!=null and .new and .no and (.ac|not))]|length)}}'
 # measured 2026-09-05:
-# {"default_state_all":{"total":196,"structured":123},
-#  "if_open_only":{"total":39,"structured":12},
-#  "by_field":{"acceptance_criteria":103,"design":0,"notes":36},
-#  "since_the_contract":{"total":75,"structured":17,"notes_only":16}}
+# {"tier_chips_select":197,
+#  "own_label_only":   {"selected": 11, "writes":  10, "open_only":  6, "open_writes":  5},
+#  "parent_inherited": {"selected":194, "writes": 120, "open_only": 40, "open_writes": 12},
+#  "unreachable_either_way":3,
+#  "passes":{"area:agents":5,"area:autopilot":17,"area:board":38,"area:codehealth":56,
+#            "area:collaboration":9,"area:platform":13,"area:reliability":7,"area:runtime":20,
+#            "area:supervision":29},
+#  "inherited_detail":{"closed":154,"closed_writes":108,"acceptance":101,"notes":35,
+#                      "since_contract":76,"since_structured":17,"since_notes_only":16}}
 ```
 
-**Under the documented default, roughly five of every eight pushed beads write on every cycle** —
-123 of 196. The open-only slice (12 of 39) is the flattering one and does not describe the default:
-157 of the 196 are closed, 111 of those carry a structured field, and nothing removes a closed bead
-from a `--state all` population.
+**The tier chips select 197 beads; the routing plan pushes at most 194 of them, and as few as 11.**
+Own-label routing selects the 10 epics — every one carries an `area:`, as the contract says — plus
+the *single* feature of 187 that carries one: 11 beads, 10 of which write every cycle.
+Parent-inherited routing selects 194 across nine passes (`area:codehealth` alone is 56), of which
+**120 write every cycle — roughly five in eight**; 3 beads are unreachable either way. A partial
+routing table scales both down. So the *ratio* is robust — a clear majority of whatever is selected
+writes on every cycle, under either reading — and it is **N that swings 18×**. Any budget stated as
+a multiple of N must name which reading it assumes.
 
-**The write tail also does not trend to zero**, for two independent reasons:
+**The write tail also does not trend to zero**, for two independent reasons (counts below are the
+inherited reading, the upper bound):
 
-- Closed beads never leave the default population, so their writes are permanent rather than
-  decaying. Closing a legacy bead does not retire its cost; it freezes it.
-- `notes` keeps minting new members of the writing set. Of the 75 epics+features created since
+- Closed beads never leave an *Open and closed* pass, so their writes are permanent rather than
+  decaying: 154 of the 194 are closed, and 108 of those carry a structured field. Closing a legacy
+  bead does not retire its cost; it freezes it.
+- `notes` keeps minting new members of the writing set. Of the 76 selected beads created since
   2026-08-15, well under the current contract, 17 carry a structured field — **16 of them
   `notes`-only**, with exactly one `acceptance_criteria`. The contract killed the acceptance field;
   it cannot keep `bd note` off a run target, and anton notes its own run targets.
 
 So the skip fires only for a bead that is description-only **and** has never been noted **and** has
-been pushed at least once — and the writing set converges to a floor, not to zero. The lever that
-actually shrinks it is the **Also include** control: *Open only* takes the population from 196 to 39
-and the per-cycle writes from 123 to 12. That is a design choice for the sync ticket, not a bd
-behaviour, and it is flagged rather than decided here.
+been pushed at least once — and the writing set converges to a floor, not to zero. Two levers shrink
+it, and both are design choices for the sync ticket rather than bd behaviours, flagged here and not
+decided: the **routing table**, which sets N outright, and **Also include** — *Open only* takes the
+inherited population from 194 to 40 and its per-cycle writes from 120 to 12 (own-label: 11 → 6 and
+10 → 5).
 
 bd's regression test does not cover either defeat: `TestBatchPush_SkipsUnchangedIssue`
 (`internal/linear/tracker_test.go:80-137`) uses an empty local description, no structured fields and
@@ -212,9 +248,9 @@ Per push, per Linear-linked bead:
    the read cost is a floor that does not shrink.
 2. **A write, conditionally.** An `issueUpdate` mutation whenever the skip misses — reported back as
    `Updated: N`, and carrying an `external_ref` re-write with it (`tracker.go:496`). It misses once
-   per bead after its create (defeat 1), then permanently for the ~5-in-8 of the default population
-   carrying a structured field (defeat 2), and for any bead whose title / description / priority /
-   status genuinely moved.
+   per bead after its create (defeat 1), then permanently for the majority of the **routed**
+   population that carries a structured field (defeat 2), and for any bead whose title /
+   description / priority / status genuinely moved.
 3. **Genuine content change only sometimes.** When an update does fire on an otherwise unchanged
    bead it re-sends title, description, priority and `stateId` at their existing values, so whether
    a stakeholder sees a feed entry is Linear's change detection, not bd's. What *is* a real change:
@@ -223,14 +259,16 @@ Per push, per Linear-linked bead:
    statuses across **two** genuine transitions.
 
 A push triggered by every run-lease refresh (5 min, `RUN_LEASE_REFRESH_MS`) therefore costs **N
-reads plus roughly 0.6N writes per cycle** on the default *Open and closed* population (123 writes
-against N=196 today) — for a change Linear cannot even represent. That tail does not decay: closed
-beads stay in the population forever and `bd note` keeps adding to it. Switching **Also include** to
-*Open only* is what moves the number (N=39, 12 writes), and the read floor alone still makes the
-debounce the only cap, not a nicety. And anton must not build the guarantee on bd's skip: a test
-asserting "an unchanged bead syncs nothing" has to assert it at anton's own seam (no push fired at
-all), because asserting it of bd holds only for a never-noted description-only bead, and only from
-its second push on.
+reads, plus a write for the structured-field majority of N**, per cycle — where N is the union
+`planLinearPushes` selects on the *Open and closed* default, **not** the 197 the tier chips match.
+On this board with every area mapped: N=194 and 120 writes (~0.6N) if a feature inherits its parent
+epic's area, N=11 and 10 writes if it does not (§2) — for a change Linear cannot even represent.
+That tail does not decay: closed beads stay in the population forever and `bd note` keeps adding to
+it. The routing table sets N outright, and **Also include** moves it again (*Open only*: N=40, 12
+writes on the inherited reading), while the read floor alone still makes the debounce the only cap,
+not a nicety. And anton must not build the guarantee on bd's skip: a test asserting "an unchanged
+bead syncs nothing" has to assert it at anton's own seam (no push fired at all), because asserting
+it of bd holds only for a never-noted description-only bead, and only from its second push on.
 
 ## 3. `--update-refs`: declared, never read, always on
 
@@ -419,13 +457,17 @@ func TestSkipDefeat_StructuredFields(t *testing.T) {
 - **anton-ey0w.5 (keep run-lease churn out of Linear):** no longer a code change to move the lease off
   labels — bd cannot leak a label. What remains is a **read per linked bead per push, unconditional**,
   plus a write tail: bd's unchanged-issue skip misses once per bead after its create, and misses
-  forever for any bead carrying a structured `acceptance_criteria`/`design`/`notes` field — **123 of
-  the 196 epics+features in the default `--state all` population** on 2026-09-05 (§2). Only a
-  never-noted, description-only bead skips from its second push on, and `bd note` keeps moving beads
-  out of that set. So the debounce is still the only cap — the read floor alone justifies it — but
-  the ticket should size the cost as N reads + ~0.6N writes on the documented default, note that the
-  tail does not decay (closed beads never leave a `--state all` population), and treat *Open only*
-  as the lever if the cost has to come down. The "a lease-only change syncs nothing" test must still
+  forever for any bead carrying a structured `acceptance_criteria`/`design`/`notes` field. Size it
+  against the beads `planLinearPushes` selects, not the 197 the tier chips match: with every area
+  mapped and the `--state all` default, that is **120 writes against N=194** if a feature inherits
+  its parent epic's `area:`, or **10 against N=11** if it does not — 186 of the 187 features carry
+  no `area:` of their own, so the two readings differ 18× and the ticket has to pick one (§2). Only
+  a never-noted, description-only bead skips from its second push on, and `bd note` keeps moving
+  beads out of that set. So the debounce is still the only cap — the read floor alone justifies it —
+  but the ticket should size the cost as N reads plus a write for the structured-field majority of
+  N over the *routed* union, note that the tail does not decay (closed beads never leave a
+  `--state all` population), and treat the routing table and *Open only* as the levers if the cost
+  has to come down. The "a lease-only change syncs nothing" test must still
   assert *no push fired* at anton's seam: asserting that bd skips is true only for a never-noted
   description-only bead, and only after its first push.
   Still to decide: whether per-run `status` transitions should reach Linear at all.

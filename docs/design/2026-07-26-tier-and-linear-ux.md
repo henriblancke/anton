@@ -104,7 +104,10 @@ command and the dry-run counts live (see the mock).
 - **Per-area routing runs one pass per area.** bd holds a single `linear.project_id`, so anton sets
   it, pushes that area's ids, and restores it. Unmapped areas are skipped and reported, never
   guessed. Build it behind a pure `planLinearPushes(beads) → [{projectId, issueIds}]` so it swaps to
-  an upstream bd label→project mapping later.
+  an upstream bd label→project mapping later. **Open: what a feature inherits.** Epics carry exactly
+  one `area:`, but features carry none — 186 of 187 on the board today — so routing on a bead's own
+  label selects 11 beads where routing on its parent epic's selects 194. Settle this before
+  `planLinearPushes` is written; it sets the whole cost budget in hazard 2.
 - **Credentials come from the environment** (`LINEAR_API_KEY`, or the OAuth pair), never stored in
   `anton.db` — same posture as `gh`. The panel reports what it found and stops there.
 - **Dry-run before the first push.** Every setting is reversible except a bad first push, which
@@ -123,8 +126,9 @@ command and the dry-run counts live (see the mock).
 > (anton-ey0w.1): hazard 3 is settled — push never sends a parent *or* the tier, so the epic→sub-issue
 > shape is not available and epics and features are indistinguishable in Linear; hazard 2 is
 > **re-scoped, not closed** — bead labels never reach Linear, but every push still costs one read per
-> linked bead, plus a write for the ~5-in-8 of the default *Open and closed* population that carries a
-> structured `acceptance_criteria`/`notes` field; hazard 1 is confirmed and `--update-refs=false`
+> linked bead, plus a write for the majority of the *routed* population — the beads per-area routing
+> actually selects, on the *Open and closed* default — that carry a structured
+> `acceptance_criteria`/`notes` field; hazard 1 is confirmed and `--update-refs=false`
 > cannot prevent it (the flag is declared but never read).
 
 1. **`external_ref` collision.** `bd linear sync --push` defaults to `--update-refs true`, writing
@@ -143,10 +147,13 @@ command and the dry-run counts live (see the mock).
    builder on a copy that still has them and appends those sections twice. anton's contract keeps the
    rubric in the description and forbids `--acceptance` — but that only covers `acceptance_criteria`,
    and **anton fills `notes` itself** via `bd note`, so new run targets keep joining the writing set.
-   Measured on the population this panel's own default pushes (`--state all`, so open *and* closed):
-   **123 of 196 epics+features write on every push** on 2026-09-05. Budget N reads + ~0.6N writes per
-   cycle, and do **not** assume it decays — a closed bead never leaves a `--state all` population.
-   Setting **Also include** to *Open only* is the lever that moves it (N=39, 12 writes). The
+   Measure it on the ids `planLinearPushes` selects, not on every bead the tier chips match. With
+   every area mapped and this panel's own `--state all` default, that was **120 writes against N=194**
+   on 2026-09-05 if a feature inherits its parent epic's `area:` — and **10 against N=11** if it does
+   not, since 186 of 187 features carry no `area:` of their own (see *Per-area routing*, above).
+   Budget N reads plus a write for the structured-field majority of N, and do **not** assume it
+   decays — a closed bead never leaves a `--state all` population. The routing table sets N outright;
+   **Also include** set to *Open only* moves it again (N=40, 12 writes on the inherited reading). The
    "a lease-only change syncs nothing" guarantee still has to be enforced at anton's seam (do not
    fire the push): bd's skip is not a guarantee we can lean on. And `status` transitions are genuine
    content changes that *do* cross.
