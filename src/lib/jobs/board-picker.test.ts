@@ -121,20 +121,30 @@ function prActivity(number: number, state: string): PrActivity {
 /**
  * A db that trips `controller` on the plan write — the one instant between the write's own signal
  * gate and the start, which is the window an abort has to be re-checked in.
+ *
+ * The transaction handle is proxied along with the connection: the plan write picks its generation
+ * by comparing against the row, so it reads and inserts inside ONE transaction (anton-f12y) and the
+ * insert never touches the outer db.
  */
 function abortOnPlanWrite(db: TestDb["db"], controller: AbortController): TestDb["db"] {
-  return new Proxy(db, {
-    get(target, prop) {
-      const value = Reflect.get(target, prop) as unknown;
-      if (typeof value !== "function") return value;
-      const fn = value as (...args: unknown[]) => unknown;
-      if (prop !== "insert") return fn.bind(target);
-      return (...args: unknown[]) => {
-        controller.abort();
-        return fn.apply(target, args);
-      };
-    },
-  }) as TestDb["db"];
+  const trip = <T extends object>(handle: T): T =>
+    new Proxy(handle, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop) as unknown;
+        if (typeof value !== "function") return value;
+        const fn = value as (...args: unknown[]) => unknown;
+        if (prop === "transaction") {
+          return (cb: (tx: object) => unknown, ...rest: unknown[]) =>
+            fn.call(target, (tx: object) => cb(trip(tx)), ...rest);
+        }
+        if (prop !== "insert") return fn.bind(target);
+        return (...args: unknown[]) => {
+          controller.abort();
+          return fn.apply(target, args);
+        };
+      },
+    });
+  return trip(db);
 }
 
 function fakeCtx(over: Partial<JobContext> = {}): JobContext {

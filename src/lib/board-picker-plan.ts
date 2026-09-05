@@ -15,8 +15,14 @@
  * and the only runtime dependency here is anton.db and the contract reader the stamp judges through
  * (`beads/contract.ts`, itself pure and spawn-free). `Bead` is a type-only import.
  *
- * db-injectable (like run-health) so the pass and its tests share one connection; the UI read path
- * goes through the shared anton.db.
+ * db-injectable (like run-health) so the pass and its tests share one connection; the UI read and
+ * write paths go through the shared anton.db.
+ *
+ * The pass is no longer the only writer (anton-f12y): the board read derives the same decision from
+ * the board it is already holding and records it too, so the generation a surface hands out names
+ * what is on screen rather than what a background tick last wrote. Both go through
+ * {@link saveBoardPickerPlan}, which is idempotent per decision — restating one costs no new
+ * generation.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
@@ -26,7 +32,7 @@ import type { Bead } from "./beads/types";
 import { ageBoundBreached, ageInDays } from "./policy/age";
 import { policyDigest } from "./policy/digest";
 import type { Policy } from "./policy/types";
-import type { AntonDb, Clock } from "./jobs/queue";
+import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
 
 /**
  * Why a candidate is not in the plan. Machine-readable rather than prose because the policy editor
@@ -99,7 +105,7 @@ export interface BoardPickerPlan {
   projectId: string;
   /**
    * Identity of this GENERATION of the plan — what a verdict names when it answers one of its picks
-   * ({@link planIdFor}).
+   * ({@link restatesDecision} is what carries it over, or does not).
    */
   planId: string;
   /** The picker job that produced it; absent for a plan written outside the job (tests). */
@@ -305,87 +311,129 @@ function toEpoch(value: unknown): number {
   return Number(value ?? 0);
 }
 
-/**
- * The identity of the plan generation being saved — the name a verdict records when it answers one
- * of this plan's picks (`picker-veto.ts`).
- *
- * NOT the board digest, and that is the whole point (PR #212 review). The digest covers the decision
- * INPUTS — the board and the armed policy — so it is legitimately REUSABLE: a target vetoed on
- * Monday is re-admitted by a later pass over a board and a policy nobody has touched, and that pass
- * stamps a byte-identical digest. A verdict keyed to it would make the new pick inherit the old
- * decline, so the release would start the run and record no accept, quietly skewing the track record
- * earned autonomy reads.
- *
- * Carried over when the pass re-decides the SAME plan, though — the digest, the ranking and the
- * exclusions all unchanged. The accept and the veto are written by two routes that each read the
- * plan for themselves, and a fresh id on every ten-minute no-op tick would let a rerun landing
- * between those two reads hand them different names for one pick, which is exactly the collision
- * `pickAlreadyAnswered` exists to catch. A veto changes the exclusions, so the pass that re-admits
- * the target after the window closes is never mistaken for the one that offered it before.
- */
-async function planIdFor(
-  db: AntonDb,
-  projectId: string,
-  decided: { boardDigest: string; entriesJson: string; exclusionsJson: string },
-): Promise<string> {
-  const [prev] = await db
-    .select({
-      planId: schema.boardPickerPlans.planId,
-      boardDigest: schema.boardPickerPlans.boardDigest,
-      entriesJson: schema.boardPickerPlans.entriesJson,
-      exclusionsJson: schema.boardPickerPlans.exclusionsJson,
-    })
-    .from(schema.boardPickerPlans)
-    .where(eq(schema.boardPickerPlans.projectId, projectId))
-    .limit(1);
-  const unchanged =
-    prev !== undefined &&
-    prev.planId !== "" &&
-    prev.boardDigest === decided.boardDigest &&
-    prev.entriesJson === decided.entriesJson &&
-    prev.exclusionsJson === decided.exclusionsJson;
-  return unchanged ? prev.planId : randomUUID();
+type PlanRow = typeof schema.boardPickerPlans.$inferSelect;
+
+/** The three columns that make a plan the decision it is — what {@link restatesDecision} compares. */
+interface DecidedPlan {
+  boardDigest: string;
+  entriesJson: string;
+  exclusionsJson: string;
 }
 
 /**
- * Write the project's plan, replacing the previous one. One row per project by construction, so
- * this is an upsert rather than an append — a pass that admits nothing stores an empty plan, which
- * is the signal "decided, nothing to start" and NOT "never ran".
+ * Does the row already say exactly this? The generation is identified by the DECISION, so a pass —
+ * or a board read — that re-decides the same plan is restating one, not making one.
+ *
+ * NOT the board digest alone, and that is the whole point (PR #212 review). The digest covers the
+ * decision INPUTS — the board and the armed policy — so it is legitimately REUSABLE: a target vetoed
+ * on Monday is re-admitted by a later pass over a board and a policy nobody has touched, and that
+ * pass stamps a byte-identical digest. A verdict keyed to it would make the new pick inherit the old
+ * decline, so the release would start the run and record no accept, quietly skewing the track record
+ * earned autonomy reads. The ranking and the exclusions therefore have to match too — a veto changes
+ * the exclusions, so the pass that re-admits the target after the window closes is never mistaken for
+ * the one that offered it before.
+ *
+ * A row with no generation id at all predates the field and cannot be restated: it has no name to
+ * carry over.
+ */
+function restatesDecision(prev: PlanRow, decided: DecidedPlan): boolean {
+  return (
+    prev.planId !== "" &&
+    prev.boardDigest === decided.boardDigest &&
+    prev.entriesJson === decided.entriesJson &&
+    prev.exclusionsJson === decided.exclusionsJson
+  );
+}
+
+function rowToPlan(row: PlanRow): BoardPickerPlan {
+  return {
+    projectId: row.projectId,
+    planId: row.planId,
+    ...(row.jobId ? { jobId: row.jobId } : {}),
+    generatedAt: toEpoch(row.generatedAt),
+    stamp: {
+      observedAtMs: row.boardObservedAtMs,
+      digest: row.boardDigest,
+      beadCount: row.boardBeadCount,
+    },
+    entries: parseList<PickerPlanEntry>(row.entriesJson),
+    exclusions: parseList<PickerExclusion>(row.exclusionsJson),
+  };
+}
+
+/** What a writer hands this module: one project's decision, and who decided it. */
+export interface BoardPickerPlanInput {
+  projectId: string;
+  jobId?: string;
+  stamp: BoardStamp;
+  entries: PickerPlanEntry[];
+  exclusions: PickerExclusion[];
+}
+
+/**
+ * Write the project's plan, replacing the previous one, and return the generation that now stands.
+ * One row per project by construction, so this is an upsert rather than an append — a pass that
+ * admits nothing stores an empty plan, which is the signal "decided, nothing to start" and NOT
+ * "never ran".
+ *
+ * IDEMPOTENT per DECISION, not per call (anton-f12y). The board read records the ranking it derives
+ * on every read, so most calls here restate a decision that is already on the row — and rewriting it
+ * would mint nothing new but move `generatedAt`, which is half the board's freshness token
+ * (`provenanceVersion`). Every poll would then spend a full board read to hand back byte-identical
+ * data. A restatement therefore keeps the generation id, its `generatedAt` and the writer that minted
+ * it, and touches only the observation instant — and only forwards, so a slow pass carrying an older
+ * snapshot cannot date the row backwards.
+ *
+ * Read and write happen in ONE immediate transaction: the id is chosen by comparing against the row,
+ * so two overlapping writers reading before either wrote would both mint a fresh generation and the
+ * loser's would be the one a surface had already handed out. The write lock is taken up front for
+ * the reason `updateProjectSettings` takes it — a deferred transaction reads first and only then
+ * tries to upgrade, which is the shape that loses to SQLITE_BUSY under exactly this concurrency.
  */
 export async function saveBoardPickerPlan(
   db: AntonDb,
   clock: Clock,
-  input: {
-    projectId: string;
-    jobId?: string;
-    stamp: BoardStamp;
-    entries: PickerPlanEntry[];
-    exclusions: PickerExclusion[];
-  },
-): Promise<void> {
+  input: BoardPickerPlanInput,
+): Promise<BoardPickerPlan> {
   // Rank order, not array order: the ranking owns the sequence, and normalizing to the rank it
   // assigned means a caller that built the list some other way still records the queue it decided.
   const entries = [...input.entries].sort((a, b) => a.rank - b.rank);
   const exclusions = sortExclusions(input.exclusions);
-  const decided = {
+  const decided: DecidedPlan = {
     boardDigest: input.stamp.digest,
     entriesJson: JSON.stringify(entries),
     exclusionsJson: JSON.stringify(exclusions),
   };
-  const row = {
-    projectId: input.projectId,
-    jobId: input.jobId ?? null,
-    planId: await planIdFor(db, input.projectId, decided),
-    generatedAt: secDate(clock.now()),
-    boardObservedAtMs: input.stamp.observedAtMs,
-    boardBeadCount: input.stamp.beadCount,
-    targetCount: entries.length,
-    ...decided,
-  };
-  await db
-    .insert(schema.boardPickerPlans)
-    .values(row)
-    .onConflictDoUpdate({ target: schema.boardPickerPlans.projectId, set: row });
+  const observedAtMs = input.stamp.observedAtMs;
+  const where = eq(schema.boardPickerPlans.projectId, input.projectId);
+
+  return db.transaction(
+    (tx) => {
+      const prev = tx.select().from(schema.boardPickerPlans).where(where).limit(1).get();
+      if (prev && restatesDecision(prev, decided)) {
+        if (observedAtMs <= prev.boardObservedAtMs) return rowToPlan(prev);
+        tx.update(schema.boardPickerPlans).set({ boardObservedAtMs: observedAtMs }).where(where).run();
+        return rowToPlan({ ...prev, boardObservedAtMs: observedAtMs });
+      }
+      const row = {
+        projectId: input.projectId,
+        jobId: input.jobId ?? null,
+        planId: randomUUID(),
+        generatedAt: secDate(clock.now()),
+        boardObservedAtMs: observedAtMs,
+        boardBeadCount: input.stamp.beadCount,
+        targetCount: entries.length,
+        ...decided,
+      };
+      tx
+        .insert(schema.boardPickerPlans)
+        .values(row)
+        .onConflictDoUpdate({ target: schema.boardPickerPlans.projectId, set: row })
+        .run();
+      return rowToPlan(row);
+    },
+    { behavior: "immediate" },
+  );
 }
 
 /** A corrupt blob degrades to "nothing recorded" rather than crashing the lane — `targetCount` on
@@ -410,23 +458,23 @@ export async function getBoardPickerPlan(
     .where(eq(schema.boardPickerPlans.projectId, projectId))
     .limit(1);
   const row = rows[0];
-  if (!row) return undefined;
-  return {
-    projectId: row.projectId,
-    planId: row.planId,
-    jobId: row.jobId ?? undefined,
-    generatedAt: toEpoch(row.generatedAt),
-    stamp: {
-      observedAtMs: row.boardObservedAtMs,
-      digest: row.boardDigest,
-      beadCount: row.boardBeadCount,
-    },
-    entries: parseList<PickerPlanEntry>(row.entriesJson),
-    exclusions: parseList<PickerExclusion>(row.exclusionsJson),
-  };
+  return row ? rowToPlan(row) : undefined;
 }
 
 /** UI read path over the shared anton.db. */
 export function latestBoardPickerPlan(projectId: string): Promise<BoardPickerPlan | undefined> {
   return getBoardPickerPlan(getDb(), projectId);
+}
+
+/**
+ * The UI WRITE path over the same database (anton-f12y): the board read records the ranking it just
+ * derived, so a pick it draws is named by a generation a verdict can be filed against rather than by
+ * whatever the last scheduled pass happened to write down.
+ *
+ * The read is the fresher writer on an active board — the pass runs every ten minutes, the operator
+ * looks now — but not the only one, so the write goes through the same idempotent upsert
+ * ({@link saveBoardPickerPlan}) rather than a second recording path that could disagree with it.
+ */
+export function recordBoardPickerPlan(input: BoardPickerPlanInput): Promise<BoardPickerPlan> {
+  return saveBoardPickerPlan(getDb(), systemClock, input);
 }
