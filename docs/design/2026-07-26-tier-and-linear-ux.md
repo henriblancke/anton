@@ -112,6 +112,12 @@ command and the dry-run counts live (see the mock).
 
 ### Hazards that must be handled
 
+> **Answered 2026-09-05** by [`docs/spikes/2026-09-05-bd-linear-push-shape.md`](../spikes/2026-09-05-bd-linear-push-shape.md)
+> (anton-ey0w.1): hazard 3 is settled — push never sends a parent, so the epic→sub-issue shape is
+> not available; hazard 2 is narrowed — bead labels never reach Linear, so the churn to manage is
+> sync frequency and `status` transitions, not the lease label; hazard 1 is confirmed and
+> `--update-refs=false` cannot prevent it (the flag is declared but never read).
+
 1. **`external_ref` collision.** `bd linear sync --push` defaults to `--update-refs true`, writing
    the Linear ref into `external_ref`. A board still carrying legacy `gh-<n>` PR pointers there
    (honoured as a fallback by `beads.getPrRef`, `bd.ts:547-552`) **loses them**. The sync job must
