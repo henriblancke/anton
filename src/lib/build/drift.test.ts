@@ -305,6 +305,30 @@ describe("recordServerBuild / serverBuildDrift", () => {
     expect(serverBuildDrift()).toBeNull();
   });
 
+  // `typeof bootedAt === "number"` is not the check it looks like: JSON admits `1e400`, which parses
+  // to `Infinity` and passes it, and any finite value past ±8.64e15 is outside the range a Date can
+  // hold. Both reached `new Date(bootedAt).toISOString()` in the stale-server banner and threw
+  // `RangeError`, taking the Health report down at exactly the moment it exists to warn — the banner
+  // renders only when a server IS drifted (PR #217 review).
+  it("reports the drift without a boot time when the record's is not one a date can hold", async () => {
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild({ runner: true });
+    const mine = JSON.parse(readFileSync(recordPath(), "utf8"));
+
+    for (const bootedAt of [1e400, 1e20, -1e20]) {
+      writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1", bootedAt }));
+      const drift = serverBuildDrift();
+      // The drift is still reported — only the time it could not read is dropped.
+      expect(drift?.state).toBe("outdated");
+      expect(drift?.bootedAt).toBeNull();
+      expect(() => new Date(drift?.bootedAt ?? 0).toISOString()).not.toThrow();
+    }
+
+    // A boot time that IS a date still comes through, so the guard rejects the value and not the field.
+    writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1", bootedAt: 1_700_000_000_000 }));
+    expect(serverBuildDrift()?.bootedAt).toBe(1_700_000_000_000);
+  });
+
   // Nothing deletes a record at exit, so without a sweep every boot leaves one more file beside
   // anton.db — in a source checkout, at the repo root.
   it("clears the records of servers that are no longer running when it boots", async () => {

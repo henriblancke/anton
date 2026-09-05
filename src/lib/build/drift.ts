@@ -369,6 +369,25 @@ function artifactIdentity(): BuildIdentity | null {
  * of every install. Saying so about a server that IS running but left no record is `anton doctor`'s
  * job — it has the pidfile and the port to prove one is up.
  */
+/**
+ * The boot time a record carries, or null when what it carries cannot be a DATE (PR #217 review).
+ *
+ * `typeof x === "number"` is not the check it looks like: JSON admits `1e400`, which parses to
+ * `Infinity` and passes it, and any finite value past ±8.64e15 is out of the range a `Date` can
+ * hold. Both reach `new Date(bootedAt).toISOString()` in the stale-server banner and throw
+ * `RangeError`, taking the Health report down at exactly the moment it exists to warn — the banner
+ * only renders when a server IS drifted.
+ *
+ * Round-tripping through `Date` is the whole test, since that is what every reader does with it: a
+ * value that cannot become a time is treated as no boot time at all, and the drift is still reported
+ * without the "running since" line.
+ */
+function bootedAtOf(record: { bootedAt?: unknown } | null | undefined): number | null {
+  const bootedAt = record?.bootedAt;
+  if (typeof bootedAt !== "number") return null;
+  return Number.isFinite(new Date(bootedAt).getTime()) ? bootedAt : null;
+}
+
 export function serverBuildDrift(): BuildDrift | null {
   const db = dbPath();
   const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
@@ -376,8 +395,7 @@ export function serverBuildDrift(): BuildDrift | null {
   if (!running) return null;
   const verdict = compareBuild(running, onDiskIdentity());
   if (verdict.state === "current") return null;
-  const bootedAt = record && typeof record.bootedAt === "number" ? record.bootedAt : null;
-  return { ...verdict, bootedAt } as BuildDrift;
+  return { ...verdict, bootedAt: bootedAtOf(record) } as BuildDrift;
 }
 
 /**
@@ -455,7 +473,7 @@ async function readServerDrifts(): Promise<ServerDrift[]> {
     db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
   const drifts: ServerDrift[] = [];
   for (const record of records) {
-    const drift = driftOf(record, typeof record.bootedAt === "number" ? record.bootedAt : null);
+    const drift = driftOf(record, bootedAtOf(record));
     if (drift) drifts.push({ pid: record.pid, self: record.pid === process.pid, runner: runsJobs(record), drift });
   }
   const boot = booted();
