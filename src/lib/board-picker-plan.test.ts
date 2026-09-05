@@ -9,7 +9,10 @@ import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
 import {
   agedOutPicks,
+  DIGEST_FIELDS,
+  DIGEST_LABEL_NAMESPACES,
   getBoardPickerPlan,
+  isDecisionRelevantLabel,
   isPlanStale,
   saveBoardPickerPlan,
   sortExclusions,
@@ -19,6 +22,7 @@ import {
   type PickerPlanEntry,
 } from "./board-picker-plan";
 import { eligibleTargets } from "./jobs/picker-targets";
+import { rankTargets } from "./beads/rank";
 import type { Bead } from "./beads/types";
 import type { Clock } from "./jobs/queue";
 
@@ -100,21 +104,8 @@ describe("board stamp", () => {
     expect(stamped.digest).toMatch(/^[0-9a-f]{16}$/);
   });
 
-  // Everything eligibility and the PRIME ranking read. A move in any of them can change the answer,
-  // so a plan computed before it is no longer about this board.
-  it.each([
-    ["status", { status: "closed" }],
-    ["type", { issue_type: "epic" }],
-    ["priority", { priority: 0 }],
-    ["assignee", { assignee: "henri" }],
-    ["parent", { parent: "anton-epic" }],
-    ["labels", { labels: ["approved", "domain:eng", "risk:high"] }],
-    ["blocks edges", { dependencies: [{ issue_id: "anton-a", depends_on_id: "anton-b", type: "blocks" }] }],
-  ])("moves when a bead's %s changes", (_field, change) => {
-    const before = stampBoard([bead()], OBSERVED);
-
-    expect(stampBoard([bead(change)], OBSERVED).digest).not.toBe(before.digest);
-  });
+  // Every field the digest carries moves it — driven off the classification itself, in
+  // "decision inputs" below, so the list cannot fall behind the columns.
 
   // The contract lives in prose, but eligibility reads it: the approve gate faults a cleared
   // Acceptance as `approval-gap`, so a digest blind to the description would hold still across the
@@ -170,6 +161,146 @@ describe("board stamp", () => {
     );
 
     expect(after.digest).toBe(before.digest);
+  });
+});
+
+/**
+ * The classification the fence's narrowing rests on (anton-gsny): every column of the digest with a
+ * verdict and a stated reason, and the proof that each verdict describes the code rather than the
+ * hope — a field called decision-relevant must actually move the stamp, a namespace called
+ * irrelevant must be one nothing in the decision reads, and anything unclassified must stay in.
+ */
+describe("decision inputs", () => {
+  /** One edit per classified column, each chosen to move THAT column. */
+  const EDIT: Record<string, Partial<Bead>> = {
+    id: { id: "anton-z" },
+    status: { status: "closed" },
+    issue_type: { issue_type: "epic" },
+    priority: { priority: 0 },
+    assignee: { assignee: "henri" },
+    parent: { parent: "anton-epic" },
+    created_at: { created_at: "2026-07-01T00:00:00Z" },
+    labels: { labels: ["approved", "domain:eng", "risk:high"] },
+    dependencies: {
+      dependencies: [{ issue_id: "anton-a", depends_on_id: "anton-b", type: "blocks" }],
+    },
+    contract: { acceptance_criteria: undefined },
+  };
+
+  // The argued set, written out: a column added, dropped or reclassified is a decision somebody
+  // makes on purpose here, not a diff that slips through with the code that motivated it.
+  it("classifies every field the digest carries", () => {
+    expect(DIGEST_FIELDS.map((f) => `${f.field}: ${f.relevance} (${f.scope})`)).toEqual([
+      "id: decision-relevant (board)",
+      "status: decision-relevant (board)",
+      "issue_type: decision-relevant (board)",
+      "priority: decision-relevant (candidate)",
+      "assignee: decision-relevant (candidate)",
+      "parent: decision-relevant (board)",
+      "created_at: decision-relevant (candidate)",
+      "labels: decision-relevant (board)",
+      "dependencies: decision-relevant (board)",
+      "contract: decision-relevant (board)",
+    ]);
+  });
+
+  it.each([...DIGEST_FIELDS, ...DIGEST_LABEL_NAMESPACES])(
+    "states one line of reasoning for %s",
+    ({ why }) => {
+      expect(why.trim()).not.toBe("");
+      expect(why).not.toContain("\n");
+    },
+  );
+
+  it("has an edit for every classified column", () => {
+    expect(Object.keys(EDIT).sort()).toEqual(DIGEST_FIELDS.map((f) => f.field).sort());
+  });
+
+  // A verdict of "decision-relevant" is a claim about the fence as it stands: the column moves, and
+  // the stamp with it. Anything that stopped being true here is a plan holding still across an edit
+  // that could have changed its picks.
+  it.each(DIGEST_FIELDS)("carries $field in the fence", ({ field, read }) => {
+    const before = shaped();
+    const after = shaped(EDIT[field]);
+
+    expect(read(after)).not.toBe(read(before));
+    expect(stampBoard([after], OBSERVED).digest).not.toBe(stampBoard([before], OBSERVED).digest);
+  });
+
+  /**
+   * Why `board` scope is not a hedge. The comparator's second term counts what finishing a target
+   * transitively releases, so a status three hops downstream of a pick — on a bead no policy would
+   * ever admit, and that appears in no plan — reorders the queue. A fence narrowed to the beads a
+   * plan named would hold still across exactly this.
+   */
+  it("reorders the picks off a bead the plan neither picked nor could pick", () => {
+    const tie = { priority: 1, created_at: "2026-08-01T00:00:00Z" };
+    const held = (id: string, by: string, o: Partial<Bead> = {}) =>
+      bead({
+        id,
+        ...o,
+        dependencies: [{ issue_id: id, depends_on_id: by, type: "blocks" }],
+      });
+    // anton-a frees a 2-long chain, anton-b a 3-long one, and nothing else separates them.
+    const chain = [
+      held("anton-c", "anton-a"),
+      held("anton-d", "anton-c"),
+      held("anton-e", "anton-b"),
+      held("anton-f", "anton-e"),
+      held("anton-g", "anton-f"),
+    ];
+    const picks = [bead({ id: "anton-a", ...tie }), bead({ id: "anton-b", ...tie })];
+    const board = [...picks, ...chain];
+    const order = (all: Bead[]) => rankTargets(picks, all).map((r) => r.bead.id);
+
+    expect(order(board)).toEqual(["anton-b", "anton-a"]);
+
+    // Close the tail of anton-b's chain: it stops waiting, so anton-b's lead over anton-a goes with
+    // it and the id tiebreak decides instead.
+    const settled = board.map((b) => (b.id === "anton-g" ? { ...b, status: "closed" } : b));
+
+    expect(order(settled)).toEqual(["anton-a", "anton-b"]);
+    expect(stampBoard(settled, OBSERVED).digest).not.toBe(stampBoard(board, OBSERVED).digest);
+  });
+
+  /**
+   * The one namespace anton writes that eligibility reads back — the finding that keeps `stage:` out
+   * of the irrelevant set. `contractGatedBeads` skips a standalone target already in review, so no
+   * contract gate refuses it, and a target the gate had faulted becomes startable on a label alone.
+   */
+  it("flips a target into the eligible set on a stage: label alone", () => {
+    const thin = bead({ labels: ["approved"] });
+    const inReview = bead({ labels: ["approved", "stage:in-review"] });
+
+    expect(eligibleTargets([thin])).toMatchObject({
+      eligible: [],
+      exclusions: [{ beadId: "anton-a", reason: "approval-gap" }],
+    });
+    expect(eligibleTargets([inReview]).eligible).toHaveLength(1);
+  });
+
+  it.each(DIGEST_LABEL_NAMESPACES)("holds $namespace as $relevance", ({ namespace, relevance }) => {
+    expect(isDecisionRelevantLabel(`${namespace}:whatever`)).toBe(
+      relevance === "decision-relevant",
+    );
+  });
+
+  // Fail closed: a board invents its own vocabulary and an operator's criteria are written over it,
+  // so a namespace nobody has classified is one nobody has proved unread.
+  it.each(["domain:eng", "agent:human", "area:picker", "approved", "abandoned", ""])(
+    "keeps the unclassified label %j in the fence",
+    (label) => {
+      expect(isDecisionRelevantLabel(label)).toBe(true);
+    },
+  );
+
+  // This ticket classifies; the narrowing itself is anton-7zpv. Until it lands the fence still
+  // carries every label, and saying so out loud is what makes the next diff readable.
+  it("still stamps the namespaces it has classified irrelevant", () => {
+    const before = stampBoard([bead()], OBSERVED);
+    const scored = stampBoard([bead({ labels: ["approved", "domain:eng", "review-score:8"] })], OBSERVED);
+
+    expect(scored.digest).not.toBe(before.digest);
   });
 });
 
