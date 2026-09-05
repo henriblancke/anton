@@ -1,6 +1,7 @@
 # CI (anton-1j1). Runs the quality gates on every push to main and every PR: control bytes, lint,
 # typecheck, tests, and a production build. The release workflow (release.yml) runs the same gates on a `v*`
-# tag before cutting a Release, so a tag can only point at a green commit.
+# tag (plus a CLI-launch smoke check) before cutting a Release, so a tag can only point at a green
+# commit. Keep the two lists in sync: a gate added here belongs in release.yml's `gates` job too.
 name: ci
 
 on:

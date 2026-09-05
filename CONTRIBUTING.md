@@ -39,7 +39,7 @@ bun run build         # next build
   - `coverage` (non-blocking) — runs `test:coverage` and uploads the html/lcov report as a run artifact. Kept off the blocking gate because instrumentation slows the suite ~5x; there's no coverage threshold yet.
 - **Control bytes** — `.gitattributes` forces `diff` on source globs so a patch always renders, and `check:control-bytes` rejects the control bytes (NUL and friends) that would otherwise make a file binary and invisible to every reviewer. See [the decision record](./.product/decisions/2026-09-05-source-diffability.md).
 - **Dependencies** — [Dependabot](./.github/dependabot.yml) opens weekly PRs for npm/bun deps (minor+patch grouped, majors individual) and GitHub Actions.
-- **Release** — pushing a `v*` tag runs the same gates and cuts a GitHub Release (`.github/workflows/release.yml`).
+- **Release** — pushing a `v*` tag runs the same `check` gates (control bytes, lint, typecheck, test, build) plus a CLI-launch smoke check, then cuts a GitHub Release (`.github/workflows/release.yml`). The `secrets` and `coverage` jobs are CI-only.
 
 ### Automated code review (Codex)
 
