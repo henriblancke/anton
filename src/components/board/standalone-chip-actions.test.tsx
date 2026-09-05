@@ -13,6 +13,7 @@ import {
   ChipBacklogActions,
   canOfferRun,
 } from "@/components/board/standalone-chip-actions";
+import { PickDecisionProvider } from "@/components/board/pick-decision";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
 const approval = (over: Partial<StandaloneApproval> = {}): StandaloneApproval => ({
@@ -205,6 +206,26 @@ describe("ApproveRunAction — releasing a pick", () => {
     expect(html).toContain(">Queue<");
     expect(html).toContain(">Release<");
     expect(html).not.toContain(">Approve<");
+  });
+
+  it("offers no start at all on a pick no recorded plan names, and says what it waits for", () => {
+    // The lane ranks live (anton-r0ew), so a chip can be anton's pick with nothing written down to
+    // accept against (anton-5axf). The plain "Approve & run" is withheld with `[Release]`: it would
+    // start the pick while recording no answer to it, which is the same missing evidence.
+    const html = renderToStaticMarkup(
+      <PickDecisionProvider unconfirmed>
+        <ApproveRunAction
+          slug="anton"
+          item={makeStandaloneItem()}
+          budgetAware
+          approval={approval()}
+        />
+      </PickDecisionProvider>,
+    );
+    expect(html).not.toContain(">Release<");
+    expect(html).not.toContain(">Queue<");
+    expect(html).not.toContain("Approve &amp; run");
+    expect(html).toContain("anton confirms next pass");
   });
 
   it("withholds it from a pick the operator set aside", () => {

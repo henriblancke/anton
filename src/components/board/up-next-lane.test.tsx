@@ -8,7 +8,7 @@
  * on this screen may call the lane "Ready", because `bd ready` already means *unblocked*.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { DragEndEvent } from "@dnd-kit/core";
 
 import type { BudgetSignal } from "@/lib/budget-line";
@@ -164,6 +164,19 @@ const PLAN = [
   entry("anton-pick2", 1, { priority: 0, unblocks: 3 }),
   entry("anton-pick1", 2, { priority: 2, unblocks: 0 }),
 ];
+
+/**
+ * The lane with the picker's `◈ policy` mark on the given picks — the recorded plan naming them,
+ * which is what binds `[Release]` to a generation. The lane is derived (anton-r0ew), so an unmarked
+ * card in it is an ordinary state: ranked live, not yet written down.
+ */
+function markedBoard(...ids: string[]): Board {
+  const board = fixture(PLAN);
+  board.columns.backlog = board.columns.backlog.map((e) =>
+    ids.includes(e.id) ? { ...e, provenance: [{ kind: "policy" as const }] } : e,
+  );
+  return board;
+}
 
 /** Every column heading on the board, left to right — the flow order R3.1 constrains. */
 function laneOrder(): string[] {
@@ -466,18 +479,9 @@ describe("the budget line in the Up Next lane", () => {
  * inside the lane knows WHICH generation it was drawn from, exactly as the vetoes above it do.
  */
 describe("releasing a pick from the lane", () => {
-  /** The fixture with the picker's mark on rank 1 — what draws `[Release]` in place of Approve. */
-  function markedBoard(): Board {
-    const board = fixture(PLAN);
-    board.columns.backlog = board.columns.backlog.map((e) =>
-      e.id === "anton-pick2" ? { ...e, provenance: [{ kind: "policy" as const }] } : e,
-    );
-    return board;
-  }
-
   it("names the generation on screen, so the accept answers the pick that was shown", async () => {
     const fetchMock = stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
-    render(<EpicBoard slug="tmp" initialBoard={markedBoard()} />);
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
 
     fireEvent.click(screen.getByRole("button", { name: /release/i }));
 
@@ -496,7 +500,7 @@ describe("releasing a pick from the lane", () => {
     // ranking it just left. `takeUpNext` subtracts a started pick, but only a board UPDATE makes the
     // card actually move — which is the path a release triggers with `router.refresh()`.
     stubFetch({ "/approve": json({ jobId: "job-1", run: "started" }) });
-    const { rerender } = render(<EpicBoard slug="tmp" initialBoard={markedBoard()} />);
+    const { rerender } = render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
 
     fireEvent.click(screen.getByRole("button", { name: /release/i }));
 
@@ -526,6 +530,81 @@ describe("releasing a pick from the lane", () => {
 
     await waitFor(() => expect(screen.queryByRole("region", { name: "Up Next" })).toBeNull());
     expect(laneOf("anton-pick2")).toBe("Implementing");
+  });
+});
+
+/**
+ * The start is bound to the RECORD, not to the ranking (anton-5axf).
+ *
+ * Up Next is derived live (anton-r0ew), so it ranks targets the last pass never wrote down — and a
+ * release files an ACCEPT against a named generation, which is the evidence earned autonomy is
+ * granted on. A start offered on a pick no plan names would put an agreement to nothing into that
+ * record, so the card offers none and says what it is waiting for.
+ */
+describe("a lane pick the recorded plan has not caught up with (anton-5axf)", () => {
+  /** One pick's card in the lane — the shell the deep link opens, where its start affordance lives. */
+  function laneCard(beadId: string): HTMLElement {
+    const lane = screen.getByRole("region", { name: "Up Next" });
+    const card = lane.querySelector(`a[href="/projects/tmp/epics/${beadId}"]`)?.parentElement;
+    if (!card) throw new Error(`no lane card for ${beadId}`);
+    return card;
+  }
+
+  /** The whole row: the card plus the rank and the two vetoes the lane puts above it. */
+  const laneRow = (beadId: string) => laneCard(beadId).parentElement as HTMLElement;
+
+  const startButtons = (beadId: string) =>
+    within(laneCard(beadId))
+      .queryAllByRole("button")
+      .map((b) => b.textContent ?? "")
+      .filter((label) => /release|approve|queue/i.test(label));
+
+  it("keeps [Release] on the pick the recorded plan names, and withholds every start from the one it does not", () => {
+    // Rank 1 is in the plan the board still stands behind; rank 2 is the derived lane running ahead
+    // of it. Same lane, same read, two different bindings.
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    expect(startButtons("anton-pick2")).toEqual(["Release"]);
+    // Not even the plain Approve: it would start anton's own pick while recording no answer to it,
+    // which is the same missing evidence with the button relabelled.
+    expect(startButtons("anton-pick1")).toEqual([]);
+  });
+
+  it("still ranks the unnamed pick — it is unanswerable, not unranked", () => {
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    expect(laneOf("anton-pick1")).toBe("Up Next");
+    expect(screen.getByRole("group", { name: "Rank 2 — P2 · Feature · unblocks 0" })).toBeTruthy();
+    // And the ways to DISAGREE stay: a pick with no record to accept against is still one the
+    // operator can refuse, and that veto already binds itself to the generation (anton-jqvy).
+    expect(within(laneRow("anton-pick1")).getByRole("button", { name: /not now/i })).toBeTruthy();
+  });
+
+  it("says anton confirms the pick on the next pass, rather than leaving a bare gap", () => {
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    const waiting = within(laneCard("anton-pick1")).getByText(/anton confirms next pass/i);
+    expect(waiting.getAttribute("title")).toMatch(/no action needed/i);
+    // The confirmed pick says nothing of the sort — it has its button.
+    expect(within(laneCard("anton-pick2")).queryByText(/next pass/i)).toBeNull();
+  });
+
+  it("withholds the start when the lane has outrun the generation, mark or no mark", () => {
+    // The badge is history and outlives the plan it came from; the generation is what a verdict is
+    // written against. Without one there is nothing to answer, so the button goes.
+    const outrun: Board = { ...markedBoard("anton-pick2"), upNextPlanId: undefined };
+    render(<EpicBoard slug="tmp" initialBoard={outrun} />);
+
+    expect(startButtons("anton-pick2")).toEqual([]);
+    expect(within(laneCard("anton-pick2")).getByText(/next pass/i)).toBeTruthy();
+  });
+
+  it("leaves an ordinary Backlog card alone — it is not a pick, so it is not waiting on one", () => {
+    render(<EpicBoard slug="tmp" initialBoard={markedBoard("anton-pick2")} />);
+
+    const backlog = document.querySelector<HTMLElement>('[data-lane="Backlog"]');
+    expect(within(backlog!).getByRole("button", { name: /approve/i })).toBeTruthy();
+    expect(within(backlog!).queryByText(/next pass/i)).toBeNull();
   });
 });
 

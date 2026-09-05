@@ -272,9 +272,13 @@ export function canStartRun(epic: Pick<Epic, "childReadiness">): boolean {
  * `[Release]` rather than the plain `Approve` every other backlog card carries (R3.5).
  *
  * A STALE mark is not a pick. The badge outlives the plan it came from — it records the rule this
- * target was picked under — but the button claims something stronger, that this is what anton would
- * start next, and the board withdraws the Up Next lane on exactly that fact. Reading the flag here
- * is what keeps the two agreeing: no lane, no release.
+ * target was picked under — but the button claims something stronger: that a RECORDED decision names
+ * this target, which is what the accept a release files is written against. A stale plan is one
+ * anton no longer stands behind, so it names nothing a verdict could answer.
+ *
+ * Since the lane went derived (anton-r0ew) this no longer tracks the lane. Up Next ranks live, so it
+ * draws targets no recorded plan names at all — and those are unanswerable rather than unranked. The
+ * lane binds the start to this predicate and says so on the card instead (anton-5axf).
  */
 export function isPickerPick(provenance: BeadProvenance[] | undefined): boolean {
   return provenance?.some((mark) => mark.kind === "policy" && !mark.stale) ?? false;

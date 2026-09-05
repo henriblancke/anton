@@ -1630,6 +1630,31 @@ describe("a pick the board has moved past (anton-t9m4)", () => {
     expect(served.upNextPlanId).toBeUndefined();
   });
 
+  it("leaves a derived pick the plan never saw unmarked, so the lane offers it no start", async () => {
+    // The board has moved past the plan, which is the ordinary case for a derived lane: `f-1` keeps
+    // the rule it WAS picked under (flagged), and `f-2` — ranked by this read alone — has no record
+    // at all. Neither can be released: the mark that binds the accept is stale on one and absent on
+    // the other, and the generation a verdict names is withheld from both (anton-5axf).
+    const board = [feature(), makeBead({ id: "f-2", title: "Filed since", issue_type: "feature" })];
+    listMock.mockResolvedValue(board);
+    pickerPlan = {
+      projectId: "p1",
+      planId: "plan-1",
+      generatedAt: 1_770_000_000,
+      stamp: { observedAtMs: 1_770_000_000_000, digest: "stale", beadCount: 1 },
+      entries: [{ beadId: "f-1", rank: 1, rule: "any claimable run target" }],
+      exclusions: [],
+    };
+
+    const served = await getBoard(project);
+    expect(served.upNext?.map((e) => e.beadId)).toEqual(["f-1", "f-2"]);
+    expect(served.upNextPlanId).toBeUndefined();
+    expect(served.columns.backlog.find((e) => e.id === "f-1")?.provenance).toEqual([
+      { kind: "policy", detail: "any claimable run target", stale: true },
+    ]);
+    expect(served.columns.backlog.find((e) => e.id === "f-2")?.provenance).toBeUndefined();
+  });
+
   it("leaves the mark unflagged while the plan still describes the board", async () => {
     const board = [feature()];
     listMock.mockResolvedValue(board);

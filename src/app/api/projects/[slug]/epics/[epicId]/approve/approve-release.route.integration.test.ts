@@ -282,6 +282,24 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
     expect(await verdictsFor(unpicked)).toHaveLength(0);
   });
 
+  it("records nothing for an unnamed pick even when the generation named is the current one", async () => {
+    // The lane is DERIVED (anton-r0ew): it ranks targets the recorded plan has not caught up with,
+    // so a release can arrive naming the very generation on screen for a bead that generation never
+    // picked. Naming the right plan is not agreeing with a decision it contains — the accept is
+    // refused on the entry, not on the id (anton-5axf). The board withholds the button on the same
+    // fact; this is the half a client cannot be trusted for.
+    actAs("anton-test");
+    const picked = await runTarget("Named by the plan");
+    const derived = await runTarget("Ranked ahead of the plan");
+    const planId = await planFor(picked);
+
+    const res = await approve(derived, { release: true, planId });
+    expect(res.status).toBe(200);
+    expect(await executeEpicJobs(derived)).toHaveLength(1);
+
+    expect(await verdictsFor(derived)).toHaveLength(0);
+  });
+
   it("records nothing when the board has moved past the plan that picked the target", async () => {
     // The lane's own standard, held on the server: a stale plan withholds `[Release]`, so a release
     // that arrives against one came from a client whose copy of the decision is provably behind.

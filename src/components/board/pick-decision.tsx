@@ -1,6 +1,10 @@
 "use client";
 
 import { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
+import { HourglassIcon } from "lucide-react";
+
+import { MetaChip } from "@/components/atoms";
+import { cn } from "@/lib/utils";
 
 /**
  * One answer per pick (PR #212 review).
@@ -36,6 +40,15 @@ export type PickDecision = {
    * Undefined under neither: a Backlog card is not a pick, so its approve answers no decision.
    */
   planId?: string;
+  /**
+   * This pick is the LIVE ranking's, and no recorded plan names it — so there is no generation a
+   * verdict could be written against (anton-5axf).
+   *
+   * Set only by a surface that presents the pick as one. It defaults to false everywhere else, and
+   * has to: an ordinary Backlog card is not a pick at all, and its plain Approve is nobody's
+   * agreement with anton.
+   */
+  unconfirmed: boolean;
   /** Take the pick synchronously; `false` means another control already holds or settled it. */
   claim: () => boolean;
   /** The write landed — the pick is answered. */
@@ -46,6 +59,7 @@ export type PickDecision = {
 
 const OPEN: PickDecision = {
   state: "open",
+  unconfirmed: false,
   claim: () => true,
   settle: () => {},
   abandon: () => {},
@@ -111,10 +125,13 @@ export function useCardVeto(): PlanSurface["onVetoed"] {
 
 export function PickDecisionProvider({
   planId,
+  unconfirmed = false,
   children,
 }: {
   /** The generation the cards below were projected from; omitted when there is no plan to name. */
   planId?: string;
+  /** This pick is ranked but unrecorded, so no verdict can be bound to it ({@link PickDecision}). */
+  unconfirmed?: boolean;
   children: React.ReactNode;
 }) {
   const held = useRef<PickDecision["state"]>("open");
@@ -134,10 +151,45 @@ export function PickDecisionProvider({
   const abandon = useCallback(() => move("open"), [move]);
 
   const value = useMemo<PickDecision>(
-    () => ({ state, claim, settle, abandon, ...(planId === undefined ? {} : { planId }) }),
-    [state, claim, settle, abandon, planId],
+    () => ({
+      state,
+      unconfirmed,
+      claim,
+      settle,
+      abandon,
+      ...(planId === undefined ? {} : { planId }),
+    }),
+    [state, unconfirmed, claim, settle, abandon, planId],
   );
   return <PickDecisionContext.Provider value={value}>{children}</PickDecisionContext.Provider>;
+}
+
+/**
+ * What stands where `[Release]` would, on a pick anton has ranked but not yet written down
+ * (anton-5axf).
+ *
+ * The start is withheld because the ACCEPT is: a release records the operator's agreement with a
+ * named decision, and that record is the evidence earned autonomy is granted on — so a start against
+ * a generation no plan names would credit the picker with an agreement to nothing. The plain Approve
+ * is withheld for the same reason and not a weaker one: it would start anton's own pick while
+ * recording no answer at all, which is the same missing evidence with the button relabelled.
+ *
+ * Said rather than merely missing. A card ranked #1 with no control on it reads as broken, and an
+ * operator who cannot tell a withheld start from a bug goes around the lane to approve from Backlog
+ * — which is exactly the unevidenced start this withholds. So the card names the wait and its end:
+ * one pass, no action required.
+ */
+export function PickAwaitingRecord({ className }: { className?: string }) {
+  return (
+    <MetaChip className={cn("pointer-events-auto", className)}>
+      <HourglassIcon className="size-2.5" aria-hidden="true" />
+      {/* Terse like the chips beside it, because it shares their row on a lane-width column; the
+          sentence that explains the wait rides in the title, where the badge's own does. */}
+      <span title="anton ranks this lane live, and the pass that records its picks has not run yet. Releasing now would file an agreement against a decision nothing has written down, so this pick's start waits one pass — no action needed.">
+        anton confirms next pass
+      </span>
+    </MetaChip>
+  );
 }
 
 export function usePickDecision(): PickDecision {

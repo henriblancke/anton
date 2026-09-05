@@ -11,7 +11,7 @@ import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
 import { VetoActions } from "@/components/board/veto-actions";
-import { usePickDecision } from "@/components/board/pick-decision";
+import { PickAwaitingRecord, usePickDecision } from "@/components/board/pick-decision";
 import { isPickerPick } from "@/components/board/board-utils";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
@@ -34,7 +34,8 @@ export function canOfferRun(item: StandaloneItem, approved: boolean, deferred: b
  *
  * A contract gap withholds the run the way an open blocker does, but asks for an edit rather than a
  * wait — so the affordance stays put and names the missing section instead of failing on click
- * (mirrors the card).
+ * (mirrors the card). An unrecorded pick withholds it ahead of both and offers nothing to click at
+ * all (anton-5axf) — also mirroring the card.
  */
 export function ApproveRunAction({
   slug,
@@ -52,7 +53,12 @@ export function ApproveRunAction({
   // would vanish on the next poll (PR #212 review). Reopen the affordance until a run actually
   // starts; approve re-enqueues for an already-approved target.
   const [unrun, setUnrun] = useState(false);
+  // This chip is anton's pick and nothing has recorded that decision: a start here would be one the
+  // accept ledger has no answer for, so the chip says what it is waiting for instead.
+  const { unconfirmed } = usePickDecision();
   if (!canOfferRun(item, approval.approved, approval.deferred) && !unrun) return null;
+
+  if (unconfirmed) return <PickAwaitingRecord />;
 
   if (contractBlocks(item.contract)) {
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;

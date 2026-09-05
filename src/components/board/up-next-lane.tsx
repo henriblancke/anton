@@ -7,7 +7,7 @@ import { GripVerticalIcon } from "lucide-react";
 import Link from "next/link";
 
 import type { UpNextCard } from "@/components/board/board-utils";
-import { UP_NEXT_LABEL, upNextMetaLabel } from "@/components/board/board-utils";
+import { UP_NEXT_LABEL, isPickerPick, upNextMetaLabel } from "@/components/board/board-utils";
 import { BudgetDivider, BudgetWaiting, useBudgetSignal } from "@/components/board/budget-line";
 import { EpicCard } from "@/components/board/epic-card";
 import { PickDecisionProvider } from "@/components/board/pick-decision";
@@ -254,7 +254,8 @@ export function UpNextAbsenceLane({ slug, absence }: { slug: string; absence: Up
  * The row is also where the pick's ONE decision lives: `[Release]` renders inside the card and the
  * vetoes render above it, so nothing below could serialize them (PR #212 review). Scoped per row —
  * answering one pick never freezes the rest of the plan. The provider carries the generation on
- * screen with it, so the release inside the card names the same decision the vetoes above it do.
+ * screen with it, so the release inside the card names the same decision the vetoes above it do —
+ * or carries that there is none to name, which is what takes the start off the card (anton-5axf).
  */
 function UpNextRow({
   slug,
@@ -278,6 +279,13 @@ function UpNextRow({
   const { beadId } = card.entry;
   const title = card.kind === "epic" ? card.epic.title : card.item.title;
   const notNowUntil = card.kind === "epic" ? card.epic.notNowUntil : card.item.notNowUntil;
+  const provenance = card.kind === "epic" ? card.epic.provenance : card.item.provenance;
+  // Is there a RECORDED decision behind this pick? The lane is DERIVED (anton-r0ew), so it ranks
+  // targets the last pass never wrote down — and a verdict on one of those has no generation to
+  // name. Both halves are asked because both are what binds it: the `◈ policy` mark is the plan
+  // naming THIS target (isPickerPick, which a stale plan fails), and `planId` is the generation the
+  // accept is written against. Missing either, the card offers no start at all (anton-5axf).
+  const unconfirmed = planId === undefined || !isPickerPick(provenance);
 
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
     useSortable({
@@ -294,7 +302,7 @@ function UpNextRow({
   };
 
   return (
-    <PickDecisionProvider {...(planId === undefined ? {} : { planId })}>
+    <PickDecisionProvider unconfirmed={unconfirmed} {...(planId === undefined ? {} : { planId })}>
       <div
         ref={setNodeRef}
         style={style}
