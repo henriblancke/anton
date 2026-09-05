@@ -251,6 +251,14 @@ export async function settleTicketTimeout(args: {
     const preservedOn =
       "branch" in kept ? kept.branch : "retainedOn" in kept ? kept.retainedOn : null;
     const retained = preservedOn !== null && !fresh;
+    // Asked BEFORE the tree is touched, not only after (PR #228 review). Only the preserve's gate
+    // window and its own commit observe the job signal; every EARLY refusal — the strict history
+    // read, the already-committed exit, the unchanged tree, a run with siblings, a project pinning
+    // no gates — returns a rollback verdict having never looked, and the rollback below hard-resets
+    // the worktree onto the baseline. A kill or a lost lease landing in that window would take the
+    // ticket's edits with it, which is exactly what the abort path must not do: the tree belongs to
+    // whoever stopped the run, and the ticket goes to the abort path below untouched.
+    if (ctx.signal.aborted) return;
     // Both routes answer the SAME question — is anything of this ticket still loose in the tree —
     // and neither is trusted to have worked. A FRESH preserve re-reads the tree from scratch (`null`
     // baseline: dirt is dirt, whatever it was before), because the commit it just made moved the
@@ -260,8 +268,8 @@ export async function settleTicketTimeout(args: {
     const leftovers = fresh
       ? await leftChangesBehind(worktreePath, null)
       : await rollbackTimedOutTicket(worktreePath, baseline, committed);
-    // Asked AGAIN, because the tree read above is the last await between the preserve's own abort
-    // check and the first board write (PR #228 review). A kill that lands in that window is still a
+    // Asked AGAIN, because the tree read above is the last await between the check above and the
+    // first board write (PR #228 review). A kill that lands in that window is still a
     // kill: the ordinary abort path writes nothing to a board a human is deciding on, and the
     // timeout's status/assignee/label/note would be a write it never authorised. The worktree work
     // is already settled either way — kept or rolled back — so there is nothing left to lose by

@@ -20,7 +20,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -441,6 +441,39 @@ suite("preserveTimedOutWork (real git)", () => {
     expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
   });
 
+  // The marker call that FAILED after its commit landed (PR #228 review). `--no-verify` bypasses
+  // only `pre-commit` and `commit-msg`, so a `post-commit` hook outliving the commit budget rejects
+  // a call whose empty marker is already on the branch. Believed, that rejection reports the work
+  // unmarked — which poison-parks the run and tells the operator to hand-create a marker that
+  // exists, on a branch a resume could already have continued from.
+  it("accepts a marker that landed under a commit call a post-commit hook then failed", async () => {
+    const baseline = await readWorktreeState(repo);
+    write("FINISHED.md", "work the agent committed itself, against the contract\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "feat: the agent's own subject"]);
+    const selfCommitted = head();
+    const hooks = join(repo, ".git", "hooks");
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "post-commit"), "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    // Long enough for git to reach the hook, short enough that the hook outlives it.
+    process.env[COMMIT_TIMEOUT_ENV] = "1500";
+
+    const kept = await preserveTimedOutWork({
+      run: run(new AbortController().signal, { testCommand: "true" }),
+      ticket,
+      logPath,
+      baseline,
+      committed: false,
+      timeoutMs: 60_000,
+      standalone: true,
+    });
+
+    expect(kept).toEqual({ branch: BRANCH, retained: false });
+    // The marker really is on the branch, exactly once, on top of the agent's own commit.
+    expect(subjects().filter((s) => s.startsWith(`WIP ${ticket.id}:`))).toHaveLength(1);
+    expect(out(["rev-parse", "HEAD~1"])).toBe(selfCommitted);
+  });
+
   // The marker is EMPTY by contract, and `--allow-empty` only permits that — it does not force it
   // (PR #228 review). So the marker is made with this project's hooks BYPASSED: a `pre-commit` that
   // stages files of its own would otherwise either ride into a commit whose message says it is
@@ -678,6 +711,33 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
 
     // No TicketTimeoutError, no poison: it returns, and the caller's abort path settles the ticket.
     await expect(settled).resolves.toBeUndefined();
+  });
+
+  // The same kill against a preserve that refuses EARLY (PR #228 review). Only the gate window and
+  // the preserved commit look at the job signal; a run with siblings — like an unreadable baseline,
+  // an unchanged tree or a project pinning no gates — refuses before either, so the verdict comes
+  // back having never observed the abort. Acted on, the rollback hard-resets the worktree and takes
+  // the ticket's edits with it, which is the one thing a kill is entitled to be spared.
+  it("leaves the worktree to whoever stopped the run when the preserve refused early", async () => {
+    const abort = new AbortController();
+    const baseline = await readWorktreeState(repo);
+    writeFileSync(join(repo, "HALF_WRITTEN.md"), "work the kill must not delete\n");
+
+    const settled = settleTicketTimeout({
+      run: run(abort.signal),
+      ticket,
+      session: { logPath, sessionId: "sess-1" },
+      baseline,
+      progress: { committed: false, delivered: false, selfReport: null },
+      timeoutMs: 60_000,
+      // A run with other tickets: the preserve refuses before it ever reaches the gates.
+      standalone: false,
+      ranOutOfTime: true,
+    });
+    abort.abort();
+
+    await expect(settled).resolves.toBeUndefined();
+    expect(existsSync(join(repo, "HALF_WRITTEN.md"))).toBe(true);
   });
 });
 

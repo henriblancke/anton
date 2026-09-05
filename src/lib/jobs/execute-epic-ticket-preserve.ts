@@ -330,8 +330,9 @@ export async function preserveTimedOutWork(args: {
  *
  * A `commit-msg` hook enforcing its own subject convention is what would otherwise reject that
  * marker, so {@link commitMarker} makes it with this project's hooks bypassed — legitimate for that
- * commit and no other, since it is EMPTY and no hook is being asked about content. Work that still
- * cannot be marked is truly unmarked — never rolled back, since the commits outrank their
+ * commit and no other, since it is EMPTY and no hook is being asked about content. A rejected marker
+ * call is then checked against the HISTORY rather than believed, and only work the branch genuinely
+ * does not carry a marker for is truly unmarked — never rolled back, since the commits outrank their
  * bookkeeping, but handed to a person instead of reported as preserved.
  */
 async function adoptSelfCommittedWork(args: {
@@ -347,7 +348,16 @@ async function adoptSelfCommittedWork(args: {
 }): Promise<PreservedWork> {
   const { worktreePath, branch, ticket, timeoutMs, logPath, why, alreadyMarked } = args;
   const message = preservedCommitMessage(ticket, timeoutMs, { marker: true });
-  const marked = alreadyMarked || (await safe(() => commitMarker(worktreePath, message)));
+  // A REJECTED marker call is not proof the marker is absent (PR #228 review). `--no-verify` bypasses
+  // only `pre-commit` and `commit-msg` (git-commit(1)); `post-commit` runs AFTER the commit is made,
+  // so a hook outliving the commit budget fails a call whose marker is already on the branch — and
+  // the halt below would then tell the operator to create a marker that exists. History decides, not
+  // the call's exit status. A read that fails stays "unmarked": that answer stops for a person, where
+  // a wrong "marked" reports work no resume can see as preserved.
+  const marked =
+    alreadyMarked ||
+    (await safe(() => commitMarker(worktreePath, message))) ||
+    (await worktreeHasPreservedCommitFor(worktreePath, ticket.id));
   if (!marked) {
     await logPreserve(
       logPath,
