@@ -362,10 +362,13 @@ describe("a named absence in place of the lane (anton-w579)", () => {
     render(<EpicBoard slug="tmp" initialBoard={withAbsence("no-claimable-work")} />);
 
     const lane = absenceLane();
-    expect(lane.textContent).toContain("nothing it may claim");
+    expect(lane.textContent).toContain("Nothing on this board is work anton may start right now.");
     expect(lane.textContent).toContain(
-      "Approve a target the policy admits — or release one you set aside — and the next pass ranks it here.",
+      "Clear what holds a target back — a blocker, a thin contract, a policy too narrow — or wait out one you set aside, and this lane fills again.",
     );
+    // The remedy must not be an impossible one (PR #226 review): Approve starts a target rather than
+    // making it rankable, and nothing clears a veto before its window runs out.
+    expect(lane.textContent).not.toMatch(/approve/i);
     expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')).toBeTruthy();
   });
 

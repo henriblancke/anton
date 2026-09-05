@@ -183,8 +183,9 @@ function LaneHead({
  *
  * The link goes where the condition is actually cleared, so the operator never has to hunt for the
  * control the sentence just named. `no-claimable-work` points at the policy rather than at the
- * Backlog beside it: approving work is already the obvious move, and a policy too narrow to admit
- * anything is the half of that state nothing else on the board would explain.
+ * Backlog beside it: its other holds — a blocker, a thin contract — are cleared on the target
+ * itself, and a policy too narrow to admit anything is the half of that state nothing else on the
+ * board would explain.
  */
 const ABSENCE_COPY: Record<
   UpNextAbsence,
@@ -213,9 +214,12 @@ const ABSENCE_COPY: Record<
   },
   "no-claimable-work": {
     badge: "none",
-    headline: "The last pass found nothing it may claim.",
+    // Never "approve one" (PR #226 review): the board's Approve STARTS the target rather than making
+    // it rankable, and a veto has no control that clears it early. The remedies named here are the
+    // ones that can actually put a target back in the ranking.
+    headline: "Nothing on this board is work anton may start right now.",
     clears:
-      "Approve a target the policy admits — or release one you set aside — and the next pass ranks it here.",
+      "Clear what holds a target back — a blocker, a thin contract, a policy too narrow — or wait out one you set aside, and this lane fills again.",
     link: { label: "Work policy", hash: "policy" },
   },
 };
