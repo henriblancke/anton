@@ -105,9 +105,19 @@ let projectSettings: {
   pickerAutonomy?: import("./policy/types").PickerAutonomy;
 } = { pickerAutonomy: "shadow" };
 
+// The settings read itself can fail (a locked or missing anton.db). The board then knows neither the
+// armed policy nor the level, and what it does with that unknown is load-bearing (PR #226 review).
+let settingsReadFails = false;
+
 vi.mock("./projects", async () => {
   const actual = await vi.importActual<typeof import("./projects")>("./projects");
-  return { ...actual, getProjectSettings: async () => projectSettings };
+  return {
+    ...actual,
+    getProjectSettings: async () => {
+      if (settingsReadFails) throw new Error("anton.db is locked");
+      return projectSettings;
+    },
+  };
 });
 
 const { deriveStage, getBoard, getBoardVersion } = await import("./board");
@@ -126,6 +136,7 @@ beforeEach(() => {
   pickerArmed = true;
   pickerRecord = { settled: 0, accepted: 0 };
   projectSettings = { pickerAutonomy: "shadow" };
+  settingsReadFails = false;
 });
 
 function makeBead(overrides: Partial<Bead> & { id: string; title: string }): Bead {
@@ -1433,6 +1444,18 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
       const served = await getBoard(project);
       expect(served.upNext).toHaveLength(1);
       expect(served.upNextAbsence).toBeUndefined();
+    });
+
+    it("names a policy anton could not read, rather than ranking as if none were armed", async () => {
+      // The settings read is where the armed policy comes from, so a failure leaves it UNKNOWN — and
+      // an unknown policy is not an absent one. Ranking here would present every structurally
+      // eligible target as what anton would start, including the ones the armed policy rejects.
+      listMock.mockResolvedValue([feature()]);
+      settingsReadFails = true;
+
+      const served = await getBoard(project);
+      expect(served.upNext).toBeUndefined();
+      expect(served.upNextAbsence).toBe("policy-unreadable");
     });
 
     it("names nothing while a lane is drawn", async () => {

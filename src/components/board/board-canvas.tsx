@@ -34,7 +34,7 @@ export function BoardCanvas({
   reordering: boolean;
 } & CardContext) {
   return view.lanes ? (
-    <BoardLanes lanes={view.lanes} planId={view.planId} {...cards} />
+    <BoardLanes lanes={view.lanes} planId={view.planId} ranked={view.ranked} {...cards} />
   ) : (
     <BoardStageGrid
       columns={view.columns}
@@ -120,17 +120,20 @@ function BoardStageGrid({
  * under the single stage strip, at any width.
  *
  * The picks stay in their epic's Backlog slice here — no lane, so no row to carry the generation
- * they were drawn from, and none to carry the vetoes either. The surface supplies both: without the
- * generation `[Release]` would post an unnamed accept the server resolves against whatever plan is
- * current by then, and without the veto sink this layout would offer the operator no way to REFUSE
- * a pick at all (PR #212 review).
+ * they were drawn from, none to carry the vetoes, and none to say which cards are picks at all. The
+ * surface supplies all three: without the generation `[Release]` would post an unnamed accept the
+ * server resolves against whatever plan is current by then, without the veto sink this layout would
+ * offer the operator no way to REFUSE a pick (PR #212 review), and without the ranked ids a pick the
+ * recorded plan does not name would get its start back here — the one the lane withholds because
+ * nothing has written the decision down (anton-5axf / PR #226 review).
  */
 function BoardLanes({
   lanes,
   planId,
+  ranked,
   onVetoed,
   ...cards
-}: { lanes: EpicLane[]; planId?: string } & CardContext) {
+}: { lanes: EpicLane[]; planId?: string; ranked: ReadonlySet<string> } & CardContext) {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-auto">
       <LaneStageStrip />
@@ -141,6 +144,7 @@ function BoardLanes({
       ) : (
         <PlanGenerationProvider
           {...(planId === undefined ? {} : { planId })}
+          ranked={ranked}
           onVetoed={onVetoed}
         >
           <div className="flex flex-col divide-y divide-border">

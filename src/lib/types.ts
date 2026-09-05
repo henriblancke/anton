@@ -363,14 +363,23 @@ export interface UpNextEntry {
 /**
  * Why there is no ranking to draw, when the reason is one the operator can act on (anton-w579).
  *
- * Three distinct nothings, and the lane must say which — "no plan" and "the pass is off" and "the
- * board is empty of claimable work" ask for three different things from the person reading it.
+ * Distinct nothings, and the lane must say which — "no plan" and "the pass is off" and "the board is
+ * empty of claimable work" ask for different things from the person reading it.
  *
  *   • `disarmed` — the `board-picker` schedule is off here, so no pass ranks anything.
  *   • `proposes-only` — the pass runs and records a ranking, but the level promises nothing offered.
  *   • `no-claimable-work` — the pass ran against this board and found nothing it may start.
+ *   • `policy-unreadable` — the settings read failed, so the armed policy is UNKNOWN and the board
+ *     refuses to rank as if none were armed (PR #226 review). The one absence that is about anton
+ *     rather than about the operator's board, and it is still named: a lane that ranked everything
+ *     structurally eligible would present targets the configured policy rejects as what anton would
+ *     start next.
  */
-export type UpNextAbsence = "disarmed" | "proposes-only" | "no-claimable-work";
+export type UpNextAbsence =
+  | "disarmed"
+  | "proposes-only"
+  | "no-claimable-work"
+  | "policy-unreadable";
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
  * SyncStatus there — kept as a separate declaration so client components import types without the

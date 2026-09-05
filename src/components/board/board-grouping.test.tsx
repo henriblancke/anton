@@ -151,6 +151,14 @@ function picked(): Board {
   };
 }
 
+/**
+ * The same live ranking with NO recorded plan behind its picks — the ordinary state since the lane
+ * went derived (anton-r0ew): anton would start these next, and no pass has written that down yet.
+ */
+function unrecorded(): Board {
+  return { ...fixture(), upNext: picked().upNext, upNextPlanId: PLAN_ID };
+}
+
 /** The EpicCard root for a card — the element wrapping its full-card deep link. */
 function cardMarkup(cardId: string): string {
   const link = document.querySelector(`a[href="/projects/tmp/epics/${cardId}"]`);
@@ -247,6 +255,31 @@ describe("board grouping (anton-9pkk.4)", () => {
     expect(screen.getAllByRole("button", { name: /release/i })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: /not now/i })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: "Never" })).toHaveLength(2);
+  });
+
+  it("withholds an unrecorded pick's start here too, so the grouping toggle is no way around it", () => {
+    // The lane ranks live (anton-r0ew), so it draws picks no recorded plan names, and their start is
+    // withheld because the accept has nothing to answer (anton-5axf). The swimlanes have no lane row
+    // to carry that, so before this the toggle handed the start back — a click away from the very
+    // unevidenced start the guard exists to prevent (PR #226 review).
+    const board = unrecorded();
+    board.columns.backlog = [
+      ...board.columns.backlog,
+      epic("anton-9", { title: "Nothing ranks this", epic: OUTCOME }),
+    ];
+    render(<EpicBoard slug="tmp" initialBoard={board} />);
+
+    const withheld = () => screen.getAllByText(/anton confirms next pass/i).length;
+    expect(withheld()).toBe(2);
+
+    toggleTo("Epic");
+
+    // Both picks — the card and the chip — still say what they wait for, and neither offers a start.
+    expect(withheld()).toBe(2);
+    expect(screen.queryAllByRole("button", { name: /release/i })).toHaveLength(0);
+    // The backlog card the ranking never named is untouched: an ordinary Approve is nobody's
+    // agreement with anton, so nothing about it is waiting on a pass.
+    expect(screen.getAllByRole("button", { name: /^approve/i })).toHaveLength(1);
   });
 
   it("names the generation on screen, so the decline answers the pick that was shown", async () => {

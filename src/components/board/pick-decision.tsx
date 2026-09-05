@@ -70,6 +70,11 @@ const PickDecisionContext = createContext<PickDecision>(OPEN);
 /** What a surface that renders picks without a lane row of their own tells the cards below it. */
 type PlanSurface = {
   planId?: string;
+  /**
+   * The LIVE ranking's targets by bead id. Which cards below are picks at all — the fact a lane row
+   * carries by existing, and that a swimlane has to be told (see {@link useUnrecordedPick}).
+   */
+  ranked?: ReadonlySet<string>;
   onVetoed?: (beadId: string, untilMs: number) => void;
 };
 
@@ -88,6 +93,11 @@ const PlanSurfaceContext = createContext<PlanSurface>(EMPTY_SURFACE);
  * current, so a later pass that re-picked the bead would be credited with an agreement to a pick the
  * operator never saw.
  *
+ * `ranked` is what tells those cards they are picks. The lane row says it by existing — every row is
+ * one — so without it a live-ranked target the recorded plan does not name is indistinguishable here
+ * from an ordinary Backlog card, and the start anton-5axf withholds would come back with one click
+ * of the grouping toggle (PR #226 review).
+ *
  * `onVetoed` is the other half of that missing row: with no row to hang them on, the two ways to
  * DISAGREE with a pick go on the card itself, and this is where the hold they place is reported so
  * the surface can hold the target back before its next poll. Its presence is what puts them there —
@@ -98,19 +108,22 @@ const PlanSurfaceContext = createContext<PlanSurface>(EMPTY_SURFACE);
  */
 export function PlanGenerationProvider({
   planId,
+  ranked,
   onVetoed,
   children,
 }: {
   planId?: string;
+  ranked?: ReadonlySet<string>;
   onVetoed?: (beadId: string, untilMs: number) => void;
   children: React.ReactNode;
 }) {
   const surface = useMemo<PlanSurface>(
     () => ({
       ...(planId === undefined ? {} : { planId }),
+      ...(ranked === undefined ? {} : { ranked }),
       ...(onVetoed === undefined ? {} : { onVetoed }),
     }),
-    [planId, onVetoed],
+    [planId, ranked, onVetoed],
   );
   return <PlanSurfaceContext.Provider value={surface}>{children}</PlanSurfaceContext.Provider>;
 }
@@ -190,6 +203,24 @@ export function PickAwaitingRecord({ className }: { className?: string }) {
       </span>
     </MetaChip>
   );
+}
+
+/**
+ * Is THIS card one of anton's live picks with no recorded decision behind it (anton-5axf)?
+ *
+ * One question, asked the same way on every surface. The lane answers it per row, on the pick's own
+ * {@link PickDecisionProvider}; the epic swimlanes have no rows, so the card asks the surface for the
+ * same two halves — is it in the live ranking, and does a current generation name it (PR #226
+ * review). Without that second path the grouping toggle was a way around the withheld start: the
+ * server refuses the accept either way, so the button offered a start it could not evidence.
+ *
+ * @param recorded the `◈ policy` mark of a plan anton still stands behind (`isPickerPick`).
+ */
+export function useUnrecordedPick(beadId: string, recorded: boolean): boolean {
+  const decision = usePickDecision();
+  const { ranked } = useContext(PlanSurfaceContext);
+  if (decision.unconfirmed) return true;
+  return ranked?.has(beadId) === true && (decision.planId === undefined || !recorded);
 }
 
 export function usePickDecision(): PickDecision {

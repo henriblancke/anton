@@ -45,6 +45,12 @@ export interface BoardView {
   /** The generation the picks on screen were drawn from, so a verdict names the plan it answers. */
   planId?: string;
   /**
+   * Every bead the LIVE ranking names, whatever the grouping. In the stage view the lane's rows say
+   * this by existing; the swimlanes have no rows, so their cards are told which of them are picks
+   * (PR #226 review) — the half of "unrecorded pick" that a card cannot see for itself.
+   */
+  ranked: ReadonlySet<string>;
+  /**
    * WHICH absence the lane is showing, when the server named one (anton-w579). Carried through
    * untouched: the states it names are about the PASS and the board, and no filter on this screen
    * clears any of them.
@@ -106,6 +112,13 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
     [grouping, board],
   );
 
+  // Read off the board rather than off `upNext` above, which is empty in the epic grouping — the
+  // ranking is a fact about the project, not about the arrangement the operator is looking at.
+  const ranked = useMemo(
+    () => new Set((board?.upNext ?? []).map((entry) => entry.beadId)),
+    [board?.upNext],
+  );
+
   // The swimlanes are a regrouping of the very cards above — the sorted columns feed both views, so
   // a lane's cards carry the chosen sort and there is no second board to keep in step.
   const lanes = useMemo(
@@ -121,6 +134,7 @@ export function useBoardView(board: Board | null, sort: BoardSort, grouping: Boa
     lanes,
     upNext: upNext.cards,
     upNextPlan,
+    ranked,
     ...(board?.upNextPlanId === undefined ? {} : { planId: board.upNextPlanId }),
     ...(board?.upNextAbsence === undefined ? {} : { upNextAbsence: board.upNextAbsence }),
   };

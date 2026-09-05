@@ -11,7 +11,11 @@ import { canStartRun, isPickerPick, typeWord } from "@/components/board/board-ut
 import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
-import { PickAwaitingRecord, usePickDecision } from "@/components/board/pick-decision";
+import {
+  PickAwaitingRecord,
+  usePickDecision,
+  useUnrecordedPick,
+} from "@/components/board/pick-decision";
 import { VetoActions } from "@/components/board/veto-actions";
 import type { ApproveRun } from "@/components/board/use-approve-run";
 import type { EpicCardProps } from "@/components/board/epic-card";
@@ -103,9 +107,13 @@ export function EpicBacklogActions({
 }) {
   const word = typeWord(epic.type);
   const decision = usePickDecision();
+  const recorded = isPickerPick(epic.provenance);
   // A target the operator set aside keeps its plain Approve: [Release] on a card that reads
   // "set aside · back in 4h" would offer the very start the veto just declined.
-  const picked = isPickerPick(epic.provenance) && epic.notNowUntil === undefined;
+  const picked = recorded && epic.notNowUntil === undefined;
+  // Asked of the pick OR of the surface: this same card renders in the lane, where its row answers
+  // it, and in the epic swimlanes, where only the surface knows it is a pick at all (PR #226 review).
+  const unconfirmed = useUnrecordedPick(epic.id, recorded);
 
   async function handleDelete() {
     const res = await fetch(`/api/projects/${slug}/epics/${epic.id}`, { method: "DELETE" });
@@ -134,7 +142,7 @@ export function EpicBacklogActions({
         budgetAware={budgetAware}
         approval={approval}
         picked={picked}
-        unconfirmed={decision.unconfirmed}
+        unconfirmed={unconfirmed}
       />
       {/* The two ways to disagree with the pick (R3.9), on the card because this surface has no row
           to put them on. Same lock as the Release beside them: one answer per pick. */}

@@ -37,6 +37,12 @@ export interface UpNextStance {
   scheduled: boolean;
   /** The resolved autonomy offers its picks (`shadow` or `apply`, never `propose`). */
   levelOffers: boolean;
+  /**
+   * The settings read succeeded, so the armed policy (or its absence) is KNOWN. False is a failed
+   * read, not an unarmed project: the ranking is withheld rather than computed as if nothing were
+   * armed (PR #226 review), and the level beside it is a fail-soft guess from the same read.
+   */
+  policyKnown: boolean;
 }
 
 /**
@@ -92,6 +98,9 @@ export function upNextAbsence(
   entries: UpNextEntry[] | undefined,
 ): UpNextAbsence | undefined {
   if (!stance.scheduled) return "disarmed";
+  // Ahead of the level, which comes from the very read that failed: a fail-soft "it offers" must not
+  // be reported as the reason when what is actually true is that anton could not read the settings.
+  if (!stance.policyKnown) return "policy-unreadable";
   if (!stance.levelOffers) return "proposes-only";
   // An entry list that came back EMPTY is a pass that ran and found nothing it may start — distinct
   // from `undefined`, which is a ranking withheld rather than a board with nothing on it.
@@ -110,5 +119,8 @@ export function upNextAbsence(
  */
 export function upNextVersion(stance: UpNextStance): string {
   if (!stance.scheduled) return "up:off:disarmed";
+  // A recovered settings read brings the lane back, and it must not 304 on the way: the withheld
+  // ranking and the one drawn from the same armed policy are otherwise the same token.
+  if (!stance.policyKnown) return "up:off:unreadable";
   return stance.levelOffers ? "up:on" : "up:off:proposes";
 }

@@ -206,7 +206,9 @@ async function readPickerPlan(project: Project): Promise<BoardPickerPlan | undef
  * `shadow` (offer and answer) and `apply` (offer and start) put picks on the board.
  *
  * Fail-soft to "offering" on each half independently — losing a read must not silently hide a lane
- * that is running, and the plan's own freshness fence still governs what it may claim.
+ * that is running, and the plan's own freshness fence still governs what it may claim. The POLICY is
+ * the exception: it decides what the lane admits, so a read that failed is carried as unknown rather
+ * than folded into "none armed" (`policyKnown`, PR #226 review).
  */
 interface PickerStance extends UpNextStance {
   /** The policy armed on this machine, or undefined when the project has armed none. */
@@ -226,14 +228,16 @@ async function readPickerStance(project: Project): Promise<PickerStance> {
   // The two halves are kept apart, not collapsed into `offers`: a withheld lane has to say WHICH
   // absence it is (anton-w579), and "the schedule is off" and "the level only proposes" are cleared
   // in two different places.
-  const { offers: levelOffers, ...rest } = level;
-  return { ...rest, scheduled, levelOffers, offers: scheduled && levelOffers };
+  const { offers: levelOffers, known: policyKnown, ...rest } = level;
+  return { ...rest, scheduled, levelOffers, policyKnown, offers: scheduled && levelOffers };
 }
 
 /** What settings alone say: the armed policy, and whether the resolved autonomy offers its picks. */
 interface PickerLevel {
   policy?: Policy;
   offers: boolean;
+  /** The read succeeded — so an absent `policy` means "none armed" rather than "unknown". */
+  known: boolean;
 }
 
 /** The settings half of {@link readPickerStance} — the armed policy and the resolved autonomy. */
@@ -249,10 +253,13 @@ async function readPickerLevel(project: Project): Promise<PickerLevel> {
     // `shadow`, which still offers — the lane is where the record that lifts it back is made.
     const autonomy = resolvePickerAutonomy(settings, record);
     const armed = resolvePickerPolicy(settings);
-    return { ...(armed ? { policy: armed } : {}), offers: autonomy !== "propose" };
+    return { ...(armed ? { policy: armed } : {}), offers: autonomy !== "propose", known: true };
   } catch (err) {
     console.error(`[board] picker settings read failed for ${project.slug}`, err);
-    return { offers: true };
+    // Fail-soft on the LEVEL, fail-closed on the POLICY (PR #226 review). An unreadable policy is not
+    // an unarmed one: ranking with `ADMIT_ALL_POLICY` here would present every structurally eligible
+    // target as what anton would start next, including the ones the configured policy rejects.
+    return { offers: true, known: false };
   }
 }
 
@@ -470,7 +477,13 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   //
   // Gated on OFFERING, unchanged: a disarmed pass — or one at `propose` — puts no picks in front of
   // the operator, and a ranking computed anyway would draw the lane the level promised not to.
-  const ranking = picker.offers
+  //
+  // And on the policy being KNOWN (PR #226 review). `readPickerLevel` fails soft, so a settings read
+  // that threw reports "offering" with no policy — and ranking that as if none were armed would put
+  // every structurally eligible target in the lane as what anton would start, including the ones the
+  // armed policy rejects. An unknown policy is not an absent one, so the lane says so instead
+  // (`policy-unreadable`) rather than showing a ranking anton would not act on.
+  const ranking = picker.offers && picker.policyKnown
     ? decideBoardPickerPlan({
         board: allBeads,
         policy: picker.policy

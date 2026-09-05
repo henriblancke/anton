@@ -11,7 +11,11 @@ import { ClaimControl } from "@/components/board/claim-control";
 import { ApproveBlocked } from "@/components/board/contract-mark";
 import { ApproveRunButtons } from "@/components/board/approve-run-buttons";
 import { VetoActions } from "@/components/board/veto-actions";
-import { PickAwaitingRecord, usePickDecision } from "@/components/board/pick-decision";
+import {
+  PickAwaitingRecord,
+  usePickDecision,
+  useUnrecordedPick,
+} from "@/components/board/pick-decision";
 import { isPickerPick } from "@/components/board/board-utils";
 import type { StandaloneApproval } from "@/components/board/use-standalone-approval";
 
@@ -53,9 +57,15 @@ export function ApproveRunAction({
   // would vanish on the next poll (PR #212 review). Reopen the affordance until a run actually
   // starts; approve re-enqueues for an already-approved target.
   const [unrun, setUnrun] = useState(false);
+  // A chip the picker chose starts with [Release] (anton-d2h6 / R3.5) — the same approve route and
+  // the same run, plus the accept that records the operator agreed with the pick. A target already
+  // set aside keeps the plain approve: offering [Release] there would re-offer the declined start.
+  const recorded = isPickerPick(item.provenance);
+  const picked = recorded && item.notNowUntil === undefined;
   // This chip is anton's pick and nothing has recorded that decision: a start here would be one the
-  // accept ledger has no answer for, so the chip says what it is waiting for instead.
-  const { unconfirmed } = usePickDecision();
+  // accept ledger has no answer for, so the chip says what it is waiting for instead. Asked of the
+  // surface too, since the epic swimlanes have no lane row to answer it (PR #226 review).
+  const unconfirmed = useUnrecordedPick(item.id, recorded);
   if (!canOfferRun(item, approval.approved, approval.deferred) && !unrun) return null;
 
   if (unconfirmed) return <PickAwaitingRecord />;
@@ -63,11 +73,6 @@ export function ApproveRunAction({
   if (contractBlocks(item.contract)) {
     return <ApproveBlocked violations={item.contract?.blocking ?? []} label="Approve & run" />;
   }
-
-  // A chip the picker chose starts with [Release] (anton-d2h6 / R3.5) — the same approve route and
-  // the same run, plus the accept that records the operator agreed with the pick. A target already
-  // set aside keeps the plain approve: offering [Release] there would re-offer the declined start.
-  const picked = isPickerPick(item.provenance) && item.notNowUntil === undefined;
 
   return (
     <ApproveRunButtons

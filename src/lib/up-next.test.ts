@@ -127,7 +127,7 @@ describe("upNextEntries", () => {
 });
 
 describe("upNextVersion", () => {
-  const on = { scheduled: true, levelOffers: true };
+  const on = { scheduled: true, levelOffers: true, policyKnown: true };
 
   it("moves when the picker is disarmed, which changes no plan row at all", () => {
     expect(upNextVersion(on)).not.toBe(upNextVersion({ ...on, scheduled: false }));
@@ -135,9 +135,15 @@ describe("upNextVersion", () => {
 
   it("tells the two off states apart, so a poll cannot 304 onto the wrong absence", () => {
     // Disarming a `propose` project moves no bead, no plan row and no policy — only this token.
-    expect(upNextVersion({ scheduled: false, levelOffers: true })).not.toBe(
-      upNextVersion({ scheduled: true, levelOffers: false }),
+    expect(upNextVersion({ ...on, scheduled: false })).not.toBe(
+      upNextVersion({ ...on, levelOffers: false }),
     );
+  });
+
+  it("moves when the policy read fails, so the lane comes back when it recovers", () => {
+    // The withheld ranking and the one the same armed policy produces touch no bead, no plan row and
+    // no policy — a token that ignored this would 304 the operator onto the absence indefinitely.
+    expect(upNextVersion({ ...on, policyKnown: false })).not.toBe(upNextVersion(on));
   });
 });
 
@@ -147,15 +153,28 @@ describe("upNextVersion", () => {
  * out of the layout rather than telling the operator to act on a wait.
  */
 describe("upNextAbsence", () => {
-  const armed = { scheduled: true, levelOffers: true };
+  const armed = { scheduled: true, levelOffers: true, policyKnown: true };
 
   it("names a disarmed pass ahead of the level, since nothing runs to reach it", () => {
-    expect(upNextAbsence({ scheduled: false, levelOffers: false }, undefined)).toBe("disarmed");
-    expect(upNextAbsence({ scheduled: false, levelOffers: true }, undefined)).toBe("disarmed");
+    expect(upNextAbsence({ ...armed, scheduled: false, levelOffers: false }, undefined)).toBe(
+      "disarmed",
+    );
+    expect(upNextAbsence({ ...armed, scheduled: false }, undefined)).toBe("disarmed");
   });
 
   it("names the level when the pass runs but promises nothing offered", () => {
-    expect(upNextAbsence({ scheduled: true, levelOffers: false }, undefined)).toBe("proposes-only");
+    expect(upNextAbsence({ ...armed, levelOffers: false }, undefined)).toBe("proposes-only");
+  });
+
+  it("names an unreadable policy ahead of the level, which came from the same failed read", () => {
+    // "It offers" is fail-soft guesswork once the settings read threw; what is actually true is that
+    // anton cannot see the policy, and that is what the lane must say (PR #226 review).
+    expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: true }, undefined)).toBe(
+      "policy-unreadable",
+    );
+    expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: false }, undefined)).toBe(
+      "policy-unreadable",
+    );
   });
 
   it("names an empty ranking as a board with nothing claimable on it", () => {

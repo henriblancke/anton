@@ -177,8 +177,8 @@ function LaneHead({
  * where there is no ranking to draw.
  *
  * A count of `0` would be the one reading the lane must never give: "anton has nothing to start" is
- * a claim about the BOARD, and two of these three states say nothing about the board at all. So the
- * count's place carries the state's own word instead, and the sentence under it is always the
+ * a claim about the BOARD, and all but one of these states say nothing about the board at all. So
+ * the count's place carries the state's own word instead, and the sentence under it is always the
  * clearing condition — the rule anton-5c8h set for every stopped state on this screen.
  *
  * The link goes where the condition is actually cleared, so the operator never has to hunt for the
@@ -202,6 +202,13 @@ const ABSENCE_COPY: Record<
     clears: "Raise picker autonomy to shadow and its picks appear here to release or veto.",
     link: { label: "Picker autonomy", hash: "policy" },
   },
+  "policy-unreadable": {
+    badge: "?",
+    headline: "anton can’t read this project’s work policy, so it won’t guess a ranking.",
+    clears:
+      "Reload the board — a ranking drawn without the armed policy would offer targets it rejects.",
+    link: { label: "Work policy", hash: "policy" },
+  },
   "no-claimable-work": {
     badge: "none",
     headline: "The last pass found nothing it may claim.",
@@ -215,9 +222,9 @@ const ABSENCE_COPY: Record<
  * The lane when there is no ranking to draw, and the reason is one the operator can clear.
  *
  * It holds the lane's column on purpose. Removing the section is what the board did before, and an
- * operator watching Up Next disappear learns nothing about which of three unrelated states they are
- * in — a switched-off pass, a level that only proposes, and a board with nothing claimable on it all
- * looked identical, and only one of them is about their work.
+ * operator watching Up Next disappear learns nothing about which unrelated state they are in — a
+ * switched-off pass, a level that only proposes, a policy anton could not read, and a board with
+ * nothing claimable on it all looked identical, and only one of them is about their work.
  */
 export function UpNextAbsenceLane({ slug, absence }: { slug: string; absence: UpNextAbsence }) {
   const copy = ABSENCE_COPY[absence];
