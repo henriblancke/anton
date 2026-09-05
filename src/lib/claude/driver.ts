@@ -17,11 +17,11 @@
 import { consumeLine, createLineReader, createStreamState, type ClaudeEvent } from "./driver-events";
 import { exitError, toClaudeResult, type ClaudeResult } from "./driver-exit";
 import {
-  buildClaudeArgs, createStallWatchdog, killTree, resolveClaudeBin, spawnClaude, writePrompt,
-  writeSystemPromptFile, type ClaudeCliOptions,
+  abortGraceMs, buildClaudeArgs, createStallWatchdog, killTree, resolveClaudeBin, spawnClaude,
+  writePrompt, writeSystemPromptFile, type ClaudeCliOptions,
 } from "./driver-spawn";
 
-export { CLAUDE_BIN_ENV } from "./driver-spawn";
+export { ABORT_GRACE_ENV, CLAUDE_BIN_ENV } from "./driver-spawn";
 export type { ClaudeEvent } from "./driver-events";
 export type { ClaudeResult } from "./driver-exit";
 
@@ -57,10 +57,30 @@ export interface RunClaudeOptions extends ClaudeCliOptions {
 export const DEFAULT_STALL_TIMEOUT_MS = 60 * 60_000;
 
 /**
+ * The rejection a cancelled session settles with when its own abort produced none — shaped like
+ * Node's `AbortError`, which is what callers discriminate cancellation by.
+ */
+function abortError(): Error {
+  const err: Error & { code?: string } = new Error("The operation was aborted");
+  err.name = "AbortError";
+  err.code = "ABORT_ERR";
+  return err;
+}
+
+/**
  * Spawn claude and stream it to completion: the child's stdout becomes events, its ending becomes
  * either the classified rejection or the run's result. Cancellation and the stall watchdog both
  * signal the whole process GROUP, since Node's built-in AbortSignal handling reaches only the
  * direct child and would leave the shell commands claude spawned orphaned.
+ *
+ * A CANCELLED session settles only once that group is actually gone (PR #228 review). Signalling is
+ * not stopping: Node emits the abort's `error` the instant it delivers SIGTERM, and claude — or a
+ * test runner, a formatter, a `git` it spawned — keeps writing the worktree until it exits. The
+ * ticket-timeout path re-runs the verify gates and COMMITS that tree the moment this promise
+ * settles, so settling on the signal hands it a snapshot still being written: the commit is
+ * inconsistent, and whatever lands after the final cleanliness check is thrown away with the failed
+ * run's worktree. So an abort holds its rejection until `close`, escalating SIGTERM → SIGKILL for
+ * anything that traps or ignores the first signal.
  */
 function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Promise<ClaudeResult> {
   return new Promise<ClaudeResult>((resolve, reject) => {
@@ -68,8 +88,32 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
 
     const stallMs = opts.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
     const watchdog = createStallWatchdog(stallMs, () => killTree(child, "SIGKILL"));
-    const onAbort = () => killTree(child, "SIGTERM");
+
+    /** The abort's own rejection, held until `close` proves the process group is gone. */
+    let aborting: Error | null = null;
+    let escalate: NodeJS.Timeout | undefined;
+    let abandon: NodeJS.Timeout | undefined;
+    const clearTermination = () => {
+      if (escalate) clearTimeout(escalate);
+      if (abandon) clearTimeout(abandon);
+      escalate = abandon = undefined;
+    };
+
+    const onAbort = () => {
+      killTree(child, "SIGTERM");
+      const grace = abortGraceMs();
+      escalate = setTimeout(() => killTree(child, "SIGKILL"), grace);
+      escalate.unref?.();
+      // The last resort, and a bounded one. SIGKILL went to the whole GROUP, so anything still
+      // holding the pipes open past this is a leaked descendant rather than a live writer — waiting
+      // on it would wedge the run instead of protecting the tree.
+      abandon = setTimeout(() => settle(() => reject(aborting ?? abortError())), grace * 2);
+      abandon.unref?.();
+    };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
+    // A signal already aborted before the spawn never fires `abort`, so escalate explicitly: Node
+    // sends its one SIGTERM either way, and without this nothing would ever follow it up.
+    if (opts.signal?.aborted) onAbort();
 
     writePrompt(child, opts.prompt);
 
@@ -88,23 +132,40 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
     });
 
     /**
-     * Every ending settles exactly once, and always releases the timer and the abort listener. The
-     * once-flag matters because an abort delivers two endings — Node's `spawn({signal})` emits
-     * 'error' with an AbortError AND `onAbort` fires — and the loser must not re-run `finish()`.
+     * Every ending settles exactly once, and always releases the timers and the abort listener. The
+     * once-flag matters because a cancelled session can still reach `close` after the abandon timer
+     * gave up on it — and the loser must not re-run `finish()`.
      */
     let settled = false;
     const settle = (finish: () => void) => {
       if (settled) return;
       settled = true;
       watchdog.clear();
+      clearTermination();
       opts.signal?.removeEventListener("abort", onAbort);
       finish();
     };
 
-    child.on("error", (err) => settle(() => reject(err)));
+    child.on("error", (err) => {
+      // An abort's `error` is the SIGNAL, not the ending — hold it until the child has gone. A
+      // spawn failure has no process to wait for and settles at once.
+      const running =
+        child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+      if (opts.signal?.aborted && running) {
+        aborting = err;
+        return;
+      }
+      settle(() => reject(err));
+    });
     child.on("close", (code) =>
       settle(() => {
         lines.flush();
+        // A cancelled session keeps the abort's own rejection: callers discriminate cancellation by
+        // it, and the signal-kill exit it leaves behind is no verdict on the session's work.
+        if (aborting) {
+          reject(aborting);
+          return;
+        }
         const error = exitError({ code, stalled: watchdog.stalled, stallMs, stderr, stream });
         if (error) reject(error);
         else resolve(toClaudeResult(stream));

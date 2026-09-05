@@ -3,11 +3,11 @@
  * usage-limit detection against fake claude binaries (no network / no real claude needed).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
-import { CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
+import { ABORT_GRACE_ENV, CLAUDE_BIN_ENV, runClaude, type ClaudeEvent, type RunClaudeOptions } from "./driver";
 
 let dir: string;
 let prevBin: string | undefined;
@@ -75,6 +75,45 @@ async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boole
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return false;
+}
+
+/**
+ * A fake that traps SIGTERM and keeps working for `lingerMs` before exiting — the agent that is
+ * SIGNALLED but not yet stopped. It writes `markerPath` on its way out, so a driver that settled on
+ * the signal rather than on the exit is provable: the marker is absent when the promise rejects.
+ */
+function writeFakeLingeringClaude(name: string, markerPath: string, lingerMs: number): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    "const { writeFileSync } = require('node:fs');",
+    "process.on('SIGTERM', () => {",
+    `  setTimeout(() => { writeFileSync(${JSON.stringify(markerPath)}, 'late'); process.exit(0); }, ${lingerMs});`,
+    "});",
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-abort' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/** A fake that ignores SIGTERM outright and writes its pid — only SIGKILL ends it. */
+function writeFakeUnkillableClaude(name: string, pidPath: string): string {
+  const path = join(dir, name);
+  const body = [
+    "#!/usr/bin/env node",
+    "const { writeFileSync } = require('node:fs');",
+    "process.on('SIGTERM', () => {});",
+    `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-kill' }) + '\\n');",
+    "setInterval(() => {}, 1 << 30);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
 }
 
 /** A fake that emits each event `gapMs` apart — slow but demonstrably alive. */
@@ -955,6 +994,53 @@ describe("runClaude", () => {
     const childPid = Number(readFileSync(childPidPath, "utf8"));
     expect(await waitForProcessExit(childPid)).toBe(true);
   });
+
+  // PR #228 review: the ticket-timeout path re-runs the verify gates and COMMITS the worktree as
+  // soon as this promise settles, so settling on the SIGNAL rather than on the exit hands it a tree
+  // the agent is still writing — an inconsistent commit, and later writes discarded with the run.
+  it.runIf(process.platform !== "win32")(
+    "waits for a cancelled session to actually exit before it settles",
+    async () => {
+      const marker = join(dir, "lingering-claude.marker");
+      const bin = writeFakeLingeringClaude("lingering-claude", marker, 400);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      const control = new AbortController();
+
+      const run = runClaude({ cwd: dir, prompt: "cancel me", signal: control.signal });
+      // Abort only once the fake is up and has trapped SIGTERM — before that it would die on the
+      // default disposition and prove nothing.
+      await new Promise((r) => setTimeout(r, 300));
+      control.abort();
+
+      await expect(run).rejects.toMatchObject({ name: "AbortError" });
+      // The write the agent made AFTER the signal is on disk by the time the caller is told, which
+      // is the whole property: nothing verifies or commits the tree until the writer has gone.
+      expect(existsSync(marker)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "escalates to SIGKILL for a cancelled session that ignores SIGTERM",
+    async () => {
+      const pidPath = join(dir, "unkillable-claude.pid");
+      const bin = writeFakeUnkillableClaude("unkillable-claude", pidPath);
+      process.env[CLAUDE_BIN_ENV] = bin;
+      // Shrink the grace so the escalation lands inside the test rather than 10s later.
+      process.env[ABORT_GRACE_ENV] = "300";
+      const control = new AbortController();
+
+      try {
+        const run = runClaude({ cwd: dir, prompt: "trap sigterm", signal: control.signal });
+        await new Promise((r) => setTimeout(r, 300));
+        control.abort();
+
+        await expect(run).rejects.toMatchObject({ name: "AbortError" });
+        expect(await waitForProcessExit(Number(readFileSync(pidPath, "utf8")))).toBe(true);
+      } finally {
+        delete process.env[ABORT_GRACE_ENV];
+      }
+    },
+  );
 
   it("does not kill a slow session that keeps emitting output", async () => {
     // Liveness is any byte, not a completed turn. The budget must exceed node's spawn time plus one
