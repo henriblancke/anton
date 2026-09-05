@@ -265,6 +265,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       error: new Error("push rejected"),
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: true,
       head: "0123456789abcdef0123456789abcdef01234567",
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
@@ -279,6 +280,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       selfReport: null,
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: false,
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toBeUndefined();
   });
@@ -291,6 +293,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       selfReport: { outcome: "blocked", reason: "y".repeat(500) },
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: true,
       head: "0123456789abcdef0123456789abcdef01234567",
     });
     const [ticket] = humanHeldTickets([held("t-1", "blocked", long)]);
@@ -307,6 +310,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       error: new Error("verify failed: nothing committed on main"),
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: true,
       head: "0123456789abcdef0123456789abcdef01234567",
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
@@ -321,11 +325,30 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
       selfReport: { outcome: "blocked", reason: "[session s0, nothing committed on main]" },
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: true,
       head: "0123456789abcdef0123456789abcdef01234567",
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
       branch: "anton/anton-e1",
       head: "0123456",
+    });
+  });
+
+  it("keeps a committed verdict whose sha the run could not read (PR #227 review)", () => {
+    // The HEAD read is best-effort; whether the ticket committed is not. Collapsing the two would
+    // publish "nothing committed" for work that is on the branch.
+    const note = ticketBlockNote({
+      kind: "post-commit",
+      selfReport: null,
+      error: new Error("push rejected"),
+      sessionId: "sess-1",
+      branch: "anton/anton-e1",
+      committed: true,
+      head: undefined,
+    });
+    expect(note).toContain("[session sess-1, committed on anton/anton-e1 @ unknown]");
+    expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
+      branch: "anton/anton-e1",
     });
   });
 
@@ -429,6 +452,26 @@ describe("humanHeldPoison — the park a held child leaves behind (anton-fude)",
     expect(error.message).toContain("bd update anton-od4 --status open");
     expect(error.message).not.toContain("ALREADY COMMITTED");
     expect(error.message).not.toContain("bd close");
+    expect(error.message).toContain("drops the work from this run");
+  });
+
+  it("neither closes nor redoes a commit whose sha was never recorded (PR #227 review)", () => {
+    // The run that blocked this ticket committed, then failed to read HEAD. Both settled remedies
+    // are wrong on the wrong guess — closing may settle the board over work in no pull request,
+    // reopening may redo work already on the branch — so the operator is sent to git to decide.
+    const error = humanHeldPoison(
+      "anton-x7la",
+      [{ id: "anton-od4", status: "blocked", committed: { branch: BRANCH } }],
+      BRANCH,
+      NOTHING_HERE,
+    );
+    expect(error.message).toContain("its work WAS committed on");
+    expect(error.message).toContain("could not read the commit's sha");
+    expect(error.message).toContain(`git log --oneline ${BRANCH} | grep anton-od4`);
+    expect(error.message).toContain("bd close anton-od4");
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toContain("ALREADY COMMITTED");
+    // Unverified is not "here": the abandon hint must not promise the commit rides along.
     expect(error.message).toContain("drops the work from this run");
   });
 
@@ -1196,6 +1239,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
       selfReport: { outcome: "blocked", reason: "the migration this depends on does not exist yet" },
       sessionId: "sess-1",
       branch: "anton/anton-e1",
+      committed: true,
       head: HEAD,
       ...over,
     });
@@ -1214,12 +1258,12 @@ describe("ticketBlockNote (anton-vqql)", () => {
   });
 
   it("says nothing was committed when the tree was empty", () => {
-    const out = note({ kind: "no-delivery", selfReport: null, head: undefined });
+    const out = note({ kind: "no-delivery", selfReport: null, committed: false, head: undefined });
     expect(out).toContain("[session sess-1, nothing committed on anton/anton-e1]");
   });
 
   it("reads a `delivered` claim on an empty tree as the false success it is", () => {
-    const out = note({ kind: "no-delivery", selfReport: { outcome: "delivered" }, head: undefined });
+    const out = note({ kind: "no-delivery", selfReport: { outcome: "delivered" }, committed: false, head: undefined });
     expect(out).toContain("run made no changes");
     expect(out).toContain("self-reported ANTON-RESULT: delivered — a false success on an unchanged tree");
   });
@@ -1228,6 +1272,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
     const out = note({
       kind: "no-delivery",
       selfReport: { outcome: "blocked", reason: "the acceptance criteria contradict each other" },
+      committed: false,
       head: undefined,
     });
     expect(out).toContain("the acceptance criteria contradict each other");
@@ -1247,7 +1292,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
       note({ selfReport: null }),
       note({ selfReport: { outcome: "blocked" } }),
       note({ selfReport: { outcome: "blocked", reason: "   " } }),
-      note({ kind: "no-delivery", selfReport: { outcome: "blocked", reason: "   " }, head: undefined }),
+      note({ kind: "no-delivery", selfReport: { outcome: "blocked", reason: "   " }, committed: false, head: undefined }),
       note({ kind: "post-commit", selfReport: null, error: undefined }),
     ]) {
       expect(out).not.toContain('""');
@@ -1324,6 +1369,15 @@ describe("timedOutTicketNote (anton-t1mo)", () => {
       branch: "anton/anton-e1",
       head: "0123456",
     });
+  });
+
+  it("keeps a committed timeout committed when the HEAD read failed (PR #227 review)", () => {
+    // `readWorktreeState` can fail on a tree that is momentarily unreadable. The sha is lost; the
+    // fact that this ticket's work is on the branch is not, and the park gate turns on it.
+    const out = timedOut({ head: undefined });
+    expect(out).toContain("Its work IS committed on the branch");
+    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ unknown]");
+    expect(latestBlockNoteCommit([out])).toEqual({ committed: true, branch: "anton/anton-e1" });
   });
 
   it("records a rolled-back timeout as the zero-diff block it is", () => {

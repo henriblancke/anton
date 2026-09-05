@@ -790,7 +790,9 @@ async function blockTimedOutTicket(args: {
   const marked =
     committed || (await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])));
   // The tip this ticket's work landed on — the same best-effort read the human-review block makes,
-  // and only when something was committed: an unreadable worktree costs the sha, never the note.
+  // and only when something was committed: an unreadable worktree costs the sha, never the note and
+  // never the verdict (`committed` is passed on its own, so a failed read records
+  // `committed ... @ unknown`, not the false "nothing committed" — PR #227 review).
   const head = committed
     ? await readWorktreeState(worktreePath)
         .then((s) => s.head)
@@ -902,7 +904,7 @@ async function releaseFailedTicket(args: {
       await safe(() => beads.setStatus(repo, ticket.id, "blocked"));
       // The tip this ticket's work landed on — the operator's route from the note straight to the
       // diff. Best-effort and only when something was committed: an unreadable worktree costs the
-      // sha, never the note.
+      // sha, never the note and never the verdict (see `blockNoteEvidence`).
       const head = committed
         ? await readWorktreeState(worktreePath)
             .then((s) => s.head)
@@ -918,6 +920,7 @@ async function releaseFailedTicket(args: {
             error: e,
             sessionId,
             branch: run.branch,
+            committed,
             head,
           }),
         ),
@@ -1143,10 +1146,12 @@ export function ticketBlockNote(args: {
   error?: unknown;
   sessionId: string;
   branch: string;
-  /** The committed tip, full sha; absent when this ticket committed nothing. */
+  /** Whether this ticket's work landed on the branch — not inferable from `kind`. */
+  committed: boolean;
+  /** The committed tip, full sha; absent when the HEAD read failed. */
   head?: string;
 }): string {
-  const { kind, sessionId, branch, head } = args;
+  const { kind, sessionId, branch, committed, head } = args;
   const reason = blockNoteDetail(args.selfReport?.reason ?? "");
   // A reason that flattens to nothing is NO reason — drop it, so the rendering falls back to the
   // category text rather than trailing an empty quote or a dangling dash.
@@ -1167,7 +1172,9 @@ export function ticketBlockNote(args: {
 
   // Written through the shared grammar: the board's park gate reads this clause back to tell a
   // committed block (review and close) from a zero-diff one (reopen and re-run) — see block-note.ts.
-  return blockNoteOneLine(`anton: ${body} [${blockNoteEvidence({ sessionId, branch, head })}]`);
+  return blockNoteOneLine(
+    `anton: ${body} [${blockNoteEvidence({ sessionId, branch, committed, head })}]`,
+  );
 }
 
 /**
@@ -1204,7 +1211,7 @@ export function timedOutTicketNote(args: {
     `anton: stopped after ${Math.round(timeoutMs / 60_000)}m — the ticket outlived its budget, ` +
       `so the run blocked it and carried on with the rest of the feature. ${fate} Re-scope it ` +
       `into smaller tickets, or raise ticketTimeoutMinutes, then resume the run ` +
-      `[${blockNoteEvidence({ sessionId, branch, head })}]`,
+      `[${blockNoteEvidence({ sessionId, branch, committed, head })}]`,
   );
 }
 

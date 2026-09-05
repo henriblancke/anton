@@ -131,9 +131,10 @@ export interface HumanHeldTicket {
   /**
    * The branch + short sha of the work this ticket's block left behind, when its note records a
    * commit. Both halves matter: the remedy this ticket is owed ({@link humanHeldClause}) turns on
-   * whether that branch is the one THIS run ships.
+   * whether that branch is the one THIS run ships. The sha is absent when the run that wrote the
+   * note could not read it — a commit that cannot be located is still a commit.
    */
-  committed?: { branch: string; head: string };
+  committed?: { branch: string; head?: string };
 }
 
 /**
@@ -165,7 +166,9 @@ export function humanHeldTickets(tickets: Bead[]): HumanHeldTicket[] {
         id: t.id,
         status: t.status,
         ...(note ? { note } : {}),
-        ...(commit?.committed ? { committed: { branch: commit.branch, head: commit.head } } : {}),
+        ...(commit?.committed
+          ? { committed: { branch: commit.branch, ...(commit.head ? { head: commit.head } : {}) } }
+          : {}),
       };
     });
 }
@@ -200,12 +203,19 @@ function clampNote(text: string | undefined): string | undefined {
  * made it parked before pushing) — the same cross-machine gap the dispatch loop closes with
  * `worktreeHasCommitFor`. `elsewhere` is the note of a re-parented ticket, still pointing at its
  * original run's branch. Both `elsewhere` and `absent` mean this run ships without that work.
+ *
+ * `unverified` is the note of a run that committed but could not read the sha (PR #227 review):
+ * there IS work, and git cannot be asked where it is without a commit to ask about. It is its own
+ * verdict rather than a lean either way — called `here` it would license closing a ticket whose work
+ * may be in no pull request, called `none` it would send an operator to redo work already on the
+ * branch.
  */
 type HeldWork =
   | { where: "none" }
   | { where: "here"; head: string }
-  | { where: "elsewhere"; branch: string; head: string }
-  | { where: "absent"; head: string };
+  | { where: "elsewhere"; branch: string; head?: string }
+  | { where: "absent"; head: string }
+  | { where: "unverified"; branch: string };
 
 /** Read {@link HeldWork} off the ticket's note plus `commitsHere` — see {@link humanHeldPoison}. */
 function heldWork(
@@ -216,13 +226,14 @@ function heldWork(
   const committed = held.committed;
   if (!committed) return { where: "none" };
   if (committed.branch !== branch) return { where: "elsewhere", ...committed };
+  if (!committed.head) return { where: "unverified", branch };
   return { where: commitsHere.has(held.id) ? "here" : "absent", head: committed.head };
 }
 
 /**
  * What one held ticket owes the operator: why no run may take it, and the move that frees it.
  *
- * A blocked ticket has FOUR remedies, and which one applies turns on where its work landed
+ * A blocked ticket has FIVE remedies, and which one applies turns on where its work landed
  * (PR #227 review). Recommending `--status open` for a ticket that already committed HERE is wrong
  * twice over: reopening does not satisfy `resumeSkipped` (only `closed` does), so the resumed run
  * dispatches the agent again ON TOP of that commit and can block right back at the same zero diff —
@@ -234,6 +245,9 @@ function heldWork(
  * closing or abandoning the ticket settles the board over work this target never ships. Reopening is
  * the move — the same one a zero-diff block gets — with the commit named so the operator can bring
  * it across instead of redoing it.
+ *
+ * Work whose sha was never recorded is owed neither: the operator is pointed at the branch to settle
+ * the question a machine could not, because both remedies above are wrong on the wrong answer.
  */
 function humanHeldClause(held: HumanHeldTicket, work: HeldWork, branch: string): string {
   const why =
@@ -248,7 +262,7 @@ function humanHeldClause(held: HumanHeldTicket, work: HeldWork, branch: string):
           `that commit`
         : work.where === "elsewhere"
           ? `${held.id} is blocked pending human review and its work was committed on ` +
-            `${work.branch} (@ ${work.head}), NOT on this run's branch ` +
+            `${work.branch}${work.head ? ` (@ ${work.head})` : ""}, NOT on this run's branch ` +
             `(${branch}) — so this run's pull request does not contain it, and closing or ` +
             `abandoning it would settle the board over work this target never ships. Reopen it ` +
             `(\`bd update ${held.id} --status open\`) to have an agent redo it here, or land that ` +
@@ -261,8 +275,16 @@ function humanHeldClause(held: HumanHeldTicket, work: HeldWork, branch: string):
               `Reopen it (\`bd update ${held.id} --status open\`) to have an agent redo it here, ` +
               `or push that commit from the machine holding it and land it on ${branch} before ` +
               `closing it`
-            : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
-              `it is resolved)`;
+            : work.where === "unverified"
+              ? `${held.id} is blocked pending human review and its note records that its work ` +
+                `WAS committed on ${branch}, but the run could not read the commit's sha — so ` +
+                `nothing here can tell whether this run's pull request contains it. Find the ` +
+                `ticket's commit (\`git log --oneline ${branch} | grep ${held.id}\`): review it ` +
+                `and \`bd close ${held.id}\` if it satisfies the ticket, or reopen it ` +
+                `(\`bd update ${held.id} --status open\`) to have an agent redo it here if it is ` +
+                `not on the branch`
+              : `${held.id} is blocked pending human review (\`bd update ${held.id} --status open\` once ` +
+                `it is resolved)`;
   return held.note ? `${why}: "${held.note}"` : why;
 }
 

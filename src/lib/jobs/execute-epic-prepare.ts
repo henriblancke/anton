@@ -318,12 +318,13 @@ function dispatchableChildren(gates: RunGates): Bead[] {
  */
 async function commitsHere(run: EpicRun, held: HumanHeldTicket[]): Promise<Set<string>> {
   const verified = await Promise.all(
-    held.map(async (h) =>
-      h.committed?.branch === run.branch &&
-      (await branchContainsCommit(run.repo, run.branch, h.committed.head))
-        ? h.id
-        : null,
-    ),
+    held.map(async (h) => {
+      // A committed block whose sha its run could not read has nothing to ask git about — it stays
+      // out of the verified set, and the park hands it the `unverified` remedy (PR #227 review).
+      const commit = h.committed;
+      if (!commit?.head || commit.branch !== run.branch) return null;
+      return (await branchContainsCommit(run.repo, run.branch, commit.head)) ? h.id : null;
+    }),
   );
   return new Set(verified.filter((id): id is string => id !== null));
 }

@@ -18,22 +18,30 @@
  * re-parented onto another run target keeps a note naming the branch it originally ran on, and a
  * reader that kept only the sha would tell the new run's operator that work already sits on THIS
  * run's branch when it does not.
+ *
+ * A committed verdict may arrive WITHOUT its sha (PR #227 review): the sha is a best-effort read of
+ * a worktree that can fail, while "did this ticket commit" is already known for certain. Whether
+ * work landed and where its tip is are separate facts, so the missing one is left absent rather than
+ * collapsed into "nothing committed" — negative evidence anton never actually observed.
  */
 export type BlockNoteCommit =
   | { committed: false; branch: string }
-  | { committed: true; branch: string; head: string };
+  | { committed: true; branch: string; head?: string };
 
-/** The evidence clause: which session, and the branch + short sha when work was committed. */
+/** What a block note records about its ticket's work — the input side of {@link BlockNoteCommit}. */
 export function blockNoteEvidence(args: {
   sessionId: string;
   branch: string;
-  /** The committed tip, full sha; absent when this ticket committed nothing. */
+  /** Whether this ticket's work landed on the branch — known independently of the sha below. */
+  committed: boolean;
+  /** The committed tip, full sha; absent when the HEAD read failed. */
   head?: string;
 }): string {
-  const { sessionId, branch, head } = args;
-  return head
-    ? `session ${sessionId}, committed on ${branch} @ ${head.slice(0, 7)}`
-    : `session ${sessionId}, nothing committed on ${branch}`;
+  const { sessionId, branch, committed, head } = args;
+  if (!committed) return `session ${sessionId}, nothing committed on ${branch}`;
+  // `@ unknown` rather than a bare "committed on <branch>", so the reader below tells a sha it never
+  // got from one it failed to parse, and the operator sees which half of the evidence is missing.
+  return `session ${sessionId}, committed on ${branch} @ ${head ? head.slice(0, 7) : "unknown"}`;
 }
 
 /**
@@ -49,6 +57,7 @@ export function blockNoteEvidence(args: {
  */
 const EVIDENCE_CLAUSE = /\[(session [^[\]]*)\]$/;
 const COMMITTED = /, committed on (\S+) @ ([0-9a-f]{7,40})$/;
+const COMMITTED_UNKNOWN_SHA = /, committed on (\S+) @ unknown$/;
 const NOTHING_COMMITTED = /, nothing committed on (\S+)$/;
 
 /** Read one machine note's evidence back: the branch it ran on, and the short sha when work landed. */
@@ -57,6 +66,10 @@ export function blockNoteCommit(note: string): BlockNoteCommit | undefined {
   if (!clause) return undefined;
   const committed = COMMITTED.exec(clause);
   if (committed) return { committed: true, branch: committed[1]!, head: committed[2]! };
+  // Committed with no readable sha: still a COMMITTED verdict. Falling through to the negative one
+  // would tell the park gate that nothing landed and win the ticket the opposite remedy.
+  const unknownSha = COMMITTED_UNKNOWN_SHA.exec(clause);
+  if (unknownSha) return { committed: true, branch: unknownSha[1]! };
   const nothing = NOTHING_COMMITTED.exec(clause);
   return nothing ? { committed: false, branch: nothing[1]! } : undefined;
 }
