@@ -218,6 +218,7 @@ describe("delete", () => {
     expect(call[0]).toBe("/api/projects/anton/tickets/bd-1");
     expect(onDeleted).toHaveBeenCalledWith("bd-1");
     expect(onClose).toHaveBeenCalled();
+    expect(toast.success).toHaveBeenCalledWith("Ticket deleted");
   });
 
   it("keeps the dialog open when the delete fails", async () => {
